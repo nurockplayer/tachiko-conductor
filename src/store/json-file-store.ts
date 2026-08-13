@@ -73,6 +73,11 @@ function readRun(filePath: string, id: string): Run {
       `Run file ${filePath} is corrupt or incompatible: expected a run with a state from the workflow enum (id/state/target/history).`,
     );
   }
+  if (parsed.id !== id) {
+    throw new Error(
+      `Run file ${filePath} is corrupt or incompatible: persisted run id "${parsed.id}" does not match its file name "${id}".`,
+    );
+  }
   return parsed;
 }
 

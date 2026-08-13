@@ -34,17 +34,19 @@ export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
 }
 
 /**
- * Parse a GitHub issue number strictly: a decimal integer >= 1. Partial or
- * malformed input (`42oops`, `3.5`, `0`, `-1`) is rejected instead of being
- * silently truncated by a prefix parse.
+ * Parse a GitHub issue number strictly: a decimal integer >= 1 that is also a
+ * safe JavaScript integer. Partial, malformed, zero, negative, or
+ * unrepresentable input (`42oops`, `3.5`, `0`, `-1`, `9007199254740993`,
+ * overflow-to-Infinity) is rejected instead of being silently truncated or
+ * rounded by a prefix parse.
  */
 export function parseIssueNumber(raw: string): number {
   if (!/^\d+$/.test(raw)) {
     throw new Error(`Invalid --issue "${raw}": expected a positive integer.`);
   }
   const value = Number(raw);
-  if (value < 1) {
-    throw new Error(`Invalid --issue "${raw}": issue numbers must be >= 1.`);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`Invalid --issue "${raw}": issue numbers must be a safe integer >= 1.`);
   }
   return value;
 }

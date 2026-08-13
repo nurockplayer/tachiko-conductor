@@ -10,6 +10,7 @@ export type InvalidTransitionCode =
   | 'unexpected-payload'
   | 'head-mutation-not-allowed'
   | 'missing-head-sha'
+  | 'empty-head-sha'
   | 'conflicting-head-sha'
   | 'stale-review'
   | 'fresh-review'
@@ -92,6 +93,7 @@ export const TRANSITION_TABLE: Readonly<
   },
   MERGE_READY: {
     merged: 'MERGED',
+    wait_dependency: 'WAITING_DEPENDENCY',
     escalate: 'NEEDS_HUMAN',
     fail: 'FAILED',
   },
@@ -151,9 +153,23 @@ export function canTransition(from: WorkflowState, type: TransitionType): boolea
   return type in TRANSITION_TABLE[from];
 }
 
-/** Whether the run's latest review is bound to its current HEAD SHA. */
+/**
+ * Whether the run's latest review is bound to its current HEAD SHA. Both
+ * SHAs must be present and non-empty: an empty or whitespace-only identity
+ * never counts as fresh, so it can never satisfy the final gate.
+ */
 export function isReviewFresh(run: Run): boolean {
-  return run.headSha !== undefined && run.reviewResult?.headSha === run.headSha;
+  return (
+    run.headSha !== undefined &&
+    run.headSha.trim() !== '' &&
+    run.reviewResult?.headSha !== undefined &&
+    run.reviewResult.headSha === run.headSha
+  );
+}
+
+/** A usable SHA identity: present and not empty after trimming whitespace. */
+function isUsableSha(value: string | undefined): value is string {
+  return value !== undefined && value.trim() !== '';
 }
 
 function assertPayload(from: WorkflowState, input: TransitionInput): void {
@@ -194,8 +210,25 @@ function assertPayload(from: WorkflowState, input: TransitionInput): void {
   // A successful implementation must report the exact commit it produced;
   // otherwise a stale HEAD could linger and be reviewed as if it were current.
   if (input.type === 'agent_succeeded') {
+    const inputSha = input.headSha;
     const resultSha = input.agentResult?.headSha;
-    if (input.headSha === undefined && resultSha === undefined) {
+    if (inputSha !== undefined && inputSha.trim() === '') {
+      throw new InvalidTransitionError(
+        'empty-head-sha',
+        from,
+        input.type,
+        `Transition "agent_succeeded" got an empty input.headSha; a HEAD SHA must be a non-empty identity.`,
+      );
+    }
+    if (resultSha !== undefined && resultSha.trim() === '') {
+      throw new InvalidTransitionError(
+        'empty-head-sha',
+        from,
+        input.type,
+        `Transition "agent_succeeded" got an empty agentResult.headSha; a HEAD SHA must be a non-empty identity.`,
+      );
+    }
+    if (!isUsableSha(inputSha) && !isUsableSha(resultSha)) {
       throw new InvalidTransitionError(
         'missing-head-sha',
         from,
@@ -203,12 +236,12 @@ function assertPayload(from: WorkflowState, input: TransitionInput): void {
         `Transition "agent_succeeded" requires an exact HEAD SHA; provide it via input.headSha or agentResult.headSha.`,
       );
     }
-    if (input.headSha !== undefined && resultSha !== undefined && input.headSha !== resultSha) {
+    if (isUsableSha(inputSha) && isUsableSha(resultSha) && inputSha.trim() !== resultSha.trim()) {
       throw new InvalidTransitionError(
         'conflicting-head-sha',
         from,
         input.type,
-        `Transition "agent_succeeded" got conflicting HEAD SHAs: input.headSha "${input.headSha}" vs agentResult.headSha "${resultSha}".`,
+        `Transition "agent_succeeded" got conflicting HEAD SHAs: input.headSha "${inputSha}" vs agentResult.headSha "${resultSha}".`,
       );
     }
   }
@@ -324,9 +357,10 @@ export function applyTransition(
   const enteringInterrupt = to === 'WAITING_DEPENDENCY' || to === 'NEEDS_HUMAN';
   const leavingInterrupt = from === 'WAITING_DEPENDENCY' || from === 'NEEDS_HUMAN';
   // HEAD may only change on implementation events; assertPayload already
-  // rejected any headSha carried by any other transition.
+  // rejected any headSha carried by any other transition and guarantees a
+  // non-empty identity for agent_succeeded. The value is normalized by trim.
   const headSha = HEAD_UPDATING_TRANSITIONS.has(input.type)
-    ? (input.headSha ?? input.agentResult?.headSha)
+    ? (input.headSha ?? input.agentResult?.headSha)?.trim()
     : undefined;
 
   const next: Run = {
@@ -336,7 +370,7 @@ export function applyTransition(
     history: [...run.history, { type: input.type, from, to, at: now, reason: input.reason }],
     ...(input.agentResult !== undefined ? { agentResult: input.agentResult } : {}),
     ...(input.reviewResult !== undefined ? { reviewResult: input.reviewResult } : {}),
-    ...(headSha !== undefined ? { headSha } : {}),
+    ...(headSha !== undefined && headSha !== '' ? { headSha } : {}),
     ...(enteringInterrupt
       ? {
           interruptedFrom: from,

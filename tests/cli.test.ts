@@ -75,12 +75,17 @@ describe('CLI command layer', () => {
     assert.match(resolveRunsDir({}), /\.tachiko-conductor/);
   });
 
-  it('parses issue numbers strictly without partial parses', () => {
+  it('parses issue numbers strictly without partial parses or unsafe integers', () => {
     assert.equal(parseIssueNumber('42'), 42);
+    assert.equal(parseIssueNumber('9007199254740991'), 9007199254740991); // Number.MAX_SAFE_INTEGER
     assert.throws(() => parseIssueNumber('42oops'), /Invalid --issue "42oops"/);
     assert.throws(() => parseIssueNumber('3.5'), /Invalid --issue "3.5"/);
-    assert.throws(() => parseIssueNumber('0'), /issue numbers must be >= 1/);
+    assert.throws(() => parseIssueNumber('0'), /safe integer >= 1/);
     assert.throws(() => parseIssueNumber('-1'), /Invalid --issue "-1"/);
+    // 2^53 + 1: silently rounds to 9007199254740992, which is not safe
+    assert.throws(() => parseIssueNumber('9007199254740993'), /safe integer >= 1/);
+    // long digit-only input overflows to Infinity
+    assert.throws(() => parseIssueNumber('999999999999999999999999999999999999'), /safe integer >= 1/);
   });
 });
 

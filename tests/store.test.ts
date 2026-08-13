@@ -110,6 +110,38 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.throws(() => store.list(), /corrupt or incompatible/);
   });
 
+  it('rejects a file whose persisted id does not match its filename on read', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'x.json'),
+      JSON.stringify({ id: 'y', state: 'READY', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.read('x'), /does not match its file name/);
+  });
+
+  it('rejects a file whose persisted id does not match its filename on list', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'x.json'),
+      JSON.stringify({ id: 'y', state: 'READY', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.list(), /does not match its file name/);
+  });
+
+  it('cannot let a mismatched-id file overwrite the real run', () => {
+    const { store, dir } = tempStore();
+    store.create(newRun('y'));
+    writeFileSync(
+      path.join(dir, 'x.json'),
+      JSON.stringify({ id: 'y', state: 'REVIEWING', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.read('x'), /does not match its file name/);
+    assert.equal(store.read('y')?.state, 'READY');
+  });
+
   it('deletes a run and then reports it as missing', () => {
     const { store } = tempStore();
     store.create(newRun('r1'));

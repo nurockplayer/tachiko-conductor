@@ -239,6 +239,17 @@ describe('state machine — final gate review freshness', () => {
       (err: unknown) => err instanceof InvalidTransitionError && err.code === 'fresh-review',
     );
   });
+
+  it('never treats empty HEAD SHAs as fresh, so the gate cannot be bypassed', () => {
+    const run = runIn('FINAL_GATE', { headSha: '', reviewResult: approval('reviewer-1', '') });
+    assert.equal(isReviewFresh(run), false);
+    assert.throws(
+      () => applyTransition(run, { type: 'gate_passed' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+    );
+    const next = applyTransition(run, { type: 'gate_blocked' }, T0);
+    assert.equal(next.state, 'REVIEWING');
+  });
 });
 
 describe('state machine — HEAD mutation is bound to implementation events', () => {
@@ -362,6 +373,33 @@ describe('state machine — successful implementation must report an exact HEAD'
       (err: unknown) => err instanceof InvalidTransitionError && err.code === 'conflicting-head-sha',
     );
   });
+
+  it('rejects an empty-string HEAD SHA from agentResult.headSha', () => {
+    const run = runIn('IMPLEMENTING', { headSha: 'sha-1' });
+    assert.throws(
+      () => applyTransition(run, { type: 'agent_succeeded', agentResult: { exitStatus: 'success', summary: 'x', headSha: '' } }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'empty-head-sha',
+    );
+  });
+
+  it('rejects a whitespace-only HEAD SHA from input.headSha', () => {
+    const run = runIn('IMPLEMENTING');
+    assert.throws(
+      () => applyTransition(run, { type: 'agent_succeeded', headSha: '   ', agentResult: successResult('sha-1') }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'empty-head-sha',
+    );
+  });
+
+  it('normalizes whitespace-padded HEAD SHAs that agree', () => {
+    const run = runIn('IMPLEMENTING');
+    const next = applyTransition(
+      run,
+      { type: 'agent_succeeded', headSha: ' sha-2 ', agentResult: successResult('sha-2') },
+      T0,
+    );
+    assert.equal(next.state, 'VALIDATING');
+    assert.equal(next.headSha, 'sha-2');
+  });
 });
 
 describe('state machine — interrupts and resume', () => {
@@ -387,6 +425,19 @@ describe('state machine — interrupts and resume', () => {
 
     run = applyTransition(run, { type: 'dependency_satisfied' }, T0);
     assert.equal(run.state, 'IMPLEMENTING');
+    assert.equal(run.interruptedFrom, undefined);
+    assert.ok(run.interrupt?.resolvedAt);
+  });
+
+  it('waits on a dependency from MERGE_READY and resumes to MERGE_READY', () => {
+    let run = runIn('MERGE_READY', { headSha: 'sha-1', reviewResult: approval('reviewer-1', 'sha-1') });
+    run = applyTransition(run, { type: 'wait_dependency', reason: 'branch protection check pending' }, T0);
+    assert.equal(run.state, 'WAITING_DEPENDENCY');
+    assert.equal(run.interruptedFrom, 'MERGE_READY');
+    assert.equal(run.interrupt?.kind, 'waiting_dependency');
+
+    run = applyTransition(run, { type: 'dependency_satisfied' }, T0);
+    assert.equal(run.state, 'MERGE_READY');
     assert.equal(run.interruptedFrom, undefined);
     assert.ok(run.interrupt?.resolvedAt);
   });
