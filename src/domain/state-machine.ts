@@ -6,6 +6,9 @@ export type InvalidTransitionCode =
   | 'unknown-transition'
   | 'missing-payload'
   | 'wrong-verdict'
+  | 'wrong-exit-status'
+  | 'unexpected-payload'
+  | 'head-mutation-not-allowed'
   | 'stale-review'
   | 'fresh-review'
   | 'no-interrupt-context';
@@ -103,13 +106,34 @@ export const TRANSITION_TABLE: Readonly<
 };
 
 /** Transitions that must carry an implementation agent result. */
-const REQUIRES_AGENT_RESULT: ReadonlySet<TransitionType> = new Set(['agent_succeeded']);
+const REQUIRES_AGENT_RESULT: ReadonlySet<TransitionType> = new Set([
+  'agent_succeeded',
+  'agent_failed',
+]);
 
 /** Transitions that must carry a reviewer result. */
 const REQUIRES_REVIEW_RESULT: ReadonlySet<TransitionType> = new Set([
   'review_approved',
   'changes_requested',
 ]);
+
+/**
+ * Transitions that legitimately change the run's HEAD SHA: implementation
+ * events where the agent's work lands at a new commit. Every other transition
+ * must leave HEAD untouched so an approval can only ever advance the exact
+ * HEAD it reviewed.
+ */
+const HEAD_UPDATING_TRANSITIONS: ReadonlySet<TransitionType> = new Set([
+  'agent_succeeded',
+  'agent_failed',
+]);
+
+/** Whether a transition requires a result payload, and which kind. */
+export function transitionRequiresResult(type: TransitionType): 'agent' | 'review' | 'none' {
+  if (REQUIRES_AGENT_RESULT.has(type)) return 'agent';
+  if (REQUIRES_REVIEW_RESULT.has(type)) return 'review';
+  return 'none';
+}
 
 /** Transitions allowed out of a state, sorted for stable diagnostics. */
 export function allowedTransitions(state: WorkflowState): readonly TransitionType[] {
@@ -147,7 +171,25 @@ function assertPayload(from: WorkflowState, input: TransitionInput): void {
       `Transition "${input.type}" requires a reviewResult; pass the reviewer's result.`,
     );
   }
-  if (input.type === 'review_approved' && input.reviewResult?.verdict !== 'approve') {
+  // Event and result semantics must agree: an agent event carries a result
+  // whose exit status matches it, mirroring the review-verdict checks below.
+  if (input.type === 'agent_succeeded' && input.agentResult !== undefined && input.agentResult.exitStatus !== 'success') {
+    throw new InvalidTransitionError(
+      'wrong-exit-status',
+      from,
+      input.type,
+      `Transition "agent_succeeded" requires an agentResult with exitStatus "success", got "${input.agentResult.exitStatus}".`,
+    );
+  }
+  if (input.type === 'agent_failed' && input.agentResult !== undefined && input.agentResult.exitStatus !== 'failure') {
+    throw new InvalidTransitionError(
+      'wrong-exit-status',
+      from,
+      input.type,
+      `Transition "agent_failed" requires an agentResult with exitStatus "failure", got "${input.agentResult.exitStatus}".`,
+    );
+  }
+  if (input.type === 'review_approved' && input.reviewResult !== undefined && input.reviewResult.verdict !== 'approve') {
     throw new InvalidTransitionError(
       'wrong-verdict',
       from,
@@ -155,12 +197,38 @@ function assertPayload(from: WorkflowState, input: TransitionInput): void {
       `Transition "review_approved" requires a reviewResult with verdict "approve", got "${input.reviewResult?.verdict ?? 'none'}".`,
     );
   }
-  if (input.type === 'changes_requested' && input.reviewResult?.verdict !== 'request_changes') {
+  if (input.type === 'changes_requested' && input.reviewResult !== undefined && input.reviewResult.verdict !== 'request_changes') {
     throw new InvalidTransitionError(
       'wrong-verdict',
       from,
       input.type,
       `Transition "changes_requested" requires a reviewResult with verdict "request_changes", got "${input.reviewResult?.verdict ?? 'none'}".`,
+    );
+  }
+  // Payloads are bound to the transitions that produce them; carrying one on
+  // an unrelated transition is rejected rather than silently ignored.
+  if (!REQUIRES_AGENT_RESULT.has(input.type) && input.agentResult !== undefined) {
+    throw new InvalidTransitionError(
+      'unexpected-payload',
+      from,
+      input.type,
+      `Transition "${input.type}" does not accept an agentResult; agent results are bound to agent_succeeded / agent_failed.`,
+    );
+  }
+  if (!REQUIRES_REVIEW_RESULT.has(input.type) && input.reviewResult !== undefined) {
+    throw new InvalidTransitionError(
+      'unexpected-payload',
+      from,
+      input.type,
+      `Transition "${input.type}" does not accept a reviewResult; review results are bound to review_approved / changes_requested.`,
+    );
+  }
+  if (!HEAD_UPDATING_TRANSITIONS.has(input.type) && input.headSha !== undefined) {
+    throw new InvalidTransitionError(
+      'head-mutation-not-allowed',
+      from,
+      input.type,
+      `Transition "${input.type}" cannot change the run's HEAD SHA; HEAD may only be updated by implementation transitions (agent_succeeded, agent_failed).`,
     );
   }
 }
@@ -232,7 +300,11 @@ export function applyTransition(
 
   const enteringInterrupt = to === 'WAITING_DEPENDENCY' || to === 'NEEDS_HUMAN';
   const leavingInterrupt = from === 'WAITING_DEPENDENCY' || from === 'NEEDS_HUMAN';
-  const headSha = input.headSha ?? input.agentResult?.headSha;
+  // HEAD may only change on implementation events; assertPayload already
+  // rejected any headSha carried by any other transition.
+  const headSha = HEAD_UPDATING_TRANSITIONS.has(input.type)
+    ? (input.headSha ?? input.agentResult?.headSha)
+    : undefined;
 
   const next: Run = {
     ...run,

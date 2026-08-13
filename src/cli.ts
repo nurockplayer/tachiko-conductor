@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 import { createRun } from './domain/run.js';
-import { applyTransition } from './domain/state-machine.js';
+import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
 import { TRANSITION_TYPES, type Run, type Target, type TransitionType } from './domain/types.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 
@@ -19,6 +19,11 @@ Usage:
   tachiko --help
 
 Transitions: ${TRANSITION_TYPES.join(', ')}.
+
+agent_succeeded, agent_failed, review_approved and changes_requested require
+result payloads (agentResult / reviewResult) that adapters supply; run
+transition cannot perform them and rejects them explicitly. Drive those
+through the domain API (applyTransition) instead.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
 `;
@@ -52,6 +57,13 @@ export function runShowCommand(store: RunStore, id: string): Run {
 }
 
 export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string): Run {
+  const requirement = transitionRequiresResult(type);
+  if (requirement !== 'none') {
+    throw new Error(
+      `Transition "${type}" requires an ${requirement}Result payload that this CLI cannot supply. ` +
+        `Drive it through the domain API (applyTransition) instead.`,
+    );
+  }
   const current = store.read(id);
   if (current === null) throw new Error(`No run with id "${id}" found.`);
   const next = applyTransition(current, { type, reason });

@@ -9,6 +9,7 @@ import {
   canTransition,
   isReviewFresh,
   isTerminal,
+  transitionRequiresResult,
 } from '../src/domain/state-machine.js';
 import {
   TRANSITION_TYPES,
@@ -222,6 +223,100 @@ describe('state machine — final gate review freshness', () => {
       () => applyTransition(run, { type: 'gate_blocked' }),
       (err: unknown) => err instanceof InvalidTransitionError && err.code === 'fresh-review',
     );
+  });
+});
+
+describe('state machine — HEAD mutation is bound to implementation events', () => {
+  it('rejects gate_passed that attempts to swap in an unreviewed HEAD', () => {
+    const run = runIn('FINAL_GATE', {
+      headSha: 'sha-1',
+      reviewResult: approval('reviewer-1', 'sha-1'),
+    });
+    assert.equal(isReviewFresh(run), true);
+    assert.throws(
+      () => applyTransition(run, { type: 'gate_passed', headSha: 'sha-2' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'head-mutation-not-allowed',
+    );
+  });
+
+  it('gate_passed without a HEAD payload keeps the approved HEAD', () => {
+    const run = runIn('FINAL_GATE', {
+      headSha: 'sha-1',
+      reviewResult: approval('reviewer-1', 'sha-1'),
+    });
+    const next = applyTransition(run, { type: 'gate_passed' }, T0);
+    assert.equal(next.state, 'MERGE_READY');
+    assert.equal(next.headSha, 'sha-1');
+  });
+
+  it('rejects merged that silently replaces the approved HEAD', () => {
+    const run = runIn('MERGE_READY', {
+      headSha: 'sha-1',
+      reviewResult: approval('reviewer-1', 'sha-1'),
+    });
+    assert.throws(
+      () => applyTransition(run, { type: 'merged', headSha: 'sha-9' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'head-mutation-not-allowed',
+    );
+  });
+
+  it('merged without a HEAD payload keeps the approved HEAD', () => {
+    const run = runIn('MERGE_READY', {
+      headSha: 'sha-1',
+      reviewResult: approval('reviewer-1', 'sha-1'),
+    });
+    const next = applyTransition(run, { type: 'merged' }, T0);
+    assert.equal(next.state, 'MERGED');
+    assert.equal(next.headSha, 'sha-1');
+  });
+
+  it('rejects agent/review payloads carried by unrelated transitions', () => {
+    assert.throws(
+      () => applyTransition(runIn('VALIDATING'), { type: 'validation_passed', agentResult: successResult('sha-2') }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unexpected-payload',
+    );
+    assert.throws(
+      () =>
+        applyTransition(
+          runIn('REVIEWING'),
+          { type: 'review_approved', headSha: 'sha-2', reviewResult: approval('reviewer-1', 'sha-1') },
+          T0,
+        ),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'head-mutation-not-allowed',
+    );
+  });
+});
+
+describe('state machine — agent result semantics match the event', () => {
+  it('rejects a failure agentResult on agent_succeeded', () => {
+    assert.throws(
+      () => applyTransition(runIn('IMPLEMENTING'), { type: 'agent_succeeded', agentResult: failureResult() }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'wrong-exit-status',
+    );
+  });
+
+  it('rejects a success agentResult on agent_failed', () => {
+    assert.throws(
+      () => applyTransition(runIn('IMPLEMENTING'), { type: 'agent_failed', agentResult: successResult() }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'wrong-exit-status',
+    );
+  });
+
+  it('requires an agentResult for agent_failed, mirroring agent_succeeded', () => {
+    assert.throws(
+      () => applyTransition(runIn('IMPLEMENTING'), { type: 'agent_failed' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-payload',
+    );
+  });
+
+  it('classifies which transitions require result payloads', () => {
+    assert.equal(transitionRequiresResult('agent_succeeded'), 'agent');
+    assert.equal(transitionRequiresResult('agent_failed'), 'agent');
+    assert.equal(transitionRequiresResult('review_approved'), 'review');
+    assert.equal(transitionRequiresResult('changes_requested'), 'review');
+    assert.equal(transitionRequiresResult('start'), 'none');
+    assert.equal(transitionRequiresResult('merged'), 'none');
+    assert.equal(transitionRequiresResult('gate_passed'), 'none');
   });
 });
 

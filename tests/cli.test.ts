@@ -12,6 +12,7 @@ import {
   runShowCommand,
   runTransitionCommand,
 } from '../src/cli.js';
+import type { TransitionType } from '../src/domain/types.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { TARGET } from './helpers.js';
 
@@ -47,6 +48,22 @@ describe('CLI command layer', () => {
 
       const created = runCreateCommand(store, 'acme', 'widgets', { issue: 1 });
       assert.throws(() => runTransitionCommand(store, created.id, 'merged'), /Invalid transition "merged" from state READY/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses payload-requiring transitions with an explicit message and leaves the run unchanged', () => {
+    const { store, dir } = tempStore();
+    try {
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
+      for (const type of ['agent_succeeded', 'agent_failed', 'review_approved', 'changes_requested'] as const) {
+        assert.throws(
+          () => runTransitionCommand(store, created.id, type as TransitionType),
+          /requires an (agent|review)Result payload/,
+        );
+      }
+      assert.equal(runShowCommand(store, created.id).state, 'READY');
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -92,12 +109,19 @@ describe('CLI end-to-end across processes', () => {
       const show2 = runCli(['run', 'show', id]);
       assert.match(show2.stdout, /"state": "IMPLEMENTING"/);
 
+      // Payload-requiring transitions are rejected explicitly by the CLI.
+      const payload = runCli(['run', 'transition', id, 'agent_succeeded']);
+      assert.equal(payload.status, 1);
+      assert.match(payload.stderr, /error: Transition "agent_succeeded" requires an agentResult payload/);
+      const show3 = runCli(['run', 'show', id]);
+      assert.match(show3.stdout, /"state": "IMPLEMENTING"/);
+
       // Invalid transition across a fresh process fails loudly and keeps state.
       const bad = runCli(['run', 'transition', id, 'merged']);
       assert.equal(bad.status, 1);
       assert.match(bad.stderr, /error: Invalid transition "merged" from state IMPLEMENTING/);
-      const show3 = runCli(['run', 'show', id]);
-      assert.match(show3.stdout, /"state": "IMPLEMENTING"/);
+      const show4 = runCli(['run', 'show', id]);
+      assert.match(show4.stdout, /"state": "IMPLEMENTING"/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

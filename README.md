@@ -51,6 +51,12 @@ invalid transition, the current state, and the allowed transitions. The final
 gate is enforced in the core: `gate_passed` only succeeds when the latest
 review result is bound to the run's current HEAD SHA.
 
+Transitions persist only the payloads they produce: agent results are bound to
+`agent_succeeded`/`agent_failed` (and must carry a matching exit status),
+review results to `review_approved`/`changes_requested`, and the run's HEAD
+SHA may only be changed by implementation transitions. A gate or merge can
+never swap in an unreviewed SHA.
+
 ## Quick start
 
 ```bash
@@ -68,6 +74,10 @@ pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
 ```
+
+`agent_succeeded`, `agent_failed`, `review_approved` and `changes_requested`
+require result payloads supplied by adapters; `run transition` rejects them
+explicitly. Drive those through the domain API (`applyTransition`).
 
 After `pnpm build`, the same commands work through the `tachiko` bin
 (`node dist/cli.js`). Run state is stored under `$TACHIKO_DATA_DIR` (default
