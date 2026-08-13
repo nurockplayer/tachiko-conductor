@@ -4,10 +4,15 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import type { GitHubAdapter, IssueSnapshot, PullRequestSnapshot } from '../src/adapters/github.js';
+import type {
+  BranchSnapshot,
+  GitHubAdapter,
+  IssueSnapshot,
+  PullRequestSnapshot,
+} from '../src/adapters/github.js';
 import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
-import type { Target } from '../src/domain/types.js';
+import type { IssueTarget, RepositoryTarget, Target } from '../src/domain/types.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { TARGET, approval, newRun } from './helpers.js';
 
@@ -24,6 +29,10 @@ describe('adapter boundaries are typed and testable', () => {
         };
         return snapshot;
       },
+      async readBranch(target) {
+        const snapshot: BranchSnapshot = { target, headSha: 'sha-branch', pullRequestNumbers: [] };
+        return snapshot;
+      },
       async listPullRequests() {
         const prs: readonly PullRequestSnapshot[] = [];
         return prs;
@@ -33,6 +42,32 @@ describe('adapter boundaries are typed and testable', () => {
     assert.equal(snapshot.title, 'Fix the widget');
     assert.equal(snapshot.state, 'open');
     assert.deepEqual(await github.listPullRequests(TARGET), []);
+  });
+
+  it('provides a coherent GitHub boundary for both issue and repository targets', async () => {
+    const issueTarget: IssueTarget = { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 };
+    const repoTarget: RepositoryTarget = { kind: 'repository', owner: 'acme', repo: 'widgets', branch: 'main' };
+    const github: GitHubAdapter = {
+      kind: 'github',
+      async readIssue(target) {
+        assert.equal(target.kind, 'issue');
+        return { target, title: 'Fix', body: '', state: 'open' };
+      },
+      async readBranch(target) {
+        assert.equal(target.kind, 'repository');
+        return { target, headSha: 'sha-branch', pullRequestNumbers: [1] };
+      },
+      async listPullRequests(target) {
+        assert.ok(target.kind === 'issue' || target.kind === 'repository');
+        return [];
+      },
+    };
+    await github.readIssue(issueTarget);
+    const branch = await github.readBranch(repoTarget);
+    assert.equal(branch.headSha, 'sha-branch');
+    assert.deepEqual(branch.pullRequestNumbers, [1]);
+    await github.listPullRequests(issueTarget);
+    await github.listPullRequests(repoTarget);
   });
 
   it('accepts a stub implementation agent', async () => {

@@ -30,10 +30,46 @@ function assertSafeId(id: string): void {
   }
 }
 
+/** States that pause a run and must be able to resume. */
+const INTERRUPT_STATES: ReadonlySet<string> = new Set(['NEEDS_HUMAN', 'WAITING_DEPENDENCY']);
+
+/** Structural guard for the Target union so a corrupt target fails early. */
+function isTarget(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const t = value as Record<string, unknown>;
+  if (t.kind === 'issue') {
+    return typeof t.owner === 'string' && typeof t.repo === 'string' && typeof t.issueNumber === 'number';
+  }
+  if (t.kind === 'repository') {
+    return typeof t.owner === 'string' && typeof t.repo === 'string' && typeof t.branch === 'string';
+  }
+  return false;
+}
+
+/**
+ * A persisted interrupt context must be coherent: a run parked in
+ * NEEDS_HUMAN / WAITING_DEPENDENCY must be able to resume to a valid,
+ * non-interrupt state, and any other state must not carry an interruptedFrom.
+ * This keeps RESUME from ever restoring an invalid state.
+ */
+function isValidInterruptContext(state: string, interruptedFrom: unknown): boolean {
+  const stateIsInterrupt = INTERRUPT_STATES.has(state);
+  if (stateIsInterrupt) {
+    return (
+      typeof interruptedFrom === 'string' &&
+      WORKFLOW_STATES.includes(interruptedFrom as WorkflowState) &&
+      !INTERRUPT_STATES.has(interruptedFrom)
+    );
+  }
+  return interruptedFrom === undefined;
+}
+
 /**
  * Minimal structural guard so a corrupt or incompatible file fails loudly at
  * the storage boundary instead of crashing later in the state machine.
- * The persisted `state` must be a member of the workflow enum.
+ * Mirrors the Run type: state and interruptedFrom must be valid workflow
+ * states, the target must be a well-formed IssueTarget/RepositoryTarget, and
+ * headSha must be a string when present.
  */
 function isRun(value: unknown): value is Run {
   if (typeof value !== 'object' || value === null) return false;
@@ -42,9 +78,10 @@ function isRun(value: unknown): value is Run {
     typeof v.id === 'string' &&
     typeof v.state === 'string' &&
     WORKFLOW_STATES.includes(v.state as WorkflowState) &&
-    typeof v.target === 'object' &&
-    v.target !== null &&
-    Array.isArray(v.history)
+    isTarget(v.target) &&
+    Array.isArray(v.history) &&
+    (v.headSha === undefined || typeof v.headSha === 'string') &&
+    isValidInterruptContext(v.state, v.interruptedFrom)
   );
 }
 

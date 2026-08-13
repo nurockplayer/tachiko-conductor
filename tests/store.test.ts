@@ -110,6 +110,65 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.throws(() => store.list(), /corrupt or incompatible/);
   });
 
+  it('rejects a persisted interrupt state with an invalid interruptedFrom', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad.json'),
+      JSON.stringify({ id: 'bad', state: 'NEEDS_HUMAN', interruptedFrom: 'REVEIWING', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad'), /corrupt or incompatible/);
+    assert.throws(() => store.list(), /corrupt or incompatible/);
+  });
+
+  it('rejects a persisted interrupt state that cannot resume (no interruptedFrom)', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad.json'),
+      JSON.stringify({ id: 'bad', state: 'NEEDS_HUMAN', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad'), /corrupt or incompatible/);
+  });
+
+  it('accepts valid NEEDS_HUMAN / WAITING_DEPENDENCY resume states and resumes them', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'n.json'),
+      JSON.stringify({ id: 'n', state: 'NEEDS_HUMAN', interruptedFrom: 'REVIEWING', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    writeFileSync(
+      path.join(dir, 'w.json'),
+      JSON.stringify({ id: 'w', state: 'WAITING_DEPENDENCY', interruptedFrom: 'IMPLEMENTING', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    const n = store.read('n')!;
+    assert.equal(applyTransition(n, { type: 'human_resolved' }, T0).state, 'REVIEWING');
+    const w = store.read('w')!;
+    assert.equal(applyTransition(w, { type: 'dependency_satisfied' }, T0).state, 'IMPLEMENTING');
+  });
+
+  it('rejects a persisted run with a structurally invalid target', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad.json'),
+      JSON.stringify({ id: 'bad', state: 'READY', createdAt: T0, updatedAt: T0, target: { kind: 'issue', owner: 'acme' }, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad'), /corrupt or incompatible/);
+  });
+
+  it('rejects a persisted run with a non-string headSha', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad.json'),
+      JSON.stringify({ id: 'bad', state: 'READY', headSha: 123, createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad'), /corrupt or incompatible/);
+  });
+
   it('rejects a file whose persisted id does not match its filename on read', () => {
     const { store, dir } = tempStore();
     writeFileSync(
