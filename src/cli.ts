@@ -59,10 +59,20 @@ export function runCreateCommand(
   repo: string,
   opts: { issue?: number; branch?: string },
 ): Run {
-  const target: Target =
-    opts.issue !== undefined
-      ? { kind: 'issue', owner, repo, issueNumber: opts.issue }
-      : { kind: 'repository', owner, repo, branch: opts.branch ?? 'main' };
+  const hasIssue = opts.issue !== undefined;
+  const hasBranch = opts.branch !== undefined;
+  if (hasIssue && hasBranch) {
+    throw new Error('run create requires exactly one of --issue <n> or --branch <branch>; got both.');
+  }
+  if (!hasIssue && !hasBranch) {
+    throw new Error('run create requires exactly one of --issue <n> or --branch <branch>.');
+  }
+  let target: Target;
+  if (opts.issue !== undefined) {
+    target = { kind: 'issue', owner, repo, issueNumber: opts.issue };
+  } else {
+    target = { kind: 'repository', owner, repo, branch: opts.branch ?? 'main' };
+  }
   const run = createRun(target);
   store.create(run);
   return run;
@@ -141,9 +151,6 @@ export async function main(argv: string[]): Promise<number> {
       throw new Error('run create requires --owner and --repo.');
     }
     const issue = values.issue !== undefined ? parseIssueNumber(values.issue) : undefined;
-    if (issue === undefined && values.branch === undefined) {
-      throw new Error('run create requires either --issue <n> or --branch <branch>.');
-    }
     const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch });
     console.log(`Created run ${run.id} (${run.state}).`);
     printRun(run);

@@ -252,6 +252,43 @@ describe('state machine — final gate review freshness', () => {
   });
 });
 
+describe('state machine — review events must be bound to the current HEAD', () => {
+  it('rejects a changes_requested review bound to a stale SHA', () => {
+    const run = runIn('REVIEWING', { headSha: 'sha-2' });
+    assert.throws(
+      () => applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-1') }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+    );
+  });
+
+  it('accepts a changes_requested review bound to the current SHA', () => {
+    const run = runIn('REVIEWING', { headSha: 'sha-2' });
+    const next = applyTransition(
+      run,
+      { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-2') },
+      T0,
+    );
+    assert.equal(next.state, 'CHANGES_REQUESTED');
+    assert.equal(next.reviewResult?.verdict, 'request_changes');
+  });
+
+  it('rejects a changes_requested review with an empty HEAD SHA as not fresh', () => {
+    const run = runIn('REVIEWING', { headSha: 'sha-2' });
+    assert.throws(
+      () => applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', '') }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+    );
+  });
+
+  it('rejects a stale review_approved before it reaches the gate', () => {
+    const run = runIn('REVIEWING', { headSha: 'sha-2' });
+    assert.throws(
+      () => applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+    );
+  });
+});
+
 describe('state machine — HEAD mutation is bound to implementation events', () => {
   it('rejects gate_passed that attempts to swap in an unreviewed HEAD', () => {
     const run = runIn('FINAL_GATE', {

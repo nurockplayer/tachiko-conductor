@@ -54,6 +54,22 @@ describe('CLI command layer', () => {
     }
   });
 
+  it('requires exactly one target form on run create', () => {
+    const { store, dir } = tempStore();
+    try {
+      assert.throws(
+        () => runCreateCommand(store, 'acme', 'widgets', { issue: 42, branch: 'main' }),
+        /exactly one of --issue <n> or --branch <branch>/,
+      );
+      assert.throws(() => runCreateCommand(store, 'acme', 'widgets', {}), /exactly one of/);
+      // the valid branch path is preserved
+      const branchRun = runCreateCommand(store, 'acme', 'widgets', { branch: 'main' });
+      assert.deepEqual(branchRun.target, { kind: 'repository', owner: 'acme', repo: 'widgets', branch: 'main' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('refuses payload-requiring transitions with an explicit message and leaves the run unchanged', () => {
     const { store, dir } = tempStore();
     try {
@@ -113,6 +129,11 @@ describe('CLI end-to-end across processes', () => {
       const id = /Created run ([a-f0-9-]+)/.exec(create.stdout)?.[1];
       assert.ok(id, `expected a run id in output: ${create.stdout}`);
       assert.match(create.stdout, /"state": "READY"/);
+
+      // Supplying both --issue and --branch is rejected.
+      const both = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--branch', 'main']);
+      assert.equal(both.status, 1);
+      assert.match(both.stderr, /error: run create requires exactly one of/);
 
       const show1 = runCli(['run', 'show', id]);
       assert.match(show1.stdout, /"state": "READY"/);

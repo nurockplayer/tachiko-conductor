@@ -1,4 +1,4 @@
-import type { Run, TransitionInput, TransitionType, WorkflowState } from './types.js';
+import type { ReviewResult, Run, TransitionInput, TransitionType, WorkflowState } from './types.js';
 
 /** Why a transition was rejected. */
 export type InvalidTransitionCode =
@@ -154,17 +154,21 @@ export function canTransition(from: WorkflowState, type: TransitionType): boolea
 }
 
 /**
- * Whether the run's latest review is bound to its current HEAD SHA. Both
- * SHAs must be present and non-empty: an empty or whitespace-only identity
- * never counts as fresh, so it can never satisfy the final gate.
+ * Whether a review result is bound to the run's current HEAD. The run's HEAD
+ * must be present and non-empty, and the review must name exactly that SHA:
+ * an empty or stale review identity never counts as fresh.
+ */
+function isReviewBoundToHead(run: Run, review: ReviewResult): boolean {
+  return run.headSha !== undefined && run.headSha.trim() !== '' && review.headSha === run.headSha;
+}
+
+/**
+ * Whether the run's latest stored review is bound to its current HEAD SHA.
+ * Both SHAs must be present and non-empty: an empty or whitespace-only
+ * identity never counts as fresh, so it can never satisfy the final gate.
  */
 export function isReviewFresh(run: Run): boolean {
-  return (
-    run.headSha !== undefined &&
-    run.headSha.trim() !== '' &&
-    run.reviewResult?.headSha !== undefined &&
-    run.reviewResult.headSha === run.headSha
-  );
+  return run.reviewResult !== undefined && isReviewBoundToHead(run, run.reviewResult);
 }
 
 /** A usable SHA identity: present and not empty after trimming whitespace. */
@@ -172,7 +176,8 @@ function isUsableSha(value: string | undefined): value is string {
   return value !== undefined && value.trim() !== '';
 }
 
-function assertPayload(from: WorkflowState, input: TransitionInput): void {
+function assertPayload(run: Run, input: TransitionInput): void {
+  const from = run.state;
   if (REQUIRES_AGENT_RESULT.has(input.type) && input.agentResult === undefined) {
     throw new InvalidTransitionError(
       'missing-payload',
@@ -187,6 +192,32 @@ function assertPayload(from: WorkflowState, input: TransitionInput): void {
       from,
       input.type,
       `Transition "${input.type}" requires a reviewResult; pass the reviewer's result.`,
+    );
+  }
+  // Payloads are bound to the transitions that produce them; carrying one on
+  // an unrelated transition is rejected rather than silently ignored.
+  if (!REQUIRES_AGENT_RESULT.has(input.type) && input.agentResult !== undefined) {
+    throw new InvalidTransitionError(
+      'unexpected-payload',
+      from,
+      input.type,
+      `Transition "${input.type}" does not accept an agentResult; agent results are bound to agent_succeeded / agent_failed.`,
+    );
+  }
+  if (!REQUIRES_REVIEW_RESULT.has(input.type) && input.reviewResult !== undefined) {
+    throw new InvalidTransitionError(
+      'unexpected-payload',
+      from,
+      input.type,
+      `Transition "${input.type}" does not accept a reviewResult; review results are bound to review_approved / changes_requested.`,
+    );
+  }
+  if (!HEAD_UPDATING_TRANSITIONS.has(input.type) && input.headSha !== undefined) {
+    throw new InvalidTransitionError(
+      'head-mutation-not-allowed',
+      from,
+      input.type,
+      `Transition "${input.type}" cannot change the run's HEAD SHA; HEAD may only be updated by implementation transitions (agent_succeeded, agent_failed).`,
     );
   }
   // Event and result semantics must agree: an agent event carries a result
@@ -261,31 +292,19 @@ function assertPayload(from: WorkflowState, input: TransitionInput): void {
       `Transition "changes_requested" requires a reviewResult with verdict "request_changes", got "${input.reviewResult?.verdict ?? 'none'}".`,
     );
   }
-  // Payloads are bound to the transitions that produce them; carrying one on
-  // an unrelated transition is rejected rather than silently ignored.
-  if (!REQUIRES_AGENT_RESULT.has(input.type) && input.agentResult !== undefined) {
-    throw new InvalidTransitionError(
-      'unexpected-payload',
-      from,
-      input.type,
-      `Transition "${input.type}" does not accept an agentResult; agent results are bound to agent_succeeded / agent_failed.`,
-    );
-  }
-  if (!REQUIRES_REVIEW_RESULT.has(input.type) && input.reviewResult !== undefined) {
-    throw new InvalidTransitionError(
-      'unexpected-payload',
-      from,
-      input.type,
-      `Transition "${input.type}" does not accept a reviewResult; review results are bound to review_approved / changes_requested.`,
-    );
-  }
-  if (!HEAD_UPDATING_TRANSITIONS.has(input.type) && input.headSha !== undefined) {
-    throw new InvalidTransitionError(
-      'head-mutation-not-allowed',
-      from,
-      input.type,
-      `Transition "${input.type}" cannot change the run's HEAD SHA; HEAD may only be updated by implementation transitions (agent_succeeded, agent_failed).`,
-    );
+  // A review event must be bound to the run's current HEAD: unlike an
+  // approval (which is re-checked at FINAL_GATE), a stale change request has
+  // no later freshness gate, so reject it here before it drives a fix loop.
+  if (input.type === 'review_approved' || input.type === 'changes_requested') {
+    const review = input.reviewResult;
+    if (review !== undefined && !isReviewBoundToHead(run, review)) {
+      throw new InvalidTransitionError(
+        'stale-review',
+        from,
+        input.type,
+        `Transition "${input.type}" requires a reviewResult bound to the run's current HEAD "${run.headSha ?? '(none)'}", got "${review.headSha}".`,
+      );
+    }
   }
 }
 
@@ -336,7 +355,7 @@ export function applyTransition(
     );
   }
 
-  assertPayload(from, input);
+  assertPayload(run, input);
   assertGate(run, input);
 
   let to: WorkflowState;
