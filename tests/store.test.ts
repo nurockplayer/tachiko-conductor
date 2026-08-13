@@ -169,6 +169,25 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.throws(() => store.read('bad'), /corrupt or incompatible/);
   });
 
+  it('rejects malformed persisted nested objects before downstream code can use them', () => {
+    const invalidRuns = [
+      { ...newRun('bad'), reviewResult: null },
+      { ...newRun('bad'), reviewResult: { verdict: 'approve', reviewerName: 'reviewer', headSha: 'sha-1', findings: null } },
+      { ...newRun('bad'), agentResult: null },
+      { ...newRun('bad'), agentResult: { exitStatus: 'maybe', summary: 'unknown' } },
+      { ...newRun('bad'), interrupt: null },
+      { ...newRun('bad'), interrupt: { kind: 'unknown', reason: 'pause', createdAt: T0 } },
+      { ...newRun('bad'), history: [null] },
+    ];
+
+    for (const invalidRun of invalidRuns) {
+      const { store, dir } = tempStore();
+      writeFileSync(path.join(dir, 'bad.json'), JSON.stringify(invalidRun), 'utf8');
+      assert.throws(() => store.read('bad'), /corrupt or incompatible/);
+      assert.throws(() => store.list(), /corrupt or incompatible/);
+    }
+  });
+
   it('rejects a file whose persisted id does not match its filename on read', () => {
     const { store, dir } = tempStore();
     writeFileSync(

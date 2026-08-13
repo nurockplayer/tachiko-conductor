@@ -174,11 +174,7 @@ function isReviewInternallyConsistent(review: ReviewResult): boolean {
  * identity never counts as fresh, so it can never satisfy the final gate.
  */
 export function isReviewFresh(run: Run): boolean {
-  return (
-    run.reviewResult !== undefined &&
-    isReviewInternallyConsistent(run.reviewResult) &&
-    isReviewBoundToHead(run, run.reviewResult)
-  );
+  return run.reviewResult !== undefined && isReviewBoundToHead(run, run.reviewResult);
 }
 
 /** A usable SHA identity: present and not empty after trimming whitespace. */
@@ -332,6 +328,18 @@ function assertPayload(run: Run, input: TransitionInput): void {
 
 /** The final gate must only pass on a review bound to the exact current HEAD. */
 function assertGate(run: Run, input: TransitionInput): void {
+  if (
+    input.type === 'gate_passed' &&
+    run.reviewResult !== undefined &&
+    !isReviewInternallyConsistent(run.reviewResult)
+  ) {
+    throw new InvalidTransitionError(
+      'contradictory-review',
+      run.state,
+      input.type,
+      `Final gate cannot pass: the latest approval contains blocking findings. Route those findings through "changes_requested".`,
+    );
+  }
   if (input.type === 'gate_passed' && !isReviewFresh(run)) {
     throw new InvalidTransitionError(
       'stale-review',
@@ -340,7 +348,12 @@ function assertGate(run: Run, input: TransitionInput): void {
       `Final gate cannot pass: the latest review is bound to SHA "${run.reviewResult?.headSha ?? '(none)'}" but the run is at "${run.headSha ?? '(none)'}". Review the current HEAD before advancing.`,
     );
   }
-  if (input.type === 'gate_blocked' && isReviewFresh(run)) {
+  if (
+    input.type === 'gate_blocked' &&
+    isReviewFresh(run) &&
+    run.reviewResult !== undefined &&
+    isReviewInternallyConsistent(run.reviewResult)
+  ) {
     throw new InvalidTransitionError(
       'fresh-review',
       run.state,

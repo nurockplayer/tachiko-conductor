@@ -266,7 +266,7 @@ describe('state machine — review events must be bound to the current HEAD', ()
     );
   });
 
-  it('does not treat a persisted contradictory approval as fresh at the final gate', () => {
+  it('rejects a persisted contradictory approval separately from HEAD freshness at the final gate', () => {
     const run = runIn('FINAL_GATE', {
       headSha: 'sha-2',
       reviewResult: {
@@ -275,10 +275,10 @@ describe('state machine — review events must be bound to the current HEAD', ()
       },
     });
 
-    assert.equal(isReviewFresh(run), false);
+    assert.equal(isReviewFresh(run), true);
     assert.throws(
       () => applyTransition(run, { type: 'gate_passed' }, T0),
-      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'contradictory-review',
     );
   });
 

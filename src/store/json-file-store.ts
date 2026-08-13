@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-import { WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
+import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -46,6 +46,74 @@ function isTarget(value: unknown): boolean {
   return false;
 }
 
+function isOptionalString(value: unknown): boolean {
+  return value === undefined || typeof value === 'string';
+}
+
+function isOptionalStringArray(value: unknown): boolean {
+  return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
+}
+
+function isAgentResult(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const result = value as Record<string, unknown>;
+  return (
+    (result.exitStatus === 'success' || result.exitStatus === 'failure') &&
+    typeof result.summary === 'string' &&
+    isOptionalString(result.headSha) &&
+    isOptionalStringArray(result.changedFiles) &&
+    isOptionalStringArray(result.diagnostics)
+  );
+}
+
+function isReviewFinding(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const finding = value as Record<string, unknown>;
+  return (
+    (finding.severity === 'blocking' || finding.severity === 'non_blocking') &&
+    typeof finding.summary === 'string' &&
+    isOptionalString(finding.detail)
+  );
+}
+
+function isReviewResult(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const result = value as Record<string, unknown>;
+  return (
+    (result.verdict === 'approve' || result.verdict === 'request_changes') &&
+    typeof result.reviewerName === 'string' &&
+    typeof result.headSha === 'string' &&
+    Array.isArray(result.findings) &&
+    result.findings.every(isReviewFinding)
+  );
+}
+
+function isInterrupt(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const interrupt = value as Record<string, unknown>;
+  return (
+    (interrupt.kind === 'needs_human' || interrupt.kind === 'waiting_dependency') &&
+    typeof interrupt.reason === 'string' &&
+    typeof interrupt.createdAt === 'string' &&
+    isOptionalString(interrupt.resolvedAt)
+  );
+}
+
+function isTransitionRecord(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    typeof record.type === 'string' &&
+    TRANSITION_TYPES.includes(record.type as (typeof TRANSITION_TYPES)[number]) &&
+    typeof record.from === 'string' &&
+    WORKFLOW_STATES.includes(record.from as WorkflowState) &&
+    typeof record.to === 'string' &&
+    WORKFLOW_STATES.includes(record.to as WorkflowState) &&
+    typeof record.at === 'string' &&
+    isOptionalString(record.reason)
+  );
+}
+
 /**
  * A persisted interrupt context must be coherent: a run parked in
  * NEEDS_HUMAN / WAITING_DEPENDENCY must be able to resume to a valid,
@@ -79,8 +147,14 @@ function isRun(value: unknown): value is Run {
     typeof v.state === 'string' &&
     WORKFLOW_STATES.includes(v.state as WorkflowState) &&
     isTarget(v.target) &&
+    typeof v.createdAt === 'string' &&
+    typeof v.updatedAt === 'string' &&
     Array.isArray(v.history) &&
-    (v.headSha === undefined || typeof v.headSha === 'string') &&
+    v.history.every(isTransitionRecord) &&
+    isOptionalString(v.headSha) &&
+    (v.interrupt === undefined || isInterrupt(v.interrupt)) &&
+    (v.agentResult === undefined || isAgentResult(v.agentResult)) &&
+    (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );
 }
