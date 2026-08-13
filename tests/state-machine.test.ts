@@ -1,0 +1,304 @@
+import assert from 'node:assert/strict';
+import { describe, it } from 'node:test';
+
+import {
+  InvalidTransitionError,
+  TRANSITION_TABLE,
+  allowedTransitions,
+  applyTransition,
+  canTransition,
+  isReviewFresh,
+  isTerminal,
+} from '../src/domain/state-machine.js';
+import {
+  TRANSITION_TYPES,
+  WORKFLOW_STATES,
+  type Run,
+  type WorkflowState,
+} from '../src/domain/types.js';
+import { T0, approval, changesRequested, failureResult, newRun, successResult } from './helpers.js';
+
+/** Build a run pinned to an arbitrary state (for edge-case tests). */
+function runIn(state: WorkflowState, overrides: Partial<Run> = {}): Run {
+  return { ...newRun(), state, ...overrides };
+}
+
+describe('state machine — transition table integrity', () => {
+  it('covers every workflow state and only uses known transitions', () => {
+    assert.deepEqual(Object.keys(TRANSITION_TABLE).sort(), [...WORKFLOW_STATES].sort());
+    for (const state of WORKFLOW_STATES) {
+      for (const type of allowedTransitions(state)) {
+        assert.ok(
+          (TRANSITION_TYPES as readonly string[]).includes(type),
+          `table uses unknown transition "${type}" from ${state}`,
+        );
+      }
+    }
+  });
+
+  it('marks only MERGED and FAILED as terminal', () => {
+    for (const state of WORKFLOW_STATES) {
+      assert.equal(isTerminal(state), state === 'MERGED' || state === 'FAILED', `state ${state}`);
+    }
+  });
+
+  it('exposes canTransition consistently with the table', () => {
+    assert.equal(canTransition('READY', 'start'), true);
+    assert.equal(canTransition('READY', 'merged'), false);
+    assert.equal(canTransition('MERGED', 'fail'), false);
+  });
+});
+
+describe('state machine — happy path', () => {
+  it('walks READY → IMPLEMENTING → VALIDATING → REVIEWING → FINAL_GATE → MERGE_READY → MERGED', () => {
+    let run = newRun();
+    assert.equal(run.state, 'READY');
+
+    run = applyTransition(run, { type: 'start' }, T0);
+    assert.equal(run.state, 'IMPLEMENTING');
+
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-1') }, T0);
+    assert.equal(run.state, 'VALIDATING');
+    assert.equal(run.headSha, 'sha-1');
+    assert.equal(run.agentResult?.exitStatus, 'success');
+
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    assert.equal(run.state, 'REVIEWING');
+
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0);
+    assert.equal(run.state, 'FINAL_GATE');
+
+    run = applyTransition(run, { type: 'gate_passed' }, T0);
+    assert.equal(run.state, 'MERGE_READY');
+
+    run = applyTransition(run, { type: 'merged' }, T0);
+    assert.equal(run.state, 'MERGED');
+    assert.equal(run.history.length, 6);
+    assert.equal(run.history[5]?.from, 'MERGE_READY');
+    assert.equal(run.history[5]?.to, 'MERGED');
+  });
+
+  it('routes a failed implementation to the FAILED terminal state', () => {
+    const run = applyTransition(
+      applyTransition(newRun(), { type: 'start' }, T0),
+      { type: 'agent_failed', agentResult: failureResult() },
+      T0,
+    );
+    assert.equal(run.state, 'FAILED');
+    assert.equal(isTerminal(run.state), true);
+  });
+
+  it('routes validation failure back to CHANGES_REQUESTED', () => {
+    let run = newRun();
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult() }, T0);
+    run = applyTransition(run, { type: 'validation_failed' }, T0);
+    assert.equal(run.state, 'CHANGES_REQUESTED');
+  });
+
+  it('routes blocking review findings through the fix loop and back to IMPLEMENTING', () => {
+    let run = newRun();
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-1') }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-1') }, T0);
+    assert.equal(run.state, 'CHANGES_REQUESTED');
+    assert.equal(run.reviewResult?.verdict, 'request_changes');
+    assert.equal(run.reviewResult?.findings.length, 1);
+
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    assert.equal(run.state, 'IMPLEMENTING');
+  });
+
+  it('records history with from/to/at/reason', () => {
+    let run = newRun();
+    run = applyTransition(run, { type: 'start', reason: 'DoR ready' }, T0);
+    const record = run.history[0];
+    assert.equal(record?.type, 'start');
+    assert.equal(record?.from, 'READY');
+    assert.equal(record?.to, 'IMPLEMENTING');
+    assert.equal(record?.at, T0);
+    assert.equal(record?.reason, 'DoR ready');
+  });
+});
+
+describe('state machine — invalid transitions fail loudly', () => {
+  it('rejects a transition not allowed from the current state with an actionable message', () => {
+    const run = newRun();
+    assert.throws(
+      () => applyTransition(run, { type: 'agent_succeeded', agentResult: successResult() }),
+      (err: unknown) => {
+        assert.ok(err instanceof InvalidTransitionError);
+        assert.equal(err.code, 'unknown-transition');
+        assert.equal(err.fromState, 'READY');
+        assert.equal(err.transition, 'agent_succeeded');
+        assert.match(err.message, /Invalid transition "agent_succeeded" from state READY/);
+        assert.match(err.message, /Allowed transitions:/);
+        assert.ok(err.message.includes('escalate'));
+        return true;
+      },
+    );
+  });
+
+  it('rejects every transition from terminal states', () => {
+    for (const state of ['MERGED', 'FAILED'] as const) {
+      assert.throws(
+        () => applyTransition(runIn(state), { type: 'start' }),
+        (err: unknown) => err instanceof InvalidTransitionError && err.code === 'terminal-state',
+      );
+      assert.throws(
+        () => applyTransition(runIn(state), { type: 'fail' }),
+        (err: unknown) => err instanceof InvalidTransitionError && err.code === 'terminal-state',
+      );
+      assert.equal(allowedTransitions(state).length, 0);
+    }
+  });
+
+  it('rejects a semantically impossible step such as merging before review', () => {
+    const run = newRun();
+    assert.throws(
+      () => applyTransition(run, { type: 'merged' }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
+    );
+  });
+
+  it('requires an agentResult for agent_succeeded', () => {
+    assert.throws(
+      () => applyTransition(runIn('IMPLEMENTING'), { type: 'agent_succeeded' }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-payload',
+    );
+  });
+
+  it('requires a reviewResult whose verdict matches the transition', () => {
+    const reviewing = runIn('REVIEWING');
+    assert.throws(
+      () => applyTransition(reviewing, { type: 'review_approved' }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-payload',
+    );
+    assert.throws(
+      () => applyTransition(reviewing, { type: 'review_approved', reviewResult: changesRequested() }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'wrong-verdict',
+    );
+    assert.throws(
+      () => applyTransition(reviewing, { type: 'changes_requested', reviewResult: approval() }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'wrong-verdict',
+    );
+  });
+});
+
+describe('state machine — final gate review freshness', () => {
+  /** A FINAL_GATE run whose work is at sha-2. */
+  function gated(): Run {
+    return runIn('FINAL_GATE', { headSha: 'sha-2' });
+  }
+
+  it('blocks gate_passed when the latest review is bound to an older SHA', () => {
+    const run = { ...gated(), reviewResult: approval('reviewer-1', 'sha-1') };
+    assert.equal(isReviewFresh(run), false);
+    assert.throws(
+      () => applyTransition(run, { type: 'gate_passed' }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+    );
+  });
+
+  it('escalates to NEEDS_HUMAN via gate_blocked when the review is stale', () => {
+    const run = { ...gated(), reviewResult: approval('reviewer-1', 'sha-1') };
+    const next = applyTransition(run, { type: 'gate_blocked' }, T0);
+    assert.equal(next.state, 'NEEDS_HUMAN');
+    assert.equal(next.interruptedFrom, 'FINAL_GATE');
+    assert.equal(next.interrupt?.kind, 'needs_human');
+  });
+
+  it('allows gate_passed only when the review is bound to the exact current HEAD', () => {
+    const run = { ...gated(), reviewResult: approval('reviewer-1', 'sha-2') };
+    assert.equal(isReviewFresh(run), true);
+    const next = applyTransition(run, { type: 'gate_passed' }, T0);
+    assert.equal(next.state, 'MERGE_READY');
+  });
+
+  it('rejects gate_blocked while the review is already fresh', () => {
+    const run = { ...gated(), reviewResult: approval('reviewer-1', 'sha-2') };
+    assert.throws(
+      () => applyTransition(run, { type: 'gate_blocked' }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'fresh-review',
+    );
+  });
+});
+
+describe('state machine — interrupts and resume', () => {
+  it('escalates to NEEDS_HUMAN remembering the interrupted state, then resumes', () => {
+    let run = runIn('REVIEWING');
+    run = applyTransition(run, { type: 'escalate', reason: 'reviewer disputed the approach' }, T0);
+    assert.equal(run.state, 'NEEDS_HUMAN');
+    assert.equal(run.interruptedFrom, 'REVIEWING');
+    assert.equal(run.interrupt?.kind, 'needs_human');
+    assert.equal(run.interrupt?.reason, 'reviewer disputed the approach');
+
+    run = applyTransition(run, { type: 'human_resolved', reason: 'approved after discussion' }, T0);
+    assert.equal(run.state, 'REVIEWING');
+    assert.equal(run.interruptedFrom, undefined);
+    assert.ok(run.interrupt?.resolvedAt);
+  });
+
+  it('waits on a dependency and resumes to the interrupted state', () => {
+    let run = runIn('IMPLEMENTING');
+    run = applyTransition(run, { type: 'wait_dependency', reason: 'waiting on upstream API' }, T0);
+    assert.equal(run.state, 'WAITING_DEPENDENCY');
+    assert.equal(run.interruptedFrom, 'IMPLEMENTING');
+
+    run = applyTransition(run, { type: 'dependency_satisfied' }, T0);
+    assert.equal(run.state, 'IMPLEMENTING');
+    assert.equal(run.interruptedFrom, undefined);
+    assert.ok(run.interrupt?.resolvedAt);
+  });
+
+  it('cannot resume an interrupt without interrupt context', () => {
+    const run = runIn('WAITING_DEPENDENCY'); // no interruptedFrom set
+    assert.throws(
+      () => applyTransition(run, { type: 'dependency_satisfied' }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'no-interrupt-context',
+    );
+  });
+
+  it('cannot stack a second interrupt while already interrupted', () => {
+    const human = runIn('NEEDS_HUMAN', { interruptedFrom: 'IMPLEMENTING' });
+    assert.throws(
+      () => applyTransition(human, { type: 'wait_dependency' }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
+    );
+    const waiting = runIn('WAITING_DEPENDENCY', { interruptedFrom: 'IMPLEMENTING' });
+    assert.throws(
+      () => applyTransition(waiting, { type: 'escalate' }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
+    );
+  });
+
+  it('records interrupt resolution when failing out of an interrupt state', () => {
+    const run = applyTransition(
+      runIn('WAITING_DEPENDENCY', {
+        interruptedFrom: 'IMPLEMENTING',
+        interrupt: { kind: 'waiting_dependency', reason: 'x', createdAt: T0 },
+      }),
+      { type: 'fail', reason: 'the dependency will never arrive' },
+      T0,
+    );
+    assert.equal(run.state, 'FAILED');
+    assert.equal(run.interruptedFrom, undefined);
+    assert.ok(run.interrupt?.resolvedAt);
+  });
+});
+
+describe('state machine — determinism and immutability', () => {
+  it('does not mutate the input run', () => {
+    const run = newRun();
+    const before = JSON.stringify(run);
+    assert.throws(() => applyTransition(run, { type: 'merged' }));
+    assert.equal(JSON.stringify(run), before);
+  });
+
+  it('produces identical results for identical inputs', () => {
+    const a = applyTransition(newRun(), { type: 'start' }, T0);
+    const b = applyTransition(newRun(), { type: 'start' }, T0);
+    assert.deepEqual(a, b);
+  });
+});
