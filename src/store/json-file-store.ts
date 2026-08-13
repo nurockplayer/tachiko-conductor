@@ -1,7 +1,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-import type { Run } from '../domain/types.js';
+import { WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -30,13 +30,18 @@ function assertSafeId(id: string): void {
   }
 }
 
-/** Minimal structural guard so a corrupt file fails loudly instead of flowing through. */
+/**
+ * Minimal structural guard so a corrupt or incompatible file fails loudly at
+ * the storage boundary instead of crashing later in the state machine.
+ * The persisted `state` must be a member of the workflow enum.
+ */
 function isRun(value: unknown): value is Run {
   if (typeof value !== 'object' || value === null) return false;
   const v = value as Record<string, unknown>;
   return (
     typeof v.id === 'string' &&
     typeof v.state === 'string' &&
+    WORKFLOW_STATES.includes(v.state as WorkflowState) &&
     typeof v.target === 'object' &&
     v.target !== null &&
     Array.isArray(v.history)
@@ -64,7 +69,9 @@ function readRun(filePath: string, id: string): Run {
     throw new Error(`Run file ${filePath} is not valid JSON (corrupt?): ${(err as Error).message}`);
   }
   if (!isRun(parsed)) {
-    throw new Error(`Run file ${filePath} does not look like a run (id/state/target/history missing).`);
+    throw new Error(
+      `Run file ${filePath} is corrupt or incompatible: expected a run with a state from the workflow enum (id/state/target/history).`,
+    );
   }
   return parsed;
 }

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import {
+  parseIssueNumber,
   resolveRunsDir,
   runCreateCommand,
   runShowCommand,
@@ -72,6 +73,14 @@ describe('CLI command layer', () => {
   it('resolves the data dir from TACHIKO_DATA_DIR or the home default', () => {
     assert.equal(resolveRunsDir({ TACHIKO_DATA_DIR: '/tmp/x' }), '/tmp/x');
     assert.match(resolveRunsDir({}), /\.tachiko-conductor/);
+  });
+
+  it('parses issue numbers strictly without partial parses', () => {
+    assert.equal(parseIssueNumber('42'), 42);
+    assert.throws(() => parseIssueNumber('42oops'), /Invalid --issue "42oops"/);
+    assert.throws(() => parseIssueNumber('3.5'), /Invalid --issue "3.5"/);
+    assert.throws(() => parseIssueNumber('0'), /issue numbers must be >= 1/);
+    assert.throws(() => parseIssueNumber('-1'), /Invalid --issue "-1"/);
   });
 });
 

@@ -33,6 +33,22 @@ export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
   return env.TACHIKO_DATA_DIR ?? path.join(os.homedir(), '.tachiko-conductor', 'runs');
 }
 
+/**
+ * Parse a GitHub issue number strictly: a decimal integer >= 1. Partial or
+ * malformed input (`42oops`, `3.5`, `0`, `-1`) is rejected instead of being
+ * silently truncated by a prefix parse.
+ */
+export function parseIssueNumber(raw: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Invalid --issue "${raw}": expected a positive integer.`);
+  }
+  const value = Number(raw);
+  if (value < 1) {
+    throw new Error(`Invalid --issue "${raw}": issue numbers must be >= 1.`);
+  }
+  return value;
+}
+
 // --- commands (exported so tests can exercise them without spawning a process) ---
 
 export function runCreateCommand(
@@ -122,10 +138,7 @@ export async function main(argv: string[]): Promise<number> {
     if (owner === undefined || repo === undefined) {
       throw new Error('run create requires --owner and --repo.');
     }
-    const issue = values.issue !== undefined ? Number.parseInt(values.issue, 10) : undefined;
-    if (values.issue !== undefined && !Number.isInteger(issue)) {
-      throw new Error(`Invalid --issue "${values.issue}": expected an integer.`);
-    }
+    const issue = values.issue !== undefined ? parseIssueNumber(values.issue) : undefined;
     if (issue === undefined && values.branch === undefined) {
       throw new Error('run create requires either --issue <n> or --branch <branch>.');
     }

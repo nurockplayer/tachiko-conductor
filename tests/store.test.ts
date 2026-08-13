@@ -6,7 +6,7 @@ import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
-import { T0, newRun, successResult } from './helpers.js';
+import { T0, TARGET, newRun, successResult } from './helpers.js';
 
 const tmpDirs: string[] = [];
 
@@ -88,6 +88,26 @@ describe('JsonFileStore — persistence round-trips', () => {
     const { store, dir } = tempStore();
     writeFileSync(path.join(dir, 'bad.json'), '{ not json', 'utf8');
     assert.throws(() => store.read('bad'), /not valid JSON/);
+  });
+
+  it('rejects a persisted state outside the workflow enum on read', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad.json'),
+      JSON.stringify({ id: 'bad', state: 'REVEIWING', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad'), /corrupt or incompatible/);
+  });
+
+  it('rejects a persisted state outside the workflow enum on list', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad.json'),
+      JSON.stringify({ id: 'bad', state: 'REVEIWING', createdAt: T0, updatedAt: T0, target: TARGET, history: [] }),
+      'utf8',
+    );
+    assert.throws(() => store.list(), /corrupt or incompatible/);
   });
 
   it('deletes a run and then reports it as missing', () => {

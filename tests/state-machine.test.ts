@@ -202,12 +202,27 @@ describe('state machine — final gate review freshness', () => {
     );
   });
 
-  it('escalates to NEEDS_HUMAN via gate_blocked when the review is stale', () => {
+  it('routes a stale gate back to REVIEWING via gate_blocked', () => {
     const run = { ...gated(), reviewResult: approval('reviewer-1', 'sha-1') };
     const next = applyTransition(run, { type: 'gate_blocked' }, T0);
-    assert.equal(next.state, 'NEEDS_HUMAN');
-    assert.equal(next.interruptedFrom, 'FINAL_GATE');
-    assert.equal(next.interrupt?.kind, 'needs_human');
+    assert.equal(next.state, 'REVIEWING');
+    assert.equal(next.interrupt, undefined);
+    assert.equal(next.interruptedFrom, undefined);
+  });
+
+  it('re-enters a fresh review cycle from a blocked gate and passes', () => {
+    let run = runIn('FINAL_GATE', { headSha: 'sha-2', reviewResult: approval('reviewer-1', 'sha-1') });
+    assert.equal(isReviewFresh(run), false);
+
+    run = applyTransition(run, { type: 'gate_blocked' }, T0);
+    assert.equal(run.state, 'REVIEWING');
+
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-2') }, T0);
+    assert.equal(run.state, 'FINAL_GATE');
+    assert.equal(isReviewFresh(run), true);
+
+    run = applyTransition(run, { type: 'gate_passed' }, T0);
+    assert.equal(run.state, 'MERGE_READY');
   });
 
   it('allows gate_passed only when the review is bound to the exact current HEAD', () => {
@@ -317,6 +332,35 @@ describe('state machine — agent result semantics match the event', () => {
     assert.equal(transitionRequiresResult('start'), 'none');
     assert.equal(transitionRequiresResult('merged'), 'none');
     assert.equal(transitionRequiresResult('gate_passed'), 'none');
+  });
+});
+
+describe('state machine — successful implementation must report an exact HEAD', () => {
+  it('rejects agent_succeeded without any HEAD SHA even when an old HEAD exists', () => {
+    const run = runIn('IMPLEMENTING', { headSha: 'sha-1' });
+    assert.throws(
+      () => applyTransition(run, { type: 'agent_succeeded', agentResult: { exitStatus: 'success', summary: 'x' } }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-head-sha',
+    );
+  });
+
+  it('accepts agent_succeeded when input.headSha and agentResult.headSha agree', () => {
+    const run = runIn('IMPLEMENTING', { headSha: 'sha-1' });
+    const next = applyTransition(
+      run,
+      { type: 'agent_succeeded', headSha: 'sha-2', agentResult: successResult('sha-2') },
+      T0,
+    );
+    assert.equal(next.state, 'VALIDATING');
+    assert.equal(next.headSha, 'sha-2');
+  });
+
+  it('rejects agent_succeeded when input.headSha and agentResult.headSha conflict', () => {
+    const run = runIn('IMPLEMENTING');
+    assert.throws(
+      () => applyTransition(run, { type: 'agent_succeeded', headSha: 'sha-2', agentResult: successResult('sha-3') }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'conflicting-head-sha',
+    );
   });
 });
 

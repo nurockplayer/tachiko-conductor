@@ -9,6 +9,8 @@ export type InvalidTransitionCode =
   | 'wrong-exit-status'
   | 'unexpected-payload'
   | 'head-mutation-not-allowed'
+  | 'missing-head-sha'
+  | 'conflicting-head-sha'
   | 'stale-review'
   | 'fresh-review'
   | 'no-interrupt-context';
@@ -83,7 +85,7 @@ export const TRANSITION_TABLE: Readonly<
   },
   FINAL_GATE: {
     gate_passed: 'MERGE_READY',
-    gate_blocked: 'NEEDS_HUMAN',
+    gate_blocked: 'REVIEWING',
     wait_dependency: 'WAITING_DEPENDENCY',
     escalate: 'NEEDS_HUMAN',
     fail: 'FAILED',
@@ -188,6 +190,27 @@ function assertPayload(from: WorkflowState, input: TransitionInput): void {
       input.type,
       `Transition "agent_failed" requires an agentResult with exitStatus "failure", got "${input.agentResult.exitStatus}".`,
     );
+  }
+  // A successful implementation must report the exact commit it produced;
+  // otherwise a stale HEAD could linger and be reviewed as if it were current.
+  if (input.type === 'agent_succeeded') {
+    const resultSha = input.agentResult?.headSha;
+    if (input.headSha === undefined && resultSha === undefined) {
+      throw new InvalidTransitionError(
+        'missing-head-sha',
+        from,
+        input.type,
+        `Transition "agent_succeeded" requires an exact HEAD SHA; provide it via input.headSha or agentResult.headSha.`,
+      );
+    }
+    if (input.headSha !== undefined && resultSha !== undefined && input.headSha !== resultSha) {
+      throw new InvalidTransitionError(
+        'conflicting-head-sha',
+        from,
+        input.type,
+        `Transition "agent_succeeded" got conflicting HEAD SHAs: input.headSha "${input.headSha}" vs agentResult.headSha "${resultSha}".`,
+      );
+    }
   }
   if (input.type === 'review_approved' && input.reviewResult !== undefined && input.reviewResult.verdict !== 'approve') {
     throw new InvalidTransitionError(

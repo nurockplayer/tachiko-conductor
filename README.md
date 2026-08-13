@@ -38,7 +38,7 @@ transport or model adapters are implemented yet (issues #3–#6).
 | `changes_requested` | `REVIEWING` | `CHANGES_REQUESTED` |
 | `start_fix` | `CHANGES_REQUESTED` | `IMPLEMENTING` |
 | `gate_passed` | `FINAL_GATE` | `MERGE_READY` |
-| `gate_blocked` | `FINAL_GATE` | `NEEDS_HUMAN` |
+| `gate_blocked` | `FINAL_GATE` | `REVIEWING` |
 | `merged` | `MERGE_READY` | `MERGED` |
 | `wait_dependency` | any active state | `WAITING_DEPENDENCY` |
 | `dependency_satisfied` | `WAITING_DEPENDENCY` | resume interrupted state |
