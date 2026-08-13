@@ -11,6 +11,7 @@ import {
   resolveRunsDir,
   runCreateCommand,
   runShowCommand,
+  runShowView,
   runTransitionCommand,
 } from '../src/cli.js';
 import type { TransitionType } from '../src/domain/types.js';
@@ -102,6 +103,41 @@ describe('CLI command layer', () => {
     assert.throws(() => parseIssueNumber('9007199254740993'), /safe integer >= 1/);
     // long digit-only input overflows to Infinity
     assert.throws(() => parseIssueNumber('999999999999999999999999999999999999'), /safe integer >= 1/);
+  });
+
+  it('shows an unresolved interrupt and hides a resolved one in run show', () => {
+    const { store, dir } = tempStore();
+    try {
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
+
+      // unresolved interrupt displays normally
+      runTransitionCommand(store, created.id, 'escalate', 'product decision needed');
+      let run = runShowCommand(store, created.id);
+      assert.deepEqual(runShowView(run).interrupt, { kind: 'needs_human', reason: 'product decision needed' });
+
+      // human_resolved hides the interrupt in the projection but keeps the history
+      runTransitionCommand(store, created.id, 'human_resolved', 'decided');
+      run = runShowCommand(store, created.id);
+      assert.equal(runShowView(run).interrupt, null);
+      assert.equal(run.interrupt?.kind, 'needs_human');
+      assert.ok(run.interrupt?.resolvedAt);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('hides a resolved dependency interrupt from run show', () => {
+    const { store, dir } = tempStore();
+    try {
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
+      runTransitionCommand(store, created.id, 'wait_dependency', 'upstream API');
+      runTransitionCommand(store, created.id, 'dependency_satisfied');
+      const run = runShowCommand(store, created.id);
+      assert.equal(runShowView(run).interrupt, null);
+      assert.ok(run.interrupt?.resolvedAt);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

@@ -1,7 +1,8 @@
-import type { AgentResult, IssueTarget } from '../domain/types.js';
+import type { AgentResult, Target } from '../domain/types.js';
 
 export interface ImplementationRequest {
-  readonly target: IssueTarget;
+  /** The work item: a single issue or a whole branch. */
+  readonly target: Target;
   readonly baseSha: string;
   readonly instructions?: string;
 }

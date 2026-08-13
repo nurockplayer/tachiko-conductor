@@ -6,7 +6,14 @@ import { pathToFileURL } from 'node:url';
 
 import { createRun } from './domain/run.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
-import { TRANSITION_TYPES, type Run, type Target, type TransitionType } from './domain/types.js';
+import {
+  TRANSITION_TYPES,
+  type InterruptKind,
+  type Run,
+  type Target,
+  type TransitionType,
+  type WorkflowState,
+} from './domain/types.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
@@ -103,22 +110,36 @@ export function runListCommand(store: RunStore): Run[] {
   return store.list();
 }
 
+export interface RunView {
+  id: string;
+  target: Target;
+  state: WorkflowState;
+  headSha: string | null;
+  /** Only an unresolved interrupt is a current interrupt. */
+  interrupt: { kind: InterruptKind; reason: string } | null;
+  transitions: number;
+  updatedAt: string;
+}
+
+/** Project a run for display; a resolved interrupt is historical, not active. */
+export function runShowView(run: Run): RunView {
+  const activeInterrupt =
+    run.interrupt !== undefined && run.interrupt.resolvedAt === undefined
+      ? { kind: run.interrupt.kind, reason: run.interrupt.reason }
+      : null;
+  return {
+    id: run.id,
+    target: run.target,
+    state: run.state,
+    headSha: run.headSha ?? null,
+    interrupt: activeInterrupt,
+    transitions: run.history.length,
+    updatedAt: run.updatedAt,
+  };
+}
+
 function printRun(run: Run): void {
-  console.log(
-    JSON.stringify(
-      {
-        id: run.id,
-        target: run.target,
-        state: run.state,
-        headSha: run.headSha ?? null,
-        interrupt: run.interrupt ? { kind: run.interrupt.kind, reason: run.interrupt.reason } : null,
-        transitions: run.history.length,
-        updatedAt: run.updatedAt,
-      },
-      null,
-      2,
-    ),
-  );
+  console.log(JSON.stringify(runShowView(run), null, 2));
 }
 
 export async function main(argv: string[]): Promise<number> {

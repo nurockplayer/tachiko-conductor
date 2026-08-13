@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import type { GitHubAdapter, IssueSnapshot, PullRequestSnapshot } from '../src/adapters/github.js';
 import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
+import type { Target } from '../src/domain/types.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { TARGET, approval, newRun } from './helpers.js';
 
@@ -56,6 +57,31 @@ describe('adapter boundaries are typed and testable', () => {
     const result = await reviewer.review({ target: TARGET, headSha: 'sha-2' });
     assert.equal(result.headSha, 'sha-2');
     assert.equal(result.verdict, 'approve');
+  });
+
+  it('passes issue-target and repository-target runs through adapter boundaries without casts', async () => {
+    const issueTarget: Target = { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 };
+    const repoTarget: Target = { kind: 'repository', owner: 'acme', repo: 'widgets', branch: 'main' };
+
+    const agent: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run(request: ImplementationRequest) {
+        assert.ok(request.target.kind === 'issue' || request.target.kind === 'repository');
+        return { exitStatus: 'success', summary: 'done', headSha: request.baseSha };
+      },
+    };
+    await agent.run({ target: issueTarget, baseSha: 'sha-1' });
+    await agent.run({ target: repoTarget, baseSha: 'sha-1' });
+
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review(request: ReviewRequest) {
+        assert.ok(request.target.kind === 'issue' || request.target.kind === 'repository');
+        return approval('reviewer-1', request.headSha);
+      },
+    };
+    await reviewer.review({ target: issueTarget, headSha: 'sha-2' });
+    await reviewer.review({ target: repoTarget, headSha: 'sha-2' });
   });
 
   it('exposes JsonFileStore as a RunStore', () => {
