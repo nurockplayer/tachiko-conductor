@@ -331,6 +331,18 @@ function assertGate(run: Run, input: TransitionInput): void {
   if (
     input.type === 'gate_passed' &&
     run.reviewResult !== undefined &&
+    run.reviewResult.verdict !== 'approve'
+  ) {
+    throw new InvalidTransitionError(
+      'wrong-verdict',
+      run.state,
+      input.type,
+      `Final gate cannot pass: the latest review verdict is "${run.reviewResult.verdict}", not "approve". Route it back to reviewing and the fix loop.`,
+    );
+  }
+  if (
+    input.type === 'gate_passed' &&
+    run.reviewResult !== undefined &&
     !isReviewInternallyConsistent(run.reviewResult)
   ) {
     throw new InvalidTransitionError(
@@ -352,6 +364,7 @@ function assertGate(run: Run, input: TransitionInput): void {
     input.type === 'gate_blocked' &&
     isReviewFresh(run) &&
     run.reviewResult !== undefined &&
+    run.reviewResult.verdict === 'approve' &&
     isReviewInternallyConsistent(run.reviewResult)
   ) {
     throw new InvalidTransitionError(

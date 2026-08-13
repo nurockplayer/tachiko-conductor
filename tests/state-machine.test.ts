@@ -282,6 +282,19 @@ describe('state machine — review events must be bound to the current HEAD', ()
     );
   });
 
+  it('rejects a persisted matching-HEAD change request at the final gate', () => {
+    const run = runIn('FINAL_GATE', {
+      headSha: 'sha-2',
+      reviewResult: changesRequested('reviewer-1', 'sha-2'),
+    });
+
+    assert.equal(isReviewFresh(run), true);
+    assert.throws(
+      () => applyTransition(run, { type: 'gate_passed' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'wrong-verdict',
+    );
+  });
+
   it('rejects a changes_requested review bound to a stale SHA', () => {
     const run = runIn('REVIEWING', { headSha: 'sha-2' });
     assert.throws(
