@@ -4,16 +4,21 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
+import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
 import { createRun } from './domain/run.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
 import {
   TRANSITION_TYPES,
   type InterruptKind,
+  type IssueTarget,
   type Run,
   type Target,
   type TransitionType,
   type WorkflowState,
 } from './domain/types.js';
+import { GitHubLiveStateError } from './github/errors.js';
+import { LiveGitHubAdapter } from './github/live-state.js';
+import { GhCliTransport } from './github/transport.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
@@ -23,6 +28,7 @@ Usage:
   tachiko run show <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
+  tachiko github snapshot owner/repo#123
   tachiko --help
 
 Transitions: ${TRANSITION_TYPES.join(', ')}.
@@ -31,6 +37,10 @@ agent_succeeded, agent_failed, review_approved and changes_requested require
 result payloads (agentResult / reviewResult) that adapters supply; run
 transition cannot perform them and rejects them explicitly. Drive those
 through the domain API (applyTransition) instead.
+
+github snapshot prints one normalized live-state JSON envelope from the
+locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
+{"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
 `;
@@ -56,6 +66,43 @@ export function parseIssueNumber(raw: string): number {
     throw new Error(`Invalid --issue "${raw}": issue numbers must be a safe integer >= 1.`);
   }
   return value;
+}
+
+/** Parse a strict `owner/repo#123` issue reference into a target. */
+export function parseIssueRef(raw: string): IssueTarget {
+  const match = /^([^/]+)\/([^/#]+)#(\d+)$/.exec(raw);
+  if (match === null) {
+    throw new Error(`Invalid issue reference "${raw}": expected owner/repo#123.`);
+  }
+  return {
+    kind: 'issue',
+    owner: match[1] ?? '',
+    repo: match[2] ?? '',
+    issueNumber: parseIssueNumber(match[3] ?? ''),
+  };
+}
+
+/** Map any snapshot failure to a stable machine-readable error object. */
+export function serializeGithubError(error: unknown): Readonly<Record<string, unknown>> {
+  if (error instanceof GitHubLiveStateError) {
+    return { code: error.code, message: error.message, retryable: error.retryable, details: error.details };
+  }
+  return { code: 'UNKNOWN', message: error instanceof Error ? error.message : String(error) };
+}
+
+export type GithubSnapshotEnvelope =
+  | { readonly ok: true; readonly snapshot: GitHubLiveSnapshot }
+  | { readonly ok: false; readonly error: Readonly<Record<string, unknown>> };
+
+/** Read one normalized live snapshot for `owner/repo#123` through an injected adapter. */
+export async function githubSnapshotCommand(adapter: GitHubAdapter, ref: string): Promise<GithubSnapshotEnvelope> {
+  const target = parseIssueRef(ref);
+  try {
+    const snapshot = await adapter.readLiveSnapshot(target);
+    return { ok: true, snapshot };
+  } catch (error) {
+    return { ok: false, error: serializeGithubError(error) };
+  }
 }
 
 // --- commands (exported so tests can exercise them without spawning a process) ---
@@ -149,6 +196,27 @@ export async function main(argv: string[]): Promise<number> {
   if (command === undefined || command === '--help' || command === '-h') {
     console.log(USAGE);
     return 0;
+  }
+
+  if (command === 'github') {
+    if (subcommand === 'snapshot') {
+      const ref = rest[0];
+      if (ref === undefined) {
+        console.error('github snapshot requires owner/repo#123.');
+        return 1;
+      }
+      const adapter = new LiveGitHubAdapter({ transport: new GhCliTransport() });
+      const outcome = await githubSnapshotCommand(adapter, ref);
+      if (outcome.ok) {
+        console.log(JSON.stringify(outcome, null, 2));
+        return 0;
+      }
+      console.error(JSON.stringify({ ok: false, error: outcome.error }, null, 2));
+      return 1;
+    }
+    console.error(`Unknown command: github ${subcommand ?? ''}\n`);
+    console.error(USAGE);
+    return 1;
   }
 
   if (command !== 'run') {
