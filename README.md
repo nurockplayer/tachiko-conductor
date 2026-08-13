@@ -15,6 +15,8 @@ transport or model adapters are implemented yet (issues #3–#6).
 - Core workflow logic is independent of Claude Code, DeepSeek, GitHub
   transport, and Linear.
 - Reviews are bound to an exact HEAD SHA; `FINAL_GATE` refuses stale approvals.
+- An approval containing a blocking finding is contradictory and is rejected
+  before it can reach the final gate.
 - No autonomous merge, no cloud, no distributed queue, no UI, no Linear.
 
 ## States

@@ -6,6 +6,7 @@ export type InvalidTransitionCode =
   | 'unknown-transition'
   | 'missing-payload'
   | 'wrong-verdict'
+  | 'contradictory-review'
   | 'wrong-exit-status'
   | 'unexpected-payload'
   | 'head-mutation-not-allowed'
@@ -162,13 +163,22 @@ function isReviewBoundToHead(run: Run, review: ReviewResult): boolean {
   return run.headSha !== undefined && run.headSha.trim() !== '' && review.headSha === run.headSha;
 }
 
+/** An approval cannot coexist with a finding that still blocks readiness. */
+function isReviewInternallyConsistent(review: ReviewResult): boolean {
+  return review.verdict !== 'approve' || review.findings.every((finding) => finding.severity !== 'blocking');
+}
+
 /**
  * Whether the run's latest stored review is bound to its current HEAD SHA.
  * Both SHAs must be present and non-empty: an empty or whitespace-only
  * identity never counts as fresh, so it can never satisfy the final gate.
  */
 export function isReviewFresh(run: Run): boolean {
-  return run.reviewResult !== undefined && isReviewBoundToHead(run, run.reviewResult);
+  return (
+    run.reviewResult !== undefined &&
+    isReviewInternallyConsistent(run.reviewResult) &&
+    isReviewBoundToHead(run, run.reviewResult)
+  );
 }
 
 /** A usable SHA identity: present and not empty after trimming whitespace. */
@@ -290,6 +300,18 @@ function assertPayload(run: Run, input: TransitionInput): void {
       from,
       input.type,
       `Transition "changes_requested" requires a reviewResult with verdict "request_changes", got "${input.reviewResult?.verdict ?? 'none'}".`,
+    );
+  }
+  if (
+    input.type === 'review_approved' &&
+    input.reviewResult !== undefined &&
+    !isReviewInternallyConsistent(input.reviewResult)
+  ) {
+    throw new InvalidTransitionError(
+      'contradictory-review',
+      from,
+      input.type,
+      `Transition "review_approved" cannot accept an approval that contains blocking findings; route those findings through "changes_requested".`,
     );
   }
   // A review event must be bound to the run's current HEAD: unlike an

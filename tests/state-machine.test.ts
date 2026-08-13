@@ -253,6 +253,35 @@ describe('state machine — final gate review freshness', () => {
 });
 
 describe('state machine — review events must be bound to the current HEAD', () => {
+  it('rejects an approval that still contains a blocking finding', () => {
+    const run = runIn('REVIEWING', { headSha: 'sha-2' });
+    const contradictoryApproval = {
+      ...approval('reviewer-1', 'sha-2'),
+      findings: [{ severity: 'blocking' as const, summary: 'the diff still has a bug' }],
+    };
+
+    assert.throws(
+      () => applyTransition(run, { type: 'review_approved', reviewResult: contradictoryApproval }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'contradictory-review',
+    );
+  });
+
+  it('does not treat a persisted contradictory approval as fresh at the final gate', () => {
+    const run = runIn('FINAL_GATE', {
+      headSha: 'sha-2',
+      reviewResult: {
+        ...approval('reviewer-1', 'sha-2'),
+        findings: [{ severity: 'blocking', summary: 'the diff still has a bug' }],
+      },
+    });
+
+    assert.equal(isReviewFresh(run), false);
+    assert.throws(
+      () => applyTransition(run, { type: 'gate_passed' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+    );
+  });
+
   it('rejects a changes_requested review bound to a stale SHA', () => {
     const run = runIn('REVIEWING', { headSha: 'sha-2' });
     assert.throws(
