@@ -160,6 +160,9 @@ export async function runIssueCommand(
 /**
  * Resume a run parked in NEEDS_HUMAN / WAITING_DEPENDENCY with a supplied
  * human decision, then continue the workflow from the interrupted state.
+ * NEEDS_HUMAN resumes via human_resolved; WAITING_DEPENDENCY resumes via
+ * dependency_satisfied — the transition is chosen from the parked state so
+ * the resume path always matches the state machine.
  */
 export async function resumeCommand(
   deps: WorkflowDependencies,
@@ -173,7 +176,8 @@ export async function resumeCommand(
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
   const now = options.now ?? (() => new Date().toISOString());
-  const resumed = applyTransition(run, { type: 'human_resolved', reason: decision }, now());
+  const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
+  const resumed = applyTransition(run, { type: transition, reason: decision }, now());
   deps.store.update(resumed);
   return runWorkflow(deps, id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,

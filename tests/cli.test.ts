@@ -422,6 +422,30 @@ describe('workflow run and resume commands', () => {
     assert.equal(persisted?.interrupt?.resolvedAt, T0);
   });
 
+  it('resumes a WAITING_DEPENDENCY run via dependency_satisfied after a supplied decision', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-1');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'wait_dependency', reason: 'upstream API', interrupt: { evidence: 'waiting on API' } }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
+
+    const outcome = await resumeCommand(
+      deps(store, githubAdapter([HEAD]), implementation, reviewer),
+      'run-1',
+      'dependency available now',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.state, 'MERGE_READY');
+    const persisted = store.read('run-1');
+    assert.ok(persisted?.history.some((entry) => entry.type === 'dependency_satisfied'));
+  });
+
   it('rejects resuming a run that is not parked for a decision', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-1'));
