@@ -8,6 +8,7 @@ export * from './adapters/reviewer.js';
 export * from './agents/claude-code.js';
 export * from './reviewers/deepseek.js';
 export * from './reviewers/loop.js';
+export * from './workflow/run.js';
 export * from './github/errors.js';
 export * from './github/handoff.js';
 export * from './github/live-state.js';

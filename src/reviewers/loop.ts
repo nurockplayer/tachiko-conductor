@@ -72,7 +72,18 @@ export async function runReviewLoop(
         liveHead === null
           ? `No live PR HEAD for ${formatTarget(target)}.`
           : `Live GitHub HEAD ${liveHead} does not match the run HEAD ${run.headSha ?? '(none)'}.`;
-      run = applyTransition(run, { type: 'escalate', reason }, now());
+      run = applyTransition(
+        run,
+        {
+          type: 'escalate',
+          reason,
+          interrupt: {
+            evidence: reason,
+            choices: ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+          },
+        },
+        now(),
+      );
       store.update(run);
       return { outcome: 'needs_human', run, reason };
     }
@@ -103,7 +114,18 @@ export async function runReviewLoop(
     store.update(run);
     if (attempts >= options.maxAttempts) {
       const reason = `Review did not converge after ${options.maxAttempts} attempt(s).`;
-      run = applyTransition(run, { type: 'escalate', reason }, now());
+      run = applyTransition(
+        run,
+        {
+          type: 'escalate',
+          reason,
+          interrupt: {
+            evidence: reason,
+            choices: ['Approve the current HEAD manually', 'Provide more context and retry', 'Cancel the run'],
+          },
+        },
+        now(),
+      );
       store.update(run);
       return { outcome: 'needs_human', run, reason };
     }
@@ -125,7 +147,18 @@ export async function runReviewLoop(
     }
     if (fixResult.headSha === undefined || fixResult.headSha === run.headSha) {
       const reason = 'Implementation did not produce a new exact HEAD after review changes.';
-      run = applyTransition(run, { type: 'escalate', reason }, now());
+      run = applyTransition(
+        run,
+        {
+          type: 'escalate',
+          reason,
+          interrupt: {
+            evidence: 'The implementation returned the same or no HEAD after review changes.',
+            choices: ['Retry the fix with more context', 'Cancel the run'],
+          },
+        },
+        now(),
+      );
       store.update(run);
       return { outcome: 'needs_human', run, reason };
     }
