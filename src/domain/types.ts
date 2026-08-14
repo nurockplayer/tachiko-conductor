@@ -101,6 +101,10 @@ export interface Interrupt {
   readonly reason: string;
   readonly createdAt: string;
   readonly resolvedAt?: string;
+  /** Structured context that a human decision should consider, when known. */
+  readonly evidence?: string;
+  /** Bounded choices offered to the human, when they are known. */
+  readonly choices?: readonly string[];
 }
 
 /** One applied step in a run's history. */
@@ -122,6 +126,11 @@ export interface TransitionInput {
   readonly reviewResult?: ReviewResult;
   /** Explicitly updates the run's current HEAD SHA. */
   readonly headSha?: string;
+  /** Structured context carried onto the interrupt when entering NEEDS_HUMAN / WAITING_DEPENDENCY. */
+  readonly interrupt?: {
+    readonly evidence?: string;
+    readonly choices?: readonly string[];
+  };
 }
 
 /**

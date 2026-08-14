@@ -95,7 +95,9 @@ function isInterrupt(value: unknown): boolean {
     (interrupt.kind === 'needs_human' || interrupt.kind === 'waiting_dependency') &&
     typeof interrupt.reason === 'string' &&
     typeof interrupt.createdAt === 'string' &&
-    isOptionalString(interrupt.resolvedAt)
+    isOptionalString(interrupt.resolvedAt) &&
+    isOptionalString(interrupt.evidence) &&
+    isOptionalStringArray(interrupt.choices)
   );
 }
 

@@ -445,6 +445,10 @@ export function applyTransition(
             kind: to === 'NEEDS_HUMAN' ? 'needs_human' : 'waiting_dependency',
             reason: input.reason ?? '',
             createdAt: now,
+            ...(input.interrupt?.evidence === undefined ? {} : { evidence: input.interrupt.evidence }),
+            ...(input.interrupt?.choices === undefined || input.interrupt.choices.length === 0
+              ? {}
+              : { choices: [...input.interrupt.choices] }),
           },
         }
       : {}),

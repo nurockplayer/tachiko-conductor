@@ -496,7 +496,30 @@ describe('state machine — interrupts and resume', () => {
     assert.ok(run.interrupt?.resolvedAt);
   });
 
-  it('waits on a dependency and resumes to the interrupted state', () => {
+  it('carries evidence and bounded choices onto a NEEDS_HUMAN interrupt', () => {
+    let run = runIn('REVIEWING');
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'ambiguous architecture',
+        interrupt: { evidence: 'two viable designs exist', choices: ['Option A', 'Option B'] },
+      },
+      T0,
+    );
+    assert.equal(run.state, 'NEEDS_HUMAN');
+    assert.equal(run.interrupt?.evidence, 'two viable designs exist');
+    assert.deepEqual(run.interrupt?.choices, ['Option A', 'Option B']);
+  });
+
+  it('omits empty choices and evidence on an interrupt', () => {
+    let run = runIn('IMPLEMENTING');
+    run = applyTransition(run, { type: 'escalate', reason: 'plain question', interrupt: { choices: [] } }, T0);
+    assert.equal(run.interrupt?.evidence, undefined);
+    assert.equal(run.interrupt?.choices, undefined);
+  });
+
+  it('records interrupt resolution when failing out of an interrupt state', () => {
     let run = runIn('IMPLEMENTING');
     run = applyTransition(run, { type: 'wait_dependency', reason: 'waiting on upstream API' }, T0);
     assert.equal(run.state, 'WAITING_DEPENDENCY');
