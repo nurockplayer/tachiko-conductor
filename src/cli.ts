@@ -4,6 +4,7 @@ import path from 'node:path';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
+import { ClaudeCodeAdapter } from './agents/claude-code.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
 import { createRun } from './domain/run.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
@@ -11,6 +12,7 @@ import {
   TRANSITION_TYPES,
   type InterruptKind,
   type IssueTarget,
+  type RepositoryTarget,
   type Run,
   type Target,
   type TransitionType,
@@ -19,11 +21,15 @@ import {
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport } from './github/transport.js';
+import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
+import { runWorkflow, type WorkflowDependencies, type WorkflowOutcome } from './workflow/run.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
 Usage:
+  tachiko run owner/repo#123
+  tachiko run resume <id> --decision <choice>
   tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>)
   tachiko run show <id>
   tachiko run transition <id> <transition> [--reason <text>]
@@ -32,6 +38,11 @@ Usage:
   tachiko --help
 
 Transitions: ${TRANSITION_TYPES.join(', ')}.
+
+run owner/repo#123 starts or continues one issue end-to-end: implementation,
+validation, independent review, and the final gate. It stops at MERGE_READY,
+FAILED, or NEEDS_HUMAN (a structured human decision with evidence and bounded
+choices). Resume a parked run with: tachiko run resume <id> --decision <text>.
 
 agent_succeeded, agent_failed, review_approved and changes_requested require
 result payloads (agentResult / reviewResult) that adapters supply; run
@@ -44,6 +55,9 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
 `;
+
+/** Bounded review attempts before a run parks in NEEDS_HUMAN. */
+export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
 
 /** Resolve the directory where run JSON files are stored. */
 export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -103,6 +117,103 @@ export async function githubSnapshotCommand(adapter: GitHubAdapter, ref: string)
   } catch (error) {
     return { ok: false, error: serializeGithubError(error) };
   }
+}
+
+function targetsEqual(a: Target, b: Target): boolean {
+  if (a.kind !== b.kind || a.owner !== b.owner || a.repo !== b.repo) return false;
+  if (a.kind === 'issue') return (b as IssueTarget).issueNumber === (a as IssueTarget).issueNumber;
+  return (b as RepositoryTarget).branch === (a as RepositoryTarget).branch;
+}
+
+/** Find a persisted run whose target matches exactly, if any. */
+export function findRunByTarget(store: RunStore, target: Target): Run | null {
+  return store.list().find((run) => targetsEqual(run.target, target)) ?? null;
+}
+
+export interface WorkflowCommandOptions {
+  readonly maxReviewAttempts?: number;
+  readonly now?: () => string;
+}
+
+/**
+ * Start or continue one issue end-to-end: create a READY run when none exists
+ * for the target, then drive it through implementation, validation, the
+ * independent review loop, and the final gate.
+ */
+export async function runIssueCommand(
+  deps: WorkflowDependencies,
+  ref: string,
+  options: WorkflowCommandOptions = {},
+): Promise<WorkflowOutcome> {
+  const target = parseIssueRef(ref);
+  let run = findRunByTarget(deps.store, target);
+  if (run === null) {
+    run = createRun(target);
+    deps.store.create(run);
+  }
+  return runWorkflow(deps, run.id, {
+    maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
+    now: options.now,
+  });
+}
+
+/**
+ * Resume a run parked in NEEDS_HUMAN / WAITING_DEPENDENCY with a supplied
+ * human decision, then continue the workflow from the interrupted state.
+ */
+export async function resumeCommand(
+  deps: WorkflowDependencies,
+  id: string,
+  decision: string,
+  options: WorkflowCommandOptions = {},
+): Promise<WorkflowOutcome> {
+  const run = deps.store.read(id);
+  if (run === null) throw new Error(`No run with id "${id}" found.`);
+  if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') {
+    throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
+  }
+  const now = options.now ?? (() => new Date().toISOString());
+  const resumed = applyTransition(run, { type: 'human_resolved', reason: decision }, now());
+  deps.store.update(resumed);
+  return runWorkflow(deps, id, {
+    maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
+    now: options.now,
+  });
+}
+
+function printOutcome(outcome: WorkflowOutcome): void {
+  const { run } = outcome;
+  if (outcome.outcome === 'merge_ready') {
+    console.log(
+      `Run ${run.id}: MERGE_READY — implementation passed independent review at ${run.headSha ?? '(no HEAD)'}.`,
+    );
+    return;
+  }
+  if (outcome.outcome === 'needs_human') {
+    console.log(`Run ${run.id}: NEEDS_HUMAN — ${outcome.reason}`);
+    const interrupt = run.interrupt;
+    if (interrupt?.evidence !== undefined) console.log(`Evidence: ${interrupt.evidence}`);
+    if ((interrupt?.choices?.length ?? 0) > 0) console.log(`Choices: ${interrupt?.choices?.join(' | ')}`);
+    console.log(`Resume with: tachiko run resume ${run.id} --decision <choice>`);
+    return;
+  }
+  console.error(`Run ${run.id}: FAILED — ${outcome.reason}`);
+}
+
+/** Production wiring: local gh CLI, Claude Code, and the DeepSeek reviewer. */
+function buildWorkflowDeps(store: RunStore): WorkflowDependencies {
+  const transport = new GhCliTransport();
+  const github = new LiveGitHubAdapter({ transport });
+  return {
+    store,
+    github,
+    implementation: new ClaudeCodeAdapter({ cwd: process.cwd(), github }),
+    reviewer: new DeepSeekReviewer({
+      github,
+      diffReader: new GhPullRequestDiffReader(transport),
+      client: new DeepSeekApiClient(),
+    }),
+  };
 }
 
 // --- commands (exported so tests can exercise them without spawning a process) ---
@@ -279,9 +390,29 @@ export async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  console.error(`Unknown command: run ${subcommand ?? ''}\n`);
-  console.error(USAGE);
-  return 1;
+  if (subcommand === 'resume') {
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: { decision: { type: 'string' } },
+    });
+    const [id] = positionals;
+    if (id === undefined) throw new Error('run resume requires a run id.');
+    const outcome = await resumeCommand(buildWorkflowDeps(store), id, values.decision ?? 'resumed');
+    printOutcome(outcome);
+    return outcome.outcome === 'failed' ? 1 : 0;
+  }
+
+  if (subcommand === undefined) {
+    console.error('run requires a subcommand or an owner/repo#123 reference.\n');
+    console.error(USAGE);
+    return 1;
+  }
+
+  // The remaining form is `run owner/repo#123`: start or continue one issue.
+  const outcome = await runIssueCommand(buildWorkflowDeps(store), subcommand);
+  printOutcome(outcome);
+  return outcome.outcome === 'failed' ? 1 : 0;
 }
 
 // Run directly (`node dist/cli.js ...` or `node --import tsx src/cli.ts ...`)
