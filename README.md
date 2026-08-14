@@ -4,11 +4,13 @@ Local orchestration core for the Tachiko Conductor product: a deterministic
 workflow state machine that drives a GitHub issue from **READY** through
 implementation, validation, independent review, and a final merge-ready gate.
 
-This repository currently implements **[issue #2]**, **[issue #3]**, and
-**[issue #4]**: the typed core, the deterministic state machine, durable local
-run state, the adapter *interfaces*, the GitHub live-state adapter (with an
-injected `gh` CLI transport and agent-handoff parser), and a Claude Code
-execution adapter. Issues #5 and #6 remain.
+This repository implements **[issue #1]**'s MVP scope across **[issue #2]**
+through **[issue #6]**: the typed core, the deterministic state machine,
+durable local run state, the adapter *interfaces*, the GitHub live-state
+adapter (with an injected `gh` CLI transport and agent-handoff parser), a
+Claude Code execution adapter, an independent DeepSeek review loop, and the
+end-to-end `tachiko run owner/repo#123` command with a structured human
+interrupt protocol.
 
 ## Design invariants
 
@@ -73,12 +75,19 @@ pnpm build       # emit dist/ for the `tachiko` bin
 ## CLI
 
 ```bash
+pnpm exec tsx src/cli.ts run owner/repo#123
+pnpm exec tsx src/cli.ts run resume <id> --decision <choice>
 pnpm exec tsx src/cli.ts run create --owner acme --repo widgets --issue 42
 pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
 pnpm exec tsx src/cli.ts github snapshot nurockplayer/tachiko-conductor#42
 ```
+
+`run owner/repo#123` starts or continues one issue end-to-end: implementation,
+validation, independent review, and the final gate. It stops at `MERGE_READY`,
+`FAILED`, or a structured `NEEDS_HUMAN` interrupt (reason, evidence, bounded
+choices); resume a parked run with `run resume <id> --decision <choice>`.
 
 `github snapshot` prints one normalized live-state JSON envelope from the
 locally authenticated `gh` CLI: `{"ok":true,"snapshot":...}` on success, or
@@ -120,3 +129,8 @@ tests/                 state-machine, store, resume, adapters, CLI tests
 ```
 
 [issue #2]: https://github.com/nurockplayer/tachiko-conductor/issues/2
+[issue #1]: https://github.com/nurockplayer/tachiko-conductor/issues/1
+[issue #3]: https://github.com/nurockplayer/tachiko-conductor/issues/3
+[issue #4]: https://github.com/nurockplayer/tachiko-conductor/issues/4
+[issue #5]: https://github.com/nurockplayer/tachiko-conductor/issues/5
+[issue #6]: https://github.com/nurockplayer/tachiko-conductor/issues/6
