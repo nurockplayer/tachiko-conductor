@@ -220,6 +220,26 @@ describe('runWorkflow', () => {
     assert.equal(result.run.state, 'MERGE_READY');
   });
 
+  it('returns a terminal outcome for a run already in MERGED without looping', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'run-1', HEAD);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'gate_passed' }, T0);
+    run = applyTransition(run, { type: 'merged' }, T0);
+    store.update(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([]), implementation, reviewer },
+      'run-1',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merged');
+    assert.equal(result.run.state, 'MERGED');
+  });
+
   it('escalates when the live snapshot has no open PR to implement against', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-1'));

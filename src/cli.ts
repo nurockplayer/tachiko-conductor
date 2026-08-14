@@ -193,6 +193,10 @@ function printOutcome(outcome: WorkflowOutcome): void {
     );
     return;
   }
+  if (outcome.outcome === 'merged') {
+    console.log(`Run ${run.id}: MERGED — the pull request was already merged.`);
+    return;
+  }
   if (outcome.outcome === 'needs_human') {
     console.log(`Run ${run.id}: NEEDS_HUMAN — ${outcome.reason}`);
     const interrupt = run.interrupt;

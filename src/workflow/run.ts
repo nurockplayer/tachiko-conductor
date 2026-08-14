@@ -21,6 +21,7 @@ export interface WorkflowOptions {
 
 export type WorkflowOutcome =
   | { readonly outcome: 'merge_ready'; readonly run: Run }
+  | { readonly outcome: 'merged'; readonly run: Run }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
@@ -117,6 +118,9 @@ export async function runWorkflow(
 
       case 'MERGE_READY':
         return { outcome: 'merge_ready', run };
+
+      case 'MERGED':
+        return { outcome: 'merged', run };
 
       case 'NEEDS_HUMAN':
         return { outcome: 'needs_human', run, reason: run.interrupt?.reason ?? 'Awaiting a human decision.' };
