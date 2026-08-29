@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { ImplementationAgent } from '../src/adapters/agent.js';
+import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
@@ -98,10 +98,12 @@ class FakeReviewer implements ReviewerAdapter {
 
 class FakeImplementation implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
+  readonly requests: ImplementationRequest[] = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
 
-  async run(request: { target: unknown; baseSha: string; instructions?: string }): Promise<AgentResult> {
+  async run(request: ImplementationRequest): Promise<AgentResult> {
+    this.requests.push(request);
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
     return outcome;
@@ -150,6 +152,33 @@ describe('runWorkflow', () => {
     assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'gate_passed'));
   });
 
+  it('passes the same ephemeral MCP capability to initial implementation and review fixes', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-capability'));
+    const implementation = new FakeImplementation([successResult(HEAD), successResult(HEAD2, 'fixed')]);
+    const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
+    const capability: McpHttpCapability = {
+      kind: 'mcp-http',
+      name: 'tachiko_browser',
+      endpoint: 'http://127.0.0.1:8931/mcp',
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD, HEAD, HEAD2]),
+        implementation,
+        reviewer,
+        implementationCapabilities: [capability],
+      },
+      'run-capability',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.deepEqual(implementation.requests.map((request) => request.capabilities), [[capability], [capability]]);
+  });
+
   it('fails the run when the implementation agent fails', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-1'));
@@ -165,6 +194,29 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'failed');
     assert.equal(result.run.state, 'FAILED');
     assert.match(result.reason, /Implementation failed/);
+  });
+
+  it('parks in NEEDS_HUMAN when the implementation agent emits the explicit takeover protocol', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-takeover'));
+    const implementation = new FakeImplementation([
+      {
+        exitStatus: 'failure',
+        summary: 'login expired',
+        diagnostics: ['TACHIKO_NEEDS_HUMAN: login expired'],
+      },
+    ]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) },
+      'run-takeover',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(result.run.interrupt?.reason, 'login expired');
+    assert.deepEqual(result.run.interrupt?.choices, ['Complete human bootstrap/takeover and resume', 'Cancel the run']);
   });
 
   it('parks in NEEDS_HUMAN with structured context when the review loop cannot converge', async () => {

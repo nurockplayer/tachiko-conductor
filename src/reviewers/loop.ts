@@ -1,4 +1,8 @@
-import type { ImplementationAgent } from '../adapters/agent.js';
+import {
+  humanTakeoverReason,
+  type ImplementationAgent,
+  type McpHttpCapability,
+} from '../adapters/agent.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
@@ -10,6 +14,7 @@ export interface ReviewLoopDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly reviewer: ReviewerAdapter;
+  readonly implementationCapabilities?: readonly McpHttpCapability[];
 }
 
 export interface ReviewLoopOptions {
@@ -139,8 +144,26 @@ export async function runReviewLoop(
       target,
       baseSha: run.headSha ?? '',
       instructions: renderFindings(reviewResult),
+      capabilities: deps.implementationCapabilities,
     });
     if (fixResult.exitStatus === 'failure') {
+      const takeoverReason = humanTakeoverReason(fixResult);
+      if (takeoverReason !== undefined) {
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason: takeoverReason,
+            interrupt: {
+              evidence: takeoverReason,
+              choices: ['Complete human bootstrap/takeover and resume', 'Cancel the run'],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason: takeoverReason };
+      }
       run = applyTransition(run, { type: 'agent_failed', agentResult: fixResult, headSha: fixResult.headSha }, now());
       store.update(run);
       return { outcome: 'failed', run, reason: `Implementation failed while fixing review findings: ${fixResult.summary}` };

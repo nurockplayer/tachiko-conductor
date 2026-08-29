@@ -1,4 +1,8 @@
-import type { ImplementationAgent } from '../adapters/agent.js';
+import {
+  humanTakeoverReason,
+  type ImplementationAgent,
+  type McpHttpCapability,
+} from '../adapters/agent.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
@@ -11,6 +15,7 @@ export interface WorkflowDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly reviewer: ReviewerAdapter;
+  readonly implementationCapabilities?: readonly McpHttpCapability[];
 }
 
 export interface WorkflowOptions {
@@ -77,8 +82,30 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
         const baseSha = snapshot.pullRequest?.baseSha ?? '';
-        const result = await implementation.run({ target, baseSha, instructions: snapshot.issue.body });
+        const result = await implementation.run({
+          target,
+          baseSha,
+          instructions: snapshot.issue.body,
+          capabilities: deps.implementationCapabilities,
+        });
         if (result.exitStatus === 'failure') {
+          const takeoverReason = humanTakeoverReason(result);
+          if (takeoverReason !== undefined) {
+            run = applyTransition(
+              run,
+              {
+                type: 'escalate',
+                reason: takeoverReason,
+                interrupt: {
+                  evidence: takeoverReason,
+                  choices: ['Complete human bootstrap/takeover and resume', 'Cancel the run'],
+                },
+              },
+              now(),
+            );
+            store.update(run);
+            return { outcome: 'needs_human', run, reason: takeoverReason };
+          }
           run = applyTransition(run, { type: 'agent_failed', agentResult: result, headSha: result.headSha }, now());
           store.update(run);
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
@@ -95,10 +122,14 @@ export async function runWorkflow(
 
       case 'REVIEWING':
       case 'CHANGES_REQUESTED': {
-        const loop = await runReviewLoop({ store, github, implementation, reviewer }, run.id, {
+        const loop = await runReviewLoop(
+          { store, github, implementation, reviewer, implementationCapabilities: deps.implementationCapabilities },
+          run.id,
+          {
           maxAttempts: options.maxReviewAttempts,
           now,
-        });
+          },
+        );
         run = loop.run;
         if (loop.outcome === 'needs_human') return { outcome: 'needs_human', run, reason: loop.reason };
         if (loop.outcome === 'failed') return { outcome: 'failed', run, reason: loop.reason };

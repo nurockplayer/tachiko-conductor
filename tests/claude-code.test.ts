@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { ClaudeCodeAdapter } from '../src/agents/claude-code.js';
+import { ClaudeCodeAdapter, NodeClaudeProcessRunner } from '../src/agents/claude-code.js';
 import type { ClaudeProcessRunner, ClaudeRunOptions } from '../src/agents/claude-code.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ProcessResult } from '../src/github/transport.js';
@@ -157,6 +157,105 @@ describe('ClaudeCodeAdapter', () => {
     assert.match(prompt, /Pull request: none/);
   });
 
+  it('injects HTTP MCP capabilities per invocation and auto-approves only that server', async () => {
+    const runner = new FakeRunner([result(claudeJson('implemented')), result(HEAD)]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      capabilities: [
+        {
+          kind: 'mcp-http',
+          name: 'tachiko_browser',
+          endpoint: 'http://127.0.0.1:8931/mcp',
+        },
+      ],
+    });
+
+    assert.equal(agentResult.exitStatus, 'success');
+    const args = runner.calls[0]?.args ?? [];
+    const configIndex = args.indexOf('--mcp-config');
+    assert.notEqual(configIndex, -1);
+    assert.deepEqual(JSON.parse(String(args[configIndex + 1])), {
+      mcpServers: {
+        tachiko_browser: { type: 'http', url: 'http://127.0.0.1:8931/mcp' },
+      },
+    });
+    assert.ok(args.includes('--strict-mcp-config'));
+    assert.ok(args.includes('mcp__tachiko_browser__*'));
+    assert.ok(!args.includes('mcp__*'));
+  });
+
+  it('supports an explicitly configured remote HTTP MCP endpoint per invocation', async () => {
+    const runner = new FakeRunner([result(claudeJson('implemented')), result(HEAD)]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      capabilities: [{ kind: 'mcp-http', name: 'browser', endpoint: 'https://browser.internal/mcp' }],
+    });
+
+    assert.equal(agentResult.exitStatus, 'success');
+    const args = runner.calls[0]?.args ?? [];
+    const configIndex = args.indexOf('--mcp-config');
+    assert.deepEqual(JSON.parse(String(args[configIndex + 1])), {
+      mcpServers: { browser: { type: 'http', url: 'https://browser.internal/mcp' } },
+    });
+  });
+
+  it('rejects unsafe MCP capability names and endpoints', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    await assert.rejects(
+      adapter.run({
+        target: TARGET,
+        baseSha: 'base-1',
+        capabilities: [{ kind: 'mcp-http', name: 'bad name', endpoint: 'http://127.0.0.1:8931/mcp' }],
+      }),
+      /Invalid MCP capability name/,
+    );
+    await assert.rejects(
+      adapter.run({
+        target: TARGET,
+        baseSha: 'base-1',
+        capabilities: [{ kind: 'mcp-http', name: 'browser', endpoint: 'ftp://127.0.0.1/mcp' }],
+      }),
+      /must use an HTTP or HTTPS endpoint/,
+    );
+    await assert.rejects(
+      adapter.run({
+        target: TARGET,
+        baseSha: 'base-1',
+        capabilities: [{ kind: 'mcp-http', name: 'browser', endpoint: 'https://user:secret@example.com/mcp' }],
+      }),
+      /must not embed credentials/,
+    );
+    assert.equal(runner.calls.length, 0);
+  });
+
+  it('maps the explicit human-takeover protocol to a deterministic failure without reading git', async () => {
+    const runner = new FakeRunner([result(claudeJson('TACHIKO_NEEDS_HUMAN: login expired; run browser bootstrap'))]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      capabilities: [
+        { kind: 'mcp-http', name: 'tachiko_browser', endpoint: 'http://127.0.0.1:8931/mcp' },
+      ],
+    });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.equal(agentResult.summary, 'login expired; run browser bootstrap');
+    assert.deepEqual(agentResult.diagnostics, ['TACHIKO_NEEDS_HUMAN: login expired; run browser bootstrap']);
+    assert.equal(runner.calls.length, 1);
+    assert.match(String(runner.calls[0]?.args[1]), /Authentication, 2FA, or CAPTCHA/);
+    assert.match(String(runner.calls[0]?.args[1]), /purchase, payment, billing, account deletion/);
+  });
+
   it('degrades to an unavailable live-state note when the snapshot read fails', async () => {
     const github = githubAdapter(() => {
       throw new Error('boom');
@@ -169,5 +268,19 @@ describe('ClaudeCodeAdapter', () => {
     assert.equal(agentResult.exitStatus, 'success');
     const prompt = String(runner.calls[0]?.args[1]);
     assert.match(prompt, /Live GitHub state: unavailable/);
+  });
+});
+
+describe('NodeClaudeProcessRunner', () => {
+  it('closes child stdin so non-interactive CLIs do not wait for piped context', async () => {
+    const runner = new NodeClaudeProcessRunner();
+
+    const child = await runner.run(
+      process.execPath,
+      ['-e', "process.stdin.resume(); process.stdin.once('end', () => process.stdout.write('closed'))"],
+      { timeoutMs: 1_000, cwd: process.cwd() },
+    );
+
+    assert.deepEqual(child, { stdout: 'closed', stderr: '', exitCode: 0 });
   });
 });
