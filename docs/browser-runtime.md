@@ -94,8 +94,9 @@ fallback is used only by the foreground owner when its actual child does not
 exit. Those signal handlers are installed before startup begins, so an
 interrupt during readiness also follows managed cleanup instead of leaving a
 startup guard behind. Startup cancellation is carried by an attempt-scoped
-signal and cannot stop a different runtime that already owns the profile. The
-separate `browser stop` process writes a
+signal through readiness and the headed bootstrap-open step; it stops only the
+exact returned handle and cannot stop a different runtime that already owns the
+profile. The separate `browser stop` process writes a
 runtime-ID-scoped stop request for that owner; it never rewrites lifecycle
 metadata or signals a persisted PID that may belong to a replacement process
 after a crash.

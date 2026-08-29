@@ -152,12 +152,42 @@ export async function browserBootstrapCommand(
 ): Promise<BrowserStartCommandResult> {
   const handle = await runtime.start({ profile, ...options, headless: false });
   try {
-    await openBrowser(handle.snapshot.endpoint);
+    await abortable(
+      openBrowser(handle.snapshot.endpoint),
+      options.signal,
+      () => new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING,
+        `Browser bootstrap for profile "${profile}" was cancelled while opening the headed browser.`,
+        { profile, runtimeId: handle.snapshot.runtimeId },
+      ),
+    );
     return { ...buildBrowserAgentConnection(handle.snapshot), handle };
   } catch (error) {
     await handle.stop().catch(() => undefined);
     throw error;
   }
+}
+
+function abortable<T>(operation: Promise<T>, signal: AbortSignal | undefined, error: () => Error): Promise<T> {
+  if (signal === undefined) return operation;
+  if (signal.aborted) return Promise.reject(error());
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => {
+      signal.removeEventListener('abort', aborted);
+      reject(error());
+    };
+    signal.addEventListener('abort', aborted, { once: true });
+    operation.then(
+      (value) => {
+        signal.removeEventListener('abort', aborted);
+        resolve(value);
+      },
+      (operationError: unknown) => {
+        signal.removeEventListener('abort', aborted);
+        reject(operationError);
+      },
+    );
+  });
 }
 
 export async function browserStatusCommand(runtime: BrowserRuntime, profile: string): Promise<BrowserRuntimeSnapshot> {

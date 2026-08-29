@@ -20,6 +20,10 @@ import type {
   BrowserRuntimeSnapshot,
   StartBrowserRuntimeOptions,
 } from '../src/browser/playwright-mcp-runtime.js';
+import {
+  BROWSER_RUNTIME_ERROR_CODE,
+  BrowserRuntimeError,
+} from '../src/browser/playwright-mcp-runtime.js';
 
 const READY: BrowserRuntimeSnapshot = {
   runtimeId: 'runtime-1',
@@ -41,14 +45,17 @@ class FakeBrowserRuntime implements BrowserRuntime {
   readonly starts: StartBrowserRuntimeOptions[] = [];
   readonly statuses: string[] = [];
   readonly stops: string[] = [];
+  handleStops = 0;
   current: BrowserRuntimeSnapshot | null = READY;
 
   async start(options: StartBrowserRuntimeOptions): Promise<BrowserRuntimeHandle> {
     this.starts.push(options);
+    const runtime = this;
     const snapshot = { ...READY, profile: options.profile, headless: options.headless ?? true };
     return {
       snapshot,
       async stop() {
+        runtime.handleStops += 1;
         return { ...snapshot, state: 'stopped', health: 'stopped' };
       },
       async waitForExit() {
@@ -210,6 +217,26 @@ describe('browser CLI command layer', () => {
     assert.deepEqual(runtime.starts, [{ profile: 'login', headless: false }]);
     assert.deepEqual(opened, ['http://127.0.0.1:8931/mcp']);
     assert.equal(result.runtime.headless, false);
+  });
+
+  it('stops the exact local handle when bootstrap opening is aborted', async () => {
+    const runtime = new FakeBrowserRuntime();
+    const controller = new AbortController();
+    const opening = browserBootstrapCommand(
+      runtime,
+      'login',
+      { signal: controller.signal },
+      async () => {
+        controller.abort();
+        await new Promise<void>(() => undefined);
+      },
+    );
+
+    await assert.rejects(opening, (error) => {
+      assert.equal((error as BrowserRuntimeError).code, BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING);
+      return true;
+    });
+    assert.equal(runtime.handleStops, 1);
   });
 
   it('reports status, stops by profile name, and fails clearly when status is absent', async () => {
