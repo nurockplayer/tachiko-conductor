@@ -19,6 +19,21 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 const FAKE_MCP = fileURLToPath(new URL('./fixtures/fake-playwright-mcp.mjs', import.meta.url));
 const cleanups: Array<() => Promise<void> | void> = [];
 
+async function tcpReadinessProbe(endpoint: string): Promise<boolean> {
+  const url = new URL(endpoint);
+  return await new Promise<boolean>((resolve) => {
+    const socket = net.createConnection({ host: url.hostname, port: Number(url.port) });
+    const done = (ready: boolean) => {
+      socket.destroy();
+      resolve(ready);
+    };
+    socket.setTimeout(250);
+    socket.once('connect', () => done(true));
+    socket.once('error', () => done(false));
+    socket.once('timeout', () => done(false));
+  });
+}
+
 afterEach(async () => {
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
@@ -55,6 +70,7 @@ function tempRuntime(env: NodeJS.ProcessEnv = process.env): {
       repositoryRoot: REPO_ROOT,
       playwrightCliPath: FAKE_MCP,
       env,
+      readinessProbe: tcpReadinessProbe,
     }),
     root,
     profileRoot,
@@ -172,11 +188,31 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     const { runtime, profileRoot } = tempRuntime();
     const profileDir = path.join(profileRoot, 'guarded');
     mkdirSync(profileDir, { recursive: true });
-    writeFileSync(path.join(profileDir, '.tachiko-runtime-lock.guard'), '{}\n', { mode: 0o600 });
+    writeFileSync(path.join(profileDir, '.tachiko-runtime-lock.guard'), '{"pid":999999999}\n', { mode: 0o600 });
 
     await assert.rejects(
       runtime.start({ profile: 'guarded', port: await freePort() }),
-      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE),
+      (error) => {
+        assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE);
+        assert.match((error as Error).message, /remove that guard and retry/);
+        return true;
+      },
+    );
+  });
+
+  it('requires an MCP handshake rather than treating any accepting socket as ready', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-handshake-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot: path.join(root, 'profiles'),
+      runtimeRoot: path.join(root, 'runtimes'),
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+    });
+
+    await assert.rejects(
+      runtime.start({ profile: 'not-mcp', port: await freePort(), startupTimeoutMs: 150 }),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT),
     );
   });
 
@@ -249,5 +285,53 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING),
     );
     assert.doesNotThrow(() => process.kill(unrelated.pid!, 0));
+  });
+
+  it('never overwrites a newer runtime identity while an older external stop completes', async () => {
+    const { runtime, runtimeRoot } = tempRuntime();
+    mkdirSync(runtimeRoot, { recursive: true });
+    const oldChild = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+    assert.ok(oldChild.pid !== undefined);
+    cleanups.push(() => {
+      oldChild.kill('SIGKILL');
+    });
+    const oldSnapshot = {
+      runtimeId: 'old-runtime',
+      profile: 'restart-race',
+      endpoint: 'http://127.0.0.1:65533/mcp',
+      host: '127.0.0.1',
+      port: 65533,
+      pid: oldChild.pid,
+      ownerPid: process.pid,
+      headless: true,
+      state: 'ready',
+      health: 'ready',
+      startedAt: '2026-08-29T00:00:00.000Z',
+    } as const;
+    const metadataPath = path.join(runtimeRoot, 'restart-race.json');
+    writeFileSync(metadataPath, `${JSON.stringify(oldSnapshot)}\n`, { mode: 0o600 });
+
+    const stopping = runtime.stop('restart-race');
+    for (;;) {
+      const current = JSON.parse(readFileSync(metadataPath, 'utf8')) as { state: string };
+      if (current.state === 'stopping') break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    oldChild.kill('SIGTERM');
+    await new Promise<void>((resolve) => oldChild.once('exit', () => resolve()));
+    const replacement = {
+      ...oldSnapshot,
+      runtimeId: 'new-runtime',
+      pid: process.pid,
+      state: 'ready',
+      health: 'ready',
+      startedAt: '2026-08-29T00:01:00.000Z',
+    } as const;
+    writeFileSync(metadataPath, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+
+    const stopped = await stopping;
+    assert.equal(stopped.runtimeId, 'old-runtime');
+    const persisted = JSON.parse(readFileSync(metadataPath, 'utf8')) as { runtimeId: string };
+    assert.equal(persisted.runtimeId, 'new-runtime');
   });
 });

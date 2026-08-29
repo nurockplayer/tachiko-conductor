@@ -37,7 +37,9 @@ One live runtime owns a profile lock before Playwright starts. Lock acquisition
 and stale-lock replacement are serialized by a separate atomic guard, so two
 starters cannot both reclaim the same profile. A dead owner's stale lock can be
 reclaimed; a live owner's lock produces `BROWSER_PROFILE_IN_USE` with the PID
-and runtime ID.
+and runtime ID. If a process is killed during the very short guarded ownership
+update, the same typed error reports the exact stale guard path and PID state;
+after confirming no start/stop is active, remove that guard and retry.
 
 ## Bootstrap and normal use
 
@@ -71,13 +73,15 @@ endpoint at `/mcp`. `--host` is an explicit operator override; exposing an MCP
 browser endpoint beyond loopback requires a separately trusted network and is
 not the v0 default.
 
-Startup checks the configured port, races readiness against child exit and a
-bounded timeout, and reports typed errors for invalid config, occupied ports,
+Startup checks the configured port, races a real MCP initialization handshake
+against child exit and a bounded timeout, and reports typed errors for invalid config, occupied ports,
 profile ownership, spawn failure, startup timeout, early/unexpected exit, and
 stop timeout. `SIGINT`/`SIGTERM` request a clean child stop; a bounded `SIGKILL`
 fallback is used only by the foreground owner when its actual child does not
 exit. The separate `browser stop` process writes a stop request for that owner;
 it never signals a persisted PID that may have been reused after a crash.
+Status health performs the same MCP handshake rather than treating any
+accepting TCP socket as a healthy browser runtime.
 
 ## Agent connection
 

@@ -12,6 +12,8 @@ import net from 'node:net';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 
 import type { McpHttpCapability } from '../adapters/agent.js';
 
@@ -131,6 +133,7 @@ export interface ManagedPlaywrightMcpRuntimeOptions {
   readonly playwrightCliPath?: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly now?: () => string;
+  readonly readinessProbe?: (endpoint: string) => Promise<boolean>;
 }
 
 interface RuntimeLock {
@@ -154,6 +157,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   private readonly playwrightCliPath: string;
   private readonly env: NodeJS.ProcessEnv;
   private readonly now: () => string;
+  private readonly readinessProbe: (endpoint: string) => Promise<boolean>;
 
   constructor(options: ManagedPlaywrightMcpRuntimeOptions) {
     this.profileRoot = path.resolve(options.profileRoot);
@@ -162,6 +166,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     this.playwrightCliPath = options.playwrightCliPath ?? resolvePlaywrightMcpCli();
     this.env = options.env ?? process.env;
     this.now = options.now ?? (() => new Date().toISOString());
+    this.readinessProbe = options.readinessProbe ?? probeMcpEndpoint;
   }
 
   async start(options: StartBrowserRuntimeOptions): Promise<BrowserRuntimeHandle> {
@@ -235,7 +240,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
 
     const startupAbort = new AbortController();
     const startup = await Promise.race([
-      waitForPort(host, port, startupTimeoutMs, startupAbort.signal).then(
+      waitForReadiness(started.endpoint, startupTimeoutMs, this.readinessProbe, startupAbort.signal).then(
         () => ({ kind: 'ready' as const }),
         (error: unknown) => ({ kind: 'startup-error' as const, error }),
       ),
@@ -353,7 +358,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       return failed;
     }
     if (snapshot.state === 'ready') {
-      const healthy = await canConnect(snapshot.host, snapshot.port);
+      const healthy = await this.readinessProbe(snapshot.endpoint);
       const checked: BrowserRuntimeSnapshot = { ...snapshot, health: healthy ? 'ready' : 'unhealthy' };
       writeJsonAtomic(metadataPath, checked);
       return checked;
@@ -407,6 +412,12 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       health: 'stopped',
       stoppedAt: this.now(),
     };
+    const current = readSnapshot(metadataPath);
+    if (current !== null && current.runtimeId !== snapshot.runtimeId) {
+      // A new owner may start as soon as the old owner records terminal state
+      // and releases the profile lock. Never overwrite that newer identity.
+      return finalSnapshot;
+    }
     writeJsonAtomic(metadataPath, finalSnapshot);
     releaseLock(path.join(this.profileDir(profile), '.tachiko-runtime-lock.json'), snapshot.runtimeId);
     return finalSnapshot;
@@ -619,11 +630,24 @@ function acquireLockGuard(profileDir: string, profile: string): string {
     return guard;
   } catch (error) {
     if (errorCode(error) !== 'EEXIST') throw error;
+    const ownerPid = readGuardOwnerPid(guard);
+    const ownerState = ownerPid === null ? 'unknown' : processIsAlive(ownerPid) ? 'live' : 'stale';
     throw new BrowserRuntimeError(
       BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE,
-      `Browser profile "${profile}" ownership is being updated; retry shortly.`,
-      { profile, guard },
+      ownerState === 'live'
+        ? `Browser profile "${profile}" ownership is being updated by PID ${ownerPid}; retry shortly.`
+        : `Browser profile "${profile}" has a ${ownerState} ownership guard at ${guard}; after verifying no start/stop is active, remove that guard and retry.`,
+      { profile, guard, guardOwnerPid: ownerPid, guardOwnerState: ownerState },
     );
+  }
+}
+
+function readGuardOwnerPid(guard: string): number | null {
+  try {
+    const value = JSON.parse(readFileSync(guard, 'utf8')) as { pid?: unknown };
+    return typeof value.pid === 'number' && Number.isInteger(value.pid) ? value.pid : null;
+  } catch {
+    return null;
   }
 }
 
@@ -714,32 +738,38 @@ async function assertPortAvailable(host: string, port: number): Promise<void> {
   });
 }
 
-async function waitForPort(host: string, port: number, timeoutMs: number, signal?: AbortSignal): Promise<void> {
+async function waitForReadiness(
+  endpoint: string,
+  timeoutMs: number,
+  probe: (endpoint: string) => Promise<boolean>,
+  signal?: AbortSignal,
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (!signal?.aborted && Date.now() < deadline) {
-    if (await canConnect(host, port)) return;
+    if (await probe(endpoint)) return;
     await delay(25);
   }
   if (signal?.aborted) return;
   throw new BrowserRuntimeError(
     BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT,
-    `Playwright MCP did not become ready on ${host}:${port} within ${timeoutMs}ms.`,
-    { host, port, timeoutMs },
+    `Playwright MCP did not complete an MCP handshake at ${endpoint} within ${timeoutMs}ms.`,
+    { endpoint, timeoutMs },
   );
 }
 
-async function canConnect(host: string, port: number): Promise<boolean> {
-  return await new Promise<boolean>((resolve) => {
-    const socket = net.createConnection({ host, port });
-    const done = (result: boolean) => {
-      socket.destroy();
-      resolve(result);
-    };
-    socket.setTimeout(250);
-    socket.once('connect', () => done(true));
-    socket.once('error', () => done(false));
-    socket.once('timeout', () => done(false));
-  });
+async function probeMcpEndpoint(endpoint: string): Promise<boolean> {
+  const client = new Client({ name: 'tachiko-browser-health', version: '0.1.0' });
+  try {
+    await client.connect(new StreamableHTTPClientTransport(new URL(endpoint)), {
+      timeout: 500,
+      maxTotalTimeout: 500,
+    });
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await client.close().catch(() => undefined);
+  }
 }
 
 function processIsAlive(pid: number): boolean {
