@@ -80,6 +80,10 @@ stop timeout. `SIGINT`/`SIGTERM` request a clean child stop; a bounded `SIGKILL`
 fallback is used only by the foreground owner when its actual child does not
 exit. The separate `browser stop` process writes a stop request for that owner;
 it never signals a persisted PID that may have been reused after a crash.
+The managed child keeps Playwright MCP's stdin watchdog connected to its
+foreground owner, so abrupt owner death closes the pipe and lets that exact
+child shut down its browser without trusting a persisted PID. Profile locks are
+released only after child exit is observed, including startup-timeout cleanup.
 Status health performs the same MCP handshake rather than treating any
 accepting TCP socket as a healthy browser runtime.
 
@@ -101,12 +105,14 @@ node dist/cli.js run nurockplayer/tachiko-conductor#12 --browser-profile github-
 node dist/cli.js run resume <run-id> --decision retry --browser-profile github-work
 ```
 
-Conductor verifies that the named profile is live and healthy, then adds the
-generic capability only to that implementation request. The Claude adapter
+Conductor re-verifies that the named profile is live and healthy immediately
+before every implementation invocation, then adds the freshly resolved generic
+capability only to that request. The Claude adapter
 translates it into inline `--mcp-config` JSON, `--strict-mcp-config`, and the
 narrow `mcp__tachiko_browser__*` allow rule. It does not use
-`bypassPermissions`. Review-fix invocations receive the same ephemeral
-capability. Browser runtime details are not added to persisted run state or to
+`bypassPermissions`. Review-fix invocations resolve a new ephemeral descriptor,
+so a profile restarted on another port is never reused through a stale endpoint.
+Browser runtime details are not added to persisted run state or to
 the workflow state machine.
 
 For a direct Codex invocation, use the emitted `codex.configOverride` value:

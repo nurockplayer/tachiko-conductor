@@ -153,16 +153,21 @@ describe('runWorkflow', () => {
     assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'gate_passed'));
   });
 
-  it('passes the same ephemeral MCP capability to initial implementation and review fixes', async () => {
+  it('resolves a fresh ephemeral MCP capability before initial implementation and every review fix', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-capability'));
     const implementation = new FakeImplementation([successResult(HEAD), successResult(HEAD2, 'fixed')]);
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
-    const capability: McpHttpCapability = {
+    const capabilities: McpHttpCapability[] = [{
       kind: 'mcp-http',
       name: 'tachiko_browser',
       endpoint: 'http://127.0.0.1:8931/mcp',
-    };
+    }, {
+      kind: 'mcp-http',
+      name: 'tachiko_browser',
+      endpoint: 'http://127.0.0.1:8932/mcp',
+    }];
+    let capabilityIndex = 0;
 
     const result = await runWorkflow(
       {
@@ -170,14 +175,15 @@ describe('runWorkflow', () => {
         github: githubAdapter([HEAD, HEAD, HEAD2]),
         implementation,
         reviewer,
-        implementationCapabilities: [capability],
+        resolveImplementationCapabilities: async () => [capabilities[capabilityIndex++]!],
       },
       'run-capability',
       { maxReviewAttempts: 3, now: () => T0 },
     );
 
     assert.equal(result.outcome, 'merge_ready');
-    assert.deepEqual(implementation.requests.map((request) => request.capabilities), [[capability], [capability]]);
+    assert.equal(capabilityIndex, 2);
+    assert.deepEqual(implementation.requests.map((request) => request.capabilities), [[capabilities[0]], [capabilities[1]]]);
   });
 
   it('fails the run when the implementation agent fails', async () => {

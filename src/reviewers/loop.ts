@@ -1,7 +1,7 @@
 import {
   humanTakeoverReason,
   type ImplementationAgent,
-  type McpHttpCapability,
+  type ImplementationCapabilityResolver,
 } from '../adapters/agent.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
@@ -14,7 +14,7 @@ export interface ReviewLoopDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly reviewer: ReviewerAdapter;
-  readonly implementationCapabilities?: readonly McpHttpCapability[];
+  readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
 
 export interface ReviewLoopOptions {
@@ -144,7 +144,7 @@ export async function runReviewLoop(
       target,
       baseSha: run.headSha ?? '',
       instructions: renderReviewFindings(reviewResult),
-      capabilities: deps.implementationCapabilities,
+      capabilities: await deps.resolveImplementationCapabilities?.(),
     });
     if (fixResult.exitStatus === 'failure') {
       const takeoverReason = humanTakeoverReason(fixResult);

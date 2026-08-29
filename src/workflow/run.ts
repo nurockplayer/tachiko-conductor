@@ -1,7 +1,7 @@
 import {
   humanTakeoverReason,
   type ImplementationAgent,
-  type McpHttpCapability,
+  type ImplementationCapabilityResolver,
 } from '../adapters/agent.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
@@ -15,7 +15,7 @@ export interface WorkflowDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly reviewer: ReviewerAdapter;
-  readonly implementationCapabilities?: readonly McpHttpCapability[];
+  readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
 
 export interface WorkflowOptions {
@@ -105,7 +105,7 @@ export async function runWorkflow(
           target,
           baseSha,
           instructions: pendingReviewFix ? renderReviewFindings(run.reviewResult!) : snapshot.issue.body,
-          capabilities: deps.implementationCapabilities,
+          capabilities: await deps.resolveImplementationCapabilities?.(),
         });
         if (result.exitStatus === 'failure') {
           const takeoverReason = humanTakeoverReason(result);
@@ -142,7 +142,7 @@ export async function runWorkflow(
       case 'REVIEWING':
       case 'CHANGES_REQUESTED': {
         const loop = await runReviewLoop(
-          { store, github, implementation, reviewer, implementationCapabilities: deps.implementationCapabilities },
+          { store, github, implementation, reviewer, resolveImplementationCapabilities: deps.resolveImplementationCapabilities },
           run.id,
           {
           maxAttempts: options.maxReviewAttempts,

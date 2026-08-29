@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 import { ClaudeCodeAdapter } from './agents/claude-code.js';
-import type { McpHttpCapability } from './adapters/agent.js';
+import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
 import { openBrowserForBootstrap } from './browser/mcp-client.js';
@@ -312,7 +312,7 @@ function printOutcome(outcome: WorkflowOutcome): void {
 /** Production wiring: local gh CLI, Claude Code, and the DeepSeek reviewer. */
 function buildWorkflowDeps(
   store: RunStore,
-  implementationCapabilities?: readonly McpHttpCapability[],
+  resolveImplementationCapabilities?: ImplementationCapabilityResolver,
 ): WorkflowDependencies {
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
@@ -325,7 +325,7 @@ function buildWorkflowDeps(
       diffReader: new GhPullRequestDiffReader(transport),
       client: new DeepSeekApiClient(),
     }),
-    implementationCapabilities,
+    resolveImplementationCapabilities,
   };
 }
 
@@ -609,9 +609,10 @@ export async function main(argv: string[]): Promise<number> {
     });
     const [id] = positionals;
     if (id === undefined) throw new Error('run resume requires a run id.');
-    const capabilities = await browserImplementationCapabilities(buildBrowserRuntime(), values['browser-profile']);
+    const runtime = buildBrowserRuntime();
+    const resolveCapabilities = async () => await browserImplementationCapabilities(runtime, values['browser-profile']);
     const outcome = await resumeCommand(
-      buildWorkflowDeps(store, capabilities),
+      buildWorkflowDeps(store, resolveCapabilities),
       id,
       values.decision ?? 'resumed',
     );
@@ -635,8 +636,9 @@ export async function main(argv: string[]): Promise<number> {
   if (ref === undefined || extra !== undefined) {
     throw new Error('run requires exactly one owner/repo#123 reference.');
   }
-  const capabilities = await browserImplementationCapabilities(buildBrowserRuntime(), values['browser-profile']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, capabilities), ref);
+  const runtime = buildBrowserRuntime();
+  const resolveCapabilities = async () => await browserImplementationCapabilities(runtime, values['browser-profile']);
+  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref);
   printOutcome(outcome);
   return outcome.outcome === 'failed' ? 1 : 0;
 }

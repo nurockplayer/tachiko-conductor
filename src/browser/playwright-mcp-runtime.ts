@@ -204,7 +204,10 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         {
           cwd: this.runtimeRoot,
           env: this.env,
-          stdio: 'ignore',
+          // The pinned Playwright MCP server treats stdin EOF as a parent-death
+          // signal and closes its browser before exiting. Keeping this pipe open
+          // gives abrupt owner termination an identity-safe cleanup path.
+          stdio: ['pipe', 'ignore', 'ignore'],
         },
       );
     } catch (error) {
@@ -250,9 +253,23 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     ]);
     startupAbort.abort();
     if (startup.kind === 'startup-error') {
+      writeJsonAtomic(metadataPath, {
+        ...started,
+        state: 'stopping',
+        health: 'stopping',
+        errorCode: BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT,
+      } satisfies BrowserRuntimeSnapshot);
       child.kill('SIGTERM');
-      await Promise.race([childOutcome, delay(1_000)]);
-      if (processIsAlive(child.pid)) child.kill('SIGKILL');
+      const terminated = await Promise.race([
+        childOutcome.then(() => true),
+        delay(stopTimeoutMs).then(() => false),
+      ]);
+      if (!terminated) {
+        child.kill('SIGKILL');
+        // Profile ownership must remain held until the process exit is
+        // observed, not merely until a signal has been sent.
+        await childOutcome;
+      }
       const failed: BrowserRuntimeSnapshot = {
         ...started,
         state: 'failed',
@@ -333,31 +350,34 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     if (snapshot.state !== 'starting' && snapshot.state !== 'ready' && snapshot.state !== 'stopping') {
       return snapshot;
     }
+    const ownerAlive = processIsAlive(snapshot.ownerPid);
     if (!processIsAlive(snapshot.pid)) {
+      const ownerExited = !ownerAlive || snapshot.errorCode === BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED;
       const finalSnapshot: BrowserRuntimeSnapshot =
-        snapshot.state === 'stopping'
+        snapshot.state === 'stopping' && !ownerExited
           ? { ...snapshot, state: 'stopped', health: 'stopped', stoppedAt: this.now() }
           : {
               ...snapshot,
               state: 'failed',
               health: 'failed',
               stoppedAt: this.now(),
-              errorCode: BROWSER_RUNTIME_ERROR_CODE.CHILD_EXITED,
+              errorCode: ownerExited
+                ? BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED
+                : BROWSER_RUNTIME_ERROR_CODE.CHILD_EXITED,
             };
       writeJsonAtomic(metadataPath, finalSnapshot);
       releaseLock(path.join(this.profileDir(profile), '.tachiko-runtime-lock.json'), snapshot.runtimeId);
       return finalSnapshot;
     }
-    if (!processIsAlive(snapshot.ownerPid)) {
-      const failed: BrowserRuntimeSnapshot = {
+    if (!ownerAlive) {
+      const stopping: BrowserRuntimeSnapshot = {
         ...snapshot,
-        state: 'failed',
-        health: 'failed',
-        stoppedAt: this.now(),
+        state: 'stopping',
+        health: 'stopping',
         errorCode: BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED,
       };
-      writeJsonAtomic(metadataPath, failed);
-      return failed;
+      writeJsonAtomic(metadataPath, stopping);
+      return stopping;
     }
     if (snapshot.state === 'ready') {
       const healthy = await this.readinessProbe(snapshot.endpoint);

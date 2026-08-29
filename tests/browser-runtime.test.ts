@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import os from 'node:os';
@@ -17,6 +17,7 @@ import {
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const FAKE_MCP = fileURLToPath(new URL('./fixtures/fake-playwright-mcp.mjs', import.meta.url));
+const RUNTIME_OWNER = fileURLToPath(new URL('./fixtures/browser-runtime-owner.ts', import.meta.url));
 const cleanups: Array<() => Promise<void> | void> = [];
 
 async function tcpReadinessProbe(endpoint: string): Promise<boolean> {
@@ -51,6 +52,23 @@ async function freePort(): Promise<number> {
       server.close((error) => (error === undefined ? resolve(address.port) : reject(error)));
     });
   });
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error('Timed out waiting for condition');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function tempRuntime(env: NodeJS.ProcessEnv = process.env): {
@@ -243,6 +261,25 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(failed.exitCode, 24);
   });
 
+  it('does not release profile ownership until a startup-timeout child has actually exited', async () => {
+    const childPidPath = path.join(os.tmpdir(), `tachiko-browser-child-${process.pid}-${Date.now()}.pid`);
+    cleanups.push(() => rmSync(childPidPath, { force: true }));
+    const { runtime, profileRoot } = tempRuntime({
+      ...process.env,
+      FAKE_MCP_MODE: 'hang-ignore-term',
+      FAKE_MCP_PID_PATH: childPidPath,
+    });
+
+    await assert.rejects(
+      runtime.start({ profile: 'timeout-cleanup', port: await freePort(), startupTimeoutMs: 500, stopTimeoutMs: 150 }),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT),
+    );
+
+    const childPid = Number(readFileSync(childPidPath, 'utf8').trim());
+    assert.equal(processIsAlive(childPid), false);
+    assert.equal(existsSync(path.join(profileRoot, 'timeout-cleanup', '.tachiko-runtime-lock.json')), false);
+  });
+
   it('returns null for a profile with no runtime metadata and refuses to stop it', async () => {
     const { runtime } = tempRuntime();
     assert.equal(await runtime.status('missing'), null);
@@ -280,13 +317,63 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     );
 
     const status = await runtime.status('reused');
-    assert.equal(status?.state, 'failed');
+    assert.equal(status?.state, 'stopping');
     assert.equal(status?.errorCode, BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED);
     await assert.rejects(
       runtime.stop('reused'),
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING),
     );
     assert.doesNotThrow(() => process.kill(unrelated.pid!, 0));
+  });
+
+  it('cleans up the owned browser child and profile lock after the foreground owner is killed', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-owner-death-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const profileRoot = path.join(root, 'profiles');
+    const runtimeRoot = path.join(root, 'runtimes');
+    const snapshotPath = path.join(root, 'owner-snapshot.json');
+    const childPidPath = path.join(root, 'mcp-child.pid');
+    const port = await freePort();
+    const owner = spawn(
+      process.execPath,
+      ['--import', 'tsx', RUNTIME_OWNER, profileRoot, runtimeRoot, REPO_ROOT, FAKE_MCP, 'orphan-safe', String(port), snapshotPath],
+      { stdio: 'ignore', env: { ...process.env, FAKE_MCP_PID_PATH: childPidPath } },
+    );
+    cleanups.push(() => {
+      owner.kill('SIGKILL');
+    });
+    await waitUntil(() => existsSync(snapshotPath) && existsSync(childPidPath));
+    const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as { pid: number };
+    const mcpPid = Number(readFileSync(childPidPath, 'utf8').trim());
+    cleanups.push(() => {
+      try { process.kill(snapshot.pid, 'SIGKILL'); } catch {}
+      try { process.kill(mcpPid, 'SIGKILL'); } catch {}
+    });
+
+    owner.kill('SIGKILL');
+    await new Promise<void>((resolve) => owner.once('exit', () => resolve()));
+    const observer = new ManagedPlaywrightMcpRuntime({
+      profileRoot,
+      runtimeRoot,
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+      readinessProbe: tcpReadinessProbe,
+    });
+    let terminal = await observer.status('orphan-safe');
+    const deadline = Date.now() + 5_000;
+    while (terminal?.state !== 'failed' && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      terminal = await observer.status('orphan-safe');
+    }
+
+    assert.equal(terminal?.state, 'failed');
+    assert.equal(terminal?.errorCode, BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED);
+    assert.equal(processIsAlive(snapshot.pid), false);
+    assert.equal(processIsAlive(mcpPid), false);
+    assert.equal(existsSync(path.join(profileRoot, 'orphan-safe', '.tachiko-runtime-lock.json')), false);
+
+    const restarted = await observer.start({ profile: 'orphan-safe', port: await freePort() });
+    await restarted.stop();
   });
 
   it('never overwrites a newer runtime identity while an older external stop completes', async () => {

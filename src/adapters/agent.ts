@@ -15,6 +15,9 @@ export interface McpHttpCapability {
   readonly endpoint: string;
 }
 
+/** Resolve ephemeral capabilities immediately before an implementation call. */
+export type ImplementationCapabilityResolver = () => Promise<readonly McpHttpCapability[] | undefined>;
+
 export interface ImplementationRequest {
   /** The work item: a single issue or a whole branch. */
   readonly target: Target;
