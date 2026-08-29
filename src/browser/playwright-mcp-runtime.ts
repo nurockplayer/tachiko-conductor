@@ -657,6 +657,40 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         { profileRoot: this.profileRoot, runtimeRoot: this.runtimeRoot },
       );
     }
+
+    // Resolve through the deepest existing ancestor before creating either
+    // root. This catches a non-existent child beneath a symlink into the
+    // repository (or the other root) without materializing the invalid path.
+    const repository = realpathSync(this.repositoryRoot);
+    const resolvedProfileRoot = resolveThroughExistingAncestor(this.profileRoot);
+    const resolvedRuntimeRoot = resolveThroughExistingAncestor(this.runtimeRoot);
+    for (const [name, configuredRoot, resolvedRoot] of [
+      ['profile root', this.profileRoot, resolvedProfileRoot],
+      ['runtime root', this.runtimeRoot, resolvedRuntimeRoot],
+    ] as const) {
+      if (isWithin(repository, resolvedRoot)) {
+        throw new BrowserRuntimeError(
+          BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+          `Browser ${name} must resolve outside the repository.`,
+          { repositoryRoot: repository, configuredRoot, resolvedRoot },
+        );
+      }
+    }
+    if (
+      isWithin(resolvedProfileRoot, resolvedRuntimeRoot) ||
+      isWithin(resolvedRuntimeRoot, resolvedProfileRoot)
+    ) {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+        'Browser profile and runtime roots must resolve to disjoint locations.',
+        {
+          profileRoot: this.profileRoot,
+          runtimeRoot: this.runtimeRoot,
+          resolvedProfileRoot,
+          resolvedRuntimeRoot,
+        },
+      );
+    }
   }
 
   private validateResolvedStorage(paths: readonly string[]): void {
@@ -823,6 +857,17 @@ function endpointFor(host: string, port: number): string {
 function isWithin(base: string, target: string): boolean {
   const relative = path.relative(base, target);
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function resolveThroughExistingAncestor(configuredPath: string): string {
+  let existingAncestor = configuredPath;
+  while (!existsSync(existingAncestor)) {
+    const parent = path.dirname(existingAncestor);
+    if (parent === existingAncestor) break;
+    existingAncestor = parent;
+  }
+  const resolvedAncestor = realpathSync(existingAncestor);
+  return path.resolve(resolvedAncestor, path.relative(existingAncestor, configuredPath));
 }
 
 function writeJsonAtomic(file: string, value: unknown): void {

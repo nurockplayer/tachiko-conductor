@@ -206,6 +206,26 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
     );
 
+    const prospectiveRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-prospective-symlink-'));
+    cleanups.push(() => rmSync(prospectiveRoot, { recursive: true, force: true }));
+    const prospectiveRepository = path.join(prospectiveRoot, 'repository');
+    const external = path.join(prospectiveRoot, 'external');
+    mkdirSync(prospectiveRepository, { recursive: true });
+    mkdirSync(external, { recursive: true });
+    symlinkSync(prospectiveRepository, path.join(external, 'repository-alias'), 'dir');
+    const notYetCreated = path.join(prospectiveRepository, 'must-not-be-created');
+    const prospectiveSymlinked = new ManagedPlaywrightMcpRuntime({
+      profileRoot: path.join(external, 'repository-alias', 'must-not-be-created'),
+      runtimeRoot: path.join(prospectiveRoot, 'runtimes'),
+      repositoryRoot: prospectiveRepository,
+      playwrightCliPath: FAKE_MCP,
+    });
+    await assert.rejects(
+      prospectiveSymlinked.start({ profile: 'safe', port: await freePort() }),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
+    );
+    assert.equal(existsSync(notYetCreated), false, 'invalid storage must be rejected before it is created');
+
     const statusSymlinkRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-status-symlink-'));
     cleanups.push(() => rmSync(statusSymlinkRoot, { recursive: true, force: true }));
     const linkedRuntimes = path.join(statusSymlinkRoot, 'runtimes');
