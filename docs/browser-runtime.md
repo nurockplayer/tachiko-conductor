@@ -29,7 +29,10 @@ Override the two roots with `TACHIKO_BROWSER_PROFILE_ROOT` and
 repository. Each named profile and runtime output directory must also resolve
 inside its corresponding dedicated root; symlinks cannot redirect them to a
 personal or unrelated browser profile. Directories and metadata are created
-with user-only permissions.
+with user-only permissions. On POSIX, startup rejects an existing storage
+directory with group or world permissions and reports the exact path to make
+private with `chmod 700` before retrying; Windows uses the current user's
+inherited ACL on the dedicated root.
 Runtime metadata contains the named runtime/profile, foreground owner PID,
 child PID, configured stop timeout, endpoint, lifecycle
 timestamps, readiness/health, and typed exit information. It never contains

@@ -6,6 +6,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import net from 'node:net';
@@ -215,11 +216,13 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     mkdirSync(this.profileRoot, { recursive: true, mode: 0o700 });
     mkdirSync(this.runtimeRoot, { recursive: true, mode: 0o700 });
     this.validateResolvedStorage([this.profileRoot, this.runtimeRoot]);
+    this.validatePrivateDirectories([this.profileRoot, this.runtimeRoot]);
     mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     mkdirSync(outputDir, { recursive: true, mode: 0o700 });
     this.validateResolvedStorage([profileDir, outputDir]);
     this.validateDedicatedChild(profileDir, this.profileRoot, 'profile directory');
     this.validateDedicatedChild(outputDir, this.runtimeRoot, 'runtime output directory');
+    this.validatePrivateDirectories([profileDir, outputDir]);
     const lockPath = path.join(profileDir, '.tachiko-runtime-lock.json');
     const startupGuard = acquireLock(
       lockPath,
@@ -640,6 +643,23 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         `Browser ${resource} must resolve inside its dedicated Tachiko storage root.`,
         { configuredRoot, resolvedRoot, configuredPath, resolvedPath },
       );
+    }
+  }
+
+  private validatePrivateDirectories(directories: readonly string[]): void {
+    // Node's POSIX mode bits do not represent Windows ACLs. Windows storage
+    // remains under the current user's dedicated root and inherits its ACL.
+    if (process.platform === 'win32') return;
+    for (const directory of directories) {
+      const mode = statSync(directory).mode & 0o777;
+      const exposedPermissions = mode & 0o077;
+      if (exposedPermissions !== 0) {
+        throw new BrowserRuntimeError(
+          BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+          `Browser storage directory ${directory} must be private; set its permissions to 0700 and retry.`,
+          { directory, permissions: `0${mode.toString(8)}` },
+        );
+      }
     }
   }
 

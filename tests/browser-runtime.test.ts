@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawn } from 'node:child_process';
 import net from 'node:net';
 import os from 'node:os';
@@ -254,7 +254,7 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     const profileRoot = path.join(root, 'profiles');
     const runtimeRoot = path.join(root, 'runtimes');
     const profileDir = path.join(profileRoot, 'pid-reuse');
-    mkdirSync(profileDir, { recursive: true });
+    mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     writeFileSync(
       path.join(profileDir, '.tachiko-runtime-lock.json'),
       `${JSON.stringify({ version: 1, runtimeId: 'old-runtime', pid: process.pid, processIdentity: 'old-process' })}\n`,
@@ -278,6 +278,32 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     await handle.stop();
   });
 
+  it('rejects existing browser storage directories that expose data to other local users', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-permissions-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const profileRoot = path.join(root, 'profiles');
+    const runtimeRoot = path.join(root, 'runtimes');
+    mkdirSync(profileRoot, { mode: 0o755 });
+    mkdirSync(runtimeRoot, { mode: 0o700 });
+    chmodSync(profileRoot, 0o755);
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot,
+      runtimeRoot,
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+    });
+
+    await assert.rejects(
+      runtime.start({ profile: 'private-only', port: await freePort() }),
+      (error) => {
+        assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG);
+        assert.match((error as Error).message, /permissions to 0700/);
+        return true;
+      },
+    );
+    assert.equal(existsSync(path.join(profileRoot, 'private-only')), false);
+  });
+
   it('reports an occupied port with a typed actionable error', async () => {
     const server = net.createServer();
     await new Promise<void>((resolve, reject) => {
@@ -298,7 +324,7 @@ describe('ManagedPlaywrightMcpRuntime', () => {
   it('fails actionably while profile ownership is being atomically updated', async () => {
     const { runtime, profileRoot } = tempRuntime();
     const profileDir = path.join(profileRoot, 'guarded');
-    mkdirSync(profileDir, { recursive: true });
+    mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     writeFileSync(path.join(profileDir, '.tachiko-runtime-lock.guard'), '{"pid":999999999}\n', { mode: 0o600 });
 
     await assert.rejects(
