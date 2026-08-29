@@ -482,26 +482,28 @@ function serializeBrowserError(error: unknown): Readonly<Record<string, unknown>
 }
 
 interface BrowserSignalSource {
-  once(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  on(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
   removeListener(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
 }
 
 export async function waitForOwnedBrowser(
-  start: () => Promise<BrowserStartCommandResult>,
+  start: (signal: AbortSignal) => Promise<BrowserStartCommandResult>,
   onStarted: (result: BrowserStartCommandResult) => void = () => undefined,
   signalSource: BrowserSignalSource = process,
 ): Promise<BrowserRuntimeSnapshot> {
   let stopping = false;
   let handle: BrowserRuntimeHandle | undefined;
+  const startupAbort = new AbortController();
   const stop = () => {
     if (stopping) return;
     stopping = true;
+    startupAbort.abort();
     if (handle !== undefined) void handle.stop().catch(() => undefined);
   };
-  signalSource.once('SIGINT', stop);
-  signalSource.once('SIGTERM', stop);
+  signalSource.on('SIGINT', stop);
+  signalSource.on('SIGTERM', stop);
   try {
-    const result = await start();
+    const result = await start(startupAbort.signal);
     handle = result.handle;
     onStarted(result);
     if (stopping) return await handle.stop();
@@ -546,11 +548,12 @@ export async function main(argv: string[]): Promise<number> {
         const port = values.port === undefined ? undefined : parseBrowserPort(values.port);
         const shared = { ...(port === undefined ? {} : { port }), ...(values.host === undefined ? {} : { host: values.host }) };
         const finalSnapshot = await waitForOwnedBrowser(
-          async () =>
+          async (signal) =>
             subcommand === 'bootstrap'
-              ? await browserBootstrapCommand(runtime, profile, shared)
+              ? await browserBootstrapCommand(runtime, profile, { ...shared, signal })
               : await browserStartCommand(runtime, profile, {
                   ...shared,
+                  signal,
                   headless: values.headed === true ? false : true,
                 }),
           printBrowserStart,

@@ -77,6 +77,8 @@ export interface StartBrowserRuntimeOptions {
   readonly headless?: boolean;
   readonly startupTimeoutMs?: number;
   readonly stopTimeoutMs?: number;
+  /** Cancels only this startup attempt; it never targets another profile owner. */
+  readonly signal?: AbortSignal;
 }
 
 export interface BrowserRuntimeHandle {
@@ -219,6 +221,13 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     const stopTimeoutMs = validateTimeout(options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS, 'stopTimeoutMs');
     const port = options.port === undefined ? await findAvailablePort(host) : validatePort(options.port);
     await assertPortAvailable(host, port);
+    if (options.signal?.aborted === true) {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING,
+        `Browser startup for profile "${options.profile}" was cancelled before launch.`,
+        { profile: options.profile },
+      );
+    }
 
     const runtimeId = randomUUID();
     const profileDir = this.profileDir(options.profile);
@@ -322,10 +331,11 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         (error: unknown) => ({ kind: 'startup-error' as const, error }),
       ),
       waitForStopRequest(stopRequestPath, startupAbort.signal).then(() => ({ kind: 'stop-request' as const })),
+      waitForAbort(options.signal, startupAbort.signal).then(() => ({ kind: 'abort-request' as const })),
       childOutcome,
     ]);
     startupAbort.abort();
-    if (startup.kind === 'stop-request') {
+    if (startup.kind === 'stop-request' || startup.kind === 'abort-request') {
       const stopping: BrowserRuntimeSnapshot = { ...started, state: 'stopping', health: 'stopping' };
       await publish(metadataPath, stopping);
       const finalization = childOutcome.then(async (outcome) => {
@@ -1193,6 +1203,19 @@ function waitForStopRequest(file: string, signal: AbortSignal): Promise<void> {
     }, 25);
     timer.unref();
     signal.addEventListener('abort', () => clearInterval(timer), { once: true });
+  });
+}
+
+function waitForAbort(signal: AbortSignal | undefined, cleanupSignal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (signal === undefined) return;
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const aborted = () => resolve();
+    signal.addEventListener('abort', aborted, { once: true });
+    cleanupSignal.addEventListener('abort', () => signal.removeEventListener('abort', aborted), { once: true });
   });
 }
 

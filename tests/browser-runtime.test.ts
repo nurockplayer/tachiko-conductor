@@ -543,6 +543,38 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     await startRejected;
   });
 
+  it('cancels the exact startup attempt through its AbortSignal', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-starting-abort-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const profileRoot = path.join(root, 'profiles');
+    const runtimeRoot = path.join(root, 'runtimes');
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot,
+      runtimeRoot,
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+      readinessProbe: async () => await new Promise<boolean>(() => undefined),
+    });
+    const controller = new AbortController();
+    const starting = runtime.start({
+      profile: 'abort-while-starting',
+      port: await freePort(),
+      startupTimeoutMs: 5_000,
+      stopTimeoutMs: 500,
+      signal: controller.signal,
+    });
+    const startRejected = assert.rejects(
+      starting,
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING),
+    );
+    await waitUntil(() => existsSync(path.join(runtimeRoot, 'abort-while-starting.json')));
+
+    controller.abort();
+    await startRejected;
+    assert.equal(existsSync(path.join(profileRoot, 'abort-while-starting', '.tachiko-runtime-lock.json')), false);
+    assert.equal((await runtime.status('abort-while-starting'))?.state, 'stopped');
+  });
+
   it('returns null for a profile with no runtime metadata and refuses to stop it', async () => {
     const { runtime } = tempRuntime();
     assert.equal(await runtime.status('missing'), null);

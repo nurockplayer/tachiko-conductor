@@ -126,7 +126,11 @@ describe('browser CLI command layer', () => {
     };
 
     const finalSnapshot = await waitForOwnedBrowser(
-      async () => {
+      async (signal) => {
+        assert.equal(signals.listenerCount('SIGINT'), 1);
+        assert.equal(signal.aborted, false);
+        signals.emit('SIGINT');
+        assert.equal(signal.aborted, true);
         assert.equal(signals.listenerCount('SIGINT'), 1);
         signals.emit('SIGINT');
         return {
@@ -151,7 +155,10 @@ describe('browser CLI command layer', () => {
     const signals = new EventEmitter();
     await assert.rejects(
       waitForOwnedBrowser(
-        async () => {
+        async (signal) => {
+          signals.emit('SIGTERM');
+          assert.equal(signal.aborted, true);
+          assert.equal(signals.listenerCount('SIGTERM'), 1);
           signals.emit('SIGTERM');
           throw new Error('profile is already owned by another runtime');
         },
