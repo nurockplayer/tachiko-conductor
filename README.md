@@ -77,10 +77,14 @@ an unreviewed SHA.
 
 ```bash
 pnpm install
+pnpm browser:install # download the pinned Chromium used by the MCP integration test
 pnpm test        # run the test suite (node:test + tsx)
 pnpm typecheck   # type-check src and tests
 pnpm build       # emit dist/ for the `tachiko` bin
 ```
+
+On Linux CI or a minimal container, install Chromium and its system packages
+with `pnpm exec playwright install --with-deps chromium` before `pnpm test`.
 
 ## CLI
 

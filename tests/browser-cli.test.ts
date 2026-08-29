@@ -110,9 +110,8 @@ describe('browser CLI command layer', () => {
     assert.equal(resumeCommandHint('run-123'), 'tachiko run resume run-123 --decision <choice>');
   });
 
-  it('installs signal cleanup before startup and stops the handle if interruption arrives early', async () => {
+  it('installs signal cleanup before startup and stops only the returned handle after early interruption', async () => {
     const signals = new EventEmitter();
-    let startupStops = 0;
     let handleStops = 0;
     const stopped = { ...READY, state: 'stopped', health: 'stopped' } as const;
     const handle: BrowserRuntimeHandle = {
@@ -138,17 +137,29 @@ describe('browser CLI command layer', () => {
           codex: { configOverride: '' },
         };
       },
-      async () => {
-        startupStops += 1;
-        throw new Error('metadata is not available yet');
-      },
       () => undefined,
       signals,
     );
 
     assert.equal(finalSnapshot.state, 'stopped');
-    assert.equal(startupStops, 1);
     assert.equal(handleStops, 1);
+    assert.equal(signals.listenerCount('SIGINT'), 0);
+    assert.equal(signals.listenerCount('SIGTERM'), 0);
+  });
+
+  it('does not issue a profile-wide stop when an interrupted startup returns no handle', async () => {
+    const signals = new EventEmitter();
+    await assert.rejects(
+      waitForOwnedBrowser(
+        async () => {
+          signals.emit('SIGTERM');
+          throw new Error('profile is already owned by another runtime');
+        },
+        () => undefined,
+        signals,
+      ),
+      /already owned by another runtime/,
+    );
     assert.equal(signals.listenerCount('SIGINT'), 0);
     assert.equal(signals.listenerCount('SIGTERM'), 0);
   });

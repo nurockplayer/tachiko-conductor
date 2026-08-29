@@ -177,7 +177,16 @@ them as authorization or CAPTCHA/transaction protection.
 The default suite starts the real pinned Playwright MCP server, navigates only
 to a localhost fixture, writes local storage, stops, restarts the same profile,
 and verifies that the state persists. It requires no model, paid API, or
-external website.
+external website. Provision the browser version required by the pinned MCP
+dependency before the first run:
+
+```bash
+pnpm browser:install
+```
+
+Linux CI and minimal containers should use
+`pnpm exec playwright install --with-deps chromium` so required OS packages are
+installed as well.
 
 The real-agent path is deliberately separate and opt-in because it invokes the
 locally authenticated Codex CLI once:
@@ -199,5 +208,6 @@ Current upstream references:
 - [Playwright MCP configuration](https://playwright.dev/mcp/configuration/options)
 - [Playwright MCP profile and state](https://playwright.dev/mcp/configuration/user-profile)
 - [Connecting to existing browsers](https://playwright.dev/mcp/configuration/browser-extension)
+- [Installing Playwright browsers](https://playwright.dev/docs/browsers)
 - [Codex MCP configuration](https://developers.openai.com/codex/extend/mcp)
 - [Codex non-interactive mode](https://developers.openai.com/codex/non-interactive-mode)

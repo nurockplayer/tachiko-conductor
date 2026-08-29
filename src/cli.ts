@@ -488,7 +488,6 @@ interface BrowserSignalSource {
 
 export async function waitForOwnedBrowser(
   start: () => Promise<BrowserStartCommandResult>,
-  stopStarting: () => Promise<BrowserRuntimeSnapshot>,
   onStarted: (result: BrowserStartCommandResult) => void = () => undefined,
   signalSource: BrowserSignalSource = process,
 ): Promise<BrowserRuntimeSnapshot> {
@@ -497,11 +496,7 @@ export async function waitForOwnedBrowser(
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    if (handle === undefined) {
-      void stopStarting().catch(() => undefined);
-    } else {
-      void handle.stop().catch(() => undefined);
-    }
+    if (handle !== undefined) void handle.stop().catch(() => undefined);
   };
   signalSource.once('SIGINT', stop);
   signalSource.once('SIGTERM', stop);
@@ -558,7 +553,6 @@ export async function main(argv: string[]): Promise<number> {
                   ...shared,
                   headless: values.headed === true ? false : true,
                 }),
-          async () => await runtime.stop(profile),
           printBrowserStart,
         );
         if (finalSnapshot.state === 'failed') {
