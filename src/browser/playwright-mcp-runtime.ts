@@ -327,7 +327,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
             ...(outcome.kind === 'exit' ? { exitCode: outcome.code, exitSignal: outcome.signal } : {}),
           }
         : failedSnapshot(current?.runtimeId === runtimeId ? current : ready, outcome, this.now());
-      writeJsonAtomic(metadataPath, finalSnapshot);
+      if (current?.runtimeId === runtimeId) writeJsonAtomic(metadataPath, finalSnapshot);
       rmSync(stopRequestPath, { force: true });
       releaseLock(lockPath, runtimeId);
       return finalSnapshot;
@@ -471,6 +471,11 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     timeoutMs: number,
   ): Promise<BrowserRuntimeSnapshot> {
     const current = await this.status(snapshot.profile);
+    if (current?.runtimeId !== snapshot.runtimeId) {
+      // A retained handle belongs only to the child it was created with. It
+      // must never transition or stop a replacement that reused the profile.
+      return await completion;
+    }
     if (current === null || (current.state !== 'starting' && current.state !== 'ready' && current.state !== 'stopping')) {
       return current ?? snapshot;
     }

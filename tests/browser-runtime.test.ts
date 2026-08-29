@@ -457,4 +457,46 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(status?.state, 'failed');
     assert.equal(status?.errorCode, BROWSER_RUNTIME_ERROR_CODE.CHILD_EXITED);
   });
+
+  it('does not let old child completion overwrite replacement metadata', async () => {
+    const { runtime, runtimeRoot } = tempRuntime();
+    const handle = await runtime.start({ profile: 'completion-identity', port: await freePort() });
+    const replacement = {
+      ...handle.snapshot,
+      runtimeId: 'replacement-runtime',
+      pid: process.pid,
+      ownerPid: process.pid,
+      endpoint: 'http://127.0.0.1:65532/mcp',
+      port: 65532,
+      startedAt: '2026-08-29T01:00:00.000Z',
+    } as const;
+    const metadataPath = path.join(runtimeRoot, 'completion-identity.json');
+    writeFileSync(metadataPath, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+
+    process.kill(handle.snapshot.pid, 'SIGTERM');
+    const oldFinal = await handle.waitForExit();
+    assert.equal(oldFinal.runtimeId, handle.snapshot.runtimeId);
+    assert.equal(oldFinal.state, 'failed');
+    const persisted = JSON.parse(readFileSync(metadataPath, 'utf8')) as { runtimeId: string };
+    assert.equal(persisted.runtimeId, replacement.runtimeId);
+  });
+
+  it('does not let a stale handle stop a replacement runtime for the same profile', async () => {
+    const { runtime } = tempRuntime();
+    const oldHandle = await runtime.start({ profile: 'stale-handle', port: await freePort() });
+    process.kill(oldHandle.snapshot.pid, 'SIGTERM');
+    await oldHandle.waitForExit();
+
+    const replacement = await runtime.start({ profile: 'stale-handle', port: await freePort() });
+    cleanups.push(async () => {
+      await replacement.stop().catch(() => undefined);
+    });
+    const oldResult = await oldHandle.stop();
+
+    assert.equal(oldResult.runtimeId, oldHandle.snapshot.runtimeId);
+    const replacementStatus = await runtime.status('stale-handle');
+    assert.equal(replacementStatus?.runtimeId, replacement.snapshot.runtimeId);
+    assert.equal(replacementStatus?.state, 'ready');
+    await replacement.stop();
+  });
 });
