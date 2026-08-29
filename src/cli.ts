@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
@@ -98,6 +99,23 @@ export function resolveBrowserRoots(
     profileRoot: env.TACHIKO_BROWSER_PROFILE_ROOT ?? path.join(root, 'profiles'),
     runtimeRoot: env.TACHIKO_BROWSER_RUNTIME_ROOT ?? path.join(root, 'runtimes'),
   };
+}
+
+export function resolveRepositoryRoot(
+  cwd: string = process.cwd(),
+  resolveGitTopLevel: (directory: string) => string = (directory) =>
+    execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: directory,
+      encoding: 'utf8',
+      timeout: 2_000,
+    }),
+): string {
+  try {
+    const resolved = resolveGitTopLevel(cwd).trim();
+    return resolved === '' ? path.resolve(cwd) : path.resolve(resolved);
+  } catch {
+    return path.resolve(cwd);
+  }
 }
 
 export function parseBrowserPort(raw: string): number {
@@ -286,7 +304,13 @@ export async function resumeCommand(
   });
 }
 
-function printOutcome(outcome: WorkflowOutcome): void {
+export function resumeCommandHint(runId: string, browserProfile?: string): string {
+  return `tachiko run resume ${runId} --decision <choice>${
+    browserProfile === undefined ? '' : ` --browser-profile ${browserProfile}`
+  }`;
+}
+
+function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
   const { run } = outcome;
   if (outcome.outcome === 'merge_ready') {
     console.log(
@@ -303,7 +327,7 @@ function printOutcome(outcome: WorkflowOutcome): void {
     const interrupt = run.interrupt;
     if (interrupt?.evidence !== undefined) console.log(`Evidence: ${interrupt.evidence}`);
     if ((interrupt?.choices?.length ?? 0) > 0) console.log(`Choices: ${interrupt?.choices?.join(' | ')}`);
-    console.log(`Resume with: tachiko run resume ${run.id} --decision <choice>`);
+    console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
     return;
   }
   console.error(`Run ${run.id}: FAILED — ${outcome.reason}`);
@@ -417,7 +441,7 @@ function buildBrowserRuntime(): ManagedPlaywrightMcpRuntime {
   const roots = resolveBrowserRoots();
   return new ManagedPlaywrightMcpRuntime({
     ...roots,
-    repositoryRoot: process.cwd(),
+    repositoryRoot: resolveRepositoryRoot(),
   });
 }
 
@@ -616,7 +640,7 @@ export async function main(argv: string[]): Promise<number> {
       id,
       values.decision ?? 'resumed',
     );
-    printOutcome(outcome);
+    printOutcome(outcome, values['browser-profile']);
     return outcome.outcome === 'failed' ? 1 : 0;
   }
 
@@ -639,7 +663,7 @@ export async function main(argv: string[]): Promise<number> {
   const runtime = buildBrowserRuntime();
   const resolveCapabilities = async () => await browserImplementationCapabilities(runtime, values['browser-profile']);
   const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref);
-  printOutcome(outcome);
+  printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }
 

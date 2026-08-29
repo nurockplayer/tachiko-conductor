@@ -9,6 +9,8 @@ import {
   browserStopCommand,
   parseBrowserPort,
   resolveBrowserRoots,
+  resolveRepositoryRoot,
+  resumeCommandHint,
 } from '../src/cli.js';
 import type {
   BrowserRuntime,
@@ -80,6 +82,30 @@ describe('browser CLI command layer', () => {
       ),
       { profileRoot: '/var/tachiko/profiles', runtimeRoot: '/var/tachiko/runtimes' },
     );
+  });
+
+  it('uses the Git top-level as the repository boundary when invoked from a subdirectory', () => {
+    assert.equal(
+      resolveRepositoryRoot('/work/repository/src', (cwd) => {
+        assert.equal(cwd, '/work/repository/src');
+        return '/work/repository\n';
+      }),
+      '/work/repository',
+    );
+    assert.equal(
+      resolveRepositoryRoot('/not-a-repository', () => {
+        throw new Error('not git');
+      }),
+      '/not-a-repository',
+    );
+  });
+
+  it('preserves the selected browser profile in takeover resume instructions', () => {
+    assert.equal(
+      resumeCommandHint('run-123', 'github-work'),
+      'tachiko run resume run-123 --decision <choice> --browser-profile github-work',
+    );
+    assert.equal(resumeCommandHint('run-123'), 'tachiko run resume run-123 --decision <choice>');
   });
 
   it('parses browser ports strictly', () => {

@@ -184,6 +184,51 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       symlinked.start({ profile: 'package.json' }),
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
     );
+
+    const statusSymlinkRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-status-symlink-'));
+    cleanups.push(() => rmSync(statusSymlinkRoot, { recursive: true, force: true }));
+    const linkedRuntimes = path.join(statusSymlinkRoot, 'runtimes');
+    symlinkSync(REPO_ROOT, linkedRuntimes, 'dir');
+    const statusSymlinked = new ManagedPlaywrightMcpRuntime({
+      profileRoot: path.join(statusSymlinkRoot, 'profiles'),
+      runtimeRoot: linkedRuntimes,
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+    });
+    await assert.rejects(
+      statusSymlinked.status('safe'),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
+    );
+  });
+
+  it('reclaims a stale lock when a live PID has a different process identity', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-pid-reuse-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const profileRoot = path.join(root, 'profiles');
+    const runtimeRoot = path.join(root, 'runtimes');
+    const profileDir = path.join(profileRoot, 'pid-reuse');
+    mkdirSync(profileDir, { recursive: true });
+    writeFileSync(
+      path.join(profileDir, '.tachiko-runtime-lock.json'),
+      `${JSON.stringify({ version: 1, runtimeId: 'old-runtime', pid: process.pid, processIdentity: 'old-process' })}\n`,
+      { mode: 0o600 },
+    );
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot,
+      runtimeRoot,
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+      readinessProbe: tcpReadinessProbe,
+      processIdentityReader: (pid) => `current-process-${pid}`,
+    });
+
+    const handle = await runtime.start({ profile: 'pid-reuse', port: await freePort() });
+    cleanups.push(async () => {
+      await handle.stop().catch(() => undefined);
+    });
+    assert.equal(handle.snapshot.state, 'ready');
+    assert.doesNotThrow(() => process.kill(process.pid, 0));
+    await handle.stop();
   });
 
   it('reports an occupied port with a typed actionable error', async () => {

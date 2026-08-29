@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import {
   existsSync,
   mkdirSync,
@@ -135,12 +135,14 @@ export interface ManagedPlaywrightMcpRuntimeOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly now?: () => string;
   readonly readinessProbe?: (endpoint: string) => Promise<boolean>;
+  readonly processIdentityReader?: (pid: number) => string | null;
 }
 
 interface RuntimeLock {
   readonly version: 1;
   readonly runtimeId: string;
   readonly pid: number;
+  readonly processIdentity?: string;
 }
 
 type ChildOutcome =
@@ -162,6 +164,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   private readonly env: NodeJS.ProcessEnv;
   private readonly now: () => string;
   private readonly readinessProbe: (endpoint: string) => Promise<boolean>;
+  private readonly processIdentityReader: (pid: number) => string | null;
 
   constructor(options: ManagedPlaywrightMcpRuntimeOptions) {
     this.profileRoot = path.resolve(options.profileRoot);
@@ -171,6 +174,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     this.env = options.env ?? process.env;
     this.now = options.now ?? (() => new Date().toISOString());
     this.readinessProbe = options.readinessProbe ?? probeMcpEndpoint;
+    this.processIdentityReader = options.processIdentityReader ?? readProcessIdentity;
   }
 
   async start(options: StartBrowserRuntimeOptions): Promise<BrowserRuntimeHandle> {
@@ -194,7 +198,12 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     mkdirSync(outputDir, { recursive: true, mode: 0o700 });
     this.validateResolvedStorage([profileDir, outputDir]);
     const lockPath = path.join(profileDir, '.tachiko-runtime-lock.json');
-    const startupGuard = acquireLock(lockPath, { version: 1, runtimeId, pid: process.pid }, options.profile);
+    const startupGuard = acquireLock(
+      lockPath,
+      runtimeLock(runtimeId, process.pid, this.processIdentityReader),
+      options.profile,
+      this.processIdentityReader,
+    );
 
     let child: ChildProcess;
     try {
@@ -228,7 +237,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       releaseOwnedLockWithGuard(lockPath, startupGuard, runtimeId);
       throw childOutcomeError(options.profile, outcome);
     }
-    writeJsonAtomic(lockPath, { version: 1, runtimeId, pid: child.pid } satisfies RuntimeLock);
+    writeJsonAtomic(lockPath, runtimeLock(runtimeId, child.pid, this.processIdentityReader));
     const metadataPath = this.metadataPath(options.profile);
     const started: BrowserRuntimeSnapshot = {
       runtimeId,
@@ -408,6 +417,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   async status(profile: string): Promise<BrowserRuntimeSnapshot | null> {
     this.validateRoots();
     validateProfile(profile);
+    this.validateExistingStorage();
     const metadataPath = this.metadataPath(profile);
     const snapshot = readSnapshot(metadataPath);
     if (snapshot === null) return null;
@@ -449,6 +459,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       const healthy = await this.readinessProbe(snapshot.endpoint);
       // Health probing awaits I/O. Re-read afterward so an owner transition
       // that completed meanwhile wins, and never persist a stale ready view.
+      this.validateExistingStorage();
       const current = readSnapshot(metadataPath);
       if (current === null || current.runtimeId !== snapshot.runtimeId || current.state !== 'ready') {
         return current ?? snapshot;
@@ -478,6 +489,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     // The foreground owner observes this runtime-ID-scoped request and stops
     // its own ChildProcess handle. This process never rewrites lifecycle state
     // or signals a persisted PID, either of which could target a replacement.
+    this.validateExistingStorage();
     writeJsonAtomic(this.stopRequestPath(profile, snapshot.runtimeId), {
       version: 1,
       runtimeId: snapshot.runtimeId,
@@ -582,6 +594,12 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         );
       }
     }
+  }
+
+  private validateExistingStorage(): void {
+    this.validateResolvedStorage(
+      [this.profileRoot, this.runtimeRoot].filter((storagePath) => existsSync(storagePath)),
+    );
   }
 
   private profileDir(profile: string): string {
@@ -703,7 +721,12 @@ function readSnapshot(file: string): BrowserRuntimeSnapshot | null {
 function readLock(file: string): RuntimeLock | null {
   try {
     const value = JSON.parse(readFileSync(file, 'utf8')) as Partial<RuntimeLock>;
-    if (value.version !== 1 || typeof value.runtimeId !== 'string' || typeof value.pid !== 'number') return null;
+    if (
+      value.version !== 1 ||
+      typeof value.runtimeId !== 'string' ||
+      typeof value.pid !== 'number' ||
+      (value.processIdentity !== undefined && typeof value.processIdentity !== 'string')
+    ) return null;
     return value as RuntimeLock;
   } catch (error) {
     if (errorCode(error) === 'ENOENT') return null;
@@ -711,12 +734,24 @@ function readLock(file: string): RuntimeLock | null {
   }
 }
 
-function acquireLock(file: string, lock: RuntimeLock, profile: string): string {
+function acquireLock(
+  file: string,
+  lock: RuntimeLock,
+  profile: string,
+  processIdentityReader: (pid: number) => string | null,
+): string {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const guard = acquireLockGuard(path.dirname(file), profile);
   try {
     const existing = readLock(file);
-    if (existing !== null && processIsAlive(existing.pid)) {
+    const existingIdentity = existing === null ? null : processIdentityReader(existing.pid);
+    const existingOwnerIsLive =
+      existing !== null &&
+      processIsAlive(existing.pid) &&
+      (existing.processIdentity === undefined ||
+        existingIdentity === null ||
+        existing.processIdentity === existingIdentity);
+    if (existingOwnerIsLive) {
       throw new BrowserRuntimeError(
         BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE,
         `Browser profile "${profile}" is already owned by live runtime ${existing.runtimeId} (PID ${existing.pid}).`,
@@ -738,6 +773,29 @@ function acquireLock(file: string, lock: RuntimeLock, profile: string): string {
   } catch (error) {
     rmSync(guard, { force: true });
     throw error;
+  }
+}
+
+function runtimeLock(
+  runtimeId: string,
+  pid: number,
+  processIdentityReader: (pid: number) => string | null,
+): RuntimeLock {
+  const processIdentity = processIdentityReader(pid);
+  return processIdentity === null
+    ? { version: 1, runtimeId, pid }
+    : { version: 1, runtimeId, pid, processIdentity };
+}
+
+function readProcessIdentity(pid: number): string | null {
+  try {
+    const identity = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      timeout: 500,
+    }).trim();
+    return identity === '' ? null : identity;
+  } catch {
+    return null;
   }
 }
 
