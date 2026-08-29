@@ -258,6 +258,43 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     );
   });
 
+  it('rejects equal, nested, and canonically overlapping browser storage roots', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-overlapping-roots-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const shared = path.join(root, 'shared');
+    const nested = path.join(shared, 'runtimes');
+    const linked = path.join(root, 'linked');
+
+    for (const [profileRoot, runtimeRoot] of [
+      [shared, shared],
+      [shared, nested],
+    ] as const) {
+      const runtime = new ManagedPlaywrightMcpRuntime({
+        profileRoot,
+        runtimeRoot,
+        repositoryRoot: REPO_ROOT,
+        playwrightCliPath: FAKE_MCP,
+      });
+      await assert.rejects(
+        runtime.start({ profile: 'overlap', port: await freePort() }),
+        (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
+      );
+    }
+
+    mkdirSync(shared, { recursive: true, mode: 0o700 });
+    symlinkSync(shared, linked, 'dir');
+    const aliased = new ManagedPlaywrightMcpRuntime({
+      profileRoot: shared,
+      runtimeRoot: linked,
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+    });
+    await assert.rejects(
+      aliased.start({ profile: 'alias', port: await freePort() }),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
+    );
+  });
+
   it('reclaims a stale lock when a live PID has a different process identity', async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-pid-reuse-'));
     cleanups.push(() => rmSync(root, { recursive: true, force: true }));

@@ -360,6 +360,10 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
       () => applyTransition(run, { type: 'human_resolved', reason: LIVE_HEAD_SYNC_DECISION, headSha: ' ' }, T0),
       (err: unknown) => err instanceof InvalidTransitionError && err.code === 'empty-head-sha',
     );
+    assert.throws(
+      () => applyTransition(run, { type: 'human_resolved', reason: LIVE_HEAD_SYNC_DECISION }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-head-sha',
+    );
   });
 
   it('authorizes the same exact live-HEAD sync emitted from review states', () => {

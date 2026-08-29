@@ -650,10 +650,36 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         );
       }
     }
+    if (isWithin(this.profileRoot, this.runtimeRoot) || isWithin(this.runtimeRoot, this.profileRoot)) {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+        'Browser profile and runtime roots must be disjoint; equal or nested roots can alias profile and output data.',
+        { profileRoot: this.profileRoot, runtimeRoot: this.runtimeRoot },
+      );
+    }
   }
 
   private validateResolvedStorage(paths: readonly string[]): void {
     const repository = realpathSync(this.repositoryRoot);
+    if (existsSync(this.profileRoot) && existsSync(this.runtimeRoot)) {
+      const resolvedProfileRoot = realpathSync(this.profileRoot);
+      const resolvedRuntimeRoot = realpathSync(this.runtimeRoot);
+      if (
+        isWithin(resolvedProfileRoot, resolvedRuntimeRoot) ||
+        isWithin(resolvedRuntimeRoot, resolvedProfileRoot)
+      ) {
+        throw new BrowserRuntimeError(
+          BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+          'Browser profile and runtime roots must resolve to disjoint locations.',
+          {
+            profileRoot: this.profileRoot,
+            runtimeRoot: this.runtimeRoot,
+            resolvedProfileRoot,
+            resolvedRuntimeRoot,
+          },
+        );
+      }
+    }
     for (const configuredPath of paths) {
       const resolvedPath = realpathSync(configuredPath);
       if (isWithin(repository, resolvedPath)) {

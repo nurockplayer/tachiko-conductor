@@ -136,7 +136,6 @@ const HEAD_UPDATING_TRANSITIONS: ReadonlySet<TransitionType> = new Set([
 function isAuthorizedHumanHeadSync(run: Run, input: TransitionInput): boolean {
   return (
     input.type === 'human_resolved' &&
-    input.headSha !== undefined &&
     input.reason?.trim() === LIVE_HEAD_SYNC_DECISION &&
     run.state === 'NEEDS_HUMAN' &&
     canSynchronizeInterruptedHead(run.interruptedFrom) &&
@@ -244,6 +243,14 @@ function assertPayload(run: Run, input: TransitionInput): void {
       from,
       input.type,
       'Live-HEAD synchronization requires a non-empty exact HEAD SHA.',
+    );
+  }
+  if (authorizedHumanHeadSync && input.headSha === undefined) {
+    throw new InvalidTransitionError(
+      'missing-head-sha',
+      from,
+      input.type,
+      'Live-HEAD synchronization requires an exact HEAD SHA.',
     );
   }
   // Event and result semantics must agree: an agent event carries a result
