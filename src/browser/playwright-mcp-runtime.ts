@@ -161,6 +161,7 @@ export interface ManagedPlaywrightMcpRuntimeOptions {
   readonly processIdentityReader?: (pid: number) => string | null | undefined;
   readonly platform?: NodeJS.Platform;
   readonly windowsAclInspector?: (directory: string) => boolean;
+  readonly jsonWriter?: (file: string, value: unknown) => void;
 }
 
 interface RuntimeLock {
@@ -193,6 +194,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   private readonly processIdentityReader: (pid: number) => string | null | undefined;
   private readonly platform: NodeJS.Platform;
   private readonly windowsAclInspector: (directory: string) => boolean;
+  private readonly jsonWriter: (file: string, value: unknown) => void;
 
   constructor(options: ManagedPlaywrightMcpRuntimeOptions) {
     this.profileRoot = path.resolve(options.profileRoot);
@@ -205,6 +207,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     this.processIdentityReader = options.processIdentityReader ?? readProcessIdentity;
     this.platform = options.platform ?? process.platform;
     this.windowsAclInspector = options.windowsAclInspector ?? inspectWindowsDirectoryAcl;
+    this.jsonWriter = options.jsonWriter ?? writeJsonAtomic;
   }
 
   async start(options: StartBrowserRuntimeOptions): Promise<BrowserRuntimeHandle> {
@@ -271,7 +274,24 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       releaseOwnedLockWithGuard(lockPath, startupGuard, runtimeId);
       throw childOutcomeError(options.profile, outcome);
     }
-    writeJsonAtomic(lockPath, {
+    const failPublication = async (error: unknown): Promise<never> => {
+      await terminateSpawnedChild(child, childOutcome, stopTimeoutMs, () => {
+        releaseOwnedLockWithGuard(lockPath, startupGuard, runtimeId);
+      });
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.SPAWN_FAILED,
+        `Could not publish lifecycle state for browser profile "${options.profile}"; termination was requested and ownership is released only after the spawned process exits.`,
+        { profile: options.profile, runtimeId, cause: errorMessage(error) },
+      );
+    };
+    const publish = async (file: string, value: unknown): Promise<void> => {
+      try {
+        this.jsonWriter(file, value);
+      } catch (error) {
+        await failPublication(error);
+      }
+    };
+    await publish(lockPath, {
       version: 1,
       runtimeId,
       pid: child.pid,
@@ -292,7 +312,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       health: 'starting',
       startedAt: this.now(),
     };
-    writeJsonAtomic(metadataPath, started);
+    await publish(metadataPath, started);
     const stopRequestPath = this.stopRequestPath(options.profile, runtimeId);
 
     const startupAbort = new AbortController();
@@ -307,7 +327,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     startupAbort.abort();
     if (startup.kind === 'stop-request') {
       const stopping: BrowserRuntimeSnapshot = { ...started, state: 'stopping', health: 'stopping' };
-      writeJsonAtomic(metadataPath, stopping);
+      await publish(metadataPath, stopping);
       const finalization = childOutcome.then(async (outcome) => {
         const stopped: BrowserRuntimeSnapshot = {
           ...stopping,
@@ -340,7 +360,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       );
     }
     if (startup.kind === 'startup-error') {
-      writeJsonAtomic(metadataPath, {
+      await publish(metadataPath, {
         ...started,
         state: 'stopping',
         health: 'stopping',
@@ -393,10 +413,11 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       health: 'ready',
       readyAt: this.now(),
     };
+    await publish(metadataPath, ready);
     try {
-      writeJsonAtomic(metadataPath, ready);
-    } finally {
       rmSync(startupGuard, { force: true });
+    } catch (error) {
+      await failPublication(error);
     }
 
     let stopRequestTimer: NodeJS.Timeout | undefined;
@@ -857,13 +878,17 @@ function runtimeProcessIdentity(runtimeId: string): string {
   return `${RUNTIME_PROCESS_IDENTITY_PREFIX}${runtimeId}`;
 }
 
+export function parseRuntimeProcessIdentity(commandLine: string): string | null | undefined {
+  if (commandLine.trim() === '') return undefined;
+  return commandLine.match(
+    new RegExp(`${RUNTIME_PROCESS_IDENTITY_PREFIX}[A-Za-z0-9._-]+`),
+  )?.[0] ?? null;
+}
+
 function readProcessIdentity(pid: number): string | null | undefined {
   if (!Number.isInteger(pid) || pid < 1) return undefined;
   try {
-    const commandLine = readProcessCommandLine(pid);
-    return commandLine.match(
-      new RegExp(`${RUNTIME_PROCESS_IDENTITY_PREFIX}[A-Za-z0-9._-]+`),
-    )?.[0] ?? null;
+    return parseRuntimeProcessIdentity(readProcessCommandLine(pid));
   } catch {
     return undefined;
   }
@@ -916,6 +941,46 @@ function inspectWindowsDirectoryAcl(directory: string): boolean {
     }
   }
   return false;
+}
+
+async function terminateSpawnedChild(
+  child: ChildProcess,
+  childOutcome: Promise<ChildOutcome>,
+  stopTimeoutMs: number,
+  releaseOwnership: () => void,
+): Promise<void> {
+  const releaseAfterExit = childOutcome.then(() => {
+    try {
+      releaseOwnership();
+    } catch {
+      // The original publication error remains the actionable startup failure.
+    }
+  });
+  try {
+    child.kill('SIGTERM');
+  } catch {
+    // The outcome observer is the authority on whether the exact child exited.
+  }
+  let exited = await Promise.race([
+    childOutcome.then(() => true),
+    delay(stopTimeoutMs).then(() => false),
+  ]);
+  if (!exited) {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // Keep ownership until the outcome observer confirms exact-child exit.
+    }
+    exited = await Promise.race([
+      childOutcome.then(() => true),
+      delay(POST_KILL_EXIT_TIMEOUT_MS).then(() => false),
+    ]);
+  }
+  if (exited) {
+    await releaseAfterExit;
+  } else {
+    void releaseAfterExit.catch(() => undefined);
+  }
 }
 
 function releaseOwnedLockWithGuard(lockPath: string, guard: string, runtimeId: string): void {

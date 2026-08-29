@@ -38,7 +38,8 @@ Runtime metadata contains the named runtime/profile, foreground owner PID,
 child PID, configured stop timeout, endpoint, lifecycle
 timestamps, readiness/health, and typed exit information. It never contains
 cookies, auth headers, passwords, tokens, storage contents, form values, or
-model/browser transcripts.
+model/browser transcripts. If lifecycle publication fails after spawn, the
+exact child is stopped and profile ownership is retained until exit is observed.
 
 One live runtime owns a profile lock before Playwright starts. Lock acquisition
 and stale-lock replacement are serialized by a separate atomic guard, so two

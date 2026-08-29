@@ -14,6 +14,7 @@ import {
   browserRuntimeCapability,
   buildPlaywrightMcpArgs,
   normalizeBrowserHost,
+  parseRuntimeProcessIdentity,
 } from '../src/browser/playwright-mcp-runtime.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -104,6 +105,15 @@ function assertRuntimeError(error: unknown, code: string): boolean {
 }
 
 describe('ManagedPlaywrightMcpRuntime', () => {
+  it('distinguishes unavailable, unrelated, and matching process command lines', () => {
+    assert.equal(parseRuntimeProcessIdentity(' \r\n\t'), undefined);
+    assert.equal(parseRuntimeProcessIdentity('node unrelated-worker.js'), null);
+    assert.equal(
+      parseRuntimeProcessIdentity('node --title=tachiko-browser-runtime-runtime-123 cli.js'),
+      'tachiko-browser-runtime-runtime-123',
+    );
+  });
+
   it('normalizes bracketed IPv6 hosts before binding while preserving URL-safe formatting', () => {
     assert.equal(normalizeBrowserHost('[::1]'), '::1');
     assert.equal(normalizeBrowserHost('::1'), '::1');
@@ -300,6 +310,57 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       runtime.start({ profile: 'unreadable', port: await freePort() }),
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE),
     );
+  });
+
+  it('stops the exact child and releases ownership when startup publication fails', async () => {
+    for (const phase of ['lock', 'starting', 'ready'] as const) {
+      const root = mkdtempSync(path.join(os.tmpdir(), `tachiko-browser-publish-${phase}-`));
+      cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+      const profileRoot = path.join(root, 'profiles');
+      const runtimeRoot = path.join(root, 'runtimes');
+      const pidPath = path.join(root, 'child.pid');
+      const profile = `publish-${phase}`;
+      const port = await freePort();
+      const jsonWriter = (file: string, value: unknown): void => {
+        const state = (value as { state?: unknown }).state;
+        const isFailurePoint =
+          (phase === 'lock' && file.endsWith('.tachiko-runtime-lock.json')) ||
+          phase === state;
+        if (isFailurePoint) throw new Error(`injected ${phase} publication failure`);
+        writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+      };
+      const runtime = new ManagedPlaywrightMcpRuntime({
+        profileRoot,
+        runtimeRoot,
+        repositoryRoot: REPO_ROOT,
+        playwrightCliPath: FAKE_MCP,
+        readinessProbe: tcpReadinessProbe,
+        env: { ...process.env, FAKE_MCP_PID_PATH: pidPath },
+        jsonWriter,
+      });
+
+      await assert.rejects(
+        runtime.start({ profile, port, stopTimeoutMs: 250 }),
+        (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.SPAWN_FAILED),
+      );
+      const profileDir = path.join(profileRoot, profile);
+      assert.equal(existsSync(path.join(profileDir, '.tachiko-runtime-lock.json')), false);
+      assert.equal(existsSync(path.join(profileDir, '.tachiko-runtime-lock.guard')), false);
+      if (existsSync(pidPath)) {
+        const childPid = Number(readFileSync(pidPath, 'utf8').trim());
+        await waitUntil(() => !processIsAlive(childPid));
+      }
+
+      const retry = new ManagedPlaywrightMcpRuntime({
+        profileRoot,
+        runtimeRoot,
+        repositoryRoot: REPO_ROOT,
+        playwrightCliPath: FAKE_MCP,
+        readinessProbe: tcpReadinessProbe,
+      });
+      const handle = await retry.start({ profile, port });
+      await handle.stop();
+    }
   });
 
   it('rejects existing browser storage directories that expose data to other local users', async (context) => {
