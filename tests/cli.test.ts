@@ -494,6 +494,40 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.run.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
   });
 
+  it('applies the same advertised sync after ordinary review-state drift instead of parking again', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-review-sync');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'live review HEAD changed',
+        interrupt: { evidence: 'new commit', choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'] },
+      },
+      T0,
+    );
+    store.create(run);
+
+    const outcome = await resumeCommand(
+      deps(
+        store,
+        githubAdapter([HEAD2, HEAD2]),
+        new FakeImplementation([]),
+        new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] }]),
+      ),
+      'run-review-sync',
+      LIVE_HEAD_SYNC_DECISION,
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.headSha, HEAD2);
+    assert.equal(outcome.run.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
+  });
+
   it('rejects resuming a run that is not parked for a decision', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-1'));

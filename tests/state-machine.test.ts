@@ -362,6 +362,28 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
     );
   });
 
+  it('authorizes the same exact live-HEAD sync emitted from review states', () => {
+    for (const state of ['REVIEWING', 'CHANGES_REQUESTED'] as const) {
+      let run = runIn(state, { headSha: 'sha-1' });
+      run = applyTransition(
+        run,
+        {
+          type: 'escalate',
+          reason: 'live HEAD changed',
+          interrupt: { choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'] },
+        },
+        T0,
+      );
+      const synchronized = applyTransition(
+        run,
+        { type: 'human_resolved', reason: LIVE_HEAD_SYNC_DECISION, headSha: 'sha-2' },
+        T0,
+      );
+      assert.equal(synchronized.state, 'VALIDATING');
+      assert.equal(synchronized.headSha, 'sha-2');
+    }
+  });
+
   it('rejects gate_passed that attempts to swap in an unreviewed HEAD', () => {
     const run = runIn('FINAL_GATE', {
       headSha: 'sha-1',

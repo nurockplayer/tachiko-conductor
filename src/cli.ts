@@ -21,7 +21,7 @@ import {
   type StartBrowserRuntimeOptions,
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
-import { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
+import { LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './domain/decisions.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
 import {
   TRANSITION_TYPES,
@@ -302,7 +302,7 @@ export async function resumeCommand(
   const synchronizeLiveHead =
     decision.trim() === LIVE_HEAD_SYNC_DECISION &&
     run.state === 'NEEDS_HUMAN' &&
-    run.interruptedFrom === 'IMPLEMENTING' &&
+    canSynchronizeInterruptedHead(run.interruptedFrom) &&
     run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION) === true &&
     run.target.kind === 'issue';
   if (synchronizeLiveHead && run.target.kind === 'issue') {

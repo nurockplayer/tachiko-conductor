@@ -1,4 +1,4 @@
-import { LIVE_HEAD_SYNC_DECISION } from './decisions.js';
+import { LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './decisions.js';
 import type { ReviewResult, Run, TransitionInput, TransitionType, WorkflowState } from './types.js';
 
 /** Why a transition was rejected. */
@@ -139,7 +139,7 @@ function isAuthorizedHumanHeadSync(run: Run, input: TransitionInput): boolean {
     input.headSha !== undefined &&
     input.reason?.trim() === LIVE_HEAD_SYNC_DECISION &&
     run.state === 'NEEDS_HUMAN' &&
-    run.interruptedFrom === 'IMPLEMENTING' &&
+    canSynchronizeInterruptedHead(run.interruptedFrom) &&
     run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION) === true
   );
 }
