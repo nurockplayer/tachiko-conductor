@@ -289,6 +289,34 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     );
   });
 
+  it('rejects an unsafe persisted runtime identity before deriving sidecar paths', async () => {
+    const { runtime, runtimeRoot } = tempRuntime();
+    mkdirSync(runtimeRoot, { recursive: true });
+    writeFileSync(
+      path.join(runtimeRoot, 'unsafe-identity.json'),
+      `${JSON.stringify({
+        runtimeId: '../../outside-runtime-root',
+        profile: 'unsafe-identity',
+        endpoint: 'http://127.0.0.1:65534/mcp',
+        host: '127.0.0.1',
+        port: 65534,
+        pid: process.pid,
+        ownerPid: process.pid,
+        stopTimeoutMs: 5_000,
+        headless: true,
+        state: 'ready',
+        health: 'ready',
+        startedAt: '2026-08-29T00:00:00.000Z',
+      })}\n`,
+      { mode: 0o600 },
+    );
+
+    await assert.rejects(
+      runtime.status('unsafe-identity'),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
+    );
+  });
+
   it('refuses an external PID-only stop when the recorded owner is gone', async () => {
     const { runtime, runtimeRoot } = tempRuntime();
     mkdirSync(runtimeRoot, { recursive: true });
@@ -458,8 +486,8 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(status?.errorCode, BROWSER_RUNTIME_ERROR_CODE.CHILD_EXITED);
   });
 
-  it('does not let old child completion overwrite replacement metadata', async () => {
-    const { runtime, runtimeRoot } = tempRuntime();
+  it('finalizes under the ownership guard without overwriting replacement metadata', async () => {
+    const { runtime, runtimeRoot, profileRoot } = tempRuntime();
     const handle = await runtime.start({ profile: 'completion-identity', port: await freePort() });
     const replacement = {
       ...handle.snapshot,
@@ -471,14 +499,24 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       startedAt: '2026-08-29T01:00:00.000Z',
     } as const;
     const metadataPath = path.join(runtimeRoot, 'completion-identity.json');
-    writeFileSync(metadataPath, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+    const profileDir = path.join(profileRoot, 'completion-identity');
+    const lockPath = path.join(profileDir, '.tachiko-runtime-lock.json');
+    const guardPath = path.join(profileDir, '.tachiko-runtime-lock.guard');
+    writeFileSync(guardPath, `${JSON.stringify({ pid: process.pid })}\n`, { mode: 0o600 });
 
     process.kill(handle.snapshot.pid, 'SIGTERM');
+    await waitUntil(() => !processIsAlive(handle.snapshot.pid));
+    writeFileSync(lockPath, `${JSON.stringify({ version: 1, runtimeId: replacement.runtimeId, pid: process.pid })}\n`, { mode: 0o600 });
+    writeFileSync(metadataPath, `${JSON.stringify(replacement)}\n`, { mode: 0o600 });
+    rmSync(guardPath, { force: true });
+
     const oldFinal = await handle.waitForExit();
     assert.equal(oldFinal.runtimeId, handle.snapshot.runtimeId);
     assert.equal(oldFinal.state, 'failed');
     const persisted = JSON.parse(readFileSync(metadataPath, 'utf8')) as { runtimeId: string };
     assert.equal(persisted.runtimeId, replacement.runtimeId);
+    const persistedLock = JSON.parse(readFileSync(lockPath, 'utf8')) as { runtimeId: string };
+    assert.equal(persistedLock.runtimeId, replacement.runtimeId);
   });
 
   it('does not let a stale handle stop a replacement runtime for the same profile', async () => {

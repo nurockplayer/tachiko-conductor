@@ -148,6 +148,7 @@ type ChildOutcome =
   | { readonly kind: 'error'; readonly error: Error };
 
 const PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const RUNTIME_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const POST_KILL_EXIT_TIMEOUT_MS = 1_000;
@@ -270,14 +271,10 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
           errorCode: BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT,
           ...(outcome.kind === 'exit' ? { exitCode: outcome.code, exitSignal: outcome.signal } : {}),
         };
-        try {
-          const current = readSnapshot(metadataPath);
-          if (current?.runtimeId === runtimeId) writeJsonAtomic(metadataPath, failed);
-        } finally {
+        return finalizeOwnedRuntime(metadataPath, lockPath, runtimeId, failed).then(() => {
           rmSync(stopRequestPath, { force: true });
-          releaseLock(lockPath, runtimeId);
-        }
-        return failed;
+          return failed;
+        });
       });
       child.kill('SIGTERM');
       const terminated = await Promise.race([
@@ -301,8 +298,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     }
     if (startup.kind !== 'ready') {
       const failed = failedSnapshot(started, startup, this.now());
-      writeJsonAtomic(metadataPath, failed);
-      releaseLock(lockPath, runtimeId);
+      await finalizeOwnedRuntime(metadataPath, lockPath, runtimeId, failed);
       throw childOutcomeError(options.profile, startup);
     }
 
@@ -315,7 +311,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     writeJsonAtomic(metadataPath, ready);
 
     let stopRequestTimer: NodeJS.Timeout | undefined;
-    const completion = childOutcome.then((outcome) => {
+    const completion = childOutcome.then(async (outcome) => {
       const current = readSnapshot(metadataPath);
       const normalStop = current?.runtimeId === runtimeId && current.state === 'stopping';
       const finalSnapshot: BrowserRuntimeSnapshot = normalStop
@@ -327,9 +323,8 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
             ...(outcome.kind === 'exit' ? { exitCode: outcome.code, exitSignal: outcome.signal } : {}),
           }
         : failedSnapshot(current?.runtimeId === runtimeId ? current : ready, outcome, this.now());
-      if (current?.runtimeId === runtimeId) writeJsonAtomic(metadataPath, finalSnapshot);
+      await finalizeOwnedRuntime(metadataPath, lockPath, runtimeId, finalSnapshot);
       rmSync(stopRequestPath, { force: true });
-      releaseLock(lockPath, runtimeId);
       return finalSnapshot;
     }).finally(() => {
       if (stopRequestTimer !== undefined) clearInterval(stopRequestTimer);
@@ -479,7 +474,14 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     if (current === null || (current.state !== 'starting' && current.state !== 'ready' && current.state !== 'stopping')) {
       return current ?? snapshot;
     }
-    writeJsonAtomic(this.metadataPath(snapshot.profile), { ...current, state: 'stopping', health: 'stopping' });
+    const transitioned = await writeOwnedRuntimeSnapshot(
+      this.metadataPath(snapshot.profile),
+      path.join(this.profileDir(snapshot.profile), '.tachiko-runtime-lock.json'),
+      snapshot.runtimeId,
+      { ...current, state: 'stopping', health: 'stopping' },
+      false,
+    );
+    if (!transitioned) return await completion;
     child.kill('SIGTERM');
     const result = await Promise.race([
       completion.then((value) => ({ done: true as const, value })),
@@ -537,6 +539,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   }
 
   private stopRequestPath(profile: string, runtimeId: string): string {
+    validateRuntimeId(runtimeId);
     return path.join(this.runtimeRoot, `${profile}.${runtimeId}.stop.json`);
   }
 }
@@ -552,6 +555,16 @@ function validateProfile(profile: string): void {
       BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
       `Invalid browser profile "${profile}"; use letters, digits, dots, underscores, or hyphens without path separators.`,
       { profile },
+    );
+  }
+}
+
+function validateRuntimeId(runtimeId: string): void {
+  if (!RUNTIME_ID_PATTERN.test(runtimeId) || runtimeId === '.' || runtimeId === '..') {
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+      'Browser runtime metadata contains an invalid runtime identity.',
+      { runtimeId },
     );
   }
 }
@@ -622,6 +635,14 @@ function readSnapshot(file: string): BrowserRuntimeSnapshot | null {
     throw error;
   }
   const value = JSON.parse(raw) as BrowserRuntimeSnapshot;
+  if (typeof value.runtimeId !== 'string') {
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+      `Browser runtime metadata at ${file} has no valid runtime identity.`,
+      { metadataPath: file },
+    );
+  }
+  validateRuntimeId(value.runtimeId);
   return value;
 }
 
@@ -670,6 +691,41 @@ function releaseLock(file: string, runtimeId: string): void {
   try {
     const current = readLock(file);
     if (current?.runtimeId === runtimeId) rmSync(file, { force: true });
+  } finally {
+    rmSync(guard, { force: true });
+  }
+}
+
+async function finalizeOwnedRuntime(
+  metadataPath: string,
+  lockPath: string,
+  runtimeId: string,
+  snapshot: BrowserRuntimeSnapshot,
+): Promise<boolean> {
+  return await writeOwnedRuntimeSnapshot(metadataPath, lockPath, runtimeId, snapshot, true);
+}
+
+async function writeOwnedRuntimeSnapshot(
+  metadataPath: string,
+  lockPath: string,
+  runtimeId: string,
+  snapshot: BrowserRuntimeSnapshot,
+  release: boolean,
+): Promise<boolean> {
+  const deadline = Date.now() + 1_000;
+  let guard = tryAcquireLockGuard(path.dirname(lockPath));
+  while (guard === null && Date.now() < deadline) {
+    await delay(10);
+    guard = tryAcquireLockGuard(path.dirname(lockPath));
+  }
+  if (guard === null) return false;
+  try {
+    const lock = readLock(lockPath);
+    const current = readSnapshot(metadataPath);
+    if (lock?.runtimeId !== runtimeId || current?.runtimeId !== runtimeId) return false;
+    writeJsonAtomic(metadataPath, snapshot);
+    if (release) rmSync(lockPath, { force: true });
+    return true;
   } finally {
     rmSync(guard, { force: true });
   }
