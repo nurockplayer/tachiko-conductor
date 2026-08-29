@@ -13,6 +13,7 @@ import {
   ManagedPlaywrightMcpRuntime,
   browserRuntimeCapability,
   buildPlaywrightMcpArgs,
+  normalizeBrowserHost,
 } from '../src/browser/playwright-mcp-runtime.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -103,6 +104,16 @@ function assertRuntimeError(error: unknown, code: string): boolean {
 }
 
 describe('ManagedPlaywrightMcpRuntime', () => {
+  it('normalizes bracketed IPv6 hosts before binding while preserving URL-safe formatting', () => {
+    assert.equal(normalizeBrowserHost('[::1]'), '::1');
+    assert.equal(normalizeBrowserHost('::1'), '::1');
+    assert.equal(normalizeBrowserHost('127.0.0.1'), '127.0.0.1');
+    assert.throws(
+      () => normalizeBrowserHost('[localhost]'),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
+    );
+  });
+
   it('starts on loopback with an argument array, reports health, blocks duplicate profile ownership, and stops', async () => {
     const argsPath = path.join(os.tmpdir(), `tachiko-browser-args-${process.pid}-${Date.now()}.json`);
     cleanups.push(() => rmSync(argsPath, { force: true }));
@@ -197,6 +208,42 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     });
     await assert.rejects(
       statusSymlinked.status('safe'),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
+    );
+
+    const dedicatedRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-dedicated-profile-'));
+    const unrelatedProfile = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-unrelated-profile-'));
+    cleanups.push(() => rmSync(dedicatedRoot, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(unrelatedProfile, { recursive: true, force: true }));
+    const dedicatedProfileRoot = path.join(dedicatedRoot, 'profiles');
+    mkdirSync(dedicatedProfileRoot, { recursive: true });
+    symlinkSync(unrelatedProfile, path.join(dedicatedProfileRoot, 'personal'), 'dir');
+    const escapedProfile = new ManagedPlaywrightMcpRuntime({
+      profileRoot: dedicatedProfileRoot,
+      runtimeRoot: path.join(dedicatedRoot, 'runtimes'),
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+    });
+    await assert.rejects(
+      escapedProfile.start({ profile: 'personal', port: await freePort() }),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
+    );
+
+    const outputEscapeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-output-escape-'));
+    const unrelatedOutput = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-unrelated-output-'));
+    cleanups.push(() => rmSync(outputEscapeRoot, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(unrelatedOutput, { recursive: true, force: true }));
+    const outputRuntimeRoot = path.join(outputEscapeRoot, 'runtimes');
+    mkdirSync(outputRuntimeRoot, { recursive: true });
+    symlinkSync(unrelatedOutput, path.join(outputRuntimeRoot, 'escaped-output'), 'dir');
+    const escapedOutput = new ManagedPlaywrightMcpRuntime({
+      profileRoot: path.join(outputEscapeRoot, 'profiles'),
+      runtimeRoot: outputRuntimeRoot,
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+    });
+    await assert.rejects(
+      escapedOutput.start({ profile: 'escaped', port: await freePort() }),
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG),
     );
   });

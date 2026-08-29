@@ -127,6 +127,27 @@ export function browserRuntimeCapability(snapshot: BrowserRuntimeSnapshot): McpH
   return { kind: 'mcp-http', name: 'tachiko_browser', endpoint: snapshot.endpoint };
 }
 
+export function normalizeBrowserHost(host: string): string {
+  validateHost(host);
+  if (!host.startsWith('[') && !host.endsWith(']')) return host;
+  if (!(host.startsWith('[') && host.endsWith(']'))) {
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+      `Invalid browser host "${host}".`,
+      { host },
+    );
+  }
+  const unbracketed = host.slice(1, -1);
+  if (net.isIP(unbracketed) !== 6) {
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+      `Invalid bracketed IPv6 browser host "${host}".`,
+      { host },
+    );
+  }
+  return unbracketed;
+}
+
 export interface ManagedPlaywrightMcpRuntimeOptions {
   readonly profileRoot: string;
   readonly runtimeRoot: string;
@@ -180,8 +201,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   async start(options: StartBrowserRuntimeOptions): Promise<BrowserRuntimeHandle> {
     this.validateRoots();
     validateProfile(options.profile);
-    const host = options.host ?? '127.0.0.1';
-    validateHost(host);
+    const host = normalizeBrowserHost(options.host ?? '127.0.0.1');
     const headless = options.headless ?? true;
     const startupTimeoutMs = validateTimeout(options.startupTimeoutMs ?? DEFAULT_STARTUP_TIMEOUT_MS, 'startupTimeoutMs');
     const stopTimeoutMs = validateTimeout(options.stopTimeoutMs ?? DEFAULT_STOP_TIMEOUT_MS, 'stopTimeoutMs');
@@ -197,6 +217,8 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     mkdirSync(outputDir, { recursive: true, mode: 0o700 });
     this.validateResolvedStorage([profileDir, outputDir]);
+    this.validateDedicatedChild(profileDir, this.profileRoot, 'profile directory');
+    this.validateDedicatedChild(outputDir, this.runtimeRoot, 'runtime output directory');
     const lockPath = path.join(profileDir, '.tachiko-runtime-lock.json');
     const startupGuard = acquireLock(
       lockPath,
@@ -600,6 +622,18 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     this.validateResolvedStorage(
       [this.profileRoot, this.runtimeRoot].filter((storagePath) => existsSync(storagePath)),
     );
+  }
+
+  private validateDedicatedChild(configuredPath: string, configuredRoot: string, resource: string): void {
+    const resolvedRoot = realpathSync(configuredRoot);
+    const resolvedPath = realpathSync(configuredPath);
+    if (resolvedPath === resolvedRoot || !isWithin(resolvedRoot, resolvedPath)) {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+        `Browser ${resource} must resolve inside its dedicated Tachiko storage root.`,
+        { configuredRoot, resolvedRoot, configuredPath, resolvedPath },
+      );
+    }
   }
 
   private profileDir(profile: string): string {

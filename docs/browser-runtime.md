@@ -26,7 +26,10 @@ Defaults:
 
 Override the two roots with `TACHIKO_BROWSER_PROFILE_ROOT` and
 `TACHIKO_BROWSER_RUNTIME_ROOT`. Both roots must remain outside the current
-repository. Directories and metadata are created with user-only permissions.
+repository. Each named profile and runtime output directory must also resolve
+inside its corresponding dedicated root; symlinks cannot redirect them to a
+personal or unrelated browser profile. Directories and metadata are created
+with user-only permissions.
 Runtime metadata contains the named runtime/profile, foreground owner PID,
 child PID, configured stop timeout, endpoint, lifecycle
 timestamps, readiness/health, and typed exit information. It never contains
