@@ -21,7 +21,7 @@ import {
   type StartBrowserRuntimeOptions,
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
-import { LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './domain/decisions.js';
+import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './domain/decisions.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
 import {
   TRANSITION_TYPES,
@@ -343,6 +343,14 @@ export async function resumeCommand(
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
   const now = options.now ?? (() => new Date().toISOString());
+  if (
+    decision.trim() === CANCEL_RUN_DECISION &&
+    run.interrupt?.choices?.includes(CANCEL_RUN_DECISION) === true
+  ) {
+    const cancelled = applyTransition(run, { type: 'fail', reason: CANCEL_RUN_DECISION }, now());
+    deps.store.update(cancelled);
+    return { outcome: 'failed', run: cancelled, reason: CANCEL_RUN_DECISION };
+  }
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
   let synchronizedHead: string | undefined;
   const synchronizeLiveHead =

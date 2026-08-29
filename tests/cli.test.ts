@@ -327,10 +327,12 @@ describe('workflow run and resume commands', () => {
 
   class FakeReviewer implements ReviewerAdapter {
     readonly kind: 'reviewer' = 'reviewer';
+    calls = 0;
 
     constructor(private readonly outcomes: ReviewResult[]) {}
 
     async review(request: ReviewRequest): Promise<ReviewResult> {
+      this.calls += 1;
       const outcome = this.outcomes.shift();
       if (outcome === undefined) throw new Error('No review outcome queued');
       return outcome;
@@ -339,10 +341,12 @@ describe('workflow run and resume commands', () => {
 
   class FakeImplementation implements ImplementationAgent {
     readonly kind: 'implementation-agent' = 'implementation-agent';
+    calls = 0;
 
     constructor(private readonly outcomes: AgentResult[]) {}
 
     async run(): Promise<AgentResult> {
+      this.calls += 1;
       const outcome = this.outcomes.shift();
       if (outcome === undefined) throw new Error('No implementation outcome queued');
       return outcome;
@@ -421,6 +425,37 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.run.state, 'MERGE_READY');
     const persisted = store.read('run-1');
     assert.equal(persisted?.interrupt?.resolvedAt, T0);
+  });
+
+  it('terminates a parked run when the advertised cancel choice is selected', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-cancel');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'browser takeover required',
+        interrupt: { evidence: '2FA required', choices: ['Complete human bootstrap/takeover and resume', 'Cancel the run'] },
+      },
+      T0,
+    );
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+
+    const outcome = await resumeCommand(
+      deps(store, githubAdapter([]), implementation, reviewer),
+      'run-cancel',
+      'Cancel the run',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'failed');
+    assert.equal(outcome.run.state, 'FAILED');
+    assert.equal(outcome.run.history.at(-1)?.type, 'fail');
+    assert.equal(implementation.calls, 0);
+    assert.equal(reviewer.calls, 0);
   });
 
   it('resumes a WAITING_DEPENDENCY run via dependency_satisfied after a supplied decision', async () => {

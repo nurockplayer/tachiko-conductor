@@ -236,6 +236,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     mkdirSync(this.runtimeRoot, { recursive: true, mode: 0o700 });
     this.validateResolvedStorage([this.profileRoot, this.runtimeRoot]);
     this.validatePrivateDirectories([this.profileRoot, this.runtimeRoot]);
+    this.prepareStopRequestStorage();
     mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     mkdirSync(outputDir, { recursive: true, mode: 0o700 });
     this.validateResolvedStorage([profileDir, outputDir]);
@@ -560,6 +561,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     // its own ChildProcess handle. This process never rewrites lifecycle state
     // or signals a persisted PID, either of which could target a replacement.
     this.validateExistingStorage();
+    this.prepareStopRequestStorage();
     writeJsonAtomic(this.stopRequestPath(profile, snapshot.runtimeId), {
       version: 1,
       runtimeId: snapshot.runtimeId,
@@ -727,9 +729,39 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   }
 
   private validateExistingStorage(): void {
+    const stopRequestRoot = this.stopRequestRoot();
     this.validateResolvedStorage(
-      [this.profileRoot, this.runtimeRoot].filter((storagePath) => existsSync(storagePath)),
+      [this.profileRoot, this.runtimeRoot, stopRequestRoot].filter((storagePath) => existsSync(storagePath)),
     );
+    if (existsSync(stopRequestRoot)) {
+      this.validateDedicatedChild(stopRequestRoot, this.runtimeRoot, 'stop request directory');
+      this.validatePrivateDirectories([stopRequestRoot]);
+    }
+  }
+
+  private prepareStopRequestStorage(): void {
+    const stopRequestRoot = this.stopRequestRoot();
+    const repository = realpathSync(this.repositoryRoot);
+    const resolvedRuntimeRoot = realpathSync(this.runtimeRoot);
+    const prospectiveRoot = resolveThroughExistingAncestor(stopRequestRoot);
+    if (isWithin(repository, prospectiveRoot)) {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+        'Browser stop-request storage must resolve outside the repository.',
+        { repositoryRoot: repository, configuredRoot: stopRequestRoot, resolvedRoot: prospectiveRoot },
+      );
+    }
+    if (prospectiveRoot === resolvedRuntimeRoot || !isWithin(resolvedRuntimeRoot, prospectiveRoot)) {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+        'Browser stop-request storage must resolve inside the dedicated runtime root.',
+        { runtimeRoot: this.runtimeRoot, resolvedRuntimeRoot, configuredRoot: stopRequestRoot, resolvedRoot: prospectiveRoot },
+      );
+    }
+    mkdirSync(stopRequestRoot, { recursive: true, mode: 0o700 });
+    this.validateResolvedStorage([stopRequestRoot]);
+    this.validateDedicatedChild(stopRequestRoot, this.runtimeRoot, 'stop request directory');
+    this.validatePrivateDirectories([stopRequestRoot]);
   }
 
   private validateDedicatedChild(configuredPath: string, configuredRoot: string, resource: string): void {
@@ -780,7 +812,11 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
 
   private stopRequestPath(profile: string, runtimeId: string): string {
     validateRuntimeId(runtimeId);
-    return path.join(this.runtimeRoot, `${profile}.${runtimeId}.stop.json`);
+    return path.join(this.stopRequestRoot(), `${profile}.${runtimeId}.json`);
+  }
+
+  private stopRequestRoot(): string {
+    return path.join(this.runtimeRoot, '.tachiko-stop-requests');
   }
 }
 
@@ -1215,17 +1251,28 @@ function childOutcomeError(profile: string, outcome: ChildOutcome): BrowserRunti
 async function findAvailablePort(host: string): Promise<number> {
   return await new Promise<number>((resolve, reject) => {
     const server = net.createServer();
-    server.once('error', reject);
+    server.once('error', (error) => reject(portUnavailableError(host, undefined, error)));
     server.listen(0, host, () => {
       const address = server.address();
       if (address === null || typeof address === 'string') {
         server.close();
-        reject(new Error('Could not allocate a browser runtime port.'));
+        reject(portUnavailableError(host, undefined, new Error('No TCP port was assigned.')));
         return;
       }
-      server.close((error) => (error === undefined ? resolve(address.port) : reject(error)));
+      server.close((error) => (
+        error === undefined ? resolve(address.port) : reject(portUnavailableError(host, address.port, error))
+      ));
     });
   });
+}
+
+function portUnavailableError(host: string, port: number | undefined, cause: Error): BrowserRuntimeError {
+  const address = port === undefined ? host : `${host}:${port}`;
+  return new BrowserRuntimeError(
+    BROWSER_RUNTIME_ERROR_CODE.PORT_IN_USE,
+    `Browser runtime could not allocate a port on ${address}.`,
+    { host, ...(port === undefined ? {} : { port }), cause: cause.message },
+  );
 }
 
 async function assertPortAvailable(host: string, port: number): Promise<void> {

@@ -8,7 +8,7 @@ import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
-import { LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
+import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
@@ -85,7 +85,7 @@ export async function runReviewLoop(
           reason,
           interrupt: {
             evidence: reason,
-            choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'],
+            choices: [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
           },
         },
         now(),
@@ -127,7 +127,7 @@ export async function runReviewLoop(
           reason,
           interrupt: {
             evidence: reason,
-            choices: ['Approve the current HEAD manually', 'Provide more context and retry', 'Cancel the run'],
+            choices: ['Approve the current HEAD manually', 'Provide more context and retry', CANCEL_RUN_DECISION],
           },
         },
         now(),
@@ -157,7 +157,7 @@ export async function runReviewLoop(
             reason: takeoverReason,
             interrupt: {
               evidence: takeoverReason,
-              choices: ['Complete human bootstrap/takeover and resume', 'Cancel the run'],
+              choices: ['Complete human bootstrap/takeover and resume', CANCEL_RUN_DECISION],
             },
           },
           now(),
@@ -178,7 +178,7 @@ export async function runReviewLoop(
           reason,
           interrupt: {
             evidence: 'The implementation returned the same or no HEAD after review changes.',
-            choices: ['Retry the fix with more context', 'Cancel the run'],
+            choices: ['Retry the fix with more context', CANCEL_RUN_DECISION],
           },
         },
         now(),

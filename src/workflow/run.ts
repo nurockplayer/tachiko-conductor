@@ -7,7 +7,7 @@ import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
 import type { Run, Target } from '../domain/types.js';
-import { LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
+import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { renderReviewFindings, runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
 
@@ -75,7 +75,7 @@ export async function runWorkflow(
             {
               type: 'escalate',
               reason,
-              interrupt: { evidence: reason, choices: ['Open a PR and retry', 'Cancel the run'] },
+              interrupt: { evidence: reason, choices: ['Open a PR and retry', CANCEL_RUN_DECISION] },
             },
             now(),
           );
@@ -93,7 +93,7 @@ export async function runWorkflow(
               reason,
               interrupt: {
                 evidence: reason,
-                choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'],
+                choices: [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
               },
             },
             now(),
@@ -118,7 +118,7 @@ export async function runWorkflow(
                 reason: takeoverReason,
                 interrupt: {
                   evidence: takeoverReason,
-                  choices: ['Complete human bootstrap/takeover and resume', 'Cancel the run'],
+                  choices: ['Complete human bootstrap/takeover and resume', CANCEL_RUN_DECISION],
                 },
               },
               now(),

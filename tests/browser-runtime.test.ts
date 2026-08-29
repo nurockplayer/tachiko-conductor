@@ -15,6 +15,7 @@ import {
   buildPlaywrightMcpArgs,
   normalizeBrowserHost,
   parseRuntimeProcessIdentity,
+  type BrowserRuntimeHandle,
 } from '../src/browser/playwright-mcp-runtime.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -494,6 +495,14 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     );
   });
 
+  it('reports automatic-port host binding failures as typed runtime errors', async () => {
+    const { runtime } = tempRuntime();
+    await assert.rejects(
+      runtime.start({ profile: 'invalid-auto-host', host: 'does-not-exist.invalid' }),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.PORT_IN_USE),
+    );
+  });
+
   it('fails actionably while profile ownership is being atomically updated', async () => {
     const { runtime, profileRoot } = tempRuntime();
     const profileDir = path.join(profileRoot, 'guarded');
@@ -782,7 +791,7 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     writeFileSync(metadataPath, `${JSON.stringify(oldSnapshot)}\n`, { mode: 0o600 });
 
     const stopping = runtime.stop('restart-race');
-    const stopRequestPath = path.join(runtimeRoot, 'restart-race.old-runtime.stop.json');
+    const stopRequestPath = path.join(runtimeRoot, '.tachiko-stop-requests', 'restart-race.old-runtime.json');
     await waitUntil(() => existsSync(stopRequestPath));
     oldChild.kill('SIGTERM');
     await new Promise<void>((resolve) => oldChild.once('exit', () => resolve()));
@@ -800,6 +809,23 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(stopped.runtimeId, 'old-runtime');
     const persisted = JSON.parse(readFileSync(metadataPath, 'utf8')) as { runtimeId: string };
     assert.equal(persisted.runtimeId, 'new-runtime');
+  });
+
+  it('isolates stop requests from valid profile metadata names', async () => {
+    const { runtime } = tempRuntime();
+    const first = await runtime.start({ profile: 'work', port: await freePort() });
+    let second: BrowserRuntimeHandle | undefined;
+    try {
+      const collidingProfile = `work.${first.snapshot.runtimeId}.stop`;
+      second = await runtime.start({ profile: collidingProfile, port: await freePort() });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      assert.equal((await runtime.status('work'))?.health, 'ready');
+      assert.equal((await runtime.status(collidingProfile))?.health, 'ready');
+    } finally {
+      await second?.stop().catch(() => undefined);
+      await first.stop().catch(() => undefined);
+    }
   });
 
   it('does not let an awaited status probe overwrite an unexpected child exit', async () => {

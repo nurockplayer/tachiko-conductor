@@ -98,8 +98,9 @@ interrupt during readiness also follows managed cleanup instead of leaving a
 startup guard behind. Startup cancellation is carried by an attempt-scoped
 signal through readiness and the headed bootstrap-open step; it stops only the
 exact returned handle and cannot stop a different runtime that already owns the
-profile. The separate `browser stop` process writes a
-runtime-ID-scoped stop request for that owner; it never rewrites lifecycle
+profile. The separate `browser stop` process writes a runtime-ID-scoped stop
+request in a dedicated sidecar directory whose namespace cannot collide with
+valid profile metadata; it never rewrites lifecycle
 metadata or signals a persisted PID that may belong to a replacement process
 after a crash.
 The managed child keeps Playwright MCP's stdin watchdog connected to its
@@ -171,6 +172,8 @@ At such a boundary the adapter accepts only the explicit result protocol
 `TACHIKO_NEEDS_HUMAN: <reason>`. Conductor routes that result into the existing
 `NEEDS_HUMAN` state with bounded takeover/resume choices. It does not infer risk
 from arbitrary model prose and does not add browser-specific workflow states.
+Selecting an advertised `Cancel the run` choice transitions directly to
+`FAILED` without invoking the implementation agent again.
 
 Playwright MCP supports allowed/blocked origin rules, but its own documentation
 warns that they do not cover every redirect/navigation case. They are defense
