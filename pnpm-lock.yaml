@@ -18,6 +18,9 @@ importers:
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
+      playwright:
+        specifier: 1.63.0-alpha-2026-08-05
+        version: 1.63.0-alpha-2026-08-05
       tsx:
         specifier: ^4.19.0
         version: 4.23.12
