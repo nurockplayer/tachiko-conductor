@@ -157,7 +157,10 @@ export interface ManagedPlaywrightMcpRuntimeOptions {
   readonly env?: NodeJS.ProcessEnv;
   readonly now?: () => string;
   readonly readinessProbe?: (endpoint: string) => Promise<boolean>;
-  readonly processIdentityReader?: (pid: number) => string | null;
+  /** string = marker found, null = readable process without marker, undefined = inspection unavailable. */
+  readonly processIdentityReader?: (pid: number) => string | null | undefined;
+  readonly platform?: NodeJS.Platform;
+  readonly windowsAclInspector?: (directory: string) => boolean;
 }
 
 interface RuntimeLock {
@@ -187,7 +190,9 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   private readonly env: NodeJS.ProcessEnv;
   private readonly now: () => string;
   private readonly readinessProbe: (endpoint: string) => Promise<boolean>;
-  private readonly processIdentityReader: (pid: number) => string | null;
+  private readonly processIdentityReader: (pid: number) => string | null | undefined;
+  private readonly platform: NodeJS.Platform;
+  private readonly windowsAclInspector: (directory: string) => boolean;
 
   constructor(options: ManagedPlaywrightMcpRuntimeOptions) {
     this.profileRoot = path.resolve(options.profileRoot);
@@ -198,6 +203,8 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     this.now = options.now ?? (() => new Date().toISOString());
     this.readinessProbe = options.readinessProbe ?? probeMcpEndpoint;
     this.processIdentityReader = options.processIdentityReader ?? readProcessIdentity;
+    this.platform = options.platform ?? process.platform;
+    this.windowsAclInspector = options.windowsAclInspector ?? inspectWindowsDirectoryAcl;
   }
 
   async start(options: StartBrowserRuntimeOptions): Promise<BrowserRuntimeHandle> {
@@ -647,9 +654,18 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   }
 
   private validatePrivateDirectories(directories: readonly string[]): void {
-    // Node's POSIX mode bits do not represent Windows ACLs. Windows storage
-    // remains under the current user's dedicated root and inherits its ACL.
-    if (process.platform === 'win32') return;
+    if (this.platform === 'win32') {
+      for (const directory of directories) {
+        if (!this.windowsAclInspector(directory)) {
+          throw new BrowserRuntimeError(
+            BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+            `Browser storage directory ${directory} must grant access only to the current user and trusted Windows system principals.`,
+            { directory, platform: this.platform },
+          );
+        }
+      }
+      return;
+    }
     for (const directory of directories) {
       const mode = statSync(directory).mode & 0o777;
       const exposedPermissions = mode & 0o077;
@@ -799,7 +815,7 @@ function acquireLock(
   file: string,
   lock: RuntimeLock,
   profile: string,
-  processIdentityReader: (pid: number) => string | null,
+  processIdentityReader: (pid: number) => string | null | undefined,
 ): string {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const guard = acquireLockGuard(path.dirname(file), profile);
@@ -810,7 +826,7 @@ function acquireLock(
       existing !== null &&
       processIsAlive(existing.pid) &&
       (existing.processIdentity === undefined ||
-        existingIdentity === null ||
+        existingIdentity === undefined ||
         existing.processIdentity === existingIdentity);
     if (existingOwnerIsLive) {
       throw new BrowserRuntimeError(
@@ -841,15 +857,15 @@ function runtimeProcessIdentity(runtimeId: string): string {
   return `${RUNTIME_PROCESS_IDENTITY_PREFIX}${runtimeId}`;
 }
 
-function readProcessIdentity(pid: number): string | null {
-  if (!Number.isInteger(pid) || pid < 1) return null;
+function readProcessIdentity(pid: number): string | null | undefined {
+  if (!Number.isInteger(pid) || pid < 1) return undefined;
   try {
     const commandLine = readProcessCommandLine(pid);
     return commandLine.match(
       new RegExp(`${RUNTIME_PROCESS_IDENTITY_PREFIX}[A-Za-z0-9._-]+`),
     )?.[0] ?? null;
   } catch {
-    return null;
+    return undefined;
   }
 }
 
@@ -870,12 +886,36 @@ function readProcessCommandLine(pid: number): string {
         // Try the other standard PowerShell host.
       }
     }
-    return '';
+    throw new Error('No PowerShell host is available to inspect the process command line.');
   }
   return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], {
     encoding: 'utf8',
     timeout: 500,
   });
+}
+
+function inspectWindowsDirectoryAcl(directory: string): boolean {
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    '$directory = $args[0]',
+    '$current = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value',
+    "$trusted = @($current, 'S-1-5-18', 'S-1-5-32-544')",
+    "$unsafe = (Get-Acl -LiteralPath $directory).Access | Where-Object { $sid = $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value; $_.AccessControlType -eq 'Allow' -and $trusted -notcontains $sid }",
+    'if ($null -ne $unsafe) { exit 3 }',
+  ].join('; ');
+  for (const executable of ['powershell.exe', 'pwsh.exe']) {
+    try {
+      execFileSync(executable, ['-NoProfile', '-NonInteractive', '-Command', script, directory], {
+        encoding: 'utf8',
+        timeout: 2_000,
+      });
+      return true;
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') continue;
+      return false;
+    }
+  }
+  return false;
 }
 
 function releaseOwnedLockWithGuard(lockPath: string, guard: string, runtimeId: string): void {

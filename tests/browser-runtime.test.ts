@@ -266,7 +266,6 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       repositoryRoot: REPO_ROOT,
       playwrightCliPath: FAKE_MCP,
       readinessProbe: tcpReadinessProbe,
-      processIdentityReader: (pid) => `current-process-${pid}`,
     });
 
     const handle = await runtime.start({ profile: 'pid-reuse', port: await freePort() });
@@ -278,7 +277,36 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     await handle.stop();
   });
 
-  it('rejects existing browser storage directories that expose data to other local users', async () => {
+  it('keeps a live-PID lock when process identity inspection is unavailable', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-identity-unreadable-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const profileRoot = path.join(root, 'profiles');
+    const profileDir = path.join(profileRoot, 'unreadable');
+    mkdirSync(profileDir, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      path.join(profileDir, '.tachiko-runtime-lock.json'),
+      `${JSON.stringify({ version: 1, runtimeId: 'existing-runtime', pid: process.pid, processIdentity: 'tachiko-browser-runtime-existing-runtime' })}\n`,
+      { mode: 0o600 },
+    );
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot,
+      runtimeRoot: path.join(root, 'runtimes'),
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+      processIdentityReader: () => undefined,
+    });
+
+    await assert.rejects(
+      runtime.start({ profile: 'unreadable', port: await freePort() }),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE),
+    );
+  });
+
+  it('rejects existing browser storage directories that expose data to other local users', async (context) => {
+    if (process.platform === 'win32') {
+      context.skip('POSIX mode-bit coverage');
+      return;
+    }
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-permissions-'));
     cleanups.push(() => rmSync(root, { recursive: true, force: true }));
     const profileRoot = path.join(root, 'profiles');
@@ -302,6 +330,33 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       },
     );
     assert.equal(existsSync(path.join(profileRoot, 'private-only')), false);
+  });
+
+  it('fails closed when a Windows storage ACL cannot be verified as private', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-windows-acl-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const inspected: string[] = [];
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot: path.join(root, 'profiles'),
+      runtimeRoot: path.join(root, 'runtimes'),
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+      platform: 'win32',
+      windowsAclInspector: (directory) => {
+        inspected.push(directory);
+        return false;
+      },
+    });
+
+    await assert.rejects(
+      runtime.start({ profile: 'acl-check', port: await freePort() }),
+      (error) => {
+        assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG);
+        assert.match((error as Error).message, /trusted Windows system principals/);
+        return true;
+      },
+    );
+    assert.equal(inspected.length, 1);
   });
 
   it('reports an occupied port with a typed actionable error', async () => {

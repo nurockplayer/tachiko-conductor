@@ -31,8 +31,9 @@ inside its corresponding dedicated root; symlinks cannot redirect them to a
 personal or unrelated browser profile. Directories and metadata are created
 with user-only permissions. On POSIX, startup rejects an existing storage
 directory with group or world permissions and reports the exact path to make
-private with `chmod 700` before retrying; Windows uses the current user's
-inherited ACL on the dedicated root.
+private with `chmod 700` before retrying. On Windows, it fails closed unless
+the directory ACL grants access only to the current user, SYSTEM, and the local
+Administrators group.
 Runtime metadata contains the named runtime/profile, foreground owner PID,
 child PID, configured stop timeout, endpoint, lifecycle
 timestamps, readiness/health, and typed exit information. It never contains
