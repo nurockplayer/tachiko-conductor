@@ -40,8 +40,9 @@ One live runtime owns a profile lock before Playwright starts. Lock acquisition
 and stale-lock replacement are serialized by a separate atomic guard, so two
 starters cannot both reclaim the same profile. A dead owner's stale lock can be
 reclaimed; a live owner's lock produces `BROWSER_PROFILE_IN_USE` with the PID
-and runtime ID. New locks also record the operating-system process start
-identity, allowing a stale lock to be reclaimed when its numeric PID has been
+and runtime ID. The managed child receives a collision-resistant
+runtime-specific process title, which the lock records and verifies instead of
+trusting numeric PID liveness; a stale lock can therefore be reclaimed when its PID has been
 reused by another live process. The ownership guard stays held through startup
 readiness so no other process can reclaim a child while its identity is being
 published. If the owner is killed during that guarded startup, the same typed
@@ -85,9 +86,12 @@ against child exit and a bounded timeout, and reports typed errors for invalid c
 profile ownership, spawn failure, startup timeout, early/unexpected exit, and
 stop timeout. `SIGINT`/`SIGTERM` request a clean child stop; a bounded `SIGKILL`
 fallback is used only by the foreground owner when its actual child does not
-exit. The separate `browser stop` process writes a runtime-ID-scoped stop
-request for that owner; it never rewrites lifecycle metadata or signals a
-persisted PID that may belong to a replacement process after a crash.
+exit. Those signal handlers are installed before startup begins, so an
+interrupt during readiness also follows managed cleanup instead of leaving a
+startup guard behind. The separate `browser stop` process writes a
+runtime-ID-scoped stop request for that owner; it never rewrites lifecycle
+metadata or signals a persisted PID that may belong to a replacement process
+after a crash.
 The managed child keeps Playwright MCP's stdin watchdog connected to its
 foreground owner, so abrupt owner death closes the pipe and lets that exact
 child shut down its browser without trusting a persisted PID. Profile locks are
@@ -116,7 +120,10 @@ node dist/cli.js run resume <run-id> --decision retry --browser-profile github-w
 When a browser-backed run parks for human input, its printed resume command
 retains the selected `--browser-profile`. Browser storage is validated against
 the Git repository top-level even when the CLI is launched from a repository
-subdirectory.
+subdirectory. If a parked review fix detects that the live pull-request HEAD
+changed, choosing the displayed live-HEAD synchronization decision records that
+exact identity before validation and independent re-review; it does not loop on
+the stale stored HEAD.
 
 Conductor re-verifies that the named profile is live and healthy immediately
 before every implementation invocation, then adds the freshly resolved generic

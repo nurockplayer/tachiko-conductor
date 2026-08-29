@@ -17,6 +17,7 @@ import {
   type Run,
   type WorkflowState,
 } from '../src/domain/types.js';
+import { LIVE_HEAD_SYNC_DECISION } from '../src/domain/decisions.js';
 import { T0, approval, changesRequested, failureResult, newRun, successResult } from './helpers.js';
 
 /** Build a run pinned to an arbitrary state (for edge-case tests). */
@@ -331,7 +332,36 @@ describe('state machine — review events must be bound to the current HEAD', ()
   });
 });
 
-describe('state machine — HEAD mutation is bound to implementation events', () => {
+describe('state machine — HEAD mutation is bound to implementation or explicit live sync', () => {
+  it('allows only an explicitly offered human live-HEAD sync and routes it through validation', () => {
+    let run = runIn('IMPLEMENTING', { headSha: 'sha-1' });
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'live HEAD changed',
+        interrupt: { choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'] },
+      },
+      T0,
+    );
+    const synchronized = applyTransition(
+      run,
+      { type: 'human_resolved', reason: LIVE_HEAD_SYNC_DECISION, headSha: ' sha-2 ' },
+      T0,
+    );
+    assert.equal(synchronized.state, 'VALIDATING');
+    assert.equal(synchronized.headSha, 'sha-2');
+
+    assert.throws(
+      () => applyTransition(run, { type: 'human_resolved', reason: 'another choice', headSha: 'sha-2' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'head-mutation-not-allowed',
+    );
+    assert.throws(
+      () => applyTransition(run, { type: 'human_resolved', reason: LIVE_HEAD_SYNC_DECISION, headSha: ' ' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'empty-head-sha',
+    );
+  });
+
   it('rejects gate_passed that attempts to swap in an unreviewed HEAD', () => {
     const run = runIn('FINAL_GATE', {
       headSha: 'sha-1',

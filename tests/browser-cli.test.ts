@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
 import { describe, it } from 'node:test';
 
 import {
@@ -11,6 +12,7 @@ import {
   resolveBrowserRoots,
   resolveRepositoryRoot,
   resumeCommandHint,
+  waitForOwnedBrowser,
 } from '../src/cli.js';
 import type {
   BrowserRuntime,
@@ -106,6 +108,49 @@ describe('browser CLI command layer', () => {
       'tachiko run resume run-123 --decision <choice> --browser-profile github-work',
     );
     assert.equal(resumeCommandHint('run-123'), 'tachiko run resume run-123 --decision <choice>');
+  });
+
+  it('installs signal cleanup before startup and stops the handle if interruption arrives early', async () => {
+    const signals = new EventEmitter();
+    let startupStops = 0;
+    let handleStops = 0;
+    const stopped = { ...READY, state: 'stopped', health: 'stopped' } as const;
+    const handle: BrowserRuntimeHandle = {
+      snapshot: READY,
+      async stop() {
+        handleStops += 1;
+        return stopped;
+      },
+      async waitForExit() {
+        throw new Error('interrupted startup must stop instead of waiting indefinitely');
+      },
+    };
+
+    const finalSnapshot = await waitForOwnedBrowser(
+      async () => {
+        assert.equal(signals.listenerCount('SIGINT'), 1);
+        signals.emit('SIGINT');
+        return {
+          handle,
+          runtime: READY,
+          capability: { kind: 'mcp-http', name: 'tachiko_browser', endpoint: READY.endpoint },
+          claudeCode: { mcpServers: {} },
+          codex: { configOverride: '' },
+        };
+      },
+      async () => {
+        startupStops += 1;
+        throw new Error('metadata is not available yet');
+      },
+      () => undefined,
+      signals,
+    );
+
+    assert.equal(finalSnapshot.state, 'stopped');
+    assert.equal(startupStops, 1);
+    assert.equal(handleStops, 1);
+    assert.equal(signals.listenerCount('SIGINT'), 0);
+    assert.equal(signals.listenerCount('SIGTERM'), 0);
   });
 
   it('parses browser ports strictly', () => {

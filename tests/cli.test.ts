@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 
 import {
   githubSnapshotCommand,
+  LIVE_HEAD_SYNC_DECISION,
   parseIssueNumber,
   parseIssueRef,
   resolveRunsDir,
@@ -444,6 +445,53 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.run.state, 'MERGE_READY');
     const persisted = store.read('run-1');
     assert.ok(persisted?.history.some((entry) => entry.type === 'dependency_satisfied'));
+  });
+
+  it('applies an advertised live-HEAD sync decision before continuing an interrupted review fix', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-sync');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'changes_requested',
+        reviewResult: {
+          verdict: 'request_changes',
+          reviewerName: 'deepseek',
+          headSha: HEAD,
+          findings: [{ severity: 'blocking', summary: 'fix the browser flow' }],
+        },
+      },
+      T0,
+    );
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'live HEAD changed',
+        interrupt: { evidence: 'new commit', choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'] },
+      },
+      T0,
+    );
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([
+      { verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] },
+    ]);
+
+    const outcome = await resumeCommand(
+      deps(store, githubAdapter([HEAD2, HEAD2]), implementation, reviewer),
+      'run-sync',
+      LIVE_HEAD_SYNC_DECISION,
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.headSha, HEAD2);
+    assert.equal(outcome.run.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
   });
 
   it('rejects resuming a run that is not parked for a decision', async () => {

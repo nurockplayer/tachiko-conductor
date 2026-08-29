@@ -7,6 +7,7 @@ import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
 import type { Run, Target } from '../domain/types.js';
+import { LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { renderReviewFindings, runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
 
@@ -92,7 +93,7 @@ export async function runWorkflow(
               reason,
               interrupt: {
                 evidence: reason,
-                choices: ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+                choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'],
               },
             },
             now(),

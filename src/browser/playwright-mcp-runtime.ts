@@ -176,6 +176,7 @@ const RUNTIME_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
 const POST_KILL_EXIT_TIMEOUT_MS = 1_000;
+const RUNTIME_PROCESS_IDENTITY_PREFIX = 'tachiko-browser-runtime-';
 
 export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   private readonly profileRoot: string;
@@ -222,7 +223,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     const lockPath = path.join(profileDir, '.tachiko-runtime-lock.json');
     const startupGuard = acquireLock(
       lockPath,
-      runtimeLock(runtimeId, process.pid, this.processIdentityReader),
+      { version: 1, runtimeId, pid: process.pid },
       options.profile,
       this.processIdentityReader,
     );
@@ -232,6 +233,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       child = spawn(
         process.execPath,
         [
+          `--title=${runtimeProcessIdentity(runtimeId)}`,
           this.playwrightCliPath,
           ...buildPlaywrightMcpArgs({ host, port, profileDir, outputDir, headless }),
         ],
@@ -259,7 +261,12 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       releaseOwnedLockWithGuard(lockPath, startupGuard, runtimeId);
       throw childOutcomeError(options.profile, outcome);
     }
-    writeJsonAtomic(lockPath, runtimeLock(runtimeId, child.pid, this.processIdentityReader));
+    writeJsonAtomic(lockPath, {
+      version: 1,
+      runtimeId,
+      pid: child.pid,
+      processIdentity: runtimeProcessIdentity(runtimeId),
+    } satisfies RuntimeLock);
     const metadataPath = this.metadataPath(options.profile);
     const started: BrowserRuntimeSnapshot = {
       runtimeId,
@@ -810,27 +817,45 @@ function acquireLock(
   }
 }
 
-function runtimeLock(
-  runtimeId: string,
-  pid: number,
-  processIdentityReader: (pid: number) => string | null,
-): RuntimeLock {
-  const processIdentity = processIdentityReader(pid);
-  return processIdentity === null
-    ? { version: 1, runtimeId, pid }
-    : { version: 1, runtimeId, pid, processIdentity };
+function runtimeProcessIdentity(runtimeId: string): string {
+  return `${RUNTIME_PROCESS_IDENTITY_PREFIX}${runtimeId}`;
 }
 
 function readProcessIdentity(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid < 1) return null;
   try {
-    const identity = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
-      encoding: 'utf8',
-      timeout: 500,
-    }).trim();
-    return identity === '' ? null : identity;
+    const commandLine = readProcessCommandLine(pid);
+    return commandLine.match(
+      new RegExp(`${RUNTIME_PROCESS_IDENTITY_PREFIX}[A-Za-z0-9._-]+`),
+    )?.[0] ?? null;
   } catch {
     return null;
   }
+}
+
+function readProcessCommandLine(pid: number): string {
+  if (process.platform === 'linux') {
+    return readFileSync(`/proc/${pid}/cmdline`, 'utf8');
+  }
+  if (process.platform === 'win32') {
+    const command =
+      `(Get-CimInstance Win32_Process -Filter 'ProcessId = ${pid}').CommandLine`;
+    for (const executable of ['powershell.exe', 'pwsh.exe']) {
+      try {
+        return execFileSync(executable, ['-NoProfile', '-NonInteractive', '-Command', command], {
+          encoding: 'utf8',
+          timeout: 1_000,
+        });
+      } catch {
+        // Try the other standard PowerShell host.
+      }
+    }
+    return '';
+  }
+  return execFileSync('ps', ['-o', 'command=', '-p', String(pid)], {
+    encoding: 'utf8',
+    timeout: 500,
+  });
 }
 
 function releaseOwnedLockWithGuard(lockPath: string, guard: string, runtimeId: string): void {

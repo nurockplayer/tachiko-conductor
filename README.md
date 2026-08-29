@@ -68,8 +68,10 @@ review result is bound to the run's current HEAD SHA.
 Transitions persist only the payloads they produce: agent results are bound to
 `agent_succeeded`/`agent_failed` (and must carry a matching exit status),
 review results to `review_approved`/`changes_requested`, and the run's HEAD
-SHA may only be changed by implementation transitions. A gate or merge can
-never swap in an unreviewed SHA.
+SHA may only be changed by implementation transitions or the exact bounded
+live-HEAD synchronization decision offered after drift. That decision routes
+through validation and independent review; a gate or merge can never swap in
+an unreviewed SHA.
 
 ## Quick start
 

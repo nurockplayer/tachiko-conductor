@@ -21,6 +21,7 @@ import {
   type StartBrowserRuntimeOptions,
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
+import { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
 import {
   TRANSITION_TYPES,
@@ -79,6 +80,7 @@ in the foreground; use status/stop from another terminal.
 
 /** Bounded review attempts before a run parks in NEEDS_HUMAN. */
 export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
+export { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
 
 /** Resolve the directory where run JSON files are stored. */
 export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -296,7 +298,29 @@ export async function resumeCommand(
   }
   const now = options.now ?? (() => new Date().toISOString());
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
-  const resumed = applyTransition(run, { type: transition, reason: decision }, now());
+  let synchronizedHead: string | undefined;
+  const synchronizeLiveHead =
+    decision.trim() === LIVE_HEAD_SYNC_DECISION &&
+    run.state === 'NEEDS_HUMAN' &&
+    run.interruptedFrom === 'IMPLEMENTING' &&
+    run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION) === true &&
+    run.target.kind === 'issue';
+  if (synchronizeLiveHead && run.target.kind === 'issue') {
+    const snapshot = await deps.github.readLiveSnapshot(run.target);
+    if (snapshot.headSha === null) {
+      throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request HEAD.`);
+    }
+    synchronizedHead = snapshot.headSha;
+  }
+  const resumed = applyTransition(
+    run,
+    {
+      type: transition,
+      reason: decision,
+      ...(synchronizedHead === undefined ? {} : { headSha: synchronizedHead }),
+    },
+    now(),
+  );
   deps.store.update(resumed);
   return runWorkflow(deps, id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
@@ -457,20 +481,39 @@ function serializeBrowserError(error: unknown): Readonly<Record<string, unknown>
   return { code: 'UNKNOWN', message: error instanceof Error ? error.message : String(error) };
 }
 
-async function waitForOwnedBrowser(handle: BrowserRuntimeHandle): Promise<BrowserRuntimeSnapshot> {
+interface BrowserSignalSource {
+  once(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  removeListener(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+}
+
+export async function waitForOwnedBrowser(
+  start: () => Promise<BrowserStartCommandResult>,
+  stopStarting: () => Promise<BrowserRuntimeSnapshot>,
+  onStarted: (result: BrowserStartCommandResult) => void = () => undefined,
+  signalSource: BrowserSignalSource = process,
+): Promise<BrowserRuntimeSnapshot> {
   let stopping = false;
+  let handle: BrowserRuntimeHandle | undefined;
   const stop = () => {
     if (stopping) return;
     stopping = true;
-    void handle.stop().catch(() => undefined);
+    if (handle === undefined) {
+      void stopStarting().catch(() => undefined);
+    } else {
+      void handle.stop().catch(() => undefined);
+    }
   };
-  process.once('SIGINT', stop);
-  process.once('SIGTERM', stop);
+  signalSource.once('SIGINT', stop);
+  signalSource.once('SIGTERM', stop);
   try {
+    const result = await start();
+    handle = result.handle;
+    onStarted(result);
+    if (stopping) return await handle.stop();
     return await handle.waitForExit();
   } finally {
-    process.removeListener('SIGINT', stop);
-    process.removeListener('SIGTERM', stop);
+    signalSource.removeListener('SIGINT', stop);
+    signalSource.removeListener('SIGTERM', stop);
   }
 }
 
@@ -507,15 +550,17 @@ export async function main(argv: string[]): Promise<number> {
         }
         const port = values.port === undefined ? undefined : parseBrowserPort(values.port);
         const shared = { ...(port === undefined ? {} : { port }), ...(values.host === undefined ? {} : { host: values.host }) };
-        const result =
-          subcommand === 'bootstrap'
-            ? await browserBootstrapCommand(runtime, profile, shared)
-            : await browserStartCommand(runtime, profile, {
-                ...shared,
-                headless: values.headed === true ? false : true,
-              });
-        printBrowserStart(result);
-        const finalSnapshot = await waitForOwnedBrowser(result.handle);
+        const finalSnapshot = await waitForOwnedBrowser(
+          async () =>
+            subcommand === 'bootstrap'
+              ? await browserBootstrapCommand(runtime, profile, shared)
+              : await browserStartCommand(runtime, profile, {
+                  ...shared,
+                  headless: values.headed === true ? false : true,
+                }),
+          async () => await runtime.stop(profile),
+          printBrowserStart,
+        );
         if (finalSnapshot.state === 'failed') {
           console.error(JSON.stringify({ ok: false, runtime: finalSnapshot }, null, 2));
           return 1;
