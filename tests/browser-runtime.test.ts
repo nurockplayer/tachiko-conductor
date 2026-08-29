@@ -370,10 +370,10 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(terminal?.errorCode, BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED);
     assert.equal(processIsAlive(snapshot.pid), false);
     assert.equal(processIsAlive(mcpPid), false);
-    assert.equal(existsSync(path.join(profileRoot, 'orphan-safe', '.tachiko-runtime-lock.json')), false);
 
     const restarted = await observer.start({ profile: 'orphan-safe', port: await freePort() });
     await restarted.stop();
+    assert.equal(existsSync(path.join(profileRoot, 'orphan-safe', '.tachiko-runtime-lock.json')), false);
   });
 
   it('never overwrites a newer runtime identity while an older external stop completes', async () => {
@@ -402,11 +402,8 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     writeFileSync(metadataPath, `${JSON.stringify(oldSnapshot)}\n`, { mode: 0o600 });
 
     const stopping = runtime.stop('restart-race');
-    for (;;) {
-      const current = JSON.parse(readFileSync(metadataPath, 'utf8')) as { state: string };
-      if (current.state === 'stopping') break;
-      await new Promise((resolve) => setTimeout(resolve, 5));
-    }
+    const stopRequestPath = path.join(runtimeRoot, 'restart-race.old-runtime.stop.json');
+    await waitUntil(() => existsSync(stopRequestPath));
     oldChild.kill('SIGTERM');
     await new Promise<void>((resolve) => oldChild.once('exit', () => resolve()));
     const replacement = {

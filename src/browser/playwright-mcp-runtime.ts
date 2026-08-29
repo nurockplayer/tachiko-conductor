@@ -150,6 +150,7 @@ type ChildOutcome =
 const PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const DEFAULT_STARTUP_TIMEOUT_MS = 15_000;
 const DEFAULT_STOP_TIMEOUT_MS = 5_000;
+const POST_KILL_EXIT_TIMEOUT_MS = 1_000;
 
 export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
   private readonly profileRoot: string;
@@ -242,6 +243,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       startedAt: this.now(),
     };
     writeJsonAtomic(metadataPath, started);
+    const stopRequestPath = this.stopRequestPath(options.profile, runtimeId);
 
     const startupAbort = new AbortController();
     const startup = await Promise.race([
@@ -259,26 +261,42 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         health: 'stopping',
         errorCode: BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT,
       } satisfies BrowserRuntimeSnapshot);
+      const finalization = childOutcome.then((outcome) => {
+        const failed: BrowserRuntimeSnapshot = {
+          ...started,
+          state: 'failed',
+          health: 'failed',
+          stoppedAt: this.now(),
+          errorCode: BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT,
+          ...(outcome.kind === 'exit' ? { exitCode: outcome.code, exitSignal: outcome.signal } : {}),
+        };
+        try {
+          const current = readSnapshot(metadataPath);
+          if (current?.runtimeId === runtimeId) writeJsonAtomic(metadataPath, failed);
+        } finally {
+          rmSync(stopRequestPath, { force: true });
+          releaseLock(lockPath, runtimeId);
+        }
+        return failed;
+      });
       child.kill('SIGTERM');
       const terminated = await Promise.race([
-        childOutcome.then(() => true),
+        finalization.then(() => true),
         delay(stopTimeoutMs).then(() => false),
       ]);
       if (!terminated) {
         child.kill('SIGKILL');
-        // Profile ownership must remain held until the process exit is
-        // observed, not merely until a signal has been sent.
-        await childOutcome;
+        const killed = await Promise.race([
+          finalization.then(() => true),
+          delay(POST_KILL_EXIT_TIMEOUT_MS).then(() => false),
+        ]);
+        if (!killed) {
+          // Keep finalization alive so profile ownership is released only after
+          // actual exit, while returning the typed startup timeout promptly.
+          void finalization.catch(() => undefined);
+          throw startup.error;
+        }
       }
-      const failed: BrowserRuntimeSnapshot = {
-        ...started,
-        state: 'failed',
-        health: 'failed',
-        stoppedAt: this.now(),
-        errorCode: BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT,
-      };
-      writeJsonAtomic(metadataPath, failed);
-      releaseLock(lockPath, runtimeId);
       throw startup.error;
     }
     if (startup.kind !== 'ready') {
@@ -310,6 +328,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
           }
         : failedSnapshot(current?.runtimeId === runtimeId ? current : ready, outcome, this.now());
       writeJsonAtomic(metadataPath, finalSnapshot);
+      rmSync(stopRequestPath, { force: true });
       releaseLock(lockPath, runtimeId);
       return finalSnapshot;
     }).finally(() => {
@@ -324,7 +343,10 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     stopRequestTimer = setInterval(() => {
       try {
         const current = readSnapshot(metadataPath);
-        if (current?.runtimeId === runtimeId && current.state === 'stopping') {
+        if (
+          current?.runtimeId === runtimeId &&
+          (current.state === 'stopping' || existsSync(stopRequestPath))
+        ) {
           void requestOwnedStop().catch(() => undefined);
         }
       } catch {
@@ -365,8 +387,11 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
                 ? BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED
                 : BROWSER_RUNTIME_ERROR_CODE.CHILD_EXITED,
             };
-      writeJsonAtomic(metadataPath, finalSnapshot);
-      releaseLock(path.join(this.profileDir(profile), '.tachiko-runtime-lock.json'), snapshot.runtimeId);
+      rmSync(this.stopRequestPath(profile, snapshot.runtimeId), { force: true });
+      // Status is observational and may run in another process. Persisting or
+      // releasing here could race a stale-lock reclaim and overwrite/remove a
+      // replacement identity; the foreground completion or next start owns
+      // those mutations.
       return finalSnapshot;
     }
     if (!ownerAlive) {
@@ -376,7 +401,6 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         health: 'stopping',
         errorCode: BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED,
       };
-      writeJsonAtomic(metadataPath, stopping);
       return stopping;
     }
     if (snapshot.state === 'ready') {
@@ -409,22 +433,17 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       );
     }
     const metadataPath = this.metadataPath(profile);
-    const stopping: BrowserRuntimeSnapshot = { ...snapshot, state: 'stopping', health: 'stopping' };
-    writeJsonAtomic(metadataPath, stopping);
-    // The foreground owner observes the metadata transition and stops its own
-    // ChildProcess handle. This process never signals a persisted PID, which
-    // may have been reused by an unrelated process after a crash/reboot.
+    // The foreground owner observes this runtime-ID-scoped request and stops
+    // its own ChildProcess handle. This process never rewrites lifecycle state
+    // or signals a persisted PID, either of which could target a replacement.
+    writeJsonAtomic(this.stopRequestPath(profile, snapshot.runtimeId), {
+      version: 1,
+      runtimeId: snapshot.runtimeId,
+      requestedAt: this.now(),
+    });
     const ownerStopTimeoutMs = persistedStopTimeout(snapshot.stopTimeoutMs);
     const stopped = await waitForProcessExit(snapshot.pid, ownerStopTimeoutMs + 1_250);
     if (!stopped) {
-      const failed: BrowserRuntimeSnapshot = {
-        ...stopping,
-        state: 'failed',
-        health: 'failed',
-        stoppedAt: this.now(),
-        errorCode: BROWSER_RUNTIME_ERROR_CODE.STOP_TIMEOUT,
-      };
-      writeJsonAtomic(metadataPath, failed);
       throw new BrowserRuntimeError(
         BROWSER_RUNTIME_ERROR_CODE.STOP_TIMEOUT,
         `Browser profile "${profile}" did not stop through its foreground owner; no persisted PID was signalled.`,
@@ -434,19 +453,14 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     const ownerSnapshot = await waitForTerminalSnapshot(metadataPath, snapshot.runtimeId, 500);
     if (ownerSnapshot !== null) return ownerSnapshot;
     const finalSnapshot: BrowserRuntimeSnapshot = {
-      ...stopping,
+      ...snapshot,
       state: 'stopped',
       health: 'stopped',
       stoppedAt: this.now(),
     };
-    const current = readSnapshot(metadataPath);
-    if (current !== null && current.runtimeId !== snapshot.runtimeId) {
-      // A new owner may start as soon as the old owner records terminal state
-      // and releases the profile lock. Never overwrite that newer identity.
-      return finalSnapshot;
-    }
-    writeJsonAtomic(metadataPath, finalSnapshot);
-    releaseLock(path.join(this.profileDir(profile), '.tachiko-runtime-lock.json'), snapshot.runtimeId);
+    // Only the foreground owner (or a later status reconciliation) persists
+    // terminal state and releases ownership. Returning a derived result here
+    // cannot overwrite a replacement runtime in the finalization window.
     return finalSnapshot;
   }
 
@@ -515,6 +529,10 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
 
   private metadataPath(profile: string): string {
     return path.join(this.runtimeRoot, `${profile}.json`);
+  }
+
+  private stopRequestPath(profile: string, runtimeId: string): string {
+    return path.join(this.runtimeRoot, `${profile}.${runtimeId}.stop.json`);
   }
 }
 

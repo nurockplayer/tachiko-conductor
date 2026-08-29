@@ -78,8 +78,9 @@ against child exit and a bounded timeout, and reports typed errors for invalid c
 profile ownership, spawn failure, startup timeout, early/unexpected exit, and
 stop timeout. `SIGINT`/`SIGTERM` request a clean child stop; a bounded `SIGKILL`
 fallback is used only by the foreground owner when its actual child does not
-exit. The separate `browser stop` process writes a stop request for that owner;
-it never signals a persisted PID that may have been reused after a crash.
+exit. The separate `browser stop` process writes a runtime-ID-scoped stop
+request for that owner; it never rewrites lifecycle metadata or signals a
+persisted PID that may belong to a replacement process after a crash.
 The managed child keeps Playwright MCP's stdin watchdog connected to its
 foreground owner, so abrupt owner death closes the pipe and lets that exact
 child shut down its browser without trusting a persisted PID. Profile locks are
