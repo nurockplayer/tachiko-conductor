@@ -90,7 +90,7 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     cleanups.push(() => rmSync(argsPath, { force: true }));
     const { runtime, profileRoot, runtimeRoot } = tempRuntime({ ...process.env, FAKE_MCP_ARGS_PATH: argsPath });
     const port = await freePort();
-    const handle = await runtime.start({ profile: 'github-work', port, headless: true });
+    const handle = await runtime.start({ profile: 'github-work', port, headless: true, stopTimeoutMs: 1_234 });
     cleanups.push(async () => {
       await handle.stop().catch(() => undefined);
     });
@@ -100,6 +100,7 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(handle.snapshot.endpoint, `http://127.0.0.1:${port}/mcp`);
     assert.equal(handle.snapshot.profile, 'github-work');
     assert.equal(handle.snapshot.headless, true);
+    assert.equal(handle.snapshot.stopTimeoutMs, 1_234);
     assert.ok(handle.snapshot.pid > 0);
     assert.deepEqual(browserRuntimeCapability(handle.snapshot), {
       kind: 'mcp-http',
@@ -269,6 +270,7 @@ describe('ManagedPlaywrightMcpRuntime', () => {
         port: 65534,
         pid: unrelated.pid,
         ownerPid: 999_999_999,
+        stopTimeoutMs: 5_000,
         headless: true,
         state: 'ready',
         health: 'ready',
@@ -303,6 +305,7 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       port: 65533,
       pid: oldChild.pid,
       ownerPid: process.pid,
+      stopTimeoutMs: 5_000,
       headless: true,
       state: 'ready',
       health: 'ready',
@@ -333,5 +336,41 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(stopped.runtimeId, 'old-runtime');
     const persisted = JSON.parse(readFileSync(metadataPath, 'utf8')) as { runtimeId: string };
     assert.equal(persisted.runtimeId, 'new-runtime');
+  });
+
+  it('does not let an awaited status probe overwrite an unexpected child exit', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-status-race-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    let releaseStatusProbe: ((ready: boolean) => void) | undefined;
+    let announceStatusProbe: (() => void) | undefined;
+    const statusProbeStarted = new Promise<void>((resolve) => {
+      announceStatusProbe = resolve;
+    });
+    let probeCount = 0;
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot: path.join(root, 'profiles'),
+      runtimeRoot: path.join(root, 'runtimes'),
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+      readinessProbe: async () => {
+        probeCount += 1;
+        if (probeCount === 1) return true;
+        announceStatusProbe?.();
+        return await new Promise<boolean>((resolve) => {
+          releaseStatusProbe = resolve;
+        });
+      },
+    });
+    const handle = await runtime.start({ profile: 'status-race', port: await freePort() });
+    const pendingStatus = runtime.status('status-race');
+    await statusProbeStarted;
+    process.kill(handle.snapshot.pid, 'SIGTERM');
+    const exited = await handle.waitForExit();
+    assert.equal(exited.state, 'failed');
+    releaseStatusProbe?.(true);
+
+    const status = await pendingStatus;
+    assert.equal(status?.state, 'failed');
+    assert.equal(status?.errorCode, BROWSER_RUNTIME_ERROR_CODE.CHILD_EXITED);
   });
 });

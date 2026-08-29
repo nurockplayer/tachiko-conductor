@@ -57,6 +57,7 @@ export interface BrowserRuntimeSnapshot {
   readonly pid: number;
   /** Foreground Conductor process that owns and can safely stop the child. */
   readonly ownerPid: number;
+  readonly stopTimeoutMs: number;
   readonly headless: boolean;
   readonly state: BrowserRuntimeState;
   readonly health: BrowserRuntimeHealth;
@@ -231,6 +232,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       port,
       pid: child.pid,
       ownerPid: process.pid,
+      stopTimeoutMs,
       headless,
       state: 'starting',
       health: 'starting',
@@ -359,9 +361,13 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     }
     if (snapshot.state === 'ready') {
       const healthy = await this.readinessProbe(snapshot.endpoint);
-      const checked: BrowserRuntimeSnapshot = { ...snapshot, health: healthy ? 'ready' : 'unhealthy' };
-      writeJsonAtomic(metadataPath, checked);
-      return checked;
+      // Health probing awaits I/O. Re-read afterward so an owner transition
+      // that completed meanwhile wins, and never persist a stale ready view.
+      const current = readSnapshot(metadataPath);
+      if (current === null || current.runtimeId !== snapshot.runtimeId || current.state !== 'ready') {
+        return current ?? snapshot;
+      }
+      return { ...current, health: healthy ? 'ready' : 'unhealthy' };
     }
     return snapshot;
   }
@@ -388,7 +394,8 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     // The foreground owner observes the metadata transition and stops its own
     // ChildProcess handle. This process never signals a persisted PID, which
     // may have been reused by an unrelated process after a crash/reboot.
-    const stopped = await waitForProcessExit(snapshot.pid, DEFAULT_STOP_TIMEOUT_MS + 1_250);
+    const ownerStopTimeoutMs = persistedStopTimeout(snapshot.stopTimeoutMs);
+    const stopped = await waitForProcessExit(snapshot.pid, ownerStopTimeoutMs + 1_250);
     if (!stopped) {
       const failed: BrowserRuntimeSnapshot = {
         ...stopping,
@@ -532,6 +539,12 @@ function validateTimeout(timeoutMs: number, name: string): number {
     );
   }
   return timeoutMs;
+}
+
+function persistedStopTimeout(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 1
+    ? value
+    : DEFAULT_STOP_TIMEOUT_MS;
 }
 
 function loopbackAllowedHosts(host: string, port: number): string {

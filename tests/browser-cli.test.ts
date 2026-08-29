@@ -25,6 +25,7 @@ const READY: BrowserRuntimeSnapshot = {
   port: 8931,
   pid: 1234,
   ownerPid: 1233,
+  stopTimeoutMs: 5000,
   headless: true,
   state: 'ready',
   health: 'ready',
