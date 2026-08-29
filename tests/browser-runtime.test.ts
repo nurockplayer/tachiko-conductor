@@ -280,6 +280,35 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(existsSync(path.join(profileRoot, 'timeout-cleanup', '.tachiko-runtime-lock.json')), false);
   });
 
+  it('honors an identity-scoped external stop request while readiness is still pending', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-starting-stop-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const profileRoot = path.join(root, 'profiles');
+    const runtimeRoot = path.join(root, 'runtimes');
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot,
+      runtimeRoot,
+      repositoryRoot: REPO_ROOT,
+      playwrightCliPath: FAKE_MCP,
+      readinessProbe: async () => await new Promise<boolean>(() => undefined),
+    });
+    const starting = runtime.start({
+      profile: 'stop-while-starting',
+      port: await freePort(),
+      startupTimeoutMs: 5_000,
+      stopTimeoutMs: 500,
+    });
+    const startRejected = assert.rejects(
+      starting,
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING),
+    );
+    await waitUntil(() => existsSync(path.join(runtimeRoot, 'stop-while-starting.json')));
+
+    const stopped = await runtime.stop('stop-while-starting');
+    assert.equal(stopped.state, 'stopped');
+    await startRejected;
+  });
+
   it('returns null for a profile with no runtime metadata and refuses to stop it', async () => {
     const { runtime } = tempRuntime();
     assert.equal(await runtime.status('missing'), null);

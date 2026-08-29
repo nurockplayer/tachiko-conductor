@@ -252,9 +252,44 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         () => ({ kind: 'ready' as const }),
         (error: unknown) => ({ kind: 'startup-error' as const, error }),
       ),
+      waitForStopRequest(stopRequestPath, startupAbort.signal).then(() => ({ kind: 'stop-request' as const })),
       childOutcome,
     ]);
     startupAbort.abort();
+    if (startup.kind === 'stop-request') {
+      const stopping: BrowserRuntimeSnapshot = { ...started, state: 'stopping', health: 'stopping' };
+      writeJsonAtomic(metadataPath, stopping);
+      const finalization = childOutcome.then(async (outcome) => {
+        const stopped: BrowserRuntimeSnapshot = {
+          ...stopping,
+          state: 'stopped',
+          health: 'stopped',
+          stoppedAt: this.now(),
+          ...(outcome.kind === 'exit' ? { exitCode: outcome.code, exitSignal: outcome.signal } : {}),
+        };
+        await finalizeOwnedRuntime(metadataPath, lockPath, runtimeId, stopped);
+        rmSync(stopRequestPath, { force: true });
+        return stopped;
+      });
+      child.kill('SIGTERM');
+      const terminated = await Promise.race([
+        finalization.then(() => true),
+        delay(stopTimeoutMs).then(() => false),
+      ]);
+      if (!terminated) {
+        child.kill('SIGKILL');
+        const killed = await Promise.race([
+          finalization.then(() => true),
+          delay(POST_KILL_EXIT_TIMEOUT_MS).then(() => false),
+        ]);
+        if (!killed) void finalization.catch(() => undefined);
+      }
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING,
+        `Browser profile "${options.profile}" was stopped before it became ready.`,
+        { profile: options.profile, runtimeId },
+      );
+    }
     if (startup.kind === 'startup-error') {
       writeJsonAtomic(metadataPath, {
         ...started,
@@ -867,6 +902,18 @@ async function waitForReadiness(
     `Playwright MCP did not complete an MCP handshake at ${endpoint} within ${timeoutMs}ms.`,
     { endpoint, timeoutMs },
   );
+}
+
+function waitForStopRequest(file: string, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setInterval(() => {
+      if (!existsSync(file)) return;
+      clearInterval(timer);
+      resolve();
+    }, 25);
+    timer.unref();
+    signal.addEventListener('abort', () => clearInterval(timer), { once: true });
+  });
 }
 
 async function probeMcpEndpoint(endpoint: string): Promise<boolean> {
