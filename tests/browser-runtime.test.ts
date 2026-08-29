@@ -566,4 +566,24 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     assert.equal(replacementStatus?.state, 'ready');
     await replacement.stop();
   });
+
+  it('fails promptly and remains retryable when the ownership guard blocks an owned stop', async () => {
+    const { runtime, profileRoot } = tempRuntime();
+    const handle = await runtime.start({ profile: 'guarded-stop', port: await freePort() });
+    cleanups.push(async () => {
+      await handle.stop().catch(() => undefined);
+    });
+    const guardPath = path.join(profileRoot, 'guarded-stop', '.tachiko-runtime-lock.guard');
+    writeFileSync(guardPath, `${JSON.stringify({ pid: process.pid })}\n`, { mode: 0o600 });
+
+    await assert.rejects(
+      handle.stop(),
+      (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE),
+    );
+    assert.equal(processIsAlive(handle.snapshot.pid), true);
+
+    rmSync(guardPath, { force: true });
+    const stopped = await handle.stop();
+    assert.equal(stopped.state, 'stopped');
+  });
 });

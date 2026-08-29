@@ -146,6 +146,7 @@ interface RuntimeLock {
 type ChildOutcome =
   | { readonly kind: 'exit'; readonly code: number | null; readonly signal: NodeJS.Signals | null }
   | { readonly kind: 'error'; readonly error: Error };
+type OwnedRuntimeWriteResult = 'written' | 'identity-changed' | 'guard-timeout';
 
 const PROFILE_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const RUNTIME_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
@@ -193,7 +194,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     mkdirSync(outputDir, { recursive: true, mode: 0o700 });
     this.validateResolvedStorage([profileDir, outputDir]);
     const lockPath = path.join(profileDir, '.tachiko-runtime-lock.json');
-    acquireLock(lockPath, { version: 1, runtimeId, pid: process.pid }, options.profile);
+    const startupGuard = acquireLock(lockPath, { version: 1, runtimeId, pid: process.pid }, options.profile);
 
     let child: ChildProcess;
     try {
@@ -213,7 +214,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         },
       );
     } catch (error) {
-      releaseLock(lockPath, runtimeId);
+      releaseOwnedLockWithGuard(lockPath, startupGuard, runtimeId);
       throw new BrowserRuntimeError(
         BROWSER_RUNTIME_ERROR_CODE.SPAWN_FAILED,
         `Could not start the Playwright MCP process for profile "${options.profile}".`,
@@ -224,7 +225,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     const childOutcome = observeChild(child);
     if (child.pid === undefined) {
       const outcome = await childOutcome;
-      releaseLock(lockPath, runtimeId);
+      releaseOwnedLockWithGuard(lockPath, startupGuard, runtimeId);
       throw childOutcomeError(options.profile, outcome);
     }
     writeJsonAtomic(lockPath, { version: 1, runtimeId, pid: child.pid } satisfies RuntimeLock);
@@ -267,7 +268,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
           stoppedAt: this.now(),
           ...(outcome.kind === 'exit' ? { exitCode: outcome.code, exitSignal: outcome.signal } : {}),
         };
-        await finalizeOwnedRuntime(metadataPath, lockPath, runtimeId, stopped);
+        finalizeOwnedRuntimeWithGuard(metadataPath, lockPath, startupGuard, runtimeId, stopped);
         rmSync(stopRequestPath, { force: true });
         return stopped;
       });
@@ -306,7 +307,8 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
           errorCode: BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT,
           ...(outcome.kind === 'exit' ? { exitCode: outcome.code, exitSignal: outcome.signal } : {}),
         };
-        return finalizeOwnedRuntime(metadataPath, lockPath, runtimeId, failed).then(() => {
+        return Promise.resolve().then(() => {
+          finalizeOwnedRuntimeWithGuard(metadataPath, lockPath, startupGuard, runtimeId, failed);
           rmSync(stopRequestPath, { force: true });
           return failed;
         });
@@ -333,7 +335,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     }
     if (startup.kind !== 'ready') {
       const failed = failedSnapshot(started, startup, this.now());
-      await finalizeOwnedRuntime(metadataPath, lockPath, runtimeId, failed);
+      finalizeOwnedRuntimeWithGuard(metadataPath, lockPath, startupGuard, runtimeId, failed);
       throw childOutcomeError(options.profile, startup);
     }
 
@@ -343,7 +345,11 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       health: 'ready',
       readyAt: this.now(),
     };
-    writeJsonAtomic(metadataPath, ready);
+    try {
+      writeJsonAtomic(metadataPath, ready);
+    } finally {
+      rmSync(startupGuard, { force: true });
+    }
 
     let stopRequestTimer: NodeJS.Timeout | undefined;
     const completion = childOutcome.then(async (outcome) => {
@@ -367,7 +373,13 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
 
     let stopPromise: Promise<BrowserRuntimeSnapshot> | undefined;
     const requestOwnedStop = (): Promise<BrowserRuntimeSnapshot> => {
-      stopPromise ??= this.stopHandle(ready, child, completion, stopTimeoutMs);
+      if (stopPromise === undefined) {
+        const attempt = this.stopHandle(ready, child, completion, stopTimeoutMs);
+        stopPromise = attempt.catch((error: unknown) => {
+          stopPromise = undefined;
+          throw error;
+        });
+      }
       return stopPromise;
     };
     stopRequestTimer = setInterval(() => {
@@ -509,14 +521,21 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     if (current === null || (current.state !== 'starting' && current.state !== 'ready' && current.state !== 'stopping')) {
       return current ?? snapshot;
     }
-    const transitioned = await writeOwnedRuntimeSnapshot(
+    const transition = await writeOwnedRuntimeSnapshot(
       this.metadataPath(snapshot.profile),
       path.join(this.profileDir(snapshot.profile), '.tachiko-runtime-lock.json'),
       snapshot.runtimeId,
       { ...current, state: 'stopping', health: 'stopping' },
       false,
     );
-    if (!transitioned) return await completion;
+    if (transition === 'identity-changed') return await completion;
+    if (transition === 'guard-timeout') {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE,
+        `Browser profile "${snapshot.profile}" ownership is busy; retry stop after the ownership update completes.`,
+        { profile: snapshot.profile, runtimeId: snapshot.runtimeId },
+      );
+    }
     child.kill('SIGTERM');
     const result = await Promise.race([
       completion.then((value) => ({ done: true as const, value })),
@@ -692,7 +711,7 @@ function readLock(file: string): RuntimeLock | null {
   }
 }
 
-function acquireLock(file: string, lock: RuntimeLock, profile: string): void {
+function acquireLock(file: string, lock: RuntimeLock, profile: string): string {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
   const guard = acquireLockGuard(path.dirname(file), profile);
   try {
@@ -715,17 +734,36 @@ function acquireLock(file: string, lock: RuntimeLock, profile: string): void {
         { profile },
       );
     }
+    return guard;
+  } catch (error) {
+    rmSync(guard, { force: true });
+    throw error;
+  }
+}
+
+function releaseOwnedLockWithGuard(lockPath: string, guard: string, runtimeId: string): void {
+  try {
+    const current = readLock(lockPath);
+    if (current?.runtimeId === runtimeId) rmSync(lockPath, { force: true });
   } finally {
     rmSync(guard, { force: true });
   }
 }
 
-function releaseLock(file: string, runtimeId: string): void {
-  const guard = tryAcquireLockGuard(path.dirname(file));
-  if (guard === null) return;
+function finalizeOwnedRuntimeWithGuard(
+  metadataPath: string,
+  lockPath: string,
+  guard: string,
+  runtimeId: string,
+  snapshot: BrowserRuntimeSnapshot,
+): boolean {
   try {
-    const current = readLock(file);
-    if (current?.runtimeId === runtimeId) rmSync(file, { force: true });
+    const lock = readLock(lockPath);
+    const current = readSnapshot(metadataPath);
+    if (lock?.runtimeId !== runtimeId || current?.runtimeId !== runtimeId) return false;
+    writeJsonAtomic(metadataPath, snapshot);
+    rmSync(lockPath, { force: true });
+    return true;
   } finally {
     rmSync(guard, { force: true });
   }
@@ -736,7 +774,7 @@ async function finalizeOwnedRuntime(
   lockPath: string,
   runtimeId: string,
   snapshot: BrowserRuntimeSnapshot,
-): Promise<boolean> {
+): Promise<OwnedRuntimeWriteResult> {
   return await writeOwnedRuntimeSnapshot(metadataPath, lockPath, runtimeId, snapshot, true);
 }
 
@@ -746,21 +784,21 @@ async function writeOwnedRuntimeSnapshot(
   runtimeId: string,
   snapshot: BrowserRuntimeSnapshot,
   release: boolean,
-): Promise<boolean> {
+): Promise<OwnedRuntimeWriteResult> {
   const deadline = Date.now() + 1_000;
   let guard = tryAcquireLockGuard(path.dirname(lockPath));
   while (guard === null && Date.now() < deadline) {
     await delay(10);
     guard = tryAcquireLockGuard(path.dirname(lockPath));
   }
-  if (guard === null) return false;
+  if (guard === null) return 'guard-timeout';
   try {
     const lock = readLock(lockPath);
     const current = readSnapshot(metadataPath);
-    if (lock?.runtimeId !== runtimeId || current?.runtimeId !== runtimeId) return false;
+    if (lock?.runtimeId !== runtimeId || current?.runtimeId !== runtimeId) return 'identity-changed';
     writeJsonAtomic(metadataPath, snapshot);
     if (release) rmSync(lockPath, { force: true });
-    return true;
+    return 'written';
   } finally {
     rmSync(guard, { force: true });
   }

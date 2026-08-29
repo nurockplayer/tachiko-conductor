@@ -37,8 +37,10 @@ One live runtime owns a profile lock before Playwright starts. Lock acquisition
 and stale-lock replacement are serialized by a separate atomic guard, so two
 starters cannot both reclaim the same profile. A dead owner's stale lock can be
 reclaimed; a live owner's lock produces `BROWSER_PROFILE_IN_USE` with the PID
-and runtime ID. If a process is killed during the very short guarded ownership
-update, the same typed error reports the exact stale guard path and PID state;
+and runtime ID. The ownership guard stays held through startup readiness so no
+other process can reclaim a child while its identity is being published. If the
+owner is killed during that guarded startup, the same typed error reports the
+exact stale guard path and PID state;
 after confirming no start/stop is active, remove that guard and retry.
 
 ## Bootstrap and normal use
