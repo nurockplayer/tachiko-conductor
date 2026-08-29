@@ -222,13 +222,16 @@ describe('browser CLI command layer', () => {
   it('stops the exact local handle when bootstrap opening is aborted', async () => {
     const runtime = new FakeBrowserRuntime();
     const controller = new AbortController();
+    let rejectOpen: ((error: Error) => void) | undefined;
     const opening = browserBootstrapCommand(
       runtime,
       'login',
       { signal: controller.signal },
       async () => {
         controller.abort();
-        await new Promise<void>(() => undefined);
+        await new Promise<void>((_resolve, reject) => {
+          rejectOpen = reject;
+        });
       },
     );
 
@@ -236,6 +239,28 @@ describe('browser CLI command layer', () => {
       assert.equal((error as BrowserRuntimeError).code, BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING);
       return true;
     });
+    assert.equal(runtime.handleStops, 1);
+    assert.notEqual(rejectOpen, undefined);
+    rejectOpen?.(new Error('late open failure'));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  });
+
+  it('does not invoke bootstrap opening for a pre-aborted attempt', async () => {
+    const runtime = new FakeBrowserRuntime();
+    const controller = new AbortController();
+    controller.abort();
+    let openCalls = 0;
+
+    await assert.rejects(
+      browserBootstrapCommand(runtime, 'login', { signal: controller.signal }, async () => {
+        openCalls += 1;
+      }),
+      (error) => {
+        assert.equal((error as BrowserRuntimeError).code, BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING);
+        return true;
+      },
+    );
+    assert.equal(openCalls, 0);
     assert.equal(runtime.handleStops, 1);
   });
 

@@ -153,7 +153,7 @@ export async function browserBootstrapCommand(
   const handle = await runtime.start({ profile, ...options, headless: false });
   try {
     await abortable(
-      openBrowser(handle.snapshot.endpoint),
+      () => openBrowser(handle.snapshot.endpoint),
       options.signal,
       () => new BrowserRuntimeError(
         BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING,
@@ -168,21 +168,37 @@ export async function browserBootstrapCommand(
   }
 }
 
-function abortable<T>(operation: Promise<T>, signal: AbortSignal | undefined, error: () => Error): Promise<T> {
-  if (signal === undefined) return operation;
+function abortable<T>(operation: () => Promise<T>, signal: AbortSignal | undefined, error: () => Error): Promise<T> {
+  if (signal === undefined) return operation();
   if (signal.aborted) return Promise.reject(error());
   return new Promise<T>((resolve, reject) => {
+    let settled = false;
     const aborted = () => {
+      if (settled) return;
+      settled = true;
       signal.removeEventListener('abort', aborted);
       reject(error());
     };
     signal.addEventListener('abort', aborted, { once: true });
-    operation.then(
+    let pending: Promise<T>;
+    try {
+      pending = operation();
+    } catch (operationError) {
+      settled = true;
+      signal.removeEventListener('abort', aborted);
+      reject(operationError);
+      return;
+    }
+    pending.then(
       (value) => {
+        if (settled) return;
+        settled = true;
         signal.removeEventListener('abort', aborted);
         resolve(value);
       },
       (operationError: unknown) => {
+        if (settled) return;
+        settled = true;
         signal.removeEventListener('abort', aborted);
         reject(operationError);
       },
