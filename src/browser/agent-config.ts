@@ -22,7 +22,9 @@ export function buildBrowserAgentConnection(snapshot: BrowserRuntimeSnapshot): B
       },
     },
     codex: {
-      configOverride: `mcp_servers.${capability.name}.url=${JSON.stringify(capability.endpoint)}`,
+      configOverride:
+        `mcp_servers.${capability.name}={` +
+        `url=${JSON.stringify(capability.endpoint)},required=true,default_tools_approval_mode="approve"}`,
     },
   };
 }

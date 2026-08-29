@@ -7,7 +7,7 @@ import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
 import type { Run, Target } from '../domain/types.js';
-import { runReviewLoop } from '../reviewers/loop.js';
+import { renderReviewFindings, runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
 
 export interface WorkflowDependencies {
@@ -81,11 +81,30 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
-        const baseSha = snapshot.pullRequest?.baseSha ?? '';
+        const pendingReviewFix =
+          run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
+        if (pendingReviewFix && snapshot.headSha !== run.headSha) {
+          const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        const baseSha = pendingReviewFix ? (run.headSha ?? '') : (snapshot.pullRequest?.baseSha ?? '');
         const result = await implementation.run({
           target,
           baseSha,
-          instructions: snapshot.issue.body,
+          instructions: pendingReviewFix ? renderReviewFindings(run.reviewResult!) : snapshot.issue.body,
           capabilities: deps.implementationCapabilities,
         });
         if (result.exitStatus === 'failure') {

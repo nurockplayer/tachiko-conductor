@@ -9,6 +9,7 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
+import { runReviewLoop } from '../src/reviewers/loop.js';
 import { TARGET, failureResult, successResult } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
@@ -217,6 +218,41 @@ describe('runWorkflow', () => {
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.equal(result.run.interrupt?.reason, 'login expired');
     assert.deepEqual(result.run.interrupt?.choices, ['Complete human bootstrap/takeover and resume', 'Cancel the run']);
+  });
+
+  it('resumes an interrupted review fix with the original blocking findings and current HEAD', async () => {
+    const store = new MemoryStore();
+    reviewingRun(store, 'run-resume-fix');
+    const implementation = new FakeImplementation([
+      {
+        exitStatus: 'failure',
+        summary: '2FA required',
+        diagnostics: ['TACHIKO_NEEDS_HUMAN: 2FA required'],
+      },
+      successResult(HEAD2, 'fixed after takeover'),
+    ]);
+    const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
+    const github = githubAdapter([HEAD, HEAD, HEAD2]);
+
+    const parked = await runReviewLoop(
+      { store, github, implementation, reviewer },
+      'run-resume-fix',
+      { maxAttempts: 3, now: () => T0 },
+    );
+    assert.equal(parked.outcome, 'needs_human');
+    const resumed = applyTransition(parked.run, { type: 'human_resolved', reason: '2FA complete' }, T0);
+    store.update(resumed);
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer },
+      'run-resume-fix',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests[1]?.baseSha, HEAD);
+    assert.match(implementation.requests[1]?.instructions ?? '', /the diff has a bug/);
+    assert.doesNotMatch(implementation.requests[1]?.instructions ?? '', /DoR-ready/);
   });
 
   it('parks in NEEDS_HUMAN with structured context when the review loop cannot converge', async () => {

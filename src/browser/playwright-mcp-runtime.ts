@@ -1,7 +1,9 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import {
+  existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
@@ -19,6 +21,7 @@ export const BROWSER_RUNTIME_ERROR_CODE = {
   PROFILE_IN_USE: 'BROWSER_PROFILE_IN_USE',
   STARTUP_TIMEOUT: 'BROWSER_STARTUP_TIMEOUT',
   CHILD_EXITED: 'BROWSER_CHILD_EXITED',
+  OWNER_EXITED: 'BROWSER_OWNER_EXITED',
   SPAWN_FAILED: 'BROWSER_SPAWN_FAILED',
   BOOTSTRAP_FAILED: 'BROWSER_BOOTSTRAP_FAILED',
   NOT_RUNNING: 'BROWSER_NOT_RUNNING',
@@ -50,6 +53,8 @@ export interface BrowserRuntimeSnapshot {
   readonly host: string;
   readonly port: number;
   readonly pid: number;
+  /** Foreground Conductor process that owns and can safely stop the child. */
+  readonly ownerPid: number;
   readonly headless: boolean;
   readonly state: BrowserRuntimeState;
   readonly health: BrowserRuntimeHealth;
@@ -173,9 +178,12 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     const runtimeId = randomUUID();
     const profileDir = this.profileDir(options.profile);
     const outputDir = path.join(this.runtimeRoot, `${options.profile}-output`);
+    mkdirSync(this.profileRoot, { recursive: true, mode: 0o700 });
+    mkdirSync(this.runtimeRoot, { recursive: true, mode: 0o700 });
+    this.validateResolvedStorage([this.profileRoot, this.runtimeRoot]);
     mkdirSync(profileDir, { recursive: true, mode: 0o700 });
     mkdirSync(outputDir, { recursive: true, mode: 0o700 });
-    mkdirSync(this.runtimeRoot, { recursive: true, mode: 0o700 });
+    this.validateResolvedStorage([profileDir, outputDir]);
     const lockPath = path.join(profileDir, '.tachiko-runtime-lock.json');
     acquireLock(lockPath, { version: 1, runtimeId, pid: process.pid }, options.profile);
 
@@ -217,6 +225,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       host,
       port,
       pid: child.pid,
+      ownerPid: process.pid,
       headless,
       state: 'starting',
       health: 'starting',
@@ -263,6 +272,7 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
     };
     writeJsonAtomic(metadataPath, ready);
 
+    let stopRequestTimer: NodeJS.Timeout | undefined;
     const completion = childOutcome.then((outcome) => {
       const current = readSnapshot(metadataPath);
       const normalStop = current?.runtimeId === runtimeId && current.state === 'stopping';
@@ -278,11 +288,31 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       writeJsonAtomic(metadataPath, finalSnapshot);
       releaseLock(lockPath, runtimeId);
       return finalSnapshot;
+    }).finally(() => {
+      if (stopRequestTimer !== undefined) clearInterval(stopRequestTimer);
     });
+
+    let stopPromise: Promise<BrowserRuntimeSnapshot> | undefined;
+    const requestOwnedStop = (): Promise<BrowserRuntimeSnapshot> => {
+      stopPromise ??= this.stopHandle(ready, child, completion, stopTimeoutMs);
+      return stopPromise;
+    };
+    stopRequestTimer = setInterval(() => {
+      try {
+        const current = readSnapshot(metadataPath);
+        if (current?.runtimeId === runtimeId && current.state === 'stopping') {
+          void requestOwnedStop().catch(() => undefined);
+        }
+      } catch {
+        // A malformed metadata file is reported by status; never infer a stop
+        // request from data that cannot be read safely.
+      }
+    }, 25);
+    stopRequestTimer.unref();
 
     return {
       snapshot: ready,
-      stop: async () => await this.stopHandle(ready, child, completion, stopTimeoutMs),
+      stop: requestOwnedStop,
       waitForExit: async () => await completion,
     };
   }
@@ -311,6 +341,17 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
       releaseLock(path.join(this.profileDir(profile), '.tachiko-runtime-lock.json'), snapshot.runtimeId);
       return finalSnapshot;
     }
+    if (!processIsAlive(snapshot.ownerPid)) {
+      const failed: BrowserRuntimeSnapshot = {
+        ...snapshot,
+        state: 'failed',
+        health: 'failed',
+        stoppedAt: this.now(),
+        errorCode: BROWSER_RUNTIME_ERROR_CODE.OWNER_EXITED,
+      };
+      writeJsonAtomic(metadataPath, failed);
+      return failed;
+    }
     if (snapshot.state === 'ready') {
       const healthy = await canConnect(snapshot.host, snapshot.port);
       const checked: BrowserRuntimeSnapshot = { ...snapshot, health: healthy ? 'ready' : 'unhealthy' };
@@ -329,21 +370,37 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
         { profile, state: snapshot?.state ?? 'missing' },
       );
     }
+    if (!processIsAlive(snapshot.ownerPid)) {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING,
+        `Browser profile "${profile}" has no live foreground owner; refusing an unsafe PID-only stop.`,
+        { profile, pid: snapshot.pid, ownerPid: snapshot.ownerPid, runtimeId: snapshot.runtimeId },
+      );
+    }
     const metadataPath = this.metadataPath(profile);
     const stopping: BrowserRuntimeSnapshot = { ...snapshot, state: 'stopping', health: 'stopping' };
     writeJsonAtomic(metadataPath, stopping);
-    signalProcess(snapshot.pid, 'SIGTERM');
-    const stopped = await waitForProcessExit(snapshot.pid, DEFAULT_STOP_TIMEOUT_MS);
+    // The foreground owner observes the metadata transition and stops its own
+    // ChildProcess handle. This process never signals a persisted PID, which
+    // may have been reused by an unrelated process after a crash/reboot.
+    const stopped = await waitForProcessExit(snapshot.pid, DEFAULT_STOP_TIMEOUT_MS + 1_250);
     if (!stopped) {
-      signalProcess(snapshot.pid, 'SIGKILL');
-      if (!(await waitForProcessExit(snapshot.pid, 1_000))) {
-        throw new BrowserRuntimeError(
-          BROWSER_RUNTIME_ERROR_CODE.STOP_TIMEOUT,
-          `Browser profile "${profile}" did not stop after SIGTERM and SIGKILL.`,
-          { profile, pid: snapshot.pid },
-        );
-      }
+      const failed: BrowserRuntimeSnapshot = {
+        ...stopping,
+        state: 'failed',
+        health: 'failed',
+        stoppedAt: this.now(),
+        errorCode: BROWSER_RUNTIME_ERROR_CODE.STOP_TIMEOUT,
+      };
+      writeJsonAtomic(metadataPath, failed);
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.STOP_TIMEOUT,
+        `Browser profile "${profile}" did not stop through its foreground owner; no persisted PID was signalled.`,
+        { profile, pid: snapshot.pid, ownerPid: snapshot.ownerPid },
+      );
     }
+    const ownerSnapshot = await waitForTerminalSnapshot(metadataPath, snapshot.runtimeId, 500);
+    if (ownerSnapshot !== null) return ownerSnapshot;
     const finalSnapshot: BrowserRuntimeSnapshot = {
       ...stopping,
       state: 'stopped',
@@ -395,6 +452,20 @@ export class ManagedPlaywrightMcpRuntime implements BrowserRuntime {
           BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
           `Browser ${name} must be outside the repository.`,
           { repositoryRoot: this.repositoryRoot, configuredRoot: value },
+        );
+      }
+    }
+  }
+
+  private validateResolvedStorage(paths: readonly string[]): void {
+    const repository = realpathSync(this.repositoryRoot);
+    for (const configuredPath of paths) {
+      const resolvedPath = realpathSync(configuredPath);
+      if (isWithin(repository, resolvedPath)) {
+        throw new BrowserRuntimeError(
+          BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+          'Browser profile/runtime storage resolves inside the repository; symlinked repository paths are not allowed.',
+          { repositoryRoot: repository, configuredPath, resolvedPath },
         );
       }
     }
@@ -500,33 +571,75 @@ function readLock(file: string): RuntimeLock | null {
 
 function acquireLock(file: string, lock: RuntimeLock, profile: string): void {
   mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  const guard = acquireLockGuard(path.dirname(file), profile);
+  try {
+    const existing = readLock(file);
+    if (existing !== null && processIsAlive(existing.pid)) {
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE,
+        `Browser profile "${profile}" is already owned by live runtime ${existing.runtimeId} (PID ${existing.pid}).`,
+        { profile, runtimeId: existing.runtimeId, pid: existing.pid },
+      );
+    }
+    if (existsSync(file)) rmSync(file, { force: true });
     try {
       writeFileSync(file, `${JSON.stringify(lock)}\n`, { encoding: 'utf8', flag: 'wx', mode: 0o600 });
-      return;
     } catch (error) {
       if (errorCode(error) !== 'EEXIST') throw error;
-      const existing = readLock(file);
-      if (existing !== null && processIsAlive(existing.pid)) {
-        throw new BrowserRuntimeError(
-          BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE,
-          `Browser profile "${profile}" is already owned by live runtime ${existing.runtimeId} (PID ${existing.pid}).`,
-          { profile, runtimeId: existing.runtimeId, pid: existing.pid },
-        );
-      }
-      rmSync(file, { force: true });
+      throw new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE,
+        `Browser profile "${profile}" became owned while its lock was being acquired.`,
+        { profile },
+      );
     }
+  } finally {
+    rmSync(guard, { force: true });
   }
-  throw new BrowserRuntimeError(
-    BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE,
-    `Browser profile "${profile}" could not be locked.`,
-    { profile },
-  );
 }
 
 function releaseLock(file: string, runtimeId: string): void {
-  const current = readLock(file);
-  if (current?.runtimeId === runtimeId) rmSync(file, { force: true });
+  const guard = tryAcquireLockGuard(path.dirname(file));
+  if (guard === null) return;
+  try {
+    const current = readLock(file);
+    if (current?.runtimeId === runtimeId) rmSync(file, { force: true });
+  } finally {
+    rmSync(guard, { force: true });
+  }
+}
+
+function acquireLockGuard(profileDir: string, profile: string): string {
+  const guard = path.join(profileDir, '.tachiko-runtime-lock.guard');
+  try {
+    writeFileSync(guard, `${JSON.stringify({ pid: process.pid })}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    return guard;
+  } catch (error) {
+    if (errorCode(error) !== 'EEXIST') throw error;
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.PROFILE_IN_USE,
+      `Browser profile "${profile}" ownership is being updated; retry shortly.`,
+      { profile, guard },
+    );
+  }
+}
+
+function tryAcquireLockGuard(profileDir: string): string | null {
+  const guard = path.join(profileDir, '.tachiko-runtime-lock.guard');
+  try {
+    writeFileSync(guard, `${JSON.stringify({ pid: process.pid })}\n`, {
+      encoding: 'utf8',
+      flag: 'wx',
+      mode: 0o600,
+    });
+    return guard;
+  } catch (error) {
+    if (errorCode(error) === 'EEXIST') return null;
+    throw error;
+  }
 }
 
 function observeChild(child: ChildProcess): Promise<ChildOutcome> {
@@ -638,14 +751,6 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-function signalProcess(pid: number, signal: NodeJS.Signals): void {
-  try {
-    process.kill(pid, signal);
-  } catch (error) {
-    if (errorCode(error) !== 'ESRCH') throw error;
-  }
-}
-
 async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boolean> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -653,6 +758,25 @@ async function waitForProcessExit(pid: number, timeoutMs: number): Promise<boole
     await delay(25);
   }
   return !processIsAlive(pid);
+}
+
+async function waitForTerminalSnapshot(
+  metadataPath: string,
+  runtimeId: string,
+  timeoutMs: number,
+): Promise<BrowserRuntimeSnapshot | null> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const snapshot = readSnapshot(metadataPath);
+    if (
+      snapshot?.runtimeId === runtimeId &&
+      (snapshot.state === 'stopped' || snapshot.state === 'failed')
+    ) {
+      return snapshot;
+    }
+    await delay(25);
+  }
+  return null;
 }
 
 async function delay(milliseconds: number): Promise<void> {

@@ -24,6 +24,7 @@ const READY: BrowserRuntimeSnapshot = {
   host: '127.0.0.1',
   port: 8931,
   pid: 1234,
+  ownerPid: 1233,
   headless: true,
   state: 'ready',
   health: 'ready',
@@ -105,7 +106,7 @@ describe('browser CLI command layer', () => {
     });
     assert.equal(
       result.codex.configOverride,
-      'mcp_servers.tachiko_browser.url="http://127.0.0.1:8931/mcp"',
+      'mcp_servers.tachiko_browser={url="http://127.0.0.1:8931/mcp",required=true,default_tools_approval_mode="approve"}',
     );
   });
 

@@ -33,7 +33,7 @@ function formatTarget(target: Target): string {
   return `${target.owner}/${target.repo}@${target.branch}`;
 }
 
-function renderFindings(review: ReviewResult): string {
+export function renderReviewFindings(review: ReviewResult): string {
   if (review.findings.length === 0) return '';
   return review.findings
     .map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.summary}${finding.detail === undefined ? '' : ` — ${finding.detail}`}`)
@@ -96,7 +96,7 @@ export async function runReviewLoop(
     const reviewResult = await reviewer.review({
       target,
       headSha: run.headSha,
-      instructions: renderFindings(run.reviewResult ?? { verdict: 'request_changes', reviewerName: '', headSha: '', findings: [] }),
+      instructions: renderReviewFindings(run.reviewResult ?? { verdict: 'request_changes', reviewerName: '', headSha: '', findings: [] }),
     });
     attempts += 1;
 
@@ -143,7 +143,7 @@ export async function runReviewLoop(
     const fixResult = await implementation.run({
       target,
       baseSha: run.headSha ?? '',
-      instructions: renderFindings(reviewResult),
+      instructions: renderReviewFindings(reviewResult),
       capabilities: deps.implementationCapabilities,
     });
     if (fixResult.exitStatus === 'failure') {

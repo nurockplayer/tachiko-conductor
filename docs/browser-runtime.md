@@ -27,13 +27,15 @@ Defaults:
 Override the two roots with `TACHIKO_BROWSER_PROFILE_ROOT` and
 `TACHIKO_BROWSER_RUNTIME_ROOT`. Both roots must remain outside the current
 repository. Directories and metadata are created with user-only permissions.
-Runtime metadata contains the named runtime/profile, PID, endpoint, lifecycle
+Runtime metadata contains the named runtime/profile, foreground owner PID,
+child PID, endpoint, lifecycle
 timestamps, readiness/health, and typed exit information. It never contains
 cookies, auth headers, passwords, tokens, storage contents, form values, or
 model/browser transcripts.
 
-One live runtime owns a profile lock before Playwright starts. A second runtime
-cannot mutate that profile concurrently. A dead owner's stale lock can be
+One live runtime owns a profile lock before Playwright starts. Lock acquisition
+and stale-lock replacement are serialized by a separate atomic guard, so two
+starters cannot both reclaim the same profile. A dead owner's stale lock can be
 reclaimed; a live owner's lock produces `BROWSER_PROFILE_IN_USE` with the PID
 and runtime ID.
 
@@ -73,7 +75,9 @@ Startup checks the configured port, races readiness against child exit and a
 bounded timeout, and reports typed errors for invalid config, occupied ports,
 profile ownership, spawn failure, startup timeout, early/unexpected exit, and
 stop timeout. `SIGINT`/`SIGTERM` request a clean child stop; a bounded `SIGKILL`
-fallback is used only when the child does not exit.
+fallback is used only by the foreground owner when its actual child does not
+exit. The separate `browser stop` process writes a stop request for that owner;
+it never signals a persisted PID that may have been reused after a crash.
 
 ## Agent connection
 
@@ -104,7 +108,7 @@ the workflow state machine.
 For a direct Codex invocation, use the emitted `codex.configOverride` value:
 
 ```bash
-codex -c 'mcp_servers.tachiko_browser.url="http://127.0.0.1:8931/mcp"' exec '<prompt>'
+codex -c 'mcp_servers.tachiko_browser={url="http://127.0.0.1:8931/mcp",required=true,default_tools_approval_mode="approve"}' exec '<prompt>'
 ```
 
 For a direct Claude invocation, pass the emitted `claudeCode` object to
@@ -148,7 +152,8 @@ TACHIKO_BROWSER_AGENT_SMOKE=1 pnpm exec tsx --test tests/browser-agent-smoke.tes
 ```
 
 It starts the managed runtime and a localhost-only fixture, injects a per-run
-MCP config, permits only `browser_navigate` and `browser_snapshot`, uses a
+MCP config whose emitted policy requires the server and approves its tools,
+then narrows the smoke to `browser_navigate` and `browser_snapshot`, uses a
 read-only sandbox with no persisted session, and requires Codex to return the
 fixture sentinel. Enabling the path without an installed/authenticated `codex`
 CLI fails clearly; the default test suite and CI skip it.
