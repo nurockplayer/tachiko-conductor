@@ -16,6 +16,7 @@ import {
   ManagedPlaywrightMcpRuntime,
   type BrowserRuntimeHandle,
 } from '../src/browser/playwright-mcp-runtime.js';
+import { openBrowserForBootstrap } from '../src/browser/mcp-client.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -61,6 +62,48 @@ function contentText(result: unknown): string {
 }
 
 describe('managed Playwright MCP integration', () => {
+  it('keeps the bootstrap browser context alive across transient client disconnects', { timeout: 60_000 }, async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-bootstrap-integration-'));
+    const runtime = new ManagedPlaywrightMcpRuntime({
+      profileRoot: path.join(root, 'profiles'),
+      runtimeRoot: path.join(root, 'runtimes'),
+      repositoryRoot: REPO_ROOT,
+      env: { ...process.env, PLAYWRIGHT_MCP_PING_TIMEOUT_MS: '100' },
+    });
+    let handle: BrowserRuntimeHandle | undefined;
+    let bootstrapLease: { close(): Promise<void> } | undefined;
+    try {
+      handle = await runtime.start({ profile: 'bootstrap', port: await freePort(), headless: true });
+      bootstrapLease = await openBrowserForBootstrap(handle.snapshot.endpoint);
+
+      await withClient(handle.snapshot.endpoint, async (client) => {
+        const written = await client.callTool({
+          name: 'browser_evaluate',
+          arguments: {
+            function: "() => { globalThis.__tachikoBootstrapSentinel = 'still-open'; return globalThis.__tachikoBootstrapSentinel; }",
+          },
+        });
+        assert.notEqual(written.isError, true);
+        assert.match(contentText(written), /still-open/);
+      });
+
+      await new Promise<void>((resolve) => setTimeout(resolve, 4_500));
+
+      await withClient(handle.snapshot.endpoint, async (client) => {
+        const read = await client.callTool({
+          name: 'browser_evaluate',
+          arguments: { function: '() => globalThis.__tachikoBootstrapSentinel' },
+        });
+        assert.notEqual(read.isError, true);
+        assert.match(contentText(read), /still-open/);
+      });
+    } finally {
+      await bootstrapLease?.close().catch(() => undefined);
+      await handle?.stop().catch(() => undefined);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('uses a local fixture and reuses persistent profile state after a clean restart', { timeout: 120_000 }, async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-browser-integration-'));
     const fixture = http.createServer((_request, response) => {

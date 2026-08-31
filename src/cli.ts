@@ -9,7 +9,7 @@ import { ClaudeCodeAdapter } from './agents/claude-code.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
-import { openBrowserForBootstrap } from './browser/mcp-client.js';
+import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
 import {
   BROWSER_RUNTIME_ERROR_CODE,
   BrowserRuntimeError,
@@ -116,12 +116,25 @@ export function resolveRepositoryRoot(
       timeout: 2_000,
     }),
 ): string {
+  const resolvedCwd = path.resolve(cwd);
+  let resolved: string;
   try {
-    const resolved = resolveGitTopLevel(cwd).trim();
-    return resolved === '' ? path.resolve(cwd) : path.resolve(resolved);
+    resolved = resolveGitTopLevel(cwd).trim();
   } catch {
-    return path.resolve(cwd);
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+      `Cannot establish the Git repository top-level from "${resolvedCwd}"; refusing browser storage.`,
+      { cwd: resolvedCwd },
+    );
   }
+  if (resolved === '') {
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+      `Cannot establish the Git repository top-level from "${resolvedCwd}"; refusing browser storage.`,
+      { cwd: resolvedCwd },
+    );
+  }
+  return path.resolve(resolved);
 }
 
 export function parseBrowserPort(raw: string): number {
@@ -152,11 +165,11 @@ export async function browserBootstrapCommand(
   runtime: BrowserRuntime,
   profile: string,
   options: Omit<StartBrowserRuntimeOptions, 'profile' | 'headless'> = {},
-  openBrowser: (endpoint: string) => Promise<void> = openBrowserForBootstrap,
+  openBrowser: (endpoint: string) => Promise<BootstrapBrowserLease | void> = openBrowserForBootstrap,
 ): Promise<BrowserStartCommandResult> {
   const handle = await runtime.start({ profile, ...options, headless: false });
   try {
-    await abortable(
+    const lease = await abortable(
       () => openBrowser(handle.snapshot.endpoint),
       options.signal,
       () => new BrowserRuntimeError(
@@ -164,15 +177,51 @@ export async function browserBootstrapCommand(
         `Browser bootstrap for profile "${profile}" was cancelled while opening the headed browser.`,
         { profile, runtimeId: handle.snapshot.runtimeId },
       ),
+      closeBootstrapLease,
     );
-    return { ...buildBrowserAgentConnection(handle.snapshot), handle };
+    const leasedHandle = lease === undefined ? handle : holdBootstrapLease(handle, lease);
+    return { ...buildBrowserAgentConnection(handle.snapshot), handle: leasedHandle };
   } catch (error) {
     await handle.stop().catch(() => undefined);
     throw error;
   }
 }
 
-function abortable<T>(operation: () => Promise<T>, signal: AbortSignal | undefined, error: () => Error): Promise<T> {
+function holdBootstrapLease(handle: BrowserRuntimeHandle, lease: BootstrapBrowserLease): BrowserRuntimeHandle {
+  let releasePromise: Promise<void> | undefined;
+  const release = (): Promise<void> => {
+    releasePromise ??= closeBootstrapLease(lease);
+    return releasePromise;
+  };
+  return {
+    snapshot: handle.snapshot,
+    async stop() {
+      try {
+        return await handle.stop();
+      } finally {
+        await release();
+      }
+    },
+    async waitForExit() {
+      try {
+        return await handle.waitForExit();
+      } finally {
+        await release();
+      }
+    },
+  };
+}
+
+async function closeBootstrapLease(lease: BootstrapBrowserLease | void): Promise<void> {
+  await lease?.close().catch(() => undefined);
+}
+
+function abortable<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal | undefined,
+  error: () => Error,
+  disposeLateResult?: (value: T) => Promise<void>,
+): Promise<T> {
   if (signal === undefined) return operation();
   if (signal.aborted) return Promise.reject(error());
   return new Promise<T>((resolve, reject) => {
@@ -195,7 +244,10 @@ function abortable<T>(operation: () => Promise<T>, signal: AbortSignal | undefin
     }
     pending.then(
       (value) => {
-        if (settled) return;
+        if (settled) {
+          void disposeLateResult?.(value).catch(() => undefined);
+          return;
+        }
         settled = true;
         signal.removeEventListener('abort', aborted);
         resolve(value);

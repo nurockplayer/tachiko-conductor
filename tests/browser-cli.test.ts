@@ -101,11 +101,18 @@ describe('browser CLI command layer', () => {
       }),
       '/work/repository',
     );
-    assert.equal(
-      resolveRepositoryRoot('/not-a-repository', () => {
-        throw new Error('not git');
+  });
+
+  it('fails closed when the Git repository top-level cannot be established', () => {
+    assert.throws(
+      () => resolveRepositoryRoot('/work/repository/src', () => {
+        throw new Error('git timed out');
       }),
-      '/not-a-repository',
+      /Cannot establish the Git repository top-level.*refusing browser storage/,
+    );
+    assert.throws(
+      () => resolveRepositoryRoot('/work/repository/src', () => '   \n'),
+      /Cannot establish the Git repository top-level.*refusing browser storage/,
     );
   });
 
@@ -219,18 +226,36 @@ describe('browser CLI command layer', () => {
     assert.equal(result.runtime.headless, false);
   });
 
+  it('holds the bootstrap browser lease until the owned runtime handle finishes', async () => {
+    const runtime = new FakeBrowserRuntime();
+    let leaseCloses = 0;
+    const result = await browserBootstrapCommand(runtime, 'login', {}, async () => ({
+      async close() {
+        leaseCloses += 1;
+      },
+    }));
+
+    assert.equal(leaseCloses, 0);
+    await result.handle.stop();
+    assert.equal(runtime.handleStops, 1);
+    assert.equal(leaseCloses, 1);
+    await result.handle.waitForExit();
+    assert.equal(leaseCloses, 1);
+  });
+
   it('stops the exact local handle when bootstrap opening is aborted', async () => {
     const runtime = new FakeBrowserRuntime();
     const controller = new AbortController();
-    let rejectOpen: ((error: Error) => void) | undefined;
+    let resolveOpen: ((lease: { close(): Promise<void> }) => void) | undefined;
+    let leaseCloses = 0;
     const opening = browserBootstrapCommand(
       runtime,
       'login',
       { signal: controller.signal },
       async () => {
         controller.abort();
-        await new Promise<void>((_resolve, reject) => {
-          rejectOpen = reject;
+        return await new Promise<{ close(): Promise<void> }>((resolve) => {
+          resolveOpen = resolve;
         });
       },
     );
@@ -240,9 +265,14 @@ describe('browser CLI command layer', () => {
       return true;
     });
     assert.equal(runtime.handleStops, 1);
-    assert.notEqual(rejectOpen, undefined);
-    rejectOpen?.(new Error('late open failure'));
+    assert.notEqual(resolveOpen, undefined);
+    resolveOpen?.({
+      async close() {
+        leaseCloses += 1;
+      },
+    });
     await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(leaseCloses, 1);
   });
 
   it('does not invoke bootstrap opening for a pre-aborted attempt', async () => {
