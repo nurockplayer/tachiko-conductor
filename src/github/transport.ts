@@ -5,6 +5,8 @@ import { GitHubLiveStateError } from './errors.js';
 export interface GitHubApiTransport {
   get(path: string, query?: Readonly<Record<string, string>>): Promise<unknown>;
   getPaginated(path: string, query?: Readonly<Record<string, string>>): Promise<readonly unknown[]>;
+  /** Read a non-JSON GitHub media representation, such as a complete PR diff. */
+  getRaw?(path: string, accept: string): Promise<string>;
 }
 
 export interface ProcessResult {
@@ -132,14 +134,18 @@ export class GhCliTransport implements GitHubApiTransport {
     this.timeoutMs = options.timeoutMs ?? 30_000;
   }
 
-  private args(path: string, query: Readonly<Record<string, string>> = {}): string[] {
+  private args(
+    path: string,
+    query: Readonly<Record<string, string>> = {},
+    accept = 'application/vnd.github+json',
+  ): string[] {
     const args = [
       'api',
       '--method',
       'GET',
       path,
       '-H',
-      'Accept: application/vnd.github+json',
+      `Accept: ${accept}`,
       '-H',
       'X-GitHub-Api-Version: 2022-11-28',
     ];
@@ -191,5 +197,8 @@ export class GhCliTransport implements GitHubApiTransport {
       );
     }
     return pages.flat();
+  }
+  async getRaw(path: string, accept: string): Promise<string> {
+    return await this.execute(path, this.args(path, {}, accept));
   }
 }
