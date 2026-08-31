@@ -91,7 +91,12 @@ export async function runWorkflow(
           return githubFailureOutcome(run, error, store, now);
         }
         const baseSha = snapshot.pullRequest?.baseSha ?? '';
-        const result = await implementation.run({ target, baseSha, instructions: snapshot.issue.body });
+        const result = await implementation.run({
+          target,
+          baseSha,
+          instructions: snapshot.issue.body,
+          ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+        });
         if (result.exitStatus === 'failure') {
           run = applyTransition(run, { type: 'agent_failed', agentResult: result, headSha: result.headSha }, now());
           store.update(run);

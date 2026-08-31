@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { ImplementationAgent } from '../src/adapters/agent.js';
+import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
@@ -99,10 +99,12 @@ class FakeReviewer implements ReviewerAdapter {
 
 class FakeImplementation implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
+  readonly requests: ImplementationRequest[] = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
 
-  async run(request: { target: unknown; baseSha: string; instructions?: string }): Promise<AgentResult> {
+  async run(request: ImplementationRequest): Promise<AgentResult> {
+    this.requests.push(request);
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
     return outcome;
@@ -255,6 +257,29 @@ describe('runWorkflow', () => {
 
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'MERGE_READY');
+    assert.equal(implementation.requests[0]?.baseSha, '');
+  });
+
+  it('restores the persisted implementation session after a restart', async () => {
+    const store = new MemoryStore();
+    let run = applyTransition(createRun(TARGET, T0, 'run-1'), { type: 'start' }, T0);
+    run = {
+      ...run,
+      headSha: HEAD,
+      agentResult: { ...successResult(HEAD), sessionId: 'session-from-disk' },
+    };
+    store.create(run);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+    const reviewer = new FakeReviewer([approve(HEAD2)]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      'run-1',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests[0]?.sessionId, 'session-from-disk');
   });
 
   it('never passes the final gate when live HEAD drifted after approval', async () => {

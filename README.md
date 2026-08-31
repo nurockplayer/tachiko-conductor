@@ -14,11 +14,13 @@ interrupt protocol.
 
 ## Design invariants
 
-- GitHub will later be the engineering source of truth; the core only ever
-  sees plain data.
+- GitHub is the engineering source of truth; the core only ever sees plain
+  normalized data.
 - Core workflow logic is independent of Claude Code, DeepSeek, GitHub
   transport, and Linear.
-- Reviews are bound to an exact HEAD SHA; `FINAL_GATE` refuses stale approvals.
+- Reviews are bound to an exact HEAD SHA; `FINAL_GATE` re-reads GitHub and
+  refuses stale approvals, draft/closed/unmergeable PRs, non-passing checks,
+  and known unresolved review threads.
 - An approval containing a blocking finding is contradictory and is rejected
   before it can reach the final gate.
 - No autonomous merge, no cloud, no distributed queue, no UI, no Linear.
@@ -60,8 +62,9 @@ review result is bound to the run's current HEAD SHA.
 Transitions persist only the payloads they produce: agent results are bound to
 `agent_succeeded`/`agent_failed` (and must carry a matching exit status),
 review results to `review_approved`/`changes_requested`, and the run's HEAD
-SHA may only be changed by implementation transitions. A gate or merge can
-never swap in an unreviewed SHA.
+SHA may only be changed by implementation transitions or an explicit human
+choice to adopt the current live GitHub HEAD after an escalation. A gate or
+merge can never swap in an unreviewed SHA.
 
 ## Quick start
 
@@ -88,6 +91,9 @@ pnpm exec tsx src/cli.ts github snapshot nurockplayer/tachiko-conductor#42
 validation, independent review, and the final gate. It stops at `MERGE_READY`,
 `FAILED`, or a structured `NEEDS_HUMAN` interrupt (reason, evidence, bounded
 choices); resume a parked run with `run resume <id> --decision <choice>`.
+When choices are present, the decision must match one exactly. `Cancel the
+run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
+independent review before the final gate.
 
 `github snapshot` prints one normalized live-state JSON envelope from the
 locally authenticated `gh` CLI: `{"ok":true,"snapshot":...}` on success, or
@@ -132,9 +138,13 @@ same directory resumes the run exactly where it stopped.
 ```
 src/domain/            typed core: types, run factory, state machine
 src/store/             durable run persistence
-src/adapters/          typed boundaries for GitHub, agents, reviewers (not implemented)
-src/cli.ts             minimal CLI entrypoint
-tests/                 state-machine, store, resume, adapters, CLI tests
+src/adapters/          typed boundaries for GitHub, implementation, and review
+src/github/            live GitHub transport, normalization, and handoff parser
+src/agents/            Claude Code non-interactive execution adapter
+src/reviewers/         DeepSeek reviewer and bounded fix loop
+src/workflow/          state-resume-aware end-to-end orchestration
+src/cli.ts             run, resume, state inspection, and GitHub snapshot CLI
+tests/                 unit, persistence, adapter, workflow, and CLI E2E tests
 ```
 
 [issue #2]: https://github.com/nurockplayer/tachiko-conductor/issues/2
