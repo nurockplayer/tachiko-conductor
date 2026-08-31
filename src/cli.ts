@@ -584,6 +584,14 @@ function buildBrowserRuntime(): ManagedPlaywrightMcpRuntime {
   });
 }
 
+function buildBrowserCapabilityResolver(
+  browserProfile: string | undefined,
+): ImplementationCapabilityResolver | undefined {
+  if (browserProfile === undefined) return undefined;
+  const runtime = buildBrowserRuntime();
+  return async () => await browserImplementationCapabilities(runtime, browserProfile);
+}
+
 function printBrowserStart(result: BrowserStartCommandResult): void {
   const { handle: _handle, ...view } = result;
   console.log(JSON.stringify({ ok: true, ...view }, null, 2));
@@ -791,8 +799,7 @@ export async function main(argv: string[]): Promise<number> {
     const [id] = positionals;
     if (id === undefined) throw new Error('run resume requires a run id.');
     if (values.decision === undefined) throw new Error('run resume requires --decision <choice>.');
-    const runtime = buildBrowserRuntime();
-    const resolveCapabilities = async () => await browserImplementationCapabilities(runtime, values['browser-profile']);
+    const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
     const outcome = await resumeCommand(
       buildWorkflowDeps(store, resolveCapabilities),
       id,
@@ -818,8 +825,7 @@ export async function main(argv: string[]): Promise<number> {
   if (ref === undefined || extra !== undefined) {
     throw new Error('run requires exactly one owner/repo#123 reference.');
   }
-  const runtime = buildBrowserRuntime();
-  const resolveCapabilities = async () => await browserImplementationCapabilities(runtime, values['browser-profile']);
+  const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
   const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref);
   printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;

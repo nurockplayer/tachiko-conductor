@@ -681,4 +681,35 @@ describe('CLI end-to-end across processes', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('keeps non-browser run and resume paths independent of Git-root discovery', () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-no-git-'));
+    try {
+      const env = { ...process.env, TACHIKO_DATA_DIR: path.join(dir, 'runs') };
+      const runCli = (args: string[]): CliResult => {
+        const result = spawnSync(
+          process.execPath,
+          ['--import', path.join(REPO_ROOT, 'node_modules/tsx/dist/loader.mjs'), path.join(REPO_ROOT, 'src/cli.ts'), ...args],
+          { cwd: dir, env, encoding: 'utf8' },
+        );
+        return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', status: result.status };
+      };
+
+      const run = runCli(['run', 'not-an-issue-ref']);
+      assert.equal(run.status, 1);
+      assert.match(run.stderr, /expected owner\/repo#123/);
+      assert.doesNotMatch(run.stderr, /Cannot establish the Git repository top-level/);
+
+      const resume = runCli(['run', 'resume', 'missing', '--decision', 'retry']);
+      assert.equal(resume.status, 1);
+      assert.match(resume.stderr, /No run with id "missing" found/);
+      assert.doesNotMatch(resume.stderr, /Cannot establish the Git repository top-level/);
+
+      const browserRun = runCli(['run', 'not-an-issue-ref', '--browser-profile', 'work']);
+      assert.equal(browserRun.status, 1);
+      assert.match(browserRun.stderr, /Cannot establish the Git repository top-level/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
