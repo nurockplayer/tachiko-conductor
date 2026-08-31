@@ -228,6 +228,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       if (raw.state === 'open') open.push({ number, path, raw });
     }
     let associated = open;
+    let authoritativeClosingMatches: number | null = null;
     if (open.length > 1 && this.transport.graphql !== undefined) {
       const closingMatches: OpenPullRequest[] = [];
       for (const candidate of open) {
@@ -235,9 +236,10 @@ export class LiveGitHubAdapter implements GitHubAdapter {
           closingMatches.push(candidate);
         }
       }
-      if (closingMatches.length === 1) associated = closingMatches;
+      authoritativeClosingMatches = closingMatches.length;
+      if (closingMatches.length > 0) associated = closingMatches;
     }
-    if (associated.length > 1) {
+    if (associated.length > 1 && (authoritativeClosingMatches === null || authoritativeClosingMatches === 0)) {
       const bodyClosingMatches = associated.filter((candidate) =>
         hasClosingReference(candidate.raw, owner, repo, issueNumber),
       );

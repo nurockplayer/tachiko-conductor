@@ -374,6 +374,19 @@ PR: #7`;
     await expectError(adapter.readLiveSnapshot(TARGET), 'GH_AMBIGUOUS_OPEN_PRS', true);
   });
 
+  it('preserves ambiguity when GitHub authoritatively reports multiple closing PRs', async () => {
+    const transport = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7), crossRef(8)])
+      .collection('repos/acme/widgets/issues/42/comments', [])
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'Closes #42' }))
+      .queue('repos/acme/widgets/pulls/8', pull(8, HEAD, { body: 'Closes #12' }))
+      .queueGraphql(closingIssues(42), closingIssues(42));
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    await expectError(adapter.readLiveSnapshot(TARGET), 'GH_AMBIGUOUS_OPEN_PRS', true);
+  });
+
   it('selects the sole open PR that GitHub says closes the issue when stacked PRs also cross-reference it', async () => {
     const transport = new RouteTransport()
       .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
