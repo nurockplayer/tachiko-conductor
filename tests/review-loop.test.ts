@@ -262,6 +262,38 @@ describe('runReviewLoop', () => {
     assert.equal(implementation.requests.length, 0);
   });
 
+  it('starts a fresh bounded attempt window after an explicit human retry', async () => {
+    const store = new MemoryStore();
+    let run = applyTransition(
+      reviewingRun(),
+      { type: 'changes_requested', reviewResult: requestChanges(HEAD) },
+      T0,
+    );
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'attempt limit',
+        interrupt: { choices: ['Provide more GitHub context and retry', 'Cancel the run'] },
+      },
+      T0,
+    );
+    run = applyTransition(run, { type: 'human_resolved', reason: 'Provide more GitHub context and retry' }, T0);
+    store.create(run);
+    const reviewer = new FakeReviewer([approve(HEAD2)]);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD2]), implementation, reviewer },
+      'run-1',
+      { maxAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'approved');
+    assert.equal(result.run.state, 'FINAL_GATE');
+    assert.equal(implementation.requests.length, 1);
+  });
+
   it('resumes a persisted CHANGES_REQUESTED run by fixing before re-reviewing', async () => {
     const store = new MemoryStore();
     const requested = requestChanges(HEAD);

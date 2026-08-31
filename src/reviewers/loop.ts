@@ -36,7 +36,14 @@ function renderBlockingFindings(review: ReviewResult): string {
 }
 
 function durableReviewAttempts(run: Run): number {
-  return run.history.filter(
+  let attemptWindowStart = 0;
+  for (let index = run.history.length - 1; index >= 0; index -= 1) {
+    if (run.history[index]?.type === 'human_resolved') {
+      attemptWindowStart = index + 1;
+      break;
+    }
+  }
+  return run.history.slice(attemptWindowStart).filter(
     (entry) => entry.type === 'review_approved' || entry.type === 'changes_requested',
   ).length;
 }
