@@ -50,8 +50,16 @@ function isOptionalString(value: unknown): boolean {
   return value === undefined || typeof value === 'string';
 }
 
+function isOptionalNonEmptyString(value: unknown): boolean {
+  return value === undefined || (typeof value === 'string' && value.length > 0);
+}
+
 function isOptionalStringArray(value: unknown): boolean {
   return value === undefined || (Array.isArray(value) && value.every((item) => typeof item === 'string'));
+}
+
+function isOptionalDuration(value: unknown): boolean {
+  return value === undefined || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
 }
 
 function isAgentResult(value: unknown): boolean {
@@ -62,7 +70,9 @@ function isAgentResult(value: unknown): boolean {
     typeof result.summary === 'string' &&
     isOptionalString(result.headSha) &&
     isOptionalStringArray(result.changedFiles) &&
-    isOptionalStringArray(result.diagnostics)
+    isOptionalStringArray(result.diagnostics) &&
+    isOptionalNonEmptyString(result.sessionId) &&
+    isOptionalDuration(result.durationMs)
   );
 }
 

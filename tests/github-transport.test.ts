@@ -6,6 +6,7 @@ import {
   GhCliTransport,
   type ProcessResult,
   type ProcessRunner,
+  type ProcessRunOptions,
 } from '../src/github/transport.js';
 
 class RecordingRunner implements ProcessRunner {
@@ -13,8 +14,8 @@ class RecordingRunner implements ProcessRunner {
 
   constructor(private readonly outcomes: Array<ProcessResult | Error>) {}
 
-  async run(file: string, args: readonly string[], timeoutMs: number): Promise<ProcessResult> {
-    this.calls.push({ file, args, timeoutMs });
+  async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
+    this.calls.push({ file, args, timeoutMs: options.timeoutMs });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No fake outcome queued');
     if (outcome instanceof Error) throw outcome;

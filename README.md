@@ -4,9 +4,11 @@ Local orchestration core for the Tachiko Conductor product: a deterministic
 workflow state machine that drives a GitHub issue from **READY** through
 implementation, validation, independent review, and a final merge-ready gate.
 
-This repository currently implements **[issue #2]** only: the typed core, the
-state machine, durable local run state, and the adapter *interfaces*. No
-transport or model adapters are implemented yet (issues #3–#6).
+This repository currently implements **[issue #2]**, **[issue #3]**, and
+**[issue #4]**: the typed core, the deterministic state machine, durable local
+run state, the adapter *interfaces*, the GitHub live-state adapter (with an
+injected `gh` CLI transport and agent-handoff parser), and a Claude Code
+execution adapter. Issues #5 and #6 remain.
 
 ## Design invariants
 
@@ -75,11 +77,35 @@ pnpm exec tsx src/cli.ts run create --owner acme --repo widgets --issue 42
 pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
+pnpm exec tsx src/cli.ts github snapshot nurockplayer/tachiko-conductor#42
 ```
+
+`github snapshot` prints one normalized live-state JSON envelope from the
+locally authenticated `gh` CLI: `{"ok":true,"snapshot":...}` on success, or
+`{"ok":false,"error":{code,message,retryable,details}}` on stderr with a
+non-zero exit code.
 
 `agent_succeeded`, `agent_failed`, `review_approved` and `changes_requested`
 require result payloads supplied by adapters; `run transition` rejects them
 explicitly. Drive those through the domain API (`applyTransition`).
+
+## Smoke paths
+
+The opt-in Claude Code smoke test invokes the installed `claude` CLI
+non-interactively once and is never part of CI:
+
+```bash
+TACHIKO_SMOKE=1 pnpm exec tsx --test tests/claude-code-smoke.test.ts
+```
+
+`ClaudeCodeAdapter` returns the CLI's opaque `session_id` as
+`AgentResult.sessionId`; persist that result and pass the token back as
+`ImplementationRequest.sessionId` to resume after a Conductor process restart.
+An optional `AbortSignal` cancels the active process as a deterministic
+`CLAUDE_CANCELLED` failure. Results retain bounded wall-clock `durationMs`, but
+never raw stdout/stderr transcripts or model-usage details. The execution
+prompt requires repository validation and tests to pass before success is
+reported.
 
 After `pnpm build`, the same commands work through the `tachiko` bin
 (`node dist/cli.js`). Run state is stored under `$TACHIKO_DATA_DIR` (default
