@@ -98,6 +98,15 @@ non-interactively once and is never part of CI:
 TACHIKO_SMOKE=1 pnpm exec tsx --test tests/claude-code-smoke.test.ts
 ```
 
+`ClaudeCodeAdapter` returns the CLI's opaque `session_id` as
+`AgentResult.sessionId`; persist that result and pass the token back as
+`ImplementationRequest.sessionId` to resume after a Conductor process restart.
+An optional `AbortSignal` cancels the active process as a deterministic
+`CLAUDE_CANCELLED` failure. Results retain bounded wall-clock `durationMs`, but
+never raw stdout/stderr transcripts or model-usage details. The execution
+prompt requires repository validation and tests to pass before success is
+reported.
+
 After `pnpm build`, the same commands work through the `tachiko` bin
 (`node dist/cli.js`). Run state is stored under `$TACHIKO_DATA_DIR` (default
 `~/.tachiko-conductor/runs`), one `<id>.json` file per run.
