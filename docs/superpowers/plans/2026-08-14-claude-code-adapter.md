@@ -12,6 +12,10 @@ GitHub live state in the execution envelope.
 
 - Argument arrays only, never shell strings.
 - Every outcome is a deterministic `AgentResult`; no raw terminal text.
+- Session continuity is explicit in request/result data so it can be persisted
+  across process restarts.
+- Cancellation uses `AbortSignal`; execution results retain only bounded
+  duration metadata.
 - No auto-merge, no production credentials, no persisted transcripts.
 - Default suite uses a fake runner; real CLI only behind an opt-in smoke flag.
 - Keep each commit independently testable.
@@ -29,7 +33,8 @@ GitHub live state in the execution envelope.
 - [ ] **Step 1: Write failing adapter tests**
   Fake runner records exact `claude` argument arrays. Cover: prompt is passed
   as `-p`, `--output-format json`, JSON result → success `AgentResult`;
-  non-zero exit, `is_error`, `ETIMEDOUT`, `ENOENT`, invalid JSON → typed
+  non-zero exit, `is_error`, cancellation, `ETIMEDOUT`, `ENOENT`, invalid or
+  structurally incomplete JSON → typed
   failure with diagnostic codes; post-run `git rev-parse HEAD` success/failure.
 - [ ] **Step 2: Run tests and verify RED** (`pnpm exec tsx --test tests/claude-code.test.ts`)
 - [ ] **Step 3: Implement the adapter**
@@ -46,8 +51,8 @@ GitHub live state in the execution envelope.
 - Modify: `tests/claude-code.test.ts`
 
 - [ ] **Step 1: Add failing resume/context tests**
-  A known session id produces `--resume <id>`; the returned `session_id` is
-  recorded; an injected `GitHubAdapter` contributes a live snapshot summary
+  A persisted request session id produces `--resume <id>`; the returned
+  `session_id` is included in `AgentResult`; an injected `GitHubAdapter` contributes a live snapshot summary
   into the prompt; a transport failure degrades to an instructions-only prompt
   with a diagnostic, never a throw.
 - [ ] **Step 2: Implement resume and prompt construction**

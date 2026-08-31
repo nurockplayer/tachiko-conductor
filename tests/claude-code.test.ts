@@ -38,17 +38,18 @@ describe('ClaudeCodeAdapter', () => {
 
     const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1', instructions: 'Fix it.' });
 
-    assert.deepEqual(agentResult, {
-      exitStatus: 'success',
-      summary: 'implemented',
-      headSha: HEAD,
-    });
+    assert.equal(agentResult.exitStatus, 'success');
+    assert.equal(agentResult.summary, 'implemented');
+    assert.equal(agentResult.headSha, HEAD);
+    assert.equal(agentResult.sessionId, 'sess-1');
+    assert.equal(typeof agentResult.durationMs, 'number');
     assert.deepEqual(runner.calls[0]?.options, { timeoutMs: 9000, cwd: '/tmp/repo' });
     assert.equal(runner.calls[0]?.file, 'claude');
     const args = runner.calls[0]?.args ?? [];
     assert.deepEqual(args.slice(0, 6), ['-p', args[1], '--output-format', 'json', '--permission-mode', 'acceptEdits']);
     assert.match(String(args[1]), /acme\/widgets#42/);
     assert.match(String(args[1]), /Fix it\./);
+    assert.match(String(args[1]), /validation and tests before reporting success/);
     assert.deepEqual(runner.calls[1]?.args, ['rev-parse', 'HEAD']);
   });
 
@@ -59,18 +60,21 @@ describe('ClaudeCodeAdapter', () => {
     const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
 
     assert.equal(agentResult.exitStatus, 'failure');
-    assert.match(agentResult.summary, /claude crashed/);
+    assert.match(agentResult.summary, /status 1/);
+    assert.doesNotMatch(agentResult.summary, /claude crashed/);
     assert.match(agentResult.diagnostics?.join('\n') ?? '', /CLAUDE_EXIT_FAILURE/);
     assert.equal(agentResult.headSha, undefined);
     assert.equal(runner.calls.length, 1);
   });
 
-  it('maps is_error results, timeouts, missing executables, and invalid JSON deterministically', async () => {
+  it('maps is_error results, timeouts, missing executables, and invalid structured output deterministically', async () => {
     const cases: Array<{ outcome: ProcessResult | Error; code: string }> = [
       { outcome: result(claudeJson('failed', { is_error: true })), code: 'CLAUDE_ERROR' },
       { outcome: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }), code: 'CLAUDE_TIMEOUT' },
       { outcome: Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' }), code: 'CLAUDE_NOT_FOUND' },
       { outcome: result('{bad json'), code: 'CLAUDE_INVALID_OUTPUT' },
+      { outcome: result('{}'), code: 'CLAUDE_INVALID_OUTPUT' },
+      { outcome: result(JSON.stringify({ type: 'result', result: 42, is_error: false })), code: 'CLAUDE_INVALID_OUTPUT' },
     ];
     for (const { outcome, code } of cases) {
       const runner = new FakeRunner([outcome]);
@@ -78,6 +82,7 @@ describe('ClaudeCodeAdapter', () => {
       const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
       assert.equal(agentResult.exitStatus, 'failure', `expected failure for ${code}`);
       assert.match(agentResult.diagnostics?.join('\n') ?? '', new RegExp(code));
+      assert.equal(typeof agentResult.durationMs, 'number');
     }
   });
 
@@ -95,24 +100,72 @@ describe('ClaudeCodeAdapter', () => {
     assert.match(agentResult.diagnostics?.join('\n') ?? '', /HEAD_READ_FAILED/);
   });
 
-  it('resumes an existing session and records the returned session id for continuation', async () => {
+  it('returns a session id that a new adapter can resume after process restart', async () => {
     const runner = new FakeRunner([
       result(claudeJson('implemented', { session_id: 'sess-2' })),
       result(HEAD),
       result(claudeJson('fixed', { session_id: 'sess-3' })),
       result(HEAD),
     ]);
-    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo', sessionId: 'sess-1' });
+    const firstAdapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
 
-    const first = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+    const first = await firstAdapter.run({ target: TARGET, baseSha: 'base-1', sessionId: 'sess-1' });
     assert.equal(first.exitStatus, 'success');
+    assert.equal(first.sessionId, 'sess-2');
     assert.ok(runner.calls[0]?.args.includes('--resume'));
     assert.ok(runner.calls[0]?.args.includes('sess-1'));
 
-    const second = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+    const restartedAdapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+    const second = await restartedAdapter.run({ target: TARGET, baseSha: 'base-1', sessionId: first.sessionId });
     assert.equal(second.exitStatus, 'success');
+    assert.equal(second.sessionId, 'sess-3');
     assert.ok(runner.calls[2]?.args.includes('--resume'));
     assert.ok(runner.calls[2]?.args.includes('sess-2'));
+  });
+
+  it('passes AbortSignal to the process and maps cancellation deterministically', async () => {
+    const controller = new AbortController();
+    const calls: Array<{ file: string; options: ClaudeRunOptions }> = [];
+    const runner: ClaudeProcessRunner = {
+      async run(file, _args, options) {
+        calls.push({ file, options });
+        controller.abort();
+        throw Object.assign(new Error('aborted'), { code: 'ABORT_ERR' });
+      },
+    };
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      sessionId: 'persisted-session',
+      signal: controller.signal,
+    });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CLAUDE_CANCELLED/);
+    assert.equal(agentResult.sessionId, 'persisted-session');
+    assert.equal(calls[0]?.options.signal, controller.signal);
+    assert.equal(calls.length, 1);
+  });
+
+  it('preserves a persisted session when cancelled before process execution', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const runner = new FakeRunner([]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      sessionId: 'persisted-session',
+      signal: controller.signal,
+    });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.equal(agentResult.sessionId, 'persisted-session');
+    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CLAUDE_CANCELLED/);
+    assert.equal(runner.calls.length, 0);
   });
 
   function githubAdapter(snapshot: () => GitHubLiveSnapshot | never): GitHubAdapter {

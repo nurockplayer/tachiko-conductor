@@ -5,6 +5,10 @@ export interface ImplementationRequest {
   readonly target: Target;
   readonly baseSha: string;
   readonly instructions?: string;
+  /** Previously persisted executor session token, when continuing a run. */
+  readonly sessionId?: string;
+  /** Cancels the active implementation process. */
+  readonly signal?: AbortSignal;
 }
 
 /**
