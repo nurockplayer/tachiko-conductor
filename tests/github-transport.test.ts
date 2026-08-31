@@ -77,6 +77,18 @@ describe('GhCliTransport', () => {
     assert.deepEqual(runner.calls[0]?.args.slice(-2), ['--paginate', '--slurp']);
   });
 
+  it('reads a raw media representation without JSON parsing', async () => {
+    const diff = 'diff --git a/a.ts b/a.ts\n+ok\n';
+    const runner = new RecordingRunner([result(diff)]);
+    const transport = new GhCliTransport({ runner });
+
+    assert.equal(
+      await transport.getRaw('repos/acme/widgets/pulls/7', 'application/vnd.github.diff'),
+      diff,
+    );
+    assert.ok(runner.calls[0]?.args.includes('Accept: application/vnd.github.diff'));
+  });
+
   it('rejects malformed JSON and non-array pagination pages', async () => {
     const malformed = new GhCliTransport({ runner: new RecordingRunner([result('{bad')]) });
     await expectCode(malformed.get('repos/acme/widgets/issues/3'), 'GH_INVALID_RESPONSE', false);
