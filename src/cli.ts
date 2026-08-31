@@ -23,7 +23,13 @@ import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
-import { runWorkflow, type WorkflowDependencies, type WorkflowOutcome } from './workflow/run.js';
+import {
+  CANCEL_RUN_DECISION,
+  SYNC_LIVE_HEAD_DECISION,
+  runWorkflow,
+  type WorkflowDependencies,
+  type WorkflowOutcome,
+} from './workflow/run.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -175,9 +181,37 @@ export async function resumeCommand(
   if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') {
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
+  if (decision.trim() === '') throw new Error('A non-empty --decision is required to resume a parked run.');
+  const choices = run.interrupt?.choices ?? [];
+  if (choices.length > 0 && !choices.includes(decision)) {
+    throw new Error(`Invalid decision "${decision}". Choose exactly one of: ${choices.join(' | ')}.`);
+  }
   const now = options.now ?? (() => new Date().toISOString());
+
+  if (decision === CANCEL_RUN_DECISION) {
+    const failed = applyTransition(run, { type: 'fail', reason: decision }, now());
+    deps.store.update(failed);
+    return { outcome: 'failed', run: failed, reason: decision };
+  }
+
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
-  const resumed = applyTransition(run, { type: transition, reason: decision }, now());
+  let adoptedHead: string | undefined;
+  if (decision === SYNC_LIVE_HEAD_DECISION) {
+    if (run.state !== 'NEEDS_HUMAN' || run.target.kind !== 'issue') {
+      throw new Error(`Decision "${SYNC_LIVE_HEAD_DECISION}" is only valid for an issue run in NEEDS_HUMAN.`);
+    }
+    const snapshot = await deps.github.readLiveSnapshot(run.target);
+    if (snapshot.headSha === null) {
+      throw new Error('Cannot sync the run: GitHub has no associated open pull request HEAD.');
+    }
+    adoptedHead = snapshot.headSha;
+  }
+
+  const resumed = applyTransition(
+    run,
+    { type: transition, reason: decision, ...(adoptedHead === undefined ? {} : { headSha: adoptedHead }) },
+    now(),
+  );
   deps.store.update(resumed);
   return runWorkflow(deps, id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
@@ -406,7 +440,8 @@ export async function main(argv: string[]): Promise<number> {
     });
     const [id] = positionals;
     if (id === undefined) throw new Error('run resume requires a run id.');
-    const outcome = await resumeCommand(buildWorkflowDeps(store), id, values.decision ?? 'resumed');
+    if (values.decision === undefined) throw new Error('run resume requires --decision <choice>.');
+    const outcome = await resumeCommand(buildWorkflowDeps(store), id, values.decision);
     printOutcome(outcome);
     return outcome.outcome === 'failed' ? 1 : 0;
   }

@@ -512,6 +512,25 @@ describe('state machine — interrupts and resume', () => {
     assert.deepEqual(run.interrupt?.choices, ['Option A', 'Option B']);
   });
 
+  it('lets an explicit human resolution adopt a non-empty live HEAD', () => {
+    let run = runIn('REVIEWING', { headSha: 'sha-1' });
+    run = applyTransition(run, { type: 'escalate', reason: 'live HEAD drifted' }, T0);
+
+    run = applyTransition(run, { type: 'human_resolved', reason: 'sync live HEAD', headSha: ' sha-2 ' }, T0);
+
+    assert.equal(run.state, 'REVIEWING');
+    assert.equal(run.headSha, 'sha-2');
+    assert.throws(
+      () =>
+        applyTransition(
+          applyTransition(run, { type: 'escalate', reason: 'drifted again' }, T0),
+          { type: 'human_resolved', headSha: '   ' },
+          T0,
+        ),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'empty-head-sha',
+    );
+  });
+
   it('omits empty choices and evidence on an interrupt', () => {
     let run = runIn('IMPLEMENTING');
     run = applyTransition(run, { type: 'escalate', reason: 'plain question', interrupt: { choices: [] } }, T0);

@@ -53,10 +53,10 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
       createdAt: T0,
       updatedAt: T0,
     },
-    pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: null, updatedAt: '', headSha, baseSha },
+    pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha },
     headSha,
-    checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
-    reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: null },
+    checks: { availability: 'available', overall: 'passing', checks: [] },
+    reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
     conversations: [],
     handoff: null,
     problems: [],
@@ -64,7 +64,7 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
   };
 }
 
-function githubAdapter(liveHeads: string[]): GitHubAdapter {
+function githubAdapter(liveHeads: Array<string | null>): GitHubAdapter {
   return {
     kind: 'github',
     async readIssue() {
@@ -79,6 +79,7 @@ function githubAdapter(liveHeads: string[]): GitHubAdapter {
     async readLiveSnapshot() {
       const head = liveHeads.shift();
       if (head === undefined) throw new Error('No live snapshot queued');
+      if (head === null) return { ...snapshot(HEAD), headSha: null, pullRequest: null };
       return snapshot(head);
     },
   };
@@ -139,7 +140,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -174,7 +175,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2]), implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 2, now: () => T0 },
     );
@@ -193,7 +194,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -211,7 +212,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD]), implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -240,35 +241,59 @@ describe('runWorkflow', () => {
     assert.equal(result.run.state, 'MERGED');
   });
 
-  it('escalates when the live snapshot has no open PR to implement against', async () => {
+  it('starts from a DoR-ready issue without a pre-existing PR', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-1'));
-    const implementation = new FakeImplementation([]);
-    const reviewer = new FakeReviewer([]);
-    const noPrGithub: GitHubAdapter = {
-      kind: 'github',
-      async readIssue() {
-        throw new Error('unused');
-      },
-      async readBranch() {
-        throw new Error('unused');
-      },
-      async listPullRequests() {
-        throw new Error('unused');
-      },
-      async readLiveSnapshot() {
-        return { ...snapshot(HEAD), headSha: null, pullRequest: null };
-      },
-    };
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+    const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: noPrGithub, implementation, reviewer },
+      { store, github: githubAdapter([null, HEAD, HEAD, HEAD]), implementation, reviewer },
+      'run-1',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(result.run.state, 'MERGE_READY');
+  });
+
+  it('never passes the final gate when live HEAD drifted after approval', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'run-1', HEAD);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    store.update(run);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD2]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
 
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.match(result.reason, /no open pull request/);
+    assert.deepEqual(result.run.interrupt?.choices, [
+      'Sync the run to the live HEAD and continue',
+      'Cancel the run',
+    ]);
+  });
+
+  it('waits instead of declaring readiness while exact-HEAD checks are pending', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'run-1', HEAD);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    store.update(run);
+    const pending = { ...snapshot(HEAD), checks: { availability: 'available' as const, overall: 'pending' as const, checks: [] } };
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => pending;
+
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      'run-1',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'WAITING_DEPENDENCY');
+    assert.deepEqual(result.run.interrupt?.choices, ['Retry readiness checks', 'Cancel the run']);
   });
 });
