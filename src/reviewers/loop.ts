@@ -36,7 +36,14 @@ function renderBlockingFindings(review: ReviewResult): string {
 }
 
 function durableReviewAttempts(run: Run): number {
-  return run.history.filter(
+  let attemptWindowStart = 0;
+  for (let index = run.history.length - 1; index >= 0; index -= 1) {
+    if (run.history[index]?.type === 'human_resolved') {
+      attemptWindowStart = index + 1;
+      break;
+    }
+  }
+  return run.history.slice(attemptWindowStart).filter(
     (entry) => entry.type === 'review_approved' || entry.type === 'changes_requested',
   ).length;
 }
@@ -97,7 +104,18 @@ export async function runReviewLoop(
     if (run.state === 'CHANGES_REQUESTED') {
       if (durableReviewAttempts(run) >= options.maxAttempts) {
         const reason = `Review did not converge after ${options.maxAttempts} attempt(s).`;
-        run = applyTransition(run, { type: 'escalate', reason }, now());
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason,
+            interrupt: {
+              evidence: reason,
+              choices: ['Provide more GitHub context and retry', 'Cancel the run'],
+            },
+          },
+          now(),
+        );
         store.update(run);
         return { outcome: 'needs_human', run, reason };
       }
@@ -125,13 +143,61 @@ export async function runReviewLoop(
       }
       if (fixResult.headSha === undefined || fixResult.headSha === run.headSha) {
         const reason = 'Implementation did not produce a new exact HEAD after review changes.';
-        run = applyTransition(run, { type: 'escalate', reason }, now());
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason,
+            interrupt: {
+              evidence: 'The implementation returned the same or no HEAD after review changes.',
+              choices: ['Retry the fix after updating GitHub context', 'Cancel the run'],
+            },
+          },
+          now(),
+        );
         store.update(run);
         return { outcome: 'needs_human', run, reason };
       }
 
       run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha }, now());
       store.update(run);
+      let validatedHead: string | null;
+      try {
+        validatedHead = (await github.readLiveSnapshot(target)).headSha;
+      } catch (error) {
+        const reason = renderFailure('GitHub live-state validation failed after the fix', error);
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason,
+            interrupt: {
+              evidence: reason,
+              choices: ['Retry after restoring GitHub access', 'Cancel the run'],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason };
+      }
+      if (validatedHead !== fixResult.headSha) {
+        const reason = `Live GitHub HEAD ${validatedHead ?? '(none)'} does not match the fix HEAD ${fixResult.headSha}.`;
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason,
+            interrupt: {
+              evidence: reason,
+              choices: validatedHead === null ? ['Open the implementation pull request and retry', 'Cancel the run'] : ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason };
+      }
       run = applyTransition(run, { type: 'validation_passed' }, now());
       store.update(run);
       continue;
@@ -139,7 +205,18 @@ export async function runReviewLoop(
 
     if (durableReviewAttempts(run) >= options.maxAttempts) {
       const reason = `Review attempt limit of ${options.maxAttempts} was already reached.`;
-      run = applyTransition(run, { type: 'escalate', reason }, now());
+      run = applyTransition(
+        run,
+        {
+          type: 'escalate',
+          reason,
+          interrupt: {
+            evidence: reason,
+            choices: ['Provide more GitHub context and retry', 'Cancel the run'],
+          },
+        },
+        now(),
+      );
       store.update(run);
       return { outcome: 'needs_human', run, reason };
     }
@@ -150,7 +227,20 @@ export async function runReviewLoop(
     } catch (error) {
       const reason = renderFailure('GitHub live-state validation failed', error);
       const type = isRetryable(error) ? 'escalate' : 'fail';
-      run = applyTransition(run, { type, reason }, now());
+      run = applyTransition(
+        run,
+        type === 'escalate'
+          ? {
+              type,
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: ['Retry after restoring GitHub access', 'Cancel the run'],
+              },
+            }
+          : { type, reason },
+        now(),
+      );
       store.update(run);
       return type === 'escalate'
         ? { outcome: 'needs_human', run, reason }
@@ -161,7 +251,20 @@ export async function runReviewLoop(
         liveHead === null
           ? `No live PR HEAD for ${formatTarget(target)}.`
           : `Live GitHub HEAD ${liveHead} does not match the run HEAD ${run.headSha ?? '(none)'}.`;
-      run = applyTransition(run, { type: 'escalate', reason }, now());
+      run = applyTransition(
+        run,
+        {
+          type: 'escalate',
+          reason,
+          interrupt: {
+            evidence: reason,
+            choices: liveHead === null
+              ? ['Open the implementation pull request and retry', 'Cancel the run']
+              : ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+          },
+        },
+        now(),
+      );
       store.update(run);
       return { outcome: 'needs_human', run, reason };
     }
@@ -178,7 +281,20 @@ export async function runReviewLoop(
     } catch (error) {
       const reason = renderFailure('Reviewer failed', error);
       const type = isRetryable(error) ? 'escalate' : 'fail';
-      run = applyTransition(run, { type, reason }, now());
+      run = applyTransition(
+        run,
+        type === 'escalate'
+          ? {
+              type,
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: ['Retry the independent review', 'Cancel the run'],
+              },
+            }
+          : { type, reason },
+        now(),
+      );
       store.update(run);
       return type === 'escalate'
         ? { outcome: 'needs_human', run, reason }
@@ -187,7 +303,18 @@ export async function runReviewLoop(
 
     if (reviewResult.headSha !== run.headSha) {
       const reason = `Reviewer returned HEAD ${reviewResult.headSha} for run HEAD ${run.headSha ?? '(none)'}.`;
-      run = applyTransition(run, { type: 'escalate', reason }, now());
+      run = applyTransition(
+        run,
+        {
+          type: 'escalate',
+          reason,
+          interrupt: {
+            evidence: reason,
+            choices: ['Retry the independent review', 'Cancel the run'],
+          },
+        },
+        now(),
+      );
       store.update(run);
       return { outcome: 'needs_human', run, reason };
     }

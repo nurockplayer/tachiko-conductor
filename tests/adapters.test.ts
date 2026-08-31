@@ -19,7 +19,7 @@ import { TARGET, approval, newRun } from './helpers.js';
 
 function liveSnapshot(target: IssueTarget): GitHubLiveSnapshot {
   return {
-    repository: { owner: target.owner, repo: target.repo },
+    repository: { owner: target.owner, repo: target.repo, defaultBranch: null, defaultBranchHeadSha: null },
     issue: {
       id: 'I_1',
       number: target.issueNumber,

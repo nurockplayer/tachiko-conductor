@@ -12,15 +12,22 @@ import {
   parseIssueRef,
   resolveRunsDir,
   runCreateCommand,
+  runIssueCommand,
+  resumeCommand,
   runShowCommand,
   runShowView,
   runTransitionCommand,
 } from '../src/cli.js';
+import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
-import type { TransitionType } from '../src/domain/types.js';
+import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
+import { createRun } from '../src/domain/run.js';
+import { applyTransition } from '../src/domain/state-machine.js';
+import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/domain/types.js';
 import { GitHubLiveStateError } from '../src/github/errors.js';
-import { JsonFileStore } from '../src/store/json-file-store.js';
-import { TARGET } from './helpers.js';
+import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
+import type { WorkflowDependencies } from '../src/workflow/run.js';
+import { T0, TARGET, successResult } from './helpers.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -148,7 +155,7 @@ describe('CLI command layer', () => {
 describe('github snapshot command', () => {
   function liveSnapshot(): GitHubLiveSnapshot {
     return {
-      repository: { owner: 'acme', repo: 'widgets' },
+      repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
       issue: {
         id: 'I_42',
         number: 42,
@@ -250,6 +257,254 @@ describe('github snapshot command', () => {
       assert.equal(outcome.error.code, 'UNKNOWN');
       assert.equal(outcome.error.message, 'boom');
     }
+  });
+});
+
+describe('workflow run and resume commands', () => {
+  const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+  const HEAD2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+
+  class MemoryStore implements RunStore {
+    readonly name = 'memory';
+    private readonly runs = new Map<string, Run>();
+
+    create(run: Run): void {
+      this.runs.set(run.id, run);
+    }
+
+    read(id: string): Run | null {
+      return this.runs.get(id) ?? null;
+    }
+
+    update(run: Run): void {
+      this.runs.set(run.id, run);
+    }
+
+    list(): Run[] {
+      return [...this.runs.values()];
+    }
+
+    delete(id: string): void {
+      this.runs.delete(id);
+    }
+  }
+
+  function snapshot(headSha: string): GitHubLiveSnapshot {
+    return {
+      repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
+      issue: { id: 'I_42', number: 42, title: 'Fix the widget', body: 'DoR-ready.', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
+      pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha: 'base' },
+      headSha,
+      checks: { availability: 'available', overall: 'passing', checks: [] },
+      reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
+      conversations: [],
+      handoff: null,
+      problems: [],
+      observedAt: T0,
+    };
+  }
+
+  function githubAdapter(liveHeads: string[]): GitHubAdapter {
+    return {
+      kind: 'github',
+      async readIssue() {
+        throw new Error('unused');
+      },
+      async readBranch() {
+        throw new Error('unused');
+      },
+      async listPullRequests() {
+        throw new Error('unused');
+      },
+      async readLiveSnapshot() {
+        const head = liveHeads.shift();
+        if (head === undefined) throw new Error('No live snapshot queued');
+        return snapshot(head);
+      },
+    };
+  }
+
+  class FakeReviewer implements ReviewerAdapter {
+    readonly kind: 'reviewer' = 'reviewer';
+
+    constructor(private readonly outcomes: ReviewResult[]) {}
+
+    async review(request: ReviewRequest): Promise<ReviewResult> {
+      const outcome = this.outcomes.shift();
+      if (outcome === undefined) throw new Error('No review outcome queued');
+      return outcome;
+    }
+  }
+
+  class FakeImplementation implements ImplementationAgent {
+    readonly kind: 'implementation-agent' = 'implementation-agent';
+
+    constructor(private readonly outcomes: AgentResult[]) {}
+
+    async run(): Promise<AgentResult> {
+      const outcome = this.outcomes.shift();
+      if (outcome === undefined) throw new Error('No implementation outcome queued');
+      return outcome;
+    }
+  }
+
+  function deps(
+    store: RunStore,
+    github: GitHubAdapter,
+    implementation: ImplementationAgent,
+    reviewer: ReviewerAdapter,
+  ): WorkflowDependencies {
+    return { store, github, implementation, reviewer };
+  }
+
+  it('starts an issue end-to-end and reaches MERGE_READY through the fake adapters', async () => {
+    const store = new MemoryStore();
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
+
+    const outcome = await runIssueCommand(
+      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
+      'acme/widgets#42',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.state, 'MERGE_READY');
+    assert.equal(store.list().length, 1);
+  });
+
+  it('reuses an existing persisted run instead of creating a second one', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-1');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
+
+    const outcome = await runIssueCommand(
+      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      'acme/widgets#42',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(store.list().length, 1);
+    assert.equal(outcome.run.id, 'run-1');
+  });
+
+  it('resumes a parked NEEDS_HUMAN run after a supplied human decision', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-1');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(
+      run,
+      { type: 'escalate', reason: 'architecture decision', interrupt: { evidence: 'two designs', choices: ['A', 'B'] } },
+      T0,
+    );
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
+
+    const outcome = await resumeCommand(
+      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      'run-1',
+      'A',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.state, 'MERGE_READY');
+    const persisted = store.read('run-1');
+    assert.equal(persisted?.interrupt?.resolvedAt, T0);
+  });
+
+  it('resumes a WAITING_DEPENDENCY run via dependency_satisfied after a supplied decision', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-1');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'wait_dependency', reason: 'upstream API', interrupt: { evidence: 'waiting on API' } }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
+
+    const outcome = await resumeCommand(
+      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      'run-1',
+      'dependency available now',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.state, 'MERGE_READY');
+    const persisted = store.read('run-1');
+    assert.ok(persisted?.history.some((entry) => entry.type === 'dependency_satisfied'));
+  });
+
+  it('rejects resuming a run that is not parked for a decision', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-1'));
+    await assert.rejects(
+      resumeCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'run-1', 'go'),
+      /not parked for a decision/,
+    );
+  });
+
+  it('rejects a decision outside the interrupt choices and makes cancel terminal', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-1');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'escalate',
+      reason: 'choose',
+      interrupt: { choices: ['Retry', 'Cancel the run'] },
+    }, T0);
+    store.create(run);
+    const workflowDeps = deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([]));
+
+    await assert.rejects(resumeCommand(workflowDeps, 'run-1', 'anything'), /Invalid decision/);
+    const outcome = await resumeCommand(workflowDeps, 'run-1', 'Cancel the run', { now: () => T0 });
+
+    assert.equal(outcome.outcome, 'failed');
+    assert.equal(outcome.run.state, 'FAILED');
+  });
+
+  it('adopts the exact live HEAD only for the explicit sync decision', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-1');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, {
+      type: 'escalate',
+      reason: 'drift',
+      interrupt: { choices: ['Sync the run to the live HEAD and continue', 'Cancel the run'] },
+    }, T0);
+    store.create(run);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] }]);
+
+    const outcome = await resumeCommand(
+      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2]), new FakeImplementation([]), reviewer),
+      'run-1',
+      'Sync the run to the live HEAD and continue',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.headSha, HEAD2);
+  });
+
+  it('rejects a malformed issue reference on run', async () => {
+    const store = new MemoryStore();
+    await assert.rejects(
+      runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'not-a-ref'),
+      /expected owner\/repo#123/,
+    );
   });
 });
 

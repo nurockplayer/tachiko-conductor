@@ -5,6 +5,8 @@ import { GitHubLiveStateError } from './errors.js';
 export interface GitHubApiTransport {
   get(path: string, query?: Readonly<Record<string, string>>): Promise<unknown>;
   getPaginated(path: string, query?: Readonly<Record<string, string>>): Promise<readonly unknown[]>;
+  /** Execute a read-only GraphQL query for state not exposed by REST. */
+  graphql?(query: string, variables?: Readonly<Record<string, string | number>>): Promise<unknown>;
   /** Read a non-JSON GitHub media representation, such as a complete PR diff. */
   getRaw?(path: string, accept: string): Promise<string>;
 }
@@ -198,6 +200,27 @@ export class GhCliTransport implements GitHubApiTransport {
     }
     return pages.flat();
   }
+
+  async graphql(
+    query: string,
+    variables: Readonly<Record<string, string | number>> = {},
+  ): Promise<unknown> {
+    const args = ['api', 'graphql', '-f', `query=${query}`];
+    for (const [key, value] of Object.entries(variables).sort(([a], [b]) => a.localeCompare(b))) {
+      args.push('-F', `${key}=${String(value)}`);
+    }
+    const path = 'graphql';
+    const raw = await this.execute(path, args);
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch (error) {
+      throw new GitHubLiveStateError('GH_INVALID_RESPONSE', 'GitHub returned invalid JSON for graphql.', {
+        details: { path },
+        cause: error,
+      });
+    }
+  }
+
   async getRaw(path: string, accept: string): Promise<string> {
     return await this.execute(path, this.args(path, {}, accept));
   }

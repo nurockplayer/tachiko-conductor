@@ -124,13 +124,15 @@ const REQUIRES_REVIEW_RESULT: ReadonlySet<TransitionType> = new Set([
 
 /**
  * Transitions that legitimately change the run's HEAD SHA: implementation
- * events where the agent's work lands at a new commit. Every other transition
- * must leave HEAD untouched so an approval can only ever advance the exact
- * HEAD it reviewed.
+ * events where the agent's work lands at a new commit, plus an explicit human
+ * resolution that adopts the current live GitHub HEAD after an escalation.
+ * Every other transition must leave HEAD untouched so an approval can only
+ * ever advance the exact HEAD it reviewed.
  */
 const HEAD_UPDATING_TRANSITIONS: ReadonlySet<TransitionType> = new Set([
   'agent_succeeded',
   'agent_failed',
+  'human_resolved',
 ]);
 
 /** Whether a transition requires a result payload, and which kind. */
@@ -223,7 +225,7 @@ function assertPayload(run: Run, input: TransitionInput): void {
       'head-mutation-not-allowed',
       from,
       input.type,
-      `Transition "${input.type}" cannot change the run's HEAD SHA; HEAD may only be updated by implementation transitions (agent_succeeded, agent_failed).`,
+      `Transition "${input.type}" cannot change the run's HEAD SHA; HEAD may only be updated by implementation transitions or an explicit human resolution.`,
     );
   }
   // Event and result semantics must agree: an agent event carries a result
@@ -281,6 +283,14 @@ function assertPayload(run: Run, input: TransitionInput): void {
         `Transition "agent_succeeded" got conflicting HEAD SHAs: input.headSha "${inputSha}" vs agentResult.headSha "${resultSha}".`,
       );
     }
+  }
+  if (input.type === 'human_resolved' && input.headSha !== undefined && input.headSha.trim() === '') {
+    throw new InvalidTransitionError(
+      'empty-head-sha',
+      from,
+      input.type,
+      `Transition "human_resolved" got an empty input.headSha; omit it or provide the exact live GitHub HEAD.`,
+    );
   }
   if (input.type === 'review_approved' && input.reviewResult !== undefined && input.reviewResult.verdict !== 'approve') {
     throw new InvalidTransitionError(
@@ -423,9 +433,9 @@ export function applyTransition(
 
   const enteringInterrupt = to === 'WAITING_DEPENDENCY' || to === 'NEEDS_HUMAN';
   const leavingInterrupt = from === 'WAITING_DEPENDENCY' || from === 'NEEDS_HUMAN';
-  // HEAD may only change on implementation events; assertPayload already
-  // rejected any headSha carried by any other transition and guarantees a
-  // non-empty identity for agent_succeeded. The value is normalized by trim.
+  // HEAD may only change on implementation events or an explicit human
+  // resolution; assertPayload rejects every other transition and guarantees
+  // that any supplied identity is non-empty. The value is normalized by trim.
   const headSha = HEAD_UPDATING_TRANSITIONS.has(input.type)
     ? (input.headSha ?? input.agentResult?.headSha)?.trim()
     : undefined;
@@ -445,6 +455,10 @@ export function applyTransition(
             kind: to === 'NEEDS_HUMAN' ? 'needs_human' : 'waiting_dependency',
             reason: input.reason ?? '',
             createdAt: now,
+            ...(input.interrupt?.evidence === undefined ? {} : { evidence: input.interrupt.evidence }),
+            ...(input.interrupt?.choices === undefined || input.interrupt.choices.length === 0
+              ? {}
+              : { choices: [...input.interrupt.choices] }),
           },
         }
       : {}),

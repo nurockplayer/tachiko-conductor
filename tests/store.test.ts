@@ -168,6 +168,44 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(applyTransition(w, { type: 'dependency_satisfied' }, T0).state, 'IMPLEMENTING');
   });
 
+  it('accepts a NEEDS_HUMAN interrupt with evidence and bounded choices', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'n.json'),
+      JSON.stringify({
+        id: 'n',
+        state: 'NEEDS_HUMAN',
+        interruptedFrom: 'REVIEWING',
+        createdAt: T0,
+        updatedAt: T0,
+        target: TARGET,
+        history: [],
+        interrupt: { kind: 'needs_human', reason: 'ambiguous', createdAt: T0, evidence: 'two designs', choices: ['A', 'B'] },
+      }),
+      'utf8',
+    );
+    const run = store.read('n')!;
+    assert.equal(run.interrupt?.evidence, 'two designs');
+    assert.deepEqual(run.interrupt?.choices, ['A', 'B']);
+  });
+
+  it('rejects a persisted interrupt with malformed evidence or choices', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad-evidence.json'),
+      JSON.stringify({ id: 'bad-evidence', state: 'NEEDS_HUMAN', interruptedFrom: 'REVIEWING', createdAt: T0, updatedAt: T0, target: TARGET, history: [], interrupt: { kind: 'needs_human', reason: 'x', createdAt: T0, evidence: 42 } }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad-evidence'), /corrupt or incompatible/);
+
+    writeFileSync(
+      path.join(dir, 'bad-choices.json'),
+      JSON.stringify({ id: 'bad-choices', state: 'NEEDS_HUMAN', interruptedFrom: 'REVIEWING', createdAt: T0, updatedAt: T0, target: TARGET, history: [], interrupt: { kind: 'needs_human', reason: 'x', createdAt: T0, choices: ['A', 42] } }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad-choices'), /corrupt or incompatible/);
+  });
+
   it('rejects a persisted run with a structurally invalid target', () => {
     const { store, dir } = tempStore();
     writeFileSync(

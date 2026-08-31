@@ -89,6 +89,25 @@ describe('GhCliTransport', () => {
     assert.ok(runner.calls[0]?.args.includes('Accept: application/vnd.github.diff'));
   });
 
+  it('executes GraphQL with typed variables and parses the response', async () => {
+    const runner = new RecordingRunner([result('{"data":{"ok":true}}')]);
+    const transport = new GhCliTransport({ runner });
+
+    assert.deepEqual(await transport.graphql('query($number: Int!) { ok }', { owner: 'acme', number: 7 }), {
+      data: { ok: true },
+    });
+    assert.deepEqual(runner.calls[0]?.args, [
+      'api',
+      'graphql',
+      '-f',
+      'query=query($number: Int!) { ok }',
+      '-F',
+      'number=7',
+      '-F',
+      'owner=acme',
+    ]);
+  });
+
   it('rejects malformed JSON and non-array pagination pages', async () => {
     const malformed = new GhCliTransport({ runner: new RecordingRunner([result('{bad')]) });
     await expectCode(malformed.get('repos/acme/widgets/issues/3'), 'GH_INVALID_RESPONSE', false);

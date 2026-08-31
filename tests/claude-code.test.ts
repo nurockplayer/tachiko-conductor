@@ -188,7 +188,7 @@ describe('ClaudeCodeAdapter', () => {
 
   it('injects a live GitHub snapshot summary into the prompt', async () => {
     const github = githubAdapter(() => ({
-      repository: { owner: 'acme', repo: 'widgets' },
+      repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
       issue: { id: 'I_42', number: 42, title: 'Fix the widget', body: '', state: 'open', url: '', createdAt: '', updatedAt: '' },
       pullRequest: null,
       headSha: null,
