@@ -20,11 +20,13 @@ and per-run Claude/Codex MCP capability injection. See
 
 ## Design invariants
 
-- GitHub will later be the engineering source of truth; the core only ever
-  sees plain data.
+- GitHub is the engineering source of truth; the core only ever sees plain
+  normalized data.
 - Core workflow logic is independent of Claude Code, DeepSeek, GitHub
   transport, and Linear.
-- Reviews are bound to an exact HEAD SHA; `FINAL_GATE` refuses stale approvals.
+- Reviews are bound to an exact HEAD SHA; `FINAL_GATE` re-reads GitHub and
+  refuses stale approvals, draft/closed/unmergeable PRs, non-passing checks,
+  and known unresolved review threads.
 - An approval containing a blocking finding is contradictory and is rejected
   before it can reach the final gate.
 - No autonomous merge, no cloud, no distributed queue, no UI, no Linear.
@@ -107,6 +109,9 @@ pnpm exec tsx src/cli.ts run owner/repo#123 --browser-profile github-work
 validation, independent review, and the final gate. It stops at `MERGE_READY`,
 `FAILED`, or a structured `NEEDS_HUMAN` interrupt (reason, evidence, bounded
 choices); resume a parked run with `run resume <id> --decision <choice>`.
+When choices are present, the decision must match one exactly. `Cancel the
+run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
+independent review before the final gate.
 
 `github snapshot` prints one normalized live-state JSON envelope from the
 locally authenticated `gh` CLI: `{"ok":true,"snapshot":...}` on success, or
@@ -125,6 +130,15 @@ non-interactively once and is never part of CI:
 ```bash
 TACHIKO_SMOKE=1 pnpm exec tsx --test tests/claude-code-smoke.test.ts
 ```
+
+`ClaudeCodeAdapter` returns the CLI's opaque `session_id` as
+`AgentResult.sessionId`; persist that result and pass the token back as
+`ImplementationRequest.sessionId` to resume after a Conductor process restart.
+An optional `AbortSignal` cancels the active process as a deterministic
+`CLAUDE_CANCELLED` failure. Results retain bounded wall-clock `durationMs`, but
+never raw stdout/stderr transcripts or model-usage details. The execution
+prompt requires repository validation and tests to pass before success is
+reported.
 
 The separate opt-in browser-agent smoke starts the managed Playwright MCP
 runtime and a localhost fixture, then proves the installed Codex CLI can use
@@ -150,9 +164,13 @@ same directory resumes the run exactly where it stopped.
 ```
 src/domain/            typed core: types, run factory, state machine
 src/store/             durable run persistence
-src/adapters/          typed boundaries for GitHub, agents, reviewers (not implemented)
-src/cli.ts             minimal CLI entrypoint
-tests/                 state-machine, store, resume, adapters, CLI tests
+src/adapters/          typed boundaries for GitHub, implementation, and review
+src/github/            live GitHub transport, normalization, and handoff parser
+src/agents/            Claude Code non-interactive execution adapter
+src/reviewers/         DeepSeek reviewer and bounded fix loop
+src/workflow/          state-resume-aware end-to-end orchestration
+src/cli.ts             run, resume, state inspection, and GitHub snapshot CLI
+tests/                 unit, persistence, adapter, workflow, and CLI E2E tests
 ```
 
 [issue #2]: https://github.com/nurockplayer/tachiko-conductor/issues/2

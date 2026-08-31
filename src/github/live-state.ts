@@ -126,6 +126,21 @@ function dedupeById<T extends { readonly id: string }>(entries: readonly T[]): T
   return result;
 }
 
+function hasClosingReference(
+  pullRequest: Record<string, unknown>,
+  owner: string,
+  repo: string,
+  issueNumber: number,
+): boolean {
+  if (typeof pullRequest.body !== 'string') return false;
+  const escapedRepository = `${owner}/${repo}`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const pattern = new RegExp(
+    `\\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\\s+(?:${escapedRepository})?#${issueNumber}\\b`,
+    'i',
+  );
+  return pattern.test(pullRequest.body);
+}
+
 interface OpenPullRequest {
   readonly number: number;
   readonly path: string;
@@ -212,20 +227,48 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       }
       if (raw.state === 'open') open.push({ number, path, raw });
     }
-    if (open.length > 1) {
+    let associated = open;
+    let authoritativeClosingMatches: number | null = null;
+    if (open.length > 1 && this.transport.graphql !== undefined) {
+      const closingMatches: OpenPullRequest[] = [];
+      for (const candidate of open) {
+        if (await this.pullRequestClosesIssue(owner, repo, candidate.number, issueNumber)) {
+          closingMatches.push(candidate);
+        }
+      }
+      authoritativeClosingMatches = closingMatches.length;
+      if (closingMatches.length > 0) associated = closingMatches;
+    }
+    if (associated.length > 1 && (authoritativeClosingMatches === null || authoritativeClosingMatches === 0)) {
+      const bodyClosingMatches = associated.filter((candidate) =>
+        hasClosingReference(candidate.raw, owner, repo, issueNumber),
+      );
+      if (bodyClosingMatches.length === 1) associated = bodyClosingMatches;
+    }
+    if (associated.length > 1) {
       throw new GitHubLiveStateError(
         'GH_AMBIGUOUS_OPEN_PRS',
-        `Issue ${owner}/${repo}#${issueNumber} is associated with ${open.length} open pull requests; refusing to choose.`,
+        `Issue ${owner}/${repo}#${issueNumber} is associated with ${associated.length} open pull requests; refusing to choose.`,
         {
           retryable: true,
-          details: { owner, repo, issueNumber, pullRequestNumbers: open.map((pull) => pull.number) },
+          details: { owner, repo, issueNumber, pullRequestNumbers: associated.map((pull) => pull.number) },
         },
       );
     }
 
     const problems: GitHubProblem[] = [];
     const conversations: GitHubConversationEntry[] = [];
-    const selected = open[0] ?? null;
+    const selected = associated[0] ?? null;
+    let defaultBranch: string | null = null;
+    let defaultBranchHeadSha: string | null = null;
+    if (selected === null) {
+      const repositoryPath = `repos/${owner}/${repo}`;
+      const repository = asRecordOrThrow(await this.transport.get(repositoryPath), repositoryPath);
+      defaultBranch = requireString(repository, 'default_branch', repositoryPath);
+      const commitPath = `repos/${owner}/${repo}/commits/${encodeURIComponent(defaultBranch)}`;
+      const commit = asRecordOrThrow(await this.transport.get(commitPath), commitPath);
+      defaultBranchHeadSha = requireString(commit, 'sha', commitPath);
+    }
     if (issue.state === 'closed' && selected !== null) {
       problems.push({
         code: 'CONTRADICTORY_STATE',
@@ -265,7 +308,10 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       const checkRuns = asRecord(await this.transport.get(checkRunsPath));
       checks = this.normalizeChecks(status, statusPath, checkRuns, checkRunsPath, problems);
 
-      reviews = this.normalizeReviews(prReviews, reviewsPath, headSha, problems);
+      reviews = {
+        ...this.normalizeReviews(prReviews, reviewsPath, headSha, problems),
+        unresolvedThreads: await this.readUnresolvedReviewThreads(owner, repo, number),
+      };
 
       const reread = asRecordOrThrow(await this.transport.get(path), path);
       const rereadHead = asRecord(reread.head);
@@ -291,7 +337,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     problems.push(...parsed.problems);
 
     return {
-      repository: { owner, repo },
+      repository: { owner, repo, defaultBranch, defaultBranchHeadSha },
       issue,
       pullRequest,
       headSha,
@@ -351,7 +397,12 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       state: normalizePullState(record),
       isDraft: record.draft === true,
       mergeable: typeof record.mergeable === 'boolean' ? record.mergeable : null,
-      mergeStateStatus: typeof record.merge_state_status === 'string' ? record.merge_state_status : null,
+      mergeStateStatus:
+        typeof record.mergeable_state === 'string'
+          ? record.mergeable_state
+          : typeof record.merge_state_status === 'string'
+            ? record.merge_state_status
+            : null,
       updatedAt: requireString(record, 'updated_at', path),
       headSha,
       baseSha: requireString(base, 'sha', path),
@@ -390,6 +441,105 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       }
     }
     return [...numbers].sort((a, b) => a - b);
+  }
+
+  private async readUnresolvedReviewThreads(owner: string, repo: string, number: number): Promise<number | null> {
+    if (this.transport.graphql === undefined) return null;
+    const query = `query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $after) {
+        nodes { isResolved }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}`;
+    let unresolved = 0;
+    let after: string | null = null;
+    for (;;) {
+      const variables: Record<string, string | number> = { owner, repo, number };
+      if (after !== null) variables.after = after;
+      const path = `graphql:repos/${owner}/${repo}/pulls/${number}/reviewThreads`;
+      const response = asRecordOrThrow(await this.transport.graphql(query, variables), path);
+      if (Array.isArray(response.errors) && response.errors.length > 0) {
+        throw invalid(path, 'GraphQL returned errors');
+      }
+      const data = asRecord(response.data);
+      const repository = asRecord(data?.repository);
+      const pullRequest = asRecord(repository?.pullRequest);
+      const reviewThreads = asRecord(pullRequest?.reviewThreads);
+      const nodes = reviewThreads?.nodes;
+      const pageInfo = asRecord(reviewThreads?.pageInfo);
+      if (!Array.isArray(nodes) || pageInfo === null || typeof pageInfo.hasNextPage !== 'boolean') {
+        throw invalid(path, 'missing reviewThreads nodes/pageInfo');
+      }
+      for (const node of nodes) {
+        const thread = asRecord(node);
+        if (thread === null || typeof thread.isResolved !== 'boolean') {
+          throw invalid(path, 'invalid review thread');
+        }
+        if (!thread.isResolved) unresolved += 1;
+      }
+      if (!pageInfo.hasNextPage) return unresolved;
+      if (typeof pageInfo.endCursor !== 'string' || pageInfo.endCursor === '') {
+        throw invalid(path, 'missing endCursor for the next review-thread page');
+      }
+      after = pageInfo.endCursor;
+    }
+  }
+
+  private async pullRequestClosesIssue(
+    owner: string,
+    repo: string,
+    pullRequestNumber: number,
+    issueNumber: number,
+  ): Promise<boolean> {
+    if (this.transport.graphql === undefined) return false;
+    const query = `query($owner: String!, $repo: String!, $number: Int!, $after: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      closingIssuesReferences(first: 100, after: $after) {
+        nodes { number repository { nameWithOwner } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}`;
+    let after: string | null = null;
+    for (;;) {
+      const variables: Record<string, string | number> = { owner, repo, number: pullRequestNumber };
+      if (after !== null) variables.after = after;
+      const path = `graphql:repos/${owner}/${repo}/pulls/${pullRequestNumber}/closingIssuesReferences`;
+      const response = asRecordOrThrow(await this.transport.graphql(query, variables), path);
+      if (Array.isArray(response.errors) && response.errors.length > 0) {
+        throw invalid(path, 'GraphQL returned errors');
+      }
+      const data = asRecord(response.data);
+      const repository = asRecord(data?.repository);
+      const pullRequest = asRecord(repository?.pullRequest);
+      const references = asRecord(pullRequest?.closingIssuesReferences);
+      const nodes = references?.nodes;
+      const pageInfo = asRecord(references?.pageInfo);
+      if (!Array.isArray(nodes) || pageInfo === null || typeof pageInfo.hasNextPage !== 'boolean') {
+        throw invalid(path, 'missing closingIssuesReferences nodes/pageInfo');
+      }
+      for (const node of nodes) {
+        const issue = asRecord(node);
+        const issueRepository = asRecord(issue?.repository);
+        if (
+          issue?.number === issueNumber &&
+          issueRepository?.nameWithOwner === `${owner}/${repo}`
+        ) {
+          return true;
+        }
+      }
+      if (!pageInfo.hasNextPage) return false;
+      if (typeof pageInfo.endCursor !== 'string' || pageInfo.endCursor === '') {
+        throw invalid(path, 'missing endCursor for the next closing-issue page');
+      }
+      after = pageInfo.endCursor;
+    }
   }
 
   private normalizeCommentEntries(
@@ -457,6 +607,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     if (status !== null) {
       const statuses = status.statuses;
       if (Array.isArray(statuses)) {
+        available = true;
         for (const item of statuses) {
           const record = asRecord(item);
           if (record === null) throw invalid(statusPath, 'status entry is not an object');
@@ -467,7 +618,6 @@ export class LiveGitHubAdapter implements GitHubAdapter {
             url: typeof record.target_url === 'string' ? record.target_url : null,
             updatedAt: typeof record.updated_at === 'string' ? record.updated_at : null,
           });
-          available = true;
         }
       }
     }
@@ -475,6 +625,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     if (checkRuns !== null) {
       const runs = checkRuns.check_runs;
       if (Array.isArray(runs)) {
+        available = true;
         for (const item of runs) {
           const record = asRecord(item);
           if (record === null) throw invalid(checkRunsPath, 'check run entry is not an object');
@@ -495,13 +646,14 @@ export class LiveGitHubAdapter implements GitHubAdapter {
             url: typeof record.html_url === 'string' ? record.html_url : null,
             updatedAt: typeof record.completed_at === 'string' ? record.completed_at : null,
           });
-          available = true;
         }
       }
     }
 
     if (checks.length === 0) {
-      return { availability: 'unavailable', overall: 'unavailable', checks: [] };
+      return available
+        ? { availability: 'available', overall: 'passing', checks: [] }
+        : { availability: 'unavailable', overall: 'unavailable', checks: [] };
     }
     const states = new Set(checks.map((check) => check.state));
     const overall: GitHubCheckSummary['overall'] = states.has('failing')
@@ -560,10 +712,10 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const decision: GitHubReviewSummary['decision'] =
       latest.length === 0
         ? 'none'
-        : latest.some((review) => review.state === 'approved')
-          ? 'approved'
-          : latest.some((review) => review.state === 'changes_requested')
-            ? 'changes_requested'
+        : latest.some((review) => review.state === 'changes_requested')
+          ? 'changes_requested'
+          : latest.some((review) => review.state === 'approved')
+            ? 'approved'
             : 'review_required';
 
     return { decision, latestByAuthor: latest, unresolvedThreads: null };

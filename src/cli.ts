@@ -38,7 +38,11 @@ import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
-import { runWorkflow, type WorkflowDependencies, type WorkflowOutcome } from './workflow/run.js';
+import {
+  runWorkflow,
+  type WorkflowDependencies,
+  type WorkflowOutcome,
+} from './workflow/run.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -341,6 +345,11 @@ export async function resumeCommand(
   if (run === null) throw new Error(`No run with id "${id}" found.`);
   if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') {
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
+  }
+  if (decision.trim() === '') throw new Error('A non-empty --decision is required to resume a parked run.');
+  const choices = run.interrupt?.choices ?? [];
+  if (choices.length > 0 && !choices.includes(decision)) {
+    throw new Error(`Invalid decision "${decision}". Choose exactly one of: ${choices.join(' | ')}.`);
   }
   const now = options.now ?? (() => new Date().toISOString());
   if (
@@ -729,12 +738,13 @@ export async function main(argv: string[]): Promise<number> {
     });
     const [id] = positionals;
     if (id === undefined) throw new Error('run resume requires a run id.');
+    if (values.decision === undefined) throw new Error('run resume requires --decision <choice>.');
     const runtime = buildBrowserRuntime();
     const resolveCapabilities = async () => await browserImplementationCapabilities(runtime, values['browser-profile']);
     const outcome = await resumeCommand(
       buildWorkflowDeps(store, resolveCapabilities),
       id,
-      values.decision ?? 'resumed',
+      values.decision,
     );
     printOutcome(outcome, values['browser-profile']);
     return outcome.outcome === 'failed' ? 1 : 0;

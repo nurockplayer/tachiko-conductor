@@ -45,6 +45,25 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.history.length, 2);
   });
 
+  it('persists agent session continuity and bounded execution metadata across restart', () => {
+    const { dir } = tempStore();
+    const first = new JsonFileStore({ dir });
+    let run = applyTransition(newRun('r1'), { type: 'start' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'agent_succeeded',
+        agentResult: { ...successResult('sha-1'), sessionId: 'session-1', durationMs: 125 },
+      },
+      T0,
+    );
+    first.create(run);
+
+    const loaded = new JsonFileStore({ dir }).read('r1');
+    assert.equal(loaded?.agentResult?.sessionId, 'session-1');
+    assert.equal(loaded?.agentResult?.durationMs, 125);
+  });
+
   it('returns null for unknown ids', () => {
     const { store } = tempStore();
     assert.equal(store.read('nope'), null);
@@ -213,6 +232,10 @@ describe('JsonFileStore — persistence round-trips', () => {
       { ...newRun('bad'), reviewResult: { verdict: 'approve', reviewerName: 'reviewer', headSha: 'sha-1', findings: null } },
       { ...newRun('bad'), agentResult: null },
       { ...newRun('bad'), agentResult: { exitStatus: 'maybe', summary: 'unknown' } },
+      { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', sessionId: 42 } },
+      { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', sessionId: '' } },
+      { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', durationMs: -1 } },
+      { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', durationMs: 'slow' } },
       { ...newRun('bad'), interrupt: null },
       { ...newRun('bad'), interrupt: { kind: 'unknown', reason: 'pause', createdAt: T0 } },
       { ...newRun('bad'), history: [null] },

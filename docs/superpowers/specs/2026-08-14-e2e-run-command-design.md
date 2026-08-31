@@ -34,12 +34,17 @@ is ever copied between agents by hand.
   come from the live GitHub snapshot.
 - `IMPLEMENTING` → `implementation.run(...)` → `agent_succeeded` (exact new
   HEAD) → `VALIDATING`, or `agent_failed` → `FAILED`.
-- `VALIDATING` → `validation_passed` → `REVIEWING`.
+- `VALIDATING` re-reads GitHub and confirms the agent-reported exact HEAD is
+  now the associated open PR HEAD, then `validation_passed` → `REVIEWING`.
 - `REVIEWING` / `CHANGES_REQUESTED` → delegate to `runReviewLoop` (issue #5).
-- `FINAL_GATE` → `gate_passed` → `MERGE_READY`, or `gate_blocked` →
-  `REVIEWING`.
+- `FINAL_GATE` re-reads GitHub after the independent review. It requires the
+  same exact HEAD, an open non-draft mergeable PR, passing checks, and no known
+  unresolved review threads before `gate_passed` → `MERGE_READY`. Pending
+  checks wait as a dependency; drift or ambiguous readiness escalates.
 - `NEEDS_HUMAN` → stop with the structured interrupt. The CLI resumes after a
   supplied decision via `human_resolved` → return to the interrupted state.
+  Decisions must match advertised choices; cancel is terminal, and explicitly
+  adopting a new live HEAD returns to review rather than reusing an old PASS.
 - `MERGE_READY` → stop, ready for manual merge. `FAILED` → stop.
 - Escalation conditions surface instead of guessing: reviewer non-convergence
   (issue #5), contradictory GitHub state, live-HEAD drift, or an unsupported
@@ -58,6 +63,9 @@ readonly choices?: readonly string[];
 string[] }`, consumed only by `escalate` / `wait_dependency`. The persisted-run
 guard validates optional `evidence` (string) and `choices` (string array).
 Existing interrupt behavior (kind/reason/createdAt/resolvedAt) is unchanged.
+An explicit `human_resolved` may carry the exact live HEAD selected by the
+human after a drift escalation; no other non-implementation transition may
+mutate HEAD.
 
 ## CLI
 
@@ -70,7 +78,7 @@ Existing interrupt behavior (kind/reason/createdAt/resolvedAt) is unchanged.
    the user supplies a decision, `human_resolved` then continue the workflow.
 5. On `MERGE_READY` / `FAILED`, print the terminal state.
 
-A separate `tachiko run resume <id> [--decision <text>]` resumes a parked run.
+A separate `tachiko run resume <id> --decision <choice>` resumes a parked run.
 
 ## Safety
 

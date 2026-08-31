@@ -309,6 +309,14 @@ function assertPayload(run: Run, input: TransitionInput): void {
       );
     }
   }
+  if (input.type === 'human_resolved' && input.headSha !== undefined && input.headSha.trim() === '') {
+    throw new InvalidTransitionError(
+      'empty-head-sha',
+      from,
+      input.type,
+      `Transition "human_resolved" got an empty input.headSha; omit it or provide the exact live GitHub HEAD.`,
+    );
+  }
   if (input.type === 'review_approved' && input.reviewResult !== undefined && input.reviewResult.verdict !== 'approve') {
     throw new InvalidTransitionError(
       'wrong-verdict',

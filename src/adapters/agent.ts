@@ -25,6 +25,10 @@ export interface ImplementationRequest {
   readonly instructions?: string;
   /** Per-invocation capabilities; never persisted in Conductor run state. */
   readonly capabilities?: readonly McpHttpCapability[];
+  /** Previously persisted executor session token, when continuing a run. */
+  readonly sessionId?: string;
+  /** Cancels the active implementation process. */
+  readonly signal?: AbortSignal;
 }
 
 /**

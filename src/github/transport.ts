@@ -5,6 +5,10 @@ import { GitHubLiveStateError } from './errors.js';
 export interface GitHubApiTransport {
   get(path: string, query?: Readonly<Record<string, string>>): Promise<unknown>;
   getPaginated(path: string, query?: Readonly<Record<string, string>>): Promise<readonly unknown[]>;
+  /** Execute a read-only GraphQL query for state not exposed by REST. */
+  graphql?(query: string, variables?: Readonly<Record<string, string | number>>): Promise<unknown>;
+  /** Read a non-JSON GitHub media representation, such as a complete PR diff. */
+  getRaw?(path: string, accept: string): Promise<string>;
 }
 
 export interface ProcessResult {
@@ -13,8 +17,14 @@ export interface ProcessResult {
   readonly exitCode: number;
 }
 
+export interface ProcessRunOptions {
+  readonly timeoutMs: number;
+  readonly cwd?: string;
+  readonly signal?: AbortSignal;
+}
+
 export interface ProcessRunner {
-  run(file: string, args: readonly string[], timeoutMs: number): Promise<ProcessResult>;
+  run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult>;
 }
 
 interface ProcessError extends ExecFileException {
@@ -23,19 +33,29 @@ interface ProcessError extends ExecFileException {
 
 /** Production process boundary. Commands are always an executable plus args. */
 export class NodeProcessRunner implements ProcessRunner {
-  async run(file: string, args: readonly string[], timeoutMs: number): Promise<ProcessResult> {
+  async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     return await new Promise<ProcessResult>((resolve, reject) => {
-      execFile(
+      const child = execFile(
         file,
         [...args],
-        { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+        {
+          encoding: 'utf8',
+          timeout: options.timeoutMs,
+          cwd: options.cwd,
+          signal: options.signal,
+          maxBuffer: 16 * 1024 * 1024,
+        },
         (error: ProcessError | null, stdout: string, stderr: string) => {
           if (error === null) {
             resolve({ stdout, stderr, exitCode: 0 });
             return;
           }
+          if (options.signal?.aborted === true) {
+            reject(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }));
+            return;
+          }
           if (error.killed) {
-            reject(Object.assign(new Error(`Command ${file} timed out after ${timeoutMs}ms.`), { code: 'ETIMEDOUT' }));
+            reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT' }));
             return;
           }
           if (typeof error.code === 'number') {
@@ -45,6 +65,9 @@ export class NodeProcessRunner implements ProcessRunner {
           reject(error);
         },
       );
+      // Non-interactive CLIs may wait for piped stdin even when their prompt
+      // and request are fully supplied as arguments.
+      child.stdin?.end();
     });
   }
 }
@@ -116,14 +139,18 @@ export class GhCliTransport implements GitHubApiTransport {
     this.timeoutMs = options.timeoutMs ?? 30_000;
   }
 
-  private args(path: string, query: Readonly<Record<string, string>> = {}): string[] {
+  private args(
+    path: string,
+    query: Readonly<Record<string, string>> = {},
+    accept = 'application/vnd.github+json',
+  ): string[] {
     const args = [
       'api',
       '--method',
       'GET',
       path,
       '-H',
-      'Accept: application/vnd.github+json',
+      `Accept: ${accept}`,
       '-H',
       'X-GitHub-Api-Version: 2022-11-28',
     ];
@@ -136,7 +163,7 @@ export class GhCliTransport implements GitHubApiTransport {
   private async execute(path: string, args: readonly string[]): Promise<string> {
     let result: ProcessResult;
     try {
-      result = await this.runner.run('gh', args, this.timeoutMs);
+      result = await this.runner.run('gh', args, { timeoutMs: this.timeoutMs });
     } catch (error) {
       throw mapThrownError(error, path);
     }
@@ -176,5 +203,28 @@ export class GhCliTransport implements GitHubApiTransport {
     }
     return pages.flat();
   }
-}
 
+  async graphql(
+    query: string,
+    variables: Readonly<Record<string, string | number>> = {},
+  ): Promise<unknown> {
+    const args = ['api', 'graphql', '-f', `query=${query}`];
+    for (const [key, value] of Object.entries(variables).sort(([a], [b]) => a.localeCompare(b))) {
+      args.push('-F', `${key}=${String(value)}`);
+    }
+    const path = 'graphql';
+    const raw = await this.execute(path, args);
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch (error) {
+      throw new GitHubLiveStateError('GH_INVALID_RESPONSE', 'GitHub returned invalid JSON for graphql.', {
+        details: { path },
+        cause: error,
+      });
+    }
+  }
+
+  async getRaw(path: string, accept: string): Promise<string> {
+    return await this.execute(path, this.args(path, {}, accept));
+  }
+}

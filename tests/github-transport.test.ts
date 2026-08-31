@@ -6,6 +6,7 @@ import {
   GhCliTransport,
   type ProcessResult,
   type ProcessRunner,
+  type ProcessRunOptions,
 } from '../src/github/transport.js';
 
 class RecordingRunner implements ProcessRunner {
@@ -13,8 +14,8 @@ class RecordingRunner implements ProcessRunner {
 
   constructor(private readonly outcomes: Array<ProcessResult | Error>) {}
 
-  async run(file: string, args: readonly string[], timeoutMs: number): Promise<ProcessResult> {
-    this.calls.push({ file, args, timeoutMs });
+  async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
+    this.calls.push({ file, args, timeoutMs: options.timeoutMs });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No fake outcome queued');
     if (outcome instanceof Error) throw outcome;
@@ -74,6 +75,37 @@ describe('GhCliTransport', () => {
       { id: 3 },
     ]);
     assert.deepEqual(runner.calls[0]?.args.slice(-2), ['--paginate', '--slurp']);
+  });
+
+  it('reads a raw media representation without JSON parsing', async () => {
+    const diff = 'diff --git a/a.ts b/a.ts\n+ok\n';
+    const runner = new RecordingRunner([result(diff)]);
+    const transport = new GhCliTransport({ runner });
+
+    assert.equal(
+      await transport.getRaw('repos/acme/widgets/pulls/7', 'application/vnd.github.diff'),
+      diff,
+    );
+    assert.ok(runner.calls[0]?.args.includes('Accept: application/vnd.github.diff'));
+  });
+
+  it('executes GraphQL with typed variables and parses the response', async () => {
+    const runner = new RecordingRunner([result('{"data":{"ok":true}}')]);
+    const transport = new GhCliTransport({ runner });
+
+    assert.deepEqual(await transport.graphql('query($number: Int!) { ok }', { owner: 'acme', number: 7 }), {
+      data: { ok: true },
+    });
+    assert.deepEqual(runner.calls[0]?.args, [
+      'api',
+      'graphql',
+      '-f',
+      'query=query($number: Int!) { ok }',
+      '-F',
+      'number=7',
+      '-F',
+      'owner=acme',
+    ]);
   });
 
   it('rejects malformed JSON and non-array pagination pages', async () => {
