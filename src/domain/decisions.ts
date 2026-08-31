@@ -6,8 +6,10 @@ export const CANCEL_RUN_DECISION = 'Cancel the run';
 
 const LIVE_HEAD_SYNC_INTERRUPT_STATES = new Set([
   'IMPLEMENTING',
+  'VALIDATING',
   'REVIEWING',
   'CHANGES_REQUESTED',
+  'FINAL_GATE',
 ]);
 
 /** States whose drift interrupt offers the bounded live-HEAD synchronization decision. */

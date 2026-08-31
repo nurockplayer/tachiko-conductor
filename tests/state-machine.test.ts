@@ -366,8 +366,8 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
     );
   });
 
-  it('authorizes the same exact live-HEAD sync emitted from review states', () => {
-    for (const state of ['REVIEWING', 'CHANGES_REQUESTED'] as const) {
+  it('authorizes the same exact live-HEAD sync from every state that advertises it', () => {
+    for (const state of ['REVIEWING', 'CHANGES_REQUESTED', 'VALIDATING', 'FINAL_GATE'] as const) {
       let run = runIn(state, { headSha: 'sha-1' });
       run = applyTransition(
         run,
