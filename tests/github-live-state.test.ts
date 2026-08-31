@@ -11,10 +11,11 @@ const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const BASE = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
 class RouteTransport implements GitHubApiTransport {
-  readonly calls: Array<{ kind: 'get' | 'paginated'; path: string }> = [];
+  readonly calls: Array<{ kind: 'get' | 'paginated' | 'graphql'; path: string }> = [];
   private readonly objects = new Map<string, unknown[]>();
   private readonly collections = new Map<string, readonly unknown[]>();
   private readonly faults = new Map<string, Error>();
+  private readonly graphqlResponses: unknown[] = [];
 
   queue(path: string, ...values: unknown[]): this {
     this.objects.set(path, [...values]);
@@ -28,6 +29,11 @@ class RouteTransport implements GitHubApiTransport {
 
   fault(path: string, error: Error): this {
     this.faults.set(path, error);
+    return this;
+  }
+
+  queueGraphql(...values: unknown[]): this {
+    this.graphqlResponses.push(...values);
     return this;
   }
 
@@ -47,6 +53,19 @@ class RouteTransport implements GitHubApiTransport {
     const value = this.collections.get(path);
     if (value === undefined) throw new Error(`No collection fixture for ${path}`);
     return value;
+  }
+
+  async graphql(): Promise<unknown> {
+    this.calls.push({ kind: 'graphql', path: 'graphql' });
+    return this.graphqlResponses.shift() ?? {
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        },
+      },
+    };
   }
 }
 
@@ -109,6 +128,21 @@ function apiComment(id: string, body: string, updatedAt: string): Record<string,
   };
 }
 
+function closingIssues(...numbers: number[]): Record<string, unknown> {
+  return {
+    data: {
+      repository: {
+        pullRequest: {
+          closingIssuesReferences: {
+            nodes: numbers.map((number) => ({ number, repository: { nameWithOwner: 'acme/widgets' } })),
+            pageInfo: { hasNextPage: false, endCursor: null },
+          },
+        },
+      },
+    },
+  };
+}
+
 async function expectError(promise: Promise<unknown>, code: string, retryable: boolean): Promise<void> {
   await assert.rejects(
     promise,
@@ -136,7 +170,9 @@ describe('LiveGitHubAdapter', () => {
     const transport = new RouteTransport()
       .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
       .collection('repos/acme/widgets/issues/42/timeline', [])
-      .collection('repos/acme/widgets/issues/42/comments', []);
+      .collection('repos/acme/widgets/issues/42/comments', [])
+      .queue('repos/acme/widgets', { default_branch: 'main' })
+      .queue('repos/acme/widgets/commits/main', { sha: BASE });
     const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
 
     const snapshot = await adapter.readLiveSnapshot(TARGET);
@@ -144,6 +180,8 @@ describe('LiveGitHubAdapter', () => {
     assert.equal(snapshot.issue.number, 42);
     assert.equal(snapshot.pullRequest, null);
     assert.equal(snapshot.headSha, null);
+    assert.equal(snapshot.repository.defaultBranch, 'main');
+    assert.equal(snapshot.repository.defaultBranchHeadSha, BASE);
     assert.deepEqual(snapshot.checks, { availability: 'unavailable', overall: 'unavailable', checks: [] });
     assert.deepEqual(snapshot.reviews, { decision: 'none', latestByAuthor: [], unresolvedThreads: null });
     assert.equal(snapshot.handoff, null);
@@ -231,6 +269,7 @@ PR: #7`;
 
     assert.equal(snapshot.pullRequest?.number, 7);
     assert.equal(snapshot.pullRequest?.headSha, HEAD);
+    assert.equal(snapshot.pullRequest?.mergeStateStatus, 'clean');
     assert.equal(snapshot.headSha, HEAD);
     assert.equal(snapshot.checks.availability, 'available');
     assert.equal(snapshot.checks.overall, 'passing');
@@ -241,6 +280,7 @@ PR: #7`;
     assert.equal(snapshot.reviews.decision, 'approved');
     assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_2']);
     assert.equal(snapshot.reviews.latestByAuthor[0]?.fresh, true);
+    assert.equal(snapshot.reviews.unresolvedThreads, 0);
     assert.equal(snapshot.handoff?.sourceId, 'IC_2');
     assert.equal(snapshot.handoff?.freshness, 'current');
     assert.deepEqual(snapshot.conversations.map((entry) => entry.id), ['IC_1', 'IC_2', 'R_1', 'R_2']);
@@ -257,6 +297,41 @@ PR: #7`;
     const snapshot = await adapter.readLiveSnapshot(TARGET);
 
     assert.deepEqual(snapshot.checks, { availability: 'available', overall: 'passing', checks: [] });
+  });
+
+  it('counts unresolved review threads across GraphQL pages', async () => {
+    const transport = prTransport().queueGraphql(
+      {
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                nodes: [{ isResolved: false }, { isResolved: true }],
+                pageInfo: { hasNextPage: true, endCursor: 'cursor-1' },
+              },
+            },
+          },
+        },
+      },
+      {
+        data: {
+          repository: {
+            pullRequest: {
+              reviewThreads: {
+                nodes: [{ isResolved: false }],
+                pageInfo: { hasNextPage: false, endCursor: null },
+              },
+            },
+          },
+        },
+      },
+    );
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.unresolvedThreads, 2);
+    assert.equal(transport.calls.filter((call) => call.kind === 'graphql').length, 2);
   });
 
   it('gives a latest change request precedence over another author approval', async () => {
@@ -292,10 +367,53 @@ PR: #7`;
       .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7), crossRef(8)])
       .collection('repos/acme/widgets/issues/42/comments', [])
       .queue('repos/acme/widgets/pulls/7', pull())
-      .queue('repos/acme/widgets/pulls/8', pull(8));
+      .queue('repos/acme/widgets/pulls/8', pull(8))
+      .queueGraphql(closingIssues(), closingIssues());
     const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
 
     await expectError(adapter.readLiveSnapshot(TARGET), 'GH_AMBIGUOUS_OPEN_PRS', true);
+  });
+
+  it('selects the sole open PR that GitHub says closes the issue when stacked PRs also cross-reference it', async () => {
+    const transport = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7), crossRef(8)])
+      .collection('repos/acme/widgets/issues/42/comments', [])
+      .queue('repos/acme/widgets/pulls/7', pull(), pull())
+      .queue('repos/acme/widgets/pulls/8', pull(8))
+      .collection('repos/acme/widgets/issues/7/comments', [])
+      .collection('repos/acme/widgets/pulls/7/reviews', [])
+      .collection('repos/acme/widgets/pulls/7/comments', [])
+      .queue('repos/acme/widgets/commits/' + HEAD + '/status', { state: 'success', statuses: [] })
+      .queue('repos/acme/widgets/commits/' + HEAD + '/check-runs', { total_count: 0, check_runs: [] })
+      .queueGraphql(closingIssues(42), closingIssues(12));
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.pullRequest?.number, 7);
+    assert.equal(snapshot.reviews.unresolvedThreads, 0);
+  });
+
+  it('uses an exact closing reference in the live PR body while a stacked base keeps GraphQL closers empty', async () => {
+    const closingPull = pull(7, HEAD, { body: 'Closes #42' });
+    const transport = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7), crossRef(8)])
+      .collection('repos/acme/widgets/issues/42/comments', [])
+      .queue('repos/acme/widgets/pulls/7', closingPull, closingPull)
+      .queue('repos/acme/widgets/pulls/8', pull(8, HEAD, { body: 'Closes #12' }))
+      .collection('repos/acme/widgets/issues/7/comments', [])
+      .collection('repos/acme/widgets/pulls/7/reviews', [])
+      .collection('repos/acme/widgets/pulls/7/comments', [])
+      .queue('repos/acme/widgets/commits/' + HEAD + '/status', { state: 'success', statuses: [] })
+      .queue('repos/acme/widgets/commits/' + HEAD + '/check-runs', { total_count: 0, check_runs: [] })
+      .queueGraphql(closingIssues(), closingIssues());
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.pullRequest?.number, 7);
   });
 
   it('treats an empty pull request HEAD as a fatal contradictory state', async () => {

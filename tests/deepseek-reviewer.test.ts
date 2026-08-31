@@ -18,7 +18,7 @@ const OTHER_HEAD = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
 function liveSnapshot(headSha: string = HEAD): GitHubLiveSnapshot {
   return {
-    repository: { owner: 'acme', repo: 'widgets' },
+    repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
     issue: {
       id: 'I_42',
       number: 42,

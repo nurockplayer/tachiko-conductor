@@ -53,7 +53,7 @@ function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string): Run {
 
 function snapshot(headSha: string | null): GitHubLiveSnapshot {
   return {
-    repository: { owner: 'acme', repo: 'widgets' },
+    repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
     issue: {
       id: 'I_42',
       number: 42,
@@ -171,7 +171,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2, 'fixed')]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -197,7 +197,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -212,7 +212,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -227,7 +227,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 2, now: () => T0 },
     );
@@ -284,7 +284,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 1, now: () => T0 },
     );
@@ -302,7 +302,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 2, now: () => T0 },
     );
@@ -398,5 +398,9 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.match(result.reason, /No live PR HEAD/);
+    assert.deepEqual(result.run.interrupt?.choices, [
+      'Open the implementation pull request and retry',
+      'Cancel the run',
+    ]);
   });
 });

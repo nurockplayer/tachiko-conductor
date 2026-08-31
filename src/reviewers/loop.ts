@@ -161,6 +161,43 @@ export async function runReviewLoop(
 
       run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha }, now());
       store.update(run);
+      let validatedHead: string | null;
+      try {
+        validatedHead = (await github.readLiveSnapshot(target)).headSha;
+      } catch (error) {
+        const reason = renderFailure('GitHub live-state validation failed after the fix', error);
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason,
+            interrupt: {
+              evidence: reason,
+              choices: ['Retry after restoring GitHub access', 'Cancel the run'],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason };
+      }
+      if (validatedHead !== fixResult.headSha) {
+        const reason = `Live GitHub HEAD ${validatedHead ?? '(none)'} does not match the fix HEAD ${fixResult.headSha}.`;
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason,
+            interrupt: {
+              evidence: reason,
+              choices: validatedHead === null ? ['Open the implementation pull request and retry', 'Cancel the run'] : ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason };
+      }
       run = applyTransition(run, { type: 'validation_passed' }, now());
       store.update(run);
       continue;
@@ -221,7 +258,9 @@ export async function runReviewLoop(
           reason,
           interrupt: {
             evidence: reason,
-            choices: ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+            choices: liveHead === null
+              ? ['Open the implementation pull request and retry', 'Cancel the run']
+              : ['Sync the run to the live HEAD and continue', 'Cancel the run'],
           },
         },
         now(),

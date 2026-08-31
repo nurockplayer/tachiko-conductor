@@ -34,6 +34,15 @@ function formatTarget(target: Target): string {
   return `${target.owner}/${target.repo}@${target.branch}`;
 }
 
+function renderBlockingFindings(run: Run): string | null {
+  if (run.reviewResult?.verdict !== 'request_changes') return null;
+  const findings = run.reviewResult.findings
+    .filter((finding) => finding.severity === 'blocking')
+    .map((finding, index) => `${index + 1}. [blocking] ${finding.summary}${finding.detail === undefined ? '' : ` — ${finding.detail}`}`)
+    .join('\n');
+  return findings === '' ? null : findings;
+}
+
 function githubFailureOutcome(run: Run, error: unknown, store: RunStore, now: () => string): WorkflowOutcome {
   const detail = error instanceof Error ? error.message : String(error);
   const reason = `GitHub live state could not be read safely: ${detail}`;
@@ -90,11 +99,36 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
-        const baseSha = snapshot.pullRequest?.baseSha ?? '';
+        const pendingFixInstructions = renderBlockingFindings(run);
+        const baseSha = pendingFixInstructions === null
+          ? snapshot.pullRequest?.baseSha ?? snapshot.repository.defaultBranchHeadSha
+          : run.headSha;
+        if (baseSha === null || baseSha === undefined || baseSha === '') {
+          const reason = `No authoritative implementation base is available for ${formatTarget(target)}.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: ['Retry after restoring the repository default branch', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        const instructions = pendingFixInstructions ?? (
+          snapshot.pullRequest === null
+            ? `${snapshot.issue.body}\n\nConductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
+            : snapshot.issue.body
+        );
         const result = await implementation.run({
           target,
           baseSha,
-          instructions: snapshot.issue.body,
+          instructions,
           ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
         });
         if (result.exitStatus === 'failure') {
@@ -201,9 +235,11 @@ export async function runWorkflow(
             ? `merge state is ${mergeState}`
             : null,
           snapshot.checks.overall !== 'passing' ? `checks are ${snapshot.checks.overall}` : null,
-          snapshot.reviews.unresolvedThreads !== null && snapshot.reviews.unresolvedThreads > 0
-            ? `${snapshot.reviews.unresolvedThreads} review thread(s) remain unresolved`
-            : null,
+          snapshot.reviews.unresolvedThreads === null
+            ? 'review thread state is unavailable'
+            : snapshot.reviews.unresolvedThreads > 0
+              ? `${snapshot.reviews.unresolvedThreads} review thread(s) remain unresolved`
+              : null,
           contradictory?.message ?? null,
         ].filter((problem): problem is string => problem !== null);
 

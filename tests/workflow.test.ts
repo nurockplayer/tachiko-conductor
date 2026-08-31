@@ -42,7 +42,7 @@ class MemoryStore implements RunStore {
 
 function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
   return {
-    repository: { owner: 'acme', repo: 'widgets' },
+    repository: { owner: 'acme', repo: 'widgets', defaultBranch: 'main', defaultBranchHeadSha: baseSha },
     issue: {
       id: 'I_42',
       number: 42,
@@ -142,7 +142,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -177,7 +177,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 2, now: () => T0 },
     );
@@ -257,7 +257,9 @@ describe('runWorkflow', () => {
 
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'MERGE_READY');
-    assert.equal(implementation.requests[0]?.baseSha, '');
+    assert.equal(implementation.requests[0]?.baseSha, 'base');
+    assert.match(implementation.requests[0]?.instructions ?? '', /start from main@base/);
+    assert.match(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
   });
 
   it('restores the persisted implementation session after a restart', async () => {
@@ -280,6 +282,26 @@ describe('runWorkflow', () => {
 
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(implementation.requests[0]?.sessionId, 'session-from-disk');
+  });
+
+  it('resumes a persisted in-flight fix with the blocking findings instead of the issue body', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'run-1', HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0);
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    store.update(run);
+    const implementation = new FakeImplementation([successResult(HEAD2, 'fixed after restart')]);
+    const reviewer = new FakeReviewer([approve(HEAD2)]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      'run-1',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests[0]?.baseSha, HEAD);
+    assert.equal(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
   });
 
   it('never passes the final gate when live HEAD drifted after approval', async () => {
@@ -320,5 +342,49 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'WAITING_DEPENDENCY');
     assert.deepEqual(result.run.interrupt?.choices, ['Retry readiness checks', 'Cancel the run']);
+  });
+
+  it('fails closed when review-thread state is unavailable at the final gate', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'run-1', HEAD);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    store.update(run);
+    const unavailable = {
+      ...snapshot(HEAD),
+      reviews: { ...snapshot(HEAD).reviews, unresolvedThreads: null },
+    };
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => unavailable;
+
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      'run-1',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /review thread state is unavailable/);
+  });
+
+  it('blocks a non-clean REST mergeable state at the final gate', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'run-1', HEAD);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    store.update(run);
+    const blocked = {
+      ...snapshot(HEAD),
+      pullRequest: { ...snapshot(HEAD).pullRequest!, mergeStateStatus: 'blocked' },
+    };
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => blocked;
+
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      'run-1',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /merge state is BLOCKED/);
   });
 });

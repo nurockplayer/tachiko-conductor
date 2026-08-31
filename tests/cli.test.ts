@@ -155,7 +155,7 @@ describe('CLI command layer', () => {
 describe('github snapshot command', () => {
   function liveSnapshot(): GitHubLiveSnapshot {
     return {
-      repository: { owner: 'acme', repo: 'widgets' },
+      repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
       issue: {
         id: 'I_42',
         number: 42,
@@ -291,7 +291,7 @@ describe('workflow run and resume commands', () => {
 
   function snapshot(headSha: string): GitHubLiveSnapshot {
     return {
-      repository: { owner: 'acme', repo: 'widgets' },
+      repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
       issue: { id: 'I_42', number: 42, title: 'Fix the widget', body: 'DoR-ready.', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
       pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha: 'base' },
       headSha,

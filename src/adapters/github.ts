@@ -105,7 +105,13 @@ export interface GitHubLivePullRequestSnapshot extends PullRequestSnapshot {
 }
 
 export interface GitHubLiveSnapshot {
-  readonly repository: { readonly owner: string; readonly repo: string };
+  readonly repository: {
+    readonly owner: string;
+    readonly repo: string;
+    /** Populated when no associated open PR exists, so implementation has an authoritative base. */
+    readonly defaultBranch: string | null;
+    readonly defaultBranchHeadSha: string | null;
+  };
   readonly issue: {
     readonly id: string;
     readonly number: number;
