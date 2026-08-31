@@ -116,6 +116,7 @@ export async function runReviewLoop(
         target,
         baseSha: run.headSha ?? '',
         instructions: renderBlockingFindings(pendingReview),
+        sessionId: run.agentResult?.sessionId,
       });
       if (fixResult.exitStatus === 'failure') {
         run = applyTransition(run, { type: 'agent_failed', agentResult: fixResult, headSha: fixResult.headSha }, now());

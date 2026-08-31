@@ -251,6 +251,41 @@ PR: #7`;
     );
   });
 
+  it('reports successful empty check responses as available and passing', async () => {
+    const adapter = new LiveGitHubAdapter({ transport: prTransport(), now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.deepEqual(snapshot.checks, { availability: 'available', overall: 'passing', checks: [] });
+  });
+
+  it('gives a latest change request precedence over another author approval', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_APPROVED',
+        user: { login: 'alice' },
+        state: 'APPROVED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/approved',
+      },
+      {
+        node_id: 'R_CHANGES',
+        user: { login: 'bob' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/changes',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED', 'R_CHANGES']);
+  });
+
   it('rejects more than one open associated pull request', async () => {
     const transport = new RouteTransport()
       .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })

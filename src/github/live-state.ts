@@ -457,6 +457,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     if (status !== null) {
       const statuses = status.statuses;
       if (Array.isArray(statuses)) {
+        available = true;
         for (const item of statuses) {
           const record = asRecord(item);
           if (record === null) throw invalid(statusPath, 'status entry is not an object');
@@ -467,7 +468,6 @@ export class LiveGitHubAdapter implements GitHubAdapter {
             url: typeof record.target_url === 'string' ? record.target_url : null,
             updatedAt: typeof record.updated_at === 'string' ? record.updated_at : null,
           });
-          available = true;
         }
       }
     }
@@ -475,6 +475,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     if (checkRuns !== null) {
       const runs = checkRuns.check_runs;
       if (Array.isArray(runs)) {
+        available = true;
         for (const item of runs) {
           const record = asRecord(item);
           if (record === null) throw invalid(checkRunsPath, 'check run entry is not an object');
@@ -495,13 +496,14 @@ export class LiveGitHubAdapter implements GitHubAdapter {
             url: typeof record.html_url === 'string' ? record.html_url : null,
             updatedAt: typeof record.completed_at === 'string' ? record.completed_at : null,
           });
-          available = true;
         }
       }
     }
 
     if (checks.length === 0) {
-      return { availability: 'unavailable', overall: 'unavailable', checks: [] };
+      return available
+        ? { availability: 'available', overall: 'passing', checks: [] }
+        : { availability: 'unavailable', overall: 'unavailable', checks: [] };
     }
     const states = new Set(checks.map((check) => check.state));
     const overall: GitHubCheckSummary['overall'] = states.has('failing')
@@ -560,10 +562,10 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const decision: GitHubReviewSummary['decision'] =
       latest.length === 0
         ? 'none'
-        : latest.some((review) => review.state === 'approved')
-          ? 'approved'
-          : latest.some((review) => review.state === 'changes_requested')
-            ? 'changes_requested'
+        : latest.some((review) => review.state === 'changes_requested')
+          ? 'changes_requested'
+          : latest.some((review) => review.state === 'approved')
+            ? 'approved'
             : 'review_required';
 
     return { decision, latestByAuthor: latest, unresolvedThreads: null };

@@ -19,12 +19,17 @@ lets raw terminal text or full transcripts leak into the workflow.
 2. An optional injected `GitHubAdapter` supplies a live snapshot summary into
    the prompt so GitHub remains the engineering source of truth.
 3. Every execution outcome — success, non-zero exit, `is_error`, timeout,
-   missing executable, or post-run git read failure — becomes a deterministic
+   cancellation, missing executable, or post-run git read failure — becomes a deterministic
    `AgentResult` with `exitStatus`, `summary`, optional `headSha`, and
-   `diagnostics`. No unstructured terminal text is returned as a result.
+   `diagnostics`. Results include bounded wall-clock `durationMs`, but no raw
+   transcript or provider-specific model usage.
 4. Session continuity: a fresh run starts a new session; a continuation run
-   passes `--resume <sessionId>`. The adapter records the returned `session_id`
-   so a later fix loop can continue the same logical run.
+   passes persisted `AgentResult.sessionId` back through
+   `ImplementationRequest.sessionId` and then `--resume <sessionId>`. Continuity
+   therefore survives a Conductor process restart and does not depend on
+   mutable adapter state.
+5. The prompt requires repository validation and tests to pass before Claude
+   reports success.
 
 ## Execution contract
 
@@ -39,18 +44,18 @@ claude -p <prompt> --output-format json \
 Parsed JSON result:
 
 ```json
-{ "type": "result", "session_id": "...", "result": "...", "is_error": false,
-  "duration_ms": 123, "model_usage": { ... } }
+{ "type": "result", "session_id": "...", "result": "...", "is_error": false }
 ```
 
 Failure mapping (all deterministic and machine-readable):
 
-- exit code ≠ 0 → `exitStatus: 'failure'`, summary from stderr/stdout, code
+- exit code ≠ 0 → `exitStatus: 'failure'`, status-only summary (no raw process output), code
   `CLAUDE_EXIT_FAILURE`.
 - parsed `is_error === true` → `CLAUDE_ERROR`.
 - timeout (`ETIMEDOUT`) → `CLAUDE_TIMEOUT`.
+- request cancellation (`AbortSignal`) → `CLAUDE_CANCELLED`.
 - missing executable (`ENOENT`) → `CLAUDE_NOT_FOUND`.
-- invalid JSON output → `CLAUDE_INVALID_OUTPUT`.
+- invalid JSON or structurally invalid result output → `CLAUDE_INVALID_OUTPUT`.
 - post-run `git rev-parse HEAD` failure → `headSha` omitted plus a
   `HEAD_READ_FAILED` diagnostic; an empty or failed HEAD read never invents a
   SHA and never yields `exitStatus: 'success'`.
@@ -64,12 +69,13 @@ Failure mapping (all deterministic and machine-readable):
 - No auto-merge; the adapter cannot bypass the Conductor state machine.
 - A Claude self-review can never satisfy the independent reviewer gate
   (issue #5 owns that gate).
-- Full raw transcripts and secrets are not persisted.
+- Full raw transcripts, process output, secrets, and model usage are not persisted.
 
 ## Validation
 
 - Fake-runner unit tests assert exact argument arrays, prompt construction,
-  `--resume` behavior, JSON parsing, and every failure mapping — no network,
+  restart-safe `--resume` behavior, structured JSON validation, cancellation,
+  and every failure mapping — no network,
   no real `claude`, in the default suite.
 - An opt-in smoke command (`TACHIKO_SMOKE=1`) may invoke the real CLI once
   and is never part of CI.

@@ -75,6 +75,10 @@ export interface AgentResult {
   readonly headSha?: string;
   readonly changedFiles?: readonly string[];
   readonly diagnostics?: readonly string[];
+  /** Opaque executor session token used to continue this logical run. */
+  readonly sessionId?: string;
+  /** Wall-clock execution duration. Raw transcripts and model usage are not retained. */
+  readonly durationMs?: number;
 }
 
 export type ReviewVerdict = 'approve' | 'request_changes';

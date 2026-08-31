@@ -42,10 +42,11 @@ class MemoryStore implements RunStore {
   }
 }
 
-function reviewingRun(headSha = HEAD, id = 'run-1'): Run {
+function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string): Run {
   let run = createRun(TARGET, T0, id);
   run = applyTransition(run, { type: 'start' }, T0);
-  run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha }, T0);
+  const agentResult = { ...successResult(headSha), ...(sessionId === undefined ? {} : { sessionId }) };
+  run = applyTransition(run, { type: 'agent_succeeded', agentResult, headSha }, T0);
   run = applyTransition(run, { type: 'validation_passed' }, T0);
   return run;
 }
@@ -114,12 +115,16 @@ class FakeReviewer implements ReviewerAdapter {
 
 class FakeImplementation implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
-  readonly requests: Array<{ baseSha: string; instructions: string | undefined }> = [];
+  readonly requests: Array<{ baseSha: string; instructions: string | undefined; sessionId: string | undefined }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
 
-  async run(request: { target: unknown; baseSha: string; instructions?: string }): Promise<AgentResult> {
-    this.requests.push({ baseSha: request.baseSha, instructions: request.instructions });
+  async run(request: { target: unknown; baseSha: string; instructions?: string; sessionId?: string }): Promise<AgentResult> {
+    this.requests.push({
+      baseSha: request.baseSha,
+      instructions: request.instructions,
+      sessionId: request.sessionId,
+    });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
     return outcome;
@@ -198,6 +203,21 @@ describe('runReviewLoop', () => {
     );
 
     assert.equal(implementation.requests[0]?.instructions, '1. [blocking] fix this');
+  });
+
+  it('resumes the persisted implementation session while fixing review findings', async () => {
+    const store = new MemoryStore();
+    store.create(reviewingRun(HEAD, 'run-1', 'session-42'));
+    const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    await runReviewLoop(
+      { store, github: githubAdapter([HEAD, HEAD2]), implementation, reviewer },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(implementation.requests[0]?.sessionId, 'session-42');
   });
 
   it('escalates to NEEDS_HUMAN when the review loop exceeds maxAttempts', async () => {

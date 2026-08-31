@@ -15,8 +15,14 @@ export interface ProcessResult {
   readonly exitCode: number;
 }
 
+export interface ProcessRunOptions {
+  readonly timeoutMs: number;
+  readonly cwd?: string;
+  readonly signal?: AbortSignal;
+}
+
 export interface ProcessRunner {
-  run(file: string, args: readonly string[], timeoutMs: number): Promise<ProcessResult>;
+  run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult>;
 }
 
 interface ProcessError extends ExecFileException {
@@ -25,19 +31,29 @@ interface ProcessError extends ExecFileException {
 
 /** Production process boundary. Commands are always an executable plus args. */
 export class NodeProcessRunner implements ProcessRunner {
-  async run(file: string, args: readonly string[], timeoutMs: number): Promise<ProcessResult> {
+  async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     return await new Promise<ProcessResult>((resolve, reject) => {
       execFile(
         file,
         [...args],
-        { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 16 * 1024 * 1024 },
+        {
+          encoding: 'utf8',
+          timeout: options.timeoutMs,
+          cwd: options.cwd,
+          signal: options.signal,
+          maxBuffer: 16 * 1024 * 1024,
+        },
         (error: ProcessError | null, stdout: string, stderr: string) => {
           if (error === null) {
             resolve({ stdout, stderr, exitCode: 0 });
             return;
           }
+          if (options.signal?.aborted === true) {
+            reject(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }));
+            return;
+          }
           if (error.killed) {
-            reject(Object.assign(new Error(`Command ${file} timed out after ${timeoutMs}ms.`), { code: 'ETIMEDOUT' }));
+            reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT' }));
             return;
           }
           if (typeof error.code === 'number') {
@@ -142,7 +158,7 @@ export class GhCliTransport implements GitHubApiTransport {
   private async execute(path: string, args: readonly string[]): Promise<string> {
     let result: ProcessResult;
     try {
-      result = await this.runner.run('gh', args, this.timeoutMs);
+      result = await this.runner.run('gh', args, { timeoutMs: this.timeoutMs });
     } catch (error) {
       throw mapThrownError(error, path);
     }
@@ -182,7 +198,6 @@ export class GhCliTransport implements GitHubApiTransport {
     }
     return pages.flat();
   }
-
   async getRaw(path: string, accept: string): Promise<string> {
     return await this.execute(path, this.args(path, {}, accept));
   }
