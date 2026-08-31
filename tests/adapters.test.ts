@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 import type {
   BranchSnapshot,
   GitHubAdapter,
+  GitHubLiveSnapshot,
   IssueSnapshot,
   PullRequestSnapshot,
 } from '../src/adapters/github.js';
@@ -15,6 +16,30 @@ import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js
 import type { IssueTarget, RepositoryTarget, Target } from '../src/domain/types.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { TARGET, approval, newRun } from './helpers.js';
+
+function liveSnapshot(target: IssueTarget): GitHubLiveSnapshot {
+  return {
+    repository: { owner: target.owner, repo: target.repo },
+    issue: {
+      id: 'I_1',
+      number: target.issueNumber,
+      title: 'Fix the widget',
+      body: 'DoR-ready.',
+      state: 'open',
+      url: 'https://github.test/acme/widgets/issues/42',
+      createdAt: '2026-08-14T00:00:00.000Z',
+      updatedAt: '2026-08-14T00:00:00.000Z',
+    },
+    pullRequest: null,
+    headSha: null,
+    checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
+    reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: null },
+    conversations: [],
+    handoff: null,
+    problems: [],
+    observedAt: '2026-08-14T00:00:00.000Z',
+  };
+}
 
 describe('adapter boundaries are typed and testable', () => {
   it('accepts a stub GitHub adapter implementing the interface', async () => {
@@ -36,6 +61,9 @@ describe('adapter boundaries are typed and testable', () => {
       async listPullRequests() {
         const prs: readonly PullRequestSnapshot[] = [];
         return prs;
+      },
+      async readLiveSnapshot(target) {
+        return liveSnapshot(target);
       },
     };
     const snapshot = await github.readIssue(TARGET);
@@ -60,6 +88,9 @@ describe('adapter boundaries are typed and testable', () => {
       async listPullRequests(target) {
         assert.ok(target.kind === 'issue' || target.kind === 'repository');
         return [];
+      },
+      async readLiveSnapshot(target) {
+        return liveSnapshot(target);
       },
     };
     await github.readIssue(issueTarget);

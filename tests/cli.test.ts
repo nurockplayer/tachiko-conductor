@@ -7,14 +7,18 @@ import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import {
+  githubSnapshotCommand,
   parseIssueNumber,
+  parseIssueRef,
   resolveRunsDir,
   runCreateCommand,
   runShowCommand,
   runShowView,
   runTransitionCommand,
 } from '../src/cli.js';
+import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { TransitionType } from '../src/domain/types.js';
+import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { TARGET } from './helpers.js';
 
@@ -137,6 +141,114 @@ describe('CLI command layer', () => {
       assert.ok(run.interrupt?.resolvedAt);
     } finally {
       rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('github snapshot command', () => {
+  function liveSnapshot(): GitHubLiveSnapshot {
+    return {
+      repository: { owner: 'acme', repo: 'widgets' },
+      issue: {
+        id: 'I_42',
+        number: 42,
+        title: 'Fix the widget',
+        body: 'DoR-ready.',
+        state: 'open',
+        url: 'https://github.test/acme/widgets/issues/42',
+        createdAt: '2026-08-14T00:00:00.000Z',
+        updatedAt: '2026-08-14T00:00:00.000Z',
+      },
+      pullRequest: null,
+      headSha: null,
+      checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
+      reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: null },
+      conversations: [],
+      handoff: null,
+      problems: [],
+      observedAt: '2026-08-14T03:00:00.000Z',
+    };
+  }
+
+  it('parses a strict owner/repo#123 reference into an issue target', () => {
+    assert.deepEqual(parseIssueRef('acme/widgets#42'), { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 });
+    assert.throws(() => parseIssueRef('acme/widgets'), /expected owner\/repo#123/);
+    assert.throws(() => parseIssueRef('acme/widgets#42oops'), /expected owner\/repo#123/);
+    assert.throws(() => parseIssueRef('acme/widgets#0'), /safe integer >= 1/);
+    assert.throws(() => parseIssueRef('acme/widgets#9007199254740993'), /safe integer >= 1/);
+  });
+
+  it('wraps a successful live snapshot in a machine-readable ok envelope', async () => {
+    const adapter: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() {
+        return { target: TARGET, title: 'Fix', body: '', state: 'open' };
+      },
+      async readBranch(target) {
+        return { target, headSha: 'sha', pullRequestNumbers: [] };
+      },
+      async listPullRequests() {
+        return [];
+      },
+      async readLiveSnapshot(target) {
+        assert.deepEqual(target, TARGET);
+        return liveSnapshot();
+      },
+    };
+
+    const outcome = await githubSnapshotCommand(adapter, 'acme/widgets#42');
+    assert.equal(outcome.ok, true);
+    if (outcome.ok) assert.equal(outcome.snapshot.issue.number, 42);
+  });
+
+  it('serializes a fatal GitHub live-state error with its code and retryable flag', async () => {
+    const adapter: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() {
+        throw new Error('unused');
+      },
+      async readBranch() {
+        throw new Error('unused');
+      },
+      async listPullRequests() {
+        throw new Error('unused');
+      },
+      async readLiveSnapshot() {
+        throw new GitHubLiveStateError('GH_RATE_LIMITED', 'rate limited', { retryable: true, details: { path: 'x' } });
+      },
+    };
+
+    const outcome = await githubSnapshotCommand(adapter, 'acme/widgets#42');
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.equal(outcome.error.code, 'GH_RATE_LIMITED');
+      assert.equal(outcome.error.retryable, true);
+      assert.deepEqual(outcome.error.details, { path: 'x' });
+    }
+  });
+
+  it('collapses unexpected failures into an UNKNOWN machine-readable error', async () => {
+    const adapter: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() {
+        throw new Error('unused');
+      },
+      async readBranch() {
+        throw new Error('unused');
+      },
+      async listPullRequests() {
+        throw new Error('unused');
+      },
+      async readLiveSnapshot() {
+        throw new Error('boom');
+      },
+    };
+
+    const outcome = await githubSnapshotCommand(adapter, 'acme/widgets#42');
+    assert.equal(outcome.ok, false);
+    if (!outcome.ok) {
+      assert.equal(outcome.error.code, 'UNKNOWN');
+      assert.equal(outcome.error.message, 'boom');
     }
   });
 });
