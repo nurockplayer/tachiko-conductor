@@ -15,6 +15,35 @@ export interface McpHttpCapability {
   readonly endpoint: string;
 }
 
+/** Validate and normalize generic HTTP MCP capabilities at the adapter boundary. */
+export function normalizeMcpHttpCapabilities(
+  capabilities: readonly McpHttpCapability[],
+): readonly McpHttpCapability[] {
+  const names = new Set<string>();
+  return capabilities.map((capability) => {
+    if (!/^[A-Za-z0-9_-]+$/.test(capability.name)) {
+      throw new Error(`Invalid MCP capability name "${capability.name}"; use only letters, digits, underscores, or hyphens.`);
+    }
+    if (names.has(capability.name)) {
+      throw new Error(`Duplicate MCP capability name "${capability.name}".`);
+    }
+    names.add(capability.name);
+    let endpoint: URL;
+    try {
+      endpoint = new URL(capability.endpoint);
+    } catch {
+      throw new Error(`MCP capability "${capability.name}" has an invalid endpoint URL.`);
+    }
+    if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
+      throw new Error(`MCP capability "${capability.name}" must use an HTTP or HTTPS endpoint.`);
+    }
+    if (endpoint.username !== '' || endpoint.password !== '') {
+      throw new Error(`MCP capability "${capability.name}" must not embed credentials in its endpoint URL.`);
+    }
+    return { ...capability, endpoint: endpoint.toString() };
+  });
+}
+
 /** Resolve ephemeral capabilities immediately before an implementation call. */
 export type ImplementationCapabilityResolver = () => Promise<readonly McpHttpCapability[] | undefined>;
 

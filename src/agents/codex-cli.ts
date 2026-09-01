@@ -1,5 +1,6 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
+  normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
   type McpHttpCapability,
@@ -179,7 +180,9 @@ export class CodexCliAdapter implements ImplementationAgent {
     executor: ExecutorIdentity | undefined,
   ): string[] {
     const args = executor === undefined ? ['exec', '--json'] : ['exec', 'resume', '--json'];
-    for (const capability of capabilities) args.push('-c', codexMcpConfig(capability));
+    for (const capability of normalizeMcpHttpCapabilities(capabilities)) {
+      args.push('-c', codexMcpConfig(capability));
+    }
     if (this.model !== undefined) args.push('--model', this.model);
     if (this.reasoningEffort !== undefined) {
       args.push('-c', `model_reasoning_effort=${JSON.stringify(this.reasoningEffort)}`);
@@ -227,7 +230,9 @@ function buildPrompt(request: ImplementationRequest): string {
     lines.push(
       'Browser capability policy:',
       '- Prefer a stable API, native integration, or first-party MCP over browser automation.',
+      '- The provided browser is a dedicated Tachiko profile; never inspect or copy a personal browser profile.',
       '- Authentication, 2FA, or CAPTCHA challenges require human takeover; do not bypass or guess them.',
+      '- Do not perform purchase, payment, billing, account deletion, credential, or security-setting changes.',
       `- If a human boundary is reached, stop and reply exactly with "${HUMAN_TAKEOVER_DIAGNOSTIC} <reason>".`,
     );
   }
@@ -287,24 +292,9 @@ function invalidOutput(detail: string): ParsedCodexOutput {
 }
 
 function codexMcpConfig(capability: McpHttpCapability): string {
-  if (!/^[A-Za-z0-9_-]+$/.test(capability.name)) {
-    throw new Error(`Invalid MCP capability name "${capability.name}"; use only letters, digits, underscores, or hyphens.`);
-  }
-  let endpoint: URL;
-  try {
-    endpoint = new URL(capability.endpoint);
-  } catch {
-    throw new Error(`MCP capability "${capability.name}" has an invalid endpoint URL.`);
-  }
-  if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
-    throw new Error(`MCP capability "${capability.name}" must use an HTTP or HTTPS endpoint.`);
-  }
-  if (endpoint.username !== '' || endpoint.password !== '') {
-    throw new Error(`MCP capability "${capability.name}" must not embed credentials in its endpoint URL.`);
-  }
   return (
     `mcp_servers.${capability.name}={` +
-    `url=${JSON.stringify(endpoint.toString())},required=true,default_tools_approval_mode="approve"}`
+    `url=${JSON.stringify(capability.endpoint)},required=true,default_tools_approval_mode="approve"}`
   );
 }
 

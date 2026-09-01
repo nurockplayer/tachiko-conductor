@@ -1,5 +1,6 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
+  normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
   type McpHttpCapability,
@@ -296,26 +297,8 @@ function buildMcpInvocation(capabilities: readonly McpHttpCapability[]): {
   if (capabilities.length === 0) return { allowedTools: [] };
   const servers: Record<string, { type: 'http'; url: string }> = {};
   const allowedTools: string[] = [];
-  for (const capability of capabilities) {
-    if (!/^[A-Za-z0-9_-]+$/.test(capability.name)) {
-      throw new Error(`Invalid MCP capability name "${capability.name}"; use only letters, digits, underscores, or hyphens.`);
-    }
-    if (servers[capability.name] !== undefined) {
-      throw new Error(`Duplicate MCP capability name "${capability.name}".`);
-    }
-    let endpoint: URL;
-    try {
-      endpoint = new URL(capability.endpoint);
-    } catch {
-      throw new Error(`MCP capability "${capability.name}" has an invalid endpoint URL.`);
-    }
-    if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
-      throw new Error(`MCP capability "${capability.name}" must use an HTTP or HTTPS endpoint.`);
-    }
-    if (endpoint.username !== '' || endpoint.password !== '') {
-      throw new Error(`MCP capability "${capability.name}" must not embed credentials in its endpoint URL.`);
-    }
-    servers[capability.name] = { type: 'http', url: endpoint.toString() };
+  for (const capability of normalizeMcpHttpCapabilities(capabilities)) {
+    servers[capability.name] = { type: 'http', url: capability.endpoint };
     allowedTools.push(`mcp__${capability.name}__*`);
   }
   return { config: { mcpServers: servers }, allowedTools };

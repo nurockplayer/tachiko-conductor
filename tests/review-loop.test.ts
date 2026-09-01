@@ -407,6 +407,7 @@ describe('runReviewLoop', () => {
         exitStatus: 'failure',
         summary: '2FA required',
         diagnostics: ['TACHIKO_NEEDS_HUMAN: 2FA required'],
+        executor: { provider: 'codex-cli', sessionId: 'thread-fix' },
       },
     ]);
 
@@ -419,6 +420,7 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.equal(result.run.interrupt?.reason, '2FA required');
+    assert.deepEqual(result.run.executor, { provider: 'codex-cli', sessionId: 'thread-fix' });
   });
 
   it('escalates to NEEDS_HUMAN when the live GitHub HEAD drifts from the run HEAD', async () => {

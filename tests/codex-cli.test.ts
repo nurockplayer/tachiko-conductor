@@ -224,4 +224,22 @@ describe('CodexCliAdapter', () => {
     assert.deepEqual(agentResult.diagnostics, ['TACHIKO_NEEDS_HUMAN: browser login requires 2FA']);
     assert.equal(runner.calls.length, 1);
   });
+
+  it('rejects duplicate MCP capability names before starting Codex', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      capabilities: [
+        { kind: 'mcp-http', name: 'browser', endpoint: 'http://127.0.0.1:8931/mcp' },
+        { kind: 'mcp-http', name: 'browser', endpoint: 'http://127.0.0.1:8932/mcp' },
+      ],
+    });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CODEX_EXEC_FAILURE.*Duplicate MCP capability name/);
+    assert.equal(runner.calls.length, 0);
+  });
 });

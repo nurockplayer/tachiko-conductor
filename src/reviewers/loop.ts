@@ -155,6 +155,7 @@ export async function runReviewLoop(
             {
               type: 'escalate',
               reason: takeoverReason,
+              ...(fixResult.executor === undefined ? {} : { executor: fixResult.executor }),
               interrupt: {
                 evidence: takeoverReason,
                 choices: ['Complete human bootstrap/takeover and resume', CANCEL_RUN_DECISION],

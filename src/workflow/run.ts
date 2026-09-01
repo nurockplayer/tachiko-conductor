@@ -172,6 +172,7 @@ export async function runWorkflow(
               {
                 type: 'escalate',
                 reason: takeoverReason,
+                ...(result.executor === undefined ? {} : { executor: result.executor }),
                 interrupt: {
                   evidence: takeoverReason,
                   choices: ['Complete human bootstrap/takeover and resume', CANCEL_RUN_DECISION],

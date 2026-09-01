@@ -138,6 +138,8 @@ export interface TransitionInput {
   readonly reviewResult?: ReviewResult;
   /** Explicitly updates the run's current HEAD SHA. */
   readonly headSha?: string;
+  /** Executor identity captured while an implementation is interrupted for human takeover. */
+  readonly executor?: ExecutorIdentity;
   /** Structured context carried onto the interrupt when entering NEEDS_HUMAN / WAITING_DEPENDENCY. */
   readonly interrupt?: {
     readonly evidence?: string;
