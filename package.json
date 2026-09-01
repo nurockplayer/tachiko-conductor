@@ -13,13 +13,19 @@
     "tachiko": "dist/cli.js"
   },
   "scripts": {
+    "browser:install": "playwright install chromium",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "tsx --test tests/*.test.ts"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
+    "playwright": "1.63.0-alpha-2026-08-05",
     "tsx": "^4.19.0",
     "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "@playwright/mcp": "0.0.79"
   }
 }

@@ -1,4 +1,9 @@
-import type { ImplementationAgent, ImplementationRequest } from '../adapters/agent.js';
+import {
+  HUMAN_TAKEOVER_DIAGNOSTIC,
+  type ImplementationAgent,
+  type ImplementationRequest,
+  type McpHttpCapability,
+} from '../adapters/agent.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { AgentResult, Target } from '../domain/types.js';
 import {
@@ -89,7 +94,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     }
     const prompt = await this.buildPrompt(request);
     const outcome = await this.runClaude(
-      this.buildArgs(prompt, sessionId),
+      this.buildArgs(prompt, request.capabilities, sessionId),
       request.signal,
       sessionId,
     );
@@ -97,6 +102,16 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
 
     if (isAborted(request.signal)) {
       return cancelledAgentResult(outcome.durationMs, outcome.sessionId);
+    }
+    const takeoverReason = parseHumanTakeover(outcome.summary);
+    if (takeoverReason !== undefined) {
+      return {
+        exitStatus: 'failure',
+        summary: takeoverReason,
+        diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
+        sessionId: outcome.sessionId,
+        durationMs: outcome.durationMs,
+      };
     }
     const head = await this.readHead(request.signal);
     if (isAborted(request.signal)) {
@@ -139,12 +154,32 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     if (request.instructions !== undefined && request.instructions !== '') {
       lines.push('', 'Instructions:', request.instructions);
     }
+    if ((request.capabilities?.length ?? 0) > 0) {
+      lines.push(
+        '',
+        'Browser capability policy:',
+        '- Prefer a stable API, native integration, or first-party MCP over browser automation.',
+        '- The provided browser is a dedicated Tachiko profile; never inspect or copy a personal browser profile.',
+        '- Authentication, 2FA, or CAPTCHA challenges require human takeover; do not bypass or guess them.',
+        '- Do not perform purchase, payment, billing, account deletion, credential, or security-setting changes.',
+        `- If a human boundary is reached, stop and reply exactly with "${HUMAN_TAKEOVER_DIAGNOSTIC} <reason>".`,
+      );
+    }
     return lines.join('\n');
   }
 
-  private buildArgs(prompt: string, sessionId: string | undefined): string[] {
+  private buildArgs(
+    prompt: string,
+    capabilities: readonly McpHttpCapability[] | undefined,
+    sessionId: string | undefined,
+  ): string[] {
     const args = ['-p', prompt, '--output-format', 'json', '--permission-mode', 'acceptEdits'];
-    if (this.allowedTools.length > 0) args.push('--allowedTools', ...this.allowedTools);
+    const mcp = buildMcpInvocation(capabilities ?? []);
+    const allowedTools = [...this.allowedTools, ...mcp.allowedTools];
+    if (allowedTools.length > 0) args.push('--allowedTools', ...allowedTools);
+    if (mcp.config !== undefined) {
+      args.push('--mcp-config', JSON.stringify(mcp.config), '--strict-mcp-config');
+    }
     if (this.model !== undefined) args.push('--model', this.model);
     if (sessionId !== undefined) args.push('--resume', sessionId);
     return args;
@@ -234,6 +269,38 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
   }
 }
 
+function buildMcpInvocation(capabilities: readonly McpHttpCapability[]): {
+  readonly config?: { readonly mcpServers: Readonly<Record<string, { readonly type: 'http'; readonly url: string }>> };
+  readonly allowedTools: readonly string[];
+} {
+  if (capabilities.length === 0) return { allowedTools: [] };
+  const servers: Record<string, { type: 'http'; url: string }> = {};
+  const allowedTools: string[] = [];
+  for (const capability of capabilities) {
+    if (!/^[A-Za-z0-9_-]+$/.test(capability.name)) {
+      throw new Error(`Invalid MCP capability name "${capability.name}"; use only letters, digits, underscores, or hyphens.`);
+    }
+    if (servers[capability.name] !== undefined) {
+      throw new Error(`Duplicate MCP capability name "${capability.name}".`);
+    }
+    let endpoint: URL;
+    try {
+      endpoint = new URL(capability.endpoint);
+    } catch {
+      throw new Error(`MCP capability "${capability.name}" has an invalid endpoint URL.`);
+    }
+    if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
+      throw new Error(`MCP capability "${capability.name}" must use an HTTP or HTTPS endpoint.`);
+    }
+    if (endpoint.username !== '' || endpoint.password !== '') {
+      throw new Error(`MCP capability "${capability.name}" must not embed credentials in its endpoint URL.`);
+    }
+    servers[capability.name] = { type: 'http', url: endpoint.toString() };
+    allowedTools.push(`mcp__${capability.name}__*`);
+  }
+  return { config: { mcpServers: servers }, allowedTools };
+}
+
 function failureAgentResult(
   code: ClaudeErrorCode,
   detail: string,
@@ -270,6 +337,12 @@ function parseResultJson(stdout: string): ClaudeResultJson | null {
   } catch {
     return null;
   }
+}
+
+function parseHumanTakeover(summary: string): string | undefined {
+  if (!summary.startsWith(HUMAN_TAKEOVER_DIAGNOSTIC)) return undefined;
+  const reason = summary.slice(HUMAN_TAKEOVER_DIAGNOSTIC.length).trim();
+  return reason === '' ? 'A human browser takeover is required.' : reason;
 }
 
 function elapsedMs(startedAt: number): number {

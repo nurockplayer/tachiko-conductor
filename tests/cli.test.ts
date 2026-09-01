@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 
 import {
   githubSnapshotCommand,
+  LIVE_HEAD_SYNC_DECISION,
   parseIssueNumber,
   parseIssueRef,
   resolveRunsDir,
@@ -326,10 +327,12 @@ describe('workflow run and resume commands', () => {
 
   class FakeReviewer implements ReviewerAdapter {
     readonly kind: 'reviewer' = 'reviewer';
+    calls = 0;
 
     constructor(private readonly outcomes: ReviewResult[]) {}
 
     async review(request: ReviewRequest): Promise<ReviewResult> {
+      this.calls += 1;
       const outcome = this.outcomes.shift();
       if (outcome === undefined) throw new Error('No review outcome queued');
       return outcome;
@@ -338,10 +341,12 @@ describe('workflow run and resume commands', () => {
 
   class FakeImplementation implements ImplementationAgent {
     readonly kind: 'implementation-agent' = 'implementation-agent';
+    calls = 0;
 
     constructor(private readonly outcomes: AgentResult[]) {}
 
     async run(): Promise<AgentResult> {
+      this.calls += 1;
       const outcome = this.outcomes.shift();
       if (outcome === undefined) throw new Error('No implementation outcome queued');
       return outcome;
@@ -422,6 +427,37 @@ describe('workflow run and resume commands', () => {
     assert.equal(persisted?.interrupt?.resolvedAt, T0);
   });
 
+  it('terminates a parked run when the advertised cancel choice is selected', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-cancel');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'browser takeover required',
+        interrupt: { evidence: '2FA required', choices: ['Complete human bootstrap/takeover and resume', 'Cancel the run'] },
+      },
+      T0,
+    );
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+
+    const outcome = await resumeCommand(
+      deps(store, githubAdapter([]), implementation, reviewer),
+      'run-cancel',
+      'Cancel the run',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'failed');
+    assert.equal(outcome.run.state, 'FAILED');
+    assert.equal(outcome.run.history.at(-1)?.type, 'fail');
+    assert.equal(implementation.calls, 0);
+    assert.equal(reviewer.calls, 0);
+  });
+
   it('resumes a WAITING_DEPENDENCY run via dependency_satisfied after a supplied decision', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'run-1');
@@ -444,6 +480,87 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.run.state, 'MERGE_READY');
     const persisted = store.read('run-1');
     assert.ok(persisted?.history.some((entry) => entry.type === 'dependency_satisfied'));
+  });
+
+  it('applies an advertised live-HEAD sync decision before continuing an interrupted review fix', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-sync');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'changes_requested',
+        reviewResult: {
+          verdict: 'request_changes',
+          reviewerName: 'deepseek',
+          headSha: HEAD,
+          findings: [{ severity: 'blocking', summary: 'fix the browser flow' }],
+        },
+      },
+      T0,
+    );
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'live HEAD changed',
+        interrupt: { evidence: 'new commit', choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'] },
+      },
+      T0,
+    );
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([
+      { verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] },
+    ]);
+
+    const outcome = await resumeCommand(
+      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer),
+      'run-sync',
+      LIVE_HEAD_SYNC_DECISION,
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.headSha, HEAD2);
+    assert.equal(outcome.run.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
+  });
+
+  it('applies the same advertised sync after ordinary review-state drift instead of parking again', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-review-sync');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(
+      run,
+      {
+        type: 'escalate',
+        reason: 'live review HEAD changed',
+        interrupt: { evidence: 'new commit', choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'] },
+      },
+      T0,
+    );
+    store.create(run);
+
+    const outcome = await resumeCommand(
+      deps(
+        store,
+        githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]),
+        new FakeImplementation([]),
+        new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] }]),
+      ),
+      'run-review-sync',
+      LIVE_HEAD_SYNC_DECISION,
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.headSha, HEAD2);
+    assert.equal(outcome.run.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
   });
 
   it('rejects resuming a run that is not parked for a decision', async () => {
@@ -489,7 +606,7 @@ describe('workflow run and resume commands', () => {
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] }]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2]), new FakeImplementation([]), reviewer),
+      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]), new FakeImplementation([]), reviewer),
       'run-1',
       'Sync the run to the live HEAD and continue',
       { now: () => T0 },
@@ -560,6 +677,37 @@ describe('CLI end-to-end across processes', () => {
       assert.match(bad.stderr, /error: Invalid transition "merged" from state IMPLEMENTING/);
       const show4 = runCli(['run', 'show', id]);
       assert.match(show4.stdout, /"state": "IMPLEMENTING"/);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps non-browser run and resume paths independent of Git-root discovery', () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-no-git-'));
+    try {
+      const env = { ...process.env, TACHIKO_DATA_DIR: path.join(dir, 'runs') };
+      const runCli = (args: string[]): CliResult => {
+        const result = spawnSync(
+          process.execPath,
+          ['--import', path.join(REPO_ROOT, 'node_modules/tsx/dist/loader.mjs'), path.join(REPO_ROOT, 'src/cli.ts'), ...args],
+          { cwd: dir, env, encoding: 'utf8' },
+        );
+        return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', status: result.status };
+      };
+
+      const run = runCli(['run', 'not-an-issue-ref']);
+      assert.equal(run.status, 1);
+      assert.match(run.stderr, /expected owner\/repo#123/);
+      assert.doesNotMatch(run.stderr, /Cannot establish the Git repository top-level/);
+
+      const resume = runCli(['run', 'resume', 'missing', '--decision', 'retry']);
+      assert.equal(resume.status, 1);
+      assert.match(resume.stderr, /No run with id "missing" found/);
+      assert.doesNotMatch(resume.stderr, /Cannot establish the Git repository top-level/);
+
+      const browserRun = runCli(['run', 'not-an-issue-ref', '--browser-profile', 'work']);
+      assert.equal(browserRun.status, 1);
+      assert.match(browserRun.stderr, /Cannot establish the Git repository top-level/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

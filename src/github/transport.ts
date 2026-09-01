@@ -35,7 +35,7 @@ interface ProcessError extends ExecFileException {
 export class NodeProcessRunner implements ProcessRunner {
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     return await new Promise<ProcessResult>((resolve, reject) => {
-      execFile(
+      const child = execFile(
         file,
         [...args],
         {
@@ -65,6 +65,9 @@ export class NodeProcessRunner implements ProcessRunner {
           reject(error);
         },
       );
+      // Non-interactive CLIs may wait for piped stdin even when their prompt
+      // and request are fully supplied as arguments.
+      child.stdin?.end();
     });
   }
 }

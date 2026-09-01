@@ -1,13 +1,17 @@
-import type { ImplementationAgent } from '../adapters/agent.js';
+import {
+  humanTakeoverReason,
+  type ImplementationAgent,
+  type ImplementationCapabilityResolver,
+} from '../adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
 import type { Run, Target } from '../domain/types.js';
+import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
 
-export const CANCEL_RUN_DECISION = 'Cancel the run';
-export const SYNC_LIVE_HEAD_DECISION = 'Sync the run to the live HEAD and continue';
+export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
 
 export interface WorkflowDependencies {
@@ -15,6 +19,7 @@ export interface WorkflowDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly reviewer: ReviewerAdapter;
+  readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
 
 export interface WorkflowOptions {
@@ -99,10 +104,29 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
-        const pendingFixInstructions = renderBlockingFindings(run);
-        const baseSha = pendingFixInstructions === null
-          ? snapshot.pullRequest?.baseSha ?? snapshot.repository.defaultBranchHeadSha
-          : run.headSha;
+        const pendingReviewFix =
+          run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
+        if (pendingReviewFix && snapshot.headSha !== run.headSha) {
+          const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        const pendingFixInstructions = pendingReviewFix ? renderBlockingFindings(run) : null;
+        const baseSha = pendingReviewFix
+          ? run.headSha
+          : snapshot.pullRequest?.baseSha ?? snapshot.repository.defaultBranchHeadSha;
         if (baseSha === null || baseSha === undefined || baseSha === '') {
           const reason = `No authoritative implementation base is available for ${formatTarget(target)}.`;
           run = applyTransition(
@@ -129,9 +153,27 @@ export async function runWorkflow(
           target,
           baseSha,
           instructions,
+          capabilities: await deps.resolveImplementationCapabilities?.(),
           ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
         });
         if (result.exitStatus === 'failure') {
+          const takeoverReason = humanTakeoverReason(result);
+          if (takeoverReason !== undefined) {
+            run = applyTransition(
+              run,
+              {
+                type: 'escalate',
+                reason: takeoverReason,
+                interrupt: {
+                  evidence: takeoverReason,
+                  choices: ['Complete human bootstrap/takeover and resume', CANCEL_RUN_DECISION],
+                },
+              },
+              now(),
+            );
+            store.update(run);
+            return { outcome: 'needs_human', run, reason: takeoverReason };
+          }
           run = applyTransition(run, { type: 'agent_failed', agentResult: result, headSha: result.headSha }, now());
           store.update(run);
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
@@ -163,7 +205,7 @@ export async function runWorkflow(
                 choices:
                   snapshot.headSha === null
                     ? ['Open the implementation pull request and retry', CANCEL_RUN_DECISION]
-                    : [SYNC_LIVE_HEAD_DECISION, CANCEL_RUN_DECISION],
+                    : [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
               },
             },
             now(),
@@ -178,10 +220,14 @@ export async function runWorkflow(
 
       case 'REVIEWING':
       case 'CHANGES_REQUESTED': {
-        const loop = await runReviewLoop({ store, github, implementation, reviewer }, run.id, {
+        const loop = await runReviewLoop(
+          { store, github, implementation, reviewer, resolveImplementationCapabilities: deps.resolveImplementationCapabilities },
+          run.id,
+          {
           maxAttempts: options.maxReviewAttempts,
           now,
-        });
+          },
+        );
         run = loop.run;
         if (loop.outcome === 'needs_human') return { outcome: 'needs_human', run, reason: loop.reason };
         if (loop.outcome === 'failed') return { outcome: 'failed', run, reason: loop.reason };
@@ -214,7 +260,7 @@ export async function runWorkflow(
               reason,
               interrupt: {
                 evidence: reason,
-                choices: snapshot.headSha === null ? [CANCEL_RUN_DECISION] : [SYNC_LIVE_HEAD_DECISION, CANCEL_RUN_DECISION],
+                choices: snapshot.headSha === null ? [CANCEL_RUN_DECISION] : [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
               },
             },
             now(),

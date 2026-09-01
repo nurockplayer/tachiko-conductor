@@ -13,3 +13,6 @@ export * from './github/errors.js';
 export * from './github/handoff.js';
 export * from './github/live-state.js';
 export * from './github/transport.js';
+export * from './browser/playwright-mcp-runtime.js';
+export * from './browser/agent-config.js';
+export * from './browser/mcp-client.js';

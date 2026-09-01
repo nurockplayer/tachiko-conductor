@@ -1,12 +1,27 @@
 #!/usr/bin/env node
 import os from 'node:os';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 import { ClaudeCodeAdapter } from './agents/claude-code.js';
+import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
+import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
+import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
+import {
+  BROWSER_RUNTIME_ERROR_CODE,
+  BrowserRuntimeError,
+  ManagedPlaywrightMcpRuntime,
+  browserRuntimeCapability,
+  type BrowserRuntime,
+  type BrowserRuntimeHandle,
+  type BrowserRuntimeSnapshot,
+  type StartBrowserRuntimeOptions,
+} from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
+import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './domain/decisions.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
 import {
   TRANSITION_TYPES,
@@ -24,8 +39,6 @@ import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import {
-  CANCEL_RUN_DECISION,
-  SYNC_LIVE_HEAD_DECISION,
   runWorkflow,
   type WorkflowDependencies,
   type WorkflowOutcome,
@@ -34,13 +47,17 @@ import {
 const USAGE = `Tachiko Conductor — local orchestration core.
 
 Usage:
-  tachiko run owner/repo#123
-  tachiko run resume <id> --decision <choice>
+  tachiko run owner/repo#123 [--browser-profile <profile>]
+  tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
   tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>)
   tachiko run show <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
   tachiko github snapshot owner/repo#123
+  tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
+  tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
+  tachiko browser status <profile>
+  tachiko browser stop <profile>
   tachiko --help
 
 Transitions: ${TRANSITION_TYPES.join(', ')}.
@@ -60,14 +77,214 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 {"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
+Browser profiles and runtime metadata are stored outside the repository under
+~/.tachiko-conductor/browser by default. start/bootstrap own the child process
+in the foreground; use status/stop from another terminal.
 `;
 
 /** Bounded review attempts before a run parks in NEEDS_HUMAN. */
 export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
+export { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
 
 /** Resolve the directory where run JSON files are stored. */
 export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
   return env.TACHIKO_DATA_DIR ?? path.join(os.homedir(), '.tachiko-conductor', 'runs');
+}
+
+export interface BrowserRoots {
+  readonly profileRoot: string;
+  readonly runtimeRoot: string;
+}
+
+export function resolveBrowserRoots(
+  env: NodeJS.ProcessEnv = process.env,
+  homeDirectory: string = os.homedir(),
+): BrowserRoots {
+  const root = path.join(homeDirectory, '.tachiko-conductor', 'browser');
+  return {
+    profileRoot: env.TACHIKO_BROWSER_PROFILE_ROOT ?? path.join(root, 'profiles'),
+    runtimeRoot: env.TACHIKO_BROWSER_RUNTIME_ROOT ?? path.join(root, 'runtimes'),
+  };
+}
+
+export function resolveRepositoryRoot(
+  cwd: string = process.cwd(),
+  resolveGitTopLevel: (directory: string) => string = (directory) =>
+    execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd: directory,
+      encoding: 'utf8',
+      timeout: 2_000,
+    }),
+): string {
+  const resolvedCwd = path.resolve(cwd);
+  let resolved: string;
+  try {
+    resolved = resolveGitTopLevel(cwd).trim();
+  } catch {
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+      `Cannot establish the Git repository top-level from "${resolvedCwd}"; refusing browser storage.`,
+      { cwd: resolvedCwd },
+    );
+  }
+  if (resolved === '') {
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.INVALID_CONFIG,
+      `Cannot establish the Git repository top-level from "${resolvedCwd}"; refusing browser storage.`,
+      { cwd: resolvedCwd },
+    );
+  }
+  return path.resolve(resolved);
+}
+
+export function parseBrowserPort(raw: string): number {
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(`Invalid browser port "${raw}": expected an integer from 1 to 65535.`);
+  }
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 65_535) {
+    throw new Error(`Invalid browser port "${raw}": expected an integer from 1 to 65535.`);
+  }
+  return value;
+}
+
+export interface BrowserStartCommandResult extends BrowserAgentConnection {
+  readonly handle: BrowserRuntimeHandle;
+}
+
+export async function browserStartCommand(
+  runtime: BrowserRuntime,
+  profile: string,
+  options: Omit<StartBrowserRuntimeOptions, 'profile'> = {},
+): Promise<BrowserStartCommandResult> {
+  const handle = await runtime.start({ profile, ...options, headless: options.headless ?? true });
+  return { ...buildBrowserAgentConnection(handle.snapshot), handle };
+}
+
+export async function browserBootstrapCommand(
+  runtime: BrowserRuntime,
+  profile: string,
+  options: Omit<StartBrowserRuntimeOptions, 'profile' | 'headless'> = {},
+  openBrowser: (endpoint: string) => Promise<BootstrapBrowserLease | void> = openBrowserForBootstrap,
+): Promise<BrowserStartCommandResult> {
+  const handle = await runtime.start({ profile, ...options, headless: false });
+  try {
+    const lease = await abortable(
+      () => openBrowser(handle.snapshot.endpoint),
+      options.signal,
+      () => new BrowserRuntimeError(
+        BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING,
+        `Browser bootstrap for profile "${profile}" was cancelled while opening the headed browser.`,
+        { profile, runtimeId: handle.snapshot.runtimeId },
+      ),
+      closeBootstrapLease,
+    );
+    const leasedHandle = lease === undefined ? handle : holdBootstrapLease(handle, lease);
+    return { ...buildBrowserAgentConnection(handle.snapshot), handle: leasedHandle };
+  } catch (error) {
+    await handle.stop().catch(() => undefined);
+    throw error;
+  }
+}
+
+function holdBootstrapLease(handle: BrowserRuntimeHandle, lease: BootstrapBrowserLease): BrowserRuntimeHandle {
+  let releasePromise: Promise<void> | undefined;
+  const release = (): Promise<void> => {
+    releasePromise ??= closeBootstrapLease(lease);
+    return releasePromise;
+  };
+  return {
+    snapshot: handle.snapshot,
+    async stop() {
+      try {
+        return await handle.stop();
+      } finally {
+        await release();
+      }
+    },
+    async waitForExit() {
+      try {
+        return await handle.waitForExit();
+      } finally {
+        await release();
+      }
+    },
+  };
+}
+
+async function closeBootstrapLease(lease: BootstrapBrowserLease | void): Promise<void> {
+  await lease?.close().catch(() => undefined);
+}
+
+function abortable<T>(
+  operation: () => Promise<T>,
+  signal: AbortSignal | undefined,
+  error: () => Error,
+  disposeLateResult?: (value: T) => Promise<void>,
+): Promise<T> {
+  if (signal === undefined) return operation();
+  if (signal.aborted) return Promise.reject(error());
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const aborted = () => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', aborted);
+      reject(error());
+    };
+    signal.addEventListener('abort', aborted, { once: true });
+    let pending: Promise<T>;
+    try {
+      pending = operation();
+    } catch (operationError) {
+      settled = true;
+      signal.removeEventListener('abort', aborted);
+      reject(operationError);
+      return;
+    }
+    pending.then(
+      (value) => {
+        if (settled) {
+          void disposeLateResult?.(value).catch(() => undefined);
+          return;
+        }
+        settled = true;
+        signal.removeEventListener('abort', aborted);
+        resolve(value);
+      },
+      (operationError: unknown) => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener('abort', aborted);
+        reject(operationError);
+      },
+    );
+  });
+}
+
+export async function browserStatusCommand(runtime: BrowserRuntime, profile: string): Promise<BrowserRuntimeSnapshot> {
+  const snapshot = await runtime.status(profile);
+  if (snapshot === null) {
+    throw new BrowserRuntimeError(
+      BROWSER_RUNTIME_ERROR_CODE.NOT_RUNNING,
+      `Browser profile "${profile}" has no runtime metadata. Run tachiko browser bootstrap ${profile} first.`,
+      { profile },
+    );
+  }
+  return snapshot;
+}
+
+export async function browserStopCommand(runtime: BrowserRuntime, profile: string): Promise<BrowserRuntimeSnapshot> {
+  return await runtime.stop(profile);
+}
+
+export async function browserImplementationCapabilities(
+  runtime: BrowserRuntime,
+  profile: string | undefined,
+): Promise<readonly McpHttpCapability[] | undefined> {
+  if (profile === undefined) return undefined;
+  const snapshot = await browserStatusCommand(runtime, profile);
+  return [browserRuntimeCapability(snapshot)];
 }
 
 /**
@@ -187,29 +404,36 @@ export async function resumeCommand(
     throw new Error(`Invalid decision "${decision}". Choose exactly one of: ${choices.join(' | ')}.`);
   }
   const now = options.now ?? (() => new Date().toISOString());
-
-  if (decision === CANCEL_RUN_DECISION) {
-    const failed = applyTransition(run, { type: 'fail', reason: decision }, now());
-    deps.store.update(failed);
-    return { outcome: 'failed', run: failed, reason: decision };
+  if (
+    decision.trim() === CANCEL_RUN_DECISION &&
+    run.interrupt?.choices?.includes(CANCEL_RUN_DECISION) === true
+  ) {
+    const cancelled = applyTransition(run, { type: 'fail', reason: CANCEL_RUN_DECISION }, now());
+    deps.store.update(cancelled);
+    return { outcome: 'failed', run: cancelled, reason: CANCEL_RUN_DECISION };
   }
-
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
-  let adoptedHead: string | undefined;
-  if (decision === SYNC_LIVE_HEAD_DECISION) {
-    if (run.state !== 'NEEDS_HUMAN' || run.target.kind !== 'issue') {
-      throw new Error(`Decision "${SYNC_LIVE_HEAD_DECISION}" is only valid for an issue run in NEEDS_HUMAN.`);
-    }
+  let synchronizedHead: string | undefined;
+  const synchronizeLiveHead =
+    decision.trim() === LIVE_HEAD_SYNC_DECISION &&
+    run.state === 'NEEDS_HUMAN' &&
+    canSynchronizeInterruptedHead(run.interruptedFrom) &&
+    run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION) === true &&
+    run.target.kind === 'issue';
+  if (synchronizeLiveHead && run.target.kind === 'issue') {
     const snapshot = await deps.github.readLiveSnapshot(run.target);
     if (snapshot.headSha === null) {
-      throw new Error('Cannot sync the run: GitHub has no associated open pull request HEAD.');
+      throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request HEAD.`);
     }
-    adoptedHead = snapshot.headSha;
+    synchronizedHead = snapshot.headSha;
   }
-
   const resumed = applyTransition(
     run,
-    { type: transition, reason: decision, ...(adoptedHead === undefined ? {} : { headSha: adoptedHead }) },
+    {
+      type: transition,
+      reason: decision,
+      ...(synchronizedHead === undefined ? {} : { headSha: synchronizedHead }),
+    },
     now(),
   );
   deps.store.update(resumed);
@@ -219,7 +443,13 @@ export async function resumeCommand(
   });
 }
 
-function printOutcome(outcome: WorkflowOutcome): void {
+export function resumeCommandHint(runId: string, browserProfile?: string): string {
+  return `tachiko run resume ${runId} --decision <choice>${
+    browserProfile === undefined ? '' : ` --browser-profile ${browserProfile}`
+  }`;
+}
+
+function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
   const { run } = outcome;
   if (outcome.outcome === 'merge_ready') {
     console.log(
@@ -236,14 +466,17 @@ function printOutcome(outcome: WorkflowOutcome): void {
     const interrupt = run.interrupt;
     if (interrupt?.evidence !== undefined) console.log(`Evidence: ${interrupt.evidence}`);
     if ((interrupt?.choices?.length ?? 0) > 0) console.log(`Choices: ${interrupt?.choices?.join(' | ')}`);
-    console.log(`Resume with: tachiko run resume ${run.id} --decision <choice>`);
+    console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
     return;
   }
   console.error(`Run ${run.id}: FAILED — ${outcome.reason}`);
 }
 
 /** Production wiring: local gh CLI, Claude Code, and the DeepSeek reviewer. */
-function buildWorkflowDeps(store: RunStore): WorkflowDependencies {
+function buildWorkflowDeps(
+  store: RunStore,
+  resolveImplementationCapabilities?: ImplementationCapabilityResolver,
+): WorkflowDependencies {
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
   return {
@@ -255,6 +488,7 @@ function buildWorkflowDeps(store: RunStore): WorkflowDependencies {
       diffReader: new GhPullRequestDiffReader(transport),
       client: new DeepSeekApiClient(),
     }),
+    resolveImplementationCapabilities,
   };
 }
 
@@ -342,6 +576,67 @@ function printRun(run: Run): void {
   console.log(JSON.stringify(runShowView(run), null, 2));
 }
 
+function buildBrowserRuntime(): ManagedPlaywrightMcpRuntime {
+  const roots = resolveBrowserRoots();
+  return new ManagedPlaywrightMcpRuntime({
+    ...roots,
+    repositoryRoot: resolveRepositoryRoot(),
+  });
+}
+
+function buildBrowserCapabilityResolver(
+  browserProfile: string | undefined,
+): ImplementationCapabilityResolver | undefined {
+  if (browserProfile === undefined) return undefined;
+  const runtime = buildBrowserRuntime();
+  return async () => await browserImplementationCapabilities(runtime, browserProfile);
+}
+
+function printBrowserStart(result: BrowserStartCommandResult): void {
+  const { handle: _handle, ...view } = result;
+  console.log(JSON.stringify({ ok: true, ...view }, null, 2));
+}
+
+function serializeBrowserError(error: unknown): Readonly<Record<string, unknown>> {
+  if (error instanceof BrowserRuntimeError) {
+    return { code: error.code, message: error.message, details: error.details };
+  }
+  return { code: 'UNKNOWN', message: error instanceof Error ? error.message : String(error) };
+}
+
+interface BrowserSignalSource {
+  on(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+  removeListener(signal: 'SIGINT' | 'SIGTERM', listener: () => void): unknown;
+}
+
+export async function waitForOwnedBrowser(
+  start: (signal: AbortSignal) => Promise<BrowserStartCommandResult>,
+  onStarted: (result: BrowserStartCommandResult) => void = () => undefined,
+  signalSource: BrowserSignalSource = process,
+): Promise<BrowserRuntimeSnapshot> {
+  let stopping = false;
+  let handle: BrowserRuntimeHandle | undefined;
+  const startupAbort = new AbortController();
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    startupAbort.abort();
+    if (handle !== undefined) void handle.stop().catch(() => undefined);
+  };
+  signalSource.on('SIGINT', stop);
+  signalSource.on('SIGTERM', stop);
+  try {
+    const result = await start(startupAbort.signal);
+    handle = result.handle;
+    onStarted(result);
+    if (stopping) return await handle.stop();
+    return await handle.waitForExit();
+  } finally {
+    signalSource.removeListener('SIGINT', stop);
+    signalSource.removeListener('SIGTERM', stop);
+  }
+}
+
 export async function main(argv: string[]): Promise<number> {
   const store = new JsonFileStore({ dir: resolveRunsDir() });
   const [command, subcommand, ...rest] = argv;
@@ -349,6 +644,66 @@ export async function main(argv: string[]): Promise<number> {
   if (command === undefined || command === '--help' || command === '-h') {
     console.log(USAGE);
     return 0;
+  }
+
+  if (command === 'browser') {
+    const runtime = buildBrowserRuntime();
+    try {
+      if (subcommand === 'start' || subcommand === 'bootstrap') {
+        const { values, positionals } = parseArgs({
+          args: rest,
+          allowPositionals: true,
+          options: {
+            port: { type: 'string' },
+            host: { type: 'string' },
+            headed: { type: 'boolean' },
+            headless: { type: 'boolean' },
+          },
+        });
+        const [profile] = positionals;
+        if (profile === undefined) throw new Error(`browser ${subcommand} requires a profile name.`);
+        if (values.headed === true && values.headless === true) {
+          throw new Error('browser start accepts only one of --headed or --headless.');
+        }
+        if (subcommand === 'bootstrap' && values.headless === true) {
+          throw new Error('browser bootstrap is always headed so a human can complete authentication.');
+        }
+        const port = values.port === undefined ? undefined : parseBrowserPort(values.port);
+        const shared = { ...(port === undefined ? {} : { port }), ...(values.host === undefined ? {} : { host: values.host }) };
+        const finalSnapshot = await waitForOwnedBrowser(
+          async (signal) =>
+            subcommand === 'bootstrap'
+              ? await browserBootstrapCommand(runtime, profile, { ...shared, signal })
+              : await browserStartCommand(runtime, profile, {
+                  ...shared,
+                  signal,
+                  headless: values.headed === true ? false : true,
+                }),
+          printBrowserStart,
+        );
+        if (finalSnapshot.state === 'failed') {
+          console.error(JSON.stringify({ ok: false, runtime: finalSnapshot }, null, 2));
+          return 1;
+        }
+        return 0;
+      }
+      if (subcommand === 'status' || subcommand === 'stop') {
+        const profile = rest[0];
+        if (profile === undefined) throw new Error(`browser ${subcommand} requires a profile name.`);
+        const snapshot =
+          subcommand === 'status'
+            ? await browserStatusCommand(runtime, profile)
+            : await browserStopCommand(runtime, profile);
+        console.log(JSON.stringify({ ok: true, runtime: snapshot }, null, 2));
+        return 0;
+      }
+      console.error(`Unknown command: browser ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    } catch (error) {
+      console.error(JSON.stringify({ ok: false, error: serializeBrowserError(error) }, null, 2));
+      return 1;
+    }
   }
 
   if (command === 'github') {
@@ -436,13 +791,21 @@ export async function main(argv: string[]): Promise<number> {
     const { values, positionals } = parseArgs({
       args: rest,
       allowPositionals: true,
-      options: { decision: { type: 'string' } },
+      options: {
+        decision: { type: 'string' },
+        'browser-profile': { type: 'string' },
+      },
     });
     const [id] = positionals;
     if (id === undefined) throw new Error('run resume requires a run id.');
     if (values.decision === undefined) throw new Error('run resume requires --decision <choice>.');
-    const outcome = await resumeCommand(buildWorkflowDeps(store), id, values.decision);
-    printOutcome(outcome);
+    const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
+    const outcome = await resumeCommand(
+      buildWorkflowDeps(store, resolveCapabilities),
+      id,
+      values.decision,
+    );
+    printOutcome(outcome, values['browser-profile']);
     return outcome.outcome === 'failed' ? 1 : 0;
   }
 
@@ -453,8 +816,18 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   // The remaining form is `run owner/repo#123`: start or continue one issue.
-  const outcome = await runIssueCommand(buildWorkflowDeps(store), subcommand);
-  printOutcome(outcome);
+  const { values, positionals } = parseArgs({
+    args: [subcommand, ...rest],
+    allowPositionals: true,
+    options: { 'browser-profile': { type: 'string' } },
+  });
+  const [ref, extra] = positionals;
+  if (ref === undefined || extra !== undefined) {
+    throw new Error('run requires exactly one owner/repo#123 reference.');
+  }
+  const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
+  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref);
+  printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }
 

@@ -1,15 +1,21 @@
-import type { ImplementationAgent } from '../adapters/agent.js';
+import {
+  humanTakeoverReason,
+  type ImplementationAgent,
+  type ImplementationCapabilityResolver,
+} from '../adapters/agent.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition } from '../domain/state-machine.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
+import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly reviewer: ReviewerAdapter;
+  readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
 
 export interface ReviewLoopOptions {
@@ -111,7 +117,7 @@ export async function runReviewLoop(
             reason,
             interrupt: {
               evidence: reason,
-              choices: ['Provide more GitHub context and retry', 'Cancel the run'],
+              choices: ['Provide more GitHub context and retry', CANCEL_RUN_DECISION],
             },
           },
           now(),
@@ -134,9 +140,27 @@ export async function runReviewLoop(
         target,
         baseSha: run.headSha ?? '',
         instructions: renderBlockingFindings(pendingReview),
+        capabilities: await deps.resolveImplementationCapabilities?.(),
         sessionId: run.agentResult?.sessionId,
       });
       if (fixResult.exitStatus === 'failure') {
+        const takeoverReason = humanTakeoverReason(fixResult);
+        if (takeoverReason !== undefined) {
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason: takeoverReason,
+              interrupt: {
+                evidence: takeoverReason,
+                choices: ['Complete human bootstrap/takeover and resume', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason: takeoverReason };
+        }
         run = applyTransition(run, { type: 'agent_failed', agentResult: fixResult, headSha: fixResult.headSha }, now());
         store.update(run);
         return { outcome: 'failed', run, reason: `Implementation failed while fixing review findings: ${fixResult.summary}` };
@@ -150,7 +174,7 @@ export async function runReviewLoop(
             reason,
             interrupt: {
               evidence: 'The implementation returned the same or no HEAD after review changes.',
-              choices: ['Retry the fix after updating GitHub context', 'Cancel the run'],
+              choices: ['Retry the fix after updating GitHub context', CANCEL_RUN_DECISION],
             },
           },
           now(),
@@ -173,7 +197,7 @@ export async function runReviewLoop(
             reason,
             interrupt: {
               evidence: reason,
-              choices: ['Retry after restoring GitHub access', 'Cancel the run'],
+              choices: ['Retry after restoring GitHub access', CANCEL_RUN_DECISION],
             },
           },
           now(),
@@ -190,7 +214,9 @@ export async function runReviewLoop(
             reason,
             interrupt: {
               evidence: reason,
-              choices: validatedHead === null ? ['Open the implementation pull request and retry', 'Cancel the run'] : ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+              choices: validatedHead === null
+                ? ['Open the implementation pull request and retry', CANCEL_RUN_DECISION]
+                : [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
             },
           },
           now(),
@@ -212,7 +238,7 @@ export async function runReviewLoop(
           reason,
           interrupt: {
             evidence: reason,
-            choices: ['Provide more GitHub context and retry', 'Cancel the run'],
+            choices: ['Provide more GitHub context and retry', CANCEL_RUN_DECISION],
           },
         },
         now(),
@@ -235,7 +261,7 @@ export async function runReviewLoop(
               reason,
               interrupt: {
                 evidence: reason,
-                choices: ['Retry after restoring GitHub access', 'Cancel the run'],
+                choices: ['Retry after restoring GitHub access', CANCEL_RUN_DECISION],
               },
             }
           : { type, reason },
@@ -259,8 +285,8 @@ export async function runReviewLoop(
           interrupt: {
             evidence: reason,
             choices: liveHead === null
-              ? ['Open the implementation pull request and retry', 'Cancel the run']
-              : ['Sync the run to the live HEAD and continue', 'Cancel the run'],
+              ? ['Open the implementation pull request and retry', CANCEL_RUN_DECISION]
+              : [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
           },
         },
         now(),
@@ -289,7 +315,7 @@ export async function runReviewLoop(
               reason,
               interrupt: {
                 evidence: reason,
-                choices: ['Retry the independent review', 'Cancel the run'],
+                choices: ['Retry the independent review', CANCEL_RUN_DECISION],
               },
             }
           : { type, reason },
@@ -310,7 +336,7 @@ export async function runReviewLoop(
           reason,
           interrupt: {
             evidence: reason,
-            choices: ['Retry the independent review', 'Cancel the run'],
+            choices: ['Retry the independent review', CANCEL_RUN_DECISION],
           },
         },
         now(),

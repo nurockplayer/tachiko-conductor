@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
+import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
@@ -9,6 +9,7 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
+import { runReviewLoop } from '../src/reviewers/loop.js';
 import { TARGET, failureResult, successResult } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
@@ -153,6 +154,39 @@ describe('runWorkflow', () => {
     assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'gate_passed'));
   });
 
+  it('resolves a fresh ephemeral MCP capability before initial implementation and every review fix', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-capability'));
+    const implementation = new FakeImplementation([successResult(HEAD), successResult(HEAD2, 'fixed')]);
+    const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
+    const capabilities: McpHttpCapability[] = [{
+      kind: 'mcp-http',
+      name: 'tachiko_browser',
+      endpoint: 'http://127.0.0.1:8931/mcp',
+    }, {
+      kind: 'mcp-http',
+      name: 'tachiko_browser',
+      endpoint: 'http://127.0.0.1:8932/mcp',
+    }];
+    let capabilityIndex = 0;
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]),
+        implementation,
+        reviewer,
+        resolveImplementationCapabilities: async () => [capabilities[capabilityIndex++]!],
+      },
+      'run-capability',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(capabilityIndex, 2);
+    assert.deepEqual(implementation.requests.map((request) => request.capabilities), [[capabilities[0]], [capabilities[1]]]);
+  });
+
   it('fails the run when the implementation agent fails', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-1'));
@@ -168,6 +202,64 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'failed');
     assert.equal(result.run.state, 'FAILED');
     assert.match(result.reason, /Implementation failed/);
+  });
+
+  it('parks in NEEDS_HUMAN when the implementation agent emits the explicit takeover protocol', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-takeover'));
+    const implementation = new FakeImplementation([
+      {
+        exitStatus: 'failure',
+        summary: 'login expired',
+        diagnostics: ['TACHIKO_NEEDS_HUMAN: login expired'],
+      },
+    ]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) },
+      'run-takeover',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(result.run.interrupt?.reason, 'login expired');
+    assert.deepEqual(result.run.interrupt?.choices, ['Complete human bootstrap/takeover and resume', 'Cancel the run']);
+  });
+
+  it('resumes an interrupted review fix with the original blocking findings and current HEAD', async () => {
+    const store = new MemoryStore();
+    reviewingRun(store, 'run-resume-fix');
+    const implementation = new FakeImplementation([
+      {
+        exitStatus: 'failure',
+        summary: '2FA required',
+        diagnostics: ['TACHIKO_NEEDS_HUMAN: 2FA required'],
+      },
+      successResult(HEAD2, 'fixed after takeover'),
+    ]);
+    const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
+    const github = githubAdapter([HEAD, HEAD, HEAD2, HEAD2, HEAD2]);
+
+    const parked = await runReviewLoop(
+      { store, github, implementation, reviewer },
+      'run-resume-fix',
+      { maxAttempts: 3, now: () => T0 },
+    );
+    assert.equal(parked.outcome, 'needs_human');
+    const resumed = applyTransition(parked.run, { type: 'human_resolved', reason: '2FA complete' }, T0);
+    store.update(resumed);
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer },
+      'run-resume-fix',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests[1]?.baseSha, HEAD);
+    assert.match(implementation.requests[1]?.instructions ?? '', /the diff has a bug/);
+    assert.doesNotMatch(implementation.requests[1]?.instructions ?? '', /DoR-ready/);
   });
 
   it('parks in NEEDS_HUMAN with structured context when the review loop cannot converge', async () => {

@@ -365,6 +365,29 @@ describe('runReviewLoop', () => {
     assert.equal(result.run.state, 'FAILED');
   });
 
+  it('parks in NEEDS_HUMAN when a review fix emits the explicit takeover protocol', async () => {
+    const store = new MemoryStore();
+    store.create(reviewingRun());
+    const reviewer = new FakeReviewer([requestChanges(HEAD)]);
+    const implementation = new FakeImplementation([
+      {
+        exitStatus: 'failure',
+        summary: '2FA required',
+        diagnostics: ['TACHIKO_NEEDS_HUMAN: 2FA required'],
+      },
+    ]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(result.run.interrupt?.reason, '2FA required');
+  });
+
   it('escalates to NEEDS_HUMAN when the live GitHub HEAD drifts from the run HEAD', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());

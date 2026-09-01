@@ -1,3 +1,4 @@
+import { LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './decisions.js';
 import type { ReviewResult, Run, TransitionInput, TransitionType, WorkflowState } from './types.js';
 
 /** Why a transition was rejected. */
@@ -123,17 +124,24 @@ const REQUIRES_REVIEW_RESULT: ReadonlySet<TransitionType> = new Set([
 ]);
 
 /**
- * Transitions that legitimately change the run's HEAD SHA: implementation
- * events where the agent's work lands at a new commit, plus an explicit human
- * resolution that adopts the current live GitHub HEAD after an escalation.
- * Every other transition must leave HEAD untouched so an approval can only
- * ever advance the exact HEAD it reviewed.
+ * Implementation events normally own HEAD changes. The separately validated
+ * human-sync path is an explicit bounded exception for a live GitHub identity
+ * the operator chose to adopt; every other transition leaves HEAD untouched.
  */
 const HEAD_UPDATING_TRANSITIONS: ReadonlySet<TransitionType> = new Set([
   'agent_succeeded',
   'agent_failed',
-  'human_resolved',
 ]);
+
+function isAuthorizedHumanHeadSync(run: Run, input: TransitionInput): boolean {
+  return (
+    input.type === 'human_resolved' &&
+    input.reason?.trim() === LIVE_HEAD_SYNC_DECISION &&
+    run.state === 'NEEDS_HUMAN' &&
+    canSynchronizeInterruptedHead(run.interruptedFrom) &&
+    run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION) === true
+  );
+}
 
 /** Whether a transition requires a result payload, and which kind. */
 export function transitionRequiresResult(type: TransitionType): 'agent' | 'review' | 'none' {
@@ -220,12 +228,29 @@ function assertPayload(run: Run, input: TransitionInput): void {
       `Transition "${input.type}" does not accept a reviewResult; review results are bound to review_approved / changes_requested.`,
     );
   }
-  if (!HEAD_UPDATING_TRANSITIONS.has(input.type) && input.headSha !== undefined) {
+  const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
+  if (!HEAD_UPDATING_TRANSITIONS.has(input.type) && !authorizedHumanHeadSync && input.headSha !== undefined) {
     throw new InvalidTransitionError(
       'head-mutation-not-allowed',
       from,
       input.type,
-      `Transition "${input.type}" cannot change the run's HEAD SHA; HEAD may only be updated by implementation transitions or an explicit human resolution.`,
+      `Transition "${input.type}" cannot change the run's HEAD SHA without an explicitly offered live-HEAD synchronization decision.`,
+    );
+  }
+  if (authorizedHumanHeadSync && input.headSha?.trim() === '') {
+    throw new InvalidTransitionError(
+      'empty-head-sha',
+      from,
+      input.type,
+      'Live-HEAD synchronization requires a non-empty exact HEAD SHA.',
+    );
+  }
+  if (authorizedHumanHeadSync && input.headSha === undefined) {
+    throw new InvalidTransitionError(
+      'missing-head-sha',
+      from,
+      input.type,
+      'Live-HEAD synchronization requires an exact HEAD SHA.',
     );
   }
   // Event and result semantics must agree: an agent event carries a result
@@ -415,6 +440,7 @@ export function applyTransition(
 
   assertPayload(run, input);
   assertGate(run, input);
+  const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
 
   let to: WorkflowState;
   if (target === 'RESUME') {
@@ -426,17 +452,16 @@ export function applyTransition(
         `Transition "${input.type}" requires the run to have been interrupted from a known state, but run ${run.id} has no interruptedFrom.`,
       );
     }
-    to = run.interruptedFrom;
+    to = authorizedHumanHeadSync ? 'VALIDATING' : run.interruptedFrom;
   } else {
     to = target;
   }
 
   const enteringInterrupt = to === 'WAITING_DEPENDENCY' || to === 'NEEDS_HUMAN';
   const leavingInterrupt = from === 'WAITING_DEPENDENCY' || from === 'NEEDS_HUMAN';
-  // HEAD may only change on implementation events or an explicit human
-  // resolution; assertPayload rejects every other transition and guarantees
-  // that any supplied identity is non-empty. The value is normalized by trim.
-  const headSha = HEAD_UPDATING_TRANSITIONS.has(input.type)
+  // HEAD changes only on implementation events or an exact, explicitly
+  // offered live-HEAD synchronization decision. The value is normalized.
+  const headSha = HEAD_UPDATING_TRANSITIONS.has(input.type) || authorizedHumanHeadSync
     ? (input.headSha ?? input.agentResult?.headSha)?.trim()
     : undefined;
 

@@ -12,6 +12,12 @@ Claude Code execution adapter, an independent DeepSeek review loop, and the
 end-to-end `tachiko run owner/repo#123` command with a structured human
 interrupt protocol.
 
+It also implements the post-MVP **[issue #12]** managed browser fallback:
+the pinned official Playwright MCP server, a dedicated persistent Tachiko
+profile, localhost lifecycle/health and typed failures, headed human bootstrap,
+and per-run Claude/Codex MCP capability injection. See
+[Managed browser runtime](docs/browser-runtime.md).
+
 ## Design invariants
 
 - GitHub is the engineering source of truth; the core only ever sees plain
@@ -24,6 +30,8 @@ interrupt protocol.
 - An approval containing a blocking finding is contradictory and is rejected
   before it can reach the final gate.
 - No autonomous merge, no cloud, no distributed queue, no UI, no Linear.
+- Browser automation is fallback-only: stable APIs/native integrations remain
+  preferred, and authentication/security/high-risk operations require humans.
 
 ## States
 
@@ -62,18 +70,23 @@ review result is bound to the run's current HEAD SHA.
 Transitions persist only the payloads they produce: agent results are bound to
 `agent_succeeded`/`agent_failed` (and must carry a matching exit status),
 review results to `review_approved`/`changes_requested`, and the run's HEAD
-SHA may only be changed by implementation transitions or an explicit human
-choice to adopt the current live GitHub HEAD after an escalation. A gate or
-merge can never swap in an unreviewed SHA.
+SHA may only be changed by implementation transitions or the exact bounded
+live-HEAD synchronization decision offered after drift. That decision routes
+through validation and independent review; a gate or merge can never swap in
+an unreviewed SHA.
 
 ## Quick start
 
 ```bash
 pnpm install
+pnpm browser:install # download the pinned Chromium used by the MCP integration test
 pnpm test        # run the test suite (node:test + tsx)
 pnpm typecheck   # type-check src and tests
 pnpm build       # emit dist/ for the `tachiko` bin
 ```
+
+On Linux CI or a minimal container, install Chromium and its system packages
+with `pnpm exec playwright install --with-deps chromium` before `pnpm test`.
 
 ## CLI
 
@@ -85,6 +98,11 @@ pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
 pnpm exec tsx src/cli.ts github snapshot nurockplayer/tachiko-conductor#42
+pnpm exec tsx src/cli.ts browser bootstrap github-work
+pnpm exec tsx src/cli.ts browser start github-work --headless
+pnpm exec tsx src/cli.ts browser status github-work
+pnpm exec tsx src/cli.ts browser stop github-work
+pnpm exec tsx src/cli.ts run owner/repo#123 --browser-profile github-work
 ```
 
 `run owner/repo#123` starts or continues one issue end-to-end: implementation,
@@ -122,6 +140,14 @@ never raw stdout/stderr transcripts or model-usage details. The execution
 prompt requires repository validation and tests to pass before success is
 reported.
 
+The separate opt-in browser-agent smoke starts the managed Playwright MCP
+runtime and a localhost fixture, then proves the installed Codex CLI can use
+the injected browser capability. It is also skipped in the default suite:
+
+```bash
+TACHIKO_BROWSER_AGENT_SMOKE=1 pnpm exec tsx --test tests/browser-agent-smoke.test.ts
+```
+
 After `pnpm build`, the same commands work through the `tachiko` bin
 (`node dist/cli.js`). Run state is stored under `$TACHIKO_DATA_DIR` (default
 `~/.tachiko-conductor/runs`), one `<id>.json` file per run.
@@ -153,3 +179,4 @@ tests/                 unit, persistence, adapter, workflow, and CLI E2E tests
 [issue #4]: https://github.com/nurockplayer/tachiko-conductor/issues/4
 [issue #5]: https://github.com/nurockplayer/tachiko-conductor/issues/5
 [issue #6]: https://github.com/nurockplayer/tachiko-conductor/issues/6
+[issue #12]: https://github.com/nurockplayer/tachiko-conductor/issues/12
