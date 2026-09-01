@@ -8,9 +8,9 @@ This repository implements **[issue #1]**'s MVP scope across **[issue #2]**
 through **[issue #6]**: the typed core, the deterministic state machine,
 durable local run state, the adapter *interfaces*, the GitHub live-state
 adapter (with an injected `gh` CLI transport and agent-handoff parser), a
-Claude Code execution adapter, an independent DeepSeek review loop, and the
-end-to-end `tachiko run owner/repo#123` command with a structured human
-interrupt protocol.
+Claude Code and Codex CLI execution adapters, an independent DeepSeek review
+loop, and the end-to-end `tachiko run owner/repo#123` command with a structured
+human interrupt protocol.
 
 It also implements the post-MVP **[issue #12]** managed browser fallback:
 the pinned official Playwright MCP server, a dedicated persistent Tachiko
@@ -140,6 +140,34 @@ never raw stdout/stderr transcripts or model-usage details. The execution
 prompt requires repository validation and tests to pass before success is
 reported.
 
+As part of **[issue #15]**, `CodexCliAdapter` uses the installed Codex CLI's
+non-interactive JSONL surface:
+fresh work runs through `codex exec --json`, and continuation uses
+`codex exec resume <SESSION_ID> --json`. Conductor persists a provider-neutral
+`Run.executor` identity and reconstructs that same provider after restart; an
+unknown, stale, or mismatched identity fails explicitly instead of starting a
+fresh thread. Select Codex for new runs without changing existing Claude runs:
+
+```bash
+TACHIKO_IMPLEMENTATION_AGENT=codex-cli pnpm exec tsx src/cli.ts run owner/repo#123
+```
+
+The adapter accepts resolved execution values without choosing a model or
+profile. Production wiring reads these optional values:
+
+- `TACHIKO_CODEX_MODEL`
+- `TACHIKO_CODEX_REASONING_EFFORT` (`minimal`, `low`, `medium`, `high`, `xhigh`)
+- `TACHIKO_CODEX_SANDBOX_MODE` (`read-only`, `workspace-write`, `danger-full-access`)
+- `TACHIKO_CODEX_APPROVAL_POLICY` (`untrusted`, `on-request`, `never`)
+- `TACHIKO_CODEX_TIMEOUT_MS` (positive integer)
+
+The opt-in real-Codex smoke invokes the installed/authenticated CLI in a
+read-only sandbox and is excluded from the normal suite and CI:
+
+```bash
+TACHIKO_CODEX_SMOKE=1 pnpm exec tsx --test tests/codex-cli-smoke.test.ts
+```
+
 The separate opt-in browser-agent smoke starts the managed Playwright MCP
 runtime and a localhost fixture, then proves the installed Codex CLI can use
 the injected browser capability. It is also skipped in the default suite:
@@ -166,7 +194,7 @@ src/domain/            typed core: types, run factory, state machine
 src/store/             durable run persistence
 src/adapters/          typed boundaries for GitHub, implementation, and review
 src/github/            live GitHub transport, normalization, and handoff parser
-src/agents/            Claude Code non-interactive execution adapter
+src/agents/            Claude Code/Codex adapters and durable provider routing
 src/reviewers/         DeepSeek reviewer and bounded fix loop
 src/workflow/          state-resume-aware end-to-end orchestration
 src/cli.ts             run, resume, state inspection, and GitHub snapshot CLI
@@ -179,4 +207,5 @@ tests/                 unit, persistence, adapter, workflow, and CLI E2E tests
 [issue #4]: https://github.com/nurockplayer/tachiko-conductor/issues/4
 [issue #5]: https://github.com/nurockplayer/tachiko-conductor/issues/5
 [issue #6]: https://github.com/nurockplayer/tachiko-conductor/issues/6
+[issue #15]: https://github.com/nurockplayer/tachiko-conductor/issues/15
 [issue #12]: https://github.com/nurockplayer/tachiko-conductor/issues/12

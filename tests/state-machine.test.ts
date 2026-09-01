@@ -470,6 +470,26 @@ describe('state machine — agent result semantics match the event', () => {
     );
   });
 
+  it('rejects switching executor providers while claiming continuation', () => {
+    const run = runIn('IMPLEMENTING', {
+      executor: { provider: 'codex-cli', sessionId: 'thread-1' },
+    });
+    assert.throws(
+      () => applyTransition(
+        run,
+        {
+          type: 'agent_succeeded',
+          agentResult: {
+            ...successResult('sha-2'),
+            executor: { provider: 'claude-code', sessionId: 'session-2' },
+          },
+        },
+        T0,
+      ),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'executor-provider-mismatch',
+    );
+  });
+
   it('classifies which transitions require result payloads', () => {
     assert.equal(transitionRequiresResult('agent_succeeded'), 'agent');
     assert.equal(transitionRequiresResult('agent_failed'), 'agent');

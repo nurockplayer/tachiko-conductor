@@ -1,4 +1,4 @@
-import type { AgentResult, Target } from '../domain/types.js';
+import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
 
 export const HUMAN_TAKEOVER_DIAGNOSTIC = 'TACHIKO_NEEDS_HUMAN:';
 
@@ -22,11 +22,17 @@ export interface ImplementationRequest {
   /** The work item: a single issue or a whole branch. */
   readonly target: Target;
   readonly baseSha: string;
+  /** Whether the executor should read target authority live instead of from copied prose. */
+  readonly authority?: 'embedded' | 'live-target';
   readonly instructions?: string;
+  /** Small Conductor/review instructions that remain relevant with live authority. */
+  readonly supplementalInstructions?: string;
   /** Per-invocation capabilities; never persisted in Conductor run state. */
   readonly capabilities?: readonly McpHttpCapability[];
   /** Previously persisted executor session token, when continuing a run. */
   readonly sessionId?: string;
+  /** Provider-neutral durable executor identity for exact continuation. */
+  readonly executor?: ExecutorIdentity;
   /** Cancels the active implementation process. */
   readonly signal?: AbortSignal;
 }

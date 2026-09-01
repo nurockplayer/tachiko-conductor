@@ -5,7 +5,7 @@ import {
   type McpHttpCapability,
 } from '../adapters/agent.js';
 import type { GitHubAdapter } from '../adapters/github.js';
-import type { AgentResult, Target } from '../domain/types.js';
+import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
 import {
   NodeProcessRunner,
   type ProcessResult,
@@ -16,6 +16,8 @@ import {
 export type ClaudeRunOptions = ProcessRunOptions;
 export type ClaudeProcessRunner = ProcessRunner;
 
+export const CLAUDE_CODE_PROVIDER = 'claude-code';
+
 export const CLAUDE_ERROR_CODE = {
   EXIT_FAILURE: 'CLAUDE_EXIT_FAILURE',
   ERROR: 'CLAUDE_ERROR',
@@ -24,6 +26,7 @@ export const CLAUDE_ERROR_CODE = {
   EXEC_FAILURE: 'CLAUDE_EXEC_FAILURE',
   CANCELLED: 'CLAUDE_CANCELLED',
   INVALID_OUTPUT: 'CLAUDE_INVALID_OUTPUT',
+  RESUME_IDENTITY_INVALID: 'CLAUDE_RESUME_IDENTITY_INVALID',
   HEAD_READ_FAILED: 'HEAD_READ_FAILED',
 } as const;
 
@@ -88,7 +91,20 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
-    const sessionId = request.sessionId ?? this.initialSessionId;
+    if (
+      request.executor !== undefined &&
+      (request.executor.provider !== CLAUDE_CODE_PROVIDER || request.executor.sessionId.trim() === '')
+    ) {
+      const detail = 'Claude Code continuation requires a non-empty claude-code executor identity.';
+      return {
+        exitStatus: 'failure',
+        summary: detail,
+        diagnostics: [`${CLAUDE_ERROR_CODE.RESUME_IDENTITY_INVALID}: ${detail}`],
+        executor: request.executor,
+        durationMs: 0,
+      };
+    }
+    const sessionId = request.executor?.sessionId ?? request.sessionId ?? this.initialSessionId;
     if (isAborted(request.signal)) {
       return cancelledAgentResult(0, sessionId);
     }
@@ -99,6 +115,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       sessionId,
     );
     if (!outcome.ok) return outcome.agentResult;
+    const executor = executorIdentity(outcome.sessionId);
 
     if (isAborted(request.signal)) {
       return cancelledAgentResult(outcome.durationMs, outcome.sessionId);
@@ -110,6 +127,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         summary: takeoverReason,
         diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
         sessionId: outcome.sessionId,
+        ...(executor === undefined ? {} : { executor }),
         durationMs: outcome.durationMs,
       };
     }
@@ -123,6 +141,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         summary: outcome.summary,
         diagnostics: [`${CLAUDE_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${this.cwd}.`],
         sessionId: outcome.sessionId,
+        ...(executor === undefined ? {} : { executor }),
         durationMs: outcome.durationMs,
       };
     }
@@ -131,6 +150,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       summary: outcome.summary,
       headSha: head.sha,
       sessionId: outcome.sessionId,
+      ...(executor === undefined ? {} : { executor }),
       durationMs: outcome.durationMs,
     };
   }
@@ -315,6 +335,7 @@ function failureAgentResult(
       diagnostics: [`${code}: ${detail}`],
       durationMs,
       sessionId,
+      ...(executorIdentity(sessionId) === undefined ? {} : { executor: executorIdentity(sessionId) }),
     },
   };
 }
@@ -364,12 +385,17 @@ function cancelledAgentResult(durationMs: number, sessionId?: string): AgentResu
     summary: detail,
     diagnostics: [`${CLAUDE_ERROR_CODE.CANCELLED}: ${detail}`],
     sessionId,
+    ...(executorIdentity(sessionId) === undefined ? {} : { executor: executorIdentity(sessionId) }),
     durationMs,
   };
 }
 
 function errorCode(error: unknown): unknown {
   return typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
+}
+
+function executorIdentity(sessionId: string | undefined): ExecutorIdentity | undefined {
+  return sessionId === undefined ? undefined : { provider: CLAUDE_CODE_PROVIDER, sessionId };
 }
 
 function message(error: unknown): string {

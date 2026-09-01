@@ -42,6 +42,7 @@ describe('ClaudeCodeAdapter', () => {
     assert.equal(agentResult.summary, 'implemented');
     assert.equal(agentResult.headSha, HEAD);
     assert.equal(agentResult.sessionId, 'sess-1');
+    assert.deepEqual(agentResult.executor, { provider: 'claude-code', sessionId: 'sess-1' });
     assert.equal(typeof agentResult.durationMs, 'number');
     assert.deepEqual(runner.calls[0]?.options, { timeoutMs: 9000, cwd: '/tmp/repo' });
     assert.equal(runner.calls[0]?.file, 'claude');
@@ -121,6 +122,25 @@ describe('ClaudeCodeAdapter', () => {
     assert.equal(second.sessionId, 'sess-3');
     assert.ok(runner.calls[2]?.args.includes('--resume'));
     assert.ok(runner.calls[2]?.args.includes('sess-2'));
+  });
+
+  it('resumes from provider-neutral executor metadata after process restart', async () => {
+    const runner = new FakeRunner([
+      result(claudeJson('fixed', { session_id: 'sess-2' })),
+      result(HEAD),
+    ]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    const resultValue = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      executor: { provider: 'claude-code', sessionId: 'sess-1' },
+    });
+
+    assert.equal(resultValue.exitStatus, 'success');
+    assert.ok(runner.calls[0]?.args.includes('--resume'));
+    assert.ok(runner.calls[0]?.args.includes('sess-1'));
+    assert.deepEqual(resultValue.executor, { provider: 'claude-code', sessionId: 'sess-2' });
   });
 
   it('passes AbortSignal to the process and maps cancellation deterministically', async () => {

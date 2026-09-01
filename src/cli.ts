@@ -5,7 +5,13 @@ import { execFileSync } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
-import { ClaudeCodeAdapter } from './agents/claude-code.js';
+import { CLAUDE_CODE_PROVIDER, ClaudeCodeAdapter } from './agents/claude-code.js';
+import {
+  CODEX_CLI_PROVIDER,
+  CodexCliAdapter,
+  type CodexCliAdapterOptions,
+} from './agents/codex-cli.js';
+import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
@@ -85,6 +91,65 @@ in the foreground; use status/stop from another terminal.
 /** Bounded review attempts before a run parks in NEEDS_HUMAN. */
 export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
 export { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
+
+export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER;
+export type CodexExecutionConfig = Pick<
+  CodexCliAdapterOptions,
+  'model' | 'reasoningEffort' | 'sandboxMode' | 'approvalPolicy' | 'timeoutMs'
+>;
+
+/** Provider selection is external to adapters; existing installs remain on Claude by default. */
+export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
+  const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? CLAUDE_CODE_PROVIDER;
+  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER) return value;
+  throw new Error(
+    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER} or ${CODEX_CLI_PROVIDER}.`,
+  );
+}
+
+/** Read already-selected Codex execution values without inventing policy defaults. */
+export function resolveCodexExecutionConfig(env: NodeJS.ProcessEnv = process.env): CodexExecutionConfig {
+  const config: {
+    model?: string;
+    reasoningEffort?: CodexCliAdapterOptions['reasoningEffort'];
+    sandboxMode?: CodexCliAdapterOptions['sandboxMode'];
+    approvalPolicy?: CodexCliAdapterOptions['approvalPolicy'];
+    timeoutMs?: number;
+  } = {};
+  if (env.TACHIKO_CODEX_MODEL !== undefined) {
+    if (env.TACHIKO_CODEX_MODEL.trim() === '') throw new Error('TACHIKO_CODEX_MODEL must not be empty.');
+    config.model = env.TACHIKO_CODEX_MODEL;
+  }
+  if (env.TACHIKO_CODEX_REASONING_EFFORT !== undefined) {
+    const value = env.TACHIKO_CODEX_REASONING_EFFORT;
+    if (!['minimal', 'low', 'medium', 'high', 'xhigh'].includes(value)) {
+      throw new Error('TACHIKO_CODEX_REASONING_EFFORT must be minimal, low, medium, high, or xhigh.');
+    }
+    config.reasoningEffort = value as NonNullable<CodexCliAdapterOptions['reasoningEffort']>;
+  }
+  if (env.TACHIKO_CODEX_SANDBOX_MODE !== undefined) {
+    const value = env.TACHIKO_CODEX_SANDBOX_MODE;
+    if (!['read-only', 'workspace-write', 'danger-full-access'].includes(value)) {
+      throw new Error('TACHIKO_CODEX_SANDBOX_MODE must be read-only, workspace-write, or danger-full-access.');
+    }
+    config.sandboxMode = value as NonNullable<CodexCliAdapterOptions['sandboxMode']>;
+  }
+  if (env.TACHIKO_CODEX_APPROVAL_POLICY !== undefined) {
+    const value = env.TACHIKO_CODEX_APPROVAL_POLICY;
+    if (!['untrusted', 'on-request', 'never'].includes(value)) {
+      throw new Error('TACHIKO_CODEX_APPROVAL_POLICY must be untrusted, on-request, or never.');
+    }
+    config.approvalPolicy = value as NonNullable<CodexCliAdapterOptions['approvalPolicy']>;
+  }
+  if (env.TACHIKO_CODEX_TIMEOUT_MS !== undefined) {
+    const value = Number(env.TACHIKO_CODEX_TIMEOUT_MS);
+    if (!Number.isSafeInteger(value) || value < 1) {
+      throw new Error('TACHIKO_CODEX_TIMEOUT_MS must be a positive safe integer.');
+    }
+    config.timeoutMs = value;
+  }
+  return config;
+}
 
 /** Resolve the directory where run JSON files are stored. */
 export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
@@ -472,17 +537,28 @@ function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
   console.error(`Run ${run.id}: FAILED — ${outcome.reason}`);
 }
 
-/** Production wiring: local gh CLI, Claude Code, and the DeepSeek reviewer. */
+/** Production wiring: durable implementation routing, local gh, and independent review. */
 function buildWorkflowDeps(
   store: RunStore,
   resolveImplementationCapabilities?: ImplementationCapabilityResolver,
+  env: NodeJS.ProcessEnv = process.env,
 ): WorkflowDependencies {
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
   return {
     store,
     github,
-    implementation: new ClaudeCodeAdapter({ cwd: process.cwd(), github }),
+    implementation: new ImplementationAgentRegistry({
+      defaultProvider: resolveImplementationProvider(env),
+      legacySessionProvider: CLAUDE_CODE_PROVIDER,
+      providers: {
+        [CLAUDE_CODE_PROVIDER]: () => new ClaudeCodeAdapter({ cwd: process.cwd(), github }),
+        [CODEX_CLI_PROVIDER]: () => new CodexCliAdapter({
+          cwd: process.cwd(),
+          ...resolveCodexExecutionConfig(env),
+        }),
+      },
+    }),
     reviewer: new DeepSeekReviewer({
       github,
       diffReader: new GhPullRequestDiffReader(transport),

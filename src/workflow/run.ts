@@ -149,12 +149,20 @@ export async function runWorkflow(
             ? `${snapshot.issue.body}\n\nConductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : snapshot.issue.body
         );
+        const supplementalInstructions = pendingFixInstructions ?? (
+          snapshot.pullRequest === null
+            ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
+            : undefined
+        );
         const result = await implementation.run({
           target,
           baseSha,
+          authority: 'live-target',
           instructions,
+          ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
           capabilities: await deps.resolveImplementationCapabilities?.(),
           ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+          ...(run.executor === undefined ? {} : { executor: run.executor }),
         });
         if (result.exitStatus === 'failure') {
           const takeoverReason = humanTakeoverReason(result);

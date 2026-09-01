@@ -9,6 +9,7 @@ export type InvalidTransitionCode =
   | 'wrong-verdict'
   | 'contradictory-review'
   | 'wrong-exit-status'
+  | 'executor-provider-mismatch'
   | 'unexpected-payload'
   | 'head-mutation-not-allowed'
   | 'missing-head-sha'
@@ -271,6 +272,19 @@ function assertPayload(run: Run, input: TransitionInput): void {
       `Transition "agent_failed" requires an agentResult with exitStatus "failure", got "${input.agentResult.exitStatus}".`,
     );
   }
+  if (
+    (input.type === 'agent_succeeded' || input.type === 'agent_failed') &&
+    run.executor !== undefined &&
+    input.agentResult?.executor !== undefined &&
+    run.executor.provider !== input.agentResult.executor.provider
+  ) {
+    throw new InvalidTransitionError(
+      'executor-provider-mismatch',
+      from,
+      input.type,
+      `Transition "${input.type}" cannot replace executor provider "${run.executor.provider}" with "${input.agentResult.executor.provider}" while claiming continuity.`,
+    );
+  }
   // A successful implementation must report the exact commit it produced;
   // otherwise a stale HEAD could linger and be reviewed as if it were current.
   if (input.type === 'agent_succeeded') {
@@ -471,6 +485,7 @@ export function applyTransition(
     updatedAt: now,
     history: [...run.history, { type: input.type, from, to, at: now, reason: input.reason }],
     ...(input.agentResult !== undefined ? { agentResult: input.agentResult } : {}),
+    ...(input.agentResult?.executor === undefined ? {} : { executor: { ...input.agentResult.executor } }),
     ...(input.reviewResult !== undefined ? { reviewResult: input.reviewResult } : {}),
     ...(headSha !== undefined && headSha !== '' ? { headSha } : {}),
     ...(enteringInterrupt
