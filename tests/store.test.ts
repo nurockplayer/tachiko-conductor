@@ -45,7 +45,7 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.history.length, 2);
   });
 
-  it('persists agent session continuity and bounded execution metadata across restart', () => {
+  it('persists provider-neutral executor continuity and bounded execution metadata across restart', () => {
     const { dir } = tempStore();
     const first = new JsonFileStore({ dir });
     let run = applyTransition(newRun('r1'), { type: 'start' }, T0);
@@ -53,14 +53,20 @@ describe('JsonFileStore — persistence round-trips', () => {
       run,
       {
         type: 'agent_succeeded',
-        agentResult: { ...successResult('sha-1'), sessionId: 'session-1', durationMs: 125 },
+        agentResult: {
+          ...successResult('sha-1'),
+          sessionId: 'legacy-session-1',
+          executor: { provider: 'codex-cli', sessionId: 'thread-1' },
+          durationMs: 125,
+        },
       },
       T0,
     );
     first.create(run);
 
     const loaded = new JsonFileStore({ dir }).read('r1');
-    assert.equal(loaded?.agentResult?.sessionId, 'session-1');
+    assert.equal(loaded?.agentResult?.sessionId, 'legacy-session-1');
+    assert.deepEqual(loaded?.executor, { provider: 'codex-cli', sessionId: 'thread-1' });
     assert.equal(loaded?.agentResult?.durationMs, 125);
   });
 
@@ -234,6 +240,11 @@ describe('JsonFileStore — persistence round-trips', () => {
       { ...newRun('bad'), agentResult: { exitStatus: 'maybe', summary: 'unknown' } },
       { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', sessionId: 42 } },
       { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', sessionId: '' } },
+      { ...newRun('bad'), executor: null },
+      { ...newRun('bad'), executor: { provider: '', sessionId: 'thread-1' } },
+      { ...newRun('bad'), executor: { provider: 'codex-cli', sessionId: '' } },
+      { ...newRun('bad'), executor: { provider: '   ', sessionId: 'thread-1' } },
+      { ...newRun('bad'), executor: { provider: 'codex-cli', sessionId: '   ' } },
       { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', durationMs: -1 } },
       { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', durationMs: 'slow' } },
       { ...newRun('bad'), interrupt: null },

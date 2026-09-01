@@ -9,6 +9,9 @@ export type InvalidTransitionCode =
   | 'wrong-verdict'
   | 'contradictory-review'
   | 'wrong-exit-status'
+  | 'executor-provider-mismatch'
+  | 'executor-mutation-not-allowed'
+  | 'invalid-executor-identity'
   | 'unexpected-payload'
   | 'head-mutation-not-allowed'
   | 'missing-head-sha'
@@ -229,6 +232,37 @@ function assertPayload(run: Run, input: TransitionInput): void {
     );
   }
   const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
+  if (input.executor !== undefined && (input.type !== 'escalate' || from !== 'IMPLEMENTING')) {
+    throw new InvalidTransitionError(
+      'executor-mutation-not-allowed',
+      from,
+      input.type,
+      `Transition "${input.type}" cannot change executor identity outside an interrupted implementation escalation.`,
+    );
+  }
+  if (
+    input.executor !== undefined &&
+    (input.executor.provider.trim() === '' || input.executor.sessionId.trim() === '')
+  ) {
+    throw new InvalidTransitionError(
+      'invalid-executor-identity',
+      from,
+      input.type,
+      'An interrupted implementation escalation requires a non-empty executor provider and session identity.',
+    );
+  }
+  if (
+    input.executor !== undefined &&
+    run.executor !== undefined &&
+    input.executor.provider !== run.executor.provider
+  ) {
+    throw new InvalidTransitionError(
+      'executor-provider-mismatch',
+      from,
+      input.type,
+      `Transition "${input.type}" cannot replace executor provider "${run.executor.provider}" with "${input.executor.provider}" while claiming continuity.`,
+    );
+  }
   if (!HEAD_UPDATING_TRANSITIONS.has(input.type) && !authorizedHumanHeadSync && input.headSha !== undefined) {
     throw new InvalidTransitionError(
       'head-mutation-not-allowed',
@@ -269,6 +303,19 @@ function assertPayload(run: Run, input: TransitionInput): void {
       from,
       input.type,
       `Transition "agent_failed" requires an agentResult with exitStatus "failure", got "${input.agentResult.exitStatus}".`,
+    );
+  }
+  if (
+    (input.type === 'agent_succeeded' || input.type === 'agent_failed') &&
+    run.executor !== undefined &&
+    input.agentResult?.executor !== undefined &&
+    run.executor.provider !== input.agentResult.executor.provider
+  ) {
+    throw new InvalidTransitionError(
+      'executor-provider-mismatch',
+      from,
+      input.type,
+      `Transition "${input.type}" cannot replace executor provider "${run.executor.provider}" with "${input.agentResult.executor.provider}" while claiming continuity.`,
     );
   }
   // A successful implementation must report the exact commit it produced;
@@ -471,6 +518,8 @@ export function applyTransition(
     updatedAt: now,
     history: [...run.history, { type: input.type, from, to, at: now, reason: input.reason }],
     ...(input.agentResult !== undefined ? { agentResult: input.agentResult } : {}),
+    ...(input.agentResult?.executor === undefined ? {} : { executor: { ...input.agentResult.executor } }),
+    ...(input.executor === undefined ? {} : { executor: { ...input.executor } }),
     ...(input.reviewResult !== undefined ? { reviewResult: input.reviewResult } : {}),
     ...(headSha !== undefined && headSha !== '' ? { headSha } : {}),
     ...(enteringInterrupt

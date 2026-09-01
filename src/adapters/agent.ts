@@ -1,4 +1,4 @@
-import type { AgentResult, Target } from '../domain/types.js';
+import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
 
 export const HUMAN_TAKEOVER_DIAGNOSTIC = 'TACHIKO_NEEDS_HUMAN:';
 
@@ -15,6 +15,35 @@ export interface McpHttpCapability {
   readonly endpoint: string;
 }
 
+/** Validate and normalize generic HTTP MCP capabilities at the adapter boundary. */
+export function normalizeMcpHttpCapabilities(
+  capabilities: readonly McpHttpCapability[],
+): readonly McpHttpCapability[] {
+  const names = new Set<string>();
+  return capabilities.map((capability) => {
+    if (!/^[A-Za-z0-9_-]+$/.test(capability.name)) {
+      throw new Error(`Invalid MCP capability name "${capability.name}"; use only letters, digits, underscores, or hyphens.`);
+    }
+    if (names.has(capability.name)) {
+      throw new Error(`Duplicate MCP capability name "${capability.name}".`);
+    }
+    names.add(capability.name);
+    let endpoint: URL;
+    try {
+      endpoint = new URL(capability.endpoint);
+    } catch {
+      throw new Error(`MCP capability "${capability.name}" has an invalid endpoint URL.`);
+    }
+    if (endpoint.protocol !== 'http:' && endpoint.protocol !== 'https:') {
+      throw new Error(`MCP capability "${capability.name}" must use an HTTP or HTTPS endpoint.`);
+    }
+    if (endpoint.username !== '' || endpoint.password !== '') {
+      throw new Error(`MCP capability "${capability.name}" must not embed credentials in its endpoint URL.`);
+    }
+    return { ...capability, endpoint: endpoint.toString() };
+  });
+}
+
 /** Resolve ephemeral capabilities immediately before an implementation call. */
 export type ImplementationCapabilityResolver = () => Promise<readonly McpHttpCapability[] | undefined>;
 
@@ -22,11 +51,17 @@ export interface ImplementationRequest {
   /** The work item: a single issue or a whole branch. */
   readonly target: Target;
   readonly baseSha: string;
+  /** Whether the executor should read target authority live instead of from copied prose. */
+  readonly authority?: 'embedded' | 'live-target';
   readonly instructions?: string;
+  /** Small Conductor/review instructions that remain relevant with live authority. */
+  readonly supplementalInstructions?: string;
   /** Per-invocation capabilities; never persisted in Conductor run state. */
   readonly capabilities?: readonly McpHttpCapability[];
   /** Previously persisted executor session token, when continuing a run. */
   readonly sessionId?: string;
+  /** Provider-neutral durable executor identity for exact continuation. */
+  readonly executor?: ExecutorIdentity;
   /** Cancels the active implementation process. */
   readonly signal?: AbortSignal;
 }

@@ -11,6 +11,8 @@ import {
   LIVE_HEAD_SYNC_DECISION,
   parseIssueNumber,
   parseIssueRef,
+  resolveCodexExecutionConfig,
+  resolveImplementationProvider,
   resolveRunsDir,
   runCreateCommand,
   runIssueCommand,
@@ -102,6 +104,33 @@ describe('CLI command layer', () => {
   it('resolves the data dir from TACHIKO_DATA_DIR or the home default', () => {
     assert.equal(resolveRunsDir({ TACHIKO_DATA_DIR: '/tmp/x' }), '/tmp/x');
     assert.match(resolveRunsDir({}), /\.tachiko-conductor/);
+  });
+
+  it('resolves the implementation provider and explicit Codex execution config without choosing a model', () => {
+    assert.equal(resolveImplementationProvider({}), 'claude-code');
+    assert.equal(resolveImplementationProvider({ TACHIKO_IMPLEMENTATION_AGENT: 'codex-cli' }), 'codex-cli');
+    assert.deepEqual(resolveCodexExecutionConfig({}), {});
+    assert.deepEqual(resolveCodexExecutionConfig({
+      TACHIKO_CODEX_MODEL: 'resolved-model',
+      TACHIKO_CODEX_REASONING_EFFORT: 'high',
+      TACHIKO_CODEX_SANDBOX_MODE: 'workspace-write',
+      TACHIKO_CODEX_APPROVAL_POLICY: 'never',
+      TACHIKO_CODEX_TIMEOUT_MS: '12345',
+    }), {
+      model: 'resolved-model',
+      reasoningEffort: 'high',
+      sandboxMode: 'workspace-write',
+      approvalPolicy: 'never',
+      timeoutMs: 12_345,
+    });
+    assert.throws(
+      () => resolveImplementationProvider({ TACHIKO_IMPLEMENTATION_AGENT: 'unknown' }),
+      /TACHIKO_IMPLEMENTATION_AGENT/,
+    );
+    assert.throws(
+      () => resolveCodexExecutionConfig({ TACHIKO_CODEX_TIMEOUT_MS: '0' }),
+      /TACHIKO_CODEX_TIMEOUT_MS/,
+    );
   });
 
   it('parses issue numbers strictly without partial parses or unsafe integers', () => {

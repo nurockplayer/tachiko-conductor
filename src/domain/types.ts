@@ -68,6 +68,12 @@ export type TransitionType = (typeof TRANSITION_TYPES)[number];
 /** Outcome of an implementation agent run. */
 export type AgentExitStatus = 'success' | 'failure';
 
+/** Provider-neutral durable identity for continuing one logical executor. */
+export interface ExecutorIdentity {
+  readonly provider: string;
+  readonly sessionId: string;
+}
+
 export interface AgentResult {
   readonly exitStatus: AgentExitStatus;
   readonly summary: string;
@@ -75,6 +81,8 @@ export interface AgentResult {
   readonly headSha?: string;
   readonly changedFiles?: readonly string[];
   readonly diagnostics?: readonly string[];
+  /** Durable identity used to reconstruct the same executor after restart. */
+  readonly executor?: ExecutorIdentity;
   /** Opaque executor session token used to continue this logical run. */
   readonly sessionId?: string;
   /** Wall-clock execution duration. Raw transcripts and model usage are not retained. */
@@ -130,6 +138,8 @@ export interface TransitionInput {
   readonly reviewResult?: ReviewResult;
   /** Explicitly updates the run's current HEAD SHA. */
   readonly headSha?: string;
+  /** Executor identity captured while an implementation is interrupted for human takeover. */
+  readonly executor?: ExecutorIdentity;
   /** Structured context carried onto the interrupt when entering NEEDS_HUMAN / WAITING_DEPENDENCY. */
   readonly interrupt?: {
     readonly evidence?: string;
@@ -152,6 +162,8 @@ export interface Run {
   readonly interruptedFrom?: WorkflowState;
   readonly interrupt?: Interrupt;
   readonly agentResult?: AgentResult;
+  /** Durable provider/session identity for reconstructing implementation continuation. */
+  readonly executor?: ExecutorIdentity;
   /** Latest review result, bound to an exact HEAD SHA. */
   readonly reviewResult?: ReviewResult;
   /** Current HEAD SHA of the implementation, when known. */

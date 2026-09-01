@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { ImplementationAgent } from '../src/adapters/agent.js';
+import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
@@ -115,15 +115,21 @@ class FakeReviewer implements ReviewerAdapter {
 
 class FakeImplementation implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
-  readonly requests: Array<{ baseSha: string; instructions: string | undefined; sessionId: string | undefined }> = [];
+  readonly requests: Array<{
+    baseSha: string;
+    instructions: string | undefined;
+    sessionId: string | undefined;
+    executor: ImplementationRequest['executor'];
+  }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
 
-  async run(request: { target: unknown; baseSha: string; instructions?: string; sessionId?: string }): Promise<AgentResult> {
+  async run(request: ImplementationRequest): Promise<AgentResult> {
     this.requests.push({
       baseSha: request.baseSha,
       instructions: request.instructions,
       sessionId: request.sessionId,
+      executor: request.executor,
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
@@ -218,6 +224,33 @@ describe('runReviewLoop', () => {
     );
 
     assert.equal(implementation.requests[0]?.sessionId, 'session-42');
+  });
+
+  it('resumes the persisted provider-neutral executor while fixing review findings', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun();
+    run = {
+      ...run,
+      executor: { provider: 'codex-cli', sessionId: 'thread-42' },
+      agentResult: {
+        ...run.agentResult!,
+        executor: { provider: 'codex-cli', sessionId: 'thread-42' },
+      },
+    };
+    store.create(run);
+    const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    await runReviewLoop(
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.deepEqual(implementation.requests[0]?.executor, {
+      provider: 'codex-cli',
+      sessionId: 'thread-42',
+    });
   });
 
   it('escalates to NEEDS_HUMAN when the review loop exceeds maxAttempts', async () => {
@@ -374,6 +407,7 @@ describe('runReviewLoop', () => {
         exitStatus: 'failure',
         summary: '2FA required',
         diagnostics: ['TACHIKO_NEEDS_HUMAN: 2FA required'],
+        executor: { provider: 'codex-cli', sessionId: 'thread-fix' },
       },
     ]);
 
@@ -386,6 +420,7 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.equal(result.run.interrupt?.reason, '2FA required');
+    assert.deepEqual(result.run.executor, { provider: 'codex-cli', sessionId: 'thread-fix' });
   });
 
   it('escalates to NEEDS_HUMAN when the live GitHub HEAD drifts from the run HEAD', async () => {

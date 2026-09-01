@@ -470,6 +470,26 @@ describe('state machine — agent result semantics match the event', () => {
     );
   });
 
+  it('rejects switching executor providers while claiming continuation', () => {
+    const run = runIn('IMPLEMENTING', {
+      executor: { provider: 'codex-cli', sessionId: 'thread-1' },
+    });
+    assert.throws(
+      () => applyTransition(
+        run,
+        {
+          type: 'agent_succeeded',
+          agentResult: {
+            ...successResult('sha-2'),
+            executor: { provider: 'claude-code', sessionId: 'session-2' },
+          },
+        },
+        T0,
+      ),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'executor-provider-mismatch',
+    );
+  });
+
   it('classifies which transitions require result payloads', () => {
     assert.equal(transitionRequiresResult('agent_succeeded'), 'agent');
     assert.equal(transitionRequiresResult('agent_failed'), 'agent');
@@ -538,6 +558,21 @@ describe('state machine — successful implementation must report an exact HEAD'
 });
 
 describe('state machine — interrupts and resume', () => {
+  it('persists executor identity while escalating an interrupted implementation', () => {
+    const executor = { provider: 'codex-cli', sessionId: 'thread-1' } as const;
+    const run = runIn('IMPLEMENTING');
+    const parked = applyTransition(
+      run,
+      { type: 'escalate', reason: '2FA required', executor },
+      T0,
+    );
+    assert.deepEqual(parked.executor, executor);
+    assert.throws(
+      () => applyTransition(runIn('VALIDATING'), { type: 'fail', executor }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'executor-mutation-not-allowed',
+    );
+  });
+
   it('escalates to NEEDS_HUMAN remembering the interrupted state, then resumes', () => {
     let run = runIn('REVIEWING');
     run = applyTransition(run, { type: 'escalate', reason: 'reviewer disputed the approach' }, T0);

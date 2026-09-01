@@ -212,6 +212,7 @@ describe('runWorkflow', () => {
         exitStatus: 'failure',
         summary: 'login expired',
         diagnostics: ['TACHIKO_NEEDS_HUMAN: login expired'],
+        executor: { provider: 'codex-cli', sessionId: 'thread-takeover' },
       },
     ]);
 
@@ -224,6 +225,7 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.equal(result.run.interrupt?.reason, 'login expired');
+    assert.deepEqual(result.run.executor, { provider: 'codex-cli', sessionId: 'thread-takeover' });
     assert.deepEqual(result.run.interrupt?.choices, ['Complete human bootstrap/takeover and resume', 'Cancel the run']);
   });
 
@@ -235,6 +237,7 @@ describe('runWorkflow', () => {
         exitStatus: 'failure',
         summary: '2FA required',
         diagnostics: ['TACHIKO_NEEDS_HUMAN: 2FA required'],
+        executor: { provider: 'codex-cli', sessionId: 'thread-fix' },
       },
       successResult(HEAD2, 'fixed after takeover'),
     ]);
@@ -257,6 +260,10 @@ describe('runWorkflow', () => {
     );
 
     assert.equal(result.outcome, 'merge_ready');
+    assert.deepEqual(implementation.requests[1]?.executor, {
+      provider: 'codex-cli',
+      sessionId: 'thread-fix',
+    });
     assert.equal(implementation.requests[1]?.baseSha, HEAD);
     assert.match(implementation.requests[1]?.instructions ?? '', /the diff has a bug/);
     assert.doesNotMatch(implementation.requests[1]?.instructions ?? '', /DoR-ready/);
@@ -354,13 +361,17 @@ describe('runWorkflow', () => {
     assert.match(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
   });
 
-  it('restores the persisted implementation session after a restart', async () => {
+  it('restores the persisted provider-neutral executor after a restart', async () => {
     const store = new MemoryStore();
     let run = applyTransition(createRun(TARGET, T0, 'run-1'), { type: 'start' }, T0);
     run = {
       ...run,
       headSha: HEAD,
-      agentResult: { ...successResult(HEAD), sessionId: 'session-from-disk' },
+      executor: { provider: 'codex-cli', sessionId: 'thread-from-disk' },
+      agentResult: {
+        ...successResult(HEAD),
+        executor: { provider: 'codex-cli', sessionId: 'thread-from-disk' },
+      },
     };
     store.create(run);
     const implementation = new FakeImplementation([successResult(HEAD2)]);
@@ -373,7 +384,10 @@ describe('runWorkflow', () => {
     );
 
     assert.equal(result.outcome, 'merge_ready');
-    assert.equal(implementation.requests[0]?.sessionId, 'session-from-disk');
+    assert.deepEqual(implementation.requests[0]?.executor, {
+      provider: 'codex-cli',
+      sessionId: 'thread-from-disk',
+    });
   });
 
   it('resumes a persisted in-flight fix with the blocking findings instead of the issue body', async () => {

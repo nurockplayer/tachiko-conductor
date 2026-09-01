@@ -6,6 +6,8 @@ export * from './adapters/github.js';
 export * from './adapters/agent.js';
 export * from './adapters/reviewer.js';
 export * from './agents/claude-code.js';
+export * from './agents/codex-cli.js';
+export * from './agents/implementation-router.js';
 export * from './reviewers/deepseek.js';
 export * from './reviewers/loop.js';
 export * from './workflow/run.js';

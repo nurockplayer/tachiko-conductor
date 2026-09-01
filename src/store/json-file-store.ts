@@ -62,6 +62,17 @@ function isOptionalDuration(value: unknown): boolean {
   return value === undefined || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
 }
 
+function isExecutorIdentity(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const executor = value as Record<string, unknown>;
+  return (
+    typeof executor.provider === 'string' &&
+    executor.provider.trim().length > 0 &&
+    typeof executor.sessionId === 'string' &&
+    executor.sessionId.trim().length > 0
+  );
+}
+
 function isAgentResult(value: unknown): boolean {
   if (typeof value !== 'object' || value === null) return false;
   const result = value as Record<string, unknown>;
@@ -71,6 +82,7 @@ function isAgentResult(value: unknown): boolean {
     isOptionalString(result.headSha) &&
     isOptionalStringArray(result.changedFiles) &&
     isOptionalStringArray(result.diagnostics) &&
+    (result.executor === undefined || isExecutorIdentity(result.executor)) &&
     isOptionalNonEmptyString(result.sessionId) &&
     isOptionalDuration(result.durationMs)
   );
@@ -166,6 +178,7 @@ function isRun(value: unknown): value is Run {
     isOptionalString(v.headSha) &&
     (v.interrupt === undefined || isInterrupt(v.interrupt)) &&
     (v.agentResult === undefined || isAgentResult(v.agentResult)) &&
+    (v.executor === undefined || isExecutorIdentity(v.executor)) &&
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );

@@ -136,12 +136,16 @@ export async function runReviewLoop(
       run = applyTransition(run, { type: 'start_fix' }, now());
       store.update(run);
 
+      const blockingFindings = renderBlockingFindings(pendingReview);
       const fixResult = await implementation.run({
         target,
         baseSha: run.headSha ?? '',
-        instructions: renderBlockingFindings(pendingReview),
+        authority: 'live-target',
+        instructions: blockingFindings,
+        supplementalInstructions: blockingFindings,
         capabilities: await deps.resolveImplementationCapabilities?.(),
         sessionId: run.agentResult?.sessionId,
+        executor: run.executor,
       });
       if (fixResult.exitStatus === 'failure') {
         const takeoverReason = humanTakeoverReason(fixResult);
@@ -151,6 +155,7 @@ export async function runReviewLoop(
             {
               type: 'escalate',
               reason: takeoverReason,
+              ...(fixResult.executor === undefined ? {} : { executor: fixResult.executor }),
               interrupt: {
                 evidence: takeoverReason,
                 choices: ['Complete human bootstrap/takeover and resume', CANCEL_RUN_DECISION],
