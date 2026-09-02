@@ -397,6 +397,40 @@ describe('GitWorktreeBootstrap', () => {
     assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
   });
 
+  it('revalidates pinned parents after the mutating worktree subprocess returns', async () => {
+    const roots = tempRoots();
+    let recovering = false;
+    let swapped = false;
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command === 'fetch --no-tags origin refs/heads/main') return result();
+      if (command === 'rev-parse FETCH_HEAD') return result(`${BASE}\n`);
+      if (command.startsWith('show-ref --verify --quiet')) return result('', 1);
+      if (command.startsWith('ls-remote --heads')) return result();
+      if (command === `cat-file -e ${BASE}^{commit}`) return result();
+      if (command.startsWith(`worktree add -b ${BRANCH} `)) {
+        const ownerPath = path.join(roots.workspaceRoot, 'acme');
+        rmSync(ownerPath, { recursive: true, force: true });
+        mkdirSync(args[4] ?? '', { recursive: true });
+        swapped = true;
+        return result();
+      }
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const planned = await bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE });
+    recovering = true;
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing: planned }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.COLLISION),
+    );
+    assert.equal(recovering, true);
+    assert.equal(swapped, true);
+    assert.equal(runner.calls.some((call) => call.args[0] === 'rev-parse' && call.args[1] === '--show-toplevel'), false);
+  });
+
   it('rejects an existing nested workspace alias before probing recovery branches', async () => {
     const roots = tempRoots();
     const actualOwner = path.join(roots.workspaceRoot, 'actual-owner');
@@ -735,6 +769,37 @@ describe('GitWorktreeBootstrap', () => {
 
     await assert.rejects(
       bootstrap.verifyDurable({ identity, expectedHeadSha: HEAD }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.HEAD_MISMATCH),
+    );
+  });
+
+  it('rejects an allow-empty review-fix commit with no tree changes from the prior HEAD', async () => {
+    const roots = tempRoots();
+    const workspacePath = path.join(roots.workspaceRoot, 'acme', 'widgets', 'run-42-issue-42');
+    mkdirSync(workspacePath, { recursive: true });
+    const identity = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: BASE,
+      branch: BRANCH, workspacePath,
+    } as const;
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command === 'rev-parse --show-toplevel') return result(`${workspacePath}\n`);
+      if (command === 'symbolic-ref --short HEAD') return result(`${BRANCH}\n`);
+      if (command === 'rev-parse HEAD') return result(`${HEAD}\n`);
+      if (command === 'status --porcelain=v1 --untracked-files=all') return result();
+      if (command === `ls-remote --heads origin refs/heads/${BRANCH}`) {
+        return result(`${HEAD}\trefs/heads/${BRANCH}\n`);
+      }
+      if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result();
+      if (command === `merge-base --is-ancestor ${OTHER} ${HEAD}`) return result();
+      if (command === `diff --quiet ${OTHER} ${HEAD} --`) return result();
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+
+    await assert.rejects(
+      bootstrap.verifyDurable({ identity, expectedHeadSha: HEAD, progressBaseSha: OTHER }),
       codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.HEAD_MISMATCH),
     );
   });

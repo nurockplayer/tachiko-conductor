@@ -305,6 +305,7 @@ export async function runReviewLoop(
           await deps.bootstrap.verifyDurable({
             identity: bootstrap,
             expectedHeadSha: fixResult.headSha,
+            progressBaseSha: run.headSha,
             ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
           });
         } catch (error) {

@@ -216,6 +216,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     if (!FULL_SHA.test(request.expectedHeadSha)) {
       throw bootstrapError('INVALID_REQUEST', 'Durable implementation verification requires an exact 40-hex HEAD SHA.');
     }
+    const progressBaseSha = request.progressBaseSha ?? request.identity.baseSha;
+    if (!FULL_SHA.test(progressBaseSha)) {
+      throw bootstrapError('INVALID_REQUEST', 'Durable implementation verification requires an exact progress-base SHA.');
+    }
     const identity = request.identity;
     request.workspaceGuard?.assertValid();
     this.assertIdentity(identity);
@@ -268,8 +272,22 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         `Implementation HEAD ${headSha} does not descend from bootstrap base ${identity.baseSha}.`,
       );
     }
+    if (progressBaseSha !== identity.baseSha) {
+      const progressAncestry = await this.git(
+        ['merge-base', '--is-ancestor', progressBaseSha, headSha],
+        identity.workspacePath,
+        [0, 1],
+      );
+      workspaceGuard.assertValid();
+      if (progressAncestry.exitCode !== 0) {
+        throw bootstrapError(
+          'HEAD_MISMATCH',
+          `Implementation HEAD ${headSha} does not descend from progress base ${progressBaseSha}.`,
+        );
+      }
+    }
     const treeDiff = await this.git(
-      ['diff', '--quiet', identity.baseSha, headSha, '--'],
+      ['diff', '--quiet', progressBaseSha, headSha, '--'],
       identity.workspacePath,
       [0, 1],
     );
@@ -277,7 +295,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     if (treeDiff.exitCode === 0) {
       throw bootstrapError(
         'HEAD_MISMATCH',
-        `Implementation HEAD ${headSha} has no tree changes from bootstrap base ${identity.baseSha}.`,
+        `Implementation HEAD ${headSha} has no tree changes from progress base ${progressBaseSha}.`,
       );
     }
     return { headSha, branch: identity.branch };
@@ -383,7 +401,9 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         ['worktree', 'add', '-b', identity.branch, identity.workspacePath, identity.baseSha],
         this.repositoryRoot,
       );
+      this.assertWorkspaceParents(parentPins);
       await this.assertWorkspace(identity);
+      this.assertWorkspaceParents(parentPins);
       return;
     }
 
@@ -423,7 +443,9 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         this.repositoryRoot,
       );
     }
+    this.assertWorkspaceParents(parentPins);
     await this.assertWorkspace(identity, recoveredSha);
+    this.assertWorkspaceParents(parentPins);
   }
 
   private async assertWorkspace(

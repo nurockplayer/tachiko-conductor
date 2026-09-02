@@ -620,6 +620,44 @@ describe('runWorkflow', () => {
     assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
   });
 
+  it('binds the recovered PR number before validation can observe a same-identity replacement', async () => {
+    const store = new MemoryStore();
+    const bootstrap = new FakeBootstrap();
+    let run = applyTransition(createRun(TARGET, T0, 'run-pr-number-drift'), { type: 'start' }, T0);
+    const identity = await bootstrap.plan({
+      runId: run.id,
+      target: TARGET,
+      baseBranch: 'main',
+      baseSha: 'base',
+    });
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+    store.create(run);
+    let reads = 0;
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => {
+      reads += 1;
+      const live = snapshot(HEAD);
+      if (reads < 3) return live;
+      return { ...live, pullRequest: { ...live.pullRequest!, id: 'PR_8', number: 8 } };
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github,
+        bootstrap,
+        implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([]),
+      },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /pull request #8.*pull request #7/i);
+    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
+  });
+
   it('uses an existing associated PR without starting bootstrap mechanics', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-existing-pr'));

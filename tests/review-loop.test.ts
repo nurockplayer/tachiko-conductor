@@ -331,6 +331,7 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'approved');
     assert.deepEqual(bootstrap.prepareRequests[0]?.existing, bootstrapIdentity);
     assert.equal(bootstrap.verifyRequests[0]?.expectedHeadSha, HEAD2);
+    assert.equal(bootstrap.verifyRequests[0]?.progressBaseSha, HEAD);
     assert.equal(implementation.requests[0]?.workspacePath, bootstrapIdentity.workspacePath);
     assert.equal(implementation.requests[0]?.branch, bootstrapIdentity.branch);
     assert.equal(bootstrap.verifyRequests[0]?.workspaceGuard, implementation.requests[0]?.workspaceGuard);

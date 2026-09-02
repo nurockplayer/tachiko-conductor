@@ -14,6 +14,8 @@ export type PlanImplementationBootstrapRequest = Omit<PrepareImplementationBoots
 export interface VerifyDurableImplementationRequest {
   readonly identity: ImplementationBootstrapIdentity;
   readonly expectedHeadSha: string;
+  /** Exact prior HEAD that this invocation must make meaningful tree progress from. */
+  readonly progressBaseSha?: string;
   /** Guard captured at preparation time, preserving inode continuity through execution. */
   readonly workspaceGuard?: WorkspaceGuard;
 }

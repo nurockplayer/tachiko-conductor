@@ -261,25 +261,28 @@ function assertPayload(run: Run, input: TransitionInput): void {
       `Transition "${input.type}" does not accept bootstrap identity; it is bound to bootstrap_prepared.`,
     );
   }
-  if (input.pullRequest !== undefined && input.type !== 'validation_passed') {
+  if (input.pullRequest !== undefined && input.type !== 'validation_passed' && input.type !== 'agent_succeeded') {
     throw new InvalidTransitionError(
       'unexpected-payload',
       from,
       input.type,
-      `Transition "${input.type}" does not accept pull request identity; it is bound to validation_passed.`,
+      `Transition "${input.type}" does not accept pull request identity; it is bound to implementation recovery or validation.`,
     );
   }
+  const pullRequestHeadSha = input.type === 'agent_succeeded'
+    ? (input.headSha ?? input.agentResult?.headSha)?.trim()
+    : run.headSha;
   if (input.pullRequest !== undefined && (
     !Number.isSafeInteger(input.pullRequest.number) ||
     input.pullRequest.number < 1 ||
     input.pullRequest.headSha.trim() === '' ||
-    input.pullRequest.headSha !== run.headSha
+    input.pullRequest.headSha !== pullRequestHeadSha
   )) {
     throw new InvalidTransitionError(
       'invalid-pull-request-identity',
       from,
       input.type,
-      'Validation pull request identity must be positive and bound to the run exact HEAD.',
+      'Pull request identity must be positive and bound to the transition exact HEAD.',
     );
   }
   if (input.bootstrap !== undefined) {

@@ -208,16 +208,28 @@ export function resolveRepositoryRoot(
   return path.resolve(resolved);
 }
 
-/** Prefer the Git top-level for workflow work, while preserving manual PR-only use outside a checkout. */
+/** Resolve the Git top-level when bootstrap mechanics are available; null keeps PR-only runs lazy. */
 export function resolveWorkflowRepositoryRoot(
   cwd: string = process.cwd(),
   resolveTopLevel: (directory: string) => string = (directory) => resolveRepositoryRoot(directory),
-): string {
+): string | null {
   try {
     return path.resolve(resolveTopLevel(cwd));
   } catch {
-    return path.resolve(cwd);
+    return null;
   }
+}
+
+export function createImplementationBootstrap(
+  repositoryRoot: string | null,
+  env: NodeJS.ProcessEnv = process.env,
+): GitWorktreeBootstrap | undefined {
+  return repositoryRoot === null
+    ? undefined
+    : new GitWorktreeBootstrap({
+        repositoryRoot,
+        workspaceRoot: resolveImplementationWorkspaceRoot(env),
+      });
 }
 
 export function parseBrowserPort(raw: string): number {
@@ -564,20 +576,19 @@ function buildWorkflowDeps(
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
   const repositoryRoot = resolveWorkflowRepositoryRoot();
+  const executionRoot = repositoryRoot ?? process.cwd();
+  const bootstrap = createImplementationBootstrap(repositoryRoot, env);
   return {
     store,
     github,
-    bootstrap: new GitWorktreeBootstrap({
-      repositoryRoot,
-      workspaceRoot: resolveImplementationWorkspaceRoot(env),
-    }),
+    ...(bootstrap === undefined ? {} : { bootstrap }),
     implementation: new ImplementationAgentRegistry({
       defaultProvider: resolveImplementationProvider(env),
       legacySessionProvider: CLAUDE_CODE_PROVIDER,
       providers: {
-        [CLAUDE_CODE_PROVIDER]: () => new ClaudeCodeAdapter({ cwd: repositoryRoot, github }),
+        [CLAUDE_CODE_PROVIDER]: () => new ClaudeCodeAdapter({ cwd: executionRoot, github }),
         [CODEX_CLI_PROVIDER]: () => new CodexCliAdapter({
-          cwd: repositoryRoot,
+          cwd: executionRoot,
           ...resolveCodexExecutionConfig(env),
         }),
       },

@@ -100,6 +100,36 @@ describe('state machine — happy path', () => {
     );
   });
 
+  it('persists a recovered PR identity atomically with the implementation HEAD', () => {
+    const implementing = applyTransition(newRun(), { type: 'start' }, T0);
+    const recovered = applyTransition(
+      implementing,
+      {
+        type: 'agent_succeeded',
+        agentResult: successResult('sha-1'),
+        headSha: 'sha-1',
+        pullRequest: { number: 7, headSha: 'sha-1' },
+      },
+      T0,
+    );
+
+    assert.equal(recovered.state, 'VALIDATING');
+    assert.deepEqual(recovered.pullRequest, { number: 7, headSha: 'sha-1' });
+    assert.throws(
+      () => applyTransition(
+        implementing,
+        {
+          type: 'agent_succeeded',
+          agentResult: successResult('sha-1'),
+          headSha: 'sha-1',
+          pullRequest: { number: 7, headSha: 'sha-2' },
+        },
+        T0,
+      ),
+      (error: unknown) => error instanceof InvalidTransitionError && error.code === 'invalid-pull-request-identity',
+    );
+  });
+
   it('routes a failed implementation to the FAILED terminal state', () => {
     const run = applyTransition(
       applyTransition(newRun(), { type: 'start' }, T0),

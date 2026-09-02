@@ -323,7 +323,12 @@ export async function runWorkflow(
             };
             run = applyTransition(
               run,
-              { type: 'agent_succeeded', agentResult: recoveredResult, headSha: snapshot.headSha },
+              {
+                type: 'agent_succeeded',
+                agentResult: recoveredResult,
+                headSha: snapshot.headSha,
+                pullRequest: { number: snapshot.pullRequest.number, headSha: snapshot.headSha },
+              },
               now(),
             );
             store.update(run);

@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, it } from 'node:test';
 
 import {
+  createImplementationBootstrap,
   githubSnapshotCommand,
   LIVE_HEAD_SYNC_DECISION,
   parseIssueNumber,
@@ -122,7 +123,11 @@ describe('CLI command layer', () => {
       resolveWorkflowRepositoryRoot('/manual/pr-only', () => {
         throw new Error('not a checkout');
       }),
-      '/manual/pr-only',
+      null,
+    );
+    assert.equal(
+      createImplementationBootstrap(null, { TACHIKO_WORKSPACE_ROOT: '/manual/pr-only/.tachiko/workspaces' }),
+      undefined,
     );
   });
 
