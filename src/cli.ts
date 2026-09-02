@@ -208,6 +208,18 @@ export function resolveRepositoryRoot(
   return path.resolve(resolved);
 }
 
+/** Prefer the Git top-level for workflow work, while preserving manual PR-only use outside a checkout. */
+export function resolveWorkflowRepositoryRoot(
+  cwd: string = process.cwd(),
+  resolveTopLevel: (directory: string) => string = (directory) => resolveRepositoryRoot(directory),
+): string {
+  try {
+    return path.resolve(resolveTopLevel(cwd));
+  } catch {
+    return path.resolve(cwd);
+  }
+}
+
 export function parseBrowserPort(raw: string): number {
   if (!/^\d+$/.test(raw)) {
     throw new Error(`Invalid browser port "${raw}": expected an integer from 1 to 65535.`);
@@ -551,20 +563,21 @@ function buildWorkflowDeps(
 ): WorkflowDependencies {
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
+  const repositoryRoot = resolveWorkflowRepositoryRoot();
   return {
     store,
     github,
     bootstrap: new GitWorktreeBootstrap({
-      repositoryRoot: process.cwd(),
+      repositoryRoot,
       workspaceRoot: resolveImplementationWorkspaceRoot(env),
     }),
     implementation: new ImplementationAgentRegistry({
       defaultProvider: resolveImplementationProvider(env),
       legacySessionProvider: CLAUDE_CODE_PROVIDER,
       providers: {
-        [CLAUDE_CODE_PROVIDER]: () => new ClaudeCodeAdapter({ cwd: process.cwd(), github }),
+        [CLAUDE_CODE_PROVIDER]: () => new ClaudeCodeAdapter({ cwd: repositoryRoot, github }),
         [CODEX_CLI_PROVIDER]: () => new CodexCliAdapter({
-          cwd: process.cwd(),
+          cwd: repositoryRoot,
           ...resolveCodexExecutionConfig(env),
         }),
       },

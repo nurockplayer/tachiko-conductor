@@ -102,6 +102,9 @@ export interface GitHubLivePullRequestSnapshot extends PullRequestSnapshot {
   readonly mergeable: boolean | null;
   readonly mergeStateStatus: string | null;
   readonly updatedAt: string;
+  readonly headRef: string;
+  readonly headRepository: { readonly owner: string; readonly repo: string } | null;
+  readonly baseRef: string;
 }
 
 export interface GitHubLiveSnapshot {

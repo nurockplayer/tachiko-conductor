@@ -314,11 +314,15 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       };
 
       const reread = asRecordOrThrow(await this.transport.get(path), path);
-      const rereadHead = asRecord(reread.head);
+      const rereadLive = this.normalizeLivePullRequest(reread, path);
       if (
-        reread.number !== raw.number ||
-        reread.state !== raw.state ||
-        rereadHead?.sha !== headSha
+        rereadLive.number !== live.number ||
+        rereadLive.state !== live.state ||
+        rereadLive.headSha !== live.headSha ||
+        rereadLive.headRef !== live.headRef ||
+        rereadLive.headRepository?.owner !== live.headRepository?.owner ||
+        rereadLive.headRepository?.repo !== live.headRepository?.repo ||
+        rereadLive.baseRef !== live.baseRef
       ) {
         throw new GitHubLiveStateError(
           'GH_SNAPSHOT_CHANGED',
@@ -381,6 +385,9 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const head = asRecord(record.head);
     const base = asRecord(record.base);
     if (head === null || base === null) throw invalid(path, 'missing head/base object');
+    const headRepo = asRecord(head.repo);
+    const headRepoOwner = asRecord(headRepo?.owner);
+    if (headRepo !== null && headRepoOwner === null) throw invalid(path, 'missing head repository owner');
     const headSha = typeof head.sha === 'string' && head.sha.trim() !== '' ? head.sha : null;
     if (headSha === null) {
       throw new GitHubLiveStateError(
@@ -406,6 +413,14 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       updatedAt: requireString(record, 'updated_at', path),
       headSha,
       baseSha: requireString(base, 'sha', path),
+      headRef: requireString(head, 'ref', path),
+      headRepository: headRepo === null
+        ? null
+        : {
+            owner: requireString(headRepoOwner as Record<string, unknown>, 'login', path),
+            repo: requireString(headRepo, 'name', path),
+          },
+      baseRef: requireString(base, 'ref', path),
     };
   }
 

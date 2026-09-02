@@ -14,6 +14,7 @@ import {
   resolveCodexExecutionConfig,
   resolveImplementationProvider,
   resolveImplementationWorkspaceRoot,
+  resolveWorkflowRepositoryRoot,
   resolveRunsDir,
   runCreateCommand,
   runIssueCommand,
@@ -107,6 +108,22 @@ describe('CLI command layer', () => {
     assert.match(resolveRunsDir({}), /\.tachiko-conductor/);
     assert.equal(resolveImplementationWorkspaceRoot({ TACHIKO_WORKSPACE_ROOT: '/tmp/worktrees' }), '/tmp/worktrees');
     assert.match(resolveImplementationWorkspaceRoot({}), /\.tachiko-conductor.*workspaces/);
+  });
+
+  it('uses the Git top-level for workflow bootstrap even when invoked from a subdirectory', () => {
+    assert.equal(
+      resolveWorkflowRepositoryRoot('/work/repository/src', (cwd) => {
+        assert.equal(cwd, '/work/repository/src');
+        return '/work/repository';
+      }),
+      '/work/repository',
+    );
+    assert.equal(
+      resolveWorkflowRepositoryRoot('/manual/pr-only', () => {
+        throw new Error('not a checkout');
+      }),
+      '/manual/pr-only',
+    );
   });
 
   it('resolves the implementation provider and explicit Codex execution config without choosing a model', () => {
@@ -326,7 +343,7 @@ describe('workflow run and resume commands', () => {
     return {
       repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
       issue: { id: 'I_42', number: 42, title: 'Fix the widget', body: 'DoR-ready.', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
-      pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha: 'base' },
+      pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha: 'base', headRef: 'tachiko/issue-42', headRepository: { owner: 'acme', repo: 'widgets' }, baseRef: 'main' },
       headSha,
       checks: { availability: 'available', overall: 'passing', checks: [] },
       reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },

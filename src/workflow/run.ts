@@ -281,6 +281,23 @@ export async function runWorkflow(
             store.update(run);
             return { outcome: 'needs_human', run, reason };
           }
+          const bootstrapPrConflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (bootstrapPrConflict !== null) {
+            run = applyTransition(
+              run,
+              {
+                type: 'escalate',
+                reason: bootstrapPrConflict,
+                interrupt: {
+                  evidence: bootstrapPrConflict,
+                  choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+                },
+              },
+              now(),
+            );
+            store.update(run);
+            return { outcome: 'needs_human', run, reason: bootstrapPrConflict };
+          }
           if (snapshot.pullRequest !== null) {
             if (deps.bootstrap === undefined || snapshot.headSha === null) {
               return bootstrapFailureOutcome(
@@ -291,7 +308,11 @@ export async function runWorkflow(
               );
             }
             try {
-              await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha });
+              await deps.bootstrap.verifyDurable({
+                identity: bootstrap,
+                expectedHeadSha: snapshot.headSha,
+                ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
+              });
             } catch (error) {
               return bootstrapFailureOutcome(run, error, store, now);
             }
@@ -397,7 +418,11 @@ export async function runWorkflow(
             );
           }
           try {
-            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha ?? '' });
+            await deps.bootstrap.verifyDurable({
+              identity: bootstrap,
+              expectedHeadSha: result.headSha ?? '',
+              ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
+            });
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now, result.executor);
           }

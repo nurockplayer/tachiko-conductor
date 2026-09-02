@@ -60,7 +60,7 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
       createdAt: T0,
       updatedAt: T0,
     },
-    pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha },
+    pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha, headRef: 'tachiko/issue-42', headRepository: { owner: 'acme', repo: 'widgets' }, baseRef: 'main' },
     headSha,
     checks: { availability: 'available', overall: 'passing', checks: [] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
@@ -413,6 +413,7 @@ describe('runWorkflow', () => {
     assert.equal(bootstrap.prepareRequests.length, 1);
     assert.equal(bootstrap.planRequests.length, 1);
     assert.equal(bootstrap.verifyRequests.length, 1);
+    assert.equal(bootstrap.verifyRequests[0]?.workspaceGuard, implementation.requests[0]?.workspaceGuard);
     assert.equal(result.run.bootstrap?.baseSha, 'base');
     assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
   });
@@ -440,28 +441,37 @@ describe('runWorkflow', () => {
     assert.equal(bootstrap.verifyRequests[0]?.expectedHeadSha, HEAD);
   });
 
-  it('fails closed when a PR appearing during bootstrap recovery is not the owned durable branch', async () => {
-    const store = new MemoryStore();
-    store.create(createRun(TARGET, T0, 'run-unrelated-pr-appeared'));
-    const bootstrap = new FakeBootstrap(new Error('pull request HEAD is not the owned bootstrap branch'));
-    const implementation = new FakeImplementation([]);
+  it('fails closed for same-SHA PRs from a different branch or fork during bootstrap recovery', async () => {
+    const cases = [
+      { name: 'branch', pullRequest: { headRef: 'unrelated-branch' } },
+      { name: 'fork', pullRequest: { headRepository: { owner: 'someone-else', repo: 'widgets' } } },
+    ] as const;
+    for (const testCase of cases) {
+      const store = new MemoryStore();
+      const runId = `run-unrelated-pr-${testCase.name}`;
+      store.create(createRun(TARGET, T0, runId));
+      const bootstrap = new FakeBootstrap();
+      const implementation = new FakeImplementation([]);
+      let reads = 0;
+      const github = githubAdapter([]);
+      github.readLiveSnapshot = async () => {
+        reads += 1;
+        if (reads === 1) return { ...snapshot(HEAD), headSha: null, pullRequest: null };
+        const live = snapshot(HEAD);
+        return { ...live, pullRequest: { ...live.pullRequest!, ...testCase.pullRequest } };
+      };
 
-    const result = await runWorkflow(
-      {
-        store,
-        github: githubAdapter([null, HEAD]),
-        bootstrap,
-        implementation,
-        reviewer: new FakeReviewer([]),
-      },
-      'run-unrelated-pr-appeared',
-      { maxReviewAttempts: 3, now: () => T0 },
-    );
+      const result = await runWorkflow(
+        { store, github, bootstrap, implementation, reviewer: new FakeReviewer([]) },
+        runId,
+        { maxReviewAttempts: 3, now: () => T0 },
+      );
 
-    assert.equal(result.outcome, 'needs_human');
-    assert.match(result.reason, /not the owned bootstrap branch/);
-    assert.equal(implementation.requests.length, 0);
-    assert.equal(bootstrap.verifyRequests.length, 1);
+      assert.equal(result.outcome, 'needs_human');
+      assert.match(result.reason, /but this run owns/);
+      assert.equal(implementation.requests.length, 0);
+      assert.equal(bootstrap.verifyRequests.length, 0);
+    }
   });
 
   it('fails closed when validation reports a HEAD without an associated open PR identity', async () => {

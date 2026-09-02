@@ -302,7 +302,11 @@ export async function runReviewLoop(
           );
         }
         try {
-          await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: fixResult.headSha });
+          await deps.bootstrap.verifyDurable({
+            identity: bootstrap,
+            expectedHeadSha: fixResult.headSha,
+            ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
+          });
         } catch (error) {
           return parkBootstrapFailure(run, error, store, now, fixResult.executor);
         }

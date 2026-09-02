@@ -91,6 +91,28 @@ describe('ClaudeCodeAdapter', () => {
     assert.equal(runner.calls.length, 0);
   });
 
+  it('keeps the workspace guard pinned through Claude and post-run HEAD discovery', async () => {
+    const runner = new FakeRunner([result(claudeJson('implemented')), result(HEAD)]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/source' });
+    let assertions = 0;
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      workspacePath: '/tmp/prepared-worktree',
+      workspaceGuard: {
+        assertValid() {
+          assertions += 1;
+          if (assertions === 3) throw new Error('workspace replaced during HEAD read');
+        },
+      },
+    });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CLAUDE_EXEC_FAILURE/);
+    assert.equal(runner.calls.length, 2);
+  });
+
   it('maps a non-zero claude exit to a deterministic failure without reading git', async () => {
     const runner = new FakeRunner([result('', 'claude crashed', 1)]);
     const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });

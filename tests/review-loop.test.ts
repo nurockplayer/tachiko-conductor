@@ -73,7 +73,7 @@ function snapshot(headSha: string | null): GitHubLiveSnapshot {
     pullRequest:
       headSha === null
         ? null
-        : { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: null, updatedAt: '', headSha, baseSha: 'base' },
+        : { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: null, updatedAt: '', headSha, baseSha: 'base', headRef: 'tachiko/issue-42', headRepository: { owner: 'acme', repo: 'widgets' }, baseRef: 'main' },
     headSha,
     checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: null },
@@ -128,6 +128,7 @@ class FakeImplementation implements ImplementationAgent {
     executor: ImplementationRequest['executor'];
     workspacePath: string | undefined;
     branch: string | undefined;
+    workspaceGuard: ImplementationRequest['workspaceGuard'];
   }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
@@ -140,6 +141,7 @@ class FakeImplementation implements ImplementationAgent {
       executor: request.executor,
       workspacePath: request.workspacePath,
       branch: request.branch,
+      workspaceGuard: request.workspaceGuard,
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
@@ -204,6 +206,37 @@ describe('runReviewLoop', () => {
 
     assert.equal(outcome.outcome, 'needs_human');
     assert.match(outcome.reason, /pull request #8.*pull request #7/i);
+    assert.equal(reviewer.requests.length, 0);
+  });
+
+  it('refuses to review a same-SHA fork PR when the run owns a bootstrap branch', async () => {
+    const store = new MemoryStore();
+    const bootstrap = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'd'.repeat(40),
+      branch: 'tachiko/issue-42', workspacePath: '/tmp/tachiko/run-1',
+    } as const;
+    store.create({ ...reviewingRun(), bootstrap });
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => {
+      const live = snapshot(HEAD);
+      return {
+        ...live,
+        pullRequest: {
+          ...live.pullRequest!,
+          headRepository: { owner: 'someone-else', repo: 'widgets' },
+        },
+      };
+    };
+    const reviewer = new FakeReviewer([approve(HEAD)]);
+
+    const outcome = await runReviewLoop(
+      { store, github, implementation: new FakeImplementation([]), reviewer },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /but this run owns/);
     assert.equal(reviewer.requests.length, 0);
   });
 
@@ -300,6 +333,7 @@ describe('runReviewLoop', () => {
     assert.equal(bootstrap.verifyRequests[0]?.expectedHeadSha, HEAD2);
     assert.equal(implementation.requests[0]?.workspacePath, bootstrapIdentity.workspacePath);
     assert.equal(implementation.requests[0]?.branch, bootstrapIdentity.branch);
+    assert.equal(bootstrap.verifyRequests[0]?.workspaceGuard, implementation.requests[0]?.workspaceGuard);
     assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD2 });
   });
 

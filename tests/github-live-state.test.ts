@@ -98,8 +98,8 @@ function pull(
     mergeable_state: 'clean',
     updated_at: '2026-08-14T02:00:00.000Z',
     merged_at: null,
-    head: { sha: headSha },
-    base: { sha: BASE },
+    head: { sha: headSha, ref: 'tachiko/issue-42', repo: { name: 'widgets', owner: { login: 'acme' } } },
+    base: { sha: BASE, ref: 'main' },
     ...overrides,
   };
 }
@@ -269,6 +269,9 @@ PR: #7`;
 
     assert.equal(snapshot.pullRequest?.number, 7);
     assert.equal(snapshot.pullRequest?.headSha, HEAD);
+    assert.equal(snapshot.pullRequest?.headRef, 'tachiko/issue-42');
+    assert.deepEqual(snapshot.pullRequest?.headRepository, { owner: 'acme', repo: 'widgets' });
+    assert.equal(snapshot.pullRequest?.baseRef, 'main');
     assert.equal(snapshot.pullRequest?.mergeStateStatus, 'clean');
     assert.equal(snapshot.headSha, HEAD);
     assert.equal(snapshot.checks.availability, 'available');
@@ -448,6 +451,17 @@ PR: #7`;
       'repos/acme/widgets/pulls/7',
       pull(7, HEAD),
       pull(7, BASE),
+    );
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    await expectError(adapter.readLiveSnapshot(TARGET), 'GH_SNAPSHOT_CHANGED', true);
+  });
+
+  it('refuses a snapshot whose PR branch identity changes at the same HEAD during re-read', async () => {
+    const transport = prTransport().queue(
+      'repos/acme/widgets/pulls/7',
+      pull(7, HEAD),
+      pull(7, HEAD, { head: { sha: HEAD, ref: 'replacement', repo: { name: 'widgets', owner: { login: 'acme' } } } }),
     );
     const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
 

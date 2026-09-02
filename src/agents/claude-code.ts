@@ -136,6 +136,16 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       };
     }
     const head = await this.readHead(request.signal, cwd);
+    try {
+      request.workspaceGuard?.assertValid();
+    } catch (error) {
+      return failureAgentResult(
+        CLAUDE_ERROR_CODE.EXEC_FAILURE,
+        `Prepared workspace identity changed before exact-HEAD verification: ${message(error)}`,
+        outcome.durationMs,
+        outcome.sessionId,
+      ).agentResult;
+    }
     if (isAborted(request.signal)) {
       return cancelledAgentResult(outcome.durationMs, outcome.sessionId);
     }
@@ -221,6 +231,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     try {
       workspaceGuard?.assertValid();
       result = await this.runner.run('claude', args, processOptions(this.timeoutMs, cwd, signal));
+      workspaceGuard?.assertValid();
     } catch (error) {
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);

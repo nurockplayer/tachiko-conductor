@@ -29,7 +29,7 @@ function liveSnapshot(headSha: string = HEAD): GitHubLiveSnapshot {
       createdAt: '2026-08-14T00:00:00.000Z',
       updatedAt: '2026-08-14T00:00:00.000Z',
     },
-    pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: null, updatedAt: '', headSha, baseSha: 'base' },
+    pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: null, updatedAt: '', headSha, baseSha: 'base', headRef: 'tachiko/issue-42', headRepository: { owner: 'acme', repo: 'widgets' }, baseRef: 'main' },
     headSha,
     checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: null },

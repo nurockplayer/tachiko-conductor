@@ -100,6 +100,7 @@ export class CodexCliAdapter implements ImplementationAgent {
         this.buildArgs(prompt, request.capabilities ?? [], executor),
         this.processOptions(request.signal, cwd),
       );
+      request.workspaceGuard?.assertValid();
     } catch (error) {
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
@@ -158,6 +159,16 @@ export class CodexCliAdapter implements ImplementationAgent {
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
 
     const sha = await this.readHead(request.signal, cwd);
+    try {
+      request.workspaceGuard?.assertValid();
+    } catch (error) {
+      return failureAgentResult(
+        CODEX_ERROR_CODE.EXEC_FAILURE,
+        `Prepared workspace identity changed before exact-HEAD verification: ${errorMessage(error)}`,
+        durationMs,
+        parsed.outcome.executor,
+      );
+    }
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
     if (sha === null) {
       return failureAgentResult(

@@ -14,6 +14,8 @@ export type PlanImplementationBootstrapRequest = Omit<PrepareImplementationBoots
 export interface VerifyDurableImplementationRequest {
   readonly identity: ImplementationBootstrapIdentity;
   readonly expectedHeadSha: string;
+  /** Guard captured at preparation time, preserving inode continuity through execution. */
+  readonly workspaceGuard?: WorkspaceGuard;
 }
 
 export interface DurableImplementationSnapshot {

@@ -92,6 +92,28 @@ describe('CodexCliAdapter', () => {
     assert.equal(runner.calls.length, 0);
   });
 
+  it('keeps the workspace guard pinned through Codex and post-run HEAD discovery', async () => {
+    const runner = new FakeRunner([result(codexJsonl()), result(HEAD)]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/source' });
+    let assertions = 0;
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      workspacePath: '/tmp/prepared-worktree',
+      workspaceGuard: {
+        assertValid() {
+          assertions += 1;
+          if (assertions === 3) throw new Error('workspace replaced during HEAD read');
+        },
+      },
+    });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CODEX_EXEC_FAILURE/);
+    assert.equal(runner.calls.length, 2);
+  });
+
   it('resumes the exact persisted Codex thread without falling back to a fresh exec', async () => {
     const threadId = '0199a213-81c0-7800-8aa1-bbab2a035a53';
     const runner = new FakeRunner([result(codexJsonl('Fixed review findings.', threadId)), result(HEAD)]);
