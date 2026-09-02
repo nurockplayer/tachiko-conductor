@@ -140,7 +140,7 @@ export async function runWorkflow(
         const pendingReviewFix =
           run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
         const implementationIdentityConflict = pendingReviewFix
-          ? pullRequestIdentityConflict(run, snapshot)
+          ? pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true })
           : null;
         if (implementationIdentityConflict !== null) {
           run = applyTransition(
@@ -356,11 +356,13 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason: identityConflict };
         }
-        if (snapshot.headSha === null || snapshot.headSha !== run.headSha) {
+        const livePullRequest = snapshot.pullRequest;
+        if (livePullRequest === null || livePullRequest.state !== 'open' ||
+          snapshot.headSha === null || snapshot.headSha !== run.headSha || livePullRequest.headSha !== run.headSha) {
           const reason =
-            snapshot.headSha === null
+            livePullRequest === null || livePullRequest.state !== 'open' || snapshot.headSha === null
               ? `Implementation completed, but ${formatTarget(target)} still has no associated open pull request.`
-              : `Live GitHub HEAD ${snapshot.headSha} does not match the implementation HEAD ${run.headSha ?? '(none)'}.`;
+              : `Live pull request #${livePullRequest.number} HEAD ${livePullRequest.headSha} does not match the implementation HEAD ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
             run,
             {
@@ -369,7 +371,7 @@ export async function runWorkflow(
               interrupt: {
                 evidence: reason,
                 choices:
-                  snapshot.headSha === null
+                  livePullRequest === null || livePullRequest.state !== 'open' || snapshot.headSha === null
                     ? ['Open the implementation pull request and retry', CANCEL_RUN_DECISION]
                     : [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
               },
@@ -383,9 +385,7 @@ export async function runWorkflow(
           run,
           {
             type: 'validation_passed',
-            ...(snapshot.pullRequest === null ? {} : {
-              pullRequest: { number: snapshot.pullRequest.number, headSha: snapshot.pullRequest.headSha },
-            }),
+            pullRequest: { number: livePullRequest.number, headSha: livePullRequest.headSha },
           },
           now(),
         );
@@ -433,7 +433,7 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
-        const identityConflict = pullRequestIdentityConflict(run, snapshot);
+        const identityConflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
         if (identityConflict !== null) {
           run = applyTransition(
             run,

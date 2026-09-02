@@ -152,6 +152,63 @@ export async function runReviewLoop(
         return { outcome: 'failed', run, reason };
       }
 
+      let preFixSnapshot: Awaited<ReturnType<GitHubAdapter['readLiveSnapshot']>>;
+      try {
+        preFixSnapshot = await github.readLiveSnapshot(target);
+      } catch (error) {
+        const reason = renderFailure('GitHub live-state validation failed before the fix', error);
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason,
+            interrupt: {
+              evidence: reason,
+              choices: ['Retry after restoring GitHub access', CANCEL_RUN_DECISION],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason };
+      }
+      const preFixIdentityConflict = pullRequestIdentityConflict(run, preFixSnapshot, { allowHeadAdvance: true });
+      if (preFixIdentityConflict !== null) {
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason: preFixIdentityConflict,
+            interrupt: {
+              evidence: preFixIdentityConflict,
+              choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason: preFixIdentityConflict };
+      }
+      if (preFixSnapshot.headSha !== run.headSha) {
+        const reason = `Live GitHub HEAD ${preFixSnapshot.headSha ?? '(none)'} does not match the review-fix HEAD ${run.headSha ?? '(none)'}.`;
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason,
+            interrupt: {
+              evidence: reason,
+              choices: preFixSnapshot.headSha === null
+                ? [CANCEL_RUN_DECISION]
+                : [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason };
+      }
+
       run = applyTransition(run, { type: 'start_fix' }, now());
       store.update(run);
 
@@ -286,8 +343,12 @@ export async function runReviewLoop(
         store.update(run);
         return { outcome: 'needs_human', run, reason: identityConflict };
       }
-      if (validatedSnapshot.headSha !== fixResult.headSha) {
-        const reason = `Live GitHub HEAD ${validatedSnapshot.headSha ?? '(none)'} does not match the fix HEAD ${fixResult.headSha}.`;
+      const validatedPullRequest = validatedSnapshot.pullRequest;
+      if (validatedPullRequest === null || validatedPullRequest.state !== 'open' ||
+        validatedSnapshot.headSha !== fixResult.headSha || validatedPullRequest.headSha !== fixResult.headSha) {
+        const reason = validatedPullRequest === null || validatedPullRequest.state !== 'open'
+          ? `The fix completed, but ${formatTarget(target)} has no associated open pull request.`
+          : `Live pull request #${validatedPullRequest.number} HEAD ${validatedPullRequest.headSha} does not match the fix HEAD ${fixResult.headSha}.`;
         run = applyTransition(
           run,
           {
@@ -295,7 +356,7 @@ export async function runReviewLoop(
             reason,
             interrupt: {
               evidence: reason,
-              choices: validatedSnapshot.headSha === null
+              choices: validatedPullRequest === null || validatedPullRequest.state !== 'open' || validatedSnapshot.headSha === null
                 ? ['Open the implementation pull request and retry', CANCEL_RUN_DECISION]
                 : [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
             },
@@ -309,12 +370,10 @@ export async function runReviewLoop(
         run,
         {
           type: 'validation_passed',
-          ...(validatedSnapshot.pullRequest === null ? {} : {
-            pullRequest: {
-              number: validatedSnapshot.pullRequest.number,
-              headSha: validatedSnapshot.pullRequest.headSha,
-            },
-          }),
+          pullRequest: {
+            number: validatedPullRequest.number,
+            headSha: validatedPullRequest.headSha,
+          },
         },
         now(),
       );
@@ -365,7 +424,7 @@ export async function runReviewLoop(
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
     }
-    const identityConflict = pullRequestIdentityConflict(run, liveSnapshot);
+    const identityConflict = pullRequestIdentityConflict(run, liveSnapshot, { allowHeadAdvance: true });
     if (identityConflict !== null) {
       run = applyTransition(
         run,

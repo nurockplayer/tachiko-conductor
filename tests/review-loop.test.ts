@@ -203,7 +203,7 @@ describe('runReviewLoop', () => {
     assert.equal(reviewer.requests.length, 0);
   });
 
-  it('refuses a PR-number switch after a review fix even when the fix HEAD matches', async () => {
+  it('refuses a PR-number switch before invoking a review fix', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
     let reads = 0;
@@ -217,9 +217,10 @@ describe('runReviewLoop', () => {
       };
     };
     const reviewer = new FakeReviewer([requestChanges(HEAD)]);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const outcome = await runReviewLoop(
-      { store, github, implementation: new FakeImplementation([successResult(HEAD2)]), reviewer },
+      { store, github, implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -227,6 +228,7 @@ describe('runReviewLoop', () => {
     assert.equal(outcome.outcome, 'needs_human');
     assert.match(outcome.reason, /pull request #8.*pull request #7/i);
     assert.equal(reviewer.requests.length, 1);
+    assert.equal(implementation.requests.length, 0);
   });
 
   it('persists an approved review at FINAL_GATE for the final-gate workflow', async () => {
@@ -255,7 +257,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2, 'fixed')]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -280,7 +282,7 @@ describe('runReviewLoop', () => {
     const result = await runReviewLoop(
       {
         store,
-        github: githubAdapter([HEAD, HEAD2, HEAD2]),
+        github: githubAdapter([HEAD, HEAD, HEAD2, HEAD2]),
         bootstrap,
         implementation,
         reviewer: new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]),
@@ -311,7 +313,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -326,7 +328,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -350,7 +352,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -368,7 +370,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 2, now: () => T0 },
     );
@@ -425,7 +427,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 1, now: () => T0 },
     );
@@ -443,7 +445,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxAttempts: 2, now: () => T0 },
     );
@@ -497,7 +499,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([failureResult('agent crashed')]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -520,7 +522,7 @@ describe('runReviewLoop', () => {
     ]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -545,7 +547,7 @@ describe('runReviewLoop', () => {
 
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.match(result.reason, /does not match its persisted HEAD/);
+    assert.match(result.reason, /does not match the run HEAD/);
     assert.equal(reviewer.requests.length, 0);
   });
 

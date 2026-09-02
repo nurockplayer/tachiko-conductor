@@ -14,7 +14,7 @@ import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, ImplementationBootstrapIdentity, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
-import { runWorkflow } from '../src/workflow/run.js';
+import { runWorkflow, SYNC_LIVE_HEAD_DECISION } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { TARGET, failureResult, successResult } from './helpers.js';
 
@@ -183,7 +183,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -213,7 +213,7 @@ describe('runWorkflow', () => {
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]),
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]),
         implementation,
         reviewer,
         resolveImplementationCapabilities: async () => [capabilities[capabilityIndex++]!],
@@ -282,7 +282,7 @@ describe('runWorkflow', () => {
       successResult(HEAD2, 'fixed after takeover'),
     ]);
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
-    const github = githubAdapter([HEAD, HEAD, HEAD2, HEAD2, HEAD2]);
+    const github = githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]);
 
     const parked = await runReviewLoop(
       { store, github, implementation, reviewer },
@@ -316,7 +316,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 2, now: () => T0 },
     );
@@ -409,6 +409,34 @@ describe('runWorkflow', () => {
     assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
   });
 
+  it('fails closed when validation reports a HEAD without an associated open PR identity', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-inconsistent-pr'));
+    let reads = 0;
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => {
+      reads += 1;
+      if (reads === 1) return { ...snapshot(HEAD), headSha: null, pullRequest: null };
+      return { ...snapshot(HEAD), pullRequest: null };
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github,
+        bootstrap: new FakeBootstrap(),
+        implementation: new FakeImplementation([successResult(HEAD)]),
+        reviewer: new FakeReviewer([]),
+      },
+      'run-inconsistent-pr',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /no associated open pull request/);
+    assert.equal(result.run.pullRequest, undefined);
+  });
+
   it('recovers the same persisted bootstrap after branch creation without creating a duplicate identity', async () => {
     const store = new MemoryStore();
     const bootstrap = new FakeBootstrap();
@@ -440,6 +468,53 @@ describe('runWorkflow', () => {
     assert.deepEqual(bootstrap.prepareRequests[0]?.existing, identity);
     assert.equal(bootstrap.prepareRequests.length, 1);
     assert.deepEqual(result.run.bootstrap, identity);
+  });
+
+  it('recovers the persisted bootstrap after the commit-and-push checkpoint but before PR creation', async () => {
+    const store = new MemoryStore();
+    const planner = new FakeBootstrap();
+    let run = applyTransition(createRun(TARGET, T0, 'run-commit-pushed'), { type: 'start' }, T0);
+    const identity = await planner.plan({
+      runId: run.id,
+      target: TARGET,
+      baseBranch: 'main',
+      baseSha: 'base',
+    });
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+    store.create(run);
+    let recoveredCommitPush = false;
+    const checkpointBootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap',
+      async plan() {
+        throw new Error('persisted planning must be reused');
+      },
+      async prepare(request) {
+        assert.deepEqual(request.existing, identity);
+        recoveredCommitPush = true;
+        return identity;
+      },
+      async verifyDurable(request) {
+        assert.equal(recoveredCommitPush, true);
+        assert.deepEqual(request.identity, identity);
+        return { headSha: request.expectedHeadSha, branch: identity.branch };
+      },
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([null, HEAD, HEAD, HEAD]),
+        bootstrap: checkpointBootstrap,
+        implementation: new FakeImplementation([successResult(HEAD)]),
+        reviewer: new FakeReviewer([approve(HEAD)]),
+      },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(recoveredCommitPush, true);
+    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
   });
 
   it('discovers an already-created PR before retry and reuses the persisted branch/workspace', async () => {
@@ -612,9 +687,74 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.deepEqual(result.run.interrupt?.choices, [
-      'Resolve the pull request identity conflict and retry',
+      SYNC_LIVE_HEAD_DECISION,
       'Cancel the run',
     ]);
+  });
+
+  it('syncs and freshly re-reviews a same-PR HEAD advance from the final gate', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'run-final-sync', HEAD);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    store.update(run);
+    const parked = await runWorkflow(
+      { store, github: githubAdapter([HEAD2]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+    assert.equal(parked.outcome, 'needs_human');
+    const resumed = applyTransition(
+      parked.run,
+      { type: 'human_resolved', reason: SYNC_LIVE_HEAD_DECISION, headSha: HEAD2 },
+      T0,
+    );
+    store.update(resumed);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD2, HEAD2, HEAD2]),
+        implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([approve(HEAD2)]),
+      },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD2 });
+  });
+
+  it('syncs and freshly reviews a same-PR HEAD advance observed before review', async () => {
+    const store = new MemoryStore();
+    const run = reviewingRun(store, 'run-review-sync', HEAD);
+    const parked = await runWorkflow(
+      { store, github: githubAdapter([HEAD2]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+    assert.equal(parked.outcome, 'needs_human');
+    assert.deepEqual(parked.run.interrupt?.choices, [SYNC_LIVE_HEAD_DECISION, 'Cancel the run']);
+    const resumed = applyTransition(
+      parked.run,
+      { type: 'human_resolved', reason: SYNC_LIVE_HEAD_DECISION, headSha: HEAD2 },
+      T0,
+    );
+    store.update(resumed);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD2, HEAD2, HEAD2]),
+        implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([approve(HEAD2)]),
+      },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD2 });
   });
 
   it('never passes the final gate when live authority switches PR number at the approved HEAD', async () => {

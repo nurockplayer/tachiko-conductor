@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -21,6 +22,7 @@ import {
 const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
 const FULL_SHA = /^[0-9a-f]{40}$/i;
+const OWNED_BRANCH = /^tachiko\/issue-[1-9][0-9]*-[0-9a-f]{16}$/;
 
 export interface GitWorktreeBootstrapOptions {
   readonly repositoryRoot: string;
@@ -83,6 +85,11 @@ function canonicalizeFuturePath(input: string): string {
   return path.join(realpathSync(existing), ...missing);
 }
 
+function implementationBranch(issueNumber: number, runId: string): string {
+  const runKey = createHash('sha256').update(runId).digest('hex').slice(0, 16);
+  return `tachiko/issue-${issueNumber}-${runKey}`;
+}
+
 /** Git worktree implementation of the provider-neutral bootstrap boundary. */
 export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   readonly kind: 'implementation-bootstrap' = 'implementation-bootstrap';
@@ -91,6 +98,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   private readonly remote: string;
   private readonly runner: ProcessRunner;
   private readonly timeoutMs: number;
+  private readonly workspaceRootIdentity: string;
 
   constructor(options: GitWorktreeBootstrapOptions) {
     this.repositoryRoot = realpathSync(path.resolve(options.repositoryRoot));
@@ -105,6 +113,12 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     ) {
       throw bootstrapError('INVALID_REQUEST', 'Implementation workspace root must be outside the source repository.');
     }
+    mkdirSync(this.workspaceRoot, { recursive: true });
+    const workspaceRootStat = lstatSync(this.workspaceRoot, { bigint: true });
+    if (workspaceRootStat.isSymbolicLink() || realpathSync(this.workspaceRoot) !== this.workspaceRoot) {
+      throw bootstrapError('INVALID_REQUEST', 'Implementation workspace root must be a pinned canonical directory.');
+    }
+    this.workspaceRootIdentity = `${workspaceRootStat.dev}:${workspaceRootStat.ino}`;
   }
 
   async plan(request: PlanImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
@@ -112,6 +126,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     await this.assertRepository(request.target.owner, request.target.repo);
 
     const expected = this.expectedIdentity(request);
+    this.assertIdentity(expected);
     await this.assertLiveBase(request.baseBranch, request.baseSha);
     if (existsSync(expected.workspacePath)) {
       throw bootstrapError('COLLISION', `Implementation workspace already exists at ${expected.workspacePath}.`);
@@ -159,6 +174,12 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         `Implementation workspace HEAD ${headSha || '(none)'} does not match reported HEAD ${request.expectedHeadSha}.`,
       );
     }
+    if (headSha === identity.baseSha) {
+      throw bootstrapError(
+        'HEAD_MISMATCH',
+        `Implementation branch ${identity.branch} contains no committed progress beyond bootstrap base ${identity.baseSha}.`,
+      );
+    }
     const status = await this.git(['status', '--porcelain=v1', '--untracked-files=all'], identity.workspacePath);
     if (status.stdout.trim() !== '') {
       throw bootstrapError(
@@ -190,7 +211,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   private expectedIdentity(
     request: PrepareImplementationBootstrapRequest | PlanImplementationBootstrapRequest,
   ): ImplementationBootstrapIdentity {
-    const branch = `tachiko/issue-${request.target.issueNumber}`;
+    const branch = implementationBranch(request.target.issueNumber, request.runId);
     const workspacePath = path.join(
       this.workspaceRoot,
       request.target.owner,
@@ -226,7 +247,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       !SAFE_COMPONENT.test(identity.repo) ||
       !Number.isSafeInteger(identity.issueNumber) ||
       identity.issueNumber < 1 ||
-      identity.branch !== `tachiko/issue-${identity.issueNumber}` ||
+      !OWNED_BRANCH.test(identity.branch) ||
       identity.baseBranch.trim() === '' ||
       !FULL_SHA.test(identity.baseSha) ||
       rootRelative === '' ||
@@ -272,7 +293,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       }
       await this.assertLiveBase(identity.baseBranch, liveBaseSha);
       await this.git(['cat-file', '-e', `${identity.baseSha}^{commit}`], this.repositoryRoot);
+      this.assertPinnedWorkspaceRoot();
       mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
+      this.assertPinnedWorkspaceRoot();
+      this.assertIdentity(identity);
       await this.git(
         ['worktree', 'add', '-b', identity.branch, identity.workspacePath, identity.baseSha],
         this.repositoryRoot,
@@ -298,7 +322,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       await this.assertWorkspace(identity, recoveredSha);
       return;
     }
+    this.assertPinnedWorkspaceRoot();
     mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
+    this.assertPinnedWorkspaceRoot();
+    this.assertIdentity(identity);
     if (localSha !== null) {
       await this.git(['worktree', 'add', identity.workspacePath, identity.branch], this.repositoryRoot);
     } else {
@@ -323,6 +350,22 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       throw bootstrapError(
         'STALE_IDENTITY',
         `Workspace ${identity.workspacePath} is not the expected ${identity.branch} worktree.`,
+      );
+    }
+  }
+
+  private assertPinnedWorkspaceRoot(): void {
+    try {
+      const rootStat = lstatSync(this.workspaceRoot, { bigint: true });
+      const identity = `${rootStat.dev}:${rootStat.ino}`;
+      if (rootStat.isSymbolicLink() || identity !== this.workspaceRootIdentity ||
+        realpathSync(this.workspaceRoot) !== this.workspaceRoot) {
+        throw new Error('identity changed');
+      }
+    } catch {
+      throw bootstrapError(
+        'COLLISION',
+        `Implementation workspace root ${this.workspaceRoot} changed after it was pinned; refusing filesystem mutation.`,
       );
     }
   }

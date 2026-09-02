@@ -200,8 +200,8 @@ same directory resumes the run exactly where it stopped.
 For a Ready Issue with no associated PR, GitHub supplies the live default
 branch and exact base SHA. Conductor first performs collision checks and
 persists the planned `Run.bootstrap` identity; only then may it create or
-restore `tachiko/issue-<number>` in an isolated worktree. Agent success is
-rejected unless the worktree is clean, its exact HEAD descends from the
+restore `tachiko/issue-<number>-<run-key>` in an isolated worktree. Agent
+success is rejected unless the worktree is clean, its exact HEAD descends from the
 recorded base, and the same HEAD is pushed to the owned remote branch. The
 next live GitHub read must discover exactly one associated open PR at that
 HEAD before review begins. Existing PR-driven runs skip bootstrap mechanics
