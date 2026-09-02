@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
@@ -15,6 +15,7 @@ import { TARGET } from './helpers.js';
 
 const BASE = 'a'.repeat(40);
 const HEAD = 'b'.repeat(40);
+const OTHER = 'c'.repeat(40);
 const tempDirs: string[] = [];
 
 interface GitCall {
@@ -58,6 +59,16 @@ afterEach(() => {
 });
 
 describe('GitWorktreeBootstrap', () => {
+  it('rejects a workspace-root symlink that canonically enters the source repository', () => {
+    const roots = tempRoots();
+    symlinkSync(roots.repositoryRoot, roots.workspaceRoot, 'dir');
+
+    assert.throws(
+      () => new GitWorktreeBootstrap(roots),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.INVALID_REQUEST),
+    );
+  });
+
   it('boots and verifies durable state against a real local Git remote', async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-integration-'));
     tempDirs.push(root);
@@ -139,7 +150,10 @@ describe('GitWorktreeBootstrap', () => {
 
     assert.equal(identity.branch, 'tachiko/issue-42');
     assert.equal(identity.baseSha, BASE);
-    assert.equal(identity.workspacePath, path.join(roots.workspaceRoot, 'acme', 'widgets', 'run-42-issue-42'));
+    assert.equal(
+      identity.workspacePath,
+      path.join(realpathSync(path.dirname(roots.workspaceRoot)), 'workspaces', 'acme', 'widgets', 'run-42-issue-42'),
+    );
     assert.deepEqual(
       runner.calls.find((call) => call.args[0] === 'worktree')?.args,
       ['worktree', 'add', '-b', 'tachiko/issue-42', identity.workspacePath, BASE],
@@ -164,6 +178,29 @@ describe('GitWorktreeBootstrap', () => {
     assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
   });
 
+  it('fails stale persisted planning after a crash when no durable Git state exists', async () => {
+    const roots = tempRoots();
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('https://github.com/acme/widgets.git\n');
+      if (command === 'fetch --no-tags origin refs/heads/main') return result();
+      if (command === 'rev-parse FETCH_HEAD') return result(`${BASE}\n`);
+      if (command.startsWith('show-ref --verify --quiet')) return result('', 1);
+      if (command.startsWith('ls-remote --heads')) return result();
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const planned = await bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE });
+
+    await assert.rejects(
+      bootstrap.prepare({
+        runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: HEAD, existing: planned,
+      }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.BASE_DRIFT),
+    );
+    assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
+  });
+
   it('rejects an unowned local or remote branch collision before creating a workspace', async () => {
     const roots = tempRoots();
     const runner = new FakeGitRunner((args) => {
@@ -182,6 +219,65 @@ describe('GitWorktreeBootstrap', () => {
     );
   });
 
+  it('fails closed when local and remote recovery branches diverge', async () => {
+    const roots = tempRoots();
+    let recovering = false;
+    let fetchedFeature = false;
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command === 'fetch --no-tags origin refs/heads/main') {
+        fetchedFeature = false;
+        return result();
+      }
+      if (command === 'rev-parse FETCH_HEAD') return result(`${fetchedFeature ? OTHER : BASE}\n`);
+      if (command.startsWith('show-ref --verify --quiet')) return result('', recovering ? 0 : 1);
+      if (command === 'rev-parse refs/heads/tachiko/issue-42') return result(`${HEAD}\n`);
+      if (command === 'ls-remote --heads origin refs/heads/tachiko/issue-42') {
+        return recovering ? result(`${OTHER}\trefs/heads/tachiko/issue-42\n`) : result();
+      }
+      if (command === 'fetch --no-tags origin refs/heads/tachiko/issue-42') {
+        fetchedFeature = true;
+        return result();
+      }
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const planned = await bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE });
+    recovering = true;
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing: planned }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.COLLISION),
+    );
+    assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
+  });
+
+  it('fails closed when a recovery branch does not descend from the persisted base', async () => {
+    const roots = tempRoots();
+    let recovering = false;
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command === 'fetch --no-tags origin refs/heads/main') return result();
+      if (command === 'rev-parse FETCH_HEAD') return result(`${BASE}\n`);
+      if (command.startsWith('show-ref --verify --quiet')) return result('', recovering ? 0 : 1);
+      if (command === 'rev-parse refs/heads/tachiko/issue-42') return result(`${HEAD}\n`);
+      if (command === 'ls-remote --heads origin refs/heads/tachiko/issue-42') return result();
+      if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result('', 1);
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const planned = await bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE });
+    recovering = true;
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing: planned }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.COLLISION),
+    );
+    assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
+  });
+
   it('reuses a persisted identity after restart without creating a second branch or worktree', async () => {
     const roots = tempRoots();
     const workspacePath = path.join(roots.workspaceRoot, 'acme', 'widgets', 'run-42-issue-42');
@@ -189,8 +285,13 @@ describe('GitWorktreeBootstrap', () => {
     const runner = new FakeGitRunner((args) => {
       const command = args.join(' ');
       if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command.startsWith('show-ref --verify --quiet')) return result();
+      if (command === 'rev-parse refs/heads/tachiko/issue-42') return result(`${HEAD}\n`);
+      if (command === 'ls-remote --heads origin refs/heads/tachiko/issue-42') return result();
+      if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result();
       if (command === 'rev-parse --show-toplevel') return result(`${workspacePath}\n`);
       if (command === 'symbolic-ref --short HEAD') return result('tachiko/issue-42\n');
+      if (command === 'rev-parse HEAD') return result(`${HEAD}\n`);
       throw new Error(`Unexpected git call: ${command}`);
     });
     const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
@@ -232,12 +333,16 @@ describe('GitWorktreeBootstrap', () => {
       if (command === 'ls-remote --heads origin refs/heads/tachiko/issue-42') {
         return result(`${HEAD}\trefs/heads/tachiko/issue-42\n`);
       }
-      if (command === `worktree add -b tachiko/issue-42 ${workspacePath} origin/tachiko/issue-42`) {
+      if (command === 'fetch --no-tags origin refs/heads/tachiko/issue-42') return result();
+      if (command === 'rev-parse FETCH_HEAD') return result(`${HEAD}\n`);
+      if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result();
+      if (command === `worktree add -b tachiko/issue-42 ${workspacePath} ${HEAD}`) {
         mkdirSync(workspacePath, { recursive: true });
         return result();
       }
       if (command === 'rev-parse --show-toplevel') return result(`${workspacePath}\n`);
       if (command === 'symbolic-ref --short HEAD') return result('tachiko/issue-42\n');
+      if (command === 'rev-parse HEAD') return result(`${HEAD}\n`);
       throw new Error(`Unexpected git call: ${command}`);
     });
     const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });

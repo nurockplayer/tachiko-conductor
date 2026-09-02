@@ -12,6 +12,7 @@ import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decision
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { parkBootstrapFailure } from './bootstrap-failure.js';
+import { pullRequestIdentityConflict } from './pull-request-identity.js';
 
 export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
@@ -138,6 +139,25 @@ export async function runWorkflow(
         }
         const pendingReviewFix =
           run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
+        const implementationIdentityConflict = pendingReviewFix
+          ? pullRequestIdentityConflict(run, snapshot)
+          : null;
+        if (implementationIdentityConflict !== null) {
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason: implementationIdentityConflict,
+              interrupt: {
+                evidence: implementationIdentityConflict,
+                choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason: implementationIdentityConflict };
+        }
         if (pendingReviewFix && snapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
@@ -319,6 +339,23 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        const identityConflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+        if (identityConflict !== null) {
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason: identityConflict,
+              interrupt: {
+                evidence: identityConflict,
+                choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason: identityConflict };
+        }
         if (snapshot.headSha === null || snapshot.headSha !== run.headSha) {
           const reason =
             snapshot.headSha === null
@@ -395,6 +432,23 @@ export async function runWorkflow(
           snapshot = await github.readLiveSnapshot(target);
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
+        }
+        const identityConflict = pullRequestIdentityConflict(run, snapshot);
+        if (identityConflict !== null) {
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason: identityConflict,
+              interrupt: {
+                evidence: identityConflict,
+                choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason: identityConflict };
         }
         if (snapshot.headSha !== run.headSha) {
           const reason = `Final gate observed live GitHub HEAD ${snapshot.headSha ?? '(none)'} but the approved run HEAD is ${run.headSha ?? '(none)'}.`;

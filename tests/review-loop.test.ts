@@ -53,7 +53,7 @@ function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string): Run {
   run = applyTransition(run, { type: 'start' }, T0);
   const agentResult = { ...successResult(headSha), ...(sessionId === undefined ? {} : { sessionId }) };
   run = applyTransition(run, { type: 'agent_succeeded', agentResult, headSha }, T0);
-  run = applyTransition(run, { type: 'validation_passed' }, T0);
+  run = applyTransition(run, { type: 'validation_passed', pullRequest: { number: 7, headSha } }, T0);
   return run;
 }
 
@@ -182,6 +182,53 @@ function approve(headSha: string): ReviewResult {
 }
 
 describe('runReviewLoop', () => {
+  it('refuses to review a different pull request even when it has the same HEAD', async () => {
+    const store = new MemoryStore();
+    store.create(reviewingRun());
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      pullRequest: { ...snapshot(HEAD).pullRequest!, id: 'PR_8', number: 8 },
+    });
+    const reviewer = new FakeReviewer([approve(HEAD)]);
+
+    const outcome = await runReviewLoop(
+      { store, github, implementation: new FakeImplementation([]), reviewer },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /pull request #8.*pull request #7/i);
+    assert.equal(reviewer.requests.length, 0);
+  });
+
+  it('refuses a PR-number switch after a review fix even when the fix HEAD matches', async () => {
+    const store = new MemoryStore();
+    store.create(reviewingRun());
+    let reads = 0;
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => {
+      reads += 1;
+      if (reads === 1) return snapshot(HEAD);
+      return {
+        ...snapshot(HEAD2),
+        pullRequest: { ...snapshot(HEAD2).pullRequest!, id: 'PR_8', number: 8 },
+      };
+    };
+    const reviewer = new FakeReviewer([requestChanges(HEAD)]);
+
+    const outcome = await runReviewLoop(
+      { store, github, implementation: new FakeImplementation([successResult(HEAD2)]), reviewer },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /pull request #8.*pull request #7/i);
+    assert.equal(reviewer.requests.length, 1);
+  });
+
   it('persists an approved review at FINAL_GATE for the final-gate workflow', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
@@ -498,7 +545,7 @@ describe('runReviewLoop', () => {
 
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.match(result.reason, /does not match the run HEAD/);
+    assert.match(result.reason, /does not match its persisted HEAD/);
     assert.equal(reviewer.requests.length, 0);
   });
 
@@ -516,9 +563,9 @@ describe('runReviewLoop', () => {
 
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.match(result.reason, /No live PR HEAD/);
+    assert.match(result.reason, /no longer has persisted pull request #7/i);
     assert.deepEqual(result.run.interrupt?.choices, [
-      'Open the implementation pull request and retry',
+      'Resolve the pull request identity conflict and retry',
       'Cancel the run',
     ]);
   });

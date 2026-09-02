@@ -170,7 +170,7 @@ function reviewingRun(store: RunStore, id = 'run-1', headSha = HEAD): Run {
   let run = createRun(TARGET, T0, id);
   run = applyTransition(run, { type: 'start' }, T0);
   run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha }, T0);
-  run = applyTransition(run, { type: 'validation_passed' }, T0);
+  run = applyTransition(run, { type: 'validation_passed', pullRequest: { number: 7, headSha } }, T0);
   store.create(run);
   return run;
 }
@@ -612,9 +612,30 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.deepEqual(result.run.interrupt?.choices, [
-      'Sync the run to the live HEAD and continue',
+      'Resolve the pull request identity conflict and retry',
       'Cancel the run',
     ]);
+  });
+
+  it('never passes the final gate when live authority switches PR number at the approved HEAD', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'run-pr-switch', HEAD);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    store.update(run);
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      pullRequest: { ...snapshot(HEAD).pullRequest!, id: 'PR_8', number: 8 },
+    });
+
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      'run-pr-switch',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /pull request #8.*pull request #7/i);
   });
 
   it('waits instead of declaring readiness while exact-HEAD checks are pending', async () => {

@@ -66,7 +66,21 @@ function identityMatches(
     actual.baseBranch === expected.baseBranch &&
     actual.baseSha === expected.baseSha &&
     actual.branch === expected.branch &&
-    actual.workspacePath === expected.workspacePath;
+    canonicalizeFuturePath(actual.workspacePath) === canonicalizeFuturePath(expected.workspacePath);
+}
+
+function canonicalizeFuturePath(input: string): string {
+  let existing = path.resolve(input);
+  const missing: string[] = [];
+  while (!existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) {
+      throw bootstrapError('INVALID_REQUEST', `Cannot resolve a canonical ancestor for ${input}.`);
+    }
+    missing.unshift(path.basename(existing));
+    existing = parent;
+  }
+  return path.join(realpathSync(existing), ...missing);
 }
 
 /** Git worktree implementation of the provider-neutral bootstrap boundary. */
@@ -79,8 +93,8 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   private readonly timeoutMs: number;
 
   constructor(options: GitWorktreeBootstrapOptions) {
-    this.repositoryRoot = path.resolve(options.repositoryRoot);
-    this.workspaceRoot = path.resolve(options.workspaceRoot);
+    this.repositoryRoot = realpathSync(path.resolve(options.repositoryRoot));
+    this.workspaceRoot = canonicalizeFuturePath(options.workspaceRoot);
     this.remote = options.remote ?? 'origin';
     this.runner = options.runner ?? new NodeProcessRunner();
     this.timeoutMs = options.timeoutMs ?? 30_000;
@@ -125,8 +139,8 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         'Persisted bootstrap identity does not match the target, branch, base, or workspace for this run.',
       );
     }
-    await this.restoreExisting(expected);
-    return expected;
+    await this.restoreExisting(request.existing, request.baseSha);
+    return request.existing;
   }
 
   async verifyDurable(request: VerifyDurableImplementationRequest): Promise<DurableImplementationSnapshot> {
@@ -207,7 +221,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   }
 
   private assertIdentity(identity: ImplementationBootstrapIdentity): void {
-    const rootRelative = path.relative(this.workspaceRoot, path.resolve(identity.workspacePath));
+    const rootRelative = path.relative(this.workspaceRoot, canonicalizeFuturePath(identity.workspacePath));
     if (!SAFE_COMPONENT.test(identity.owner) ||
       !SAFE_COMPONENT.test(identity.repo) ||
       !Number.isSafeInteger(identity.issueNumber) ||
@@ -244,15 +258,19 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     }
   }
 
-  private async restoreExisting(identity: ImplementationBootstrapIdentity): Promise<void> {
+  private async restoreExisting(identity: ImplementationBootstrapIdentity, liveBaseSha: string): Promise<void> {
     this.assertIdentity(identity);
-    if (existsSync(identity.workspacePath)) {
-      await this.assertWorkspace(identity);
-      return;
-    }
-    const local = await this.localBranchExists(identity.branch);
+    const hasWorkspace = existsSync(identity.workspacePath);
+    const localSha = await this.localBranchSha(identity.branch);
     const remoteSha = await this.remoteBranchSha(identity.branch);
-    if (!local && remoteSha === null) {
+    if (!hasWorkspace && localSha === null && remoteSha === null) {
+      if (identity.baseSha !== liveBaseSha) {
+        throw bootstrapError(
+          'BASE_DRIFT',
+          `Persisted bootstrap base ${identity.baseSha} is stale; live ${identity.baseBranch} is ${liveBaseSha} and no durable implementation state exists.`,
+        );
+      }
+      await this.assertLiveBase(identity.baseBranch, liveBaseSha);
       await this.git(['cat-file', '-e', `${identity.baseSha}^{commit}`], this.repositoryRoot);
       mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
       await this.git(
@@ -262,24 +280,46 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       await this.assertWorkspace(identity);
       return;
     }
+
+    if (remoteSha !== null) await this.fetchRemoteBranch(identity.branch, remoteSha);
+    if (localSha !== null && remoteSha !== null && localSha !== remoteSha) {
+      throw bootstrapError(
+        'COLLISION',
+        `Local ${identity.branch} at ${localSha} diverges from ${this.remote}/${identity.branch} at ${remoteSha}.`,
+      );
+    }
+    const recoveredSha = localSha ?? remoteSha;
+    if (recoveredSha === null) {
+      throw bootstrapError('STALE_IDENTITY', `Workspace ${identity.workspacePath} has no recoverable branch identity.`);
+    }
+    await this.assertDescendsFromBase(identity, recoveredSha);
+
+    if (hasWorkspace) {
+      await this.assertWorkspace(identity, recoveredSha);
+      return;
+    }
     mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
-    if (local) {
+    if (localSha !== null) {
       await this.git(['worktree', 'add', identity.workspacePath, identity.branch], this.repositoryRoot);
     } else {
       await this.git(
-        ['worktree', 'add', '-b', identity.branch, identity.workspacePath, `${this.remote}/${identity.branch}`],
+        ['worktree', 'add', '-b', identity.branch, identity.workspacePath, recoveredSha],
         this.repositoryRoot,
       );
     }
-    await this.assertWorkspace(identity);
+    await this.assertWorkspace(identity, recoveredSha);
   }
 
-  private async assertWorkspace(identity: ImplementationBootstrapIdentity): Promise<void> {
+  private async assertWorkspace(identity: ImplementationBootstrapIdentity, expectedHeadSha?: string): Promise<void> {
     this.assertIdentity(identity);
     const top = realpathSync(path.resolve((await this.git(['rev-parse', '--show-toplevel'], identity.workspacePath)).stdout.trim()));
     const expectedTop = realpathSync(identity.workspacePath);
     const branch = (await this.git(['symbolic-ref', '--short', 'HEAD'], identity.workspacePath)).stdout.trim();
-    if (top !== expectedTop || branch !== identity.branch) {
+    const headSha = expectedHeadSha === undefined
+      ? undefined
+      : (await this.git(['rev-parse', 'HEAD'], identity.workspacePath)).stdout.trim();
+    if (!this.isWithin(this.workspaceRoot, expectedTop) || top !== expectedTop || branch !== identity.branch ||
+      (expectedHeadSha !== undefined && headSha !== expectedHeadSha)) {
       throw bootstrapError(
         'STALE_IDENTITY',
         `Workspace ${identity.workspacePath} is not the expected ${identity.branch} worktree.`,
@@ -294,6 +334,40 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       [0, 1],
     );
     return result.exitCode === 0;
+  }
+
+  private async localBranchSha(branch: string): Promise<string | null> {
+    if (!await this.localBranchExists(branch)) return null;
+    const sha = (await this.git(['rev-parse', `refs/heads/${branch}`], this.repositoryRoot)).stdout.trim();
+    if (!FULL_SHA.test(sha)) {
+      throw bootstrapError('COMMAND_FAILED', `Git returned malformed local branch identity for ${branch}.`);
+    }
+    return sha;
+  }
+
+  private async fetchRemoteBranch(branch: string, expectedSha: string): Promise<void> {
+    await this.git(['fetch', '--no-tags', this.remote, `refs/heads/${branch}`], this.repositoryRoot);
+    const fetched = (await this.git(['rev-parse', 'FETCH_HEAD'], this.repositoryRoot)).stdout.trim();
+    if (fetched !== expectedSha) {
+      throw bootstrapError(
+        'COLLISION',
+        `Remote branch ${this.remote}/${branch} changed from ${expectedSha} to ${fetched || '(none)'} during recovery.`,
+      );
+    }
+  }
+
+  private async assertDescendsFromBase(identity: ImplementationBootstrapIdentity, headSha: string): Promise<void> {
+    const ancestry = await this.git(
+      ['merge-base', '--is-ancestor', identity.baseSha, headSha],
+      this.repositoryRoot,
+      [0, 1],
+    );
+    if (ancestry.exitCode !== 0) {
+      throw bootstrapError(
+        'COLLISION',
+        `Recovered branch ${identity.branch} at ${headSha} does not descend from persisted base ${identity.baseSha}.`,
+      );
+    }
   }
 
   private async remoteBranchSha(branch: string): Promise<string | null> {

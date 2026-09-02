@@ -11,6 +11,7 @@ import type { ExecutorIdentity, ReviewResult, Run, Target } from '../domain/type
 import type { RunStore } from '../store/json-file-store.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { parkBootstrapFailure as persistBootstrapFailure } from '../workflow/bootstrap-failure.js';
+import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
@@ -268,6 +269,23 @@ export async function runReviewLoop(
         store.update(run);
         return { outcome: 'needs_human', run, reason };
       }
+      const identityConflict = pullRequestIdentityConflict(run, validatedSnapshot, { allowHeadAdvance: true });
+      if (identityConflict !== null) {
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate',
+            reason: identityConflict,
+            interrupt: {
+              evidence: identityConflict,
+              choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason: identityConflict };
+      }
       if (validatedSnapshot.headSha !== fixResult.headSha) {
         const reason = `Live GitHub HEAD ${validatedSnapshot.headSha ?? '(none)'} does not match the fix HEAD ${fixResult.headSha}.`;
         run = applyTransition(
@@ -322,9 +340,9 @@ export async function runReviewLoop(
       return { outcome: 'needs_human', run, reason };
     }
 
-    let liveHead: string | null;
+    let liveSnapshot: Awaited<ReturnType<GitHubAdapter['readLiveSnapshot']>>;
     try {
-      liveHead = (await github.readLiveSnapshot(target)).headSha;
+      liveSnapshot = await github.readLiveSnapshot(target);
     } catch (error) {
       const reason = renderFailure('GitHub live-state validation failed', error);
       const type = isRetryable(error) ? 'escalate' : 'fail';
@@ -347,6 +365,24 @@ export async function runReviewLoop(
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
     }
+    const identityConflict = pullRequestIdentityConflict(run, liveSnapshot);
+    if (identityConflict !== null) {
+      run = applyTransition(
+        run,
+        {
+          type: 'escalate',
+          reason: identityConflict,
+          interrupt: {
+            evidence: identityConflict,
+            choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+          },
+        },
+        now(),
+      );
+      store.update(run);
+      return { outcome: 'needs_human', run, reason: identityConflict };
+    }
+    const liveHead = liveSnapshot.headSha;
     if (liveHead === null || liveHead !== run.headSha) {
       const reason =
         liveHead === null
