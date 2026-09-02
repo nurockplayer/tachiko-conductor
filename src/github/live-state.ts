@@ -322,7 +322,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
         rereadLive.headRef !== live.headRef ||
         rereadLive.headRepository?.owner !== live.headRepository?.owner ||
         rereadLive.headRepository?.repo !== live.headRepository?.repo ||
-        rereadLive.baseRef !== live.baseRef
+        rereadLive.baseRef !== live.baseRef ||
+        rereadLive.baseSha !== live.baseSha
       ) {
         throw new GitHubLiveStateError(
           'GH_SNAPSHOT_CHANGED',

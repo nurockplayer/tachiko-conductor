@@ -468,6 +468,17 @@ PR: #7`;
     await expectError(adapter.readLiveSnapshot(TARGET), 'GH_SNAPSHOT_CHANGED', true);
   });
 
+  it('refuses a snapshot whose PR base SHA changes during re-read', async () => {
+    const transport = prTransport().queue(
+      'repos/acme/widgets/pulls/7',
+      pull(7, HEAD),
+      pull(7, HEAD, { base: { sha: HEAD, ref: 'main' } }),
+    );
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    await expectError(adapter.readLiveSnapshot(TARGET), 'GH_SNAPSHOT_CHANGED', true);
+  });
+
   it('propagates a transport failure without returning a partial snapshot', async () => {
     const transport = prTransport().fault(
       'repos/acme/widgets/commits/' + HEAD + '/status',

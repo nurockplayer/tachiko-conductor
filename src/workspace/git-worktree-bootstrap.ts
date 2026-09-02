@@ -146,6 +146,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   private readonly runner: ProcessRunner;
   private readonly timeoutMs: number;
   private readonly workspaceRootIdentity: string;
+  private readonly preparedWorkspacePins = new Map<string, readonly DirectoryPin[]>();
 
   constructor(options: GitWorktreeBootstrapOptions) {
     this.repositoryRoot = realpathSync(path.resolve(options.repositoryRoot));
@@ -203,12 +204,14 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     const entryPins = this.pinPresentWorkspacePath(request.existing);
     await this.assertRepository(request.target.owner, request.target.repo);
     this.assertWorkspacePathSnapshot(request.existing, entryPins);
-    await this.restoreExisting(request.existing, request.baseSha, entryPins);
+    const pins = await this.restoreExisting(request.existing, request.baseSha, entryPins);
+    this.preparedWorkspacePins.set(this.workspaceKey(request.existing), pins);
     return request.existing;
   }
 
   guard(identity: ImplementationBootstrapIdentity): WorkspaceGuard {
-    const pins = this.pinExistingWorkspace(identity);
+    const pins = this.preparedWorkspacePins.get(this.workspaceKey(identity)) ?? this.pinExistingWorkspace(identity);
+    this.assertWorkspaceParents(pins);
     return { assertValid: () => this.assertWorkspaceParents(pins) };
   }
 
@@ -376,7 +379,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     identity: ImplementationBootstrapIdentity,
     liveBaseSha: string,
     initialPins: readonly DirectoryPin[],
-  ): Promise<void> {
+  ): Promise<readonly DirectoryPin[]> {
     this.assertIdentity(identity);
     this.assertWorkspacePathSnapshot(identity, initialPins);
     const hasWorkspace = existsSync(identity.workspacePath);
@@ -394,17 +397,20 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       await this.assertLiveBase(identity.baseBranch, liveBaseSha);
       this.assertWorkspacePathSnapshot(identity, initialPins);
       const parentPins = this.ensureWorkspaceParents(identity);
-      await this.git(['cat-file', '-e', `${identity.baseSha}^{commit}`], this.repositoryRoot);
+      const gitDirectory = await this.resolveGitDirectory();
       this.assertWorkspaceParents(parentPins);
+      const workspacePins = this.reserveWorkspaceDirectory(identity, parentPins);
+      await this.git(['cat-file', '-e', `${identity.baseSha}^{commit}`], this.repositoryRoot);
+      this.assertWorkspaceParents(workspacePins);
       this.assertIdentity(identity);
       await this.git(
-        ['worktree', 'add', '-b', identity.branch, identity.workspacePath, identity.baseSha],
-        this.repositoryRoot,
+        ['--git-dir', gitDirectory, 'worktree', 'add', '-b', identity.branch, '.', identity.baseSha],
+        identity.workspacePath,
       );
-      this.assertWorkspaceParents(parentPins);
+      this.assertWorkspaceParents(workspacePins);
       await this.assertWorkspace(identity);
-      this.assertWorkspaceParents(parentPins);
-      return;
+      this.assertWorkspaceParents(workspacePins);
+      return workspacePins;
     }
 
     if (remoteSha !== null) {
@@ -428,24 +434,32 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
 
     if (hasWorkspace) {
       await this.assertWorkspace(identity, recoveredSha, true);
-      return;
+      this.assertWorkspacePathSnapshot(identity, initialPins);
+      return initialPins;
     }
     if (parentPins === undefined) {
       throw bootstrapError('STALE_IDENTITY', 'Recovery workspace parents were not pinned before mutation.');
     }
     this.assertWorkspaceParents(parentPins);
     this.assertIdentity(identity);
+    const gitDirectory = await this.resolveGitDirectory();
+    this.assertWorkspaceParents(parentPins);
+    const workspacePins = this.reserveWorkspaceDirectory(identity, parentPins);
     if (localSha !== null) {
-      await this.git(['worktree', 'add', identity.workspacePath, identity.branch], this.repositoryRoot);
+      await this.git(
+        ['--git-dir', gitDirectory, 'worktree', 'add', '.', identity.branch],
+        identity.workspacePath,
+      );
     } else {
       await this.git(
-        ['worktree', 'add', '-b', identity.branch, identity.workspacePath, recoveredSha],
-        this.repositoryRoot,
+        ['--git-dir', gitDirectory, 'worktree', 'add', '-b', identity.branch, '.', recoveredSha],
+        identity.workspacePath,
       );
     }
-    this.assertWorkspaceParents(parentPins);
+    this.assertWorkspaceParents(workspacePins);
     await this.assertWorkspace(identity, recoveredSha);
-    this.assertWorkspaceParents(parentPins);
+    this.assertWorkspaceParents(workspacePins);
+    return workspacePins;
   }
 
   private async assertWorkspace(
@@ -508,6 +522,49 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     }
     this.assertWorkspaceParents(pins);
     return pins;
+  }
+
+  private reserveWorkspaceDirectory(
+    identity: ImplementationBootstrapIdentity,
+    parentPins: readonly DirectoryPin[],
+  ): readonly DirectoryPin[] {
+    this.assertWorkspaceParents(parentPins);
+    const workspacePath = path.join(
+      this.workspaceRoot,
+      identity.owner,
+      identity.repo,
+      path.basename(identity.workspacePath),
+    );
+    if (path.resolve(identity.workspacePath) !== workspacePath) {
+      throw bootstrapError('STALE_IDENTITY', 'Persisted workspace path is not the configured canonical run directory.');
+    }
+    try {
+      mkdirSync(workspacePath);
+    } catch {
+      throw bootstrapError('COLLISION', `Implementation workspace path ${workspacePath} could not be reserved atomically.`);
+    }
+    const workspacePin = this.pinCanonicalDirectory(workspacePath);
+    const pins = [...parentPins, workspacePin];
+    this.assertWorkspaceParents(pins);
+    return pins;
+  }
+
+  private async resolveGitDirectory(): Promise<string> {
+    const raw = (await this.git(['rev-parse', '--absolute-git-dir'], this.repositoryRoot)).stdout.trim();
+    if (raw === '' || !path.isAbsolute(raw)) {
+      throw bootstrapError('COMMAND_FAILED', `Git returned an invalid absolute Git directory ${raw || '(none)'}.`);
+    }
+    try {
+      const directory = realpathSync(path.resolve(raw));
+      if (!lstatSync(directory).isDirectory()) throw new Error('not a directory');
+      return directory;
+    } catch {
+      throw bootstrapError('COMMAND_FAILED', `Git returned an invalid absolute Git directory ${raw || '(none)'}.`);
+    }
+  }
+
+  private workspaceKey(identity: ImplementationBootstrapIdentity): string {
+    return `${identity.owner}/${identity.repo}#${identity.issueNumber}:${identity.branch}:${path.resolve(identity.workspacePath)}`;
   }
 
   private pinExistingWorkspace(identity: ImplementationBootstrapIdentity): readonly DirectoryPin[] {
