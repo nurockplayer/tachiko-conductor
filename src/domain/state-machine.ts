@@ -12,6 +12,9 @@ export type InvalidTransitionCode =
   | 'executor-provider-mismatch'
   | 'executor-mutation-not-allowed'
   | 'invalid-executor-identity'
+  | 'invalid-bootstrap-identity'
+  | 'bootstrap-identity-mismatch'
+  | 'invalid-pull-request-identity'
   | 'unexpected-payload'
   | 'head-mutation-not-allowed'
   | 'missing-head-sha'
@@ -63,6 +66,7 @@ export const TRANSITION_TABLE: Readonly<
     fail: 'FAILED',
   },
   IMPLEMENTING: {
+    bootstrap_prepared: 'IMPLEMENTING',
     agent_succeeded: 'VALIDATING',
     agent_failed: 'FAILED',
     wait_dependency: 'WAITING_DEPENDENCY',
@@ -195,6 +199,16 @@ function isUsableSha(value: string | undefined): value is string {
   return value !== undefined && value.trim() !== '';
 }
 
+function sameBootstrapIdentity(a: NonNullable<Run['bootstrap']>, b: NonNullable<Run['bootstrap']>): boolean {
+  return a.owner === b.owner &&
+    a.repo === b.repo &&
+    a.issueNumber === b.issueNumber &&
+    a.baseBranch === b.baseBranch &&
+    a.baseSha === b.baseSha &&
+    a.branch === b.branch &&
+    a.workspacePath === b.workspacePath;
+}
+
 function assertPayload(run: Run, input: TransitionInput): void {
   const from = run.state;
   if (REQUIRES_AGENT_RESULT.has(input.type) && input.agentResult === undefined) {
@@ -211,6 +225,14 @@ function assertPayload(run: Run, input: TransitionInput): void {
       from,
       input.type,
       `Transition "${input.type}" requires a reviewResult; pass the reviewer's result.`,
+    );
+  }
+  if (input.type === 'bootstrap_prepared' && input.bootstrap === undefined) {
+    throw new InvalidTransitionError(
+      'missing-payload',
+      from,
+      input.type,
+      'Transition "bootstrap_prepared" requires durable bootstrap identity.',
     );
   }
   // Payloads are bound to the transitions that produce them; carrying one on
@@ -230,6 +252,67 @@ function assertPayload(run: Run, input: TransitionInput): void {
       input.type,
       `Transition "${input.type}" does not accept a reviewResult; review results are bound to review_approved / changes_requested.`,
     );
+  }
+  if (input.type !== 'bootstrap_prepared' && input.bootstrap !== undefined) {
+    throw new InvalidTransitionError(
+      'unexpected-payload',
+      from,
+      input.type,
+      `Transition "${input.type}" does not accept bootstrap identity; it is bound to bootstrap_prepared.`,
+    );
+  }
+  if (input.pullRequest !== undefined && input.type !== 'validation_passed') {
+    throw new InvalidTransitionError(
+      'unexpected-payload',
+      from,
+      input.type,
+      `Transition "${input.type}" does not accept pull request identity; it is bound to validation_passed.`,
+    );
+  }
+  if (input.pullRequest !== undefined && (
+    !Number.isSafeInteger(input.pullRequest.number) ||
+    input.pullRequest.number < 1 ||
+    input.pullRequest.headSha.trim() === '' ||
+    input.pullRequest.headSha !== run.headSha
+  )) {
+    throw new InvalidTransitionError(
+      'invalid-pull-request-identity',
+      from,
+      input.type,
+      'Validation pull request identity must be positive and bound to the run exact HEAD.',
+    );
+  }
+  if (input.bootstrap !== undefined) {
+    const bootstrap = input.bootstrap;
+    const targetMatches =
+      run.target.kind === 'issue' &&
+      bootstrap.owner === run.target.owner &&
+      bootstrap.repo === run.target.repo &&
+      bootstrap.issueNumber === run.target.issueNumber;
+    const strings = [
+      bootstrap.owner,
+      bootstrap.repo,
+      bootstrap.baseBranch,
+      bootstrap.baseSha,
+      bootstrap.branch,
+      bootstrap.workspacePath,
+    ];
+    if (!targetMatches || !Number.isSafeInteger(bootstrap.issueNumber) || bootstrap.issueNumber < 1 || strings.some((value) => value.trim() === '')) {
+      throw new InvalidTransitionError(
+        'invalid-bootstrap-identity',
+        from,
+        input.type,
+        'Bootstrap identity must be non-empty and match the issue target exactly.',
+      );
+    }
+    if (run.bootstrap !== undefined && !sameBootstrapIdentity(run.bootstrap, bootstrap)) {
+      throw new InvalidTransitionError(
+        'bootstrap-identity-mismatch',
+        from,
+        input.type,
+        'A prepared implementation cannot replace its durable branch/workspace identity.',
+      );
+    }
   }
   const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
   if (input.executor !== undefined && (input.type !== 'escalate' || from !== 'IMPLEMENTING')) {
@@ -520,6 +603,8 @@ export function applyTransition(
     ...(input.agentResult !== undefined ? { agentResult: input.agentResult } : {}),
     ...(input.agentResult?.executor === undefined ? {} : { executor: { ...input.agentResult.executor } }),
     ...(input.executor === undefined ? {} : { executor: { ...input.executor } }),
+    ...(input.bootstrap === undefined ? {} : { bootstrap: { ...input.bootstrap } }),
+    ...(input.pullRequest === undefined ? {} : { pullRequest: { ...input.pullRequest } }),
     ...(input.reviewResult !== undefined ? { reviewResult: input.reviewResult } : {}),
     ...(headSha !== undefined && headSha !== '' ? { headSha } : {}),
     ...(enteringInterrupt

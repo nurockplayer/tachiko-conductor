@@ -3,17 +3,20 @@ import {
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
 } from '../adapters/agent.js';
+import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition } from '../domain/state-machine.js';
-import type { ReviewResult, Run, Target } from '../domain/types.js';
+import type { ExecutorIdentity, ReviewResult, Run, Target } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
+import { parkBootstrapFailure as persistBootstrapFailure } from '../workflow/bootstrap-failure.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
+  readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly reviewer: ReviewerAdapter;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
@@ -71,6 +74,21 @@ function isRetryable(error: unknown): boolean {
 function renderFailure(prefix: string, error: unknown): string {
   const code = errorCode(error);
   return `${prefix}${code === null ? '' : ` (${code})`}: ${errorMessage(error)}`;
+}
+
+function parkBootstrapFailure(
+  run: Run,
+  error: unknown,
+  store: RunStore,
+  now: () => string,
+  executor?: ExecutorIdentity,
+): ReviewLoopResult {
+  const parked = persistBootstrapFailure(run, error, store, now, {
+    prefix: 'Implementation bootstrap recovery failed',
+    retryChoice: 'Resolve the bootstrap Git state and retry',
+    ...(executor === undefined ? {} : { executor }),
+  });
+  return { outcome: 'needs_human', ...parked };
 }
 
 /**
@@ -136,10 +154,34 @@ export async function runReviewLoop(
       run = applyTransition(run, { type: 'start_fix' }, now());
       store.update(run);
 
+      let bootstrap = run.bootstrap;
+      if (bootstrap !== undefined) {
+        if (deps.bootstrap === undefined) {
+          return parkBootstrapFailure(
+            run,
+            new Error('The persisted implementation bootstrap adapter is unavailable.'),
+            store,
+            now,
+          );
+        }
+        try {
+          bootstrap = await deps.bootstrap.prepare({
+            runId: run.id,
+            target,
+            baseBranch: bootstrap.baseBranch,
+            baseSha: bootstrap.baseSha,
+            existing: bootstrap,
+          });
+        } catch (error) {
+          return parkBootstrapFailure(run, error, store, now);
+        }
+      }
+
       const blockingFindings = renderBlockingFindings(pendingReview);
       const fixResult = await implementation.run({
         target,
         baseSha: run.headSha ?? '',
+        ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch }),
         authority: 'live-target',
         instructions: blockingFindings,
         supplementalInstructions: blockingFindings,
@@ -187,12 +229,28 @@ export async function runReviewLoop(
         store.update(run);
         return { outcome: 'needs_human', run, reason };
       }
+      if (bootstrap !== undefined) {
+        if (deps.bootstrap === undefined) {
+          return parkBootstrapFailure(
+            run,
+            new Error('Durable implementation verification is unavailable.'),
+            store,
+            now,
+            fixResult.executor,
+          );
+        }
+        try {
+          await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: fixResult.headSha });
+        } catch (error) {
+          return parkBootstrapFailure(run, error, store, now, fixResult.executor);
+        }
+      }
 
       run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha }, now());
       store.update(run);
-      let validatedHead: string | null;
+      let validatedSnapshot: Awaited<ReturnType<GitHubAdapter['readLiveSnapshot']>>;
       try {
-        validatedHead = (await github.readLiveSnapshot(target)).headSha;
+        validatedSnapshot = await github.readLiveSnapshot(target);
       } catch (error) {
         const reason = renderFailure('GitHub live-state validation failed after the fix', error);
         run = applyTransition(
@@ -210,8 +268,8 @@ export async function runReviewLoop(
         store.update(run);
         return { outcome: 'needs_human', run, reason };
       }
-      if (validatedHead !== fixResult.headSha) {
-        const reason = `Live GitHub HEAD ${validatedHead ?? '(none)'} does not match the fix HEAD ${fixResult.headSha}.`;
+      if (validatedSnapshot.headSha !== fixResult.headSha) {
+        const reason = `Live GitHub HEAD ${validatedSnapshot.headSha ?? '(none)'} does not match the fix HEAD ${fixResult.headSha}.`;
         run = applyTransition(
           run,
           {
@@ -219,7 +277,7 @@ export async function runReviewLoop(
             reason,
             interrupt: {
               evidence: reason,
-              choices: validatedHead === null
+              choices: validatedSnapshot.headSha === null
                 ? ['Open the implementation pull request and retry', CANCEL_RUN_DECISION]
                 : [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
             },
@@ -229,7 +287,19 @@ export async function runReviewLoop(
         store.update(run);
         return { outcome: 'needs_human', run, reason };
       }
-      run = applyTransition(run, { type: 'validation_passed' }, now());
+      run = applyTransition(
+        run,
+        {
+          type: 'validation_passed',
+          ...(validatedSnapshot.pullRequest === null ? {} : {
+            pullRequest: {
+              number: validatedSnapshot.pullRequest.number,
+              headSha: validatedSnapshot.pullRequest.headSha,
+            },
+          }),
+        },
+        now(),
+      );
       store.update(run);
       continue;
     }

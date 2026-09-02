@@ -2,11 +2,17 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } from '../src/adapters/agent.js';
+import type {
+  ImplementationBootstrapAdapter,
+  PlanImplementationBootstrapRequest,
+  PrepareImplementationBootstrapRequest,
+  VerifyDurableImplementationRequest,
+} from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
-import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
+import type { AgentResult, ImplementationBootstrapIdentity, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
@@ -109,6 +115,40 @@ class FakeImplementation implements ImplementationAgent {
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
     return outcome;
+  }
+}
+
+class FakeBootstrap implements ImplementationBootstrapAdapter {
+  readonly kind: 'implementation-bootstrap' = 'implementation-bootstrap';
+  readonly prepareRequests: PrepareImplementationBootstrapRequest[] = [];
+  readonly planRequests: PlanImplementationBootstrapRequest[] = [];
+  readonly verifyRequests: VerifyDurableImplementationRequest[] = [];
+
+  constructor(private readonly verifyError?: Error) {}
+
+  async plan(request: PlanImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
+    this.planRequests.push(request);
+    return {
+      owner: request.target.owner,
+      repo: request.target.repo,
+      issueNumber: request.target.issueNumber,
+      baseBranch: request.baseBranch,
+      baseSha: request.baseSha,
+      branch: `tachiko/issue-${request.target.issueNumber}`,
+      workspacePath: `/tmp/tachiko-workspaces/${request.runId}`,
+    };
+  }
+
+  async prepare(request: PrepareImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
+    this.prepareRequests.push(request);
+    if (request.existing === undefined) throw new Error('expected persisted bootstrap identity');
+    return request.existing;
+  }
+
+  async verifyDurable(request: VerifyDurableImplementationRequest): Promise<{ headSha: string; branch: string }> {
+    this.verifyRequests.push(request);
+    if (this.verifyError !== undefined) throw this.verifyError;
+    return { headSha: request.expectedHeadSha, branch: request.identity.branch };
   }
 }
 
@@ -347,9 +387,10 @@ describe('runWorkflow', () => {
     store.create(createRun(TARGET, T0, 'run-1'));
     const implementation = new FakeImplementation([successResult(HEAD)]);
     const reviewer = new FakeReviewer([approve(HEAD)]);
+    const bootstrap = new FakeBootstrap();
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([null, HEAD, HEAD, HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([null, HEAD, HEAD, HEAD]), bootstrap, implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -357,8 +398,154 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'MERGE_READY');
     assert.equal(implementation.requests[0]?.baseSha, 'base');
-    assert.match(implementation.requests[0]?.instructions ?? '', /start from main@base/);
-    assert.match(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
+    assert.equal(implementation.requests[0]?.branch, 'tachiko/issue-42');
+    assert.equal(implementation.requests[0]?.workspacePath, '/tmp/tachiko-workspaces/run-1');
+    assert.match(implementation.requests[0]?.instructions ?? '', /prepared branch tachiko\/issue-42 from main@base/);
+    assert.match(implementation.requests[0]?.instructions ?? '', /create one associated open implementation pull request/);
+    assert.equal(bootstrap.prepareRequests.length, 1);
+    assert.equal(bootstrap.planRequests.length, 1);
+    assert.equal(bootstrap.verifyRequests.length, 1);
+    assert.equal(result.run.bootstrap?.baseSha, 'base');
+    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
+  });
+
+  it('recovers the same persisted bootstrap after branch creation without creating a duplicate identity', async () => {
+    const store = new MemoryStore();
+    const bootstrap = new FakeBootstrap();
+    let run = applyTransition(createRun(TARGET, T0, 'run-restart'), { type: 'start' }, T0);
+    const identity = await bootstrap.plan({
+      runId: run.id,
+      target: TARGET,
+      baseBranch: 'main',
+      baseSha: 'base',
+    });
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+    store.create(run);
+    bootstrap.prepareRequests.length = 0;
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([null, HEAD, HEAD, HEAD]),
+        bootstrap,
+        implementation,
+        reviewer: new FakeReviewer([approve(HEAD)]),
+      },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.deepEqual(bootstrap.prepareRequests[0]?.existing, identity);
+    assert.equal(bootstrap.prepareRequests.length, 1);
+    assert.deepEqual(result.run.bootstrap, identity);
+  });
+
+  it('discovers an already-created PR before retry and reuses the persisted branch/workspace', async () => {
+    const store = new MemoryStore();
+    const bootstrap = new FakeBootstrap();
+    let run = applyTransition(createRun(TARGET, T0, 'run-pr-restart'), { type: 'start' }, T0);
+    const identity = await bootstrap.plan({
+      runId: run.id,
+      target: TARGET,
+      baseBranch: 'main',
+      baseSha: 'base',
+    });
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+    store.create(run);
+    bootstrap.prepareRequests.length = 0;
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD]),
+        bootstrap,
+        implementation,
+        reviewer: new FakeReviewer([approve(HEAD)]),
+      },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(bootstrap.prepareRequests.length, 1);
+    assert.deepEqual(bootstrap.prepareRequests[0]?.existing, identity);
+    assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
+    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
+  });
+
+  it('uses an existing associated PR without starting bootstrap mechanics', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-existing-pr'));
+    const bootstrap = new FakeBootstrap();
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD]),
+        bootstrap,
+        implementation: new FakeImplementation([successResult(HEAD)]),
+        reviewer: new FakeReviewer([approve(HEAD)]),
+      },
+      'run-existing-pr',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(bootstrap.prepareRequests.length, 0);
+    assert.equal(bootstrap.verifyRequests.length, 0);
+  });
+
+  it('fails closed when durable verification finds only ephemeral implementation state', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-ephemeral'));
+    const bootstrap = new FakeBootstrap(new Error('workspace is dirty'));
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([null]),
+        bootstrap,
+        implementation: new FakeImplementation([{
+          ...successResult(HEAD),
+          executor: { provider: 'codex-cli', sessionId: 'thread-ephemeral' },
+        }]),
+        reviewer: new FakeReviewer([]),
+      },
+      'run-ephemeral',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.match(result.reason, /workspace is dirty/);
+    assert.deepEqual(result.run.executor, { provider: 'codex-cli', sessionId: 'thread-ephemeral' });
+    assert.equal(result.run.agentResult, undefined);
+  });
+
+  it('refuses to invoke implementation when live authority says the Issue is closed', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-closed'));
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      issue: { ...snapshot(HEAD).issue, state: 'closed' },
+      pullRequest: null,
+      headSha: null,
+    });
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      { store, github, bootstrap: new FakeBootstrap(), implementation, reviewer: new FakeReviewer([]) },
+      'run-closed',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /no longer open/);
+    assert.equal(implementation.requests.length, 0);
   });
 
   it('restores the persisted provider-neutral executor after a restart', async () => {

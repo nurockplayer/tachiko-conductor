@@ -3,13 +3,15 @@ import {
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
 } from '../adapters/agent.js';
+import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
-import type { Run, Target } from '../domain/types.js';
+import type { ExecutorIdentity, Run, Target } from '../domain/types.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
+import { parkBootstrapFailure } from './bootstrap-failure.js';
 
 export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
@@ -18,6 +20,7 @@ export interface WorkflowDependencies {
   readonly store: RunStore;
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
+  readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly reviewer: ReviewerAdapter;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
@@ -67,6 +70,21 @@ function githubFailureOutcome(run: Run, error: unknown, store: RunStore, now: ()
   return { outcome: 'needs_human', run: parked, reason };
 }
 
+function bootstrapFailureOutcome(
+  run: Run,
+  error: unknown,
+  store: RunStore,
+  now: () => string,
+  executor?: ExecutorIdentity,
+): WorkflowOutcome {
+  const parked = parkBootstrapFailure(run, error, store, now, {
+    prefix: 'Implementation bootstrap could not establish durable Git state',
+    retryChoice: 'Resolve the bootstrap collision or Git state and retry',
+    ...(executor === undefined ? {} : { executor }),
+  });
+  return { outcome: 'needs_human', ...parked };
+}
+
 /**
  * Wire the core state machine, GitHub live state, the implementation agent,
  * and the independent reviewer into one state-resume-aware workflow. Given a
@@ -104,6 +122,20 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        if (snapshot.issue.state !== 'open') {
+          const reason = `Issue ${formatTarget(target)} is no longer open; refusing to start or continue implementation.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: { evidence: reason, choices: [CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
         const pendingReviewFix =
           run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
         if (pendingReviewFix && snapshot.headSha !== run.headSha) {
@@ -123,10 +155,82 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
+        let bootstrap = run.bootstrap;
+        if (!pendingReviewFix && snapshot.pullRequest === null) {
+          const baseBranch = snapshot.repository.defaultBranch;
+          const liveBaseSha = snapshot.repository.defaultBranchHeadSha;
+          if (baseBranch === null || liveBaseSha === null || baseBranch === '' || liveBaseSha === '') {
+            const reason = `No authoritative implementation base is available for ${formatTarget(target)}.`;
+            run = applyTransition(
+              run,
+              {
+                type: 'escalate',
+                reason,
+                interrupt: {
+                  evidence: reason,
+                  choices: ['Retry after restoring the repository default branch', CANCEL_RUN_DECISION],
+                },
+              },
+              now(),
+            );
+            store.update(run);
+            return { outcome: 'needs_human', run, reason };
+          }
+          if (deps.bootstrap === undefined) {
+            return bootstrapFailureOutcome(
+              run,
+              new Error('No implementation bootstrap adapter is configured for a Ready Issue without a pull request.'),
+              store,
+              now,
+            );
+          }
+          try {
+            if (run.bootstrap === undefined) {
+              bootstrap = await deps.bootstrap.plan({
+                runId: run.id,
+                target,
+                baseBranch,
+                baseSha: liveBaseSha,
+              });
+              run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
+              store.update(run);
+            }
+            bootstrap = await deps.bootstrap.prepare({
+              runId: run.id,
+              target,
+              baseBranch,
+              baseSha: liveBaseSha,
+              existing: bootstrap,
+            });
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now);
+          }
+        } else if (bootstrap !== undefined) {
+          if (deps.bootstrap === undefined) {
+            return bootstrapFailureOutcome(
+              run,
+              new Error('The persisted implementation bootstrap cannot be reconstructed because its adapter is unavailable.'),
+              store,
+              now,
+            );
+          }
+          try {
+            bootstrap = await deps.bootstrap.prepare({
+              runId: run.id,
+              target,
+              baseBranch: bootstrap.baseBranch,
+              baseSha: bootstrap.baseSha,
+              existing: bootstrap,
+            });
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now);
+          }
+        }
+
         const pendingFixInstructions = pendingReviewFix ? renderBlockingFindings(run) : null;
         const baseSha = pendingReviewFix
           ? run.headSha
-          : snapshot.pullRequest?.baseSha ?? snapshot.repository.defaultBranchHeadSha;
+          : snapshot.pullRequest?.baseSha ?? bootstrap?.baseSha ?? snapshot.repository.defaultBranchHeadSha;
         if (baseSha === null || baseSha === undefined || baseSha === '') {
           const reason = `No authoritative implementation base is available for ${formatTarget(target)}.`;
           run = applyTransition(
@@ -146,17 +250,18 @@ export async function runWorkflow(
         }
         const instructions = pendingFixInstructions ?? (
           snapshot.pullRequest === null
-            ? `${snapshot.issue.body}\n\nConductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
+            ? `${snapshot.issue.body}\n\nConductor requirement: work only in prepared branch ${bootstrap?.branch ?? '(unavailable)'} from ${snapshot.repository.defaultBranch}@${baseSha}; commit and push all meaningful changes, then create one associated open implementation pull request before reporting success. Do not create another branch or workspace.`
             : snapshot.issue.body
         );
         const supplementalInstructions = pendingFixInstructions ?? (
           snapshot.pullRequest === null
-            ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
+            ? `Conductor prepared branch ${bootstrap?.branch ?? '(unavailable)'} from ${snapshot.repository.defaultBranch}@${baseSha}. Commit and push all meaningful changes, then create one associated open implementation pull request. Do not create another branch or workspace.`
             : undefined
         );
         const result = await implementation.run({
           target,
           baseSha,
+          ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch }),
           authority: 'live-target',
           instructions,
           ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
@@ -186,6 +291,21 @@ export async function runWorkflow(
           run = applyTransition(run, { type: 'agent_failed', agentResult: result, headSha: result.headSha }, now());
           store.update(run);
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
+        }
+        if (bootstrap !== undefined) {
+          if (deps.bootstrap === undefined) {
+            return bootstrapFailureOutcome(
+              run,
+              new Error('The implementation completed but durable bootstrap verification is unavailable.'),
+              store,
+              now,
+            );
+          }
+          try {
+            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha ?? '' });
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now, result.executor);
+          }
         }
         run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha }, now());
         store.update(run);
@@ -222,7 +342,16 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
-        run = applyTransition(run, { type: 'validation_passed' }, now());
+        run = applyTransition(
+          run,
+          {
+            type: 'validation_passed',
+            ...(snapshot.pullRequest === null ? {} : {
+              pullRequest: { number: snapshot.pullRequest.number, headSha: snapshot.pullRequest.headSha },
+            }),
+          },
+          now(),
+        );
         store.update(run);
         break;
       }
@@ -230,7 +359,14 @@ export async function runWorkflow(
       case 'REVIEWING':
       case 'CHANGES_REQUESTED': {
         const loop = await runReviewLoop(
-          { store, github, implementation, reviewer, resolveImplementationCapabilities: deps.resolveImplementationCapabilities },
+          {
+            store,
+            github,
+            implementation,
+            reviewer,
+            bootstrap: deps.bootstrap,
+            resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
+          },
           run.id,
           {
           maxAttempts: options.maxReviewAttempts,

@@ -13,6 +13,7 @@ import {
   parseIssueRef,
   resolveCodexExecutionConfig,
   resolveImplementationProvider,
+  resolveImplementationWorkspaceRoot,
   resolveRunsDir,
   runCreateCommand,
   runIssueCommand,
@@ -104,6 +105,8 @@ describe('CLI command layer', () => {
   it('resolves the data dir from TACHIKO_DATA_DIR or the home default', () => {
     assert.equal(resolveRunsDir({ TACHIKO_DATA_DIR: '/tmp/x' }), '/tmp/x');
     assert.match(resolveRunsDir({}), /\.tachiko-conductor/);
+    assert.equal(resolveImplementationWorkspaceRoot({ TACHIKO_WORKSPACE_ROOT: '/tmp/worktrees' }), '/tmp/worktrees');
+    assert.match(resolveImplementationWorkspaceRoot({}), /\.tachiko-conductor.*workspaces/);
   });
 
   it('resolves the implementation provider and explicit Codex execution config without choosing a model', () => {

@@ -44,6 +44,7 @@ import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
+import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
 import {
   runWorkflow,
   type WorkflowDependencies,
@@ -154,6 +155,11 @@ export function resolveCodexExecutionConfig(env: NodeJS.ProcessEnv = process.env
 /** Resolve the directory where run JSON files are stored. */
 export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
   return env.TACHIKO_DATA_DIR ?? path.join(os.homedir(), '.tachiko-conductor', 'runs');
+}
+
+/** Resolve isolated implementation worktrees outside the source repository. */
+export function resolveImplementationWorkspaceRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces');
 }
 
 export interface BrowserRoots {
@@ -548,6 +554,10 @@ function buildWorkflowDeps(
   return {
     store,
     github,
+    bootstrap: new GitWorktreeBootstrap({
+      repositoryRoot: process.cwd(),
+      workspaceRoot: resolveImplementationWorkspaceRoot(env),
+    }),
     implementation: new ImplementationAgentRegistry({
       defaultProvider: resolveImplementationProvider(env),
       legacySessionProvider: CLAUDE_CODE_PROVIDER,

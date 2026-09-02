@@ -92,6 +92,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const cwd = request.workspacePath ?? this.cwd;
     if (
       request.executor !== undefined &&
       (request.executor.provider !== CLAUDE_CODE_PROVIDER || request.executor.sessionId.trim() === '')
@@ -114,6 +115,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       this.buildArgs(prompt, request.capabilities, sessionId),
       request.signal,
       sessionId,
+      cwd,
     );
     if (!outcome.ok) return outcome.agentResult;
     const executor = executorIdentity(outcome.sessionId);
@@ -132,7 +134,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         durationMs: outcome.durationMs,
       };
     }
-    const head = await this.readHead(request.signal);
+    const head = await this.readHead(request.signal, cwd);
     if (isAborted(request.signal)) {
       return cancelledAgentResult(outcome.durationMs, outcome.sessionId);
     }
@@ -140,7 +142,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       return {
         exitStatus: 'failure',
         summary: outcome.summary,
-        diagnostics: [`${CLAUDE_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${this.cwd}.`],
+        diagnostics: [`${CLAUDE_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`],
         sessionId: outcome.sessionId,
         ...(executor === undefined ? {} : { executor }),
         durationMs: outcome.durationMs,
@@ -210,11 +212,12 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     args: readonly string[],
     signal: AbortSignal | undefined,
     resumeSessionId: string | undefined,
+    cwd: string,
   ): Promise<ClaudeOutcome> {
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
-      result = await this.runner.run('claude', args, processOptions(this.timeoutMs, this.cwd, signal));
+      result = await this.runner.run('claude', args, processOptions(this.timeoutMs, cwd, signal));
     } catch (error) {
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
@@ -278,9 +281,9 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     };
   }
 
-  private async readHead(signal: AbortSignal | undefined): Promise<{ ok: true; sha: string } | { ok: false }> {
+  private async readHead(signal: AbortSignal | undefined, cwd: string): Promise<{ ok: true; sha: string } | { ok: false }> {
     try {
-      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], processOptions(this.timeoutMs, this.cwd, signal));
+      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], processOptions(this.timeoutMs, cwd, signal));
       const sha = result.stdout.trim();
       if (result.exitCode === 0 && FULL_SHA.test(sha)) return { ok: true, sha };
       return { ok: false };

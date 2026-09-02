@@ -1,0 +1,345 @@
+import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import path from 'node:path';
+
+import {
+  IMPLEMENTATION_BOOTSTRAP_ERROR_CODE,
+  ImplementationBootstrapError,
+  type DurableImplementationSnapshot,
+  type ImplementationBootstrapAdapter,
+  type PlanImplementationBootstrapRequest,
+  type PrepareImplementationBootstrapRequest,
+  type VerifyDurableImplementationRequest,
+} from '../adapters/bootstrap.js';
+import type { ImplementationBootstrapIdentity } from '../domain/types.js';
+import {
+  NodeProcessRunner,
+  type ProcessResult,
+  type ProcessRunOptions,
+  type ProcessRunner,
+} from '../github/transport.js';
+
+const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
+const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
+const FULL_SHA = /^[0-9a-f]{40}$/i;
+
+export interface GitWorktreeBootstrapOptions {
+  readonly repositoryRoot: string;
+  readonly workspaceRoot: string;
+  readonly remote?: string;
+  readonly runner?: ProcessRunner;
+  readonly timeoutMs?: number;
+}
+
+function bootstrapError(
+  code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE,
+  message: string,
+  details: Readonly<Record<string, unknown>> = {},
+): ImplementationBootstrapError {
+  return new ImplementationBootstrapError(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE[code], message, details);
+}
+
+function repositoryFromRemote(raw: string): { owner: string; repo: string } | null {
+  const value = raw.trim();
+  let repositoryPath: string;
+  try {
+    const url = new URL(value);
+    repositoryPath = url.pathname;
+  } catch {
+    const scp = /^(?:[^@\s]+@)?[^:\s]+:(.+)$/.exec(value);
+    if (scp === null) return null;
+    repositoryPath = scp[1] ?? '';
+  }
+  const parts = repositoryPath.replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.length < 2) return null;
+  const owner = parts.at(-2) ?? '';
+  const repo = (parts.at(-1) ?? '').replace(/\.git$/i, '');
+  return owner === '' || repo === '' ? null : { owner, repo };
+}
+
+function identityMatches(
+  actual: ImplementationBootstrapIdentity,
+  expected: ImplementationBootstrapIdentity,
+): boolean {
+  return actual.owner === expected.owner &&
+    actual.repo === expected.repo &&
+    actual.issueNumber === expected.issueNumber &&
+    actual.baseBranch === expected.baseBranch &&
+    actual.baseSha === expected.baseSha &&
+    actual.branch === expected.branch &&
+    actual.workspacePath === expected.workspacePath;
+}
+
+/** Git worktree implementation of the provider-neutral bootstrap boundary. */
+export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
+  readonly kind: 'implementation-bootstrap' = 'implementation-bootstrap';
+  private readonly repositoryRoot: string;
+  private readonly workspaceRoot: string;
+  private readonly remote: string;
+  private readonly runner: ProcessRunner;
+  private readonly timeoutMs: number;
+
+  constructor(options: GitWorktreeBootstrapOptions) {
+    this.repositoryRoot = path.resolve(options.repositoryRoot);
+    this.workspaceRoot = path.resolve(options.workspaceRoot);
+    this.remote = options.remote ?? 'origin';
+    this.runner = options.runner ?? new NodeProcessRunner();
+    this.timeoutMs = options.timeoutMs ?? 30_000;
+    if (
+      this.repositoryRoot === this.workspaceRoot ||
+      this.isWithin(this.repositoryRoot, this.workspaceRoot) ||
+      this.isWithin(this.workspaceRoot, this.repositoryRoot)
+    ) {
+      throw bootstrapError('INVALID_REQUEST', 'Implementation workspace root must be outside the source repository.');
+    }
+  }
+
+  async plan(request: PlanImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
+    this.assertRequest(request);
+    await this.assertRepository(request.target.owner, request.target.repo);
+
+    const expected = this.expectedIdentity(request);
+    await this.assertLiveBase(request.baseBranch, request.baseSha);
+    if (existsSync(expected.workspacePath)) {
+      throw bootstrapError('COLLISION', `Implementation workspace already exists at ${expected.workspacePath}.`);
+    }
+    if (await this.localBranchExists(expected.branch) || await this.remoteBranchSha(expected.branch) !== null) {
+      throw bootstrapError(
+        'COLLISION',
+        `Implementation branch ${expected.branch} already exists without persisted Issue #${request.target.issueNumber} ownership.`,
+      );
+    }
+
+    return expected;
+  }
+
+  async prepare(request: PrepareImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
+    this.assertRequest(request);
+    if (request.existing === undefined) {
+      throw bootstrapError('INVALID_REQUEST', 'Bootstrap identity must be planned and persisted before Git state is created.');
+    }
+    await this.assertRepository(request.target.owner, request.target.repo);
+    const expected = this.expectedIdentity(request);
+    if (!identityMatches(request.existing, expected)) {
+      throw bootstrapError(
+        'STALE_IDENTITY',
+        'Persisted bootstrap identity does not match the target, branch, base, or workspace for this run.',
+      );
+    }
+    await this.restoreExisting(expected);
+    return expected;
+  }
+
+  async verifyDurable(request: VerifyDurableImplementationRequest): Promise<DurableImplementationSnapshot> {
+    if (!FULL_SHA.test(request.expectedHeadSha)) {
+      throw bootstrapError('INVALID_REQUEST', 'Durable implementation verification requires an exact 40-hex HEAD SHA.');
+    }
+    const identity = request.identity;
+    this.assertIdentity(identity);
+    await this.assertRepository(identity.owner, identity.repo);
+    await this.assertWorkspace(identity);
+
+    const headSha = (await this.git(['rev-parse', 'HEAD'], identity.workspacePath)).stdout.trim();
+    if (!FULL_SHA.test(headSha) || headSha !== request.expectedHeadSha) {
+      throw bootstrapError(
+        'HEAD_MISMATCH',
+        `Implementation workspace HEAD ${headSha || '(none)'} does not match reported HEAD ${request.expectedHeadSha}.`,
+      );
+    }
+    const status = await this.git(['status', '--porcelain=v1', '--untracked-files=all'], identity.workspacePath);
+    if (status.stdout.trim() !== '') {
+      throw bootstrapError(
+        'DIRTY_WORKSPACE',
+        'Implementation reported success with uncommitted or untracked workspace changes.',
+      );
+    }
+    const remoteHead = await this.remoteBranchSha(identity.branch);
+    if (remoteHead !== headSha) {
+      throw bootstrapError(
+        'UNPUSHED_HEAD',
+        `Implementation HEAD ${headSha} is not durably published at ${this.remote}/${identity.branch}.`,
+      );
+    }
+    const ancestry = await this.git(
+      ['merge-base', '--is-ancestor', identity.baseSha, headSha],
+      identity.workspacePath,
+      [0, 1],
+    );
+    if (ancestry.exitCode !== 0) {
+      throw bootstrapError(
+        'HEAD_MISMATCH',
+        `Implementation HEAD ${headSha} does not descend from bootstrap base ${identity.baseSha}.`,
+      );
+    }
+    return { headSha, branch: identity.branch };
+  }
+
+  private expectedIdentity(
+    request: PrepareImplementationBootstrapRequest | PlanImplementationBootstrapRequest,
+  ): ImplementationBootstrapIdentity {
+    const branch = `tachiko/issue-${request.target.issueNumber}`;
+    const workspacePath = path.join(
+      this.workspaceRoot,
+      request.target.owner,
+      request.target.repo,
+      `${request.runId}-issue-${request.target.issueNumber}`,
+    );
+    return {
+      owner: request.target.owner,
+      repo: request.target.repo,
+      issueNumber: request.target.issueNumber,
+      baseBranch: request.baseBranch,
+      baseSha: 'existing' in request && request.existing !== undefined ? request.existing.baseSha : request.baseSha,
+      branch,
+      workspacePath,
+    };
+  }
+
+  private assertRequest(request: PrepareImplementationBootstrapRequest | PlanImplementationBootstrapRequest): void {
+    if (!SAFE_RUN_ID.test(request.runId) ||
+      !SAFE_COMPONENT.test(request.target.owner) ||
+      !SAFE_COMPONENT.test(request.target.repo) ||
+      !Number.isSafeInteger(request.target.issueNumber) ||
+      request.target.issueNumber < 1 ||
+      request.baseBranch.trim() === '' ||
+      !FULL_SHA.test(request.baseSha)) {
+      throw bootstrapError('INVALID_REQUEST', 'Bootstrap request contains an unsafe target, run id, branch, or base SHA.');
+    }
+  }
+
+  private assertIdentity(identity: ImplementationBootstrapIdentity): void {
+    const rootRelative = path.relative(this.workspaceRoot, path.resolve(identity.workspacePath));
+    if (!SAFE_COMPONENT.test(identity.owner) ||
+      !SAFE_COMPONENT.test(identity.repo) ||
+      !Number.isSafeInteger(identity.issueNumber) ||
+      identity.issueNumber < 1 ||
+      identity.branch !== `tachiko/issue-${identity.issueNumber}` ||
+      identity.baseBranch.trim() === '' ||
+      !FULL_SHA.test(identity.baseSha) ||
+      rootRelative === '' ||
+      rootRelative.startsWith('..') ||
+      path.isAbsolute(rootRelative)) {
+      throw bootstrapError('STALE_IDENTITY', 'Persisted bootstrap identity is unsafe or outside the configured workspace root.');
+    }
+  }
+
+  private async assertRepository(owner: string, repo: string): Promise<void> {
+    const remoteUrl = (await this.git(['remote', 'get-url', this.remote], this.repositoryRoot)).stdout;
+    const actual = repositoryFromRemote(remoteUrl);
+    if (actual === null || actual.owner.toLowerCase() !== owner.toLowerCase() || actual.repo.toLowerCase() !== repo.toLowerCase()) {
+      throw bootstrapError(
+        'REPOSITORY_MISMATCH',
+        `Source repository remote ${this.remote} does not match ${owner}/${repo}; refusing to bootstrap another repository.`,
+      );
+    }
+  }
+
+  private async assertLiveBase(branch: string, expectedSha: string): Promise<void> {
+    await this.git(['fetch', '--no-tags', this.remote, `refs/heads/${branch}`], this.repositoryRoot);
+    const fetched = (await this.git(['rev-parse', 'FETCH_HEAD'], this.repositoryRoot)).stdout.trim();
+    if (fetched !== expectedSha) {
+      throw bootstrapError(
+        'BASE_DRIFT',
+        `Fetched ${this.remote}/${branch} at ${fetched || '(none)'}, expected live GitHub base ${expectedSha}.`,
+      );
+    }
+  }
+
+  private async restoreExisting(identity: ImplementationBootstrapIdentity): Promise<void> {
+    this.assertIdentity(identity);
+    if (existsSync(identity.workspacePath)) {
+      await this.assertWorkspace(identity);
+      return;
+    }
+    const local = await this.localBranchExists(identity.branch);
+    const remoteSha = await this.remoteBranchSha(identity.branch);
+    if (!local && remoteSha === null) {
+      await this.git(['cat-file', '-e', `${identity.baseSha}^{commit}`], this.repositoryRoot);
+      mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
+      await this.git(
+        ['worktree', 'add', '-b', identity.branch, identity.workspacePath, identity.baseSha],
+        this.repositoryRoot,
+      );
+      await this.assertWorkspace(identity);
+      return;
+    }
+    mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
+    if (local) {
+      await this.git(['worktree', 'add', identity.workspacePath, identity.branch], this.repositoryRoot);
+    } else {
+      await this.git(
+        ['worktree', 'add', '-b', identity.branch, identity.workspacePath, `${this.remote}/${identity.branch}`],
+        this.repositoryRoot,
+      );
+    }
+    await this.assertWorkspace(identity);
+  }
+
+  private async assertWorkspace(identity: ImplementationBootstrapIdentity): Promise<void> {
+    this.assertIdentity(identity);
+    const top = realpathSync(path.resolve((await this.git(['rev-parse', '--show-toplevel'], identity.workspacePath)).stdout.trim()));
+    const expectedTop = realpathSync(identity.workspacePath);
+    const branch = (await this.git(['symbolic-ref', '--short', 'HEAD'], identity.workspacePath)).stdout.trim();
+    if (top !== expectedTop || branch !== identity.branch) {
+      throw bootstrapError(
+        'STALE_IDENTITY',
+        `Workspace ${identity.workspacePath} is not the expected ${identity.branch} worktree.`,
+      );
+    }
+  }
+
+  private async localBranchExists(branch: string): Promise<boolean> {
+    const result = await this.git(
+      ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`],
+      this.repositoryRoot,
+      [0, 1],
+    );
+    return result.exitCode === 0;
+  }
+
+  private async remoteBranchSha(branch: string): Promise<string | null> {
+    const result = await this.git(
+      ['ls-remote', '--heads', this.remote, `refs/heads/${branch}`],
+      this.repositoryRoot,
+    );
+    const line = result.stdout.trim();
+    if (line === '') return null;
+    const [sha, ref, ...extra] = line.split(/\s+/);
+    if (extra.length !== 0 || ref !== `refs/heads/${branch}` || sha === undefined || !FULL_SHA.test(sha)) {
+      throw bootstrapError(
+        'COMMAND_FAILED',
+        `Git returned malformed remote branch identity for ${this.remote}/${branch}.`,
+      );
+    }
+    return sha;
+  }
+
+  private async git(
+    args: readonly string[],
+    cwd: string,
+    allowedExitCodes: readonly number[] = [0],
+  ): Promise<ProcessResult> {
+    let result: ProcessResult;
+    const options: ProcessRunOptions = { cwd, timeoutMs: this.timeoutMs };
+    try {
+      result = await this.runner.run('git', args, options);
+    } catch (error) {
+      throw bootstrapError(
+        'COMMAND_FAILED',
+        `Git command failed while preparing implementation state: ${error instanceof Error ? error.message : String(error)}.`,
+      );
+    }
+    if (!allowedExitCodes.includes(result.exitCode)) {
+      throw bootstrapError(
+        'COMMAND_FAILED',
+        `Git command ${args[0] ?? '(unknown)'} exited with status ${result.exitCode}.`,
+        { exitCode: result.exitCode },
+      );
+    }
+    return result;
+  }
+
+  private isWithin(parent: string, child: string): boolean {
+    const relative = path.relative(parent, child);
+    return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+  }
+}

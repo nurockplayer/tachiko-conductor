@@ -54,6 +54,23 @@ describe('ClaudeCodeAdapter', () => {
     assert.deepEqual(runner.calls[1]?.args, ['rev-parse', 'HEAD']);
   });
 
+  it('runs both the executor and exact-HEAD read inside the prepared workspace', async () => {
+    const runner = new FakeRunner([result(claudeJson('implemented')), result(HEAD)]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/source' });
+
+    await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      workspacePath: '/tmp/prepared-worktree',
+      branch: 'tachiko/issue-42',
+    });
+
+    assert.deepEqual(runner.calls.map((call) => call.options.cwd), [
+      '/tmp/prepared-worktree',
+      '/tmp/prepared-worktree',
+    ]);
+  });
+
   it('maps a non-zero claude exit to a deterministic failure without reading git', async () => {
     const runner = new FakeRunner([result('', 'claude crashed', 1)]);
     const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });

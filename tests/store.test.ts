@@ -70,6 +70,26 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.agentResult?.durationMs, 125);
   });
 
+  it('persists implementation branch/workspace and discovered PR identity across restart', () => {
+    const { dir } = tempStore();
+    let run = applyTransition(newRun('r-bootstrap'), { type: 'start' }, T0);
+    const bootstrap = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'a'.repeat(40),
+      branch: 'tachiko/issue-42', workspacePath: '/tmp/tachiko/r-bootstrap',
+    } as const;
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('b'.repeat(40)) }, T0);
+    run = applyTransition(run, {
+      type: 'validation_passed',
+      pullRequest: { number: 7, headSha: 'b'.repeat(40) },
+    }, T0);
+    new JsonFileStore({ dir }).create(run);
+
+    const loaded = new JsonFileStore({ dir }).read('r-bootstrap');
+    assert.deepEqual(loaded?.bootstrap, bootstrap);
+    assert.deepEqual(loaded?.pullRequest, { number: 7, headSha: 'b'.repeat(40) });
+  });
+
   it('returns null for unknown ids', () => {
     const { store } = tempStore();
     assert.equal(store.read('nope'), null);

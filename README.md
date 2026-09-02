@@ -18,6 +18,12 @@ profile, localhost lifecycle/health and typed failures, headed human bootstrap,
 and per-run Claude/Codex MCP capability injection. See
 [Managed browser runtime](docs/browser-runtime.md).
 
+As part of **[issue #16]**, an authorized open Issue can bootstrap from a
+live exact default-branch SHA before a PR exists. Conductor persists one
+deterministic implementation branch/worktree identity before creating Git
+state, reconstructs it after restart, and binds the discovered PR/exact HEAD
+back into the existing validation and review workflow.
+
 ## Design invariants
 
 - GitHub is the engineering source of truth; the core only ever sees plain
@@ -46,6 +52,7 @@ and per-run Claude/Codex MCP capability injection. See
 | Event | Allowed from | Goes to |
 | --- | --- | --- |
 | `start` | `READY` | `IMPLEMENTING` |
+| `bootstrap_prepared` | `IMPLEMENTING` | `IMPLEMENTING` |
 | `agent_succeeded` | `IMPLEMENTING` | `VALIDATING` |
 | `agent_failed` | `IMPLEMENTING` | `FAILED` |
 | `validation_passed` | `VALIDATING` | `REVIEWING` |
@@ -179,6 +186,9 @@ TACHIKO_BROWSER_AGENT_SMOKE=1 pnpm exec tsx --test tests/browser-agent-smoke.tes
 After `pnpm build`, the same commands work through the `tachiko` bin
 (`node dist/cli.js`). Run state is stored under `$TACHIKO_DATA_DIR` (default
 `~/.tachiko-conductor/runs`), one `<id>.json` file per run.
+Issue bootstrap worktrees are stored under `$TACHIKO_WORKSPACE_ROOT` (default
+`~/.tachiko-conductor/workspaces`) and must remain outside the source
+repository.
 
 ## Persistence
 
@@ -186,6 +196,16 @@ After `pnpm build`, the same commands work through the `tachiko` bin
 write-then-rename, so a crash mid-write never corrupts the committed file and a
 run survives a process restart intact. A fresh store instance pointed at the
 same directory resumes the run exactly where it stopped.
+
+For a Ready Issue with no associated PR, GitHub supplies the live default
+branch and exact base SHA. Conductor first performs collision checks and
+persists the planned `Run.bootstrap` identity; only then may it create or
+restore `tachiko/issue-<number>` in an isolated worktree. Agent success is
+rejected unless the worktree is clean, its exact HEAD descends from the
+recorded base, and the same HEAD is pushed to the owned remote branch. The
+next live GitHub read must discover exactly one associated open PR at that
+HEAD before review begins. Existing PR-driven runs skip bootstrap mechanics
+and remain supported.
 
 ## Layout
 
@@ -195,6 +215,7 @@ src/store/             durable run persistence
 src/adapters/          typed boundaries for GitHub, implementation, and review
 src/github/            live GitHub transport, normalization, and handoff parser
 src/agents/            Claude Code/Codex adapters and durable provider routing
+src/workspace/         provider-neutral isolated Git worktree bootstrap
 src/reviewers/         DeepSeek reviewer and bounded fix loop
 src/workflow/          state-resume-aware end-to-end orchestration
 src/cli.ts             run, resume, state inspection, and GitHub snapshot CLI
@@ -208,4 +229,5 @@ tests/                 unit, persistence, adapter, workflow, and CLI E2E tests
 [issue #5]: https://github.com/nurockplayer/tachiko-conductor/issues/5
 [issue #6]: https://github.com/nurockplayer/tachiko-conductor/issues/6
 [issue #15]: https://github.com/nurockplayer/tachiko-conductor/issues/15
+[issue #16]: https://github.com/nurockplayer/tachiko-conductor/issues/16
 [issue #12]: https://github.com/nurockplayer/tachiko-conductor/issues/12

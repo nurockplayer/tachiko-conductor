@@ -55,6 +55,23 @@ describe('CodexCliAdapter', () => {
     assert.deepEqual(runner.calls[1]?.args, ['rev-parse', 'HEAD']);
   });
 
+  it('runs both Codex and exact-HEAD discovery inside the prepared workspace', async () => {
+    const runner = new FakeRunner([result(codexJsonl()), result(HEAD)]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/source' });
+
+    await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      workspacePath: '/tmp/prepared-worktree',
+      branch: 'tachiko/issue-42',
+    });
+
+    assert.deepEqual(runner.calls.map((call) => call.options.cwd), [
+      '/tmp/prepared-worktree',
+      '/tmp/prepared-worktree',
+    ]);
+  });
+
   it('resumes the exact persisted Codex thread without falling back to a fresh exec', async () => {
     const threadId = '0199a213-81c0-7800-8aa1-bbab2a035a53';
     const runner = new FakeRunner([result(codexJsonl('Fixed review findings.', threadId)), result(HEAD)]);

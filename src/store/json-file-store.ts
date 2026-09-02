@@ -73,6 +73,39 @@ function isExecutorIdentity(value: unknown): boolean {
   );
 }
 
+function isImplementationBootstrapIdentity(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const bootstrap = value as Record<string, unknown>;
+  return (
+    typeof bootstrap.owner === 'string' && bootstrap.owner.length > 0 &&
+    typeof bootstrap.repo === 'string' && bootstrap.repo.length > 0 &&
+    typeof bootstrap.issueNumber === 'number' && Number.isSafeInteger(bootstrap.issueNumber) && bootstrap.issueNumber > 0 &&
+    typeof bootstrap.baseBranch === 'string' && bootstrap.baseBranch.length > 0 &&
+    typeof bootstrap.baseSha === 'string' && bootstrap.baseSha.length > 0 &&
+    typeof bootstrap.branch === 'string' && bootstrap.branch.length > 0 &&
+    typeof bootstrap.workspacePath === 'string' && path.isAbsolute(bootstrap.workspacePath)
+  );
+}
+
+function isImplementationPullRequestIdentity(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const pullRequest = value as Record<string, unknown>;
+  return (
+    typeof pullRequest.number === 'number' && Number.isSafeInteger(pullRequest.number) && pullRequest.number > 0 &&
+    typeof pullRequest.headSha === 'string' && pullRequest.headSha.length > 0
+  );
+}
+
+function bootstrapMatchesTarget(bootstrap: unknown, target: unknown): boolean {
+  if (!isImplementationBootstrapIdentity(bootstrap) || typeof target !== 'object' || target === null) return false;
+  const identity = bootstrap as Record<string, unknown>;
+  const issue = target as Record<string, unknown>;
+  return issue.kind === 'issue' &&
+    identity.owner === issue.owner &&
+    identity.repo === issue.repo &&
+    identity.issueNumber === issue.issueNumber;
+}
+
 function isAgentResult(value: unknown): boolean {
   if (typeof value !== 'object' || value === null) return false;
   const result = value as Record<string, unknown>;
@@ -179,6 +212,8 @@ function isRun(value: unknown): value is Run {
     (v.interrupt === undefined || isInterrupt(v.interrupt)) &&
     (v.agentResult === undefined || isAgentResult(v.agentResult)) &&
     (v.executor === undefined || isExecutorIdentity(v.executor)) &&
+    (v.bootstrap === undefined || bootstrapMatchesTarget(v.bootstrap, v.target)) &&
+    (v.pullRequest === undefined || isImplementationPullRequestIdentity(v.pullRequest)) &&
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );

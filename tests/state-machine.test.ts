@@ -80,6 +80,26 @@ describe('state machine — happy path', () => {
     assert.equal(run.history[5]?.to, 'MERGED');
   });
 
+  it('persists one provider-neutral bootstrap identity without leaving IMPLEMENTING', () => {
+    const bootstrap = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'a'.repeat(40),
+      branch: 'tachiko/issue-42', workspacePath: '/tmp/tachiko/run-42',
+    } as const;
+    const implementing = applyTransition(newRun(), { type: 'start' }, T0);
+    const prepared = applyTransition(implementing, { type: 'bootstrap_prepared', bootstrap }, T0);
+
+    assert.equal(prepared.state, 'IMPLEMENTING');
+    assert.deepEqual(prepared.bootstrap, bootstrap);
+    assert.equal(prepared.history.at(-1)?.type, 'bootstrap_prepared');
+    assert.throws(
+      () => applyTransition(prepared, {
+        type: 'bootstrap_prepared',
+        bootstrap: { ...bootstrap, branch: 'tachiko/other' },
+      }, T0),
+      (error: unknown) => error instanceof InvalidTransitionError && error.code === 'bootstrap-identity-mismatch',
+    );
+  });
+
   it('routes a failed implementation to the FAILED terminal state', () => {
     const run = applyTransition(
       applyTransition(newRun(), { type: 'start' }, T0),
@@ -444,6 +464,10 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
           T0,
         ),
       (err: unknown) => err instanceof InvalidTransitionError && err.code === 'head-mutation-not-allowed',
+    );
+    assert.throws(
+      () => applyTransition(runIn('IMPLEMENTING'), { type: 'bootstrap_prepared' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-payload',
     );
   });
 });

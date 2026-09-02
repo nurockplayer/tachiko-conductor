@@ -51,6 +51,10 @@ export interface ImplementationRequest {
   /** The work item: a single issue or a whole branch. */
   readonly target: Target;
   readonly baseSha: string;
+  /** Isolated provider-neutral workspace prepared for this issue, when bootstrapped. */
+  readonly workspacePath?: string;
+  /** Durable implementation branch paired with workspacePath. */
+  readonly branch?: string;
   /** Whether the executor should read target authority live instead of from copied prose. */
   readonly authority?: 'embedded' | 'live-target';
   readonly instructions?: string;

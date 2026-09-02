@@ -2,11 +2,17 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
+import type {
+  ImplementationBootstrapAdapter,
+  PlanImplementationBootstrapRequest,
+  PrepareImplementationBootstrapRequest,
+  VerifyDurableImplementationRequest,
+} from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
-import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
+import type { AgentResult, ImplementationBootstrapIdentity, ReviewResult, Run } from '../src/domain/types.js';
 import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import type { RunStore } from '../src/store/json-file-store.js';
@@ -120,6 +126,8 @@ class FakeImplementation implements ImplementationAgent {
     instructions: string | undefined;
     sessionId: string | undefined;
     executor: ImplementationRequest['executor'];
+    workspacePath: string | undefined;
+    branch: string | undefined;
   }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
@@ -130,10 +138,33 @@ class FakeImplementation implements ImplementationAgent {
       instructions: request.instructions,
       sessionId: request.sessionId,
       executor: request.executor,
+      workspacePath: request.workspacePath,
+      branch: request.branch,
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
     return outcome;
+  }
+}
+
+class FakeBootstrap implements ImplementationBootstrapAdapter {
+  readonly kind: 'implementation-bootstrap' = 'implementation-bootstrap';
+  readonly prepareRequests: PrepareImplementationBootstrapRequest[] = [];
+  readonly verifyRequests: VerifyDurableImplementationRequest[] = [];
+
+  async plan(_request: PlanImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
+    throw new Error('plan is not used for an existing review fix');
+  }
+
+  async prepare(request: PrepareImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
+    this.prepareRequests.push(request);
+    if (request.existing === undefined) throw new Error('expected persisted bootstrap identity');
+    return request.existing;
+  }
+
+  async verifyDurable(request: VerifyDurableImplementationRequest): Promise<{ headSha: string; branch: string }> {
+    this.verifyRequests.push(request);
+    return { headSha: request.expectedHeadSha, branch: request.identity.branch };
   }
 }
 
@@ -187,6 +218,36 @@ describe('runReviewLoop', () => {
     assert.equal(result.run.headSha, HEAD2);
     assert.deepEqual(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
     assert.deepEqual(reviewer.requests.map((request) => request.headSha), [HEAD, HEAD2]);
+  });
+
+  it('reconstructs and verifies the persisted bootstrap workspace for review fixes', async () => {
+    const store = new MemoryStore();
+    const bootstrapIdentity = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'd'.repeat(40),
+      branch: 'tachiko/issue-42', workspacePath: '/tmp/tachiko/run-1',
+    } as const;
+    store.create({ ...reviewingRun(), bootstrap: bootstrapIdentity });
+    const bootstrap = new FakeBootstrap();
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    const result = await runReviewLoop(
+      {
+        store,
+        github: githubAdapter([HEAD, HEAD2, HEAD2]),
+        bootstrap,
+        implementation,
+        reviewer: new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]),
+      },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'approved');
+    assert.deepEqual(bootstrap.prepareRequests[0]?.existing, bootstrapIdentity);
+    assert.equal(bootstrap.verifyRequests[0]?.expectedHeadSha, HEAD2);
+    assert.equal(implementation.requests[0]?.workspacePath, bootstrapIdentity.workspacePath);
+    assert.equal(implementation.requests[0]?.branch, bootstrapIdentity.branch);
+    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD2 });
   });
 
   it('routes only blocking findings to implementation', async () => {

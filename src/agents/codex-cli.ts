@@ -78,6 +78,7 @@ export class CodexCliAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const cwd = request.workspacePath ?? this.cwd;
     const executor = request.executor;
     if (executor !== undefined && !isUsableCodexExecutor(executor)) {
       return failureAgentResult(
@@ -96,7 +97,7 @@ export class CodexCliAdapter implements ImplementationAgent {
       result = await this.runner.run(
         'codex',
         this.buildArgs(prompt, request.capabilities ?? [], executor),
-        this.processOptions(request.signal),
+        this.processOptions(request.signal, cwd),
       );
     } catch (error) {
       const durationMs = elapsedMs(startedAt);
@@ -155,12 +156,12 @@ export class CodexCliAdapter implements ImplementationAgent {
     }
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
 
-    const sha = await this.readHead(request.signal);
+    const sha = await this.readHead(request.signal, cwd);
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
     if (sha === null) {
       return failureAgentResult(
         CODEX_ERROR_CODE.HEAD_READ_FAILED,
-        `Codex completed, but an exact 40-hex HEAD could not be read from ${this.cwd}.`,
+        `Codex completed, but an exact 40-hex HEAD could not be read from ${cwd}.`,
         durationMs,
         parsed.outcome.executor,
       );
@@ -199,15 +200,15 @@ export class CodexCliAdapter implements ImplementationAgent {
     return args;
   }
 
-  private processOptions(signal: AbortSignal | undefined): ProcessRunOptions {
+  private processOptions(signal: AbortSignal | undefined, cwd: string): ProcessRunOptions {
     return signal === undefined
-      ? { timeoutMs: this.timeoutMs, cwd: this.cwd }
-      : { timeoutMs: this.timeoutMs, cwd: this.cwd, signal };
+      ? { timeoutMs: this.timeoutMs, cwd }
+      : { timeoutMs: this.timeoutMs, cwd, signal };
   }
 
-  private async readHead(signal: AbortSignal | undefined): Promise<string | null> {
+  private async readHead(signal: AbortSignal | undefined, cwd: string): Promise<string | null> {
     try {
-      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], this.processOptions(signal));
+      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], this.processOptions(signal, cwd));
       const sha = result.stdout.trim();
       return result.exitCode === 0 && FULL_SHA.test(sha) ? sha : null;
     } catch {
