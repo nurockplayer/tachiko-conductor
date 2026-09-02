@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
@@ -312,6 +312,76 @@ describe('GitWorktreeBootstrap', () => {
     assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
   });
 
+  it('refuses a nested symlink inserted before repository-parent creation', async () => {
+    const roots = tempRoots();
+    const outside = path.join(path.dirname(roots.workspaceRoot), 'outside-before-mkdir');
+    mkdirSync(outside);
+    let recovering = false;
+    let swapped = false;
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command === 'fetch --no-tags origin refs/heads/main') return result();
+      if (command === 'rev-parse FETCH_HEAD') {
+        if (recovering && !swapped) {
+          symlinkSync(outside, path.join(roots.workspaceRoot, 'acme'), 'dir');
+          swapped = true;
+        }
+        return result(`${BASE}\n`);
+      }
+      if (command.startsWith('show-ref --verify --quiet')) return result('', 1);
+      if (command.startsWith('ls-remote --heads')) return result();
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const planned = await bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE });
+    recovering = true;
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing: planned }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.COLLISION),
+    );
+    assert.equal(swapped, true);
+    assert.equal(existsSync(path.join(outside, 'widgets')), false);
+    assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
+  });
+
+  it('revalidates pinned nested parents after the final awaited probe before worktree creation', async () => {
+    const roots = tempRoots();
+    const outside = path.join(path.dirname(roots.workspaceRoot), 'outside-before-worktree');
+    mkdirSync(outside);
+    let recovering = false;
+    let swapped = false;
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command === 'fetch --no-tags origin refs/heads/main') return result();
+      if (command === 'rev-parse FETCH_HEAD') return result(`${BASE}\n`);
+      if (command.startsWith('show-ref --verify --quiet')) return result('', 1);
+      if (command.startsWith('ls-remote --heads')) return result();
+      if (command === `cat-file -e ${BASE}^{commit}`) {
+        if (recovering && !swapped) {
+          rmSync(path.join(roots.workspaceRoot, 'acme'), { recursive: true, force: true });
+          symlinkSync(outside, path.join(roots.workspaceRoot, 'acme'), 'dir');
+          swapped = true;
+        }
+        return result();
+      }
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const planned = await bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE });
+    recovering = true;
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing: planned }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.COLLISION),
+    );
+    assert.equal(swapped, true);
+    assert.equal(existsSync(path.join(outside, 'widgets')), false);
+    assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
+  });
+
   it('fails closed when a recovery branch does not descend from the persisted base', async () => {
     const roots = tempRoots();
     let recovering = false;
@@ -351,6 +421,7 @@ describe('GitWorktreeBootstrap', () => {
       if (command === 'rev-parse --show-toplevel') return result(`${workspacePath}\n`);
       if (command === 'symbolic-ref --short HEAD') return result(`${BRANCH}\n`);
       if (command === 'rev-parse HEAD') return result(`${HEAD}\n`);
+      if (command === 'status --porcelain=v1 --untracked-files=all') return result();
       throw new Error(`Unexpected git call: ${command}`);
     });
     const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
@@ -376,6 +447,36 @@ describe('GitWorktreeBootstrap', () => {
     );
     assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
     assert.equal(runner.calls.some((call) => call.args[0] === 'fetch'), false);
+  });
+
+  it('refuses automatic recovery from an existing dirty workspace', async () => {
+    const roots = tempRoots();
+    const workspacePath = path.join(roots.workspaceRoot, 'acme', 'widgets', 'run-42-issue-42');
+    mkdirSync(workspacePath, { recursive: true });
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command.startsWith('show-ref --verify --quiet')) return result();
+      if (command === `rev-parse refs/heads/${BRANCH}`) return result(`${HEAD}\n`);
+      if (command === `ls-remote --heads origin refs/heads/${BRANCH}`) return result();
+      if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result();
+      if (command === 'rev-parse --show-toplevel') return result(`${workspacePath}\n`);
+      if (command === 'symbolic-ref --short HEAD') return result(`${BRANCH}\n`);
+      if (command === 'rev-parse HEAD') return result(`${HEAD}\n`);
+      if (command === 'status --porcelain=v1 --untracked-files=all') return result('?? scratch.txt\n');
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const existing = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: BASE,
+      branch: BRANCH, workspacePath,
+    } as const;
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.DIRTY_WORKSPACE),
+    );
+    assert.equal(runner.calls.some((call) => call.args[0] === 'worktree'), false);
   });
 
   it('reconstructs a missing local workspace from the persisted pushed branch after restart', async () => {

@@ -32,6 +32,11 @@ export interface GitWorktreeBootstrapOptions {
   readonly timeoutMs?: number;
 }
 
+interface DirectoryPin {
+  readonly path: string;
+  readonly identity: string;
+}
+
 function bootstrapError(
   code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE,
   message: string,
@@ -292,10 +297,9 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         );
       }
       await this.assertLiveBase(identity.baseBranch, liveBaseSha);
+      const parentPins = this.ensureWorkspaceParents(identity);
       await this.git(['cat-file', '-e', `${identity.baseSha}^{commit}`], this.repositoryRoot);
-      this.assertPinnedWorkspaceRoot();
-      mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
-      this.assertPinnedWorkspaceRoot();
+      this.assertWorkspaceParents(parentPins);
       this.assertIdentity(identity);
       await this.git(
         ['worktree', 'add', '-b', identity.branch, identity.workspacePath, identity.baseSha],
@@ -316,15 +320,17 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     if (recoveredSha === null) {
       throw bootstrapError('STALE_IDENTITY', `Workspace ${identity.workspacePath} has no recoverable branch identity.`);
     }
+    const parentPins = hasWorkspace ? undefined : this.ensureWorkspaceParents(identity);
     await this.assertDescendsFromBase(identity, recoveredSha);
 
     if (hasWorkspace) {
-      await this.assertWorkspace(identity, recoveredSha);
+      await this.assertWorkspace(identity, recoveredSha, true);
       return;
     }
-    this.assertPinnedWorkspaceRoot();
-    mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
-    this.assertPinnedWorkspaceRoot();
+    if (parentPins === undefined) {
+      throw bootstrapError('STALE_IDENTITY', 'Recovery workspace parents were not pinned before mutation.');
+    }
+    this.assertWorkspaceParents(parentPins);
     this.assertIdentity(identity);
     if (localSha !== null) {
       await this.git(['worktree', 'add', identity.workspacePath, identity.branch], this.repositoryRoot);
@@ -337,7 +343,11 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     await this.assertWorkspace(identity, recoveredSha);
   }
 
-  private async assertWorkspace(identity: ImplementationBootstrapIdentity, expectedHeadSha?: string): Promise<void> {
+  private async assertWorkspace(
+    identity: ImplementationBootstrapIdentity,
+    expectedHeadSha?: string,
+    requireClean = false,
+  ): Promise<void> {
     this.assertIdentity(identity);
     const top = realpathSync(path.resolve((await this.git(['rev-parse', '--show-toplevel'], identity.workspacePath)).stdout.trim()));
     const expectedTop = realpathSync(identity.workspacePath);
@@ -351,6 +361,64 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         'STALE_IDENTITY',
         `Workspace ${identity.workspacePath} is not the expected ${identity.branch} worktree.`,
       );
+    }
+    if (requireClean) {
+      const status = await this.git(['status', '--porcelain=v1', '--untracked-files=all'], identity.workspacePath);
+      if (status.stdout.trim() !== '') {
+        throw bootstrapError(
+          'DIRTY_WORKSPACE',
+          `Workspace ${identity.workspacePath} has uncommitted or untracked state; refusing automatic recovery.`,
+        );
+      }
+    }
+  }
+
+  private ensureWorkspaceParents(identity: ImplementationBootstrapIdentity): readonly DirectoryPin[] {
+    this.assertPinnedWorkspaceRoot();
+    const pins: DirectoryPin[] = [];
+    let parent = this.workspaceRoot;
+    for (const component of [identity.owner, identity.repo]) {
+      const child = path.join(parent, component);
+      if (!existsSync(child)) {
+        try {
+          mkdirSync(child);
+        } catch {
+          throw bootstrapError('COLLISION', `Cannot safely create implementation workspace directory ${child}.`);
+        }
+      }
+      const pin = this.pinCanonicalDirectory(child);
+      pins.push(pin);
+      parent = child;
+    }
+    if (canonicalizeFuturePath(path.dirname(identity.workspacePath)) !== parent) {
+      throw bootstrapError('STALE_IDENTITY', 'Persisted workspace parent does not match the configured repository path.');
+    }
+    this.assertWorkspaceParents(pins);
+    return pins;
+  }
+
+  private pinCanonicalDirectory(directory: string): DirectoryPin {
+    try {
+      const stat = lstatSync(directory, { bigint: true });
+      if (stat.isSymbolicLink() || !stat.isDirectory() || realpathSync(directory) !== directory) {
+        throw new Error('not a canonical directory');
+      }
+      return { path: directory, identity: `${stat.dev}:${stat.ino}` };
+    } catch {
+      throw bootstrapError('COLLISION', `Implementation workspace directory ${directory} is not a pinned canonical directory.`);
+    }
+  }
+
+  private assertWorkspaceParents(pins: readonly DirectoryPin[]): void {
+    this.assertPinnedWorkspaceRoot();
+    for (const pin of pins) {
+      const current = this.pinCanonicalDirectory(pin.path);
+      if (current.identity !== pin.identity) {
+        throw bootstrapError(
+          'COLLISION',
+          `Implementation workspace directory ${pin.path} changed during recovery.`,
+        );
+      }
     }
   }
 

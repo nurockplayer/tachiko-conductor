@@ -124,7 +124,10 @@ class FakeBootstrap implements ImplementationBootstrapAdapter {
   readonly planRequests: PlanImplementationBootstrapRequest[] = [];
   readonly verifyRequests: VerifyDurableImplementationRequest[] = [];
 
-  constructor(private readonly verifyError?: Error) {}
+  constructor(
+    private readonly verifyError?: Error,
+    private readonly prepareError?: Error,
+  ) {}
 
   async plan(request: PlanImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
     this.planRequests.push(request);
@@ -141,6 +144,7 @@ class FakeBootstrap implements ImplementationBootstrapAdapter {
 
   async prepare(request: PrepareImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity> {
     this.prepareRequests.push(request);
+    if (this.prepareError !== undefined) throw this.prepareError;
     if (request.existing === undefined) throw new Error('expected persisted bootstrap identity');
     return request.existing;
   }
@@ -598,6 +602,37 @@ describe('runWorkflow', () => {
     assert.match(result.reason, /workspace is dirty/);
     assert.deepEqual(result.run.executor, { provider: 'codex-cli', sessionId: 'thread-ephemeral' });
     assert.equal(result.run.agentResult, undefined);
+  });
+
+  it('does not invoke implementation when restart recovery finds a dirty workspace', async () => {
+    const store = new MemoryStore();
+    const planner = new FakeBootstrap();
+    let run = applyTransition(createRun(TARGET, T0, 'run-dirty-recovery'), { type: 'start' }, T0);
+    const identity = await planner.plan({
+      runId: run.id,
+      target: TARGET,
+      baseBranch: 'main',
+      baseSha: 'base',
+    });
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([null]),
+        bootstrap: new FakeBootstrap(undefined, new Error('workspace has uncommitted state')),
+        implementation,
+        reviewer: new FakeReviewer([]),
+      },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /uncommitted state/);
+    assert.equal(implementation.requests.length, 0);
   });
 
   it('refuses to invoke implementation when live authority says the Issue is closed', async () => {
