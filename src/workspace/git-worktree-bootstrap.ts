@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, readdirSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -24,6 +24,7 @@ const SAFE_COMPONENT = /^[A-Za-z0-9._-]+$/;
 const SAFE_RUN_ID = /^[A-Za-z0-9._-]+$/;
 const FULL_SHA = /^[0-9a-f]{40}$/i;
 const OWNED_BRANCH = /^tachiko\/issue-[1-9][0-9]*-[0-9a-f]{16}$/;
+const GITHUB_HOST = 'github.com';
 
 export interface GitWorktreeBootstrapOptions {
   readonly repositoryRoot: string;
@@ -38,6 +39,13 @@ interface DirectoryPin {
   readonly identity: string;
 }
 
+interface WorktreeRegistration {
+  readonly workspacePath: string;
+  readonly headSha: string | null;
+  readonly branchRef: string | null;
+  readonly locked: boolean;
+}
+
 function bootstrapError(
   code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE,
   message: string,
@@ -46,22 +54,64 @@ function bootstrapError(
   return new ImplementationBootstrapError(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE[code], message, details);
 }
 
-function repositoryFromRemote(raw: string): { owner: string; repo: string } | null {
+function repositoryFromRemote(raw: string): { host: string; owner: string; repo: string } | null {
   const value = raw.trim();
+  let host: string;
   let repositoryPath: string;
   try {
     const url = new URL(value);
+    host = url.hostname.toLowerCase().replace(/\.$/, '');
     repositoryPath = url.pathname;
   } catch {
-    const scp = /^(?:[^@\s]+@)?[^:\s]+:(.+)$/.exec(value);
+    const scp = /^(?:[^@\s]+@)?([^:\s]+):(.+)$/.exec(value);
     if (scp === null) return null;
-    repositoryPath = scp[1] ?? '';
+    host = (scp[1] ?? '').toLowerCase().replace(/\.$/, '');
+    repositoryPath = scp[2] ?? '';
   }
+  if (host === '') return null;
   const parts = repositoryPath.replace(/^\/+|\/+$/g, '').split('/');
   if (parts.length < 2) return null;
   const owner = parts.at(-2) ?? '';
   const repo = (parts.at(-1) ?? '').replace(/\.git$/i, '');
-  return owner === '' || repo === '' ? null : { owner, repo };
+  return owner === '' || repo === '' ? null : { host, owner, repo };
+}
+
+function parseWorktreeRegistrations(raw: string): readonly WorktreeRegistration[] {
+  const registrations: WorktreeRegistration[] = [];
+  let current: {
+    workspacePath: string;
+    headSha: string | null;
+    branchRef: string | null;
+    locked: boolean;
+  } | null = null;
+  const finish = (): void => {
+    if (current !== null) registrations.push(current);
+    current = null;
+  };
+
+  for (const field of raw.split('\0')) {
+    if (field === '') {
+      finish();
+    } else if (field.startsWith('worktree ')) {
+      finish();
+      current = {
+        workspacePath: field.slice('worktree '.length),
+        headSha: null,
+        branchRef: null,
+        locked: false,
+      };
+    } else if (current === null) {
+      throw bootstrapError('COMMAND_FAILED', 'Git returned malformed worktree registration data.');
+    } else if (field.startsWith('HEAD ')) {
+      current.headSha = field.slice('HEAD '.length);
+    } else if (field.startsWith('branch ')) {
+      current.branchRef = field.slice('branch '.length);
+    } else if (field === 'locked' || field.startsWith('locked ')) {
+      current.locked = true;
+    }
+  }
+  finish();
+  return registrations;
 }
 
 function identityMatches(
@@ -356,10 +406,13 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   private async assertRepository(owner: string, repo: string): Promise<void> {
     const remoteUrl = (await this.git(['remote', 'get-url', this.remote], this.repositoryRoot)).stdout;
     const actual = repositoryFromRemote(remoteUrl);
-    if (actual === null || actual.owner.toLowerCase() !== owner.toLowerCase() || actual.repo.toLowerCase() !== repo.toLowerCase()) {
+    if (actual === null ||
+      actual.host !== GITHUB_HOST ||
+      actual.owner.toLowerCase() !== owner.toLowerCase() ||
+      actual.repo.toLowerCase() !== repo.toLowerCase()) {
       throw bootstrapError(
         'REPOSITORY_MISMATCH',
-        `Source repository remote ${this.remote} does not match ${owner}/${repo}; refusing to bootstrap another repository.`,
+        `Source repository remote ${this.remote} does not match ${GITHUB_HOST}/${owner}/${repo}; refusing to bootstrap another repository.`,
       );
     }
   }
@@ -446,8 +499,18 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     this.assertWorkspaceParents(parentPins);
     const workspacePins = this.reserveWorkspaceDirectory(identity, parentPins);
     if (localSha !== null) {
+      const forceStaleRegistration = await this.requiresForcedWorktreeRecovery(identity, localSha, workspacePins);
+      this.assertReservedWorkspaceEmpty(workspacePins);
       await this.git(
-        ['--git-dir', gitDirectory, 'worktree', 'add', '.', identity.branch],
+        [
+          '--git-dir',
+          gitDirectory,
+          'worktree',
+          'add',
+          ...(forceStaleRegistration ? ['--force'] : []),
+          '.',
+          identity.branch,
+        ],
         identity.workspacePath,
       );
     } else {
@@ -460,6 +523,58 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     await this.assertWorkspace(identity, recoveredSha);
     this.assertWorkspaceParents(workspacePins);
     return workspacePins;
+  }
+
+  private async requiresForcedWorktreeRecovery(
+    identity: ImplementationBootstrapIdentity,
+    expectedHeadSha: string,
+    workspacePins: readonly DirectoryPin[],
+  ): Promise<boolean> {
+    this.assertReservedWorkspaceEmpty(workspacePins);
+    const raw = (await this.git(['worktree', 'list', '--porcelain', '-z'], this.repositoryRoot)).stdout;
+    this.assertReservedWorkspaceEmpty(workspacePins);
+    const registrations = parseWorktreeRegistrations(raw);
+    const expectedPath = path.resolve(identity.workspacePath);
+    const expectedBranchRef = `refs/heads/${identity.branch}`;
+    const pathMatches = registrations.filter((registration) =>
+      path.isAbsolute(registration.workspacePath) && path.resolve(registration.workspacePath) === expectedPath,
+    );
+    const branchMatches = registrations.filter((registration) => registration.branchRef === expectedBranchRef);
+
+    if (pathMatches.length === 0 && branchMatches.length === 0) return false;
+    const exact = pathMatches.length === 1 ? pathMatches[0] : undefined;
+    if (exact === undefined ||
+      branchMatches.length !== 1 ||
+      branchMatches[0] !== exact ||
+      exact.branchRef !== expectedBranchRef ||
+      exact.headSha !== expectedHeadSha ||
+      exact.locked) {
+      throw bootstrapError(
+        'COLLISION',
+        `Cannot safely recover ${identity.branch}; its Git worktree registration is owned by another path or identity.`,
+      );
+    }
+    return true;
+  }
+
+  private assertReservedWorkspaceEmpty(workspacePins: readonly DirectoryPin[]): void {
+    this.assertWorkspaceParents(workspacePins);
+    const workspace = workspacePins.at(-1);
+    if (workspace === undefined) {
+      throw bootstrapError('COLLISION', 'Reserved implementation workspace identity is missing.');
+    }
+    let entries: readonly string[];
+    try {
+      entries = readdirSync(workspace.path);
+    } catch {
+      throw bootstrapError('COLLISION', `Reserved implementation workspace ${workspace.path} cannot be inspected safely.`);
+    }
+    if (entries.length !== 0) {
+      throw bootstrapError(
+        'COLLISION',
+        `Reserved implementation workspace ${workspace.path} changed before Git reconstruction.`,
+      );
+    }
   }
 
   private async assertWorkspace(

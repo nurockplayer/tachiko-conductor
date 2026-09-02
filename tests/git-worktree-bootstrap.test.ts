@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
@@ -10,7 +19,12 @@ import {
   IMPLEMENTATION_BOOTSTRAP_ERROR_CODE,
   ImplementationBootstrapError,
 } from '../src/adapters/bootstrap.js';
-import type { ProcessResult, ProcessRunOptions, ProcessRunner } from '../src/github/transport.js';
+import {
+  NodeProcessRunner,
+  type ProcessResult,
+  type ProcessRunOptions,
+  type ProcessRunner,
+} from '../src/github/transport.js';
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
 import { TARGET } from './helpers.js';
 
@@ -47,7 +61,7 @@ function result(stdout = '', exitCode = 0): ProcessResult {
 }
 
 function isWorktreeCall(call: GitCall): boolean {
-  return call.args.includes('worktree');
+  return call.args.includes('worktree') && call.args.includes('add');
 }
 
 function tempRoots(): { repositoryRoot: string; workspaceRoot: string } {
@@ -114,7 +128,13 @@ describe('GitWorktreeBootstrap', () => {
     git(repositoryRoot, ['remote', 'add', 'origin', `file://${remote}`]);
     git(repositoryRoot, ['push', '-u', 'origin', 'main']);
     const baseSha = git(repositoryRoot, ['rev-parse', 'HEAD']);
-    const bootstrap = new GitWorktreeBootstrap({ repositoryRoot, workspaceRoot });
+    const processRunner = new NodeProcessRunner();
+    const runner: ProcessRunner = {
+      run: (file, args, options) => args.join(' ') === 'remote get-url origin'
+        ? Promise.resolve(result('git@github.com:acme/widgets.git\n'))
+        : processRunner.run(file, args, options),
+    };
+    const bootstrap = new GitWorktreeBootstrap({ repositoryRoot, workspaceRoot, runner });
 
     const planned = await bootstrap.plan({
       runId: 'run-real', target: TARGET, baseBranch: 'main', baseSha,
@@ -130,7 +150,13 @@ describe('GitWorktreeBootstrap', () => {
     git(identity.workspacePath, ['push', '-u', 'origin', identity.branch]);
     const headSha = git(identity.workspacePath, ['rev-parse', 'HEAD']);
 
-    assert.deepEqual(await bootstrap.verifyDurable({ identity, expectedHeadSha: headSha }), {
+    renameSync(identity.workspacePath, `${identity.workspacePath}-removed`);
+    const recoveredBootstrap = new GitWorktreeBootstrap({ repositoryRoot, workspaceRoot, runner });
+    assert.deepEqual(await recoveredBootstrap.prepare({
+      runId: 'run-real', target: TARGET, baseBranch: 'main', baseSha, existing: identity,
+    }), identity);
+
+    assert.deepEqual(await recoveredBootstrap.verifyDurable({ identity, expectedHeadSha: headSha }), {
       headSha,
       branch: expectedBranch('run-real'),
     });
@@ -209,6 +235,27 @@ describe('GitWorktreeBootstrap', () => {
       codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.BASE_DRIFT),
     );
     assert.equal(runner.calls.some(isWorktreeCall), false);
+  });
+
+  it('rejects same-path remotes on non-GitHub hosts before any fetch or mutation', async () => {
+    for (const remoteUrl of [
+      'git@example.com:acme/widgets.git',
+      'https://example.com/acme/widgets.git',
+    ]) {
+      const roots = tempRoots();
+      const runner = new FakeGitRunner((args) => {
+        const command = args.join(' ');
+        if (command === 'remote get-url origin') return result(`${remoteUrl}\n`);
+        throw new Error(`Unexpected git call: ${command}`);
+      });
+      const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+
+      await assert.rejects(
+        bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE }),
+        codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH),
+      );
+      assert.deepEqual(runner.calls.map((call) => call.args), [['remote', 'get-url', 'origin']]);
+    }
   });
 
   it('fails stale persisted planning after a crash when no durable Git state exists', async () => {
@@ -836,6 +883,7 @@ describe('GitWorktreeBootstrap', () => {
       if (command === `ls-remote --heads origin refs/heads/${BRANCH}`) return result();
       if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result();
       if (command === 'rev-parse --absolute-git-dir') return result(`${realpathSync(roots.repositoryRoot)}\n`);
+      if (command === 'worktree list --porcelain -z') return result();
       if (command === `--git-dir ${realpathSync(roots.repositoryRoot)} worktree add . ${BRANCH}`) {
         assert.equal(cwd, workspacePath);
         assert.equal(existsSync(workspacePath), true);
@@ -855,6 +903,100 @@ describe('GitWorktreeBootstrap', () => {
       args: ['--git-dir', realpathSync(roots.repositoryRoot), 'worktree', 'add', '.', BRANCH],
       cwd: workspacePath,
     });
+  });
+
+  it('safely overrides the exact stale registration when reconstructing a missing workspace', async () => {
+    const roots = tempRoots();
+    const workspacePath = path.join(
+      realpathSync(path.dirname(roots.workspaceRoot)),
+      path.basename(roots.workspaceRoot),
+      'acme',
+      'widgets',
+      'run-42-issue-42',
+    );
+    const existing = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: BASE,
+      branch: BRANCH, workspacePath,
+    } as const;
+    const registrations = [
+      `worktree ${realpathSync(roots.repositoryRoot)}`,
+      `HEAD ${BASE}`,
+      'branch refs/heads/main',
+      '',
+      `worktree ${workspacePath}`,
+      `HEAD ${HEAD}`,
+      `branch refs/heads/${BRANCH}`,
+      'prunable gitdir file points to non-existent location',
+      '',
+    ].join('\0');
+    const runner = new FakeGitRunner((args, cwd) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command.startsWith('show-ref --verify --quiet')) return result();
+      if (command === `rev-parse refs/heads/${BRANCH}`) return result(`${HEAD}\n`);
+      if (command === `ls-remote --heads origin refs/heads/${BRANCH}`) return result();
+      if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result();
+      if (command === 'rev-parse --absolute-git-dir') return result(`${realpathSync(roots.repositoryRoot)}\n`);
+      if (command === 'worktree list --porcelain -z') return result(registrations);
+      if (command === `--git-dir ${realpathSync(roots.repositoryRoot)} worktree add --force . ${BRANCH}`) {
+        assert.equal(cwd, workspacePath);
+        assert.equal(existsSync(workspacePath), true);
+        return result();
+      }
+      if (command === 'rev-parse --show-toplevel') return result(`${workspacePath}\n`);
+      if (command === 'symbolic-ref --short HEAD') return result(`${BRANCH}\n`);
+      if (command === 'rev-parse HEAD') return result(`${HEAD}\n`);
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+
+    assert.deepEqual(await bootstrap.prepare({
+      runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing,
+    }), existing);
+    assert.deepEqual(runner.calls.find(isWorktreeCall), {
+      args: ['--git-dir', realpathSync(roots.repositoryRoot), 'worktree', 'add', '--force', '.', BRANCH],
+      cwd: workspacePath,
+    });
+  });
+
+  it('refuses to override a branch registration owned by another worktree path', async () => {
+    const roots = tempRoots();
+    const workspacePath = path.join(
+      realpathSync(path.dirname(roots.workspaceRoot)),
+      path.basename(roots.workspaceRoot),
+      'acme',
+      'widgets',
+      'run-42-issue-42',
+    );
+    const otherPath = path.join(path.dirname(workspacePath), 'another-run-issue-42');
+    const existing = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: BASE,
+      branch: BRANCH, workspacePath,
+    } as const;
+    const registrations = [
+      `worktree ${otherPath}`,
+      `HEAD ${HEAD}`,
+      `branch refs/heads/${BRANCH}`,
+      '',
+    ].join('\0');
+    const runner = new FakeGitRunner((args) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command.startsWith('show-ref --verify --quiet')) return result();
+      if (command === `rev-parse refs/heads/${BRANCH}`) return result(`${HEAD}\n`);
+      if (command === `ls-remote --heads origin refs/heads/${BRANCH}`) return result();
+      if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result();
+      if (command === 'rev-parse --absolute-git-dir') return result(`${realpathSync(roots.repositoryRoot)}\n`);
+      if (command === 'worktree list --porcelain -z') return result(registrations);
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.COLLISION),
+    );
+    assert.equal(runner.calls.some(isWorktreeCall), false);
   });
 
   it('accepts only a clean exact HEAD that is pushed on the owned branch and descends from the base', async () => {
