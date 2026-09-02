@@ -72,6 +72,26 @@ describe('CodexCliAdapter', () => {
     ]);
   });
 
+  it('revalidates the prepared workspace immediately before spawning Codex', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/source' });
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      workspacePath: '/tmp/prepared-worktree',
+      workspaceGuard: {
+        assertValid() {
+          throw new Error('prepared workspace identity changed');
+        },
+      },
+    });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CODEX_EXEC_FAILURE/);
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('resumes the exact persisted Codex thread without falling back to a fresh exec', async () => {
     const threadId = '0199a213-81c0-7800-8aa1-bbab2a035a53';
     const runner = new FakeRunner([result(codexJsonl('Fixed review findings.', threadId)), result(HEAD)]);

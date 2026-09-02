@@ -2,6 +2,7 @@ import {
   humanTakeoverReason,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
+  type WorkspaceGuard,
 } from '../adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter } from '../adapters/github.js';
@@ -213,6 +214,7 @@ export async function runReviewLoop(
       store.update(run);
 
       let bootstrap = run.bootstrap;
+      let workspaceGuard: WorkspaceGuard | undefined;
       if (bootstrap !== undefined) {
         if (deps.bootstrap === undefined) {
           return parkBootstrapFailure(
@@ -230,6 +232,7 @@ export async function runReviewLoop(
             baseSha: bootstrap.baseSha,
             existing: bootstrap,
           });
+          workspaceGuard = deps.bootstrap.guard(bootstrap);
         } catch (error) {
           return parkBootstrapFailure(run, error, store, now);
         }
@@ -240,6 +243,7 @@ export async function runReviewLoop(
         target,
         baseSha: run.headSha ?? '',
         ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch }),
+        ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
         authority: 'live-target',
         instructions: blockingFindings,
         supplementalInstructions: blockingFindings,

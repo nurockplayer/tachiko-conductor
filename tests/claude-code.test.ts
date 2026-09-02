@@ -71,6 +71,26 @@ describe('ClaudeCodeAdapter', () => {
     ]);
   });
 
+  it('revalidates the prepared workspace immediately before spawning Claude', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/source' });
+
+    const agentResult = await adapter.run({
+      target: TARGET,
+      baseSha: 'base-1',
+      workspacePath: '/tmp/prepared-worktree',
+      workspaceGuard: {
+        assertValid() {
+          throw new Error('prepared workspace identity changed');
+        },
+      },
+    });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CLAUDE_EXEC_FAILURE/);
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('maps a non-zero claude exit to a deterministic failure without reading git', async () => {
     const runner = new FakeRunner([result('', 'claude crashed', 1)]);
     const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });

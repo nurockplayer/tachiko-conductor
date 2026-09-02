@@ -116,6 +116,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       request.signal,
       sessionId,
       cwd,
+      request.workspaceGuard,
     );
     if (!outcome.ok) return outcome.agentResult;
     const executor = executorIdentity(outcome.sessionId);
@@ -213,10 +214,12 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     signal: AbortSignal | undefined,
     resumeSessionId: string | undefined,
     cwd: string,
+    workspaceGuard: ImplementationRequest['workspaceGuard'],
   ): Promise<ClaudeOutcome> {
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
+      workspaceGuard?.assertValid();
       result = await this.runner.run('claude', args, processOptions(this.timeoutMs, cwd, signal));
     } catch (error) {
       const durationMs = elapsedMs(startedAt);

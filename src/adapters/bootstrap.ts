@@ -1,4 +1,5 @@
 import type { ImplementationBootstrapIdentity, IssueTarget } from '../domain/types.js';
+import type { WorkspaceGuard } from './agent.js';
 
 export interface PrepareImplementationBootstrapRequest {
   readonly runId: string;
@@ -27,6 +28,8 @@ export interface ImplementationBootstrapAdapter {
   plan(request: PlanImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity>;
   /** Realize or reconstruct an identity that the Run already persisted. */
   prepare(request: PrepareImplementationBootstrapRequest): Promise<ImplementationBootstrapIdentity>;
+  /** Pin the prepared workspace identity through any later prompt/capability awaits. */
+  guard(identity: ImplementationBootstrapIdentity): WorkspaceGuard;
   verifyDurable(request: VerifyDurableImplementationRequest): Promise<DurableImplementationSnapshot>;
 }
 

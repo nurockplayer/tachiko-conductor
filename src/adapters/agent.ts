@@ -47,6 +47,11 @@ export function normalizeMcpHttpCapabilities(
 /** Resolve ephemeral capabilities immediately before an implementation call. */
 export type ImplementationCapabilityResolver = () => Promise<readonly McpHttpCapability[] | undefined>;
 
+/** Transient filesystem identity guard; implementations assert it immediately before process spawn. */
+export interface WorkspaceGuard {
+  assertValid(): void;
+}
+
 export interface ImplementationRequest {
   /** The work item: a single issue or a whole branch. */
   readonly target: Target;
@@ -55,6 +60,7 @@ export interface ImplementationRequest {
   readonly workspacePath?: string;
   /** Durable implementation branch paired with workspacePath. */
   readonly branch?: string;
+  readonly workspaceGuard?: WorkspaceGuard;
   /** Whether the executor should read target authority live instead of from copied prose. */
   readonly authority?: 'embedded' | 'live-target';
   readonly instructions?: string;

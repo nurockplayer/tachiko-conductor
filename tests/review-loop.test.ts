@@ -162,6 +162,10 @@ class FakeBootstrap implements ImplementationBootstrapAdapter {
     return request.existing;
   }
 
+  guard(): { assertValid(): void } {
+    return { assertValid() {} };
+  }
+
   async verifyDurable(request: VerifyDurableImplementationRequest): Promise<{ headSha: string; branch: string }> {
     this.verifyRequests.push(request);
     return { headSha: request.expectedHeadSha, branch: request.identity.branch };

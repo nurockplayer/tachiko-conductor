@@ -149,6 +149,10 @@ class FakeBootstrap implements ImplementationBootstrapAdapter {
     return request.existing;
   }
 
+  guard(): { assertValid(): void } {
+    return { assertValid() {} };
+  }
+
   async verifyDurable(request: VerifyDurableImplementationRequest): Promise<{ headSha: string; branch: string }> {
     this.verifyRequests.push(request);
     if (this.verifyError !== undefined) throw this.verifyError;
@@ -394,7 +398,7 @@ describe('runWorkflow', () => {
     const bootstrap = new FakeBootstrap();
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([null, HEAD, HEAD, HEAD]), bootstrap, implementation, reviewer },
+      { store, github: githubAdapter([null, null, HEAD, HEAD, HEAD]), bootstrap, implementation, reviewer },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -411,6 +415,53 @@ describe('runWorkflow', () => {
     assert.equal(bootstrap.verifyRequests.length, 1);
     assert.equal(result.run.bootstrap?.baseSha, 'base');
     assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
+  });
+
+  it('uses a matching durable PR that appears while the prepared bootstrap is being recovered', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-pr-appeared'));
+    const bootstrap = new FakeBootstrap();
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([null, HEAD, HEAD, HEAD, HEAD]),
+        bootstrap,
+        implementation,
+        reviewer: new FakeReviewer([approve(HEAD)]),
+      },
+      'run-pr-appeared',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(bootstrap.verifyRequests[0]?.expectedHeadSha, HEAD);
+  });
+
+  it('fails closed when a PR appearing during bootstrap recovery is not the owned durable branch', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-unrelated-pr-appeared'));
+    const bootstrap = new FakeBootstrap(new Error('pull request HEAD is not the owned bootstrap branch'));
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([null, HEAD]),
+        bootstrap,
+        implementation,
+        reviewer: new FakeReviewer([]),
+      },
+      'run-unrelated-pr-appeared',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /not the owned bootstrap branch/);
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(bootstrap.verifyRequests.length, 1);
   });
 
   it('fails closed when validation reports a HEAD without an associated open PR identity', async () => {
@@ -459,7 +510,7 @@ describe('runWorkflow', () => {
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([null, HEAD, HEAD, HEAD]),
+        github: githubAdapter([null, null, HEAD, HEAD, HEAD]),
         bootstrap,
         implementation,
         reviewer: new FakeReviewer([approve(HEAD)]),
@@ -497,6 +548,9 @@ describe('runWorkflow', () => {
         recoveredCommitPush = true;
         return identity;
       },
+      guard() {
+        return { assertValid() {} };
+      },
       async verifyDurable(request) {
         assert.equal(recoveredCommitPush, true);
         assert.deepEqual(request.identity, identity);
@@ -507,7 +561,7 @@ describe('runWorkflow', () => {
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([null, HEAD, HEAD, HEAD]),
+        github: githubAdapter([null, null, HEAD, HEAD, HEAD]),
         bootstrap: checkpointBootstrap,
         implementation: new FakeImplementation([successResult(HEAD)]),
         reviewer: new FakeReviewer([approve(HEAD)]),
@@ -534,12 +588,12 @@ describe('runWorkflow', () => {
     run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
     store.create(run);
     bootstrap.prepareRequests.length = 0;
-    const implementation = new FakeImplementation([successResult(HEAD)]);
+    const implementation = new FakeImplementation([]);
 
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([HEAD, HEAD, HEAD, HEAD]),
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD]),
         bootstrap,
         implementation,
         reviewer: new FakeReviewer([approve(HEAD)]),
@@ -551,7 +605,8 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(bootstrap.prepareRequests.length, 1);
     assert.deepEqual(bootstrap.prepareRequests[0]?.existing, identity);
-    assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(bootstrap.verifyRequests[0]?.expectedHeadSha, HEAD);
     assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
   });
 
@@ -585,7 +640,7 @@ describe('runWorkflow', () => {
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([null]),
+        github: githubAdapter([null, null]),
         bootstrap,
         implementation: new FakeImplementation([{
           ...successResult(HEAD),

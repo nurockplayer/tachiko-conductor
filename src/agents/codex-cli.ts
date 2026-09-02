@@ -94,6 +94,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
+      request.workspaceGuard?.assertValid();
       result = await this.runner.run(
         'codex',
         this.buildArgs(prompt, request.capabilities ?? [], executor),

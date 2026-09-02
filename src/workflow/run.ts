@@ -2,6 +2,7 @@ import {
   humanTakeoverReason,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
+  type WorkspaceGuard,
 } from '../adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
@@ -176,6 +177,7 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
         let bootstrap = run.bootstrap;
+        let workspaceGuard: WorkspaceGuard | undefined;
         if (!pendingReviewFix && snapshot.pullRequest === null) {
           const baseBranch = snapshot.repository.defaultBranch;
           const liveBaseSha = snapshot.repository.defaultBranchHeadSha;
@@ -247,6 +249,78 @@ export async function runWorkflow(
           }
         }
 
+        if (bootstrap !== undefined) {
+          if (deps.bootstrap === undefined) {
+            return bootstrapFailureOutcome(
+              run,
+              new Error('The persisted implementation bootstrap guard is unavailable.'),
+              store,
+              now,
+            );
+          }
+          try {
+            workspaceGuard = deps.bootstrap.guard(bootstrap);
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now);
+          }
+        }
+
+        if (!pendingReviewFix && bootstrap !== undefined) {
+          try {
+            snapshot = await github.readLiveSnapshot(target);
+          } catch (error) {
+            return githubFailureOutcome(run, error, store, now);
+          }
+          if (snapshot.issue.state !== 'open') {
+            const reason = `Issue ${formatTarget(target)} closed while implementation state was being prepared.`;
+            run = applyTransition(
+              run,
+              { type: 'escalate', reason, interrupt: { evidence: reason, choices: [CANCEL_RUN_DECISION] } },
+              now(),
+            );
+            store.update(run);
+            return { outcome: 'needs_human', run, reason };
+          }
+          if (snapshot.pullRequest !== null) {
+            if (deps.bootstrap === undefined || snapshot.headSha === null) {
+              return bootstrapFailureOutcome(
+                run,
+                new Error('An associated pull request appeared without a verifiable bootstrap HEAD.'),
+                store,
+                now,
+              );
+            }
+            try {
+              await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha });
+            } catch (error) {
+              return bootstrapFailureOutcome(run, error, store, now);
+            }
+            const recoveredResult = {
+              exitStatus: 'success' as const,
+              summary: `Recovered durable implementation from pull request #${snapshot.pullRequest.number}.`,
+              headSha: snapshot.headSha,
+            };
+            run = applyTransition(
+              run,
+              { type: 'agent_succeeded', agentResult: recoveredResult, headSha: snapshot.headSha },
+              now(),
+            );
+            store.update(run);
+            break;
+          }
+          if (snapshot.repository.defaultBranch !== bootstrap.baseBranch ||
+            snapshot.repository.defaultBranchHeadSha !== bootstrap.baseSha) {
+            return bootstrapFailureOutcome(
+              run,
+              new Error(
+                `Live default branch moved after bootstrap preparation; expected ${bootstrap.baseBranch}@${bootstrap.baseSha}.`,
+              ),
+              store,
+              now,
+            );
+          }
+        }
+
         const pendingFixInstructions = pendingReviewFix ? renderBlockingFindings(run) : null;
         const baseSha = pendingReviewFix
           ? run.headSha
@@ -282,6 +356,7 @@ export async function runWorkflow(
           target,
           baseSha,
           ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch }),
+          ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
           authority: 'live-target',
           instructions,
           ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),

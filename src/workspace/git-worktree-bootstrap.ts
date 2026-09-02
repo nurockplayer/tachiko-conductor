@@ -11,6 +11,7 @@ import {
   type PrepareImplementationBootstrapRequest,
   type VerifyDurableImplementationRequest,
 } from '../adapters/bootstrap.js';
+import type { WorkspaceGuard } from '../adapters/agent.js';
 import type { ImplementationBootstrapIdentity } from '../domain/types.js';
 import {
   NodeProcessRunner,
@@ -95,6 +96,47 @@ function implementationBranch(issueNumber: number, runId: string): string {
   return `tachiko/issue-${issueNumber}-${runKey}`;
 }
 
+function materializeCanonicalDirectory(directory: string): void {
+  let existing = directory;
+  const missing: string[] = [];
+  while (!existsSync(existing)) {
+    const parent = path.dirname(existing);
+    if (parent === existing) {
+      throw bootstrapError('INVALID_REQUEST', `Cannot materialize workspace root ${directory}.`);
+    }
+    missing.unshift(path.basename(existing));
+    existing = parent;
+  }
+  existing = realpathSync(existing);
+  let parentStat = lstatSync(existing, { bigint: true });
+  if (parentStat.isSymbolicLink() || !parentStat.isDirectory()) {
+    throw bootstrapError('INVALID_REQUEST', `Workspace-root ancestor ${existing} is not a canonical directory.`);
+  }
+  let parentIdentity = `${parentStat.dev}:${parentStat.ino}`;
+  for (const component of missing) {
+    const currentParent = lstatSync(existing, { bigint: true });
+    if (`${currentParent.dev}:${currentParent.ino}` !== parentIdentity || currentParent.isSymbolicLink()) {
+      throw bootstrapError('COLLISION', `Workspace-root ancestor ${existing} changed during creation.`);
+    }
+    const child = path.join(existing, component);
+    try {
+      mkdirSync(child);
+    } catch {
+      throw bootstrapError('COLLISION', `Cannot safely create workspace-root directory ${child}.`);
+    }
+    const childStat = lstatSync(child, { bigint: true });
+    if (childStat.isSymbolicLink() || !childStat.isDirectory() || realpathSync(child) !== child) {
+      throw bootstrapError('COLLISION', `Workspace-root directory ${child} is not canonical.`);
+    }
+    existing = child;
+    parentStat = childStat;
+    parentIdentity = `${childStat.dev}:${childStat.ino}`;
+  }
+  if (existing !== directory) {
+    throw bootstrapError('INVALID_REQUEST', `Workspace root ${directory} did not materialize canonically.`);
+  }
+}
+
 /** Git worktree implementation of the provider-neutral bootstrap boundary. */
 export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   readonly kind: 'implementation-bootstrap' = 'implementation-bootstrap';
@@ -118,7 +160,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     ) {
       throw bootstrapError('INVALID_REQUEST', 'Implementation workspace root must be outside the source repository.');
     }
-    mkdirSync(this.workspaceRoot, { recursive: true });
+    materializeCanonicalDirectory(this.workspaceRoot);
     const workspaceRootStat = lstatSync(this.workspaceRoot, { bigint: true });
     if (workspaceRootStat.isSymbolicLink() || realpathSync(this.workspaceRoot) !== this.workspaceRoot) {
       throw bootstrapError('INVALID_REQUEST', 'Implementation workspace root must be a pinned canonical directory.');
@@ -163,6 +205,11 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     return request.existing;
   }
 
+  guard(identity: ImplementationBootstrapIdentity): WorkspaceGuard {
+    const pins = this.pinExistingWorkspace(identity);
+    return { assertValid: () => this.assertWorkspaceParents(pins) };
+  }
+
   async verifyDurable(request: VerifyDurableImplementationRequest): Promise<DurableImplementationSnapshot> {
     if (!FULL_SHA.test(request.expectedHeadSha)) {
       throw bootstrapError('INVALID_REQUEST', 'Durable implementation verification requires an exact 40-hex HEAD SHA.');
@@ -171,8 +218,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     this.assertIdentity(identity);
     await this.assertRepository(identity.owner, identity.repo);
     await this.assertWorkspace(identity);
+    const workspaceGuard = this.guard(identity);
 
     const headSha = (await this.git(['rev-parse', 'HEAD'], identity.workspacePath)).stdout.trim();
+    workspaceGuard.assertValid();
     if (!FULL_SHA.test(headSha) || headSha !== request.expectedHeadSha) {
       throw bootstrapError(
         'HEAD_MISMATCH',
@@ -186,6 +235,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       );
     }
     const status = await this.git(['status', '--porcelain=v1', '--untracked-files=all'], identity.workspacePath);
+    workspaceGuard.assertValid();
     if (status.stdout.trim() !== '') {
       throw bootstrapError(
         'DIRTY_WORKSPACE',
@@ -193,6 +243,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       );
     }
     const remoteHead = await this.remoteBranchSha(identity.branch);
+    workspaceGuard.assertValid();
     if (remoteHead !== headSha) {
       throw bootstrapError(
         'UNPUSHED_HEAD',
@@ -204,10 +255,23 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       identity.workspacePath,
       [0, 1],
     );
+    workspaceGuard.assertValid();
     if (ancestry.exitCode !== 0) {
       throw bootstrapError(
         'HEAD_MISMATCH',
         `Implementation HEAD ${headSha} does not descend from bootstrap base ${identity.baseSha}.`,
+      );
+    }
+    const treeDiff = await this.git(
+      ['diff', '--quiet', identity.baseSha, headSha, '--'],
+      identity.workspacePath,
+      [0, 1],
+    );
+    workspaceGuard.assertValid();
+    if (treeDiff.exitCode === 0) {
+      throw bootstrapError(
+        'HEAD_MISMATCH',
+        `Implementation HEAD ${headSha} has no tree changes from bootstrap base ${identity.baseSha}.`,
       );
     }
     return { headSha, branch: identity.branch };
@@ -286,9 +350,12 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
 
   private async restoreExisting(identity: ImplementationBootstrapIdentity, liveBaseSha: string): Promise<void> {
     this.assertIdentity(identity);
+    const initialPins = this.pinPresentWorkspacePath(identity);
     const hasWorkspace = existsSync(identity.workspacePath);
     const localSha = await this.localBranchSha(identity.branch);
+    this.assertWorkspaceParents(initialPins);
     const remoteSha = await this.remoteBranchSha(identity.branch);
+    this.assertWorkspaceParents(initialPins);
     if (!hasWorkspace && localSha === null && remoteSha === null) {
       if (identity.baseSha !== liveBaseSha) {
         throw bootstrapError(
@@ -297,6 +364,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         );
       }
       await this.assertLiveBase(identity.baseBranch, liveBaseSha);
+      this.assertWorkspaceParents(initialPins);
       const parentPins = this.ensureWorkspaceParents(identity);
       await this.git(['cat-file', '-e', `${identity.baseSha}^{commit}`], this.repositoryRoot);
       this.assertWorkspaceParents(parentPins);
@@ -309,7 +377,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       return;
     }
 
-    if (remoteSha !== null) await this.fetchRemoteBranch(identity.branch, remoteSha);
+    if (remoteSha !== null) {
+      await this.fetchRemoteBranch(identity.branch, remoteSha);
+      this.assertWorkspaceParents(initialPins);
+    }
     if (localSha !== null && remoteSha !== null && localSha !== remoteSha) {
       throw bootstrapError(
         'COLLISION',
@@ -322,6 +393,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     }
     const parentPins = hasWorkspace ? undefined : this.ensureWorkspaceParents(identity);
     await this.assertDescendsFromBase(identity, recoveredSha);
+    this.assertWorkspaceParents(initialPins);
 
     if (hasWorkspace) {
       await this.assertWorkspace(identity, recoveredSha, true);
@@ -349,12 +421,19 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     requireClean = false,
   ): Promise<void> {
     this.assertIdentity(identity);
+    const pins = this.pinExistingWorkspace(identity);
+    const expectedTop = pins.at(-1)?.path;
+    if (expectedTop === undefined) {
+      throw bootstrapError('STALE_IDENTITY', 'Implementation workspace could not be pinned.');
+    }
     const top = realpathSync(path.resolve((await this.git(['rev-parse', '--show-toplevel'], identity.workspacePath)).stdout.trim()));
-    const expectedTop = realpathSync(identity.workspacePath);
+    this.assertWorkspaceParents(pins);
     const branch = (await this.git(['symbolic-ref', '--short', 'HEAD'], identity.workspacePath)).stdout.trim();
+    this.assertWorkspaceParents(pins);
     const headSha = expectedHeadSha === undefined
       ? undefined
       : (await this.git(['rev-parse', 'HEAD'], identity.workspacePath)).stdout.trim();
+    this.assertWorkspaceParents(pins);
     if (!this.isWithin(this.workspaceRoot, expectedTop) || top !== expectedTop || branch !== identity.branch ||
       (expectedHeadSha !== undefined && headSha !== expectedHeadSha)) {
       throw bootstrapError(
@@ -364,6 +443,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     }
     if (requireClean) {
       const status = await this.git(['status', '--porcelain=v1', '--untracked-files=all'], identity.workspacePath);
+      this.assertWorkspaceParents(pins);
       if (status.stdout.trim() !== '') {
         throw bootstrapError(
           'DIRTY_WORKSPACE',
@@ -392,6 +472,38 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     }
     if (canonicalizeFuturePath(path.dirname(identity.workspacePath)) !== parent) {
       throw bootstrapError('STALE_IDENTITY', 'Persisted workspace parent does not match the configured repository path.');
+    }
+    this.assertWorkspaceParents(pins);
+    return pins;
+  }
+
+  private pinExistingWorkspace(identity: ImplementationBootstrapIdentity): readonly DirectoryPin[] {
+    this.assertIdentity(identity);
+    this.assertPinnedWorkspaceRoot();
+    const ownerPath = path.join(this.workspaceRoot, identity.owner);
+    const repoPath = path.join(ownerPath, identity.repo);
+    const workspacePath = path.join(repoPath, path.basename(identity.workspacePath));
+    if (canonicalizeFuturePath(identity.workspacePath) !== workspacePath) {
+      throw bootstrapError('STALE_IDENTITY', 'Persisted workspace path is not the configured canonical run directory.');
+    }
+    const pins = [ownerPath, repoPath, workspacePath].map((directory) => this.pinCanonicalDirectory(directory));
+    this.assertWorkspaceParents(pins);
+    return pins;
+  }
+
+  private pinPresentWorkspacePath(identity: ImplementationBootstrapIdentity): readonly DirectoryPin[] {
+    this.assertPinnedWorkspaceRoot();
+    const pins: DirectoryPin[] = [];
+    const ownerPath = path.join(this.workspaceRoot, identity.owner);
+    const repoPath = path.join(ownerPath, identity.repo);
+    const workspacePath = path.join(repoPath, path.basename(identity.workspacePath));
+    for (const directory of [
+      ownerPath,
+      repoPath,
+      workspacePath,
+    ]) {
+      if (!existsSync(directory)) break;
+      pins.push(this.pinCanonicalDirectory(directory));
     }
     this.assertWorkspaceParents(pins);
     return pins;
