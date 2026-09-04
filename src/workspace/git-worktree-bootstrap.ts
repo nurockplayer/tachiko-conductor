@@ -1010,6 +1010,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
 
   private isWithin(parent: string, child: string): boolean {
     const relative = path.relative(parent, child);
-    return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative);
+    const firstSegment = relative.split(path.sep)[0];
+    return relative !== '' && firstSegment !== '..' && !path.isAbsolute(relative);
   }
 }

@@ -119,6 +119,29 @@ describe('GitWorktreeBootstrap', () => {
     );
   });
 
+  it('rejects a workspace root named ..workspaces when nested inside the repository', () => {
+    const roots = tempRoots();
+    const unsafeWorkspaceRoot = path.join(roots.repositoryRoot, '..workspaces');
+
+    assert.throws(
+      () => new GitWorktreeBootstrap({
+        repositoryRoot: roots.repositoryRoot,
+        workspaceRoot: unsafeWorkspaceRoot,
+      }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.INVALID_REQUEST),
+    );
+  });
+
+  it('accepts a sibling workspace root named ..workspaces outside the repository', () => {
+    const roots = tempRoots();
+    const siblingWorkspaceRoot = path.join(path.dirname(roots.repositoryRoot), '..workspaces');
+
+    assert.doesNotThrow(() => new GitWorktreeBootstrap({
+      repositoryRoot: roots.repositoryRoot,
+      workspaceRoot: siblingWorkspaceRoot,
+    }));
+  });
+
   it('boots and verifies durable state against a real local Git remote', async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-integration-'));
     tempDirs.push(root);
