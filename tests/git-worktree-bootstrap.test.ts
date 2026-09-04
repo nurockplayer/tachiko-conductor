@@ -48,11 +48,15 @@ class FakeGitRunner implements ProcessRunner {
 
   constructor(
     private readonly respond: (args: readonly string[], cwd: string | undefined) => ProcessResult,
+    private readonly pushUrls: readonly string[] = ['git@github.com:acme/widgets.git'],
   ) {}
 
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     assert.equal(file, 'git');
     this.calls.push({ args, cwd: options.cwd });
+    if (args.join(' ') === 'remote get-url --all --push origin') {
+      return result(this.pushUrls.length === 0 ? '' : `${this.pushUrls.join('\n')}\n`);
+    }
     return this.respond(args, options.cwd);
   }
 }
@@ -131,7 +135,8 @@ describe('GitWorktreeBootstrap', () => {
     const baseSha = git(repositoryRoot, ['rev-parse', 'HEAD']);
     const processRunner = new NodeProcessRunner();
     const runner: ProcessRunner = {
-      run: (file, args, options) => args.join(' ') === 'remote get-url origin'
+      run: (file, args, options) => args.join(' ') === 'remote get-url origin' ||
+        args.join(' ') === 'remote get-url --all --push origin'
         ? Promise.resolve(result('git@github.com:acme/widgets.git\n'))
         : processRunner.run(file, args, options),
     };
@@ -256,6 +261,70 @@ describe('GitWorktreeBootstrap', () => {
         codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH),
       );
       assert.deepEqual(runner.calls.map((call) => call.args), [['remote', 'get-url', 'origin']]);
+    }
+  });
+
+  it('rejects a push URL that diverges from the expected fetch repository', async () => {
+    const roots = tempRoots();
+    const runner = new FakeGitRunner(
+      (args) => {
+        const command = args.join(' ');
+        if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+        throw new Error(`Unexpected git call: ${command}`);
+      },
+      ['git@github.com:other/widgets.git'],
+    );
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+
+    await assert.rejects(
+      bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH),
+    );
+    assert.equal(runner.calls.some((call) => call.args[0] === 'fetch'), false);
+  });
+
+  it('validates every configured push URL when a remote has multiple destinations', async () => {
+    const roots = tempRoots();
+    const runner = new FakeGitRunner(
+      (args) => {
+        const command = args.join(' ');
+        if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+        throw new Error(`Unexpected git call: ${command}`);
+      },
+      ['git@github.com:acme/widgets.git', 'https://github.com/acme/other.git'],
+    );
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+
+    await assert.rejects(
+      bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH),
+    );
+    assert.equal(runner.calls.some((call) => call.args[0] === 'fetch'), false);
+  });
+
+  it('fails closed for missing, malformed, or non-GitHub effective push URLs', async () => {
+    for (const pushUrls of [
+      [],
+      ['not-a-remote-url'],
+      ['git@gitlab.com:acme/widgets.git'],
+      ['git@github.com:acme/widgets.git', ''],
+    ]) {
+      const roots = tempRoots();
+      const runner = new FakeGitRunner(
+        (args) => {
+          const command = args.join(' ');
+          if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+          throw new Error(`Unexpected git call: ${command}`);
+        },
+        pushUrls,
+      );
+      const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+
+      await assert.rejects(
+        bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE }),
+        codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH),
+      );
+      assert.equal(runner.calls.some((call) => call.args[0] === 'fetch'), false);
     }
   });
 

@@ -70,10 +70,25 @@ function repositoryFromRemote(raw: string): { host: string; owner: string; repo:
   }
   if (host === '') return null;
   const parts = repositoryPath.replace(/^\/+|\/+$/g, '').split('/');
-  if (parts.length < 2) return null;
+  if (parts.length !== 2) return null;
   const owner = parts.at(-2) ?? '';
   const repo = (parts.at(-1) ?? '').replace(/\.git$/i, '');
   return owner === '' || repo === '' ? null : { host, owner, repo };
+}
+
+function isExpectedRepository(raw: string, owner: string, repo: string): boolean {
+  const actual = repositoryFromRemote(raw);
+  return actual !== null &&
+    actual.host === GITHUB_HOST &&
+    actual.owner.toLowerCase() === owner.toLowerCase() &&
+    actual.repo.toLowerCase() === repo.toLowerCase();
+}
+
+function effectiveRemoteUrls(raw: string): readonly string[] | null {
+  const lines = raw.split(/\r?\n/);
+  if (lines.at(-1) === '') lines.pop();
+  if (lines.length === 0 || lines.some((line) => line.trim() === '')) return null;
+  return lines.map((line) => line.trim());
 }
 
 function parseWorktreeRegistrations(raw: string): readonly WorktreeRegistration[] {
@@ -405,14 +420,18 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
 
   private async assertRepository(owner: string, repo: string): Promise<void> {
     const remoteUrl = (await this.git(['remote', 'get-url', this.remote], this.repositoryRoot)).stdout;
-    const actual = repositoryFromRemote(remoteUrl);
-    if (actual === null ||
-      actual.host !== GITHUB_HOST ||
-      actual.owner.toLowerCase() !== owner.toLowerCase() ||
-      actual.repo.toLowerCase() !== repo.toLowerCase()) {
+    if (!isExpectedRepository(remoteUrl, owner, repo)) {
       throw bootstrapError(
         'REPOSITORY_MISMATCH',
         `Source repository remote ${this.remote} does not match ${GITHUB_HOST}/${owner}/${repo}; refusing to bootstrap another repository.`,
+      );
+    }
+    const pushRaw = (await this.git(['remote', 'get-url', '--all', '--push', this.remote], this.repositoryRoot)).stdout;
+    const pushUrls = effectiveRemoteUrls(pushRaw);
+    if (pushUrls === null || pushUrls.some((pushUrl) => !isExpectedRepository(pushUrl, owner, repo))) {
+      throw bootstrapError(
+        'REPOSITORY_MISMATCH',
+        `Effective push URLs for remote ${this.remote} do not all match ${GITHUB_HOST}/${owner}/${repo}; refusing to let the agent push to another repository.`,
       );
     }
   }
