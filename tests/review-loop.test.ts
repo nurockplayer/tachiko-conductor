@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
+import {
+  WorkspaceGuardFailure,
+  type ImplementationAgent,
+  type ImplementationRequest,
+} from '../src/adapters/agent.js';
 import type {
   ImplementationBootstrapAdapter,
   PlanImplementationBootstrapRequest,
@@ -131,7 +135,7 @@ class FakeImplementation implements ImplementationAgent {
     workspaceGuard: ImplementationRequest['workspaceGuard'];
   }> = [];
 
-  constructor(private readonly outcomes: AgentResult[]) {}
+  constructor(private readonly outcomes: Array<AgentResult | Error>) {}
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
     this.requests.push({
@@ -145,6 +149,7 @@ class FakeImplementation implements ImplementationAgent {
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
+    if (outcome instanceof Error) throw outcome;
     return outcome;
   }
 }
@@ -545,6 +550,27 @@ describe('runReviewLoop', () => {
 
     assert.equal(result.outcome, 'failed');
     assert.equal(result.run.state, 'FAILED');
+  });
+
+  it('parks a provider-neutral workspace guard failure for resumable review recovery', async () => {
+    const store = new MemoryStore();
+    store.create(reviewingRun());
+    const reviewer = new FakeReviewer([requestChanges(HEAD)]);
+    const implementation = new FakeImplementation([
+      new WorkspaceGuardFailure(new Error('workspace replaced after execution')),
+    ]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.match(result.reason, /WORKSPACE_GUARD_FAILURE/);
+    assert.match(result.reason, /workspace replaced after execution/);
+    assert.notEqual(result.run.state, 'FAILED');
   });
 
   it('parks in NEEDS_HUMAN when a review fix emits the explicit takeover protocol', async () => {

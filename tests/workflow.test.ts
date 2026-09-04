@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } from '../src/adapters/agent.js';
+import {
+  WorkspaceGuardFailure,
+  type ImplementationAgent,
+  type ImplementationRequest,
+  type McpHttpCapability,
+} from '../src/adapters/agent.js';
 import type {
   ImplementationBootstrapAdapter,
   PlanImplementationBootstrapRequest,
@@ -108,12 +113,13 @@ class FakeImplementation implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
   readonly requests: ImplementationRequest[] = [];
 
-  constructor(private readonly outcomes: AgentResult[]) {}
+  constructor(private readonly outcomes: Array<AgentResult | Error>) {}
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
     this.requests.push(request);
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
+    if (outcome instanceof Error) throw outcome;
     return outcome;
   }
 }
@@ -275,6 +281,27 @@ describe('runWorkflow', () => {
     assert.equal(result.run.interrupt?.reason, 'login expired');
     assert.deepEqual(result.run.executor, { provider: 'codex-cli', sessionId: 'thread-takeover' });
     assert.deepEqual(result.run.interrupt?.choices, ['Complete human bootstrap/takeover and resume', 'Cancel the run']);
+  });
+
+  it('parks a provider-neutral workspace guard failure as resumable bootstrap recovery', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-workspace-guard'));
+    const implementation = new FakeImplementation([
+      new WorkspaceGuardFailure(new Error('workspace replaced before execution')),
+    ]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) },
+      'run-workspace-guard',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.match(result.reason, /WORKSPACE_GUARD_FAILURE/);
+    assert.match(result.reason, /workspace replaced before execution/);
+    assert.notEqual(result.run.state, 'FAILED');
+    assert.equal(result.run.agentResult, undefined);
   });
 
   it('resumes an interrupted review fix with the original blocking findings and current HEAD', async () => {

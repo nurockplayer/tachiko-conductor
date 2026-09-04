@@ -1,5 +1,6 @@
 import {
   humanTakeoverReason,
+  isWorkspaceGuardFailure,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
   type WorkspaceGuard,
@@ -378,18 +379,24 @@ export async function runWorkflow(
             ? `Conductor prepared branch ${bootstrap?.branch ?? '(unavailable)'} from ${snapshot.repository.defaultBranch}@${baseSha}. Commit and push all meaningful changes, then create one associated open implementation pull request. Do not create another branch or workspace.`
             : undefined
         );
-        const result = await implementation.run({
-          target,
-          baseSha,
-          ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch }),
-          ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
-          authority: 'live-target',
-          instructions,
-          ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
-          capabilities: await deps.resolveImplementationCapabilities?.(),
-          ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-          ...(run.executor === undefined ? {} : { executor: run.executor }),
-        });
+        let result: Awaited<ReturnType<ImplementationAgent['run']>>;
+        try {
+          result = await implementation.run({
+            target,
+            baseSha,
+            ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch }),
+            ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
+            authority: 'live-target',
+            instructions,
+            ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
+            capabilities: await deps.resolveImplementationCapabilities?.(),
+            ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(run.executor === undefined ? {} : { executor: run.executor }),
+          });
+        } catch (error) {
+          if (isWorkspaceGuardFailure(error)) return bootstrapFailureOutcome(run, error, store, now, run.executor);
+          throw error;
+        }
         if (result.exitStatus === 'failure') {
           const takeoverReason = humanTakeoverReason(result);
           if (takeoverReason !== undefined) {

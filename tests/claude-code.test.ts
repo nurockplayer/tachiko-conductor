@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
+import {
+  WORKSPACE_GUARD_FAILURE_CODE,
+  WorkspaceGuardFailure,
+} from '../src/adapters/agent.js';
 import { ClaudeCodeAdapter, NodeClaudeProcessRunner } from '../src/agents/claude-code.js';
 import type { ClaudeProcessRunner, ClaudeRunOptions } from '../src/agents/claude-code.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
@@ -75,19 +79,21 @@ describe('ClaudeCodeAdapter', () => {
     const runner = new FakeRunner([]);
     const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/source' });
 
-    const agentResult = await adapter.run({
-      target: TARGET,
-      baseSha: 'base-1',
-      workspacePath: '/tmp/prepared-worktree',
-      workspaceGuard: {
-        assertValid() {
-          throw new Error('prepared workspace identity changed');
+    await assert.rejects(
+      adapter.run({
+        target: TARGET,
+        baseSha: 'base-1',
+        workspacePath: '/tmp/prepared-worktree',
+        workspaceGuard: {
+          assertValid() {
+            throw new Error('prepared workspace identity changed');
+          },
         },
-      },
-    });
-
-    assert.equal(agentResult.exitStatus, 'failure');
-    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CLAUDE_EXEC_FAILURE/);
+      }),
+      (error: unknown) => error instanceof WorkspaceGuardFailure &&
+        error.code === WORKSPACE_GUARD_FAILURE_CODE &&
+        /prepared workspace identity changed/.test(error.message),
+    );
     assert.equal(runner.calls.length, 0);
   });
 
@@ -96,20 +102,22 @@ describe('ClaudeCodeAdapter', () => {
     const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/source' });
     let assertions = 0;
 
-    const agentResult = await adapter.run({
-      target: TARGET,
-      baseSha: 'base-1',
-      workspacePath: '/tmp/prepared-worktree',
-      workspaceGuard: {
-        assertValid() {
-          assertions += 1;
-          if (assertions === 3) throw new Error('workspace replaced during HEAD read');
+    await assert.rejects(
+      adapter.run({
+        target: TARGET,
+        baseSha: 'base-1',
+        workspacePath: '/tmp/prepared-worktree',
+        workspaceGuard: {
+          assertValid() {
+            assertions += 1;
+            if (assertions === 3) throw new Error('workspace replaced during HEAD read');
+          },
         },
-      },
-    });
-
-    assert.equal(agentResult.exitStatus, 'failure');
-    assert.match(agentResult.diagnostics?.join('\n') ?? '', /CLAUDE_EXEC_FAILURE/);
+      }),
+      (error: unknown) => error instanceof WorkspaceGuardFailure &&
+        error.code === WORKSPACE_GUARD_FAILURE_CODE &&
+        /workspace replaced during HEAD read/.test(error.message),
+    );
     assert.equal(runner.calls.length, 2);
   });
 

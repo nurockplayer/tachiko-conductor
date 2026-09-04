@@ -638,6 +638,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     if (expectedTop === undefined) {
       throw bootstrapError('STALE_IDENTITY', 'Implementation workspace could not be pinned.');
     }
+    const sourceCommonGitDirectory = await this.resolveGitCommonDirectory(this.repositoryRoot);
+    this.assertWorkspaceParents(pins);
+    const workspaceCommonGitDirectory = await this.resolveGitCommonDirectory(identity.workspacePath);
+    this.assertWorkspaceParents(pins);
     const top = realpathSync(path.resolve((await this.git(['rev-parse', '--show-toplevel'], identity.workspacePath)).stdout.trim()));
     this.assertWorkspaceParents(pins);
     const branch = (await this.git(['symbolic-ref', '--short', 'HEAD'], identity.workspacePath)).stdout.trim();
@@ -646,11 +650,12 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       ? undefined
       : (await this.git(['rev-parse', 'HEAD'], identity.workspacePath)).stdout.trim();
     this.assertWorkspaceParents(pins);
-    if (!this.isWithin(this.workspaceRoot, expectedTop) || top !== expectedTop || branch !== identity.branch ||
+    if (sourceCommonGitDirectory !== workspaceCommonGitDirectory ||
+      !this.isWithin(this.workspaceRoot, expectedTop) || top !== expectedTop || branch !== identity.branch ||
       (expectedHeadSha !== undefined && headSha !== expectedHeadSha)) {
       throw bootstrapError(
         'STALE_IDENTITY',
-        `Workspace ${identity.workspacePath} is not the expected ${identity.branch} worktree.`,
+        `Workspace ${identity.workspacePath} is not the expected linked ${identity.branch} worktree of the source repository.`,
       );
     }
     if (requireClean) {
@@ -725,6 +730,20 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       return directory;
     } catch {
       throw bootstrapError('COMMAND_FAILED', `Git returned an invalid absolute Git directory ${raw || '(none)'}.`);
+    }
+  }
+
+  private async resolveGitCommonDirectory(cwd: string): Promise<string> {
+    const raw = (await this.git(['rev-parse', '--git-common-dir'], cwd)).stdout.trim();
+    if (raw === '') {
+      throw bootstrapError('COMMAND_FAILED', 'Git returned an empty common Git directory.');
+    }
+    try {
+      const directory = realpathSync(path.resolve(cwd, raw));
+      if (!lstatSync(directory).isDirectory()) throw new Error('not a directory');
+      return directory;
+    } catch {
+      throw bootstrapError('COMMAND_FAILED', `Git returned an invalid common Git directory ${raw}.`);
     }
   }
 

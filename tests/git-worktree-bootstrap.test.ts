@@ -49,6 +49,7 @@ class FakeGitRunner implements ProcessRunner {
   constructor(
     private readonly respond: (args: readonly string[], cwd: string | undefined) => ProcessResult,
     private readonly pushUrls: readonly string[] = ['git@github.com:acme/widgets.git'],
+    private readonly commonGitDirectory: string | ((cwd: string | undefined) => string) = '/tmp',
   ) {}
 
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
@@ -56,6 +57,12 @@ class FakeGitRunner implements ProcessRunner {
     this.calls.push({ args, cwd: options.cwd });
     if (args.join(' ') === 'remote get-url --all --push origin') {
       return result(this.pushUrls.length === 0 ? '' : `${this.pushUrls.join('\n')}\n`);
+    }
+    if (args.join(' ') === 'rev-parse --git-common-dir') {
+      const directory = typeof this.commonGitDirectory === 'function'
+        ? this.commonGitDirectory(options.cwd)
+        : this.commonGitDirectory;
+      return result(`${directory}\n`);
     }
     return this.respond(args, options.cwd);
   }
@@ -858,6 +865,47 @@ describe('GitWorktreeBootstrap', () => {
     );
     assert.equal(runner.calls.some(isWorktreeCall), false);
     assert.equal(runner.calls.some((call) => call.args[0] === 'fetch'), false);
+  });
+
+  it('rejects a standalone checkout substitution even when path, branch, and HEAD match', async () => {
+    const roots = tempRoots();
+    const workspacePath = path.join(roots.workspaceRoot, 'acme', 'widgets', 'run-42-issue-42');
+    const standaloneCommonDir = path.join(path.dirname(roots.repositoryRoot), 'standalone-common');
+    mkdirSync(workspacePath, { recursive: true });
+    mkdirSync(standaloneCommonDir);
+    const sourceCommonDir = realpathSync(roots.repositoryRoot);
+    const runner = new FakeGitRunner(
+      (args) => {
+        const command = args.join(' ');
+        if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+        if (command.startsWith('show-ref --verify --quiet')) return result();
+        if (command === `rev-parse refs/heads/${BRANCH}`) return result(`${HEAD}\n`);
+        if (command === `ls-remote --heads origin refs/heads/${BRANCH}`) return result();
+        if (command === `merge-base --is-ancestor ${BASE} ${HEAD}`) return result();
+        if (command === 'rev-parse --show-toplevel') return result(`${workspacePath}\n`);
+        if (command === 'symbolic-ref --short HEAD') return result(`${BRANCH}\n`);
+        if (command === 'rev-parse HEAD') return result(`${HEAD}\n`);
+        if (command === 'status --porcelain=v1 --untracked-files=all') return result();
+        throw new Error(`Unexpected git call: ${command}`);
+      },
+      ['git@github.com:acme/widgets.git'],
+      (cwd) => cwd === sourceCommonDir ? sourceCommonDir : standaloneCommonDir,
+    );
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const existing = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: BASE,
+      branch: BRANCH, workspacePath,
+    } as const;
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.STALE_IDENTITY),
+    );
+    assert.equal(runner.calls.some(isWorktreeCall), false);
+    assert.match(
+      runner.calls.map((call) => call.args.join(' ')).join('\n'),
+      /rev-parse --git-common-dir/,
+    );
   });
 
   it('refuses automatic recovery from an existing dirty workspace', async () => {

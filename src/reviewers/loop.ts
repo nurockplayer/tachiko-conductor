@@ -1,5 +1,6 @@
 import {
   humanTakeoverReason,
+  isWorkspaceGuardFailure,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
   type WorkspaceGuard,
@@ -239,18 +240,24 @@ export async function runReviewLoop(
       }
 
       const blockingFindings = renderBlockingFindings(pendingReview);
-      const fixResult = await implementation.run({
-        target,
-        baseSha: run.headSha ?? '',
-        ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch }),
-        ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
-        authority: 'live-target',
-        instructions: blockingFindings,
-        supplementalInstructions: blockingFindings,
-        capabilities: await deps.resolveImplementationCapabilities?.(),
-        sessionId: run.agentResult?.sessionId,
-        executor: run.executor,
-      });
+      let fixResult: Awaited<ReturnType<ImplementationAgent['run']>>;
+      try {
+        fixResult = await implementation.run({
+          target,
+          baseSha: run.headSha ?? '',
+          ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch }),
+          ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
+          authority: 'live-target',
+          instructions: blockingFindings,
+          supplementalInstructions: blockingFindings,
+          capabilities: await deps.resolveImplementationCapabilities?.(),
+          sessionId: run.agentResult?.sessionId,
+          executor: run.executor,
+        });
+      } catch (error) {
+        if (isWorkspaceGuardFailure(error)) return parkBootstrapFailure(run, error, store, now, run.executor);
+        throw error;
+      }
       if (fixResult.exitStatus === 'failure') {
         const takeoverReason = humanTakeoverReason(fixResult);
         if (takeoverReason !== undefined) {

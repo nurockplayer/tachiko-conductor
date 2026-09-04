@@ -52,6 +52,36 @@ export interface WorkspaceGuard {
   assertValid(): void;
 }
 
+/** Provider-neutral signal that the prepared implementation workspace is no longer safe to use. */
+export const WORKSPACE_GUARD_FAILURE_CODE = 'WORKSPACE_GUARD_FAILURE' as const;
+
+export class WorkspaceGuardFailure extends Error {
+  readonly code = WORKSPACE_GUARD_FAILURE_CODE;
+  readonly causeError: unknown;
+
+  constructor(cause: unknown) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    super(`Prepared workspace identity guard failed: ${detail}`);
+    this.name = 'WorkspaceGuardFailure';
+    this.causeError = cause;
+  }
+}
+
+export function isWorkspaceGuardFailure(error: unknown): error is WorkspaceGuardFailure {
+  return error instanceof WorkspaceGuardFailure;
+}
+
+/** Preserve guard failures as a typed bootstrap signal at every provider boundary. */
+export function assertWorkspaceGuard(guard: WorkspaceGuard | undefined): void {
+  if (guard === undefined) return;
+  try {
+    guard.assertValid();
+  } catch (error) {
+    if (isWorkspaceGuardFailure(error)) throw error;
+    throw new WorkspaceGuardFailure(error);
+  }
+}
+
 export interface ImplementationRequest {
   /** The work item: a single issue or a whole branch. */
   readonly target: Target;

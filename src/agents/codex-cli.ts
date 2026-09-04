@@ -1,5 +1,7 @@
 import {
+  assertWorkspaceGuard,
   HUMAN_TAKEOVER_DIAGNOSTIC,
+  isWorkspaceGuardFailure,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -94,14 +96,15 @@ export class CodexCliAdapter implements ImplementationAgent {
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
-      request.workspaceGuard?.assertValid();
+      assertWorkspaceGuard(request.workspaceGuard);
       result = await this.runner.run(
         'codex',
         this.buildArgs(prompt, request.capabilities ?? [], executor),
         this.processOptions(request.signal, cwd),
       );
-      request.workspaceGuard?.assertValid();
+      assertWorkspaceGuard(request.workspaceGuard);
     } catch (error) {
+      if (isWorkspaceGuardFailure(error)) throw error;
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
       if (isAborted(request.signal) || code === 'ABORT_ERR') return cancelledAgentResult(durationMs, executor);
@@ -159,16 +162,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
 
     const sha = await this.readHead(request.signal, cwd);
-    try {
-      request.workspaceGuard?.assertValid();
-    } catch (error) {
-      return failureAgentResult(
-        CODEX_ERROR_CODE.EXEC_FAILURE,
-        `Prepared workspace identity changed before exact-HEAD verification: ${errorMessage(error)}`,
-        durationMs,
-        parsed.outcome.executor,
-      );
-    }
+    assertWorkspaceGuard(request.workspaceGuard);
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
     if (sha === null) {
       return failureAgentResult(
