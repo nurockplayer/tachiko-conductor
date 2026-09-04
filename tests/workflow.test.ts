@@ -851,7 +851,7 @@ describe('runWorkflow', () => {
     const implementation = new FakeImplementation([successResult(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD]), bootstrap, implementation, reviewer: new FakeReviewer([]) },
+      { store, github: githubAdapter([HEAD, HEAD]), bootstrap, implementation, reviewer: new FakeReviewer([]) },
       run.id,
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -878,7 +878,7 @@ describe('runWorkflow', () => {
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2]),
+        github: githubAdapter([HEAD, HEAD, HEAD2, HEAD2, HEAD2]),
         bootstrap,
         implementation,
         reviewer: new FakeReviewer([approve(HEAD2)]),
@@ -889,6 +889,32 @@ describe('runWorkflow', () => {
 
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(bootstrap.verifyRequests[0]?.progressBaseSha, HEAD);
+    assert.deepEqual(bootstrap.prepareRequests[0]?.recoveryAuthority, { expectedHeadSha: HEAD });
+  });
+
+  it('does not recover a bootstrap workspace while the persisted PR head is stale', async () => {
+    const store = new MemoryStore();
+    const bootstrapIdentity = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'c'.repeat(40),
+      branch: 'tachiko/issue-42', workspacePath: '/tmp/tachiko/run-stale-head',
+    } as const;
+    let run: Run = { ...reviewingRun(store, 'run-stale-head', HEAD), bootstrap: bootstrapIdentity };
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0);
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    store.update(run);
+    const bootstrap = new FakeBootstrap();
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD2]), bootstrap, implementation, reviewer: new FakeReviewer([]) },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.deepEqual(result.run.interrupt?.choices, [SYNC_LIVE_HEAD_DECISION, 'Cancel the run']);
+    assert.equal(bootstrap.prepareRequests.length, 0);
+    assert.equal(implementation.requests.length, 0);
   });
 
   it('never passes the final gate when live HEAD drifted after approval', async () => {

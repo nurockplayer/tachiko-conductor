@@ -5,7 +5,7 @@ import {
   type ImplementationCapabilityResolver,
   type WorkspaceGuard,
 } from '../adapters/agent.js';
-import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
+import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
@@ -86,6 +86,22 @@ function bootstrapFailureOutcome(
     ...(executor === undefined ? {} : { executor }),
   });
   return { outcome: 'needs_human', ...parked };
+}
+
+function liveRecoveryEscalation(
+  run: Run,
+  reason: string,
+  choices: readonly string[],
+  store: RunStore,
+  now: () => string,
+): WorkflowOutcome {
+  const parked = applyTransition(
+    run,
+    { type: 'escalate', reason, interrupt: { evidence: reason, choices } },
+    now(),
+  );
+  store.update(parked);
+  return { outcome: 'needs_human', run: parked, reason };
 }
 
 /**
@@ -178,6 +194,40 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
         let bootstrap = run.bootstrap;
+        let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
+        if (bootstrap !== undefined && snapshot.pullRequest !== null && run.headSha !== undefined) {
+          const recoveryIdentityConflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (recoveryIdentityConflict !== null) {
+            return liveRecoveryEscalation(
+              run,
+              recoveryIdentityConflict,
+              ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+              store,
+              now,
+            );
+          }
+          if (snapshot.pullRequest.state !== 'open') {
+            const reason = `Live pull request #${snapshot.pullRequest.number} is not open; refusing automatic bootstrap recovery.`;
+            return liveRecoveryEscalation(
+              run,
+              reason,
+              ['Open the implementation pull request and retry', CANCEL_RUN_DECISION],
+              store,
+              now,
+            );
+          }
+          if (snapshot.headSha !== run.headSha || snapshot.pullRequest.headSha !== run.headSha) {
+            const reason = `Live GitHub HEAD ${snapshot.headSha ?? '(none)'} does not match the persisted run HEAD ${run.headSha}.`;
+            return liveRecoveryEscalation(
+              run,
+              reason,
+              [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
+              store,
+              now,
+            );
+          }
+          recoveryAuthority = { expectedHeadSha: run.headSha };
+        }
         let workspaceGuard: WorkspaceGuard | undefined;
         if (!pendingReviewFix && snapshot.pullRequest === null) {
           const baseBranch = snapshot.repository.defaultBranch;
@@ -224,6 +274,7 @@ export async function runWorkflow(
               baseBranch,
               baseSha: liveBaseSha,
               existing: bootstrap,
+              ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
             });
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -244,6 +295,7 @@ export async function runWorkflow(
               baseBranch: bootstrap.baseBranch,
               baseSha: bootstrap.baseSha,
               existing: bootstrap,
+              ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
             });
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -266,11 +318,62 @@ export async function runWorkflow(
           }
         }
 
-        if (!pendingReviewFix && bootstrap !== undefined) {
+        if (recoveryAuthority !== undefined) {
           try {
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
             return githubFailureOutcome(run, error, store, now);
+          }
+          const postRecoveryIdentityConflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (postRecoveryIdentityConflict !== null) {
+            return liveRecoveryEscalation(
+              run,
+              postRecoveryIdentityConflict,
+              ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+              store,
+              now,
+            );
+          }
+          if (snapshot.issue.state !== 'open') {
+            const reason = `Issue ${formatTarget(target)} closed during bootstrap recovery.`;
+            return liveRecoveryEscalation(
+              run,
+              reason,
+              [CANCEL_RUN_DECISION],
+              store,
+              now,
+            );
+          }
+          if (snapshot.pullRequest === null || snapshot.pullRequest.state !== 'open') {
+            const reason = 'The associated implementation pull request disappeared or closed during bootstrap recovery.';
+            return liveRecoveryEscalation(
+              run,
+              reason,
+              ['Open the implementation pull request and retry', CANCEL_RUN_DECISION],
+              store,
+              now,
+            );
+          }
+          if (snapshot.headSha !== recoveryAuthority.expectedHeadSha ||
+            snapshot.pullRequest.headSha !== recoveryAuthority.expectedHeadSha) {
+            const reason = `Live GitHub HEAD ${snapshot.headSha ?? '(none)'} changed during bootstrap recovery; expected ${recoveryAuthority.expectedHeadSha}.`;
+            return liveRecoveryEscalation(
+              run,
+              reason,
+              [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
+              store,
+              now,
+            );
+          }
+        }
+
+        if (!pendingReviewFix && bootstrap !== undefined) {
+          if (recoveryAuthority === undefined) {
+            try {
+              snapshot = await github.readLiveSnapshot(target);
+            } catch (error) {
+              return githubFailureOutcome(run, error, store, now);
+            }
           }
           if (snapshot.issue.state !== 'open') {
             const reason = `Issue ${formatTarget(target)} closed while implementation state was being prepared.`;

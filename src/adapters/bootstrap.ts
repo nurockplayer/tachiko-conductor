@@ -1,15 +1,28 @@
 import type { ImplementationBootstrapIdentity, IssueTarget } from '../domain/types.js';
 import type { WorkspaceGuard } from './agent.js';
 
+/**
+ * Ephemeral authority for repairing a local replica of an already accepted
+ * PR head. It is never persisted and must only be supplied after the caller
+ * has proved the live PR head equals the persisted run head.
+ */
+export interface BootstrapRecoveryAuthority {
+  readonly expectedHeadSha: string;
+}
+
 export interface PrepareImplementationBootstrapRequest {
   readonly runId: string;
   readonly target: IssueTarget;
   readonly baseBranch: string;
   readonly baseSha: string;
   readonly existing?: ImplementationBootstrapIdentity;
+  readonly recoveryAuthority?: BootstrapRecoveryAuthority;
 }
 
-export type PlanImplementationBootstrapRequest = Omit<PrepareImplementationBootstrapRequest, 'existing'>;
+export type PlanImplementationBootstrapRequest = Omit<
+  PrepareImplementationBootstrapRequest,
+  'existing' | 'recoveryAuthority'
+>;
 
 export interface VerifyDurableImplementationRequest {
   readonly identity: ImplementationBootstrapIdentity;

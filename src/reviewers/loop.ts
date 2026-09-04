@@ -5,7 +5,7 @@ import {
   type ImplementationCapabilityResolver,
   type WorkspaceGuard,
 } from '../adapters/agent.js';
-import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
+import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition } from '../domain/state-machine.js';
@@ -215,6 +215,7 @@ export async function runReviewLoop(
       store.update(run);
 
       let bootstrap = run.bootstrap;
+      let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
       let workspaceGuard: WorkspaceGuard | undefined;
       if (bootstrap !== undefined) {
         if (deps.bootstrap === undefined) {
@@ -226,16 +227,112 @@ export async function runReviewLoop(
           );
         }
         try {
+          if (run.headSha !== undefined && preFixSnapshot.pullRequest !== null &&
+            preFixSnapshot.pullRequest.state === 'open' && preFixSnapshot.headSha === run.headSha &&
+            preFixSnapshot.pullRequest.headSha === run.headSha) {
+            recoveryAuthority = { expectedHeadSha: run.headSha };
+          }
           bootstrap = await deps.bootstrap.prepare({
             runId: run.id,
             target,
             baseBranch: bootstrap.baseBranch,
             baseSha: bootstrap.baseSha,
             existing: bootstrap,
+            ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
           });
           workspaceGuard = deps.bootstrap.guard(bootstrap);
         } catch (error) {
           return parkBootstrapFailure(run, error, store, now);
+        }
+      }
+
+      if (recoveryAuthority !== undefined) {
+        let postRecoverySnapshot: Awaited<ReturnType<GitHubAdapter['readLiveSnapshot']>>;
+        try {
+          postRecoverySnapshot = await github.readLiveSnapshot(target);
+        } catch (error) {
+          const reason = renderFailure('GitHub live-state validation failed after bootstrap recovery', error);
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: ['Retry after restoring GitHub access', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        const postRecoveryIdentityConflict = pullRequestIdentityConflict(run, postRecoverySnapshot, { allowHeadAdvance: true });
+        if (postRecoveryIdentityConflict !== null) {
+          const reason = `Bootstrap recovery live PR identity changed: ${postRecoveryIdentityConflict}`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        if (postRecoverySnapshot.issue.state !== 'open') {
+          const reason = `Issue ${formatTarget(target)} closed during bootstrap recovery.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: { evidence: reason, choices: [CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        if (postRecoverySnapshot.pullRequest === null || postRecoverySnapshot.pullRequest.state !== 'open') {
+          const reason = 'The associated implementation pull request disappeared or closed during bootstrap recovery.';
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: ['Open the implementation pull request and retry', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        if (postRecoverySnapshot.headSha !== recoveryAuthority.expectedHeadSha ||
+          postRecoverySnapshot.pullRequest.headSha !== recoveryAuthority.expectedHeadSha) {
+          const reason = `Live GitHub HEAD ${postRecoverySnapshot.headSha ?? '(none)'} changed during bootstrap recovery; expected ${recoveryAuthority.expectedHeadSha}.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: {
+                evidence: reason,
+                choices: [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
         }
       }
 

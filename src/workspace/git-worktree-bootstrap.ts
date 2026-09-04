@@ -7,6 +7,7 @@ import {
   ImplementationBootstrapError,
   type DurableImplementationSnapshot,
   type ImplementationBootstrapAdapter,
+  type BootstrapRecoveryAuthority,
   type PlanImplementationBootstrapRequest,
   type PrepareImplementationBootstrapRequest,
   type VerifyDurableImplementationRequest,
@@ -266,10 +267,21 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         'Persisted bootstrap identity does not match the target, branch, base, or workspace for this run.',
       );
     }
+    if (request.recoveryAuthority !== undefined && !FULL_SHA.test(request.recoveryAuthority.expectedHeadSha)) {
+      throw bootstrapError(
+        'INVALID_REQUEST',
+        'Bootstrap recovery authority requires an exact 40-hex persisted/live HEAD SHA.',
+      );
+    }
     const entryPins = this.pinPresentWorkspacePath(request.existing);
     await this.assertRepository(request.target.owner, request.target.repo);
     this.assertWorkspacePathSnapshot(request.existing, entryPins);
-    const pins = await this.restoreExisting(request.existing, request.baseSha, entryPins);
+    const pins = await this.restoreExisting(
+      request.existing,
+      request.baseSha,
+      entryPins,
+      request.recoveryAuthority,
+    );
     this.preparedWorkspacePins.set(this.workspaceKey(request.existing), pins);
     return request.existing;
   }
@@ -451,6 +463,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     identity: ImplementationBootstrapIdentity,
     liveBaseSha: string,
     initialPins: readonly DirectoryPin[],
+    recoveryAuthority?: BootstrapRecoveryAuthority,
   ): Promise<readonly DirectoryPin[]> {
     this.assertIdentity(identity);
     this.assertWorkspacePathSnapshot(identity, initialPins);
@@ -498,13 +511,33 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       await this.fetchRemoteBranch(identity.branch, remoteSha);
       this.assertWorkspacePathSnapshot(identity, initialPins);
     }
-    if (localSha !== null && remoteSha !== null && localSha !== remoteSha) {
+    if (recoveryAuthority !== undefined && remoteSha !== recoveryAuthority.expectedHeadSha) {
       throw bootstrapError(
         'COLLISION',
-        `Local ${identity.branch} at ${localSha} diverges from ${this.remote}/${identity.branch} at ${remoteSha}.`,
+        `Authorized recovery head ${recoveryAuthority.expectedHeadSha} is not the owned remote ${this.remote}/${identity.branch} at ${remoteSha ?? '(none)'}.`,
       );
     }
-    const recoveredSha = localSha ?? remoteSha;
+    let recoveredSha = localSha ?? remoteSha;
+    if (localSha !== null && remoteSha !== null && localSha !== remoteSha) {
+      if (recoveryAuthority === undefined) {
+        throw bootstrapError(
+          'COLLISION',
+          `Local ${identity.branch} at ${localSha} diverges from ${this.remote}/${identity.branch} at ${remoteSha}.`,
+        );
+      }
+      const localFastForward = await this.git(
+        ['merge-base', '--is-ancestor', localSha, remoteSha],
+        this.repositoryRoot,
+        [0, 1],
+      );
+      if (localFastForward.exitCode !== 0) {
+        throw bootstrapError(
+          'COLLISION',
+          `Local ${identity.branch} at ${localSha} is not an ancestor of the authorized remote head ${remoteSha}; refusing automatic recovery.`,
+        );
+      }
+      recoveredSha = remoteSha;
+    }
     if (recoveredSha === null) {
       throw bootstrapError('STALE_IDENTITY', `Workspace ${identity.workspacePath} has no recoverable branch identity.`);
     }
@@ -514,7 +547,21 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     else this.assertWorkspaceParents(parentPins);
 
     if (hasWorkspace) {
-      await this.assertWorkspace(identity, recoveredSha, true);
+      if (recoveryAuthority !== undefined && localSha !== null && localSha !== recoveredSha) {
+        await this.assertWorkspace(identity, localSha, true);
+        this.assertWorkspacePathSnapshot(identity, initialPins);
+        await this.assertRemoteBranchAt(identity.branch, recoveredSha);
+        this.assertWorkspacePathSnapshot(identity, initialPins);
+        await this.git(['merge', '--ff-only', recoveredSha], identity.workspacePath);
+        this.assertWorkspacePathSnapshot(identity, initialPins);
+        await this.assertRemoteBranchAt(identity.branch, recoveredSha);
+        await this.assertWorkspace(identity, recoveredSha, true);
+      } else {
+        if (recoveryAuthority !== undefined) {
+          await this.assertRemoteBranchAt(identity.branch, recoveredSha);
+        }
+        await this.assertWorkspace(identity, recoveredSha, true);
+      }
       this.assertWorkspacePathSnapshot(identity, initialPins);
       return initialPins;
     }
@@ -526,8 +573,31 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     const gitDirectory = await this.resolveGitDirectory();
     this.assertWorkspaceParents(parentPins);
     const workspacePins = this.reserveWorkspaceDirectory(identity, parentPins);
+    const forceStaleRegistration = localSha === null
+      ? false
+      : await this.requiresForcedWorktreeRecovery(identity, localSha, workspacePins);
+    if (recoveryAuthority !== undefined) {
+      this.assertReservedWorkspaceEmpty(workspacePins);
+      await this.assertRemoteBranchAt(identity.branch, recoveredSha);
+      this.assertWorkspaceParents(workspacePins);
+    }
+    if (recoveryAuthority !== undefined && localSha !== null && localSha !== recoveredSha) {
+      this.assertReservedWorkspaceEmpty(workspacePins);
+      await this.git(
+        ['update-ref', `refs/heads/${identity.branch}`, recoveredSha, localSha],
+        this.repositoryRoot,
+      );
+      this.assertWorkspaceParents(workspacePins);
+      const advancedLocalSha = await this.localBranchSha(identity.branch);
+      if (advancedLocalSha !== recoveredSha) {
+        throw bootstrapError(
+          'COLLISION',
+          `Local ${identity.branch} did not advance atomically to the authorized recovery head ${recoveredSha}.`,
+        );
+      }
+      await this.assertRemoteBranchAt(identity.branch, recoveredSha);
+    }
     if (localSha !== null) {
-      const forceStaleRegistration = await this.requiresForcedWorktreeRecovery(identity, localSha, workspacePins);
       this.assertReservedWorkspaceEmpty(workspacePins);
       await this.git(
         [
@@ -548,7 +618,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       );
     }
     this.assertWorkspaceParents(workspacePins);
-    await this.assertWorkspace(identity, recoveredSha);
+    if (recoveryAuthority !== undefined) {
+      await this.assertRemoteBranchAt(identity.branch, recoveredSha);
+    }
+    await this.assertWorkspace(identity, recoveredSha, recoveryAuthority !== undefined);
     this.assertWorkspaceParents(workspacePins);
     return workspacePins;
   }
@@ -866,6 +939,17 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
         `Remote branch ${this.remote}/${branch} changed from ${expectedSha} to ${fetched || '(none)'} during recovery.`,
       );
     }
+  }
+
+  private async assertRemoteBranchAt(branch: string, expectedSha: string): Promise<void> {
+    const remoteSha = await this.remoteBranchSha(branch);
+    if (remoteSha !== expectedSha) {
+      throw bootstrapError(
+        'COLLISION',
+        `Remote branch ${this.remote}/${branch} changed from authorized head ${expectedSha} to ${remoteSha ?? '(none)'} during recovery.`,
+      );
+    }
+    await this.fetchRemoteBranch(branch, expectedSha);
   }
 
   private async assertDescendsFromBase(identity: ImplementationBootstrapIdentity, headSha: string): Promise<void> {

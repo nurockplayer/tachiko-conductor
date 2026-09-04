@@ -324,7 +324,7 @@ describe('runReviewLoop', () => {
     const result = await runReviewLoop(
       {
         store,
-        github: githubAdapter([HEAD, HEAD, HEAD2, HEAD2]),
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2]),
         bootstrap,
         implementation,
         reviewer: new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]),
@@ -335,6 +335,7 @@ describe('runReviewLoop', () => {
 
     assert.equal(result.outcome, 'approved');
     assert.deepEqual(bootstrap.prepareRequests[0]?.existing, bootstrapIdentity);
+    assert.deepEqual(bootstrap.prepareRequests[0]?.recoveryAuthority, { expectedHeadSha: HEAD });
     assert.equal(bootstrap.verifyRequests[0]?.expectedHeadSha, HEAD2);
     assert.equal(bootstrap.verifyRequests[0]?.progressBaseSha, HEAD);
     assert.equal(implementation.requests[0]?.workspacePath, bootstrapIdentity.workspacePath);
