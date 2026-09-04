@@ -104,6 +104,20 @@ describe('CLI command layer', () => {
     }
   });
 
+  it('rejects the API-only bootstrap_prepared transition from the payload-free CLI', () => {
+    const { store, dir } = tempStore();
+    try {
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
+      assert.throws(
+        () => runTransitionCommand(store, created.id, 'bootstrap_prepared'),
+        /Transition "bootstrap_prepared" is API-only and requires durable bootstrap identity/,
+      );
+      assert.equal(runShowCommand(store, created.id).state, 'READY');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('resolves the data dir from TACHIKO_DATA_DIR or the home default', () => {
     assert.equal(resolveRunsDir({ TACHIKO_DATA_DIR: '/tmp/x' }), '/tmp/x');
     assert.match(resolveRunsDir({}), /\.tachiko-conductor/);

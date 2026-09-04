@@ -75,9 +75,10 @@ FAILED, or NEEDS_HUMAN (a structured human decision with evidence and bounded
 choices). Resume a parked run with: tachiko run resume <id> --decision <text>.
 
 agent_succeeded, agent_failed, review_approved and changes_requested require
-result payloads (agentResult / reviewResult) that adapters supply; run
-transition cannot perform them and rejects them explicitly. Drive those
-through the domain API (applyTransition) instead.
+result payloads (agentResult / reviewResult) that adapters supply;
+bootstrap_prepared requires durable bootstrap identity. The payload-free run
+transition command cannot perform these transitions and rejects them
+explicitly. Drive them through the domain API (applyTransition) instead.
 
 github snapshot prints one normalized live-state JSON envelope from the
 locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
@@ -636,6 +637,12 @@ export function runShowCommand(store: RunStore, id: string): Run {
 }
 
 export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string): Run {
+  if (type === 'bootstrap_prepared') {
+    throw new Error(
+      'Transition "bootstrap_prepared" is API-only and requires durable bootstrap identity that this CLI cannot supply. ' +
+        'Drive it through the domain API (applyTransition) instead.',
+    );
+  }
   const requirement = transitionRequiresResult(type);
   if (requirement !== 'none') {
     throw new Error(

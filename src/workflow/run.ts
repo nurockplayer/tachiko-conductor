@@ -413,6 +413,23 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
         }
+        if (pendingReviewFix && (result.headSha === undefined || result.headSha === run.headSha)) {
+          const reason = 'Implementation did not produce a new exact HEAD after review changes.';
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate',
+              reason,
+              interrupt: {
+                evidence: 'The implementation returned the same or no HEAD after review changes.',
+                choices: ['Retry the fix after updating GitHub context', CANCEL_RUN_DECISION],
+              },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
         if (bootstrap !== undefined) {
           if (deps.bootstrap === undefined) {
             return bootstrapFailureOutcome(
@@ -426,6 +443,7 @@ export async function runWorkflow(
             await deps.bootstrap.verifyDurable({
               identity: bootstrap,
               expectedHeadSha: result.headSha ?? '',
+              ...(pendingReviewFix ? { progressBaseSha: run.headSha ?? '' } : {}),
               ...(workspaceGuard === undefined ? {} : { workspaceGuard }),
             });
           } catch (error) {

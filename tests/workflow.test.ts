@@ -810,6 +810,60 @@ describe('runWorkflow', () => {
     assert.equal(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
   });
 
+  it('requires resumed review fixes to make progress from the reviewed HEAD', async () => {
+    const store = new MemoryStore();
+    const bootstrapIdentity = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'c'.repeat(40),
+      branch: 'tachiko/issue-42', workspacePath: '/tmp/tachiko/run-resume-fix-progress',
+    } as const;
+    let run: Run = { ...reviewingRun(store, 'run-resume-fix-progress', HEAD), bootstrap: bootstrapIdentity };
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0);
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    store.update(run);
+    const bootstrap = new FakeBootstrap();
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), bootstrap, implementation, reviewer: new FakeReviewer([]) },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.match(result.reason, /did not produce a new exact HEAD after review changes/);
+    assert.equal(bootstrap.verifyRequests.length, 0);
+  });
+
+  it('passes the reviewed HEAD as the progress base when resuming a review fix', async () => {
+    const store = new MemoryStore();
+    const bootstrapIdentity = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'c'.repeat(40),
+      branch: 'tachiko/issue-42', workspacePath: '/tmp/tachiko/run-resume-fix-progress-base',
+    } as const;
+    let run: Run = { ...reviewingRun(store, 'run-resume-fix-progress-base', HEAD), bootstrap: bootstrapIdentity };
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0);
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    store.update(run);
+    const bootstrap = new FakeBootstrap();
+    const implementation = new FakeImplementation([successResult(HEAD2, 'fixed after resume')]);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2]),
+        bootstrap,
+        implementation,
+        reviewer: new FakeReviewer([approve(HEAD2)]),
+      },
+      run.id,
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(bootstrap.verifyRequests[0]?.progressBaseSha, HEAD);
+  });
+
   it('never passes the final gate when live HEAD drifted after approval', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
