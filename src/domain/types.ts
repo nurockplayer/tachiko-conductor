@@ -46,6 +46,7 @@ export type WorkflowState = (typeof WORKFLOW_STATES)[number];
 /** Named events that drive the workflow forward. */
 export const TRANSITION_TYPES = [
   'start',
+  'bootstrap_prepared',
   'agent_succeeded',
   'agent_failed',
   'validation_passed',
@@ -64,6 +65,23 @@ export const TRANSITION_TYPES = [
 ] as const;
 
 export type TransitionType = (typeof TRANSITION_TYPES)[number];
+
+/** Immutable local identity selected before an issue implementation begins. */
+export interface ImplementationBootstrapIdentity {
+  readonly owner: string;
+  readonly repo: string;
+  readonly issueNumber: number;
+  readonly baseBranch: string;
+  readonly baseSha: string;
+  readonly branch: string;
+  readonly workspacePath: string;
+}
+
+/** The exact live pull request identity a prepared run has accepted. */
+export interface ImplementationPullRequestIdentity {
+  readonly number: number;
+  readonly headSha: string;
+}
 
 /** Outcome of an implementation agent run. */
 export type AgentExitStatus = 'success' | 'failure';
@@ -140,6 +158,10 @@ export interface TransitionInput {
   readonly headSha?: string;
   /** Executor identity captured while an implementation is interrupted for human takeover. */
   readonly executor?: ExecutorIdentity;
+  /** Durable branch/worktree identity produced before an issue starts without a PR. */
+  readonly bootstrap?: ImplementationBootstrapIdentity;
+  /** Live PR identity captured with a successful implementation or validation. */
+  readonly pullRequest?: ImplementationPullRequestIdentity;
   /** Structured context carried onto the interrupt when entering NEEDS_HUMAN / WAITING_DEPENDENCY. */
   readonly interrupt?: {
     readonly evidence?: string;
@@ -164,6 +186,10 @@ export interface Run {
   readonly agentResult?: AgentResult;
   /** Durable provider/session identity for reconstructing implementation continuation. */
   readonly executor?: ExecutorIdentity;
+  /** Immutable local implementation identity, once prepared. */
+  readonly bootstrap?: ImplementationBootstrapIdentity;
+  /** Accepted live PR identity for later recovery and exact-head review. */
+  readonly pullRequest?: ImplementationPullRequestIdentity;
   /** Latest review result, bound to an exact HEAD SHA. */
   readonly reviewResult?: ReviewResult;
   /** Current HEAD SHA of the implementation, when known. */

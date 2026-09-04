@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } from '../src/adapters/agent.js';
+import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
@@ -54,7 +56,7 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
       createdAt: T0,
       updatedAt: T0,
     },
-    pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha },
+    pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha, headRef: 'tachiko/issue-42-test', headRepository: { owner: 'acme', repo: 'widgets' }, baseRef: 'main' },
     headSha,
     checks: { availability: 'available', overall: 'passing', checks: [] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
@@ -109,6 +111,27 @@ class FakeImplementation implements ImplementationAgent {
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
     return outcome;
+  }
+}
+
+class FakeBootstrap implements ImplementationBootstrapAdapter {
+  readonly kind = 'implementation-bootstrap' as const;
+  readonly identity = {
+    owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base',
+    branch: 'tachiko/issue-42-test', workspacePath: '/tmp/tachiko-workspace',
+  };
+  async plan() { return this.identity; }
+  async prepare() { return this.identity; }
+  guard() { return { assertValid: () => undefined }; }
+  async verifyDurable(request: { expectedHeadSha: string }) { return { headSha: request.expectedHeadSha, branch: this.identity.branch }; }
+}
+
+class GuardFailingImplementation implements ImplementationAgent {
+  readonly kind = 'implementation-agent' as const;
+  calls = 0;
+  async run(): Promise<AgentResult> {
+    this.calls += 1;
+    throw new WorkspaceGuardFailure(new Error('common Git directory changed'));
   }
 }
 
@@ -349,7 +372,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([null, HEAD, HEAD, HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([null, null, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer, bootstrap: new FakeBootstrap() },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -359,6 +382,35 @@ describe('runWorkflow', () => {
     assert.equal(implementation.requests[0]?.baseSha, 'base');
     assert.match(implementation.requests[0]?.instructions ?? '', /start from main@base/);
     assert.match(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
+  });
+
+  it('parks a provider-neutral workspace guard failure instead of terminal agent failure', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-guard'));
+    const implementation = new GuardFailingImplementation();
+    const result = await runWorkflow(
+      { store, github: githubAdapter([null, null]), implementation, reviewer: new FakeReviewer([]), bootstrap: new FakeBootstrap() },
+      'run-guard', { maxReviewAttempts: 3, now: () => T0 },
+    );
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.match(result.reason, /WORKSPACE_GUARD_FAILURE/);
+    assert.equal(implementation.calls, 1);
+  });
+
+  it('recovers a crash after a durable PR exists but before the run recorded its HEAD', async () => {
+    const store = new MemoryStore();
+    let run = applyTransition(createRun(TARGET, T0, 'run-crash-window'), { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: new FakeBootstrap().identity }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([approve(HEAD)]), bootstrap: new FakeBootstrap() },
+      'run-crash-window', { maxReviewAttempts: 3, now: () => T0 },
+    );
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(result.run.headSha, HEAD);
+    assert.equal(implementation.requests.length, 0);
   });
 
   it('restores the persisted provider-neutral executor after a restart', async () => {

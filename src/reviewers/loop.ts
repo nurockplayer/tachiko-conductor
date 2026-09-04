@@ -1,19 +1,25 @@
 import {
   humanTakeoverReason,
+  isWorkspaceGuardFailure,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
+  type WorkspaceGuard,
 } from '../adapters/agent.js';
+import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition } from '../domain/state-machine.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
+import { parkBootstrapFailure } from '../workflow/bootstrap-failure.js';
+import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
+  readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly reviewer: ReviewerAdapter;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
@@ -71,6 +77,11 @@ function isRetryable(error: unknown): boolean {
 function renderFailure(prefix: string, error: unknown): string {
   const code = errorCode(error);
   return `${prefix}${code === null ? '' : ` (${code})`}: ${errorMessage(error)}`;
+}
+
+function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => string): ReviewLoopResult {
+  const parked = parkBootstrapFailure(run, error, store, now, run.executor);
+  return { outcome: 'needs_human', ...parked };
 }
 
 /**
@@ -137,16 +148,34 @@ export async function runReviewLoop(
       store.update(run);
 
       const blockingFindings = renderBlockingFindings(pendingReview);
-      const fixResult = await implementation.run({
-        target,
-        baseSha: run.headSha ?? '',
-        authority: 'live-target',
-        instructions: blockingFindings,
-        supplementalInstructions: blockingFindings,
-        capabilities: await deps.resolveImplementationCapabilities?.(),
-        sessionId: run.agentResult?.sessionId,
-        executor: run.executor,
-      });
+      const progressBaseSha = run.headSha;
+      let workspaceGuard: WorkspaceGuard | undefined;
+      if (run.bootstrap !== undefined) {
+        if (deps.bootstrap === undefined || progressBaseSha === undefined) {
+          return parkBootstrap(run, new Error('Review fix cannot prove its persisted implementation workspace.'), store, now);
+        }
+        try {
+          await deps.bootstrap.prepare({
+            runId: run.id, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
+            existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: progressBaseSha },
+          });
+          workspaceGuard = deps.bootstrap.guard(run.bootstrap);
+        } catch (error) {
+          return parkBootstrap(run, error, store, now);
+        }
+      }
+      let fixResult;
+      try {
+        fixResult = await implementation.run({
+          target, baseSha: progressBaseSha ?? '', authority: 'live-target', instructions: blockingFindings,
+          supplementalInstructions: blockingFindings,
+          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
+          capabilities: await deps.resolveImplementationCapabilities?.(), sessionId: run.agentResult?.sessionId, executor: run.executor,
+        });
+      } catch (error) {
+        if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now);
+        throw error;
+      }
       if (fixResult.exitStatus === 'failure') {
         const takeoverReason = humanTakeoverReason(fixResult);
         if (takeoverReason !== undefined) {
@@ -188,11 +217,24 @@ export async function runReviewLoop(
         return { outcome: 'needs_human', run, reason };
       }
 
-      run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha }, now());
-      store.update(run);
+      if (run.bootstrap !== undefined) {
+        if (deps.bootstrap === undefined || progressBaseSha === undefined) {
+          return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now);
+        }
+        try {
+          await deps.bootstrap.verifyDurable({
+            identity: run.bootstrap, expectedHeadSha: fixResult.headSha, progressBaseSha, workspaceGuard,
+          });
+        } catch (error) {
+          return parkBootstrap(run, error, store, now);
+        }
+      }
+
       let validatedHead: string | null;
+      let validatedSnapshot;
       try {
-        validatedHead = (await github.readLiveSnapshot(target)).headSha;
+        validatedSnapshot = await github.readLiveSnapshot(target);
+        validatedHead = validatedSnapshot.headSha;
       } catch (error) {
         const reason = renderFailure('GitHub live-state validation failed after the fix', error);
         run = applyTransition(
@@ -229,6 +271,19 @@ export async function runReviewLoop(
         store.update(run);
         return { outcome: 'needs_human', run, reason };
       }
+      if (run.bootstrap !== undefined) {
+        const conflict = pullRequestIdentityConflict(run, validatedSnapshot!, { allowHeadAdvance: true });
+        if (conflict !== null || validatedSnapshot!.pullRequest === null) {
+          const reason = conflict ?? 'Live pull request disappeared after durable review fix.';
+          run = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] } }, now());
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha, pullRequest: { number: validatedSnapshot!.pullRequest.number, headSha: fixResult.headSha } }, now());
+      } else {
+        run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha }, now());
+      }
+      store.update(run);
       run = applyTransition(run, { type: 'validation_passed' }, now());
       store.update(run);
       continue;

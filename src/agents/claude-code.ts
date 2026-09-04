@@ -1,5 +1,6 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
+  assertWorkspaceGuard,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -110,10 +111,15 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       return cancelledAgentResult(0, sessionId);
     }
     const prompt = await this.buildPrompt(request);
+    // This awaits after all prompt/live/capability work and immediately before
+    // the provider spawn, closing the prepare-to-spawn identity race.
+    await assertWorkspaceGuard(request.workspaceGuard);
+    const cwd = request.workspacePath ?? this.cwd;
     const outcome = await this.runClaude(
       this.buildArgs(prompt, request.capabilities, sessionId),
       request.signal,
       sessionId,
+      cwd,
     );
     if (!outcome.ok) return outcome.agentResult;
     const executor = executorIdentity(outcome.sessionId);
@@ -132,7 +138,8 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         durationMs: outcome.durationMs,
       };
     }
-    const head = await this.readHead(request.signal);
+    await assertWorkspaceGuard(request.workspaceGuard);
+    const head = await this.readHead(request.signal, cwd);
     if (isAborted(request.signal)) {
       return cancelledAgentResult(outcome.durationMs, outcome.sessionId);
     }
@@ -210,11 +217,12 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     args: readonly string[],
     signal: AbortSignal | undefined,
     resumeSessionId: string | undefined,
+    cwd: string,
   ): Promise<ClaudeOutcome> {
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
-      result = await this.runner.run('claude', args, processOptions(this.timeoutMs, this.cwd, signal));
+      result = await this.runner.run('claude', args, processOptions(this.timeoutMs, cwd, signal));
     } catch (error) {
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
@@ -278,9 +286,9 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     };
   }
 
-  private async readHead(signal: AbortSignal | undefined): Promise<{ ok: true; sha: string } | { ok: false }> {
+  private async readHead(signal: AbortSignal | undefined, cwd: string): Promise<{ ok: true; sha: string } | { ok: false }> {
     try {
-      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], processOptions(this.timeoutMs, this.cwd, signal));
+      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], processOptions(this.timeoutMs, cwd, signal));
       const sha = result.stdout.trim();
       if (result.exitCode === 0 && FULL_SHA.test(sha)) return { ok: true, sha };
       return { ok: false };

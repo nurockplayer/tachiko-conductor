@@ -389,6 +389,15 @@ export class LiveGitHubAdapter implements GitHubAdapter {
         { details: { path } },
       );
     }
+    const headRepository = asRecord(head.repo);
+    const headRef = typeof head.ref === 'string' && head.ref !== '' ? head.ref : undefined;
+    const baseRef = typeof base.ref === 'string' && base.ref !== '' ? base.ref : undefined;
+    const owner = headRepository === null ? undefined : asRecord(headRepository.owner);
+    const headRepositoryIdentity = owner !== null && owner !== undefined &&
+      typeof owner.login === 'string' && owner.login !== '' &&
+      typeof headRepository?.name === 'string' && headRepository.name !== ''
+      ? { owner: owner.login, repo: headRepository.name }
+      : headRepository === null ? null : undefined;
     return {
       id: requireString(record, 'node_id', path),
       number: requirePositiveInt(record, 'number', path),
@@ -406,6 +415,9 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       updatedAt: requireString(record, 'updated_at', path),
       headSha,
       baseSha: requireString(base, 'sha', path),
+      ...(headRef === undefined ? {} : { headRef }),
+      ...(headRepositoryIdentity === undefined ? {} : { headRepository: headRepositoryIdentity }),
+      ...(baseRef === undefined ? {} : { baseRef }),
     };
   }
 

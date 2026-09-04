@@ -47,10 +47,44 @@ export function normalizeMcpHttpCapabilities(
 /** Resolve ephemeral capabilities immediately before an implementation call. */
 export type ImplementationCapabilityResolver = () => Promise<readonly McpHttpCapability[] | undefined>;
 
+/** A non-persisted guard that providers must assert directly before spawning. */
+export interface WorkspaceGuard {
+  assertValid(): void | Promise<void>;
+}
+
+export const WORKSPACE_GUARD_FAILURE_CODE = 'WORKSPACE_GUARD_FAILURE' as const;
+
+export class WorkspaceGuardFailure extends Error {
+  readonly code = WORKSPACE_GUARD_FAILURE_CODE;
+  constructor(cause: unknown) {
+    super(`Prepared workspace identity guard failed: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = 'WorkspaceGuardFailure';
+  }
+}
+
+export function isWorkspaceGuardFailure(error: unknown): error is WorkspaceGuardFailure {
+  return error instanceof WorkspaceGuardFailure;
+}
+
+export async function assertWorkspaceGuard(guard: WorkspaceGuard | undefined): Promise<void> {
+  if (guard === undefined) return;
+  try {
+    await guard.assertValid();
+  } catch (error) {
+    if (isWorkspaceGuardFailure(error)) throw error;
+    throw new WorkspaceGuardFailure(error);
+  }
+}
+
 export interface ImplementationRequest {
   /** The work item: a single issue or a whole branch. */
   readonly target: Target;
   readonly baseSha: string;
+  /** Prepared linked worktree; providers use this as their process cwd. */
+  readonly workspacePath?: string;
+  readonly branch?: string;
+  /** Must be evaluated after capability resolution and directly before spawn. */
+  readonly workspaceGuard?: WorkspaceGuard;
   /** Whether the executor should read target authority live instead of from copied prose. */
   readonly authority?: 'embedded' | 'live-target';
   readonly instructions?: string;

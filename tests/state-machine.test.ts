@@ -52,6 +52,17 @@ describe('state machine — transition table integrity', () => {
 });
 
 describe('state machine — happy path', () => {
+  it('persists bootstrap identity only through its payload-bearing implementation checkpoint', () => {
+    let run = newRun();
+    run = applyTransition(run, { type: 'start' }, T0);
+    const bootstrap = {
+      owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base',
+      branch: 'tachiko/issue-42-test', workspacePath: '/tmp/tachiko-workspace',
+    };
+    const prepared = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, T0);
+    assert.deepEqual(prepared.bootstrap, bootstrap);
+    assert.throws(() => applyTransition(run, { type: 'bootstrap_prepared' }, T0), /requires durable bootstrap identity/);
+  });
   it('walks READY → IMPLEMENTING → VALIDATING → REVIEWING → FINAL_GATE → MERGE_READY → MERGED', () => {
     let run = newRun();
     assert.equal(run.state, 'READY');

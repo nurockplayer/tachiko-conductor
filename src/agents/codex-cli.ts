@@ -1,5 +1,6 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
+  assertWorkspaceGuard,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -90,13 +91,15 @@ export class CodexCliAdapter implements ImplementationAgent {
     if (isAborted(request.signal)) return cancelledAgentResult(0, executor);
 
     const prompt = buildPrompt(request);
+    await assertWorkspaceGuard(request.workspaceGuard);
+    const cwd = request.workspacePath ?? this.cwd;
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
       result = await this.runner.run(
         'codex',
         this.buildArgs(prompt, request.capabilities ?? [], executor),
-        this.processOptions(request.signal),
+        this.processOptions(request.signal, cwd),
       );
     } catch (error) {
       const durationMs = elapsedMs(startedAt);
@@ -155,7 +158,8 @@ export class CodexCliAdapter implements ImplementationAgent {
     }
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
 
-    const sha = await this.readHead(request.signal);
+    await assertWorkspaceGuard(request.workspaceGuard);
+    const sha = await this.readHead(request.signal, cwd);
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
     if (sha === null) {
       return failureAgentResult(
@@ -199,15 +203,15 @@ export class CodexCliAdapter implements ImplementationAgent {
     return args;
   }
 
-  private processOptions(signal: AbortSignal | undefined): ProcessRunOptions {
+  private processOptions(signal: AbortSignal | undefined, cwd = this.cwd): ProcessRunOptions {
     return signal === undefined
-      ? { timeoutMs: this.timeoutMs, cwd: this.cwd }
-      : { timeoutMs: this.timeoutMs, cwd: this.cwd, signal };
+      ? { timeoutMs: this.timeoutMs, cwd }
+      : { timeoutMs: this.timeoutMs, cwd, signal };
   }
 
-  private async readHead(signal: AbortSignal | undefined): Promise<string | null> {
+  private async readHead(signal: AbortSignal | undefined, cwd: string): Promise<string | null> {
     try {
-      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], this.processOptions(signal));
+      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], this.processOptions(signal, cwd));
       const sha = result.stdout.trim();
       return result.exitCode === 0 && FULL_SHA.test(sha) ? sha : null;
     } catch {

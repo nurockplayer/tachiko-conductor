@@ -13,6 +13,7 @@ import {
 } from './agents/codex-cli.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
+import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
 import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
@@ -44,6 +45,7 @@ import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
+import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
 import {
   runWorkflow,
   type WorkflowDependencies,
@@ -545,6 +547,32 @@ function buildWorkflowDeps(
 ): WorkflowDependencies {
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
+  let bootstrap: ImplementationBootstrapAdapter | undefined;
+  const lazyBootstrap: ImplementationBootstrapAdapter = {
+    kind: 'implementation-bootstrap',
+    plan: async (request) => {
+      bootstrap ??= new GitWorktreeBootstrap({
+        repositoryRoot: resolveRepositoryRoot(),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+      });
+      return bootstrap.plan(request);
+    },
+    prepare: async (request) => {
+      bootstrap ??= new GitWorktreeBootstrap({
+        repositoryRoot: resolveRepositoryRoot(),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+      });
+      return bootstrap.prepare(request);
+    },
+    guard: (identity) => {
+      if (bootstrap === undefined) throw new Error('Bootstrap workspace was not prepared.');
+      return bootstrap.guard(identity);
+    },
+    verifyDurable: async (request) => {
+      if (bootstrap === undefined) throw new Error('Bootstrap workspace was not prepared.');
+      return bootstrap.verifyDurable(request);
+    },
+  };
   return {
     store,
     github,
@@ -564,6 +592,7 @@ function buildWorkflowDeps(
       diffReader: new GhPullRequestDiffReader(transport),
       client: new DeepSeekApiClient(),
     }),
+    bootstrap: lazyBootstrap,
     resolveImplementationCapabilities,
   };
 }
@@ -602,6 +631,9 @@ export function runShowCommand(store: RunStore, id: string): Run {
 }
 
 export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string): Run {
+  if (type === 'bootstrap_prepared') {
+    throw new Error('Transition "bootstrap_prepared" requires durable bootstrap identity that this CLI cannot supply. Drive it through the workflow.');
+  }
   const requirement = transitionRequiresResult(type);
   if (requirement !== 'none') {
     throw new Error(
