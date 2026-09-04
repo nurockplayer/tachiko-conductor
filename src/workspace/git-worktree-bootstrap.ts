@@ -440,7 +440,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     this.assertWorkspacePathSnapshot(identity, initialPins);
     const remoteSha = await this.remoteBranchSha(identity.branch);
     this.assertWorkspacePathSnapshot(identity, initialPins);
-    if (!hasWorkspace && localSha === null && remoteSha === null) {
+    if (localSha === null && remoteSha === null) {
       if (identity.baseSha !== liveBaseSha) {
         throw bootstrapError(
           'BASE_DRIFT',
@@ -449,10 +449,19 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       }
       await this.assertLiveBase(identity.baseBranch, liveBaseSha);
       this.assertWorkspacePathSnapshot(identity, initialPins);
-      const parentPins = this.ensureWorkspaceParents(identity);
-      const gitDirectory = await this.resolveGitDirectory();
-      this.assertWorkspaceParents(parentPins);
-      const workspacePins = this.reserveWorkspaceDirectory(identity, parentPins);
+      let workspacePins: readonly DirectoryPin[];
+      let gitDirectory: string;
+      if (hasWorkspace) {
+        await this.assertEmptyUnregisteredReservation(identity, initialPins);
+        gitDirectory = await this.resolveGitDirectory();
+        workspacePins = initialPins;
+      } else {
+        const parentPins = this.ensureWorkspaceParents(identity);
+        gitDirectory = await this.resolveGitDirectory();
+        this.assertWorkspaceParents(parentPins);
+        workspacePins = this.reserveWorkspaceDirectory(identity, parentPins);
+      }
+      this.assertWorkspaceParents(workspacePins);
       await this.git(['cat-file', '-e', `${identity.baseSha}^{commit}`], this.repositoryRoot);
       this.assertWorkspaceParents(workspacePins);
       this.assertIdentity(identity);
@@ -555,6 +564,28 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       );
     }
     return true;
+  }
+
+  private async assertEmptyUnregisteredReservation(
+    identity: ImplementationBootstrapIdentity,
+    workspacePins: readonly DirectoryPin[],
+  ): Promise<void> {
+    this.assertReservedWorkspaceEmpty(workspacePins);
+    const raw = (await this.git(['worktree', 'list', '--porcelain', '-z'], this.repositoryRoot)).stdout;
+    this.assertReservedWorkspaceEmpty(workspacePins);
+    const registrations = parseWorktreeRegistrations(raw);
+    const expectedPath = path.resolve(identity.workspacePath);
+    const expectedBranchRef = `refs/heads/${identity.branch}`;
+    const pathRegistered = registrations.some((registration) =>
+      path.isAbsolute(registration.workspacePath) && path.resolve(registration.workspacePath) === expectedPath,
+    );
+    const branchRegistered = registrations.some((registration) => registration.branchRef === expectedBranchRef);
+    if (pathRegistered || branchRegistered) {
+      throw bootstrapError(
+        'COLLISION',
+        `Empty implementation workspace ${identity.workspacePath} is already registered with Git; refusing ambiguous recovery.`,
+      );
+    }
   }
 
   private assertReservedWorkspaceEmpty(workspacePins: readonly DirectoryPin[]): void {

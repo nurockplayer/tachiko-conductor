@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   renameSync,
   rmSync,
@@ -860,6 +861,51 @@ describe('GitWorktreeBootstrap', () => {
       runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing,
     }), existing);
     assert.ok(runner.calls.some(isWorktreeCall));
+  });
+
+  it('reuses an empty unregistered reservation after interruption before branch creation', async () => {
+    const roots = tempRoots();
+    let catFileCalls = 0;
+    let workspacePath = '';
+    const runner = new FakeGitRunner((args, cwd) => {
+      const command = args.join(' ');
+      if (command === 'remote get-url origin') return result('git@github.com:acme/widgets.git\n');
+      if (command.startsWith('show-ref --verify --quiet')) return result('', 1);
+      if (command === `ls-remote --heads origin refs/heads/${BRANCH}`) return result();
+      if (command === 'fetch --no-tags origin refs/heads/main') return result();
+      if (command === 'rev-parse FETCH_HEAD') return result(`${BASE}\n`);
+      if (command === 'rev-parse --absolute-git-dir') return result(`${realpathSync(roots.repositoryRoot)}\n`);
+      if (command === `cat-file -e ${BASE}^{commit}`) {
+        catFileCalls += 1;
+        return catFileCalls === 1 ? result('', 1) : result();
+      }
+      if (command === 'worktree list --porcelain -z') return result();
+      if (command === `--git-dir ${realpathSync(roots.repositoryRoot)} worktree add -b ${BRANCH} . ${BASE}`) {
+        assert.equal(cwd, workspacePath);
+        assert.equal(existsSync(cwd ?? ''), true);
+        return result();
+      }
+      if (command === 'rev-parse --show-toplevel') return result(`${cwd}\n`);
+      if (command === 'symbolic-ref --short HEAD') return result(`${BRANCH}\n`);
+      throw new Error(`Unexpected git call: ${command}`);
+    });
+    const bootstrap = new GitWorktreeBootstrap({ ...roots, runner });
+    const planned = await bootstrap.plan({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE });
+    workspacePath = planned.workspacePath;
+
+    await assert.rejects(
+      bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing: planned }),
+      codeIs(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.COMMAND_FAILED),
+    );
+    assert.deepEqual(readdirSync(planned.workspacePath), []);
+    assert.equal(runner.calls.some(isWorktreeCall), false);
+
+    assert.deepEqual(
+      await bootstrap.prepare({ runId: 'run-42', target: TARGET, baseBranch: 'main', baseSha: BASE, existing: planned }),
+      planned,
+    );
+    assert.equal(catFileCalls, 2);
+    assert.equal(runner.calls.filter(isWorktreeCall).length, 1);
   });
 
   it('reconstructs a missing workspace from the persisted local branch through the reserved directory', async () => {
