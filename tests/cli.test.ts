@@ -12,6 +12,7 @@ import {
   parseIssueNumber,
   parseIssueRef,
   resolveCodexExecutionConfig,
+  resolveLocalValidationConfiguration,
   resolveImplementationProvider,
   resolveRunsDir,
   runCreateCommand,
@@ -30,7 +31,7 @@ import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/doma
 import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
-import { T0, TARGET, successResult } from './helpers.js';
+import { T0, TARGET, successResult, validationPassed } from './helpers.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -130,6 +131,21 @@ describe('CLI command layer', () => {
     assert.throws(
       () => resolveCodexExecutionConfig({ TACHIKO_CODEX_TIMEOUT_MS: '0' }),
       /TACHIKO_CODEX_TIMEOUT_MS/,
+    );
+    assert.equal(resolveLocalValidationConfiguration({}), undefined);
+    assert.deepEqual(
+      resolveLocalValidationConfiguration({
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] }),
+      }),
+      { revision: 'repo-v1', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: '{bad json' }),
+      /must be valid JSON/,
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [{ argv: [], timeoutMs: 0 }] }) }),
+      /argv must be a non-empty string array/,
     );
   });
 
@@ -388,7 +404,10 @@ describe('workflow run and resume commands', () => {
     implementation: ImplementationAgent,
     reviewer: ReviewerAdapter,
   ): WorkflowDependencies {
-    return { store, github, implementation, reviewer };
+    return {
+      store, github, implementation, reviewer,
+      validation: { kind: 'validation', async validate(request) { return validationPassed(request.headSha).local; } },
+    };
   }
 
   it('starts an issue end-to-end and reaches MERGE_READY through the fake adapters', async () => {
@@ -412,7 +431,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
     store.create(run);
     const implementation = new FakeImplementation([]);
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
@@ -433,7 +452,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
     run = applyTransition(
       run,
       { type: 'escalate', reason: 'architecture decision', interrupt: { evidence: 'two designs', choices: ['A', 'B'] } },
@@ -492,7 +511,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
     run = applyTransition(run, { type: 'wait_dependency', reason: 'upstream API', interrupt: { evidence: 'waiting on API' } }, T0);
     store.create(run);
     const implementation = new FakeImplementation([]);
@@ -516,7 +535,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-sync');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
     run = applyTransition(
       run,
       {
@@ -563,7 +582,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-review-sync');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
     run = applyTransition(
       run,
       {
@@ -625,7 +644,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
     run = applyTransition(run, {
       type: 'escalate',
       reason: 'drift',

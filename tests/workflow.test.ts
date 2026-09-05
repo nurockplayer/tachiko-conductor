@@ -6,13 +6,14 @@ import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
+import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
-import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
+import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
-import { TARGET, failureResult, successResult } from './helpers.js';
+import { TARGET, failureResult, successResult, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -114,6 +115,18 @@ class FakeImplementation implements ImplementationAgent {
   }
 }
 
+class FakeValidation implements ValidationAdapter {
+  readonly kind = 'validation' as const;
+  readonly requests: ValidationRequest[] = [];
+
+  constructor(private readonly outcomes: LocalValidationEvidence[] = []) {}
+
+  async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
+    this.requests.push(request);
+    return this.outcomes.shift() ?? validationPassed(request.headSha).local;
+  }
+}
+
 class FakeBootstrap implements ImplementationBootstrapAdapter {
   readonly kind = 'implementation-bootstrap' as const;
   readonly identity = {
@@ -153,12 +166,86 @@ function reviewingRun(store: RunStore, id = 'run-1', headSha = HEAD): Run {
   let run = createRun(TARGET, T0, id);
   run = applyTransition(run, { type: 'start' }, T0);
   run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha }, T0);
-  run = applyTransition(run, { type: 'validation_passed' }, T0);
+  run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(headSha) }, T0);
   store.create(run);
   return run;
 }
 
 describe('runWorkflow', () => {
+  it('fails closed in VALIDATING when no explicit local validation adapter is configured', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-missing');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      checks: { availability: 'available', overall: 'pending', checks: [] },
+    });
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(result.run.validationResult?.status, 'unknown');
+    assert.equal(result.run.validationResult?.hosted.status, 'waiting');
+  });
+
+  it('persists local evidence while hosted checks wait, then resumes with a fresh hosted pass', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-wait');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const validation = new FakeValidation();
+    const pending = { ...snapshot(HEAD), checks: { availability: 'available' as const, overall: 'pending' as const, checks: [] } };
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => pending;
+
+    const waiting = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(waiting.run.state, 'WAITING_DEPENDENCY');
+    assert.equal(waiting.run.validationResult?.status, 'waiting');
+    assert.equal(validation.requests.length, 1);
+
+    store.update(applyTransition(waiting.run, { type: 'dependency_satisfied', reason: 'Retry readiness checks' }, T0));
+    const resumed = await runWorkflow(
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(HEAD)]), validation },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(resumed.outcome, 'merge_ready');
+    assert.equal(resumed.run.validationResult?.status, 'passed');
+    assert.equal(validation.requests.length, 1);
+  });
+
+  it('does not treat unavailable hosted checks as a passing validation source', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-hosted-unavailable');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      checks: { availability: 'unavailable', overall: 'passing', checks: [] },
+    });
+
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation() },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.validationResult?.status, 'unknown');
+    assert.equal(result.run.validationResult?.hosted.status, 'unknown');
+  });
+
   it('drives READY → implementation → review changes → fix → PASS → MERGE_READY', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-1'));
@@ -166,7 +253,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation() },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -196,9 +283,10 @@ describe('runWorkflow', () => {
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]),
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]),
         implementation,
         reviewer,
+        validation: new FakeValidation(),
         resolveImplementationCapabilities: async () => [capabilities[capabilityIndex++]!],
       },
       'run-capability',
@@ -277,7 +365,7 @@ describe('runWorkflow', () => {
     store.update(resumed);
 
     const result = await runWorkflow(
-      { store, github, implementation, reviewer },
+      { store, github, implementation, reviewer, validation: new FakeValidation() },
       'run-resume-fix',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -299,7 +387,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation() },
       'run-1',
       { maxReviewAttempts: 2, now: () => T0 },
     );
@@ -372,7 +460,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([null, null, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer, bootstrap: new FakeBootstrap() },
+      { store, github: githubAdapter([null, null, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer, bootstrap: new FakeBootstrap(), validation: new FakeValidation() },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -405,7 +493,7 @@ describe('runWorkflow', () => {
     store.create(run);
     const implementation = new FakeImplementation([]);
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([approve(HEAD)]), bootstrap: new FakeBootstrap() },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([approve(HEAD)]), bootstrap: new FakeBootstrap(), validation: new FakeValidation() },
       'run-crash-window', { maxReviewAttempts: 3, now: () => T0 },
     );
     assert.equal(result.outcome, 'merge_ready');
@@ -430,7 +518,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation() },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -452,7 +540,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation() },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );

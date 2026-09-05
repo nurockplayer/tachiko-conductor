@@ -18,7 +18,7 @@ import {
   type WorkflowState,
 } from '../src/domain/types.js';
 import { LIVE_HEAD_SYNC_DECISION } from '../src/domain/decisions.js';
-import { T0, approval, changesRequested, failureResult, newRun, successResult } from './helpers.js';
+import { T0, approval, changesRequested, failureResult, newRun, successResult, validationFailed, validationPassed } from './helpers.js';
 
 /** Build a run pinned to an arbitrary state (for edge-case tests). */
 function runIn(state: WorkflowState, overrides: Partial<Run> = {}): Run {
@@ -75,7 +75,7 @@ describe('state machine — happy path', () => {
     assert.equal(run.headSha, 'sha-1');
     assert.equal(run.agentResult?.exitStatus, 'success');
 
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1') }, T0);
     assert.equal(run.state, 'REVIEWING');
 
     run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0);
@@ -105,7 +105,7 @@ describe('state machine — happy path', () => {
     let run = newRun();
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult() }, T0);
-    run = applyTransition(run, { type: 'validation_failed' }, T0);
+    run = applyTransition(run, { type: 'validation_failed', validationResult: validationFailed() }, T0);
     assert.equal(run.state, 'CHANGES_REQUESTED');
   });
 
@@ -113,7 +113,7 @@ describe('state machine — happy path', () => {
     let run = newRun();
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-1') }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1') }, T0);
     run = applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-1') }, T0);
     assert.equal(run.state, 'CHANGES_REQUESTED');
     assert.equal(run.reviewResult?.verdict, 'request_changes');
@@ -197,12 +197,20 @@ describe('state machine — invalid transitions fail loudly', () => {
       (err: unknown) => err instanceof InvalidTransitionError && err.code === 'wrong-verdict',
     );
   });
+
+  it('refuses to advance VALIDATING without exact-HEAD validation evidence', () => {
+    const validating = runIn('VALIDATING', { headSha: 'sha-2' });
+    assert.throws(
+      () => applyTransition(validating, { type: 'validation_passed' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-payload',
+    );
+  });
 });
 
 describe('state machine — final gate review freshness', () => {
   /** A FINAL_GATE run whose work is at sha-2. */
   function gated(): Run {
-    return runIn('FINAL_GATE', { headSha: 'sha-2' });
+    return runIn('FINAL_GATE', { headSha: 'sha-2', validationResult: validationPassed('sha-2') });
   }
 
   it('blocks gate_passed when the latest review is bound to an older SHA', () => {
@@ -223,7 +231,7 @@ describe('state machine — final gate review freshness', () => {
   });
 
   it('re-enters a fresh review cycle from a blocked gate and passes', () => {
-    let run = runIn('FINAL_GATE', { headSha: 'sha-2', reviewResult: approval('reviewer-1', 'sha-1') });
+    let run = runIn('FINAL_GATE', { headSha: 'sha-2', reviewResult: approval('reviewer-1', 'sha-1'), validationResult: validationPassed('sha-2') });
     assert.equal(isReviewFresh(run), false);
 
     run = applyTransition(run, { type: 'gate_blocked' }, T0);
@@ -345,7 +353,7 @@ describe('state machine — review events must be bound to the current HEAD', ()
 
 describe('state machine — HEAD mutation is bound to implementation or explicit live sync', () => {
   it('allows only an explicitly offered human live-HEAD sync and routes it through validation', () => {
-    let run = runIn('IMPLEMENTING', { headSha: 'sha-1' });
+    let run = runIn('IMPLEMENTING', { headSha: 'sha-1', validationResult: validationPassed('sha-1') });
     run = applyTransition(
       run,
       {
@@ -361,6 +369,7 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
       T0,
     );
     assert.equal(synchronized.state, 'VALIDATING');
+    assert.equal(synchronized.validationResult, undefined);
     assert.equal(synchronized.headSha, 'sha-2');
 
     assert.throws(
@@ -403,6 +412,7 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
     const run = runIn('FINAL_GATE', {
       headSha: 'sha-1',
       reviewResult: approval('reviewer-1', 'sha-1'),
+      validationResult: validationPassed('sha-1'),
     });
     assert.equal(isReviewFresh(run), true);
     assert.throws(
@@ -415,6 +425,7 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
     const run = runIn('FINAL_GATE', {
       headSha: 'sha-1',
       reviewResult: approval('reviewer-1', 'sha-1'),
+      validationResult: validationPassed('sha-1'),
     });
     const next = applyTransition(run, { type: 'gate_passed' }, T0);
     assert.equal(next.state, 'MERGE_READY');
@@ -445,7 +456,7 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
   it('rejects agent/review payloads carried by unrelated transitions', () => {
     assert.throws(
       () => applyTransition(runIn('VALIDATING'), { type: 'validation_passed', agentResult: successResult('sha-2') }, T0),
-      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unexpected-payload',
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-payload',
     );
     assert.throws(
       () =>

@@ -8,8 +8,9 @@ import {
 import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
-import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
-import type { Run, Target } from '../domain/types.js';
+import type { ValidationAdapter } from '../adapters/validation.js';
+import { applyTransition, isReviewFresh, isValidationFresh } from '../domain/state-machine.js';
+import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
@@ -25,6 +26,8 @@ export interface WorkflowDependencies {
   readonly implementation: ImplementationAgent;
   readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly reviewer: ReviewerAdapter;
+  /** Explicit repository/run validation adapter; absence is recorded as unknown and fails closed. */
+  readonly validation?: ValidationAdapter;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
 
@@ -83,6 +86,56 @@ function park(run: Run, reason: string, store: RunStore, now: () => string, choi
   const next = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices } }, now());
   store.update(next);
   return { outcome: 'needs_human', run: next, reason };
+}
+
+function hostedValidation(snapshot: GitHubLiveSnapshot): HostedValidationEvidence {
+  const status = snapshot.checks.availability !== 'available'
+    ? 'unknown'
+    : snapshot.checks.overall === 'passing'
+    ? 'passed'
+    : snapshot.checks.overall === 'failing'
+      ? 'failed'
+      : snapshot.checks.overall === 'pending'
+        ? 'waiting'
+        : 'unknown';
+  return {
+    status,
+    observedAt: snapshot.observedAt,
+    pullRequestNumber: snapshot.pullRequest?.number ?? null,
+    availability: snapshot.checks.availability,
+    overall: snapshot.checks.overall,
+  };
+}
+
+function unavailableLocalValidation(): LocalValidationEvidence {
+  return { status: 'unknown', configRevision: null, commands: [] };
+}
+
+function combineValidation(headSha: string, local: LocalValidationEvidence, hosted: HostedValidationEvidence): ValidationResult {
+  const status = local.status === 'failed' || hosted.status === 'failed'
+    ? 'failed'
+    : local.status === 'unknown' || hosted.status === 'unknown'
+        ? 'unknown'
+        : hosted.status === 'waiting'
+          ? 'waiting'
+          : 'passed';
+  return { headSha, status, local, hosted };
+}
+
+async function validateExactHead(
+  run: Run,
+  target: Extract<Target, { readonly kind: 'issue' }>,
+  snapshot: GitHubLiveSnapshot,
+  validation: ValidationAdapter | undefined,
+): Promise<ValidationResult> {
+  if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
+  const reusable = run.validationResult;
+  const local = reusable?.headSha === run.headSha && reusable.local.status === 'passed'
+    ? reusable.local
+    : validation === undefined
+      ? unavailableLocalValidation()
+      : await validation.validate({ target, headSha: run.headSha });
+  return combineValidation(run.headSha, local, hostedValidation(snapshot));
 }
 
 /**
@@ -336,7 +389,62 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
-        run = applyTransition(run, { type: 'validation_passed' }, now());
+        let validationResult: ValidationResult;
+        try {
+          validationResult = await validateExactHead(run, target, snapshot, deps.validation);
+        } catch (error) {
+          const reason = `Local validation could not be observed safely: ${error instanceof Error ? error.message : String(error)}`;
+          validationResult = combineValidation(run.headSha ?? '', unavailableLocalValidation(), hostedValidation(snapshot));
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate', reason, validationResult,
+              interrupt: { evidence: reason, choices: ['Restore the configured validation runner and retry', CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        if (validationResult.status === 'failed') {
+          run = applyTransition(run, { type: 'validation_failed', validationResult }, now());
+          store.update(run);
+          break;
+        }
+        if (validationResult.status === 'waiting') {
+          const reason = `Validation for ${run.headSha} is waiting for required hosted checks.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'wait_dependency', reason, validationResult,
+              interrupt: { evidence: reason, choices: [RETRY_READINESS_DECISION, CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        if (validationResult.status === 'unknown') {
+          const reason = `Validation for ${run.headSha} lacks required local or hosted evidence.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate', reason, validationResult,
+              interrupt: { evidence: reason, choices: ['Restore required validation evidence and retry', CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        run = applyTransition(
+          run,
+          {
+            type: 'validation_passed', validationResult,
+            ...(snapshot.pullRequest === null ? {} : { pullRequest: { number: snapshot.pullRequest.number, headSha: run.headSha! } }),
+          },
+          now(),
+        );
         store.update(run);
         break;
       }
@@ -360,6 +468,18 @@ export async function runWorkflow(
       case 'FINAL_GATE': {
         if (!isReviewFresh(run)) {
           run = applyTransition(run, { type: 'gate_blocked' }, now());
+          store.update(run);
+          break;
+        }
+        if (!isValidationFresh(run)) {
+          const reason = `Final gate has no passing validation bound to current HEAD ${run.headSha ?? '(none)'}.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'gate_blocked', reason,
+            },
+            now(),
+          );
           store.update(run);
           break;
         }

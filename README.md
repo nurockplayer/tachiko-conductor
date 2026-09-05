@@ -113,6 +113,27 @@ When choices are present, the decision must match one exactly. `Cancel the
 run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
 independent review before the final gate.
 
+## Exact-HEAD validation
+
+`VALIDATING` requires a persisted `ValidationResult` for the current exact
+HEAD. Conductor retains compact local-command and hosted-check provenance only;
+it never stores command output, full command arguments, or secrets. A new HEAD
+makes prior evidence stale. Pending hosted checks park in `WAITING_DEPENDENCY`
+for a later re-read; unavailable or unknown evidence fails closed.
+
+Local commands are repository/run configuration and are never inferred from
+Issue text. Set `TACHIKO_LOCAL_VALIDATION_CONFIG` to a stable revision and
+bounded argv-array commands, for example:
+
+```bash
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
+```
+
+Without explicit configuration, local validation is unknown and the run cannot
+advance to review. Commands use a direct process boundary (no shell), with
+compact pass, non-zero-exit, timeout, unavailable-executable, and malformed
+configuration outcomes.
+
 ## Implementation workspace safety
 
 For an issue that has no associated open pull request, Conductor first creates

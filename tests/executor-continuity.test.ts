@@ -11,6 +11,7 @@ import type { ImplementationAgent, WorkspaceGuard } from '../src/adapters/agent.
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
+import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
 import { resumeCommand } from '../src/cli.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
@@ -19,7 +20,7 @@ import type { ProcessResult, ProcessRunOptions, ProcessRunner } from '../src/git
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
-import { TARGET, T0, successResult } from './helpers.js';
+import { TARGET, T0, successResult, validationPassed } from './helpers.js';
 
 const HEAD = 'a'.repeat(40);
 const HEAD2 = 'b'.repeat(40);
@@ -141,7 +142,7 @@ function runAtReviewFix(route: 'direct' | 'resumed', id: string): Run {
     type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD,
     pullRequest: { number: 7, headSha: HEAD },
   }, T0);
-  run = applyTransition(run, { type: 'validation_passed' }, T0);
+  run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
   run = applyTransition(run, {
     type: 'changes_requested',
     reviewResult: { verdict: 'request_changes', reviewerName: 'controlled', headSha: HEAD, findings: [{ severity: 'blocking', summary: 'repair continuity' }] },
@@ -173,6 +174,10 @@ for (const provider of ['claude-code', 'codex-cli'] as const) {
           implementation: providerAgent(provider, runner),
           bootstrap,
           reviewer: new ApprovingReviewer(),
+          validation: {
+            kind: 'validation',
+            async validate(request: ValidationRequest) { return validationPassed(request.headSha).local; },
+          } satisfies ValidationAdapter,
         };
         try {
           const parked = route === 'direct'

@@ -123,6 +123,42 @@ export interface ReviewResult {
   readonly findings: readonly ReviewFinding[];
 }
 
+/** A fail-closed validation outcome. `waiting` is reserved for a re-checkable external dependency. */
+export type ValidationStatus = 'passed' | 'failed' | 'waiting' | 'unknown';
+
+/** Compact, secret-free result for one explicitly configured local command. */
+export interface LocalValidationCommandEvidence {
+  readonly commandIndex: number;
+  readonly executable: string;
+  readonly outcome: 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed';
+  readonly exitCode: number | null;
+  readonly durationMs: number;
+}
+
+/** Durable provenance for deterministic local validation. It intentionally excludes command output. */
+export interface LocalValidationEvidence {
+  readonly status: Exclude<ValidationStatus, 'waiting'>;
+  readonly configRevision: string | null;
+  readonly commands: readonly LocalValidationCommandEvidence[];
+}
+
+/** Compact snapshot of hosted checks observed for the run's exact PR HEAD. */
+export interface HostedValidationEvidence {
+  readonly status: ValidationStatus;
+  readonly observedAt: string;
+  readonly pullRequestNumber: number | null;
+  readonly availability: 'available' | 'unavailable';
+  readonly overall: 'pending' | 'passing' | 'failing' | 'unknown' | 'unavailable';
+}
+
+/** The persisted exact-HEAD validation ledger consumed by review and final readiness. */
+export interface ValidationResult {
+  readonly headSha: string;
+  readonly status: ValidationStatus;
+  readonly local: LocalValidationEvidence;
+  readonly hosted: HostedValidationEvidence;
+}
+
 /** Why a run is paused waiting on a human or an external dependency. */
 export type InterruptKind = 'needs_human' | 'waiting_dependency';
 
@@ -154,6 +190,8 @@ export interface TransitionInput {
   readonly agentResult?: AgentResult;
   /** Carried into the run; required for `review_approved` / `changes_requested`. */
   readonly reviewResult?: ReviewResult;
+  /** Exact-HEAD validation evidence produced at the validation boundary. */
+  readonly validationResult?: ValidationResult;
   /** Explicitly updates the run's current HEAD SHA. */
   readonly headSha?: string;
   /** Executor identity captured while an implementation is interrupted for human takeover. */
@@ -192,6 +230,8 @@ export interface Run {
   readonly pullRequest?: ImplementationPullRequestIdentity;
   /** Latest review result, bound to an exact HEAD SHA. */
   readonly reviewResult?: ReviewResult;
+  /** Latest validation result, bound to an exact HEAD SHA. */
+  readonly validationResult?: ValidationResult;
   /** Current HEAD SHA of the implementation, when known. */
   readonly headSha?: string;
 }

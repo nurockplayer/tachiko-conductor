@@ -10,7 +10,7 @@ import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
 import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import type { RunStore } from '../src/store/json-file-store.js';
-import { TARGET, failureResult, successResult } from './helpers.js';
+import { TARGET, failureResult, successResult, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -47,7 +47,7 @@ function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string): Run {
   run = applyTransition(run, { type: 'start' }, T0);
   const agentResult = { ...successResult(headSha), ...(sessionId === undefined ? {} : { sessionId }) };
   run = applyTransition(run, { type: 'agent_succeeded', agentResult, headSha }, T0);
-  run = applyTransition(run, { type: 'validation_passed' }, T0);
+  run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(headSha) }, T0);
   return run;
 }
 
@@ -170,7 +170,7 @@ describe('runReviewLoop', () => {
     assert.equal(persisted?.history.some((entry) => entry.type === 'gate_passed'), false);
   });
 
-  it('routes REQUEST_CHANGES through the fix loop back to a re-review that approves', async () => {
+  it('returns a new fix HEAD to VALIDATING instead of bypassing fresh validation', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
@@ -183,10 +183,10 @@ describe('runReviewLoop', () => {
     );
 
     assert.equal(result.outcome, 'approved');
-    assert.equal(result.run.state, 'FINAL_GATE');
+    assert.equal(result.run.state, 'VALIDATING');
     assert.equal(result.run.headSha, HEAD2);
     assert.deepEqual(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
-    assert.deepEqual(reviewer.requests.map((request) => request.headSha), [HEAD, HEAD2]);
+    assert.deepEqual(reviewer.requests.map((request) => request.headSha), [HEAD]);
   });
 
   it('routes only blocking findings to implementation', async () => {
@@ -253,7 +253,7 @@ describe('runReviewLoop', () => {
     });
   });
 
-  it('escalates to NEEDS_HUMAN when the review loop exceeds maxAttempts', async () => {
+  it('returns the fixed HEAD to VALIDATING before a second review can consume the attempt budget', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
@@ -265,9 +265,8 @@ describe('runReviewLoop', () => {
       { maxAttempts: 2, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'needs_human');
-    assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.match(result.reason, /did not converge/);
+    assert.equal(result.outcome, 'approved');
+    assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests.length, 1);
   });
 
@@ -323,7 +322,7 @@ describe('runReviewLoop', () => {
     );
 
     assert.equal(result.outcome, 'approved');
-    assert.equal(result.run.state, 'FINAL_GATE');
+    assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests.length, 1);
   });
 
@@ -341,9 +340,9 @@ describe('runReviewLoop', () => {
     );
 
     assert.equal(result.outcome, 'approved');
-    assert.equal(result.run.state, 'FINAL_GATE');
+    assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests[0]?.baseSha, HEAD);
-    assert.deepEqual(reviewer.requests.map((reviewRequest) => reviewRequest.headSha), [HEAD2]);
+    assert.deepEqual(reviewer.requests.map((reviewRequest) => reviewRequest.headSha), []);
   });
 
   it('turns retryable and fatal reviewer failures into durable outcomes', async () => {

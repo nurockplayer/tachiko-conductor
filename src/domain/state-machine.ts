@@ -1,5 +1,5 @@
 import { LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './decisions.js';
-import type { ReviewResult, Run, TransitionInput, TransitionType, WorkflowState } from './types.js';
+import type { ReviewResult, Run, TransitionInput, TransitionType, ValidationResult, WorkflowState } from './types.js';
 
 /** Why a transition was rejected. */
 export type InvalidTransitionCode =
@@ -21,6 +21,8 @@ export type InvalidTransitionCode =
   | 'empty-head-sha'
   | 'conflicting-head-sha'
   | 'stale-review'
+  | 'stale-validation'
+  | 'invalid-validation-result'
   | 'fresh-review'
   | 'no-interrupt-context';
 
@@ -194,9 +196,50 @@ export function isReviewFresh(run: Run): boolean {
   return run.reviewResult !== undefined && isReviewBoundToHead(run, run.reviewResult);
 }
 
+/** Validation may only authorize the exact non-empty HEAD it observed. */
+export function isValidationFresh(run: Run): boolean {
+  return run.validationResult !== undefined &&
+    run.headSha !== undefined && run.headSha.trim() !== '' &&
+    run.validationResult.headSha === run.headSha &&
+    run.validationResult.status === 'passed';
+}
+
 /** A usable SHA identity: present and not empty after trimming whitespace. */
 function isUsableSha(value: string | undefined): value is string {
   return value !== undefined && value.trim() !== '';
+}
+
+function acceptsValidationResult(from: WorkflowState, type: TransitionType): boolean {
+  return type === 'validation_passed' || type === 'validation_failed' ||
+    (from === 'VALIDATING' && (type === 'wait_dependency' || type === 'escalate'));
+}
+
+function assertValidationResult(run: Run, result: ValidationResult, from: WorkflowState, type: TransitionType): void {
+  if (!isUsableSha(result.headSha) || !isUsableSha(run.headSha) || result.headSha !== run.headSha) {
+    throw new InvalidTransitionError(
+      result.headSha !== run.headSha ? 'stale-validation' : 'invalid-validation-result',
+      from,
+      type,
+      `Validation evidence must name the run's exact current HEAD "${run.headSha ?? '(none)'}", got "${result.headSha}".`,
+    );
+  }
+  if (result.local.configRevision !== null && result.local.configRevision.trim() === '') {
+    throw new InvalidTransitionError('invalid-validation-result', from, type, 'Local validation provenance is malformed.');
+  }
+  if (result.hosted.observedAt.trim() === '' ||
+      (result.hosted.pullRequestNumber !== null && (!Number.isSafeInteger(result.hosted.pullRequestNumber) || result.hosted.pullRequestNumber < 1))) {
+    throw new InvalidTransitionError('invalid-validation-result', from, type, 'Hosted validation provenance is malformed.');
+  }
+  const expectedStatus = result.local.status === 'failed' || result.hosted.status === 'failed'
+    ? 'failed'
+    : result.local.status === 'unknown' || result.hosted.status === 'unknown'
+        ? 'unknown'
+        : result.hosted.status === 'waiting'
+          ? 'waiting'
+          : 'passed';
+  if (result.status !== expectedStatus) {
+    throw new InvalidTransitionError('invalid-validation-result', from, type, `Validation outcome "${result.status}" conflicts with its source evidence.`);
+  }
 }
 
 function sameBootstrap(a: NonNullable<Run['bootstrap']>, b: NonNullable<Run['bootstrap']>): boolean {
@@ -223,6 +266,9 @@ function assertPayload(run: Run, input: TransitionInput): void {
       `Transition "${input.type}" requires a reviewResult; pass the reviewer's result.`,
     );
   }
+  if ((input.type === 'validation_passed' || input.type === 'validation_failed') && input.validationResult === undefined) {
+    throw new InvalidTransitionError('missing-payload', from, input.type, `Transition "${input.type}" requires exact-HEAD validation evidence.`);
+  }
   if (input.type === 'bootstrap_prepared' && input.bootstrap === undefined) {
     throw new InvalidTransitionError('missing-payload', from, input.type, 'Transition "bootstrap_prepared" requires durable bootstrap identity.');
   }
@@ -243,6 +289,18 @@ function assertPayload(run: Run, input: TransitionInput): void {
       input.type,
       `Transition "${input.type}" does not accept a reviewResult; review results are bound to review_approved / changes_requested.`,
     );
+  }
+  if (input.validationResult !== undefined && !acceptsValidationResult(from, input.type)) {
+    throw new InvalidTransitionError('unexpected-payload', from, input.type, `Transition "${input.type}" cannot carry validation evidence from ${from}.`);
+  }
+  if (input.validationResult !== undefined) {
+    assertValidationResult(run, input.validationResult, from, input.type);
+  }
+  if (input.type === 'validation_passed' && input.validationResult?.status !== 'passed') {
+    throw new InvalidTransitionError('invalid-validation-result', from, input.type, 'validation_passed requires a passed validation result.');
+  }
+  if (input.type === 'validation_failed' && input.validationResult?.status !== 'failed') {
+    throw new InvalidTransitionError('invalid-validation-result', from, input.type, 'validation_failed requires a failed validation result.');
   }
   if (input.type !== 'bootstrap_prepared' && input.bootstrap !== undefined) {
     throw new InvalidTransitionError('unexpected-payload', from, input.type, 'Bootstrap identity is only accepted by "bootstrap_prepared".');
@@ -486,9 +544,18 @@ function assertGate(run: Run, input: TransitionInput): void {
       `Final gate cannot pass: the latest review is bound to SHA "${run.reviewResult?.headSha ?? '(none)'}" but the run is at "${run.headSha ?? '(none)'}". Review the current HEAD before advancing.`,
     );
   }
+  if (input.type === 'gate_passed' && !isValidationFresh(run)) {
+    throw new InvalidTransitionError(
+      'stale-validation',
+      run.state,
+      input.type,
+      `Final gate cannot pass: no passing validation is bound to the current HEAD "${run.headSha ?? '(none)'}".`,
+    );
+  }
   if (
     input.type === 'gate_blocked' &&
     isReviewFresh(run) &&
+    isValidationFresh(run) &&
     run.reviewResult !== undefined &&
     run.reviewResult.verdict === 'approve' &&
     isReviewInternallyConsistent(run.reviewResult)
@@ -558,9 +625,15 @@ export function applyTransition(
   const headSha = !preservesOwnedHead && (HEAD_UPDATING_TRANSITIONS.has(input.type) || authorizedHumanHeadSync)
     ? (input.headSha ?? input.agentResult?.headSha)?.trim()
     : undefined;
+  // A newly accepted ownership HEAD invalidates any result recorded for the
+  // prior commit. In particular, an explicit live-HEAD synchronization must
+  // persist a resumable VALIDATING run without allowing old evidence to be
+  // mistaken for authorization of the new commit.
+  const invalidatesValidation = headSha !== undefined && headSha !== '' && headSha !== run.headSha;
+  const { validationResult: _previousValidationResult, ...runWithoutStaleValidation } = run;
 
   const next: Run = {
-    ...run,
+    ...(invalidatesValidation ? runWithoutStaleValidation : run),
     state: to,
     updatedAt: now,
     history: [...run.history, { type: input.type, from, to, at: now, reason: input.reason }],
@@ -570,6 +643,7 @@ export function applyTransition(
     ...(input.bootstrap === undefined ? {} : { bootstrap: { ...input.bootstrap } }),
     ...(input.pullRequest === undefined ? {} : { pullRequest: { ...input.pullRequest } }),
     ...(input.reviewResult !== undefined ? { reviewResult: input.reviewResult } : {}),
+    ...(input.validationResult !== undefined ? { validationResult: input.validationResult } : {}),
     ...(headSha !== undefined && headSha !== '' ? { headSha } : {}),
     ...(enteringInterrupt
       ? {

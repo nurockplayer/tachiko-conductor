@@ -312,9 +312,10 @@ export async function runReviewLoop(
         run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha }, now());
       }
       store.update(run);
-      run = applyTransition(run, { type: 'validation_passed' }, now());
-      store.update(run);
-      continue;
+      // A new fix creates a new exact HEAD. Validation is owned by the outer
+      // workflow so it must collect fresh local and hosted evidence before a
+      // reviewer can see that HEAD.
+      return { outcome: 'approved', run };
     }
 
     if (durableReviewAttempts(run) >= options.maxAttempts) {

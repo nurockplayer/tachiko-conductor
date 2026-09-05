@@ -15,6 +15,8 @@ import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
+import type { LocalValidationConfiguration } from './adapters/validation.js';
+import { ConfiguredLocalValidationAdapter } from './validation/local-command.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
 import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
 import {
@@ -152,6 +154,47 @@ export function resolveCodexExecutionConfig(env: NodeJS.ProcessEnv = process.env
     config.timeoutMs = value;
   }
   return config;
+}
+
+/**
+ * Parse the repository/run-owned local validation plan. Commands are explicit
+ * JSON data; workflow code never derives them from Issue prose or defaults.
+ */
+export function resolveLocalValidationConfiguration(
+  env: NodeJS.ProcessEnv = process.env,
+): LocalValidationConfiguration | undefined {
+  const raw = env.TACHIKO_LOCAL_VALIDATION_CONFIG;
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG must be valid JSON.');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG must be an object.');
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.revision !== 'string' || record.revision.trim() === '') {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.revision must be a non-empty string.');
+  }
+  if (!Array.isArray(record.commands)) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.commands must be an array.');
+  }
+  const commands = record.commands.map((value, index) => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}] must be an object.`);
+    }
+    const command = value as Record<string, unknown>;
+    if (!Array.isArray(command.argv) || command.argv.length === 0 || command.argv.some((part) => typeof part !== 'string' || part.trim() === '')) {
+      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].argv must be a non-empty string array.`);
+    }
+    if (!Number.isSafeInteger(command.timeoutMs) || (command.timeoutMs as number) < 1) {
+      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].timeoutMs must be a positive safe integer.`);
+    }
+    return { argv: command.argv as string[], timeoutMs: command.timeoutMs as number };
+  });
+  return { revision: record.revision, commands };
 }
 
 /** Resolve the directory where run JSON files are stored. */
@@ -555,6 +598,7 @@ function buildWorkflowDeps(
 ): WorkflowDependencies {
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
+  const localValidation = resolveLocalValidationConfiguration(env);
   let bootstrap: ImplementationBootstrapAdapter | undefined;
   const lazyBootstrap: ImplementationBootstrapAdapter = {
     kind: 'implementation-bootstrap',
@@ -601,6 +645,7 @@ function buildWorkflowDeps(
       client: new DeepSeekApiClient(),
     }),
     bootstrap: lazyBootstrap,
+    ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
     resolveImplementationCapabilities,
   };
 }
