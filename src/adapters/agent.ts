@@ -49,7 +49,7 @@ export type ImplementationCapabilityResolver = () => Promise<readonly McpHttpCap
 
 /** A non-persisted guard that providers must assert directly before spawning. */
 export interface WorkspaceGuard {
-  assertValid(): void | Promise<void>;
+  assertValid(phase?: 'before-execution' | 'after-execution'): void | Promise<void>;
 }
 
 export const WORKSPACE_GUARD_FAILURE_CODE = 'WORKSPACE_GUARD_FAILURE' as const;
@@ -66,10 +66,10 @@ export function isWorkspaceGuardFailure(error: unknown): error is WorkspaceGuard
   return error instanceof WorkspaceGuardFailure;
 }
 
-export async function assertWorkspaceGuard(guard: WorkspaceGuard | undefined): Promise<void> {
+export async function assertWorkspaceGuard(guard: WorkspaceGuard | undefined, phase: 'before-execution' | 'after-execution' = 'before-execution'): Promise<void> {
   if (guard === undefined) return;
   try {
-    await guard.assertValid();
+    await guard.assertValid(phase);
   } catch (error) {
     if (isWorkspaceGuardFailure(error)) throw error;
     throw new WorkspaceGuardFailure(error);

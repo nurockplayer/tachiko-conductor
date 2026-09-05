@@ -130,13 +130,18 @@ export async function runWorkflow(
         let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
         let workspaceGuard: WorkspaceGuard | undefined;
 
-        if (bootstrap !== undefined && snapshot.pullRequest !== null && run.headSha !== undefined) {
-          const conflict = pullRequestIdentityConflict(run, snapshot);
+        if (bootstrap !== undefined && (snapshot.pullRequest !== null || run.headSha !== undefined || run.pullRequest !== undefined)) {
+          const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
           if (conflict !== null) return park(run, conflict, store, now);
-          if (snapshot.headSha !== run.headSha) {
+          if (run.headSha === undefined && run.pullRequest !== undefined) {
+            return park(run, 'Initial-result recovery requires both the persisted HEAD and PR record to be absent.', store, now);
+          }
+          if (run.headSha !== undefined && snapshot.headSha !== run.headSha) {
             return park(run, `Live GitHub HEAD ${snapshot.headSha ?? '(none)'} does not match persisted run HEAD ${run.headSha ?? '(none)'}.`, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
           }
-          recoveryAuthority = { expectedHeadSha: run.headSha };
+          // With no H/PR this is only preparation of the narrow initial result;
+          // durable verification below must succeed before anything is adopted.
+          recoveryAuthority = { expectedHeadSha: run.headSha ?? snapshot.headSha! };
         }
         if (pendingReviewFix && snapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
@@ -182,7 +187,7 @@ export async function runWorkflow(
           }
           if (snapshot.issue.state !== 'open') return park(run, `Issue ${formatTarget(target)} closed during bootstrap.`, store, now, [CANCEL_RUN_DECISION]);
           if (snapshot.pullRequest !== null) {
-            const conflict = pullRequestIdentityConflict(run, snapshot);
+            const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
             if (conflict !== null) return park(run, conflict, store, now);
             if (run.headSha === undefined) {
               try {
@@ -196,6 +201,8 @@ export async function runWorkflow(
               break;
             }
             if (snapshot.headSha !== run.headSha) return park(run, `Live GitHub HEAD changed during bootstrap recovery.`, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
+          } else if (run.headSha !== undefined || recoveryAuthority !== undefined) {
+            return park(run, 'The owned pull request disappeared during workspace recovery.', store, now);
           } else if (!pendingReviewFix && (snapshot.repository.defaultBranch !== bootstrap.baseBranch || snapshot.repository.defaultBranchHeadSha !== bootstrap.baseSha)) {
             return bootstrapFailureOutcome(run, new Error('Live default branch changed after bootstrap preparation.'), store, now);
           }
@@ -295,6 +302,8 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+        if (conflict !== null) return park(run, conflict, store, now);
         if (snapshot.headSha === null || snapshot.headSha !== run.headSha) {
           const reason =
             snapshot.headSha === null
@@ -356,6 +365,8 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+        if (conflict !== null) return park(run, conflict, store, now);
         if (snapshot.headSha !== run.headSha) {
           const reason = `Final gate observed live GitHub HEAD ${snapshot.headSha ?? '(none)'} but the approved run HEAD is ${run.headSha ?? '(none)'}.`;
           run = applyTransition(

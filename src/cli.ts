@@ -46,6 +46,7 @@ import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
+import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
   type WorkflowDependencies,
@@ -481,6 +482,7 @@ export async function resumeCommand(
   }
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
   let synchronizedHead: string | undefined;
+  let synchronizedPullRequest: Run['pullRequest'];
   const synchronizeLiveHead =
     decision.trim() === LIVE_HEAD_SYNC_DECISION &&
     run.state === 'NEEDS_HUMAN' &&
@@ -492,7 +494,12 @@ export async function resumeCommand(
     if (snapshot.headSha === null) {
       throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request HEAD.`);
     }
+    const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+    if (conflict !== null) throw new Error(`Cannot synchronize run "${id}": ${conflict}`);
     synchronizedHead = snapshot.headSha;
+    if (run.bootstrap !== undefined && snapshot.pullRequest !== null) {
+      synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
+    }
   }
   const resumed = applyTransition(
     run,
@@ -500,6 +507,7 @@ export async function resumeCommand(
       type: transition,
       reason: decision,
       ...(synchronizedHead === undefined ? {} : { headSha: synchronizedHead }),
+      ...(synchronizedPullRequest === undefined ? {} : { pullRequest: synchronizedPullRequest }),
     },
     now(),
   );

@@ -61,6 +61,7 @@ describe('GitWorktreeBootstrap', () => {
     const runner: ProcessRunner = {
       async run(_file, args) {
         (calls as string[][]).push([...args]);
+        if (args.join(' ') === 'check-ref-format --branch main') return { stdout: 'main\n', stderr: '', exitCode: 0 };
         if (args.join(' ') === 'remote get-url origin') return { stdout: 'git@github.com:acme/widgets.git\n', stderr: '', exitCode: 0 };
         if (args.join(' ') === 'remote get-url --all --push origin') return { stdout: 'git@github.com:acme/widgets.git\nhttps://github.com/acme/other.git\n', stderr: '', exitCode: 0 };
         throw new Error(`unexpected command ${args.join(' ')}`);
@@ -102,7 +103,7 @@ describe('GitWorktreeBootstrap', () => {
     assert.deepEqual(await bootstrap.verifyDurable({ identity, expectedHeadSha: headSha }), { headSha, branch: identity.branch });
 
     runner.remoteGood = false;
-    await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); }, code(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH));
+    await assert.rejects(async () => { await bootstrap.guard(identity).assertValid('after-execution'); }, code(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH));
     runner.remoteGood = true;
     // Fixture-only simulation of an old clean local replica: recovery may only
     // move it through the implementation's ff-only path.

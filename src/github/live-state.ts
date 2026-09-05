@@ -315,10 +315,15 @@ export class LiveGitHubAdapter implements GitHubAdapter {
 
       const reread = asRecordOrThrow(await this.transport.get(path), path);
       const rereadHead = asRecord(reread.head);
+      const tuple = (value: Record<string, unknown>): string => {
+        const head = asRecord(value.head);
+        const repository = asRecord(head?.repo);
+        return JSON.stringify([head?.ref, repository?.name, asRecord(repository?.owner)?.login, asRecord(value.base)?.ref]);
+      };
       if (
         reread.number !== raw.number ||
         reread.state !== raw.state ||
-        rereadHead?.sha !== headSha
+        rereadHead?.sha !== headSha || tuple(reread) !== tuple(raw)
       ) {
         throw new GitHubLiveStateError(
           'GH_SNAPSHOT_CHANGED',

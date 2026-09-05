@@ -6,7 +6,7 @@ import {
   type WorkspaceGuard,
 } from '../adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
-import type { GitHubAdapter } from '../adapters/github.js';
+import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition } from '../domain/state-machine.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
@@ -107,8 +107,9 @@ export async function runReviewLoop(
     throw new Error('runReviewLoop maxAttempts must be a positive integer.');
   }
 
-  let run = store.read(runId);
-  if (run === null) throw new Error(`No run with id "${runId}" found.`);
+  const loaded = store.read(runId);
+  if (loaded === null) throw new Error(`No run with id "${runId}" found.`);
+  let run: Run = loaded;
   if (run.state !== 'REVIEWING' && run.state !== 'CHANGES_REQUESTED') {
     throw new Error(`runReviewLoop requires the run in REVIEWING or CHANGES_REQUESTED; it is in ${run.state}.`);
   }
@@ -144,6 +145,30 @@ export async function runReviewLoop(
         return { outcome: 'failed', run, reason };
       }
 
+      // A persisted review does not authorize local repair against a different
+      // live PR. Re-read before preparation and again after local recovery.
+      const checkOwnedFix = async (): Promise<ReviewLoopResult | null> => {
+        if (run.bootstrap === undefined) return null;
+        try {
+          const live = await github.readLiveSnapshot(target);
+          const conflict = pullRequestIdentityConflict(run, live, { allowHeadAdvance: true });
+          const drift = live.headSha !== run.headSha;
+          if (conflict === null && !drift) return null;
+          const reason = conflict ?? 'Live GitHub HEAD changed before the review fix.';
+          run = applyTransition(run, {
+            type: 'escalate', reason,
+            interrupt: { evidence: reason, choices: conflict === null
+              ? [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]
+              : ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] },
+          }, now());
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        } catch (error) {
+          return parkBootstrap(run, error, store, now);
+        }
+      };
+      const preflight = await checkOwnedFix();
+      if (preflight !== null) return preflight;
       run = applyTransition(run, { type: 'start_fix' }, now());
       store.update(run);
 
@@ -163,6 +188,8 @@ export async function runReviewLoop(
         } catch (error) {
           return parkBootstrap(run, error, store, now);
         }
+        const recovered = await checkOwnedFix();
+        if (recovered !== null) return recovered;
       }
       let fixResult;
       try {
@@ -308,8 +335,10 @@ export async function runReviewLoop(
     }
 
     let liveHead: string | null;
+    let liveSnapshot: GitHubLiveSnapshot;
     try {
-      liveHead = (await github.readLiveSnapshot(target)).headSha;
+      liveSnapshot = await github.readLiveSnapshot(target);
+      liveHead = liveSnapshot.headSha;
     } catch (error) {
       const reason = renderFailure('GitHub live-state validation failed', error);
       const type = isRetryable(error) ? 'escalate' : 'fail';
@@ -332,6 +361,8 @@ export async function runReviewLoop(
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
     }
+    const identityConflict = pullRequestIdentityConflict(run, liveSnapshot, { allowHeadAdvance: true });
+    if (identityConflict !== null) return parkBootstrap(run, new Error(identityConflict), store, now);
     if (liveHead === null || liveHead !== run.headSha) {
       const reason =
         liveHead === null

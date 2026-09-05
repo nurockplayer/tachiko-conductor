@@ -258,19 +258,24 @@ function assertPayload(run: Run, input: TransitionInput): void {
       throw new InvalidTransitionError('bootstrap-identity-mismatch', from, input.type, 'A persisted bootstrap identity cannot be replaced.');
     }
   }
-  if (input.pullRequest !== undefined && input.type !== 'agent_succeeded' && input.type !== 'validation_passed') {
+  const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
+  if (input.pullRequest !== undefined && input.type !== 'agent_succeeded' && input.type !== 'validation_passed' && !authorizedHumanHeadSync) {
     throw new InvalidTransitionError('unexpected-payload', from, input.type, 'Pull request identity is only accepted with implementation success or validation.');
   }
   if (input.pullRequest !== undefined) {
-    const expectedHead = input.type === 'agent_succeeded'
+    const expectedHead = input.type === 'agent_succeeded' || authorizedHumanHeadSync
       ? (input.headSha ?? input.agentResult?.headSha)?.trim()
       : run.headSha;
     if (!Number.isSafeInteger(input.pullRequest.number) || input.pullRequest.number < 1 ||
-      input.pullRequest.headSha.trim() === '' || input.pullRequest.headSha !== expectedHead) {
+      input.pullRequest.headSha.trim() === '' || input.pullRequest.headSha !== expectedHead ||
+      (run.pullRequest !== undefined && input.pullRequest.number !== run.pullRequest.number)) {
       throw new InvalidTransitionError('invalid-pull-request-identity', from, input.type, 'Pull request identity must be positive and bound to the exact implementation HEAD.');
     }
   }
-  const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
+  if ((run.bootstrap !== undefined && input.type === 'agent_succeeded' ||
+      run.pullRequest !== undefined && authorizedHumanHeadSync) && input.pullRequest === undefined) {
+    throw new InvalidTransitionError('missing-payload', from, input.type, 'An owned HEAD acceptance requires the verified pull request identity in the same transition.');
+  }
   if (input.executor !== undefined && (input.type !== 'escalate' || from !== 'IMPLEMENTING')) {
     throw new InvalidTransitionError(
       'executor-mutation-not-allowed',
@@ -547,7 +552,10 @@ export function applyTransition(
   const leavingInterrupt = from === 'WAITING_DEPENDENCY' || from === 'NEEDS_HUMAN';
   // HEAD changes only on implementation events or an exact, explicitly
   // offered live-HEAD synchronization decision. The value is normalized.
-  const headSha = HEAD_UPDATING_TRANSITIONS.has(input.type) || authorizedHumanHeadSync
+  // A failed execution's observed head is evidence, not a new accepted ledger
+  // head. Keep the prior ownership intact for bootstrap-bound runs.
+  const preservesOwnedHead = run.bootstrap !== undefined && input.type === 'agent_failed';
+  const headSha = !preservesOwnedHead && (HEAD_UPDATING_TRANSITIONS.has(input.type) || authorizedHumanHeadSync)
     ? (input.headSha ?? input.agentResult?.headSha)?.trim()
     : undefined;
 

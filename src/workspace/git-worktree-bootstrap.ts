@@ -73,6 +73,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   private readonly remote: string;
   private readonly runner: ProcessRunner;
   private readonly timeoutMs: number;
+  private readonly preparedHeads = new Map<string, string>();
 
   constructor(options: GitWorktreeBootstrapOptions) {
     this.repositoryRoot = realpathSync(path.resolve(options.repositoryRoot));
@@ -90,7 +91,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   }
 
   async plan(request: BootstrapPlanRequest): Promise<ImplementationBootstrapIdentity> {
-    this.assertRequest(request);
+    await this.assertRequest(request);
     await this.assertRemote(request.target.owner, request.target.repo, this.repositoryRoot);
     await this.assertFetchedRef(request.baseBranch, request.baseSha);
     const identity = this.identityFor(request);
@@ -101,77 +102,85 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   }
 
   async prepare(request: BootstrapPrepareRequest): Promise<ImplementationBootstrapIdentity> {
-    this.assertRequest(request);
+    await this.assertRequest(request);
     const expected = this.identityFor(request);
     if (!sameIdentity(expected, request.existing)) fail('STALE_IDENTITY', 'Persisted bootstrap identity does not match this run.');
     await this.assertRemote(expected.owner, expected.repo, this.repositoryRoot);
 
-    if (existsSync(expected.workspacePath)) {
-      if (request.recoveryAuthority === undefined) {
-        // A crash can occur after the owned workspace commits/pushes but before
-        // workflow state records a PR HEAD. Keep no local mutable state hidden:
-        // accept only a clean linked workspace, then workflow re-reads GitHub
-        // and performs durable exact-head verification before adoption.
-        await this.assertWorkspace(expected, undefined, true);
-        return expected;
-      }
-      const recovered = request.recoveryAuthority.expectedHeadSha;
-      if (!SHA.test(recovered) || await this.remoteRef(expected.branch) !== recovered) {
-        fail('STALE_IDENTITY', 'Live recovery authority does not match the remote implementation branch.');
-      }
-      await this.assertWorkspace(expected, undefined, true);
-      await this.fetchExactBranch(expected.branch, recovered);
-      const local = (await this.git(['rev-parse', 'HEAD'], expected.workspacePath)).stdout.trim();
-      if (local !== recovered) {
-        if (!await this.isAncestor(local, recovered)) fail('STALE_IDENTITY', 'Existing workspace diverged from the authorized remote head.');
-        await this.git(['merge', '--ff-only', recovered], expected.workspacePath);
-      }
-      await this.assertWorkspace(expected, recovered, true);
-      return expected;
-    }
-
+    const present = existsSync(expected.workspacePath);
     const local = await this.localRef(expected.branch);
     const remote = await this.remoteRef(expected.branch);
-    if (request.recoveryAuthority === undefined) {
-      if (local !== null || remote !== null) fail('STALE_IDENTITY', 'Bootstrap was interrupted after branch creation; live recovery authority is required.');
-      await this.addWorktree(expected, expected.baseSha, true);
-      await this.assertWorkspace(expected, expected.baseSha, true);
-      return expected;
+    if (present) {
+      await this.assertWorkspace(expected, local ?? undefined, true);
+      if (local === null) fail('STALE_IDENTITY', 'Owned workspace has no local branch.');
+    } else if (this.canonicalFuturePath(expected.workspacePath) !== expected.workspacePath) {
+      fail('COLLISION', 'The canonical workspace path has changed.');
     }
 
-    const recovered = request.recoveryAuthority.expectedHeadSha;
-    if (!SHA.test(recovered) || remote !== recovered) fail('STALE_IDENTITY', 'Live recovery authority does not match the remote implementation branch.');
-    await this.fetchExactBranch(expected.branch, recovered);
-    if (local === null) {
-      await this.addWorktree(expected, recovered, false);
-    } else if (local !== recovered) {
-      if (!await this.isAncestor(local, recovered)) fail('STALE_IDENTITY', 'Local implementation branch diverged from the authorized remote head.');
-      await this.git(['update-ref', `refs/heads/${expected.branch}`, recovered, local], this.repositoryRoot);
-      await this.addWorktree(expected, recovered, false);
-    } else {
-      await this.addWorktree(expected, recovered, false);
+    const authority = request.recoveryAuthority?.expectedHeadSha;
+    if (authority !== undefined && (!SHA.test(authority) || remote !== authority)) {
+      fail('STALE_IDENTITY', 'Live recovery authority does not match the remote implementation branch.');
     }
-    await this.assertWorkspace(expected, recovered, true);
+    if (authority === undefined && local !== null && remote !== null && local !== remote) {
+      fail('STALE_IDENTITY', 'Pre-PR local and remote checkpoints disagree.');
+    }
+    const candidate = authority ?? remote ?? local ?? expected.baseSha;
+    if (remote !== null) await this.fetchExactBranch(expected.branch, remote);
+    if (!await this.isAncestor(expected.baseSha, candidate)) {
+      fail('STALE_IDENTITY', 'Recovery candidate does not descend from the immutable bootstrap base.');
+    }
+    if (local !== null && local !== candidate && !await this.isAncestor(local, candidate)) {
+      fail('STALE_IDENTITY', 'Local implementation branch is ahead of or diverged from the authorized head.');
+    }
+    // Registration is an admission proof, never a check after CAS has already
+    // moved a ref. Only our exact unlocked missing registration admits --force.
+    const force = await this.assertRegistration(expected, local ?? candidate, !present);
+    if (!present && local === null && remote === null && force) {
+      fail('COLLISION', 'A stale registration without a surviving checkpoint cannot bootstrap a new branch.');
+    }
+    await this.assertRemote(expected.owner, expected.repo, this.repositoryRoot);
+    if (await this.remoteRef(expected.branch) !== remote || await this.localRef(expected.branch) !== local) {
+      fail('STALE_IDENTITY', 'Git refs changed during recovery admission.');
+    }
+
+    if (present) {
+      if (local !== candidate) await this.git(['merge', '--ff-only', candidate], expected.workspacePath);
+    } else {
+      if (local !== candidate) {
+        // Zero expected-old creates only an absent branch; neither this CAS nor
+        // worktree add relies on remote-tracking guesses.
+        await this.git(['update-ref', `refs/heads/${expected.branch}`, candidate, local ?? '0'.repeat(40)], this.repositoryRoot);
+      }
+      await this.addWorktree(expected, force);
+    }
+    await this.assertWorkspace(expected, candidate, true);
+    if (await this.localRef(expected.branch) !== candidate || await this.remoteRef(expected.branch) !== remote) {
+      fail('STALE_IDENTITY', 'Git refs changed after workspace recovery; refusing execution.');
+    }
+    this.preparedHeads.set(expected.workspacePath, candidate);
     return expected;
   }
 
   guard(identity: ImplementationBootstrapIdentity): WorkspaceGuard {
-    return { assertValid: async () => { await this.assertWorkspace(identity); } };
+    const startingHead = this.preparedHeads.get(identity.workspacePath);
+    return { assertValid: async (phase = 'before-execution') => {
+      if (phase === 'before-execution' && startingHead === undefined) fail('STALE_IDENTITY', 'No successful preparation proves the execution starting HEAD.');
+      await this.assertWorkspace(identity, phase === 'before-execution' ? startingHead : undefined, true);
+    } };
   }
 
   async verifyDurable(request: VerifyDurableRequest): Promise<DurableImplementationSnapshot> {
     if (!SHA.test(request.expectedHeadSha)) fail('INVALID_REQUEST', 'Durable verification requires an exact HEAD SHA.');
-    await request.workspaceGuard?.assertValid();
+    await request.workspaceGuard?.assertValid('after-execution');
     await this.assertWorkspace(request.identity, request.expectedHeadSha, true);
     const remote = await this.remoteRef(request.identity.branch, request.identity.workspacePath);
     if (remote !== request.expectedHeadSha) fail('UNPUSHED_HEAD', 'Implementation HEAD is not exactly published to its expected remote branch.');
     const progressBase = request.progressBaseSha ?? request.identity.baseSha;
     if (!SHA.test(progressBase)) fail('INVALID_REQUEST', 'Durable verification requires an exact progress base SHA.');
-    if (progressBase !== request.identity.baseSha) {
-      if (!await this.isAncestor(progressBase, request.expectedHeadSha)) fail('HEAD_MISMATCH', 'Implementation head does not descend from the reviewed progress head.');
-      const changed = await this.git(['diff', '--quiet', progressBase, request.expectedHeadSha, '--'], request.identity.workspacePath, [0, 1]);
-      if (changed.exitCode === 0) fail('HEAD_MISMATCH', 'Review-fix execution made no tree progress from the reviewed head.');
-    }
+    if (!await this.isAncestor(request.identity.baseSha, request.expectedHeadSha)) fail('HEAD_MISMATCH', 'Implementation head does not descend from the immutable bootstrap base.');
+    if (!await this.isAncestor(progressBase, request.expectedHeadSha)) fail('HEAD_MISMATCH', 'Implementation head does not descend from the progress head.');
+    const changed = await this.git(['diff', '--quiet', progressBase, request.expectedHeadSha, '--'], request.identity.workspacePath, [0, 1]);
+    if (changed.exitCode === 0) fail('HEAD_MISMATCH', 'Implementation execution made no tree progress from the required progress base.');
     return { headSha: request.expectedHeadSha, branch: request.identity.branch };
   }
 
@@ -188,9 +197,16 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     };
   }
 
-  private assertRequest(request: BootstrapPlanRequest): void {
-    if (!SHA.test(request.baseSha) || !COMPONENT.test(request.runId) || !COMPONENT.test(request.target.owner) || !COMPONENT.test(request.target.repo) || !COMPONENT.test(request.baseBranch) || !Number.isSafeInteger(request.target.issueNumber) || request.target.issueNumber < 1) {
+  private async assertRequest(request: BootstrapPlanRequest): Promise<void> {
+    if (!SHA.test(request.baseSha) || !COMPONENT.test(request.runId) || !COMPONENT.test(request.target.owner) || !COMPONENT.test(request.target.repo) || !Number.isSafeInteger(request.target.issueNumber) || request.target.issueNumber < 1 ||
+      request.baseBranch.includes('@{')) {
       fail('INVALID_REQUEST', 'Bootstrap request has an invalid target, branch, base SHA, or run id.');
+    }
+    // --branch expands previous-checkout syntax; rejecting @{ above makes this
+    // a literal validation. Never normalize or silently substitute another ref.
+    const ref = await this.git(['check-ref-format', '--branch', request.baseBranch], this.repositoryRoot, [0, 1, 128]);
+    if (ref.exitCode !== 0 || ref.stdout.replace(/\r?\n$/, '') !== request.baseBranch) {
+      fail('INVALID_REQUEST', 'Bootstrap requires a literal valid Git branch name.');
     }
   }
 
@@ -225,42 +241,40 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
       fail('STALE_IDENTITY', 'Workspace is not the expected linked source worktree, branch, and HEAD.');
     }
     await this.assertRemote(identity.owner, identity.repo, identity.workspacePath);
+    await this.assertRegistration(identity, head, false);
     if (clean) {
       const status = (await this.git(['status', '--porcelain=v1', '--untracked-files=all'], identity.workspacePath)).stdout;
       if (status.trim() !== '') fail('DIRTY_WORKSPACE', 'Workspace has tracked or untracked local changes.');
     }
   }
 
-  private async addWorktree(identity: ImplementationBootstrapIdentity, ref: string, createBranch: boolean): Promise<void> {
+  private async addWorktree(identity: ImplementationBootstrapIdentity, force: boolean): Promise<void> {
     mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
-    if (existsSync(identity.workspacePath)) fail('COLLISION', 'Workspace path appeared before linked worktree creation.');
-    const force = createBranch ? false : await this.canForceExactStaleRegistration(identity, ref);
-    const args = createBranch
-      ? ['worktree', 'add', '-b', identity.branch, identity.workspacePath, ref]
-      : ['worktree', 'add', ...(force ? ['--force'] : []), identity.workspacePath, identity.branch];
-    await this.git(args, this.repositoryRoot);
+    if (existsSync(identity.workspacePath) || this.canonicalFuturePath(identity.workspacePath) !== identity.workspacePath) {
+      fail('COLLISION', 'Workspace path appeared or changed before linked worktree creation.');
+    }
+    await this.git(['worktree', 'add', ...(force ? ['--force'] : []), identity.workspacePath, identity.branch], this.repositoryRoot);
   }
 
-  /** A narrowly scoped --force is allowed only to repair our exact unlocked stale registration. */
-  private async canForceExactStaleRegistration(identity: ImplementationBootstrapIdentity, expectedHead: string): Promise<boolean> {
+  private async assertRegistration(identity: ImplementationBootstrapIdentity, localHead: string, missing: boolean): Promise<boolean> {
     const raw = (await this.git(['worktree', 'list', '--porcelain'], this.repositoryRoot)).stdout;
-    const blocks = raw.trim().split(/\n\n+/).filter((block) => block !== '');
     const expectedPath = path.resolve(identity.workspacePath);
     const expectedBranch = `refs/heads/${identity.branch}`;
-    const matching = blocks.filter((block) => {
+    const records = raw.trim().split(/\n\n+/).filter(Boolean).map((block) => {
       const lines = block.split(/\r?\n/);
-      const registeredPath = lines.find((line) => line.startsWith('worktree '))?.slice('worktree '.length);
-      const branch = lines.find((line) => line.startsWith('branch '))?.slice('branch '.length);
-      const head = lines.find((line) => line.startsWith('HEAD '))?.slice('HEAD '.length);
-      return registeredPath !== undefined && path.resolve(registeredPath) === expectedPath && branch === expectedBranch && head === expectedHead && !lines.some((line) => line === 'locked' || line.startsWith('locked '));
+      return {
+        path: lines.find((line) => line.startsWith('worktree '))?.slice(9),
+        branch: lines.find((line) => line.startsWith('branch '))?.slice(7),
+        head: lines.find((line) => line.startsWith('HEAD '))?.slice(5),
+        locked: lines.some((line) => line === 'locked' || line.startsWith('locked ')),
+      };
     });
-    const branchElsewhere = blocks.some((block) => {
-      const lines = block.split(/\r?\n/);
-      return lines.find((line) => line.startsWith('branch '))?.slice('branch '.length) === expectedBranch &&
-        lines.find((line) => line.startsWith('worktree '))?.slice('worktree '.length) !== expectedPath;
-    });
-    if (branchElsewhere || matching.length > 1) fail('COLLISION', 'Git worktree registration is not uniquely owned by this bootstrap identity.');
-    return matching.length === 1;
+    const related = records.filter((record) => record.path === expectedPath || record.branch === expectedBranch);
+    if (related.length > 1 || related.some((record) => record.path !== expectedPath || record.branch !== expectedBranch ||
+      record.head !== localHead || (missing && record.locked)) || (!missing && related.length !== 1)) {
+      fail('COLLISION', 'Git worktree registration is not uniquely and safely owned by this bootstrap identity.');
+    }
+    return missing && related.length === 1;
   }
 
   private async commonDir(cwd: string): Promise<string> {
