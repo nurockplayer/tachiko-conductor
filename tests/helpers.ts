@@ -35,7 +35,10 @@ export function validationPassed(headSha = 'sha-1'): ValidationResult {
   return {
     headSha,
     status: 'passed',
-    local: { status: 'passed', configRevision: 'test-config-v1', commands: [] },
+    local: {
+      status: 'passed', configRevision: 'test-config-v1',
+      commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1 }],
+    },
     hosted: {
       status: 'passed', observedAt: T0, pullRequestNumber: 7,
       availability: 'available', overall: 'passing',

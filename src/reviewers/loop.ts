@@ -139,8 +139,9 @@ export async function runReviewLoop(
         return { outcome: 'needs_human', run, reason };
       }
       const pendingReview = run.reviewResult;
-      if (pendingReview === undefined || pendingReview.verdict !== 'request_changes') {
-        const reason = 'Persisted CHANGES_REQUESTED run has no actionable review result.';
+      const validationFailure = run.validationResult?.status === 'failed';
+      if ((pendingReview === undefined || pendingReview.verdict !== 'request_changes') && !validationFailure) {
+        const reason = 'Persisted CHANGES_REQUESTED run has no actionable review or validation failure.';
         run = applyTransition(run, { type: 'fail', reason }, now());
         store.update(run);
         return { outcome: 'failed', run, reason };
@@ -173,7 +174,9 @@ export async function runReviewLoop(
       run = applyTransition(run, { type: 'start_fix' }, now());
       store.update(run);
 
-      const blockingFindings = renderBlockingFindings(pendingReview);
+      const blockingFindings = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
+        ? 'Exact-HEAD validation failed. Repair the implementation and its required validation before returning a new exact HEAD.'
+        : renderBlockingFindings(pendingReview!);
       const progressBaseSha = run.headSha;
       let workspaceGuard: WorkspaceGuard | undefined;
       if (run.bootstrap !== undefined) {

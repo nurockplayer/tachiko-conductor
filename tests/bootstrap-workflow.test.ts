@@ -11,6 +11,7 @@ import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter } from '../src/adapters/reviewer.js';
 import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
+import { ConfiguredLocalValidationAdapter } from '../src/validation/local-command.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { LIVE_HEAD_SYNC_DECISION } from '../src/domain/decisions.js';
@@ -105,6 +106,7 @@ class ApprovingReviewer implements ReviewerAdapter {
 
 class PassingValidation implements ValidationAdapter {
   readonly kind = 'validation' as const;
+  readonly configRevision = 'test-config-v1';
   readonly requests: ValidationRequest[] = [];
   async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
     this.requests.push(request);
@@ -436,17 +438,19 @@ describe('bootstrap lifecycle acceptance coverage', () => {
         : { verdict: 'approve', reviewerName: 'fixture-reviewer', headSha: request.headSha, findings: [] };
     } };
     const github = new QueueGithub(Array.from({ length: 12 }, () => live));
-    const validation = new PassingValidation();
+    const validation = new ConfiguredLocalValidationAdapter({
+      revision: 'fixture-owned-worktree-v1',
+      commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
+    });
     const beforeRecovery = fixture.commands.length;
     const offered = await runWorkflow({ store, github, implementation, bootstrap, reviewer, validation }, runId, { now: () => T0, maxReviewAttempts: 2 });
     assert.equal(offered.outcome, 'needs_human');
     assert.ok(offered.run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION));
     assert.equal(reviews, 0);
     const outcome = await resumeCommand({ store: new JsonFileStore({ dir }), github, implementation, bootstrap, reviewer, validation }, runId, LIVE_HEAD_SYNC_DECISION, { now: () => T0, maxReviewAttempts: 2 });
-    assert.deepEqual(reviewedHeads, [newHead, fixHead]);
-    assert.deepEqual(validation.requests.map((request) => request.headSha), [newHead, fixHead]);
-    assert.deepEqual(fixture.commands.slice(beforeRecovery).filter((c) => c.args[0] === 'merge').map((c) => c.args), [['merge', '--ff-only', newHead]]);
     assert.equal(outcome.outcome, 'merge_ready', JSON.stringify(outcome));
+    assert.deepEqual(reviewedHeads, [newHead, fixHead]);
+    assert.deepEqual(fixture.commands.slice(beforeRecovery).filter((c) => c.args[0] === 'merge').map((c) => c.args), [['merge', '--ff-only', newHead]]);
     const persisted = new JsonFileStore({ dir }).read(runId)!;
     assert.equal(persisted.state, 'MERGE_READY');
     assert.equal(persisted.headSha, fixHead);
@@ -454,6 +458,8 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     assert.equal(persisted.history.filter((entry) => entry.type === 'review_approved').length, 2);
     assert.equal(persisted.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
     assert.equal(persisted.executor?.provider, 'fixture');
+    assert.equal(persisted.validationResult?.local.configRevision, 'fixture-owned-worktree-v1');
+    assert.equal(persisted.validationResult?.local.commands[0]?.outcome, 'passed');
   });
 
   for (const checkpoint of ['identity', 'branch', 'published-checkpoint'] as const) {

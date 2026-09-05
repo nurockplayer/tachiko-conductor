@@ -205,6 +205,16 @@ describe('state machine — invalid transitions fail loudly', () => {
       (err: unknown) => err instanceof InvalidTransitionError && err.code === 'missing-payload',
     );
   });
+
+  it('rejects contradictory persisted-style validation provenance before it can reach review', () => {
+    const validating = runIn('VALIDATING', { headSha: 'sha-2' });
+    const contradictory = validationPassed('sha-2');
+    const result = { ...contradictory, local: { ...contradictory.local, commands: [] } };
+    assert.throws(
+      () => applyTransition(validating, { type: 'validation_passed', validationResult: result }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'invalid-validation-result',
+    );
+  });
 });
 
 describe('state machine — final gate review freshness', () => {

@@ -130,11 +130,12 @@ async function validateExactHead(
 ): Promise<ValidationResult> {
   if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
   const reusable = run.validationResult;
-  const local = reusable?.headSha === run.headSha && reusable.local.status === 'passed'
+  const local = reusable?.headSha === run.headSha && reusable.local.status === 'passed' &&
+    validation?.configRevision !== undefined && reusable.local.configRevision === validation.configRevision
     ? reusable.local
     : validation === undefined
       ? unavailableLocalValidation()
-      : await validation.validate({ target, headSha: run.headSha });
+      : await validation.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
   return combineValidation(run.headSha, local, hostedValidation(snapshot));
 }
 
@@ -388,6 +389,24 @@ export async function runWorkflow(
           );
           store.update(run);
           return { outcome: 'needs_human', run, reason };
+        }
+        // Validation must execute against the owned checkout for this exact
+        // live HEAD. An accepted H synchronization can advance GitHub before
+        // the local worktree is fast-forwarded, so prepare and prove it again
+        // immediately before the local process boundary.
+        if (run.bootstrap !== undefined && deps.validation?.requiresOwnedWorkspace === true) {
+          if (deps.bootstrap === undefined || run.headSha === undefined) {
+            return bootstrapFailureOutcome(run, new Error('Exact-HEAD validation requires the owned workspace bootstrap.'), store, now);
+          }
+          try {
+            const identity = await deps.bootstrap.prepare({
+              runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
+              existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },
+            });
+            await deps.bootstrap.verifyDurable({ identity, expectedHeadSha: run.headSha });
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now);
+          }
         }
         let validationResult: ValidationResult;
         try {

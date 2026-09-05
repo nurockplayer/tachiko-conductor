@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import path from 'node:path';
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
+import { isValidationResultCoherent } from '../domain/validation.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -128,36 +129,6 @@ function isReviewResult(value: unknown): boolean {
   );
 }
 
-function isLocalValidationEvidence(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null) return false;
-  const evidence = value as Record<string, unknown>;
-  return (evidence.status === 'passed' || evidence.status === 'failed' || evidence.status === 'unknown') &&
-    (evidence.configRevision === null || typeof evidence.configRevision === 'string') &&
-    Array.isArray(evidence.commands) && evidence.commands.every((command) => {
-      if (typeof command !== 'object' || command === null) return false;
-      const entry = command as Record<string, unknown>;
-      return typeof entry.commandIndex === 'number' && Number.isSafeInteger(entry.commandIndex) && entry.commandIndex >= 0 &&
-        typeof entry.executable === 'string' &&
-        ['passed', 'failed', 'timed_out', 'unavailable', 'malformed'].includes(entry.outcome as string) &&
-        (entry.exitCode === null || typeof entry.exitCode === 'number') &&
-        typeof entry.durationMs === 'number' && Number.isSafeInteger(entry.durationMs) && entry.durationMs >= 0;
-    });
-}
-
-function isValidationResult(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null) return false;
-  const result = value as Record<string, unknown>;
-  if (typeof result.headSha !== 'string' || result.headSha.trim() === '' ||
-      !['passed', 'failed', 'waiting', 'unknown'].includes(result.status as string) ||
-      !isLocalValidationEvidence(result.local) || typeof result.hosted !== 'object' || result.hosted === null) return false;
-  const hosted = result.hosted as Record<string, unknown>;
-  return ['passed', 'failed', 'waiting', 'unknown'].includes(hosted.status as string) &&
-    typeof hosted.observedAt === 'string' && hosted.observedAt.trim() !== '' &&
-    (hosted.pullRequestNumber === null || typeof hosted.pullRequestNumber === 'number' && Number.isSafeInteger(hosted.pullRequestNumber) && hosted.pullRequestNumber > 0) &&
-    (hosted.availability === 'available' || hosted.availability === 'unavailable') &&
-    ['pending', 'passing', 'failing', 'unknown', 'unavailable'].includes(hosted.overall as string);
-}
-
 function isInterrupt(value: unknown): boolean {
   if (typeof value !== 'object' || value === null) return false;
   const interrupt = value as Record<string, unknown>;
@@ -231,7 +202,7 @@ function isRun(value: unknown): value is Run {
     (v.pullRequest === undefined || isPullRequestIdentity(v.pullRequest)) &&
     (v.pullRequest === undefined || v.headSha === undefined || (v.pullRequest as { headSha: unknown }).headSha === v.headSha) &&
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
-    (v.validationResult === undefined || isValidationResult(v.validationResult)) &&
+    (v.validationResult === undefined || isValidationResultCoherent(v.validationResult)) &&
     (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );

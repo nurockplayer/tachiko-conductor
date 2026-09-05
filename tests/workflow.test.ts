@@ -13,7 +13,7 @@ import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '..
 import type { RunStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
-import { TARGET, failureResult, successResult, validationPassed } from './helpers.js';
+import { TARGET, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -117,9 +117,12 @@ class FakeImplementation implements ImplementationAgent {
 
 class FakeValidation implements ValidationAdapter {
   readonly kind = 'validation' as const;
+  readonly configRevision: string;
   readonly requests: ValidationRequest[] = [];
 
-  constructor(private readonly outcomes: LocalValidationEvidence[] = []) {}
+  constructor(private readonly outcomes: LocalValidationEvidence[] = [], revision = 'test-config-v1') {
+    this.configRevision = revision;
+  }
 
   async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
     this.requests.push(request);
@@ -215,13 +218,15 @@ describe('runWorkflow', () => {
     assert.equal(validation.requests.length, 1);
 
     store.update(applyTransition(waiting.run, { type: 'dependency_satisfied', reason: 'Retry readiness checks' }, T0));
+    const revisedValidation = new FakeValidation([], 'test-config-v2');
     const resumed = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(HEAD)]), validation },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(HEAD)]), validation: revisedValidation },
       run.id, { maxReviewAttempts: 1, now: () => T0 },
     );
     assert.equal(resumed.outcome, 'merge_ready');
     assert.equal(resumed.run.validationResult?.status, 'passed');
     assert.equal(validation.requests.length, 1);
+    assert.equal(revisedValidation.requests.length, 1);
   });
 
   it('does not treat unavailable hosted checks as a passing validation source', async () => {
@@ -244,6 +249,27 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.validationResult?.status, 'unknown');
     assert.equal(result.run.validationResult?.hosted.status, 'unknown');
+  });
+
+  it('routes a failed validation through a bounded implementation repair instead of terminal failure', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-failure-repair');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([successResult(HEAD2, 'repair failed validation')]);
+    const result = await runWorkflow(
+      {
+        store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation,
+        reviewer: new FakeReviewer([approve(HEAD2)]),
+        validation: new FakeValidation([validationFailed(HEAD).local]),
+      },
+      run.id, { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests.length, 1);
+    assert.equal(result.run.headSha, HEAD2);
   });
 
   it('drives READY → implementation → review changes → fix → PASS → MERGE_READY', async () => {

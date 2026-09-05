@@ -130,9 +130,12 @@ export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","comman
 ```
 
 Without explicit configuration, local validation is unknown and the run cannot
-advance to review. Commands use a direct process boundary (no shell), with
-compact pass, non-zero-exit, timeout, unavailable-executable, and malformed
-configuration outcomes.
+advance to review. The configured runner refuses an ambient directory: it
+re-proves the clean bootstrap-owned worktree's exact HEAD before and after the
+commands. Commands use a direct process boundary (no shell), with compact
+pass, non-zero-exit, timeout, unavailable-executable, and malformed
+configuration outcomes; timeouts terminate the owned command group and settle
+within a bounded grace period.
 
 ## Implementation workspace safety
 

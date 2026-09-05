@@ -1,5 +1,6 @@
 import { LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './decisions.js';
 import type { ReviewResult, Run, TransitionInput, TransitionType, ValidationResult, WorkflowState } from './types.js';
+import { isValidationResultCoherent } from './validation.js';
 
 /** Why a transition was rejected. */
 export type InvalidTransitionCode =
@@ -223,21 +224,7 @@ function assertValidationResult(run: Run, result: ValidationResult, from: Workfl
       `Validation evidence must name the run's exact current HEAD "${run.headSha ?? '(none)'}", got "${result.headSha}".`,
     );
   }
-  if (result.local.configRevision !== null && result.local.configRevision.trim() === '') {
-    throw new InvalidTransitionError('invalid-validation-result', from, type, 'Local validation provenance is malformed.');
-  }
-  if (result.hosted.observedAt.trim() === '' ||
-      (result.hosted.pullRequestNumber !== null && (!Number.isSafeInteger(result.hosted.pullRequestNumber) || result.hosted.pullRequestNumber < 1))) {
-    throw new InvalidTransitionError('invalid-validation-result', from, type, 'Hosted validation provenance is malformed.');
-  }
-  const expectedStatus = result.local.status === 'failed' || result.hosted.status === 'failed'
-    ? 'failed'
-    : result.local.status === 'unknown' || result.hosted.status === 'unknown'
-        ? 'unknown'
-        : result.hosted.status === 'waiting'
-          ? 'waiting'
-          : 'passed';
-  if (result.status !== expectedStatus) {
+  if (!isValidationResultCoherent(result as unknown)) {
     throw new InvalidTransitionError('invalid-validation-result', from, type, `Validation outcome "${result.status}" conflicts with its source evidence.`);
   }
 }

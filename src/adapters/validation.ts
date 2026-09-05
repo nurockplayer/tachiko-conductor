@@ -19,10 +19,16 @@ export interface ValidationRequest {
   readonly target: IssueTarget;
   /** Exact implementation HEAD that the caller observed before validation. */
   readonly headSha: string;
+  /** Owned worktree verified by the implementation bootstrap, when available. */
+  readonly workspacePath?: string;
 }
 
 /** Provider-neutral boundary for Conductor-observed local validation. */
 export interface ValidationAdapter {
   readonly kind: 'validation';
+  /** Stable identity for the command plan whose successful evidence may be reused. */
+  readonly configRevision?: string;
+  /** This boundary refuses ambient working directories and needs the owned bootstrap workspace. */
+  readonly requiresOwnedWorkspace?: boolean;
   validate(request: ValidationRequest): Promise<LocalValidationEvidence>;
 }
