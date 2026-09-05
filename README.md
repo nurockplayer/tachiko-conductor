@@ -113,6 +113,29 @@ When choices are present, the decision must match one exactly. `Cancel the
 run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
 independent review before the final gate.
 
+## Implementation workspace safety
+
+For an issue that has no associated open pull request, Conductor first creates
+one deterministic, persisted bootstrap identity before it lets an implementation
+provider run. The identity binds the issue target, GitHub's live default
+branch/base SHA, a Conductor-owned branch, and an isolated linked Git worktree.
+By default worktrees are below `~/.tachiko-conductor/workspaces`; set
+`TACHIKO_WORKSPACE_ROOT` to choose another root outside the source repository.
+
+The bootstrap boundary is deliberately fail-closed. It requires the configured
+remote fetch URL and every effective push URL to resolve exactly to the target
+`github.com/<owner>/<repo>`, confirms the fetched base SHA, and rejects dirty,
+ambiguous, divergent, or non-linked worktrees. On a restart it may only
+fast-forward a clean local replica to the already persisted/live PR HEAD; it
+never resets, force-pushes, or silently adopts a new remote head.
+
+Immediately before both Claude Code and Codex CLI spawn, the prepared workspace
+is revalidated for source common Git directory, current branch, and effective
+remote destinations. A failure is a resumable `NEEDS_HUMAN` bootstrap interrupt,
+not a terminal provider failure. Provider success is accepted only after the
+workspace has a clean, pushed exact HEAD and live GitHub proves the matching PR
+identity. The same guard and durable-progress check apply to review fixes.
+
 `github snapshot` prints one normalized live-state JSON envelope from the
 locally authenticated `gh` CLI: `{"ok":true,"snapshot":...}` on success, or
 `{"ok":false,"error":{code,message,retryable,details}}` on stderr with a

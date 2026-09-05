@@ -13,6 +13,7 @@ import {
 } from './agents/codex-cli.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
+import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
 import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
@@ -44,6 +45,8 @@ import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
+import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
+import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
   type WorkflowDependencies,
@@ -479,6 +482,7 @@ export async function resumeCommand(
   }
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
   let synchronizedHead: string | undefined;
+  let synchronizedPullRequest: Run['pullRequest'];
   const synchronizeLiveHead =
     decision.trim() === LIVE_HEAD_SYNC_DECISION &&
     run.state === 'NEEDS_HUMAN' &&
@@ -490,7 +494,12 @@ export async function resumeCommand(
     if (snapshot.headSha === null) {
       throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request HEAD.`);
     }
+    const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+    if (conflict !== null) throw new Error(`Cannot synchronize run "${id}": ${conflict}`);
     synchronizedHead = snapshot.headSha;
+    if (run.bootstrap !== undefined && snapshot.pullRequest !== null) {
+      synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
+    }
   }
   const resumed = applyTransition(
     run,
@@ -498,6 +507,7 @@ export async function resumeCommand(
       type: transition,
       reason: decision,
       ...(synchronizedHead === undefined ? {} : { headSha: synchronizedHead }),
+      ...(synchronizedPullRequest === undefined ? {} : { pullRequest: synchronizedPullRequest }),
     },
     now(),
   );
@@ -545,6 +555,32 @@ function buildWorkflowDeps(
 ): WorkflowDependencies {
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
+  let bootstrap: ImplementationBootstrapAdapter | undefined;
+  const lazyBootstrap: ImplementationBootstrapAdapter = {
+    kind: 'implementation-bootstrap',
+    plan: async (request) => {
+      bootstrap ??= new GitWorktreeBootstrap({
+        repositoryRoot: resolveRepositoryRoot(),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+      });
+      return bootstrap.plan(request);
+    },
+    prepare: async (request) => {
+      bootstrap ??= new GitWorktreeBootstrap({
+        repositoryRoot: resolveRepositoryRoot(),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+      });
+      return bootstrap.prepare(request);
+    },
+    guard: (identity) => {
+      if (bootstrap === undefined) throw new Error('Bootstrap workspace was not prepared.');
+      return bootstrap.guard(identity);
+    },
+    verifyDurable: async (request) => {
+      if (bootstrap === undefined) throw new Error('Bootstrap workspace was not prepared.');
+      return bootstrap.verifyDurable(request);
+    },
+  };
   return {
     store,
     github,
@@ -564,6 +600,7 @@ function buildWorkflowDeps(
       diffReader: new GhPullRequestDiffReader(transport),
       client: new DeepSeekApiClient(),
     }),
+    bootstrap: lazyBootstrap,
     resolveImplementationCapabilities,
   };
 }
@@ -602,6 +639,9 @@ export function runShowCommand(store: RunStore, id: string): Run {
 }
 
 export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string): Run {
+  if (type === 'bootstrap_prepared') {
+    throw new Error('Transition "bootstrap_prepared" requires durable bootstrap identity that this CLI cannot supply. Drive it through the workflow.');
+  }
   const requirement = transitionRequiresResult(type);
   if (requirement !== 'none') {
     throw new Error(

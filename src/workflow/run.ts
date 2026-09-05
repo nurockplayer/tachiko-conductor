@@ -1,8 +1,11 @@
 import {
   humanTakeoverReason,
+  isWorkspaceGuardFailure,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
+  type WorkspaceGuard,
 } from '../adapters/agent.js';
+import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
@@ -10,6 +13,8 @@ import type { Run, Target } from '../domain/types.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
+import { parkBootstrapFailure } from './bootstrap-failure.js';
+import { pullRequestIdentityConflict } from './pull-request-identity.js';
 
 export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
@@ -18,6 +23,7 @@ export interface WorkflowDependencies {
   readonly store: RunStore;
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
+  readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly reviewer: ReviewerAdapter;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
@@ -67,6 +73,18 @@ function githubFailureOutcome(run: Run, error: unknown, store: RunStore, now: ()
   return { outcome: 'needs_human', run: parked, reason };
 }
 
+function bootstrapFailureOutcome(run: Run, error: unknown, store: RunStore, now: () => string): WorkflowOutcome {
+  const executor = isWorkspaceGuardFailure(error) ? error.executor : undefined;
+  const parked = parkBootstrapFailure(run, error, store, now, executor);
+  return { outcome: 'needs_human', ...parked };
+}
+
+function park(run: Run, reason: string, store: RunStore, now: () => string, choices = ['Resolve the identity conflict and retry', CANCEL_RUN_DECISION]): WorkflowOutcome {
+  const next = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices } }, now());
+  store.update(next);
+  return { outcome: 'needs_human', run: next, reason };
+}
+
 /**
  * Wire the core state machine, GitHub live state, the implementation agent,
  * and the independent reviewer into one state-resume-aware workflow. Given a
@@ -104,8 +122,32 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        if (snapshot.issue.state !== 'open') {
+          return park(run, `Issue ${formatTarget(target)} is closed; refusing implementation.`, store, now, [CANCEL_RUN_DECISION]);
+        }
         const pendingReviewFix =
           run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
+        let bootstrap = run.bootstrap;
+        let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
+        let initialRecoveryCandidate: { number: number; headSha: string } | undefined;
+        let workspaceGuard: WorkspaceGuard | undefined;
+
+        if (bootstrap !== undefined && (snapshot.pullRequest !== null || run.headSha !== undefined || run.pullRequest !== undefined)) {
+          const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (conflict !== null) return park(run, conflict, store, now);
+          if (run.headSha === undefined && run.pullRequest !== undefined) {
+            return park(run, 'Initial-result recovery requires both the persisted HEAD and PR record to be absent.', store, now);
+          }
+          if (run.headSha !== undefined && snapshot.headSha !== run.headSha) {
+            return park(run, `Live GitHub HEAD ${snapshot.headSha ?? '(none)'} does not match persisted run HEAD ${run.headSha ?? '(none)'}.`, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
+          }
+          // With no H/PR this is only preparation of the narrow initial result;
+          // durable verification below must succeed before anything is adopted.
+          recoveryAuthority = { expectedHeadSha: run.headSha ?? snapshot.headSha! };
+          if (run.headSha === undefined) {
+            initialRecoveryCandidate = { number: snapshot.pullRequest!.number, headSha: snapshot.headSha! };
+          }
+        }
         if (pendingReviewFix && snapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
@@ -122,6 +164,57 @@ export async function runWorkflow(
           );
           store.update(run);
           return { outcome: 'needs_human', run, reason };
+        }
+
+        if (!pendingReviewFix && snapshot.pullRequest === null && bootstrap === undefined) {
+          if (deps.bootstrap === undefined || snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null) {
+            return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
+          }
+          try {
+            bootstrap = await deps.bootstrap.plan({ runId: run.id, target, baseBranch: snapshot.repository.defaultBranch, baseSha: snapshot.repository.defaultBranchHeadSha });
+            run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
+            store.update(run);
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now);
+          }
+        }
+        if (bootstrap !== undefined) {
+          if (deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
+          try {
+            bootstrap = await deps.bootstrap.prepare({
+              runId: run.id, target, baseBranch: bootstrap.baseBranch, baseSha: bootstrap.baseSha,
+              existing: bootstrap, ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
+            });
+            workspaceGuard = deps.bootstrap.guard(bootstrap);
+            snapshot = await github.readLiveSnapshot(target);
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now);
+          }
+          if (snapshot.issue.state !== 'open') return park(run, `Issue ${formatTarget(target)} closed during bootstrap.`, store, now, [CANCEL_RUN_DECISION]);
+          if (snapshot.pullRequest !== null) {
+            const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+            if (conflict !== null) return park(run, conflict, store, now);
+            if (run.headSha === undefined) {
+              if (initialRecoveryCandidate !== undefined &&
+                  (snapshot.pullRequest.number !== initialRecoveryCandidate.number || snapshot.headSha !== initialRecoveryCandidate.headSha)) {
+                return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
+              }
+              try {
+                await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard });
+              } catch (error) {
+                return bootstrapFailureOutcome(run, error, store, now);
+              }
+              const recovered = { exitStatus: 'success' as const, summary: `Recovered durable implementation from pull request #${snapshot.pullRequest.number}.`, headSha: snapshot.headSha! };
+              run = applyTransition(run, { type: 'agent_succeeded', agentResult: recovered, headSha: snapshot.headSha!, pullRequest: { number: snapshot.pullRequest.number, headSha: snapshot.headSha! } }, now());
+              store.update(run);
+              break;
+            }
+            if (snapshot.headSha !== run.headSha) return park(run, `Live GitHub HEAD changed during bootstrap recovery.`, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
+          } else if (run.headSha !== undefined || recoveryAuthority !== undefined) {
+            return park(run, 'The owned pull request disappeared during workspace recovery.', store, now);
+          } else if (!pendingReviewFix && (snapshot.repository.defaultBranch !== bootstrap.baseBranch || snapshot.repository.defaultBranchHeadSha !== bootstrap.baseSha)) {
+            return bootstrapFailureOutcome(run, new Error('Live default branch changed after bootstrap preparation.'), store, now);
+          }
         }
         const pendingFixInstructions = pendingReviewFix ? renderBlockingFindings(run) : null;
         const baseSha = pendingReviewFix
@@ -154,16 +247,20 @@ export async function runWorkflow(
             ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : undefined
         );
-        const result = await implementation.run({
-          target,
-          baseSha,
-          authority: 'live-target',
-          instructions,
-          ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
-          capabilities: await deps.resolveImplementationCapabilities?.(),
-          ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-          ...(run.executor === undefined ? {} : { executor: run.executor }),
-        });
+        let result;
+        try {
+          result = await implementation.run({
+            target, baseSha, authority: 'live-target', instructions,
+            ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
+            ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
+            capabilities: await deps.resolveImplementationCapabilities?.(),
+            ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(run.executor === undefined ? {} : { executor: run.executor }),
+          });
+        } catch (error) {
+          if (isWorkspaceGuardFailure(error)) return bootstrapFailureOutcome(run, error, store, now);
+          throw error;
+        }
         if (result.exitStatus === 'failure') {
           const takeoverReason = humanTakeoverReason(result);
           if (takeoverReason !== undefined) {
@@ -187,7 +284,22 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
         }
-        run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha }, now());
+        if (bootstrap !== undefined) {
+          if (result.headSha === undefined || deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
+          try {
+            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingReviewFix ? run.headSha : undefined, workspaceGuard });
+            snapshot = await github.readLiveSnapshot(target);
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now);
+          }
+          const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (conflict !== null || snapshot.pullRequest === null || snapshot.headSha !== result.headSha) {
+            return park(run, conflict ?? 'Live pull request does not prove the implementation exact HEAD.', store, now);
+          }
+          run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha, pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha } }, now());
+        } else {
+          run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha }, now());
+        }
         store.update(run);
         break;
       }
@@ -199,6 +311,8 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+        if (conflict !== null) return park(run, conflict, store, now);
         if (snapshot.headSha === null || snapshot.headSha !== run.headSha) {
           const reason =
             snapshot.headSha === null
@@ -230,7 +344,7 @@ export async function runWorkflow(
       case 'REVIEWING':
       case 'CHANGES_REQUESTED': {
         const loop = await runReviewLoop(
-          { store, github, implementation, reviewer, resolveImplementationCapabilities: deps.resolveImplementationCapabilities },
+          { store, github, implementation, reviewer, bootstrap: deps.bootstrap, resolveImplementationCapabilities: deps.resolveImplementationCapabilities },
           run.id,
           {
           maxAttempts: options.maxReviewAttempts,
@@ -260,6 +374,8 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+        if (conflict !== null) return park(run, conflict, store, now);
         if (snapshot.headSha !== run.headSha) {
           const reason = `Final gate observed live GitHub HEAD ${snapshot.headSha ?? '(none)'} but the approved run HEAD is ${run.headSha ?? '(none)'}.`;
           run = applyTransition(

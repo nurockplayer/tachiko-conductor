@@ -89,10 +89,10 @@ describe('CLI command layer', () => {
     const { store, dir } = tempStore();
     try {
       const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
-      for (const type of ['agent_succeeded', 'agent_failed', 'review_approved', 'changes_requested'] as const) {
+      for (const type of ['bootstrap_prepared', 'agent_succeeded', 'agent_failed', 'review_approved', 'changes_requested'] as const) {
         assert.throws(
           () => runTransitionCommand(store, created.id, type as TransitionType),
-          /requires an (agent|review)Result payload/,
+          /requires (durable bootstrap identity|an (agent|review)Result payload)/,
         );
       }
       assert.equal(runShowCommand(store, created.id).state, 'READY');

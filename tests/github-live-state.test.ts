@@ -454,6 +454,25 @@ PR: #7`;
     await expectError(adapter.readLiveSnapshot(TARGET), 'GH_SNAPSHOT_CHANGED', true);
   });
 
+  it('refuses same-HEAD ownership drift during the coherent snapshot reread', async () => {
+    const first = pull(7, HEAD, {
+      head: { sha: HEAD, ref: 'owned', repo: { name: 'widgets', owner: { login: 'acme' } } },
+      base: { sha: BASE, ref: 'main' },
+    });
+    const changed = [
+      { head: { sha: HEAD, ref: 'other', repo: { name: 'widgets', owner: { login: 'acme' } } } },
+      { head: { sha: HEAD, ref: 'owned', repo: { name: 'other', owner: { login: 'acme' } } } },
+      { head: { sha: HEAD, ref: 'owned', repo: { name: 'widgets', owner: { login: 'other' } } } },
+      { head: { sha: HEAD, ref: 'owned', repo: null } },
+      { base: { sha: BASE, ref: 'release' } },
+    ];
+    for (const delta of changed) {
+      const transport = prTransport().queue('repos/acme/widgets/pulls/7', first, { ...first, ...delta });
+      const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+      await expectError(adapter.readLiveSnapshot(TARGET), 'GH_SNAPSHOT_CHANGED', true);
+    }
+  });
+
   it('propagates a transport failure without returning a partial snapshot', async () => {
     const transport = prTransport().fault(
       'repos/acme/widgets/commits/' + HEAD + '/status',

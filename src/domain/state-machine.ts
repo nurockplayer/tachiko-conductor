@@ -12,6 +12,9 @@ export type InvalidTransitionCode =
   | 'executor-provider-mismatch'
   | 'executor-mutation-not-allowed'
   | 'invalid-executor-identity'
+  | 'invalid-bootstrap-identity'
+  | 'bootstrap-identity-mismatch'
+  | 'invalid-pull-request-identity'
   | 'unexpected-payload'
   | 'head-mutation-not-allowed'
   | 'missing-head-sha'
@@ -63,6 +66,7 @@ export const TRANSITION_TABLE: Readonly<
     fail: 'FAILED',
   },
   IMPLEMENTING: {
+    bootstrap_prepared: 'IMPLEMENTING',
     agent_succeeded: 'VALIDATING',
     agent_failed: 'FAILED',
     wait_dependency: 'WAITING_DEPENDENCY',
@@ -195,6 +199,12 @@ function isUsableSha(value: string | undefined): value is string {
   return value !== undefined && value.trim() !== '';
 }
 
+function sameBootstrap(a: NonNullable<Run['bootstrap']>, b: NonNullable<Run['bootstrap']>): boolean {
+  return a.owner === b.owner && a.repo === b.repo && a.issueNumber === b.issueNumber &&
+    a.baseBranch === b.baseBranch && a.baseSha === b.baseSha && a.branch === b.branch &&
+    a.workspacePath === b.workspacePath;
+}
+
 function assertPayload(run: Run, input: TransitionInput): void {
   const from = run.state;
   if (REQUIRES_AGENT_RESULT.has(input.type) && input.agentResult === undefined) {
@@ -212,6 +222,9 @@ function assertPayload(run: Run, input: TransitionInput): void {
       input.type,
       `Transition "${input.type}" requires a reviewResult; pass the reviewer's result.`,
     );
+  }
+  if (input.type === 'bootstrap_prepared' && input.bootstrap === undefined) {
+    throw new InvalidTransitionError('missing-payload', from, input.type, 'Transition "bootstrap_prepared" requires durable bootstrap identity.');
   }
   // Payloads are bound to the transitions that produce them; carrying one on
   // an unrelated transition is rejected rather than silently ignored.
@@ -231,7 +244,38 @@ function assertPayload(run: Run, input: TransitionInput): void {
       `Transition "${input.type}" does not accept a reviewResult; review results are bound to review_approved / changes_requested.`,
     );
   }
+  if (input.type !== 'bootstrap_prepared' && input.bootstrap !== undefined) {
+    throw new InvalidTransitionError('unexpected-payload', from, input.type, 'Bootstrap identity is only accepted by "bootstrap_prepared".');
+  }
+  if (input.bootstrap !== undefined) {
+    const value = input.bootstrap;
+    const targetMatches = run.target.kind === 'issue' && value.owner === run.target.owner &&
+      value.repo === run.target.repo && value.issueNumber === run.target.issueNumber;
+    if (!targetMatches || [value.owner, value.repo, value.baseBranch, value.baseSha, value.branch, value.workspacePath].some((part) => part.trim() === '')) {
+      throw new InvalidTransitionError('invalid-bootstrap-identity', from, input.type, 'Bootstrap identity must be non-empty and match the issue target exactly.');
+    }
+    if (run.bootstrap !== undefined && !sameBootstrap(run.bootstrap, value)) {
+      throw new InvalidTransitionError('bootstrap-identity-mismatch', from, input.type, 'A persisted bootstrap identity cannot be replaced.');
+    }
+  }
   const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
+  if (input.pullRequest !== undefined && input.type !== 'agent_succeeded' && input.type !== 'validation_passed' && !authorizedHumanHeadSync) {
+    throw new InvalidTransitionError('unexpected-payload', from, input.type, 'Pull request identity is only accepted with implementation success or validation.');
+  }
+  if (input.pullRequest !== undefined) {
+    const expectedHead = input.type === 'agent_succeeded' || authorizedHumanHeadSync
+      ? (input.headSha ?? input.agentResult?.headSha)?.trim()
+      : run.headSha;
+    if (!Number.isSafeInteger(input.pullRequest.number) || input.pullRequest.number < 1 ||
+      input.pullRequest.headSha.trim() === '' || input.pullRequest.headSha !== expectedHead ||
+      (run.pullRequest !== undefined && input.pullRequest.number !== run.pullRequest.number)) {
+      throw new InvalidTransitionError('invalid-pull-request-identity', from, input.type, 'Pull request identity must be positive and bound to the exact implementation HEAD.');
+    }
+  }
+  if ((run.bootstrap !== undefined && input.type === 'agent_succeeded' ||
+      run.pullRequest !== undefined && authorizedHumanHeadSync) && input.pullRequest === undefined) {
+    throw new InvalidTransitionError('missing-payload', from, input.type, 'An owned HEAD acceptance requires the verified pull request identity in the same transition.');
+  }
   if (input.executor !== undefined && (input.type !== 'escalate' || from !== 'IMPLEMENTING')) {
     throw new InvalidTransitionError(
       'executor-mutation-not-allowed',
@@ -508,7 +552,10 @@ export function applyTransition(
   const leavingInterrupt = from === 'WAITING_DEPENDENCY' || from === 'NEEDS_HUMAN';
   // HEAD changes only on implementation events or an exact, explicitly
   // offered live-HEAD synchronization decision. The value is normalized.
-  const headSha = HEAD_UPDATING_TRANSITIONS.has(input.type) || authorizedHumanHeadSync
+  // A failed execution's observed head is evidence, not a new accepted ledger
+  // head. Keep the prior ownership intact for bootstrap-bound runs.
+  const preservesOwnedHead = run.bootstrap !== undefined && input.type === 'agent_failed';
+  const headSha = !preservesOwnedHead && (HEAD_UPDATING_TRANSITIONS.has(input.type) || authorizedHumanHeadSync)
     ? (input.headSha ?? input.agentResult?.headSha)?.trim()
     : undefined;
 
@@ -520,6 +567,8 @@ export function applyTransition(
     ...(input.agentResult !== undefined ? { agentResult: input.agentResult } : {}),
     ...(input.agentResult?.executor === undefined ? {} : { executor: { ...input.agentResult.executor } }),
     ...(input.executor === undefined ? {} : { executor: { ...input.executor } }),
+    ...(input.bootstrap === undefined ? {} : { bootstrap: { ...input.bootstrap } }),
+    ...(input.pullRequest === undefined ? {} : { pullRequest: { ...input.pullRequest } }),
     ...(input.reviewResult !== undefined ? { reviewResult: input.reviewResult } : {}),
     ...(headSha !== undefined && headSha !== '' ? { headSha } : {}),
     ...(enteringInterrupt

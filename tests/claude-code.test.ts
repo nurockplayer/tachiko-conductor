@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import { ClaudeCodeAdapter, NodeClaudeProcessRunner } from '../src/agents/claude-code.js';
 import type { ClaudeProcessRunner, ClaudeRunOptions } from '../src/agents/claude-code.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
+import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ProcessResult } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
 
@@ -31,6 +32,19 @@ function claudeJson(resultText: string, extra: Record<string, unknown> = {}): st
 
 describe('ClaudeCodeAdapter', () => {
   const HEAD = '9d9cc7d210960f3c81d7d7498a36f65c67b9f4a9';
+
+  it('revalidates a prepared workspace immediately before spawn and never invokes Claude after guard failure', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+    await assert.rejects(
+      () => adapter.run({
+        target: TARGET, baseSha: 'base', workspacePath: '/tmp/prepared',
+        workspaceGuard: { assertValid: () => { throw new Error('branch switched'); } },
+      }),
+      WorkspaceGuardFailure,
+    );
+    assert.equal(runner.calls.length, 0);
+  });
 
   it('runs claude with an argument array and converts a JSON result to a success AgentResult', async () => {
     const runner = new FakeRunner([result(claudeJson('implemented')), result(HEAD)]);

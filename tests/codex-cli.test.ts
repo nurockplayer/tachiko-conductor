@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
+import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
 
@@ -33,6 +34,18 @@ function codexJsonl(summary = 'Implemented Issue #15.', threadId = '0199a213-81c
 }
 
 describe('CodexCliAdapter', () => {
+  it('revalidates a prepared workspace immediately before spawn and never invokes Codex after guard failure', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
+    await assert.rejects(
+      () => adapter.run({
+        target: TARGET, baseSha: 'base', workspacePath: '/tmp/prepared',
+        workspaceGuard: { assertValid: () => { throw new Error('remote changed'); } },
+      }),
+      WorkspaceGuardFailure,
+    );
+    assert.equal(runner.calls.length, 0);
+  });
   const HEAD = '9d9cc7d210960f3c81d7d7498a36f65c67b9f4a9';
 
   it('runs a fresh Codex exec with an argument array and returns its exact HEAD and thread identity', async () => {

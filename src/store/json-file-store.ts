@@ -73,6 +73,24 @@ function isExecutorIdentity(value: unknown): boolean {
   );
 }
 
+function isBootstrapIdentity(value: unknown, target: unknown): boolean {
+  if (typeof value !== 'object' || value === null || typeof target !== 'object' || target === null) return false;
+  const bootstrap = value as Record<string, unknown>;
+  const issue = target as Record<string, unknown>;
+  return issue.kind === 'issue' && bootstrap.owner === issue.owner && bootstrap.repo === issue.repo &&
+    bootstrap.issueNumber === issue.issueNumber && [
+      bootstrap.owner, bootstrap.repo, bootstrap.baseBranch, bootstrap.baseSha, bootstrap.branch, bootstrap.workspacePath,
+    ].every((entry) => typeof entry === 'string' && entry.trim() !== '') &&
+    typeof bootstrap.issueNumber === 'number' && Number.isSafeInteger(bootstrap.issueNumber) && bootstrap.issueNumber > 0;
+}
+
+function isPullRequestIdentity(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const pullRequest = value as Record<string, unknown>;
+  return typeof pullRequest.number === 'number' && Number.isSafeInteger(pullRequest.number) && pullRequest.number > 0 &&
+    typeof pullRequest.headSha === 'string' && pullRequest.headSha.trim() !== '';
+}
+
 function isAgentResult(value: unknown): boolean {
   if (typeof value !== 'object' || value === null) return false;
   const result = value as Record<string, unknown>;
@@ -179,6 +197,9 @@ function isRun(value: unknown): value is Run {
     (v.interrupt === undefined || isInterrupt(v.interrupt)) &&
     (v.agentResult === undefined || isAgentResult(v.agentResult)) &&
     (v.executor === undefined || isExecutorIdentity(v.executor)) &&
+    (v.bootstrap === undefined || isBootstrapIdentity(v.bootstrap, v.target)) &&
+    (v.pullRequest === undefined || isPullRequestIdentity(v.pullRequest)) &&
+    (v.pullRequest === undefined || v.headSha === undefined || (v.pullRequest as { headSha: unknown }).headSha === v.headSha) &&
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );
