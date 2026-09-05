@@ -56,7 +56,7 @@ export const WORKSPACE_GUARD_FAILURE_CODE = 'WORKSPACE_GUARD_FAILURE' as const;
 
 export class WorkspaceGuardFailure extends Error {
   readonly code = WORKSPACE_GUARD_FAILURE_CODE;
-  constructor(cause: unknown) {
+  constructor(cause: unknown, readonly executor?: ExecutorIdentity) {
     super(`Prepared workspace identity guard failed: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = 'WorkspaceGuardFailure';
   }
@@ -66,13 +66,17 @@ export function isWorkspaceGuardFailure(error: unknown): error is WorkspaceGuard
   return error instanceof WorkspaceGuardFailure;
 }
 
-export async function assertWorkspaceGuard(guard: WorkspaceGuard | undefined, phase: 'before-execution' | 'after-execution' = 'before-execution'): Promise<void> {
+export async function assertWorkspaceGuard(
+  guard: WorkspaceGuard | undefined,
+  phase: 'before-execution' | 'after-execution' = 'before-execution',
+  executor?: ExecutorIdentity,
+): Promise<void> {
   if (guard === undefined) return;
   try {
     await guard.assertValid(phase);
   } catch (error) {
-    if (isWorkspaceGuardFailure(error)) throw error;
-    throw new WorkspaceGuardFailure(error);
+    if (isWorkspaceGuardFailure(error) && (executor === undefined || error.executor !== undefined)) throw error;
+    throw new WorkspaceGuardFailure(error, executor);
   }
 }
 

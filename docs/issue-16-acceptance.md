@@ -78,6 +78,7 @@ only in the implementation column.
 | C ordinary failed observation | S preserves accepted bootstrap H/PR, new failed observation in agentResult | workflow ordinary bootstrap failure: actual transition→update→fresh read/list yields FAILED, old H/PR and agentResult NEW; existing non-bootstrap failure suite unchanged | retrospective baseline replay RED → current GREEN |
 | D empty reservation / checkpoint restart | W creates parent only, never reserves/auto-adopts leaf | recovery `resumes after parent mkdir…`: interrupted add leaves no leaf, original branch, restart same I; lifecycle identity/branch/published checkpoint and PR crash fixtures avoid duplicate successful implementation/PR | C |
 | D execution-boundary/provider-neutral recovery | W prepared starting H + clean identity; provider pre/post phases | both providers reject head/branch/push/common-dir before spawn and dirty/branch after successful result; clean new HEAD allowed; actual adapter + Git + JSON initial/direct/resumed pre/post guard scenarios park and resume | dirty pre-guard R→G; parity/resume C |
+| P2 3939277751 post-run executor continuity | `WorkspaceGuardFailure` carries a provider identity already returned by a completed invocation; F/R persist it through the shared bootstrap-failure path | `executor-continuity.test.ts`: controlled Claude/Codex runner returns a new session/thread, real post-run guard parks, fresh JsonFileStore read/resume continues exactly that provider/session for direct and resumed fixes while accepted H/PR stay unchanged until durable proof | R→G; provider/GitHub/reviewer are controlled, JSON/workflow/state transitions are real |
 | D retained historical assertions | Existing CLI, path, workflow, review-loop/store suites | payload-free bootstrap transition rejected; nested `..workspaces` vs sibling containment; manual non-bootstrap PR path and ordinary provider failure unchanged | Existing coverage retained |
 
 Historical #23 findings map respectively: 3912248220 / 3931476331 → A10 endpoints;
@@ -117,3 +118,18 @@ or resetting refs/workspace. The no-PR initial route remains a distinct case; no
 persisted field, state, or recovery policy was added. Final exact-SHA GREEN and the
 subsequent independent review are recorded in the live handoff. Consolidation: **1/1**;
 any remaining substantive P0–P2 requires stopping for Steward, not another repair loop.
+
+## Post-handoff continuity repair
+
+Hosted P2 `3939277751` arrived after the first final handoff and was separately
+authorized by the live #16 / PR handoffs without resetting the prior consolidation
+budget. The pre-repair continuity regressions use controlled Claude/Codex runners:
+each returns a valid new provider identity, then the actual post-execution workspace
+guard fails. Both provider cases cover the direct review-fix entry and the persisted
+IMPLEMENTING resume entry. Before the repair all four cases parked without an
+executor. The minimal repair carries that already-returned identity only on the typed
+guard failure, so the existing bootstrap interruption persists it. A fresh
+JsonFileStore instance then resumes the same provider session/thread; the guard still
+parks first, and the accepted H/PR remain unchanged until the resumed execution proves
+a new durable result. This is not a validation engine or unattended execution proof;
+#20 remains deferred.

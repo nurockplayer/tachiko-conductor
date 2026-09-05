@@ -74,7 +74,8 @@ function githubFailureOutcome(run: Run, error: unknown, store: RunStore, now: ()
 }
 
 function bootstrapFailureOutcome(run: Run, error: unknown, store: RunStore, now: () => string): WorkflowOutcome {
-  const parked = parkBootstrapFailure(run, error, store, now);
+  const executor = isWorkspaceGuardFailure(error) ? error.executor : undefined;
+  const parked = parkBootstrapFailure(run, error, store, now, executor);
   return { outcome: 'needs_human', ...parked };
 }
 

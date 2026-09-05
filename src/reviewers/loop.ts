@@ -80,7 +80,8 @@ function renderFailure(prefix: string, error: unknown): string {
 }
 
 function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => string): ReviewLoopResult {
-  const parked = parkBootstrapFailure(run, error, store, now, run.executor);
+  const executor = isWorkspaceGuardFailure(error) ? error.executor ?? run.executor : run.executor;
+  const parked = parkBootstrapFailure(run, error, store, now, executor);
   return { outcome: 'needs_human', ...parked };
 }
 

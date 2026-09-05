@@ -158,7 +158,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     }
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
 
-    await assertWorkspaceGuard(request.workspaceGuard, 'after-execution');
+    await assertWorkspaceGuard(request.workspaceGuard, 'after-execution', parsed.outcome.executor);
     const sha = await this.readHead(request.signal, cwd);
     if (isAborted(request.signal)) return cancelledAgentResult(durationMs, parsed.outcome.executor);
     if (sha === null) {

@@ -138,7 +138,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         durationMs: outcome.durationMs,
       };
     }
-    await assertWorkspaceGuard(request.workspaceGuard, 'after-execution');
+    await assertWorkspaceGuard(request.workspaceGuard, 'after-execution', executor);
     const head = await this.readHead(request.signal, cwd);
     if (isAborted(request.signal)) {
       return cancelledAgentResult(outcome.durationMs, outcome.sessionId);
