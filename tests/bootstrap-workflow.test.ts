@@ -672,3 +672,47 @@ it('E2 sync admission rejects same-SHA ownership drift without updating the ledg
   const persisted = new JsonFileStore({ dir }).read('run-1')!;
   assert.equal(persisted.state, 'NEEDS_HUMAN'); assert.equal(persisted.headSha, OLD); assert.equal(persisted.pullRequest?.headSha, OLD);
 });
+
+for (const drift of ['head', 'number'] as const) {
+  it(`E2 initial crash candidate ${drift} drift after preparation preserves absent H/PR`, async () => {
+    const f = createBootstrapGitFixture(); fixtures.push(f);
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-candidate-drift-')); dirs.push(dir);
+    const runId = `candidate-${drift}`;
+    const b = new GitWorktreeBootstrap({ repositoryRoot: f.source, workspaceRoot: f.workspaceRoot, runner: f.runner });
+    const request = { runId, target: TARGET, baseBranch: f.branch, baseSha: f.baseSha };
+    const i = await b.plan(request); await b.prepare({ ...request, existing: i });
+    const original = f.commit(i.workspacePath, 'initial.txt', 'initial durable result\n');
+    f.git(i.workspacePath, ['push', 'origin', i.branch]);
+    const run = applyTransition(applyTransition(createRun(TARGET, T0, runId), { type: 'start' }, T0), { type: 'bootstrap_prepared', bootstrap: i }, T0);
+    const store = new JsonFileStore({ dir }); store.create(run);
+    let head = original;
+    let number = 11;
+    let reads = 0;
+    let implementations = 0;
+    let reviews = 0;
+    const live = () => {
+      if (++reads === 2) {
+        if (drift === 'head') {
+          head = f.commit(i.workspacePath, 'advanced.txt', 'external advancement\n');
+          f.git(i.workspacePath, ['push', 'origin', i.branch]);
+        } else number = 12;
+      }
+      return snapshot(head, pr(number, head, { headRef: i.branch, baseRef: i.baseBranch }));
+    };
+    const before = f.commands.length;
+    const result = await runWorkflow({ store, bootstrap: b, github: new QueueGithub(Array.from({ length: 8 }, () => live)),
+      implementation: { kind: 'implementation-agent', run: async () => { implementations++; return successResult(head); } },
+      reviewer: { kind: 'reviewer', review: async (req) => { reviews++; return { verdict: 'approve', reviewerName: 'fixture', headSha: req.headSha, findings: [] }; } },
+    }, runId, { maxReviewAttempts: 2, now: () => T0 });
+    assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+    assert.equal(implementations, 0); assert.equal(reviews, 0);
+    const fresh = new JsonFileStore({ dir });
+    assert.equal(fresh.read(runId)?.headSha, undefined);
+    assert.equal(fresh.read(runId)?.pullRequest, undefined);
+    assert.equal(fresh.list().length, 1);
+    assert.deepEqual(fresh.read(runId)?.bootstrap, i);
+    assert.equal(f.git(i.workspacePath, ['rev-parse', 'HEAD']), head);
+    assert.match(f.git(f.source, ['ls-remote', 'origin', `refs/heads/${i.branch}`]), new RegExp(`^${head}`));
+    assert.equal(f.commands.slice(before).some((c) => ['reset', 'push', 'update-ref', 'merge'].includes(c.args[0]!)), false);
+  });
+}

@@ -128,6 +128,7 @@ export async function runWorkflow(
           run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
         let bootstrap = run.bootstrap;
         let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
+        let initialRecoveryCandidate: { number: number; headSha: string } | undefined;
         let workspaceGuard: WorkspaceGuard | undefined;
 
         if (bootstrap !== undefined && (snapshot.pullRequest !== null || run.headSha !== undefined || run.pullRequest !== undefined)) {
@@ -142,6 +143,9 @@ export async function runWorkflow(
           // With no H/PR this is only preparation of the narrow initial result;
           // durable verification below must succeed before anything is adopted.
           recoveryAuthority = { expectedHeadSha: run.headSha ?? snapshot.headSha! };
+          if (run.headSha === undefined) {
+            initialRecoveryCandidate = { number: snapshot.pullRequest!.number, headSha: snapshot.headSha! };
+          }
         }
         if (pendingReviewFix && snapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
@@ -190,6 +194,10 @@ export async function runWorkflow(
             const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
             if (conflict !== null) return park(run, conflict, store, now);
             if (run.headSha === undefined) {
+              if (initialRecoveryCandidate !== undefined &&
+                  (snapshot.pullRequest.number !== initialRecoveryCandidate.number || snapshot.headSha !== initialRecoveryCandidate.headSha)) {
+                return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
+              }
               try {
                 await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard });
               } catch (error) {

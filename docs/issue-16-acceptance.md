@@ -94,3 +94,26 @@ checks only. The live handoff records final counts and any failure, real returne
 independent review and model evidence limits, and the consolidation budget (at most
 one repair batch after the first fresh review). CI absence is not CI success.
 A green local suite and returned review do not substitute for Steward acceptance.
+
+
+## First independent review and the single consolidation batch
+
+The first completed read-only review covered
+`a463d145403ad48b95cb52a3a15f3894107e9cf2` and returned one P2, with no other P0–P2.
+The reviewer independently ran 112 relevant tests successfully and used two actual
+Git/JSON temporary probes: H/PR absent, first live PR #11/G1, then either #11/G2
+(clean descendant, published) or #12/G1 after preparation. Both were wrongly adopted.
+This maps to A10 and B initial-persistence candidate stability, not a new policy.
+The configured reviewer role first failed to launch (unsupported model); that failed
+attempt is not review evidence. The successful fresh read-only task did not expose
+an independently verifiable runtime model ID.
+
+The only consolidation batch adds `E2 initial crash candidate head/number drift…`.
+Both tests were run before the fix on the reviewed commit and produced behavioral
+RED: actual `merge_ready`, expected `needs_human` (0/2 pass). F now retains the already
+selected initial PR number/HEAD ephemerally and compares the post-prepare snapshot
+before adoption. Drift parks without writing H/PR, spawning implementation/reviewer,
+or resetting refs/workspace. The no-PR initial route remains a distinct case; no
+persisted field, state, or recovery policy was added. Final exact-SHA GREEN and the
+subsequent independent review are recorded in the live handoff. Consolidation: **1/1**;
+any remaining substantive P0–P2 requires stopping for Steward, not another repair loop.
