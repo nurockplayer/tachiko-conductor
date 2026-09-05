@@ -47,7 +47,12 @@ function renderBlockingFindings(review: ReviewResult): string {
     .join('\n');
 }
 
-function durableReviewAttempts(run: Run): number {
+/**
+ * One persisted repair budget covers both reviewer-directed and
+ * post-implementation validation repairs.  Reading history makes the limit
+ * survive restart rather than resetting with a new process.
+ */
+function durableRepairAttempts(run: Run): number {
   let attemptWindowStart = 0;
   for (let index = run.history.length - 1; index >= 0; index -= 1) {
     if (run.history[index]?.type === 'human_resolved') {
@@ -56,7 +61,7 @@ function durableReviewAttempts(run: Run): number {
     }
   }
   return run.history.slice(attemptWindowStart).filter(
-    (entry) => entry.type === 'review_approved' || entry.type === 'changes_requested',
+    (entry) => entry.type === 'validation_failed' || entry.type === 'review_approved' || entry.type === 'changes_requested',
   ).length;
 }
 
@@ -121,8 +126,8 @@ export async function runReviewLoop(
 
   for (;;) {
     if (run.state === 'CHANGES_REQUESTED') {
-      if (durableReviewAttempts(run) >= options.maxAttempts) {
-        const reason = `Review did not converge after ${options.maxAttempts} attempt(s).`;
+      if (durableRepairAttempts(run) >= options.maxAttempts) {
+        const reason = `Review did not converge after ${options.maxAttempts} attempt(s); the shared post-implementation repair budget was exhausted.`;
         run = applyTransition(
           run,
           {
@@ -321,8 +326,8 @@ export async function runReviewLoop(
       return { outcome: 'approved', run };
     }
 
-    if (durableReviewAttempts(run) >= options.maxAttempts) {
-      const reason = `Review attempt limit of ${options.maxAttempts} was already reached.`;
+    if (durableRepairAttempts(run) >= options.maxAttempts) {
+      const reason = `Post-implementation repair budget of ${options.maxAttempts} attempt(s) was already reached.`;
       run = applyTransition(
         run,
         {

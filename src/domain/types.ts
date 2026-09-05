@@ -54,6 +54,7 @@ export const TRANSITION_TYPES = [
   'review_approved',
   'changes_requested',
   'start_fix',
+  'revalidate',
   'gate_passed',
   'gate_blocked',
   'merged',
@@ -144,11 +145,19 @@ export interface LocalValidationEvidence {
 
 /** Compact snapshot of hosted checks observed for the run's exact PR HEAD. */
 export interface HostedValidationEvidence {
-  readonly status: ValidationStatus;
+  /** `not_required` is neutral policy evidence, never a synthetic passing check. */
+  readonly status: ValidationStatus | 'not_required';
   readonly observedAt: string;
   readonly pullRequestNumber: number | null;
   readonly availability: 'available' | 'unavailable';
   readonly overall: 'pending' | 'passing' | 'failing' | 'unknown' | 'unavailable';
+  /** Identity of the policy which interpreted the live check list, when configured. */
+  readonly policyRevision: string | null;
+  readonly policyMode: 'required' | 'not_required' | 'unconfigured';
+  /** Required check names from that policy, when its mode is `required`. */
+  readonly requiredCheckNames: readonly string[];
+  /** Names observed at the exact PR HEAD; URLs and raw command output are not persisted. */
+  readonly observedCheckNames: readonly string[];
 }
 
 /** The persisted exact-HEAD validation ledger consumed by review and final readiness. */

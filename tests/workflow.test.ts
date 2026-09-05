@@ -59,7 +59,7 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
     },
     pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha, headRef: 'tachiko/issue-42-test', headRepository: { owner: 'acme', repo: 'widgets' }, baseRef: 'main' },
     headSha,
-    checks: { availability: 'available', overall: 'passing', checks: [] },
+    checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
     conversations: [],
     handoff: null,
@@ -126,7 +126,7 @@ class FakeValidation implements ValidationAdapter {
 
   async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
     this.requests.push(request);
-    return this.outcomes.shift() ?? validationPassed(request.headSha).local;
+    return this.outcomes.shift() ?? { ...validationPassed(request.headSha).local, configRevision: this.configRevision };
   }
 }
 
@@ -611,7 +611,7 @@ describe('runWorkflow', () => {
       { maxReviewAttempts: 3, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.outcome, 'waiting_dependency');
     assert.equal(result.run.state, 'WAITING_DEPENDENCY');
     assert.deepEqual(result.run.interrupt?.choices, ['Retry readiness checks', 'Cancel the run']);
   });

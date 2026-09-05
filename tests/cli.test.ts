@@ -341,7 +341,7 @@ describe('workflow run and resume commands', () => {
       issue: { id: 'I_42', number: 42, title: 'Fix the widget', body: 'DoR-ready.', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
       pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha: 'base' },
       headSha,
-      checks: { availability: 'available', overall: 'passing', checks: [] },
+      checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
       reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
       conversations: [],
       handoff: null,

@@ -8,6 +8,10 @@ function malformed(commandIndex: number, executable = ''): LocalValidationComman
 }
 
 const TERMINATION_GRACE_MS = 1_000;
+const SETTLEMENT_POLL_MS = 25;
+/** A validation command must be long enough to make termination observable, but never unattended indefinitely. */
+export const MIN_LOCAL_VALIDATION_TIMEOUT_MS = 100;
+export const MAX_LOCAL_VALIDATION_TIMEOUT_MS = 60 * 60_000;
 
 function ownedWorkspaceMatches(request: ValidationRequest): boolean {
   if (request.workspacePath === undefined || request.workspacePath.trim() === '') return false;
@@ -28,7 +32,40 @@ function isCommand(value: unknown): value is { readonly argv: readonly string[];
   const command = value as { argv?: unknown; timeoutMs?: unknown };
   return Array.isArray(command.argv) && command.argv.length > 0 &&
     command.argv.every((part) => typeof part === 'string' && part.trim() !== '') &&
-    Number.isSafeInteger(command.timeoutMs) && (command.timeoutMs as number) > 0;
+    Number.isSafeInteger(command.timeoutMs) &&
+    (command.timeoutMs as number) >= MIN_LOCAL_VALIDATION_TIMEOUT_MS &&
+    (command.timeoutMs as number) <= MAX_LOCAL_VALIDATION_TIMEOUT_MS;
+}
+
+function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals): boolean {
+  if (pid === undefined) return false;
+  try {
+    if (process.platform !== 'win32') process.kill(-pid, signal);
+    else process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function processGroupHasSettled(pid: number | undefined): boolean {
+  if (pid === undefined || process.platform === 'win32') return false;
+  try {
+    process.kill(-pid, 0);
+    return false;
+  } catch (error) {
+    return typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
+async function waitForProcessGroupSettlement(pid: number | undefined): Promise<boolean> {
+  if (process.platform === 'win32' || pid === undefined) return false;
+  const deadline = Date.now() + TERMINATION_GRACE_MS;
+  while (Date.now() <= deadline) {
+    if (processGroupHasSettled(pid)) return true;
+    await new Promise<void>((resolve) => setTimeout(resolve, SETTLEMENT_POLL_MS));
+  }
+  return processGroupHasSettled(pid);
 }
 
 async function execute(
@@ -43,6 +80,7 @@ async function execute(
     let timedOut = false;
     let timer: NodeJS.Timeout | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
+    let settling = false;
     const finish = (outcome: LocalValidationCommandEvidence['outcome'], exitCode: number | null): void => {
       if (settled) return;
       settled = true;
@@ -50,7 +88,17 @@ async function execute(
       if (forceTimer !== undefined) clearTimeout(forceTimer);
       resolve({ commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt });
     };
-    let child;
+    const settleTimedOutProcess = async (child: ReturnType<typeof spawn>): Promise<void> => {
+      if (settling || settled) return;
+      settling = true;
+      terminateProcessGroup(child.pid, 'SIGKILL');
+      // A child `close` event only proves the direct process exited.  For a
+      // detached validation command, prove the owned group has no surviving
+      // descendants before recording a timeout; otherwise fail closed.
+      const groupSettled = await waitForProcessGroupSettlement(child.pid);
+      finish(groupSettled ? 'timed_out' : 'unavailable', null);
+    };
+    let child: ReturnType<typeof spawn>;
     try {
       child = spawn(executable, command.argv.slice(1), {
         shell: false, stdio: 'ignore', cwd: workspacePath, detached: process.platform !== 'win32',
@@ -61,18 +109,19 @@ async function execute(
     }
     timer = setTimeout(() => {
       timedOut = true;
-      if (process.platform !== 'win32' && child.pid !== undefined) {
-        try { process.kill(-child.pid, 'SIGTERM'); } catch { child.kill('SIGTERM'); }
-      } else child.kill('SIGTERM');
+      if (!terminateProcessGroup(child.pid, 'SIGTERM')) child.kill('SIGTERM');
       forceTimer = setTimeout(() => {
-        if (process.platform !== 'win32' && child.pid !== undefined) {
-          try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
-        } else child.kill('SIGKILL');
-        finish('timed_out', null);
+        void settleTimedOutProcess(child);
       }, TERMINATION_GRACE_MS);
     }, command.timeoutMs);
     child.once('error', () => finish('unavailable', null));
-    child.once('close', (code) => finish(timedOut ? 'timed_out' : code === 0 ? 'passed' : 'failed', code));
+    child.once('close', (code) => {
+      if (timedOut) {
+        void settleTimedOutProcess(child);
+        return;
+      }
+      finish(code === 0 ? 'passed' : 'failed', code);
+    });
   });
 }
 

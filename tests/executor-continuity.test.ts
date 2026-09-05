@@ -120,7 +120,7 @@ class LiveGithub implements GitHubAdapter {
         headRef: identity.branch, headRepository: { owner: TARGET.owner, repo: TARGET.repo }, baseRef: identity.baseBranch,
       },
       headSha,
-      checks: { availability: 'available', overall: 'passing', checks: [] },
+      checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
       reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
       conversations: [], handoff: null, problems: [], observedAt: T0,
     };

@@ -42,6 +42,8 @@ export function validationPassed(headSha = 'sha-1'): ValidationResult {
     hosted: {
       status: 'passed', observedAt: T0, pullRequestNumber: 7,
       availability: 'available', overall: 'passing',
+      policyRevision: 'test-hosted-policy-v1', policyMode: 'required',
+      requiredCheckNames: [], observedCheckNames: ['test'],
     },
   };
 }
@@ -57,6 +59,8 @@ export function validationFailed(headSha = 'sha-1'): ValidationResult {
     hosted: {
       status: 'passed', observedAt: T0, pullRequestNumber: 7,
       availability: 'available', overall: 'passing',
+      policyRevision: 'test-hosted-policy-v1', policyMode: 'required',
+      requiredCheckNames: [], observedCheckNames: ['test'],
     },
   };
 }

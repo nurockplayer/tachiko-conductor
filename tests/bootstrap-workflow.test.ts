@@ -65,7 +65,7 @@ function snapshot(headSha: string, pull: ReturnType<typeof pr> | null = pr(7, he
     issue: { id: 'I_42', number: TARGET.issueNumber, title: 'issue', body: 'implement it', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
     pullRequest: pull as GitHubLiveSnapshot['pullRequest'],
     headSha,
-    checks: { availability: 'available', overall: 'passing', checks: [] },
+    checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
     conversations: [],
     handoff: null,

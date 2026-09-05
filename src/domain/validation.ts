@@ -28,16 +28,36 @@ function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
 function isHostedEvidence(value: unknown): value is HostedValidationEvidence {
   if (typeof value !== 'object' || value === null) return false;
   const hosted = value as Record<string, unknown>;
-  if (!['passed', 'failed', 'waiting', 'unknown'].includes(hosted.status as string) ||
+  if (!['passed', 'failed', 'waiting', 'unknown', 'not_required'].includes(hosted.status as string) ||
       typeof hosted.observedAt !== 'string' || hosted.observedAt.trim() === '' ||
       (hosted.pullRequestNumber !== null && (!Number.isSafeInteger(hosted.pullRequestNumber) || (hosted.pullRequestNumber as number) < 1)) ||
       (hosted.availability !== 'available' && hosted.availability !== 'unavailable') ||
-      !['pending', 'passing', 'failing', 'unknown', 'unavailable'].includes(hosted.overall as string)) return false;
+      !['pending', 'passing', 'failing', 'unknown', 'unavailable'].includes(hosted.overall as string) ||
+      (hosted.policyRevision !== null && (typeof hosted.policyRevision !== 'string' || hosted.policyRevision.trim() === '')) ||
+      !['required', 'not_required', 'unconfigured'].includes(hosted.policyMode as string) ||
+      !Array.isArray(hosted.requiredCheckNames) || !hosted.requiredCheckNames.every((name) => typeof name === 'string' && name.trim() !== '') ||
+      !Array.isArray(hosted.observedCheckNames) || !hosted.observedCheckNames.every((name) => typeof name === 'string' && name.trim() !== '')) return false;
+  if (hosted.policyMode !== 'required' && hosted.requiredCheckNames.length > 0) return false;
+  const observedCheckNames = hosted.observedCheckNames as string[];
+  const requiredCheckNames = hosted.requiredCheckNames as string[];
   const expected = hosted.availability !== 'available'
     ? 'unknown'
     : hosted.overall === 'passing' ? 'passed'
       : hosted.overall === 'failing' ? 'failed'
         : hosted.overall === 'pending' ? 'waiting' : 'unknown';
+  if (hosted.status === 'not_required') {
+    return hosted.policyMode === 'not_required' && hosted.overall !== 'failing' && hosted.overall !== 'pending';
+  }
+  if (hosted.policyMode === 'not_required') return expected === 'failed' || expected === 'waiting'
+    ? hosted.status === expected
+    : false;
+  if (hosted.policyMode === 'unconfigured' && observedCheckNames.length === 0 && hosted.overall !== 'failing' && hosted.overall !== 'pending') {
+    return hosted.status === 'unknown';
+  }
+  if (hosted.policyMode === 'required' && hosted.overall === 'passing' &&
+    (observedCheckNames.length === 0 || requiredCheckNames.some((name) => !observedCheckNames.includes(name)))) {
+    return hosted.status === 'unknown';
+  }
   return hosted.status === expected;
 }
 

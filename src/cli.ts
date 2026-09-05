@@ -15,8 +15,12 @@ import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
-import type { LocalValidationConfiguration } from './adapters/validation.js';
-import { ConfiguredLocalValidationAdapter } from './validation/local-command.js';
+import type { HostedCheckPolicyConfiguration, LocalValidationConfiguration } from './adapters/validation.js';
+import {
+  ConfiguredLocalValidationAdapter,
+  MAX_LOCAL_VALIDATION_TIMEOUT_MS,
+  MIN_LOCAL_VALIDATION_TIMEOUT_MS,
+} from './validation/local-command.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
 import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
 import {
@@ -189,12 +193,57 @@ export function resolveLocalValidationConfiguration(
     if (!Array.isArray(command.argv) || command.argv.length === 0 || command.argv.some((part) => typeof part !== 'string' || part.trim() === '')) {
       throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].argv must be a non-empty string array.`);
     }
-    if (!Number.isSafeInteger(command.timeoutMs) || (command.timeoutMs as number) < 1) {
-      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].timeoutMs must be a positive safe integer.`);
+    if (!Number.isSafeInteger(command.timeoutMs) ||
+      (command.timeoutMs as number) < MIN_LOCAL_VALIDATION_TIMEOUT_MS ||
+      (command.timeoutMs as number) > MAX_LOCAL_VALIDATION_TIMEOUT_MS) {
+      throw new Error(
+        `TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].timeoutMs must be a safe integer between ` +
+        `${MIN_LOCAL_VALIDATION_TIMEOUT_MS} and ${MAX_LOCAL_VALIDATION_TIMEOUT_MS}.`,
+      );
     }
     return { argv: command.argv as string[], timeoutMs: command.timeoutMs as number };
   });
   return { revision: record.revision, commands };
+}
+
+/** Parse the explicit repository/run contract for hosted checks. */
+export function resolveHostedCheckPolicyConfiguration(
+  env: NodeJS.ProcessEnv = process.env,
+): HostedCheckPolicyConfiguration | undefined {
+  const raw = env.TACHIKO_HOSTED_CHECK_POLICY_CONFIG;
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG must be valid JSON.');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG must be an object.');
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.revision !== 'string' || record.revision.trim() === '') {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.revision must be a non-empty string.');
+  }
+  if (record.mode !== 'required' && record.mode !== 'not_required') {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.mode must be required or not_required.');
+  }
+  if (record.requiredCheckNames !== undefined &&
+    (!Array.isArray(record.requiredCheckNames) || record.requiredCheckNames.some((name) => typeof name !== 'string' || name.trim() === ''))) {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.requiredCheckNames must be a non-empty string array when supplied.');
+  }
+  if (record.mode === 'not_required' && record.requiredCheckNames !== undefined) {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.requiredCheckNames is only valid when mode is required.');
+  }
+  return {
+    revision: record.revision,
+    policy: record.mode === 'not_required'
+      ? { mode: 'not_required' }
+      : {
+          mode: 'required',
+          ...(record.requiredCheckNames === undefined ? {} : { requiredCheckNames: record.requiredCheckNames as string[] }),
+        },
+  };
 }
 
 /** Resolve the directory where run JSON files are stored. */
@@ -587,6 +636,11 @@ function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
     console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
     return;
   }
+  if (outcome.outcome === 'waiting_dependency') {
+    console.log(`Run ${run.id}: WAITING_DEPENDENCY — ${outcome.reason}`);
+    console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
+    return;
+  }
   console.error(`Run ${run.id}: FAILED — ${outcome.reason}`);
 }
 
@@ -599,6 +653,7 @@ function buildWorkflowDeps(
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
   const localValidation = resolveLocalValidationConfiguration(env);
+  const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
   let bootstrap: ImplementationBootstrapAdapter | undefined;
   const lazyBootstrap: ImplementationBootstrapAdapter = {
     kind: 'implementation-bootstrap',
@@ -646,6 +701,7 @@ function buildWorkflowDeps(
     }),
     bootstrap: lazyBootstrap,
     ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
+    ...(hostedCheckPolicy === undefined ? {} : { hostedCheckPolicy }),
     resolveImplementationCapabilities,
   };
 }

@@ -54,7 +54,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
 
   it('maps a bounded timeout to failed evidence', async () => {
     const result = await new ConfiguredLocalValidationAdapter(
-      configuration([process.execPath, '-e', 'setTimeout(() => {}, 1_000)'], 50),
+      configuration([process.execPath, '-e', 'setTimeout(() => {}, 1_000)'], 100),
     ).validate(request());
 
     assert.equal(result.status, 'failed');
@@ -78,7 +78,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
   it('forces a signal-resistant command to settle after the bounded grace period', async () => {
     const startedAt = Date.now();
     const result = await new ConfiguredLocalValidationAdapter(
-      configuration([process.execPath, '-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"], 25),
+      configuration([process.execPath, '-e', "process.on('SIGTERM', () => {}); setInterval(() => {}, 1_000)"], 100),
     ).validate(request());
     assert.equal(result.status, 'failed');
     assert.equal(result.commands[0]?.outcome, 'timed_out');

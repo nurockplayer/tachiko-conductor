@@ -8,7 +8,7 @@ import {
 import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
-import type { ValidationAdapter } from '../adapters/validation.js';
+import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
 import { applyTransition, isReviewFresh, isValidationFresh } from '../domain/state-machine.js';
 import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
@@ -16,6 +16,7 @@ import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { parkBootstrapFailure } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
+import { evaluateHostedCheckPolicy } from '../validation/hosted-policy.js';
 
 export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
@@ -28,6 +29,8 @@ export interface WorkflowDependencies {
   readonly reviewer: ReviewerAdapter;
   /** Explicit repository/run validation adapter; absence is recorded as unknown and fails closed. */
   readonly validation?: ValidationAdapter;
+  /** Explicit repository/run policy for interpreting the exact-HEAD hosted check list. */
+  readonly hostedCheckPolicy?: HostedCheckPolicyConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
 
@@ -40,6 +43,7 @@ export interface WorkflowOptions {
 export type WorkflowOutcome =
   | { readonly outcome: 'merge_ready'; readonly run: Run }
   | { readonly outcome: 'merged'; readonly run: Run }
+  | { readonly outcome: 'waiting_dependency'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
@@ -88,22 +92,35 @@ function park(run: Run, reason: string, store: RunStore, now: () => string, choi
   return { outcome: 'needs_human', run: next, reason };
 }
 
-function hostedValidation(snapshot: GitHubLiveSnapshot): HostedValidationEvidence {
+function hostedValidation(
+  snapshot: GitHubLiveSnapshot,
+  configuredPolicy: HostedCheckPolicyConfiguration | undefined,
+): HostedValidationEvidence {
+  const observedCheckNames = snapshot.checks.checks.map((check) => check.name);
+  // An unconfigured but non-empty provider response is still evidence of an
+  // actual check suite.  The only ambiguous shortcut is an empty response,
+  // which always remains unknown unless policy explicitly marks it neutral.
+  const effectivePolicy = configuredPolicy?.policy ??
+    (observedCheckNames.length > 0 ? { mode: 'required' as const } : undefined);
   const status = snapshot.checks.availability !== 'available'
     ? 'unknown'
-    : snapshot.checks.overall === 'passing'
-    ? 'passed'
-    : snapshot.checks.overall === 'failing'
-      ? 'failed'
-      : snapshot.checks.overall === 'pending'
-        ? 'waiting'
-        : 'unknown';
+    : evaluateHostedCheckPolicy({
+      overall: snapshot.checks.overall,
+      observedCheckNames,
+      ...(effectivePolicy === undefined ? {} : { policy: effectivePolicy }),
+    });
   return {
     status,
     observedAt: snapshot.observedAt,
     pullRequestNumber: snapshot.pullRequest?.number ?? null,
     availability: snapshot.checks.availability,
     overall: snapshot.checks.overall,
+    policyRevision: configuredPolicy?.revision ?? null,
+    policyMode: configuredPolicy?.policy.mode ?? 'unconfigured',
+    requiredCheckNames: configuredPolicy?.policy.mode === 'required'
+      ? [...(configuredPolicy.policy.requiredCheckNames ?? [])]
+      : [],
+    observedCheckNames,
   };
 }
 
@@ -127,6 +144,7 @@ async function validateExactHead(
   target: Extract<Target, { readonly kind: 'issue' }>,
   snapshot: GitHubLiveSnapshot,
   validation: ValidationAdapter | undefined,
+  hostedPolicy: HostedCheckPolicyConfiguration | undefined,
 ): Promise<ValidationResult> {
   if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
   const reusable = run.validationResult;
@@ -136,7 +154,14 @@ async function validateExactHead(
     : validation === undefined
       ? unavailableLocalValidation()
       : await validation.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
-  return combineValidation(run.headSha, local, hostedValidation(snapshot));
+  return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
+}
+
+function activeValidationConfiguration(deps: WorkflowDependencies) {
+  return {
+    ...(deps.validation?.configRevision === undefined ? {} : { localRevision: deps.validation.configRevision }),
+    ...(deps.hostedCheckPolicy === undefined ? {} : { hostedPolicyRevision: deps.hostedCheckPolicy.revision }),
+  };
 }
 
 /**
@@ -410,10 +435,12 @@ export async function runWorkflow(
         }
         let validationResult: ValidationResult;
         try {
-          validationResult = await validateExactHead(run, target, snapshot, deps.validation);
+          validationResult = await validateExactHead(run, target, snapshot, deps.validation, deps.hostedCheckPolicy);
         } catch (error) {
           const reason = `Local validation could not be observed safely: ${error instanceof Error ? error.message : String(error)}`;
-          validationResult = combineValidation(run.headSha ?? '', unavailableLocalValidation(), hostedValidation(snapshot));
+          validationResult = combineValidation(
+            run.headSha ?? '', unavailableLocalValidation(), hostedValidation(snapshot, deps.hostedCheckPolicy),
+          );
           run = applyTransition(
             run,
             {
@@ -441,7 +468,7 @@ export async function runWorkflow(
             now(),
           );
           store.update(run);
-          return { outcome: 'needs_human', run, reason };
+          return { outcome: 'waiting_dependency', run, reason };
         }
         if (validationResult.status === 'unknown') {
           const reason = `Validation for ${run.headSha} lacks required local or hosted evidence.`;
@@ -490,12 +517,12 @@ export async function runWorkflow(
           store.update(run);
           break;
         }
-        if (!isValidationFresh(run)) {
-          const reason = `Final gate has no passing validation bound to current HEAD ${run.headSha ?? '(none)'}.`;
+        if (!isValidationFresh(run, activeValidationConfiguration(deps))) {
+          const reason = `Final gate requires validation at current HEAD ${run.headSha ?? '(none)'} under the active repository/run configuration.`;
           run = applyTransition(
             run,
             {
-              type: 'gate_blocked', reason,
+              type: 'revalidate', reason,
             },
             now(),
           );
@@ -533,9 +560,21 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
+        const persistedValidation = run.validationResult;
+        if (persistedValidation === undefined ||
+          persistedValidation.hosted.pullRequestNumber !== snapshot.pullRequest?.number ||
+          (deps.hostedCheckPolicy !== undefined &&
+            persistedValidation.hosted.policyRevision !== deps.hostedCheckPolicy.revision)) {
+          const reason = 'Final gate observed hosted validation evidence that does not match the current pull request or active policy configuration.';
+          run = applyTransition(run, { type: 'revalidate', reason }, now());
+          store.update(run);
+          break;
+        }
+
         const pullRequest = snapshot.pullRequest;
         const mergeState = pullRequest?.mergeStateStatus?.toUpperCase() ?? null;
         const contradictory = snapshot.problems.find((problem) => problem.code === 'CONTRADICTORY_STATE');
+        const currentHosted = hostedValidation(snapshot, deps.hostedCheckPolicy);
         const readinessProblems = [
           snapshot.issue.state !== 'open' ? 'the issue is not open' : null,
           pullRequest === null || pullRequest.state !== 'open' ? 'the pull request is not open' : null,
@@ -544,7 +583,9 @@ export async function runWorkflow(
           mergeState !== null && mergeState !== 'CLEAN' && mergeState !== 'HAS_HOOKS'
             ? `merge state is ${mergeState}`
             : null,
-          snapshot.checks.overall !== 'passing' ? `checks are ${snapshot.checks.overall}` : null,
+          currentHosted.status === 'failed' ? 'required hosted checks are failing' : null,
+          currentHosted.status === 'waiting' ? 'required hosted checks are pending' : null,
+          currentHosted.status === 'unknown' ? 'required hosted check evidence is unavailable or incomplete' : null,
           snapshot.reviews.unresolvedThreads === null
             ? 'review thread state is unavailable'
             : snapshot.reviews.unresolvedThreads > 0
@@ -555,7 +596,7 @@ export async function runWorkflow(
 
         if (readinessProblems.length > 0) {
           const reason = `Final GitHub readiness gate is blocked: ${readinessProblems.join('; ')}.`;
-          const checksPending = snapshot.checks.overall === 'pending' && readinessProblems.length === 1;
+          const checksPending = currentHosted.status === 'waiting' && readinessProblems.length === 1;
           run = applyTransition(
             run,
             {
@@ -569,7 +610,9 @@ export async function runWorkflow(
             now(),
           );
           store.update(run);
-          return { outcome: 'needs_human', run, reason };
+          return checksPending
+            ? { outcome: 'waiting_dependency', run, reason }
+            : { outcome: 'needs_human', run, reason };
         }
 
         run = applyTransition(run, { type: 'gate_passed' }, now());
@@ -587,7 +630,7 @@ export async function runWorkflow(
         return { outcome: 'needs_human', run, reason: run.interrupt?.reason ?? 'Awaiting a human decision.' };
 
       case 'WAITING_DEPENDENCY':
-        return { outcome: 'needs_human', run, reason: run.interrupt?.reason ?? 'Awaiting an external dependency.' };
+        return { outcome: 'waiting_dependency', run, reason: run.interrupt?.reason ?? 'Awaiting an external dependency.' };
 
       case 'FAILED':
         return { outcome: 'failed', run, reason: run.history.at(-1)?.reason ?? 'The run failed.' };
