@@ -406,7 +406,8 @@ describe('workflow run and resume commands', () => {
   ): WorkflowDependencies {
     return {
       store, github, implementation, reviewer,
-      validation: { kind: 'validation', async validate(request) { return validationPassed(request.headSha).local; } },
+      validation: { kind: 'validation', configRevision: 'test-config-v1', async validate(request) { return validationPassed(request.headSha).local; } },
+      hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
     };
   }
 

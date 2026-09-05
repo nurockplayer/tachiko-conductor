@@ -200,8 +200,10 @@ export function isReviewFresh(run: Run): boolean {
 
 /** Validation may only authorize the exact non-empty HEAD it observed. */
 export interface ActiveValidationConfiguration {
-  readonly localRevision?: string | null;
-  readonly hostedPolicyRevision?: string | null;
+  /** Includes an explicit disabled/absent identity; it is never a wildcard. */
+  readonly localRevision: string | null;
+  /** Includes an explicit disabled/absent identity; it is never a wildcard. */
+  readonly hostedPolicyRevision: string | null;
 }
 
 /**
@@ -215,8 +217,8 @@ export function isValidationFresh(run: Run, active?: ActiveValidationConfigurati
     run.validationResult.headSha === run.headSha &&
     run.validationResult.status === 'passed' &&
     (active === undefined || (
-      (active.localRevision === undefined || run.validationResult.local.configRevision === active.localRevision) &&
-      (active.hostedPolicyRevision === undefined || run.validationResult.hosted.policyRevision === active.hostedPolicyRevision)
+      run.validationResult.local.configRevision === active.localRevision &&
+      run.validationResult.hosted.policyRevision === active.hostedPolicyRevision
     ));
 }
 
@@ -297,8 +299,9 @@ function assertPayload(run: Run, input: TransitionInput): void {
   }
   if (input.validationResult !== undefined) {
     assertValidationResult(run, input.validationResult, from, input.type);
-    if (input.pullRequest !== undefined &&
-      input.validationResult.hosted.pullRequestNumber !== input.pullRequest.number) {
+    const acceptedPullRequestNumber = input.pullRequest?.number ?? run.pullRequest?.number;
+    if (acceptedPullRequestNumber !== undefined &&
+      input.validationResult.hosted.pullRequestNumber !== acceptedPullRequestNumber) {
       throw new InvalidTransitionError(
         'invalid-validation-result',
         from,

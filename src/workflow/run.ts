@@ -97,11 +97,9 @@ function hostedValidation(
   configuredPolicy: HostedCheckPolicyConfiguration | undefined,
 ): HostedValidationEvidence {
   const observedCheckNames = snapshot.checks.checks.map((check) => check.name);
-  // An unconfigured but non-empty provider response is still evidence of an
-  // actual check suite.  The only ambiguous shortcut is an empty response,
-  // which always remains unknown unless policy explicitly marks it neutral.
-  const effectivePolicy = configuredPolicy?.policy ??
-    (observedCheckNames.length > 0 ? { mode: 'required' as const } : undefined);
+  // GitHub observations never create their own policy authority. Without an
+  // explicit repository/run policy, every hosted result is fail-closed.
+  const effectivePolicy = configuredPolicy?.policy;
   const status = snapshot.checks.availability !== 'available'
     ? 'unknown'
     : evaluateHostedCheckPolicy({
@@ -159,8 +157,8 @@ async function validateExactHead(
 
 function activeValidationConfiguration(deps: WorkflowDependencies) {
   return {
-    ...(deps.validation?.configRevision === undefined ? {} : { localRevision: deps.validation.configRevision }),
-    ...(deps.hostedCheckPolicy === undefined ? {} : { hostedPolicyRevision: deps.hostedCheckPolicy.revision }),
+    localRevision: deps.validation?.configRevision ?? null,
+    hostedPolicyRevision: deps.hostedCheckPolicy?.revision ?? null,
   };
 }
 
@@ -563,8 +561,7 @@ export async function runWorkflow(
         const persistedValidation = run.validationResult;
         if (persistedValidation === undefined ||
           persistedValidation.hosted.pullRequestNumber !== snapshot.pullRequest?.number ||
-          (deps.hostedCheckPolicy !== undefined &&
-            persistedValidation.hosted.policyRevision !== deps.hostedCheckPolicy.revision)) {
+          persistedValidation.hosted.policyRevision !== (deps.hostedCheckPolicy?.revision ?? null)) {
           const reason = 'Final gate observed hosted validation evidence that does not match the current pull request or active policy configuration.';
           run = applyTransition(run, { type: 'revalidate', reason }, now());
           store.update(run);
@@ -575,6 +572,19 @@ export async function runWorkflow(
         const mergeState = pullRequest?.mergeStateStatus?.toUpperCase() ?? null;
         const contradictory = snapshot.problems.find((problem) => problem.code === 'CONTRADICTORY_STATE');
         const currentHosted = hostedValidation(snapshot, deps.hostedCheckPolicy);
+        if (currentHosted.status === 'waiting') {
+          const reason = `Final GitHub readiness gate is waiting for required hosted checks at ${run.headSha ?? '(none)'}.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'wait_dependency', reason,
+              interrupt: { evidence: reason, choices: [RETRY_READINESS_DECISION, CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'waiting_dependency', run, reason };
+        }
         const readinessProblems = [
           snapshot.issue.state !== 'open' ? 'the issue is not open' : null,
           pullRequest === null || pullRequest.state !== 'open' ? 'the pull request is not open' : null,
@@ -584,7 +594,6 @@ export async function runWorkflow(
             ? `merge state is ${mergeState}`
             : null,
           currentHosted.status === 'failed' ? 'required hosted checks are failing' : null,
-          currentHosted.status === 'waiting' ? 'required hosted checks are pending' : null,
           currentHosted.status === 'unknown' ? 'required hosted check evidence is unavailable or incomplete' : null,
           snapshot.reviews.unresolvedThreads === null
             ? 'review thread state is unavailable'
@@ -596,23 +605,20 @@ export async function runWorkflow(
 
         if (readinessProblems.length > 0) {
           const reason = `Final GitHub readiness gate is blocked: ${readinessProblems.join('; ')}.`;
-          const checksPending = currentHosted.status === 'waiting' && readinessProblems.length === 1;
           run = applyTransition(
             run,
             {
-              type: checksPending ? 'wait_dependency' : 'escalate',
+              type: 'escalate',
               reason,
               interrupt: {
                 evidence: reason,
-                choices: [checksPending ? RETRY_READINESS_DECISION : 'Resolve the GitHub readiness blockers and retry', CANCEL_RUN_DECISION],
+                choices: ['Resolve the GitHub readiness blockers and retry', CANCEL_RUN_DECISION],
               },
             },
             now(),
           );
           store.update(run);
-          return checksPending
-            ? { outcome: 'waiting_dependency', run, reason }
-            : { outcome: 'needs_human', run, reason };
+          return { outcome: 'needs_human', run, reason };
         }
 
         run = applyTransition(run, { type: 'gate_passed' }, now());

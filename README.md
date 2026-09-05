@@ -53,6 +53,7 @@ and per-run Claude/Codex MCP capability injection. See
 | `review_approved` | `REVIEWING` | `FINAL_GATE` |
 | `changes_requested` | `REVIEWING` | `CHANGES_REQUESTED` |
 | `start_fix` | `CHANGES_REQUESTED` | `IMPLEMENTING` |
+| `revalidate` | `FINAL_GATE` | `VALIDATING` |
 | `gate_passed` | `FINAL_GATE` | `MERGE_READY` |
 | `gate_blocked` | `FINAL_GATE` | `REVIEWING` |
 | `merged` | `MERGE_READY` | `MERGED` |
@@ -64,8 +65,9 @@ and per-run Claude/Codex MCP capability injection. See
 
 Anything else throws an `InvalidTransitionError` whose message names the
 invalid transition, the current state, and the allowed transitions. The final
-gate is enforced in the core: `gate_passed` only succeeds when the latest
-review result is bound to the run's current HEAD SHA.
+gate is enforced in the canonical workflow: `gate_passed` only succeeds after
+the live FINAL_GATE reconciliation. The public `run transition` command refuses
+manual `gate_passed` so cached evidence cannot bypass the live PR/check read.
 
 Transitions persist only the payloads they produce: agent results are bound to
 `agent_succeeded`/`agent_failed` (and must carry a matching exit status),
@@ -128,6 +130,20 @@ bounded argv-array commands, for example:
 ```bash
 export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
 ```
+
+Hosted checks are independently policy-controlled. Set
+`TACHIKO_HOSTED_CHECK_POLICY_CONFIG` with a stable revision and either
+`{"mode":"not_required"}` or `{"mode":"required","requiredCheckNames":[...]}`.
+For example:
+
+```bash
+export TACHIKO_HOSTED_CHECK_POLICY_CONFIG='{"revision":"repo-hosted-v1","mode":"required","requiredCheckNames":["test"]}'
+```
+
+Absent policy is fail-closed: neither an empty nor non-empty GitHub check list
+is hosted passing evidence. Validation evidence is reusable only for the exact
+HEAD and the currently active local and hosted-policy revisions; disabling a
+configuration is an explicit identity change, not a wildcard.
 
 Without explicit configuration, local validation is unknown and the run cannot
 advance to review. The configured runner refuses an ambient directory: it

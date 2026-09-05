@@ -18,6 +18,7 @@ import { TARGET, failureResult, successResult, validationFailed, validationPasse
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const HEAD2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const TEST_HOSTED_POLICY = { revision: 'test-hosted-policy-v1', policy: { mode: 'required' as const } };
 
 class MemoryStore implements RunStore {
   readonly name = 'memory';
@@ -210,7 +211,7 @@ describe('runWorkflow', () => {
     github.readLiveSnapshot = async () => pending;
 
     const waiting = await runWorkflow(
-      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation },
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation, hostedCheckPolicy: TEST_HOSTED_POLICY },
       run.id, { maxReviewAttempts: 1, now: () => T0 },
     );
     assert.equal(waiting.run.state, 'WAITING_DEPENDENCY');
@@ -220,7 +221,7 @@ describe('runWorkflow', () => {
     store.update(applyTransition(waiting.run, { type: 'dependency_satisfied', reason: 'Retry readiness checks' }, T0));
     const revisedValidation = new FakeValidation([], 'test-config-v2');
     const resumed = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(HEAD)]), validation: revisedValidation },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(HEAD)]), validation: revisedValidation, hostedCheckPolicy: TEST_HOSTED_POLICY },
       run.id, { maxReviewAttempts: 1, now: () => T0 },
     );
     assert.equal(resumed.outcome, 'merge_ready');
@@ -242,7 +243,7 @@ describe('runWorkflow', () => {
     });
 
     const result = await runWorkflow(
-      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation() },
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       run.id, { maxReviewAttempts: 1, now: () => T0 },
     );
 
@@ -262,7 +263,7 @@ describe('runWorkflow', () => {
       {
         store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation,
         reviewer: new FakeReviewer([approve(HEAD2)]),
-        validation: new FakeValidation([validationFailed(HEAD).local]),
+        validation: new FakeValidation([validationFailed(HEAD).local]), hostedCheckPolicy: TEST_HOSTED_POLICY,
       },
       run.id, { maxReviewAttempts: 2, now: () => T0 },
     );
@@ -279,7 +280,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation() },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -312,7 +313,7 @@ describe('runWorkflow', () => {
         github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]),
         implementation,
         reviewer,
-        validation: new FakeValidation(),
+        validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
         resolveImplementationCapabilities: async () => [capabilities[capabilityIndex++]!],
       },
       'run-capability',
@@ -391,7 +392,7 @@ describe('runWorkflow', () => {
     store.update(resumed);
 
     const result = await runWorkflow(
-      { store, github, implementation, reviewer, validation: new FakeValidation() },
+      { store, github, implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-resume-fix',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -413,7 +414,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation() },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 2, now: () => T0 },
     );
@@ -432,7 +433,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -450,7 +451,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -486,7 +487,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([null, null, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer, bootstrap: new FakeBootstrap(), validation: new FakeValidation() },
+      { store, github: githubAdapter([null, null, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer, bootstrap: new FakeBootstrap(), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -519,7 +520,7 @@ describe('runWorkflow', () => {
     store.create(run);
     const implementation = new FakeImplementation([]);
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([approve(HEAD)]), bootstrap: new FakeBootstrap(), validation: new FakeValidation() },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([approve(HEAD)]), bootstrap: new FakeBootstrap(), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-crash-window', { maxReviewAttempts: 3, now: () => T0 },
     );
     assert.equal(result.outcome, 'merge_ready');
@@ -544,7 +545,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation() },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -566,7 +567,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation() },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -606,7 +607,7 @@ describe('runWorkflow', () => {
     github.readLiveSnapshot = async () => pending;
 
     const result = await runWorkflow(
-      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -629,7 +630,7 @@ describe('runWorkflow', () => {
     github.readLiveSnapshot = async () => unavailable;
 
     const result = await runWorkflow(
-      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -651,7 +652,7 @@ describe('runWorkflow', () => {
     github.readLiveSnapshot = async () => blocked;
 
     const result = await runWorkflow(
-      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
