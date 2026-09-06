@@ -181,6 +181,10 @@ for (const provider of ['claude-code', 'codex-cli'] as const) {
             async validate(request: ValidationRequest) { return validationPassed(request.headSha).local; },
           } satisfies ValidationAdapter,
           hostedCheckPolicy: TEST_HOSTED_POLICY,
+          resolveValidationAuthority: () => ({
+            local: { kind: 'configured' as const, revision: 'test-config-v1' },
+            hosted: { kind: 'configured' as const, revision: 'test-hosted-policy-v1', mode: 'required' as const },
+          }),
         };
         try {
           const parked = route === 'direct'

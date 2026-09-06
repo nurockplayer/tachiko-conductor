@@ -145,7 +145,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     store.create(parkedForSync());
     const deps = {
       store,
-      github: new QueueGithub([snapshot(NEW), snapshot(NEW), snapshot(NEW), snapshot(NEW)]),
+      github: new QueueGithub([snapshot(NEW), snapshot(NEW), snapshot(NEW), snapshot(NEW), snapshot(NEW)]),
       implementation: new NoopImplementation(),
       reviewer: new ApprovingReviewer(),
       validation: new PassingValidation(),
@@ -278,6 +278,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       () => published(),
       () => published(),
       () => published(),
+      () => published(),
     ]);
     const run = createRun(TARGET, T0, runId);
     store.create(run);
@@ -311,7 +312,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     const implementation = new NoopImplementation();
     const outcome = await runWorkflow({
       store,
-      github: new QueueGithub([live, live, live, live, live]),
+      github: new QueueGithub([live, live, live, live, live, live]),
       implementation,
       bootstrap,
       reviewer: new ApprovingReviewer(),

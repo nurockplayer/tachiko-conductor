@@ -559,7 +559,15 @@ export async function runWorkflow(
           );
         }
         const loop = await runReviewLoop(
-          { store, github, implementation, reviewer, bootstrap: deps.bootstrap, resolveImplementationCapabilities: deps.resolveImplementationCapabilities },
+          {
+            store,
+            github,
+            implementation,
+            reviewer,
+            bootstrap: deps.bootstrap,
+            resolveValidationAuthority: () => activeValidationConfiguration(deps),
+            resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
+          },
           run.id,
           {
           maxAttempts: options.maxReviewAttempts,

@@ -170,7 +170,11 @@ function reviewingRun(store: RunStore, id = 'run-1', headSha = HEAD): Run {
   let run = createRun(TARGET, T0, id);
   run = applyTransition(run, { type: 'start' }, T0);
   run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha }, T0);
-  run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(headSha) }, T0);
+  run = applyTransition(run, {
+    type: 'validation_passed',
+    validationResult: validationPassed(headSha),
+    pullRequest: { number: 7, headSha },
+  }, T0);
   store.create(run);
   return run;
 }
@@ -344,7 +348,7 @@ describe('runWorkflow', () => {
     const implementation = new FakeImplementation([successResult(HEAD2, 'repair failed validation')]);
     const result = await runWorkflow(
       {
-        store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation,
+        store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation,
         reviewer: new FakeReviewer([approve(HEAD2)]),
         validation: new FakeValidation([validationFailed(HEAD).local]), hostedCheckPolicy: TEST_HOSTED_POLICY,
       },
@@ -363,7 +367,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -393,7 +397,7 @@ describe('runWorkflow', () => {
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]),
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]),
         implementation,
         reviewer,
         validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
@@ -463,10 +467,19 @@ describe('runWorkflow', () => {
       successResult(HEAD2, 'fixed after takeover'),
     ]);
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
-    const github = githubAdapter([HEAD, HEAD, HEAD2, HEAD2, HEAD2]);
+    const github = githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]);
 
     const parked = await runReviewLoop(
-      { store, github, implementation, reviewer },
+      {
+        store,
+        github,
+        implementation,
+        reviewer,
+        resolveValidationAuthority: () => ({
+          local: { kind: 'configured' as const, revision: 'test-config-v1' },
+          hosted: { kind: 'configured' as const, revision: 'test-hosted-policy-v1', mode: 'required' as const },
+        }),
+      },
       'run-resume-fix',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -497,7 +510,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 2, now: () => T0 },
     );
@@ -516,7 +529,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );

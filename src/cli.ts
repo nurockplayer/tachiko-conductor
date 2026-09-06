@@ -583,15 +583,16 @@ export async function resumeCommand(
     run.target.kind === 'issue';
   if (synchronizeLiveHead && run.target.kind === 'issue') {
     const snapshot = await deps.github.readLiveSnapshot(run.target);
-    if (snapshot.headSha === null) {
-      throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request HEAD.`);
+    if (snapshot.headSha === null || snapshot.pullRequest === null) {
+      throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request identity and exact HEAD.`);
     }
     const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
     if (conflict !== null) throw new Error(`Cannot synchronize run "${id}": ${conflict}`);
     synchronizedHead = snapshot.headSha;
-    if (run.bootstrap !== undefined && snapshot.pullRequest !== null) {
-      synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
-    }
+    // An explicit live-HEAD sync is an owned identity adoption. Even runs
+    // without a bootstrap must carry the re-read PR tuple atomically so a
+    // later reviewer cannot see an exact HEAD detached from its acceptance.
+    synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
   }
   const resumed = applyTransition(
     run,

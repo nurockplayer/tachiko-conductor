@@ -8,7 +8,8 @@ import {
 import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
-import { applyTransition } from '../domain/state-machine.js';
+import { applyTransition, isValidationFresh, type ActiveValidationConfiguration } from '../domain/state-machine.js';
+import { isValidationResultCoherent } from '../domain/validation.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
@@ -21,6 +22,12 @@ export interface ReviewLoopDependencies {
   readonly implementation: ImplementationAgent;
   readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly reviewer: ReviewerAdapter;
+  /**
+   * Resolves the active validation-policy identity at each reviewer effect
+   * boundary. It is required even for direct callers so no public review path
+   * can treat omitted or stale policy as a wildcard.
+   */
+  readonly resolveValidationAuthority: () => ActiveValidationConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
 
@@ -32,6 +39,7 @@ export interface ReviewLoopOptions {
 
 export type ReviewLoopResult =
   | { readonly outcome: 'approved'; readonly run: Run }
+  | { readonly outcome: 'revalidating'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
@@ -90,6 +98,76 @@ function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => str
   return { outcome: 'needs_human', ...parked };
 }
 
+type ReviewAdmission =
+  | { readonly kind: 'admitted' }
+  | { readonly kind: 'revalidate'; readonly reason: string }
+  | { readonly kind: 'needs_human'; readonly reason: string };
+
+/**
+ * The sole review-admission invariant. This runs both immediately before the
+ * reviewer effect and after it resolves, before any verdict is persisted.
+ * Policy/evidence drift is recoverable validation work; a moved or
+ * contradictory live identity remains an explicit human live-HEAD sync path.
+ */
+function reviewAdmission(
+  run: Run,
+  snapshot: GitHubLiveSnapshot,
+  resolveValidationAuthority: () => ActiveValidationConfiguration,
+): ReviewAdmission {
+  const target = run.target;
+  if (target.kind !== 'issue' ||
+    snapshot.repository.owner.toLowerCase() !== target.owner.toLowerCase() ||
+    snapshot.repository.repo.toLowerCase() !== target.repo.toLowerCase() ||
+    snapshot.issue.number !== target.issueNumber) {
+    return { kind: 'needs_human', reason: 'Live GitHub repository or Issue identity no longer matches the accepted run.' };
+  }
+  const acceptedPullRequest = run.pullRequest;
+  if (run.headSha === undefined || run.headSha.trim() === '' || acceptedPullRequest === undefined ||
+    acceptedPullRequest.headSha !== run.headSha || snapshot.pullRequest === null ||
+    snapshot.pullRequest.number !== acceptedPullRequest.number ||
+    snapshot.pullRequest.headSha !== run.headSha || snapshot.headSha !== run.headSha) {
+    return {
+      kind: 'needs_human',
+      reason: `Live GitHub pull-request or exact HEAD identity no longer matches the accepted run (accepted PR #${acceptedPullRequest?.number ?? '(none)'}@${run.headSha ?? '(none)'}, live PR #${snapshot.pullRequest?.number ?? '(none)'}@${snapshot.headSha ?? '(none)'}).`,
+    };
+  }
+  const validation = run.validationResult;
+  if (!isValidationResultCoherent(validation) || validation.headSha !== run.headSha ||
+    validation.hosted.pullRequestNumber !== acceptedPullRequest.number) {
+    return { kind: 'revalidate', reason: 'Persisted validation evidence is not coherent with the accepted pull request and exact HEAD.' };
+  }
+  let active: ActiveValidationConfiguration;
+  try {
+    active = resolveValidationAuthority();
+  } catch (error) {
+    return { kind: 'revalidate', reason: `Active validation-policy identity could not be resolved: ${errorMessage(error)}` };
+  }
+  if (!isValidationFresh(run, active)) {
+    return { kind: 'revalidate', reason: 'Persisted validation evidence does not match the freshly resolved active validation-policy identity.' };
+  }
+  return { kind: 'admitted' };
+}
+
+function persistRevalidation(run: Run, reason: string, store: RunStore, now: () => string): ReviewLoopResult {
+  const revalidating = applyTransition(run, { type: 'revalidate', reason }, now());
+  store.update(revalidating);
+  return { outcome: 'revalidating', run: revalidating, reason };
+}
+
+function parkAdmission(run: Run, reason: string, store: RunStore, now: () => string): ReviewLoopResult {
+  const liveHeadMoved = run.headSha !== undefined && reason.includes('exact HEAD identity');
+  const parked = applyTransition(run, {
+    type: 'escalate',
+    reason,
+    interrupt: {
+      evidence: reason,
+      choices: liveHeadMoved ? [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION] : ['Resolve the GitHub identity conflict and retry', CANCEL_RUN_DECISION],
+    },
+  }, now());
+  store.update(parked);
+  return { outcome: 'needs_human', run: parked, reason };
+}
+
 /**
  * Drive the review → fix → re-review loop for one issue-target run through the
  * core state machine. GitHub live state wins: the loop re-reads the live PR
@@ -106,11 +184,14 @@ export async function runReviewLoop(
   runId: string,
   options: ReviewLoopOptions,
 ): Promise<ReviewLoopResult> {
-  const { store, github, implementation, reviewer } = deps;
+  const { store, github, implementation, reviewer, resolveValidationAuthority } = deps;
   const now = options.now ?? (() => new Date().toISOString());
 
   if (!Number.isInteger(options.maxAttempts) || options.maxAttempts < 1) {
     throw new Error('runReviewLoop maxAttempts must be a positive integer.');
+  }
+  if (typeof resolveValidationAuthority !== 'function') {
+    throw new Error('runReviewLoop requires a current validation-authority resolver.');
   }
 
   const loaded = store.read(runId);
@@ -396,6 +477,10 @@ export async function runReviewLoop(
       return { outcome: 'needs_human', run, reason };
     }
 
+    const beforeReview = reviewAdmission(run, liveSnapshot, resolveValidationAuthority);
+    if (beforeReview.kind === 'revalidate') return persistRevalidation(run, beforeReview.reason, store, now);
+    if (beforeReview.kind === 'needs_human') return parkAdmission(run, beforeReview.reason, store, now);
+
     let reviewResult: ReviewResult;
     try {
       reviewResult = await reviewer.review({
@@ -427,6 +512,17 @@ export async function runReviewLoop(
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
     }
+
+    let postReviewSnapshot: GitHubLiveSnapshot;
+    try {
+      postReviewSnapshot = await github.readLiveSnapshot(target);
+    } catch (error) {
+      const reason = renderFailure('GitHub live-state validation failed after reviewer completion', error);
+      return parkAdmission(run, reason, store, now);
+    }
+    const afterReview = reviewAdmission(run, postReviewSnapshot, resolveValidationAuthority);
+    if (afterReview.kind === 'revalidate') return persistRevalidation(run, afterReview.reason, store, now);
+    if (afterReview.kind === 'needs_human') return parkAdmission(run, afterReview.reason, store, now);
 
     if (reviewResult.headSha !== run.headSha) {
       const reason = `Reviewer returned HEAD ${reviewResult.headSha} for run HEAD ${run.headSha ?? '(none)'}.`;

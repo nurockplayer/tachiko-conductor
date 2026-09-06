@@ -86,6 +86,10 @@ export const TRANSITION_TABLE: Readonly<
   REVIEWING: {
     review_approved: 'FINAL_GATE',
     changes_requested: 'CHANGES_REQUESTED',
+    // Policy/evidence drift is discovered at the reviewer effect boundary.
+    // It invalidates only the persisted review and returns through the normal
+    // exact-head validation authority; it can never spend review/fix budget.
+    revalidate: 'VALIDATING',
     wait_dependency: 'WAITING_DEPENDENCY',
     escalate: 'NEEDS_HUMAN',
     fail: 'FAILED',

@@ -417,7 +417,7 @@ describe('workflow run and resume commands', () => {
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await runIssueCommand(
-      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
       'acme/widgets#42',
       { now: () => T0 },
     );
@@ -432,13 +432,13 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     store.create(run);
     const implementation = new FakeImplementation([]);
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await runIssueCommand(
-      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer),
       'acme/widgets#42',
       { now: () => T0 },
     );
@@ -453,7 +453,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(
       run,
       { type: 'escalate', reason: 'architecture decision', interrupt: { evidence: 'two designs', choices: ['A', 'B'] } },
@@ -464,7 +464,7 @@ describe('workflow run and resume commands', () => {
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer),
       'run-1',
       'A',
       { now: () => T0 },
@@ -512,14 +512,14 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(run, { type: 'wait_dependency', reason: 'upstream API', interrupt: { evidence: 'waiting on API' } }, T0);
     store.create(run);
     const implementation = new FakeImplementation([]);
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer),
       'run-1',
       'dependency available now',
       { now: () => T0 },
@@ -536,7 +536,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-sync');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(
       run,
       {
@@ -567,7 +567,7 @@ describe('workflow run and resume commands', () => {
     ]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer),
       'run-sync',
       LIVE_HEAD_SYNC_DECISION,
       { now: () => T0 },
@@ -583,7 +583,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-review-sync');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(
       run,
       {
@@ -598,7 +598,7 @@ describe('workflow run and resume commands', () => {
     const outcome = await resumeCommand(
       deps(
         store,
-        githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]),
+        githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]),
         new FakeImplementation([]),
         new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] }]),
       ),
@@ -645,7 +645,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(run, {
       type: 'escalate',
       reason: 'drift',
@@ -655,7 +655,7 @@ describe('workflow run and resume commands', () => {
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] }]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]), new FakeImplementation([]), reviewer),
+      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), new FakeImplementation([]), reviewer),
       'run-1',
       'Sync the run to the live HEAD and continue',
       { now: () => T0 },

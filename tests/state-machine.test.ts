@@ -243,6 +243,20 @@ describe('state machine — final gate review freshness', () => {
     assert.equal(next.interruptedFrom, undefined);
   });
 
+  it('returns reviewer-bound policy drift to VALIDATING and clears only the stale review', () => {
+    const run = {
+      ...runIn('REVIEWING', { headSha: 'sha-2', validationResult: validationPassed('sha-2') }),
+      reviewResult: approval('reviewer-1', 'sha-2'),
+    };
+
+    const next = applyTransition(run, { type: 'revalidate', reason: 'validation policy changed' }, T0);
+
+    assert.equal(next.state, 'VALIDATING');
+    assert.equal(next.reviewResult, undefined);
+    assert.equal(next.validationResult?.headSha, 'sha-2');
+    assert.equal(next.history.at(-1)?.type, 'revalidate');
+  });
+
   it('re-enters a fresh review cycle from a blocked gate without exposing readiness', () => {
     let run = runIn('FINAL_GATE', { headSha: 'sha-2', reviewResult: approval('reviewer-1', 'sha-1'), validationResult: validationPassed('sha-2') });
     assert.equal(isReviewFresh(run), false);
