@@ -54,7 +54,6 @@ and per-run Claude/Codex MCP capability injection. See
 | `changes_requested` | `REVIEWING` | `CHANGES_REQUESTED` |
 | `start_fix` | `CHANGES_REQUESTED` | `IMPLEMENTING` |
 | `revalidate` | `FINAL_GATE` | `VALIDATING` |
-| `gate_passed` | `FINAL_GATE` | `MERGE_READY` |
 | `gate_blocked` | `FINAL_GATE` | `REVIEWING` |
 | `merged` | `MERGE_READY` | `MERGED` |
 | `wait_dependency` | any active state | `WAITING_DEPENDENCY` |
@@ -64,10 +63,9 @@ and per-run Claude/Codex MCP capability injection. See
 | `fail` | any non-terminal state | `FAILED` |
 
 Anything else throws an `InvalidTransitionError` whose message names the
-invalid transition, the current state, and the allowed transitions. The final
-gate is enforced in the canonical workflow: `gate_passed` only succeeds after
-the live FINAL_GATE reconciliation. The public `run transition` command refuses
-manual `gate_passed` so cached evidence cannot bypass the live PR/check read.
+invalid transition, the current state, and the allowed transitions. `MERGE_READY`
+is not a public transition: only the canonical workflow creates it after a live
+FINAL_GATE reconciliation of the PR, checks, review, and validation identities.
 
 Transitions persist only the payloads they produce: agent results are bound to
 `agent_succeeded`/`agent_failed` (and must carry a matching exit status),
@@ -142,8 +140,10 @@ export TACHIKO_HOSTED_CHECK_POLICY_CONFIG='{"revision":"repo-hosted-v1","mode":"
 
 Absent policy is fail-closed: neither an empty nor non-empty GitHub check list
 is hosted passing evidence. Validation evidence is reusable only for the exact
-HEAD and the currently active local and hosted-policy revisions; disabling a
-configuration is an explicit identity change, not a wildcard.
+HEAD and an explicit active identity (local revision; hosted mode plus
+revision). Removing, changing, or supplying an anonymous policy/adapter is an
+identity change, never a nullable wildcard. An explicit `not_required` hosted
+policy is neutral; GitHub observations do not infer one.
 
 Without explicit configuration, local validation is unknown and the run cannot
 advance to review. The configured runner refuses an ambient directory: it

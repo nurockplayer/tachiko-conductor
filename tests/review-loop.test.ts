@@ -167,7 +167,7 @@ describe('runReviewLoop', () => {
     assert.equal(result.run.state, 'FINAL_GATE');
     const persisted = store.read('run-1');
     assert.equal(persisted?.state, 'FINAL_GATE');
-    assert.equal(persisted?.history.some((entry) => entry.type === 'gate_passed'), false);
+    assert.equal(persisted?.history.some((entry) => entry.type === 'final_gate_verified'), false);
   });
 
   it('returns a new fix HEAD to VALIDATING instead of bypassing fresh validation', async () => {

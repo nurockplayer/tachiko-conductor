@@ -63,7 +63,7 @@ describe('state machine — happy path', () => {
     assert.deepEqual(prepared.bootstrap, bootstrap);
     assert.throws(() => applyTransition(run, { type: 'bootstrap_prepared' }, T0), /requires durable bootstrap identity/);
   });
-  it('walks READY → IMPLEMENTING → VALIDATING → REVIEWING → FINAL_GATE → MERGE_READY → MERGED', () => {
+  it('walks the public path through FINAL_GATE; only the workflow may create MERGE_READY', () => {
     let run = newRun();
     assert.equal(run.state, 'READY');
 
@@ -81,14 +81,17 @@ describe('state machine — happy path', () => {
     run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0);
     assert.equal(run.state, 'FINAL_GATE');
 
-    run = applyTransition(run, { type: 'gate_passed' }, T0);
-    assert.equal(run.state, 'MERGE_READY');
+    assert.equal(run.state, 'FINAL_GATE');
+    assert.throws(
+      () => applyTransition(run, { type: 'gate_passed' as never }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
+    );
 
-    run = applyTransition(run, { type: 'merged' }, T0);
+    const mergeReady = { ...run, state: 'MERGE_READY' as const };
+    run = applyTransition(mergeReady, { type: 'merged' }, T0);
     assert.equal(run.state, 'MERGED');
-    assert.equal(run.history.length, 6);
-    assert.equal(run.history[5]?.from, 'MERGE_READY');
-    assert.equal(run.history[5]?.to, 'MERGED');
+    assert.equal(run.history.at(-1)?.from, 'MERGE_READY');
+    assert.equal(run.history.at(-1)?.to, 'MERGED');
   });
 
   it('routes a failed implementation to the FAILED terminal state', () => {
@@ -223,12 +226,12 @@ describe('state machine — final gate review freshness', () => {
     return runIn('FINAL_GATE', { headSha: 'sha-2', validationResult: validationPassed('sha-2') });
   }
 
-  it('blocks gate_passed when the latest review is bound to an older SHA', () => {
+  it('rejects the removed public gate event even when a review is stale', () => {
     const run = { ...gated(), reviewResult: approval('reviewer-1', 'sha-1') };
     assert.equal(isReviewFresh(run), false);
     assert.throws(
-      () => applyTransition(run, { type: 'gate_passed' }),
-      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+      () => applyTransition(run, { type: 'gate_passed' as never }),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
     );
   });
 
@@ -240,7 +243,7 @@ describe('state machine — final gate review freshness', () => {
     assert.equal(next.interruptedFrom, undefined);
   });
 
-  it('re-enters a fresh review cycle from a blocked gate and passes', () => {
+  it('re-enters a fresh review cycle from a blocked gate without exposing readiness', () => {
     let run = runIn('FINAL_GATE', { headSha: 'sha-2', reviewResult: approval('reviewer-1', 'sha-1'), validationResult: validationPassed('sha-2') });
     assert.equal(isReviewFresh(run), false);
 
@@ -251,15 +254,14 @@ describe('state machine — final gate review freshness', () => {
     assert.equal(run.state, 'FINAL_GATE');
     assert.equal(isReviewFresh(run), true);
 
-    run = applyTransition(run, { type: 'gate_passed' }, T0);
-    assert.equal(run.state, 'MERGE_READY');
+    assert.equal(run.state, 'FINAL_GATE');
+    assert.throws(() => applyTransition(run, { type: 'gate_passed' as never }, T0), /Invalid transition/);
   });
 
-  it('allows gate_passed only when the review is bound to the exact current HEAD', () => {
+  it('does not allow a public transition even when the review is bound to the exact current HEAD', () => {
     const run = { ...gated(), reviewResult: approval('reviewer-1', 'sha-2') };
     assert.equal(isReviewFresh(run), true);
-    const next = applyTransition(run, { type: 'gate_passed' }, T0);
-    assert.equal(next.state, 'MERGE_READY');
+    assert.throws(() => applyTransition(run, { type: 'gate_passed' as never }, T0), /Invalid transition/);
   });
 
   it('rejects gate_blocked while the review is already fresh', () => {
@@ -274,8 +276,8 @@ describe('state machine — final gate review freshness', () => {
     const run = runIn('FINAL_GATE', { headSha: '', reviewResult: approval('reviewer-1', '') });
     assert.equal(isReviewFresh(run), false);
     assert.throws(
-      () => applyTransition(run, { type: 'gate_passed' }, T0),
-      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'stale-review',
+      () => applyTransition(run, { type: 'gate_passed' as never }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
     );
     const next = applyTransition(run, { type: 'gate_blocked' }, T0);
     assert.equal(next.state, 'REVIEWING');
@@ -307,8 +309,8 @@ describe('state machine — review events must be bound to the current HEAD', ()
 
     assert.equal(isReviewFresh(run), true);
     assert.throws(
-      () => applyTransition(run, { type: 'gate_passed' }, T0),
-      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'contradictory-review',
+      () => applyTransition(run, { type: 'gate_passed' as never }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
     );
   });
 
@@ -320,8 +322,8 @@ describe('state machine — review events must be bound to the current HEAD', ()
 
     assert.equal(isReviewFresh(run), true);
     assert.throws(
-      () => applyTransition(run, { type: 'gate_passed' }, T0),
-      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'wrong-verdict',
+      () => applyTransition(run, { type: 'gate_passed' as never }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
     );
   });
 
@@ -418,7 +420,7 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
     }
   });
 
-  it('rejects gate_passed that attempts to swap in an unreviewed HEAD', () => {
+  it('rejects a removed public final-gate event that attempts to swap in an unreviewed HEAD', () => {
     const run = runIn('FINAL_GATE', {
       headSha: 'sha-1',
       reviewResult: approval('reviewer-1', 'sha-1'),
@@ -426,20 +428,18 @@ describe('state machine — HEAD mutation is bound to implementation or explicit
     });
     assert.equal(isReviewFresh(run), true);
     assert.throws(
-      () => applyTransition(run, { type: 'gate_passed', headSha: 'sha-2' }, T0),
-      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'head-mutation-not-allowed',
+      () => applyTransition(run, { type: 'gate_passed' as never, headSha: 'sha-2' }, T0),
+      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'unknown-transition',
     );
   });
 
-  it('gate_passed without a HEAD payload keeps the approved HEAD', () => {
+  it('does not permit a public final-gate event without a HEAD payload', () => {
     const run = runIn('FINAL_GATE', {
       headSha: 'sha-1',
       reviewResult: approval('reviewer-1', 'sha-1'),
       validationResult: validationPassed('sha-1'),
     });
-    const next = applyTransition(run, { type: 'gate_passed' }, T0);
-    assert.equal(next.state, 'MERGE_READY');
-    assert.equal(next.headSha, 'sha-1');
+    assert.throws(() => applyTransition(run, { type: 'gate_passed' as never }, T0), /Invalid transition/);
   });
 
   it('rejects merged that silently replaces the approved HEAD', () => {
@@ -529,7 +529,6 @@ describe('state machine — agent result semantics match the event', () => {
     assert.equal(transitionRequiresResult('changes_requested'), 'review');
     assert.equal(transitionRequiresResult('start'), 'none');
     assert.equal(transitionRequiresResult('merged'), 'none');
-    assert.equal(transitionRequiresResult('gate_passed'), 'none');
   });
 });
 

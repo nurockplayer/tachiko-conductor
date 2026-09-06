@@ -196,7 +196,7 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.equal(result.run.validationResult?.status, 'unknown');
-    assert.equal(result.run.validationResult?.hosted.status, 'waiting');
+    assert.equal(result.run.validationResult?.hosted.status, 'unknown');
   });
 
   it('persists local evidence while hosted checks wait, then resumes with a fresh hosted pass', async () => {
@@ -288,7 +288,7 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'MERGE_READY');
     assert.equal(result.run.headSha, HEAD2);
-    assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'gate_passed'));
+    assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'final_gate_verified'));
   });
 
   it('resolves a fresh ephemeral MCP capability before initial implementation and every review fix', async () => {
@@ -464,7 +464,7 @@ describe('runWorkflow', () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
     run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
-    run = applyTransition(run, { type: 'gate_passed' }, T0);
+    run = { ...run, state: 'MERGE_READY', history: [...run.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
     run = applyTransition(run, { type: 'merged' }, T0);
     store.update(run);
     const implementation = new FakeImplementation([]);

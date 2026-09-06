@@ -19,6 +19,8 @@ describe('hosted-check policy evaluation', () => {
   it('does not treat a missing policy and zero checks as passing', () => {
     assert.equal(evaluate({ overall: 'passing', observedCheckNames: [] }), 'unknown');
     assert.equal(evaluate({ overall: 'passing', observedCheckNames: [], policy: null }), 'unknown');
+    assert.equal(evaluate({ overall: 'pending', observedCheckNames: ['ci'] }), 'unknown');
+    assert.equal(evaluate({ overall: 'failing', observedCheckNames: ['ci'] }), 'unknown');
   });
 
   it('keeps a required zero-check response unknown', () => {
@@ -32,10 +34,10 @@ describe('hosted-check policy evaluation', () => {
     assert.equal(evaluate({ overall: 'passing', observedCheckNames: ['build', 'test'], policy }), 'passed');
   });
 
-  it('prioritizes actual failing and pending observations', () => {
+  it('keeps not-required neutral even when provider observations are failing or pending', () => {
     const policy = { mode: 'not_required' as const };
-    assert.equal(evaluate({ overall: 'failing', observedCheckNames: [], policy }), 'failed');
-    assert.equal(evaluate({ overall: 'pending', observedCheckNames: [], policy }), 'waiting');
+    assert.equal(evaluate({ overall: 'failing', observedCheckNames: [], policy }), 'not_required');
+    assert.equal(evaluate({ overall: 'pending', observedCheckNames: [], policy }), 'not_required');
     assert.equal(evaluate({ overall: 'failing', policy: { mode: 'required' } }), 'failed');
     assert.equal(evaluate({ overall: 'pending', policy: { mode: 'required' } }), 'waiting');
   });
@@ -48,6 +50,6 @@ describe('hosted-check policy evaluation', () => {
 
   it('keeps non-empty not-required observations neutral', () => {
     assert.equal(evaluate({ overall: 'passing', observedCheckNames: ['build'], policy: { mode: 'not_required' } }), 'not_required');
-    assert.equal(evaluate({ overall: 'unknown', observedCheckNames: ['build'], policy: { mode: 'not_required' } }), 'unknown');
+    assert.equal(evaluate({ overall: 'unknown', observedCheckNames: ['build'], policy: { mode: 'not_required' } }), 'not_required');
   });
 });

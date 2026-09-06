@@ -31,7 +31,9 @@ describe('resume across process restarts', () => {
 
       resumed = applyTransition(resumed!, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0);
       assert.equal(resumed.state, 'FINAL_GATE');
-      resumed = applyTransition(resumed, { type: 'gate_passed' }, T0);
+      // Readiness is intentionally owned by the live workflow, not a public
+      // transition. Simulate only a workflow-produced persisted snapshot.
+      resumed = { ...resumed, state: 'MERGE_READY', history: [...resumed.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
       assert.equal(resumed.state, 'MERGE_READY');
       store2.update(resumed);
 

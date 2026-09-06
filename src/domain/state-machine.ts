@@ -98,7 +98,6 @@ export const TRANSITION_TABLE: Readonly<
   },
   FINAL_GATE: {
     revalidate: 'VALIDATING',
-    gate_passed: 'MERGE_READY',
     gate_blocked: 'REVIEWING',
     wait_dependency: 'WAITING_DEPENDENCY',
     escalate: 'NEEDS_HUMAN',
@@ -200,11 +199,21 @@ export function isReviewFresh(run: Run): boolean {
 
 /** Validation may only authorize the exact non-empty HEAD it observed. */
 export interface ActiveValidationConfiguration {
-  /** Includes an explicit disabled/absent identity; it is never a wildcard. */
-  readonly localRevision: string | null;
-  /** Includes an explicit disabled/absent identity; it is never a wildcard. */
-  readonly hostedPolicyRevision: string | null;
+  readonly local: LocalValidationPolicyIdentity;
+  readonly hosted: HostedValidationPolicyIdentity;
 }
+
+/** A validation adapter is either absent, revisioned, or unusably anonymous. */
+export type LocalValidationPolicyIdentity =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'configured'; readonly revision: string }
+  | { readonly kind: 'invalid' };
+
+/** Hosted policy identity includes mode; an observation can never fill this in. */
+export type HostedValidationPolicyIdentity =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'configured'; readonly mode: 'required' | 'not_required'; readonly revision: string }
+  | { readonly kind: 'invalid' };
 
 /**
  * Validation is fresh only when it names the exact HEAD and the active
@@ -217,9 +226,46 @@ export function isValidationFresh(run: Run, active?: ActiveValidationConfigurati
     run.validationResult.headSha === run.headSha &&
     run.validationResult.status === 'passed' &&
     (active === undefined || (
-      run.validationResult.local.configRevision === active.localRevision &&
-      run.validationResult.hosted.policyRevision === active.hostedPolicyRevision
+      sameLocalPolicyIdentity(validationLocalPolicyIdentity(run.validationResult.local.configRevision), active.local) &&
+      sameHostedPolicyIdentity(validationHostedPolicyIdentity(run.validationResult.hosted.policyRevision, run.validationResult.hosted.policyMode), active.hosted)
     ));
+}
+
+function usableRevision(revision: string | null | undefined): revision is string {
+  return typeof revision === 'string' && revision.trim() !== '';
+}
+
+export function activeLocalPolicyIdentity(revision: string | undefined, present: boolean): LocalValidationPolicyIdentity {
+  if (!present) return { kind: 'absent' };
+  return usableRevision(revision) ? { kind: 'configured', revision } : { kind: 'invalid' };
+}
+
+export function validationLocalPolicyIdentity(revision: string | null): LocalValidationPolicyIdentity {
+  return usableRevision(revision) ? { kind: 'configured', revision } : { kind: 'invalid' };
+}
+
+export function activeHostedPolicyIdentity(
+  revision: string | undefined,
+  mode: 'required' | 'not_required' | 'unconfigured' | undefined,
+): HostedValidationPolicyIdentity {
+  if (mode === undefined || mode === 'unconfigured') return { kind: 'absent' };
+  return usableRevision(revision) ? { kind: 'configured', mode, revision } : { kind: 'invalid' };
+}
+
+export function validationHostedPolicyIdentity(
+  revision: string | null,
+  mode: 'required' | 'not_required' | 'unconfigured',
+): HostedValidationPolicyIdentity {
+  if (mode === 'unconfigured') return { kind: 'absent' };
+  return usableRevision(revision) ? { kind: 'configured', mode, revision } : { kind: 'invalid' };
+}
+
+function sameLocalPolicyIdentity(actual: LocalValidationPolicyIdentity, active: LocalValidationPolicyIdentity): boolean {
+  return actual.kind === 'configured' && active.kind === 'configured' && actual.revision === active.revision;
+}
+
+function sameHostedPolicyIdentity(actual: HostedValidationPolicyIdentity, active: HostedValidationPolicyIdentity): boolean {
+  return actual.kind === 'configured' && active.kind === 'configured' && actual.mode === active.mode && actual.revision === active.revision;
 }
 
 /** A usable SHA identity: present and not empty after trimming whitespace. */
@@ -527,46 +573,6 @@ function assertPayload(run: Run, input: TransitionInput): void {
 /** The final gate must only pass on a review bound to the exact current HEAD. */
 function assertGate(run: Run, input: TransitionInput): void {
   if (
-    input.type === 'gate_passed' &&
-    run.reviewResult !== undefined &&
-    run.reviewResult.verdict !== 'approve'
-  ) {
-    throw new InvalidTransitionError(
-      'wrong-verdict',
-      run.state,
-      input.type,
-      `Final gate cannot pass: the latest review verdict is "${run.reviewResult.verdict}", not "approve". Route it back to reviewing and the fix loop.`,
-    );
-  }
-  if (
-    input.type === 'gate_passed' &&
-    run.reviewResult !== undefined &&
-    !isReviewInternallyConsistent(run.reviewResult)
-  ) {
-    throw new InvalidTransitionError(
-      'contradictory-review',
-      run.state,
-      input.type,
-      `Final gate cannot pass: the latest approval contains blocking findings. Route those findings through "changes_requested".`,
-    );
-  }
-  if (input.type === 'gate_passed' && !isReviewFresh(run)) {
-    throw new InvalidTransitionError(
-      'stale-review',
-      run.state,
-      input.type,
-      `Final gate cannot pass: the latest review is bound to SHA "${run.reviewResult?.headSha ?? '(none)'}" but the run is at "${run.headSha ?? '(none)'}". Review the current HEAD before advancing.`,
-    );
-  }
-  if (input.type === 'gate_passed' && !isValidationFresh(run)) {
-    throw new InvalidTransitionError(
-      'stale-validation',
-      run.state,
-      input.type,
-      `Final gate cannot pass: no passing validation is bound to the current HEAD "${run.headSha ?? '(none)'}".`,
-    );
-  }
-  if (
     input.type === 'gate_blocked' &&
     isReviewFresh(run) &&
     isValidationFresh(run) &&
@@ -578,7 +584,7 @@ function assertGate(run: Run, input: TransitionInput): void {
       'fresh-review',
       run.state,
       input.type,
-      `Final gate cannot be marked blocked: the latest review is already fresh for SHA "${run.headSha}". Use "gate_passed".`,
+      `Final gate cannot be marked blocked: the latest review is already fresh for SHA "${run.headSha}". Reconcile live readiness through the workflow.`,
     );
   }
 }

@@ -740,9 +740,6 @@ export function runShowCommand(store: RunStore, id: string): Run {
 }
 
 export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string): Run {
-  if (type === 'gate_passed') {
-    throw new Error('Transition "gate_passed" requires the canonical live FINAL_GATE workflow and cannot be applied manually.');
-  }
   if (type === 'bootstrap_prepared') {
     throw new Error('Transition "bootstrap_prepared" requires durable bootstrap identity that this CLI cannot supply. Drive it through the workflow.');
   }

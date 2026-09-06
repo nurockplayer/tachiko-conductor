@@ -147,7 +147,7 @@ function isTransitionRecord(value: unknown): boolean {
   const record = value as Record<string, unknown>;
   return (
     typeof record.type === 'string' &&
-    TRANSITION_TYPES.includes(record.type as (typeof TRANSITION_TYPES)[number]) &&
+    (TRANSITION_TYPES.includes(record.type as (typeof TRANSITION_TYPES)[number]) || record.type === 'final_gate_verified') &&
     typeof record.from === 'string' &&
     WORKFLOW_STATES.includes(record.from as WorkflowState) &&
     typeof record.to === 'string' &&

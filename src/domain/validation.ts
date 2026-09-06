@@ -46,12 +46,10 @@ function isHostedEvidence(value: unknown): value is HostedValidationEvidence {
       : hosted.overall === 'failing' ? 'failed'
         : hosted.overall === 'pending' ? 'waiting' : 'unknown';
   if (hosted.status === 'not_required') {
-    return hosted.policyMode === 'not_required' && hosted.overall !== 'failing' && hosted.overall !== 'pending';
+    return hosted.policyMode === 'not_required';
   }
-  if (hosted.policyMode === 'not_required') return expected === 'failed' || expected === 'waiting'
-    ? hosted.status === expected
-    : false;
-  if (hosted.policyMode === 'unconfigured' && observedCheckNames.length === 0 && hosted.overall !== 'failing' && hosted.overall !== 'pending') {
+  if (hosted.policyMode === 'not_required') return false;
+  if (hosted.policyMode === 'unconfigured') {
     return hosted.status === 'unknown';
   }
   if (hosted.policyMode === 'required' && hosted.overall === 'passing' &&

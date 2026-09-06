@@ -44,9 +44,9 @@ export interface HostedCheckPolicyObservation {
 /**
  * Apply the explicit hosted-check policy to one exact-HEAD observation.
  *
- * Failing and pending observations take precedence over policy.  A
- * `not_required` policy is neutral: it yields `not_required`, including for a
- * zero-check response, rather than fabricating a passing check.  A required
+ * A `not_required` policy is neutral for every observation; it yields
+ * `not_required` rather than allowing a hosted observation to become a gate.
+ * A required
  * policy needs a non-empty, passing observation and (when named checks are
  * configured) all required names.  A missing policy is always unknown so an
  * unconfigured run cannot accidentally accept hosted evidence.
@@ -57,17 +57,19 @@ export function evaluateHostedCheckPolicy(
   const { overall, policy } = observation;
   const observedNames = observation.observedCheckNames ?? [];
 
+  // Provider observations have no authority to supply a missing policy.
+  if (policy === undefined || policy === null) return 'unknown';
+
+  if (policy?.mode === 'not_required') {
+    // The policy, rather than provider observations, decides that hosted
+    // checks are outside this run's gate.
+    return 'not_required';
+  }
+
   if (overall === 'failing') return 'failed';
   if (overall === 'pending') return 'waiting';
 
-  if (policy?.mode === 'not_required') {
-    // A zero-check response is explicitly neutral.  A non-empty response is
-    // neutral as well: this policy does not make hosted checks a gate.
-    if (observedNames.length === 0 || overall === 'passing') return 'not_required';
-    return 'unknown';
-  }
-
-  if (policy?.mode !== 'required' || overall !== 'passing' || observedNames.length === 0) {
+  if (policy.mode !== 'required' || overall !== 'passing' || observedNames.length === 0) {
     return 'unknown';
   }
 

@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  activeHostedPolicyIdentity,
+  activeLocalPolicyIdentity,
   InvalidTransitionError,
   applyTransition,
   isValidationFresh,
@@ -33,25 +35,43 @@ describe('validation closure regressions', () => {
 
     assert.equal(
       isValidationFresh(run, {
-        localRevision: 'test-config-v1',
-        hostedPolicyRevision: 'test-hosted-policy-v1',
+        local: { kind: 'configured', revision: 'test-config-v1' },
+        hosted: { kind: 'configured', mode: 'required', revision: 'test-hosted-policy-v1' },
       }),
       true,
     );
     assert.equal(
       isValidationFresh(run, {
-        localRevision: null,
-        hostedPolicyRevision: 'test-hosted-policy-v1',
+        local: { kind: 'absent' },
+        hosted: { kind: 'configured', mode: 'required', revision: 'test-hosted-policy-v1' },
       }),
       false,
     );
     assert.equal(
       isValidationFresh(run, {
-        localRevision: 'test-config-v1',
-        hostedPolicyRevision: null,
+        local: { kind: 'configured', revision: 'test-config-v1' },
+        hosted: { kind: 'absent' },
       }),
       false,
     );
+  });
+
+  it('distinguishes revision, mode, absent, and anonymous-present policy identities', () => {
+    const run = runIn('FINAL_GATE', {
+      headSha: OLD_HEAD,
+      validationResult: validationPassed(OLD_HEAD),
+    });
+    const local = { kind: 'configured' as const, revision: 'test-config-v1' };
+    const hosted = { kind: 'configured' as const, mode: 'required' as const, revision: 'test-hosted-policy-v1' };
+
+    assert.equal(isValidationFresh(run, { local, hosted }), true);
+    assert.equal(isValidationFresh(run, { local: { kind: 'configured', revision: 'test-config-v2' }, hosted }), false);
+    assert.equal(isValidationFresh(run, { local, hosted: { kind: 'configured', mode: 'not_required', revision: 'test-hosted-policy-v1' } }), false);
+    assert.deepEqual(activeLocalPolicyIdentity(undefined, false), { kind: 'absent' });
+    assert.deepEqual(activeLocalPolicyIdentity(undefined, true), { kind: 'invalid' });
+    assert.deepEqual(activeHostedPolicyIdentity(undefined, undefined), { kind: 'absent' });
+    assert.deepEqual(activeHostedPolicyIdentity(undefined, 'required'), { kind: 'invalid' });
+    assert.equal(isValidationFresh(run, { local: activeLocalPolicyIdentity(undefined, true), hosted }), false);
   });
 
   it('clears prior review and validation evidence when a new HEAD is accepted', () => {

@@ -25,6 +25,7 @@ import { TARGET, T0, successResult, validationPassed } from './helpers.js';
 const HEAD = 'a'.repeat(40);
 const HEAD2 = 'b'.repeat(40);
 const BASE = 'c'.repeat(40);
+const TEST_HOSTED_POLICY = { revision: 'test-hosted-policy-v1', policy: { mode: 'required' as const } };
 const RESUME_WORKSPACE_DECISION = 'Resolve the workspace identity and retry';
 
 type Provider = 'claude-code' | 'codex-cli';
@@ -176,8 +177,10 @@ for (const provider of ['claude-code', 'codex-cli'] as const) {
           reviewer: new ApprovingReviewer(),
           validation: {
             kind: 'validation',
+            configRevision: 'test-config-v1',
             async validate(request: ValidationRequest) { return validationPassed(request.headSha).local; },
           } satisfies ValidationAdapter,
+          hostedCheckPolicy: TEST_HOSTED_POLICY,
         };
         try {
           const parked = route === 'direct'

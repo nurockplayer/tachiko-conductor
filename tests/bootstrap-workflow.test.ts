@@ -26,6 +26,7 @@ import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js
 const OLD = 'a'.repeat(40);
 const NEW = 'b'.repeat(40);
 const BASE = 'c'.repeat(40);
+const TEST_HOSTED_POLICY = { revision: 'test-hosted-policy-v1', policy: { mode: 'required' as const } };
 const dirs: string[] = [];
 const fixtures: BootstrapGitFixture[] = [];
 
@@ -148,6 +149,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       implementation: new NoopImplementation(),
       reviewer: new ApprovingReviewer(),
       validation: new PassingValidation(),
+      hostedCheckPolicy: TEST_HOSTED_POLICY,
       maxReviewAttempts: 2,
     };
 
@@ -279,7 +281,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     ]);
     const run = createRun(TARGET, T0, runId);
     store.create(run);
-    const outcome = await runWorkflow({ store, github: live, implementation: realImplementation, bootstrap, reviewer: new ApprovingReviewer(), validation: new PassingValidation() }, runId, { maxReviewAttempts: 1, now: () => T0 });
+    const outcome = await runWorkflow({ store, github: live, implementation: realImplementation, bootstrap, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, { maxReviewAttempts: 1, now: () => T0 });
     assert.equal(outcome.outcome, 'merge_ready', JSON.stringify(outcome));
     const restarted = new JsonFileStore({ dir }).read(runId)!;
     assert.equal(restarted.state, 'MERGE_READY');
@@ -314,6 +316,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       bootstrap,
       reviewer: new ApprovingReviewer(),
       validation: new PassingValidation(),
+      hostedCheckPolicy: TEST_HOSTED_POLICY,
     }, runId, { maxReviewAttempts: 1, now: () => T0 });
     assert.equal(outcome.outcome, 'merge_ready', JSON.stringify(outcome));
     assert.equal(implementation.requests.length, 0);
@@ -335,6 +338,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
         implementation: { kind: 'implementation-agent', run: async () => { calls.push('agent'); return successResult(NEW); } },
         reviewer: { kind: 'reviewer', review: async () => { calls.push('reviewer'); return { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] }; } },
         validation: new PassingValidation(),
+        hostedCheckPolicy: TEST_HOSTED_POLICY,
         bootstrap: { kind: 'implementation-bootstrap', plan: async () => identity, prepare: async () => { calls.push('prepare'); return identity; }, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => ({ headSha: NEW, branch: identity.branch }) },
       }, run.id, { maxReviewAttempts: 1, now: () => T0 });
       assert.equal(result.outcome, 'needs_human', state);
@@ -413,7 +417,13 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: prepared }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: { ...successResult(oldHead, 'prior implementation'), executor: { provider: 'fixture', sessionId: 'executor-1' } }, headSha: oldHead, pullRequest: { number: 21, headSha: oldHead } }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(oldHead) }, T0);
+    run = applyTransition(run, {
+      type: 'validation_passed',
+      validationResult: {
+        ...validationPassed(oldHead),
+        hosted: { ...validationPassed(oldHead).hosted, pullRequestNumber: 21 },
+      },
+    }, T0);
     run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'old-reviewer', headSha: oldHead, findings: [] } }, T0);
     store.create(run);
     const live = () => {
@@ -443,11 +453,11 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
     });
     const beforeRecovery = fixture.commands.length;
-    const offered = await runWorkflow({ store, github, implementation, bootstrap, reviewer, validation }, runId, { now: () => T0, maxReviewAttempts: 2 });
+    const offered = await runWorkflow({ store, github, implementation, bootstrap, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, { now: () => T0, maxReviewAttempts: 2 });
     assert.equal(offered.outcome, 'needs_human');
     assert.ok(offered.run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION));
     assert.equal(reviews, 0);
-    const outcome = await resumeCommand({ store: new JsonFileStore({ dir }), github, implementation, bootstrap, reviewer, validation }, runId, LIVE_HEAD_SYNC_DECISION, { now: () => T0, maxReviewAttempts: 2 });
+    const outcome = await resumeCommand({ store: new JsonFileStore({ dir }), github, implementation, bootstrap, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, LIVE_HEAD_SYNC_DECISION, { now: () => T0, maxReviewAttempts: 2 });
     assert.equal(outcome.outcome, 'merge_ready', JSON.stringify(outcome));
     assert.deepEqual(reviewedHeads, [newHead, fixHead]);
     assert.deepEqual(fixture.commands.slice(beforeRecovery).filter((c) => c.args[0] === 'merge').map((c) => c.args), [['merge', '--ff-only', newHead]]);
@@ -496,7 +506,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       } };
       const store = new JsonFileStore({ dir });
       const deps = { store, github: new QueueGithub(Array.from({ length: 8 }, () => live)), implementation,
-        bootstrap: new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner }), reviewer: new ApprovingReviewer(), validation: new PassingValidation() };
+        bootstrap: new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner }), reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY };
       const result = await runWorkflow(deps, runId, { maxReviewAttempts: 1, now: () => T0 });
       assert.equal(result.outcome, 'merge_ready', JSON.stringify(result));
       assert.equal((await runWorkflow({ ...deps, store: new JsonFileStore({ dir }) }, runId, { maxReviewAttempts: 1 })).outcome, 'merge_ready');
@@ -546,7 +556,7 @@ for (const route of ['direct', 'resumed'] as const) {
         } else f.git(i.workspacePath, ['push', 'origin', i.branch]);
         return successResult(head);
       } };
-      const result = await runWorkflow({ store: new JsonFileStore({ dir }), bootstrap: b, github: new QueueGithub(Array.from({ length: 12 }, () => live)), implementation, reviewer: new ApprovingReviewer(), validation: new PassingValidation() }, id, { maxReviewAttempts: 3, now: () => T0 });
+      const result = await runWorkflow({ store: new JsonFileStore({ dir }), bootstrap: b, github: new QueueGithub(Array.from({ length: 12 }, () => live)), implementation, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, id, { maxReviewAttempts: 3, now: () => T0 });
       assert.equal(result.outcome, delta === 'valid' ? 'merge_ready' : 'needs_human', JSON.stringify(result));
       assert.equal(calls, 1);
       const persisted = new JsonFileStore({ dir }).read(id)!;
@@ -624,7 +634,7 @@ for (const route of ['initial', 'direct', 'resumed'] as const) {
         : snapshot(head, pr(7, head, { headRef: i.branch, baseRef: i.baseBranch }));
       const deps = { store, bootstrap: b, github: new QueueGithub(Array.from({ length: 20 }, () => live)),
         implementation: provider === 'claude' ? new ClaudeCodeAdapter({ runner }) : new CodexCliAdapter({ runner }),
-        reviewer: new ApprovingReviewer(), validation: new PassingValidation(), resolveImplementationCapabilities: async () => {
+        reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY, resolveImplementationCapabilities: async () => {
           if (failing && phase === 'pre') writeFileSync(`${i.workspacePath}/dirty.txt`, 'capability-time race\n');
           return [];
         } };
@@ -659,7 +669,7 @@ for (const resultKind of ['no-delta', 'orphan'] as const) {
     const store = new JsonFileStore({ dir }); store.create(run);
     const implementation = new NoopImplementation();
     const live = () => snapshot(head, pr(7, head, { headRef: i.branch }));
-    const result = await runWorkflow({ store, bootstrap: b, github: new QueueGithub([live, live]), implementation, reviewer: new ApprovingReviewer(), validation: new PassingValidation() }, runId, { now: () => T0, maxReviewAttempts: 2 });
+    const result = await runWorkflow({ store, bootstrap: b, github: new QueueGithub([live, live]), implementation, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, { now: () => T0, maxReviewAttempts: 2 });
     assert.equal(result.outcome, 'needs_human');
     assert.equal(implementation.requests.length, 0);
     const persisted = new JsonFileStore({ dir }).read(runId)!;

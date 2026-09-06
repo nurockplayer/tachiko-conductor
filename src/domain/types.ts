@@ -55,7 +55,6 @@ export const TRANSITION_TYPES = [
   'changes_requested',
   'start_fix',
   'revalidate',
-  'gate_passed',
   'gate_blocked',
   'merged',
   'wait_dependency',
@@ -184,7 +183,8 @@ export interface Interrupt {
 
 /** One applied step in a run's history. */
 export interface TransitionRecord {
-  readonly type: TransitionType;
+  /** The workflow-owned final authority records this event after live reconciliation. */
+  readonly type: TransitionType | 'final_gate_verified';
   readonly from: WorkflowState;
   readonly to: WorkflowState;
   readonly at: string;

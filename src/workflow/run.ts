@@ -9,7 +9,7 @@ import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from 
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
-import { applyTransition, isReviewFresh, isValidationFresh } from '../domain/state-machine.js';
+import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
@@ -147,7 +147,7 @@ async function validateExactHead(
   if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
   const reusable = run.validationResult;
   const local = reusable?.headSha === run.headSha && reusable.local.status === 'passed' &&
-    validation?.configRevision !== undefined && reusable.local.configRevision === validation.configRevision
+    validation?.configRevision !== undefined && validation.configRevision.trim() !== '' && reusable.local.configRevision === validation.configRevision
     ? reusable.local
     : validation === undefined
       ? unavailableLocalValidation()
@@ -157,8 +157,25 @@ async function validateExactHead(
 
 function activeValidationConfiguration(deps: WorkflowDependencies) {
   return {
-    localRevision: deps.validation?.configRevision ?? null,
-    hostedPolicyRevision: deps.hostedCheckPolicy?.revision ?? null,
+    local: activeLocalPolicyIdentity(deps.validation?.configRevision, deps.validation !== undefined),
+    hosted: activeHostedPolicyIdentity(deps.hostedCheckPolicy?.revision, deps.hostedCheckPolicy?.policy.mode),
+  };
+}
+
+/**
+ * The only code path which produces MERGE_READY.  It is intentionally local
+ * to the workflow so callers cannot advance cached state around the live
+ * GitHub reconciliation immediately above this call site.
+ */
+function completeLiveFinalGate(run: Run, now: string, activeValidation: ActiveValidationConfiguration): Run {
+  if (run.state !== 'FINAL_GATE' || !isReviewFresh(run) || !isValidationFresh(run, activeValidation) || run.reviewResult?.verdict !== 'approve' || run.reviewResult.findings.some((finding) => finding.severity === 'blocking')) {
+    throw new Error('Live final-gate authority received a run without fresh approving review and validation evidence.');
+  }
+  return {
+    ...run,
+    state: 'MERGE_READY',
+    updatedAt: now,
+    history: [...run.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: now }],
   };
 }
 
@@ -621,7 +638,7 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
-        run = applyTransition(run, { type: 'gate_passed' }, now());
+        run = completeLiveFinalGate(run, now(), activeValidationConfiguration(deps));
         store.update(run);
         break;
       }
