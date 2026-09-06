@@ -33,8 +33,8 @@ export interface ValidationRequest {
 /** Provider-neutral boundary for Conductor-observed local validation. */
 export interface ValidationAdapter {
   readonly kind: 'validation';
-  /** Stable identity for the command plan whose successful evidence may be reused. */
-  readonly configRevision?: string;
+  /** Non-empty stable identity for the command plan whose evidence may be admitted. */
+  readonly configRevision: string;
   /** This boundary refuses ambient working directories and needs the owned bootstrap workspace. */
   readonly requiresOwnedWorkspace?: boolean;
   validate(request: ValidationRequest): Promise<LocalValidationEvidence>;

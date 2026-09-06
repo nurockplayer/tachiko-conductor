@@ -252,6 +252,89 @@ describe('runWorkflow', () => {
     assert.equal(result.run.validationResult?.hosted.status, 'unknown');
   });
 
+  it('keeps an explicit not-required hosted policy neutral when its observation endpoint is unavailable', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-hosted-neutral');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
+    });
+
+    const result = await runWorkflow(
+      {
+        store,
+        github,
+        implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([approve(HEAD)]),
+        validation: new FakeValidation(),
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'not_required' } },
+      },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(result.run.validationResult?.hosted.status, 'not_required');
+  });
+
+  it('parks an anonymous configured validation adapter before it can execute or enter review', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-anonymous');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    let calls = 0;
+    const anonymous = {
+      kind: 'validation' as const,
+      async validate() {
+        calls += 1;
+        return validationPassed(HEAD).local;
+      },
+    } as unknown as ValidationAdapter;
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: anonymous, hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(calls, 0);
+    assert.match(result.reason, /no usable stable revision/i);
+  });
+
+  it('does not re-review a persisted run after its configured validation authority loses identity', async () => {
+    const store = new MemoryStore();
+    reviewingRun(store, 'review-anonymous', HEAD);
+    let reviewCalls = 0;
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review() {
+        reviewCalls += 1;
+        return approve(HEAD);
+      },
+    };
+    const anonymous = {
+      kind: 'validation' as const,
+      async validate() { return validationPassed(HEAD).local; },
+    } as unknown as ValidationAdapter;
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation: new FakeImplementation([]), reviewer, validation: anonymous, hostedCheckPolicy: TEST_HOSTED_POLICY },
+      'review-anonymous',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(reviewCalls, 0);
+  });
+
   it('routes a failed validation through a bounded implementation repair instead of terminal failure', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'validation-failure-repair');

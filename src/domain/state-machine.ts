@@ -217,18 +217,24 @@ export type HostedValidationPolicyIdentity =
 
 /**
  * Validation is fresh only when it names the exact HEAD and the active
- * repository/run configuration that interpreted it.  Callers without an
- * active configuration can still use the exact-HEAD predicate alone.
+ * repository/run configuration that interpreted it. The active identity is
+ * mandatory: there is no public wildcard freshness predicate.
  */
-export function isValidationFresh(run: Run, active?: ActiveValidationConfiguration): boolean {
+export function isValidationFresh(run: Run, active: ActiveValidationConfiguration): boolean {
   return run.validationResult !== undefined &&
     run.headSha !== undefined && run.headSha.trim() !== '' &&
     run.validationResult.headSha === run.headSha &&
     run.validationResult.status === 'passed' &&
-    (active === undefined || (
-      sameLocalPolicyIdentity(validationLocalPolicyIdentity(run.validationResult.local.configRevision), active.local) &&
-      sameHostedPolicyIdentity(validationHostedPolicyIdentity(run.validationResult.hosted.policyRevision, run.validationResult.hosted.policyMode), active.hosted)
-    ));
+    validationEvidenceMatchesActive(run.validationResult, active);
+}
+
+/** Exact policy identity match for evidence admission as well as final freshness. */
+export function validationEvidenceMatchesActive(
+  result: ValidationResult,
+  active: ActiveValidationConfiguration,
+): boolean {
+  return sameLocalPolicyIdentity(validationLocalPolicyIdentity(result.local.configRevision), active.local) &&
+    sameHostedPolicyIdentity(validationHostedPolicyIdentity(result.hosted.policyRevision, result.hosted.policyMode), active.hosted);
 }
 
 function usableRevision(revision: string | null | undefined): revision is string {
@@ -570,25 +576,6 @@ function assertPayload(run: Run, input: TransitionInput): void {
   }
 }
 
-/** The final gate must only pass on a review bound to the exact current HEAD. */
-function assertGate(run: Run, input: TransitionInput): void {
-  if (
-    input.type === 'gate_blocked' &&
-    isReviewFresh(run) &&
-    isValidationFresh(run) &&
-    run.reviewResult !== undefined &&
-    run.reviewResult.verdict === 'approve' &&
-    isReviewInternallyConsistent(run.reviewResult)
-  ) {
-    throw new InvalidTransitionError(
-      'fresh-review',
-      run.state,
-      input.type,
-      `Final gate cannot be marked blocked: the latest review is already fresh for SHA "${run.headSha}". Reconcile live readiness through the workflow.`,
-    );
-  }
-}
-
 /**
  * Apply a transition to a run, returning the new run snapshot.
  *
@@ -617,7 +604,6 @@ export function applyTransition(
   }
 
   assertPayload(run, input);
-  assertGate(run, input);
   const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
 
   let to: WorkflowState;

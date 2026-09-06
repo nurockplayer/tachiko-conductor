@@ -264,12 +264,10 @@ describe('state machine — final gate review freshness', () => {
     assert.throws(() => applyTransition(run, { type: 'gate_passed' as never }, T0), /Invalid transition/);
   });
 
-  it('rejects gate_blocked while the review is already fresh', () => {
+  it('allows the public blocked event to conservatively return a fresh cached gate to review', () => {
     const run = { ...gated(), reviewResult: approval('reviewer-1', 'sha-2') };
-    assert.throws(
-      () => applyTransition(run, { type: 'gate_blocked' }),
-      (err: unknown) => err instanceof InvalidTransitionError && err.code === 'fresh-review',
-    );
+    const next = applyTransition(run, { type: 'gate_blocked' }, T0);
+    assert.equal(next.state, 'REVIEWING');
   });
 
   it('never treats empty HEAD SHAs as fresh, so the gate cannot be bypassed', () => {

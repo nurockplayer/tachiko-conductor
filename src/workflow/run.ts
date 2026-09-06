@@ -9,7 +9,7 @@ import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from 
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
-import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, type ActiveValidationConfiguration } from '../domain/state-machine.js';
+import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
@@ -100,9 +100,15 @@ function hostedValidation(
   // GitHub observations never create their own policy authority. Without an
   // explicit repository/run policy, every hosted result is fail-closed.
   const effectivePolicy = configuredPolicy?.policy;
-  const status = snapshot.checks.availability !== 'available'
-    ? 'unknown'
-    : evaluateHostedCheckPolicy({
+  const status = configuredPolicy?.policy.mode === 'not_required'
+    ? evaluateHostedCheckPolicy({
+      overall: snapshot.checks.overall,
+      observedCheckNames,
+      policy: configuredPolicy.policy,
+    })
+    : snapshot.checks.availability !== 'available'
+      ? 'unknown'
+      : evaluateHostedCheckPolicy({
       overall: snapshot.checks.overall,
       observedCheckNames,
       ...(effectivePolicy === undefined ? {} : { policy: effectivePolicy }),
@@ -147,7 +153,7 @@ async function validateExactHead(
   if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
   const reusable = run.validationResult;
   const local = reusable?.headSha === run.headSha && reusable.local.status === 'passed' &&
-    validation?.configRevision !== undefined && validation.configRevision.trim() !== '' && reusable.local.configRevision === validation.configRevision
+    validation !== undefined && validation.configRevision.trim() !== '' && reusable.local.configRevision === validation.configRevision
     ? reusable.local
     : validation === undefined
       ? unavailableLocalValidation()
@@ -160,6 +166,12 @@ function activeValidationConfiguration(deps: WorkflowDependencies) {
     local: activeLocalPolicyIdentity(deps.validation?.configRevision, deps.validation !== undefined),
     hosted: activeHostedPolicyIdentity(deps.hostedCheckPolicy?.revision, deps.hostedCheckPolicy?.policy.mode),
   };
+}
+
+function invalidValidationAuthority(active: ActiveValidationConfiguration): string | null {
+  if (active.local.kind === 'invalid') return 'The configured local validation authority has no usable stable revision.';
+  if (active.hosted.kind === 'invalid') return 'The configured hosted-check policy has no usable stable revision.';
+  return null;
 }
 
 /**
@@ -399,6 +411,17 @@ export async function runWorkflow(
       }
 
       case 'VALIDATING': {
+        const activeValidation = activeValidationConfiguration(deps);
+        const invalidAuthority = invalidValidationAuthority(activeValidation);
+        if (invalidAuthority !== null) {
+          return park(
+            run,
+            `${invalidAuthority} Refusing validation and review admission until an explicit identity is configured.`,
+            store,
+            now,
+            ['Configure a stable validation-policy identity and retry', CANCEL_RUN_DECISION],
+          );
+        }
         let snapshot: GitHubLiveSnapshot;
         try {
           snapshot = await github.readLiveSnapshot(target);
@@ -498,6 +521,19 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
+        if (!validationEvidenceMatchesActive(validationResult, activeValidation)) {
+          const reason = `Validation evidence for ${run.headSha} does not match the active validation-policy identity.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate', reason, validationResult,
+              interrupt: { evidence: reason, choices: ['Restore matching validation evidence and retry', CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
         run = applyTransition(
           run,
           {
@@ -512,6 +548,16 @@ export async function runWorkflow(
 
       case 'REVIEWING':
       case 'CHANGES_REQUESTED': {
+        const invalidAuthority = invalidValidationAuthority(activeValidationConfiguration(deps));
+        if (invalidAuthority !== null) {
+          return park(
+            run,
+            `${invalidAuthority} Refusing review admission until an explicit identity is configured.`,
+            store,
+            now,
+            ['Configure a stable validation-policy identity and retry', CANCEL_RUN_DECISION],
+          );
+        }
         const loop = await runReviewLoop(
           { store, github, implementation, reviewer, bootstrap: deps.bootstrap, resolveImplementationCapabilities: deps.resolveImplementationCapabilities },
           run.id,
@@ -527,6 +573,16 @@ export async function runWorkflow(
       }
 
       case 'FINAL_GATE': {
+        const invalidAuthority = invalidValidationAuthority(activeValidationConfiguration(deps));
+        if (invalidAuthority !== null) {
+          return park(
+            run,
+            `${invalidAuthority} Refusing final-gate re-entry until an explicit identity is configured.`,
+            store,
+            now,
+            ['Configure a stable validation-policy identity and retry', CANCEL_RUN_DECISION],
+          );
+        }
         if (!isReviewFresh(run)) {
           run = applyTransition(run, { type: 'gate_blocked' }, now());
           store.update(run);
