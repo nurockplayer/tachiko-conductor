@@ -434,7 +434,7 @@ describe('workflow run and resume commands', () => {
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await runIssueCommand(
-      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
       'acme/widgets#42',
       { now: () => T0 },
     );
