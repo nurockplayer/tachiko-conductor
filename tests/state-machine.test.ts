@@ -75,7 +75,7 @@ describe('state machine — happy path', () => {
     assert.equal(run.headSha, 'sha-1');
     assert.equal(run.agentResult?.exitStatus, 'success');
 
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1') }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1'), pullRequest: { number: 7, headSha: 'sha-1' } }, T0);
     assert.equal(run.state, 'REVIEWING');
 
     run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0);
@@ -116,7 +116,7 @@ describe('state machine — happy path', () => {
     let run = newRun();
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-1') }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1') }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1'), pullRequest: { number: 7, headSha: 'sha-1' } }, T0);
     run = applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-1') }, T0);
     assert.equal(run.state, 'CHANGES_REQUESTED');
     assert.equal(run.reviewResult?.verdict, 'request_changes');
@@ -223,7 +223,7 @@ describe('state machine — invalid transitions fail loudly', () => {
 describe('state machine — final gate review freshness', () => {
   /** A FINAL_GATE run whose work is at sha-2. */
   function gated(): Run {
-    return runIn('FINAL_GATE', { headSha: 'sha-2', validationResult: validationPassed('sha-2') });
+    return runIn('FINAL_GATE', { headSha: 'sha-2', pullRequest: { number: 7, headSha: 'sha-2' }, validationResult: validationPassed('sha-2') });
   }
 
   it('rejects the removed public gate event even when a review is stale', () => {
@@ -245,7 +245,7 @@ describe('state machine — final gate review freshness', () => {
 
   it('returns reviewer-bound policy drift to VALIDATING and clears only the stale review', () => {
     const run = {
-      ...runIn('REVIEWING', { headSha: 'sha-2', validationResult: validationPassed('sha-2') }),
+      ...runIn('REVIEWING', { headSha: 'sha-2', pullRequest: { number: 7, headSha: 'sha-2' }, validationResult: validationPassed('sha-2') }),
       reviewResult: approval('reviewer-1', 'sha-2'),
     };
 
@@ -258,7 +258,7 @@ describe('state machine — final gate review freshness', () => {
   });
 
   it('re-enters a fresh review cycle from a blocked gate without exposing readiness', () => {
-    let run = runIn('FINAL_GATE', { headSha: 'sha-2', reviewResult: approval('reviewer-1', 'sha-1'), validationResult: validationPassed('sha-2') });
+    let run = runIn('FINAL_GATE', { headSha: 'sha-2', pullRequest: { number: 7, headSha: 'sha-2' }, reviewResult: approval('reviewer-1', 'sha-1'), validationResult: validationPassed('sha-2') });
     assert.equal(isReviewFresh(run), false);
 
     run = applyTransition(run, { type: 'gate_blocked' }, T0);
@@ -298,7 +298,7 @@ describe('state machine — final gate review freshness', () => {
 
 describe('state machine — review events must be bound to the current HEAD', () => {
   it('rejects an approval that still contains a blocking finding', () => {
-    const run = runIn('REVIEWING', { headSha: 'sha-2' });
+    const run = runIn('REVIEWING', { headSha: 'sha-2', pullRequest: { number: 7, headSha: 'sha-2' }, validationResult: validationPassed('sha-2') });
     const contradictoryApproval = {
       ...approval('reviewer-1', 'sha-2'),
       findings: [{ severity: 'blocking' as const, summary: 'the diff still has a bug' }],
@@ -348,7 +348,11 @@ describe('state machine — review events must be bound to the current HEAD', ()
   });
 
   it('accepts a changes_requested review bound to the current SHA', () => {
-    const run = runIn('REVIEWING', { headSha: 'sha-2' });
+    const run = runIn('REVIEWING', {
+      headSha: 'sha-2',
+      pullRequest: { number: 7, headSha: 'sha-2' },
+      validationResult: validationPassed('sha-2'),
+    });
     const next = applyTransition(
       run,
       { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-2') },

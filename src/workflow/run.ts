@@ -404,6 +404,15 @@ export async function runWorkflow(
           }
           run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha, pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha } }, now());
         } else {
+          // An implementation result is only a claim.  Re-read the live PR
+          // after every unbootstrapped implementation effect as well: this
+          // covers initial work, an interrupted review fix resumed by the
+          // outer workflow, and validation-repair continuity after restart.
+          try {
+            snapshot = await github.readLiveSnapshot(target);
+          } catch (error) {
+            return githubFailureOutcome(run, error, store, now);
+          }
           if (result.headSha === undefined || snapshot.pullRequest === null || snapshot.headSha !== result.headSha ||
             pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true }) !== null) {
             return park(run, 'Live pull request does not prove the implementation exact HEAD and accepted PR identity.', store, now);

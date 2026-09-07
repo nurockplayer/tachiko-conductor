@@ -52,8 +52,13 @@ function isHostedEvidence(value: unknown): value is HostedValidationEvidence {
   if (hosted.policyMode === 'unconfigured') {
     return hosted.status === 'unknown';
   }
+  // A named required policy is fail-closed until every required provider
+  // observation is present.  For an unnamed required policy, an empty
+  // *passing* observation is likewise not proof, but a provider-reported
+  // pending/failing result remains meaningful transport evidence.
   if (hosted.policyMode === 'required' &&
-    (observedCheckNames.length === 0 || requiredCheckNames.some((name) => !observedCheckNames.includes(name)))) {
+    (requiredCheckNames.some((name) => !observedCheckNames.includes(name)) ||
+      (hosted.overall === 'passing' && observedCheckNames.length === 0))) {
     return hosted.status === 'unknown';
   }
   return hosted.status === expected;

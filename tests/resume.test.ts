@@ -20,7 +20,7 @@ describe('resume across process restarts', () => {
 
       run = applyTransition(run, { type: 'start' }, T0);
       run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-1') }, T0);
-      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1') }, T0);
+      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1'), pullRequest: { number: 7, headSha: 'sha-1' } }, T0);
       store1.update(run);
 
       // --- process 2 (restart): pick up and push through the gate ---
