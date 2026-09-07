@@ -29,6 +29,11 @@ const KIND_ORDER: Readonly<Record<GitHubConversationEntry['kind'], number>> = {
   review_comment: 2,
 };
 
+/** GitHub REST permits up to 100 entries per page for these two endpoints. */
+const HOSTED_PAGE_SIZE = 100;
+/** A bounded read must never silently turn an unbounded provider result green. */
+const MAX_HOSTED_PAGES = 100;
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -61,6 +66,14 @@ function requireString(record: Record<string, unknown>, field: string, path: str
 function requirePositiveInt(record: Record<string, unknown>, field: string, path: string): number {
   const value = record[field];
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw invalid(path, `missing or invalid "${field}"`);
+  }
+  return value;
+}
+
+function requireNonNegativeInt(record: Record<string, unknown>, field: string, path: string): number {
+  const value = record[field];
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, `missing or invalid "${field}"`);
   }
   return value;
@@ -319,8 +332,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       // failure must not erase an otherwise coherent core Issue/PR/HEAD read,
       // but neither endpoint may make a partial observation look complete.
       const [statusResult, checkRunsResult] = await Promise.allSettled([
-        this.transport.get(statusPath),
-        this.transport.get(checkRunsPath),
+        this.readCompleteHostedObservation(statusPath, 'statuses'),
+        this.readCompleteHostedObservation(checkRunsPath, 'check_runs'),
       ]);
       if (statusResult.status === 'rejected' || checkRunsResult.status === 'rejected') {
         const failures = [
@@ -357,6 +370,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
 
       const reread = asRecordOrThrow(await this.transport.get(path), path);
       const rereadHead = asRecord(reread.head);
+      const rereadLive = this.normalizeLivePullRequest(reread, path);
       const tuple = (value: Record<string, unknown>): string => {
         const head = asRecord(value.head);
         const repository = asRecord(head?.repo);
@@ -365,7 +379,9 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       if (
         reread.number !== raw.number ||
         reread.state !== raw.state ||
-        rereadHead?.sha !== headSha || tuple(reread) !== tuple(raw)
+        rereadHead?.sha !== headSha || tuple(reread) !== tuple(raw) ||
+        rereadLive.isDraft !== live.isDraft || rereadLive.mergeable !== live.mergeable ||
+        rereadLive.mergeStateStatus !== live.mergeStateStatus || rereadLive.baseSha !== live.baseSha
       ) {
         throw new GitHubLiveStateError(
           'GH_SNAPSHOT_CHANGED',
@@ -407,6 +423,54 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       baseSha: requireString(base, 'sha', path),
       state: normalizePullState(record),
     };
+  }
+
+  /**
+   * Read a complete, bounded hosted observation.  These endpoints wrap their
+   * entries in an object instead of the array shape used by getPaginated(), so
+   * use their advertised total when available and otherwise only accept a
+   * terminal short page.  Any count drift, missing page, or page-limit breach
+   * is deliberately an unavailable hosted channel rather than partial green.
+   */
+  private async readCompleteHostedObservation(
+    path: string,
+    entriesField: 'statuses' | 'check_runs',
+  ): Promise<Record<string, unknown>> {
+    const entries: unknown[] = [];
+    let advertisedCount: number | null = null;
+
+    for (let page = 1; page <= MAX_HOSTED_PAGES; page += 1) {
+      const raw = asRecord(await this.transport.get(path, {
+        page: String(page),
+        per_page: String(HOSTED_PAGE_SIZE),
+      }));
+      if (raw === null) throw invalid(path, 'hosted observation is not an object');
+      const pageEntries = raw[entriesField];
+      if (!Array.isArray(pageEntries)) throw invalid(path, `missing ${entriesField} array`);
+
+      if (raw.total_count !== undefined) {
+        const count = requireNonNegativeInt(raw, 'total_count', path);
+        if (advertisedCount !== null && advertisedCount !== count) {
+          throw invalid(path, 'total_count changed while hosted observations were being read');
+        }
+        advertisedCount = count;
+      }
+      if (advertisedCount !== null && entries.length + pageEntries.length > advertisedCount) {
+        throw invalid(path, 'hosted observation contains more entries than total_count');
+      }
+      entries.push(...pageEntries);
+
+      if (advertisedCount !== null) {
+        if (entries.length === advertisedCount) return { ...raw, [entriesField]: entries };
+        if (pageEntries.length === 0) {
+          throw invalid(path, 'hosted observation ended before total_count entries were returned');
+        }
+        continue;
+      }
+      if (pageEntries.length < HOSTED_PAGE_SIZE) return { ...raw, [entriesField]: entries };
+    }
+
+    throw invalid(path, `hosted observation exceeded ${String(MAX_HOSTED_PAGES)} pages`);
   }
 
   private normalizeIssue(record: Record<string, unknown>, path: string): GitHubLiveSnapshot['issue'] {

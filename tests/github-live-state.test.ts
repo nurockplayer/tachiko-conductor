@@ -465,6 +465,10 @@ PR: #7`;
       { head: { sha: HEAD, ref: 'owned', repo: { name: 'widgets', owner: { login: 'other' } } } },
       { head: { sha: HEAD, ref: 'owned', repo: null } },
       { base: { sha: BASE, ref: 'release' } },
+      { draft: true },
+      { mergeable: false },
+      { mergeable_state: 'blocked' },
+      { base: { sha: 'c'.repeat(40), ref: 'main' } },
     ];
     for (const delta of changed) {
       const transport = prTransport().queue('repos/acme/widgets/pulls/7', first, { ...first, ...delta });

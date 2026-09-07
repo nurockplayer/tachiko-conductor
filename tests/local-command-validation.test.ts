@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -20,6 +20,12 @@ function request() {
   }
   const headSha = spawnSync('git', ['-C', workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
   return { target: TARGET, headSha, workspacePath };
+}
+
+function preExistingPullRequestRequest() {
+  const value = request();
+  assert.equal(spawnSync('git', ['-C', value.workspacePath, 'remote', 'add', 'origin', 'https://github.com/acme/widgets.git'], { encoding: 'utf8' }).status, 0);
+  return value;
 }
 
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -75,6 +81,30 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(wrongHead.status, 'unknown');
   });
 
+  it('runs a configured real command for an explicit verified pre-existing-PR workspace, never the ambient cwd', async () => {
+    const existing = preExistingPullRequestRequest();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const cwdProof = path.join(proofDir, 'cwd');
+    const adapter = new ConfiguredLocalValidationAdapter({
+      revision: 'pre-existing-pr-v1',
+      workspacePath: existing.workspacePath,
+      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(cwdProof)}, process.cwd())`], timeoutMs: 1_000 }],
+    });
+    const result = await adapter.validate({ target: TARGET, headSha: existing.headSha });
+    assert.equal(result.status, 'passed');
+    assert.equal(result.commands[0]?.outcome, 'passed');
+    assert.equal(realpathSync(readFileSync(cwdProof, 'utf8')), realpathSync(existing.workspacePath));
+
+    assert.equal(
+      (await new ConfiguredLocalValidationAdapter({
+        revision: 'wrong-repository-v1', workspacePath: existing.workspacePath,
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+      }).validate({ target: { ...TARGET, repo: 'other' }, headSha: existing.headSha })).status,
+      'unknown',
+    );
+  });
+
   it('forces a signal-resistant command to settle after the bounded grace period', async () => {
     const startedAt = Date.now();
     const result = await new ConfiguredLocalValidationAdapter(
@@ -83,6 +113,21 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(result.status, 'failed');
     assert.equal(result.commands[0]?.outcome, 'timed_out');
     assert.ok(Date.now() - startedAt < 2_500);
+  });
+
+  it('does not record a timeout until a signal-resistant descendant process group has settled', async () => {
+    const owned = request();
+    const pidFile = path.join(owned.workspacePath, 'descendant.pid');
+    const source = `const {spawn}=require('node:child_process'); const fs=require('node:fs'); const child=spawn(process.execPath,['-e',\"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)\"],{stdio:'ignore'}); fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid)); process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);`;
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, '-e', source], 100),
+    ).validate(owned);
+    assert.equal(result.status, 'failed');
+    assert.equal(result.commands[0]?.outcome, 'timed_out');
+    const pid = Number.parseInt(readFileSync(pidFile, 'utf8'), 10);
+    assert.ok(Number.isSafeInteger(pid));
+    assert.throws(() => process.kill(pid, 0), (error: unknown) =>
+      typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ESRCH');
   });
 
   it('fails closed for malformed configuration and an unavailable executable', async () => {

@@ -129,6 +129,12 @@ bounded argv-array commands, for example:
 export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
 ```
 
+`commands` 必須至少有一個項目。既存 PR（沒有 Conductor bootstrap 記錄）必須在同一設定中明確提供絕對 `workspacePath`；Conductor 會在執行前後驗證其 clean exact HEAD 與 `origin` 的 GitHub owner/repo，絕不使用 ambient cwd。例如：
+
+```bash
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","workspacePath":"/absolute/clean/worktree","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
+```
+
 Hosted checks are independently policy-controlled. Set
 `TACHIKO_HOSTED_CHECK_POLICY_CONFIG` with a stable revision and either
 `{"mode":"not_required"}` or `{"mode":"required","requiredCheckNames":[...]}`.
@@ -144,6 +150,11 @@ HEAD and an explicit active identity (local revision; hosted mode plus
 revision). Removing, changing, or supplying an anonymous policy/adapter is an
 identity change, never a nullable wildcard. An explicit `not_required` hosted
 policy is neutral; GitHub observations do not infer one.
+
+Historical persisted `gate_passed` entries remain read-compatible for completed
+old runs only. They are never a public transition and never certify current
+validation, review, or final readiness; current policy or live-state drift
+returns the run to validation before review can resume.
 
 An explicitly `not_required` hosted policy remains neutral even when the
 hosted-check observation endpoint is unavailable; this does not relax the

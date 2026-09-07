@@ -236,12 +236,10 @@ export async function runReviewLoop(
       // A persisted review does not authorize local repair against a different
       // live PR. Re-read before preparation and again after local recovery.
       const checkOwnedFix = async (): Promise<ReviewLoopResult | null> => {
-        if (run.bootstrap === undefined) return null;
         try {
           const live = await github.readLiveSnapshot(target);
           const conflict = pullRequestIdentityConflict(run, live, { allowHeadAdvance: true });
-          const drift = live.headSha !== run.headSha;
-          if (conflict === null && !drift) return null;
+          if (conflict === null && live.headSha === run.headSha) return null;
           const reason = conflict ?? 'Live GitHub HEAD changed before the review fix.';
           run = applyTransition(run, {
             type: 'escalate', reason,
@@ -388,18 +386,18 @@ export async function runReviewLoop(
         store.update(run);
         return { outcome: 'needs_human', run, reason };
       }
-      if (run.bootstrap !== undefined) {
-        const conflict = pullRequestIdentityConflict(run, validatedSnapshot!, { allowHeadAdvance: true });
-        if (conflict !== null || validatedSnapshot!.pullRequest === null) {
-          const reason = conflict ?? 'Live pull request disappeared after durable review fix.';
-          run = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] } }, now());
-          store.update(run);
-          return { outcome: 'needs_human', run, reason };
-        }
-        run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha, pullRequest: { number: validatedSnapshot!.pullRequest.number, headSha: fixResult.headSha } }, now());
-      } else {
-        run = applyTransition(run, { type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha }, now());
+      const conflict = pullRequestIdentityConflict(run, validatedSnapshot!, { allowHeadAdvance: true });
+      if (conflict !== null || validatedSnapshot!.pullRequest === null ||
+        (run.pullRequest !== undefined && validatedSnapshot!.pullRequest.number !== run.pullRequest.number)) {
+        const reason = conflict ?? 'Live pull request disappeared or changed after the review fix.';
+        run = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] } }, now());
+        store.update(run);
+        return { outcome: 'needs_human', run, reason };
       }
+      run = applyTransition(run, {
+        type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha,
+        pullRequest: { number: validatedSnapshot!.pullRequest.number, headSha: fixResult.headSha },
+      }, now());
       store.update(run);
       // A new fix creates a new exact HEAD. Validation is owned by the outer
       // workflow so it must collect fresh local and hosted evidence before a
@@ -452,8 +450,6 @@ export async function runReviewLoop(
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
     }
-    const identityConflict = pullRequestIdentityConflict(run, liveSnapshot, { allowHeadAdvance: true });
-    if (identityConflict !== null) return parkBootstrap(run, new Error(identityConflict), store, now);
     if (liveHead === null || liveHead !== run.headSha) {
       const reason =
         liveHead === null
@@ -476,6 +472,8 @@ export async function runReviewLoop(
       store.update(run);
       return { outcome: 'needs_human', run, reason };
     }
+    const identityConflict = pullRequestIdentityConflict(run, liveSnapshot, { allowHeadAdvance: true });
+    if (identityConflict !== null) return parkBootstrap(run, new Error(identityConflict), store, now);
 
     const beforeReview = reviewAdmission(run, liveSnapshot, resolveValidationAuthority);
     if (beforeReview.kind === 'revalidate') return persistRevalidation(run, beforeReview.reason, store, now);

@@ -13,14 +13,37 @@ const SETTLEMENT_POLL_MS = 25;
 export const MIN_LOCAL_VALIDATION_TIMEOUT_MS = 100;
 export const MAX_LOCAL_VALIDATION_TIMEOUT_MS = 60 * 60_000;
 
-function ownedWorkspaceMatches(request: ValidationRequest): boolean {
-  if (request.workspacePath === undefined || request.workspacePath.trim() === '') return false;
-  const invoke = (args: readonly string[]) => spawnSync('git', ['-C', request.workspacePath!, ...args], {
+function remoteMatchesTarget(remote: string, request: ValidationRequest): boolean {
+  const text = remote.trim();
+  let host = '';
+  let pathname = '';
+  try {
+    const parsed = new URL(text);
+    host = parsed.hostname;
+    pathname = parsed.pathname;
+  } catch {
+    const match = /^(?:[^@\s]+@)?([^:\s]+):([^\s]+)$/.exec(text);
+    if (match === null) return false;
+    host = match[1] ?? '';
+    pathname = match[2] ?? '';
+  }
+  const [owner, repo, ...rest] = pathname.replace(/^\/+|\/+$/g, '').split('/');
+  return rest.length === 0 && host.toLowerCase().replace(/\.$/, '') === 'github.com' &&
+    owner?.toLowerCase() === request.target.owner.toLowerCase() &&
+    repo?.replace(/\.git$/i, '').toLowerCase() === request.target.repo.toLowerCase();
+}
+
+function workspaceMatches(request: ValidationRequest, workspacePath: string, requireRepositoryIdentity: boolean): boolean {
+  if (workspacePath.trim() === '') return false;
+  const invoke = (args: readonly string[]) => spawnSync('git', ['-C', workspacePath, ...args], {
     encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: 512,
   });
   const head = invoke(['rev-parse', 'HEAD']);
   const status = invoke(['status', '--porcelain']);
-  return head.status === 0 && status.status === 0 && head.stdout.trim() === request.headSha && status.stdout.trim() === '';
+  if (head.status !== 0 || status.status !== 0 || head.stdout.trim() !== request.headSha || status.stdout.trim() !== '') return false;
+  if (!requireRepositoryIdentity) return true;
+  const remote = invoke(['remote', 'get-url', 'origin']);
+  return remote.status === 0 && remoteMatchesTarget(remote.stdout, request);
 }
 
 function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvidence {
@@ -135,16 +158,19 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     this.configRevision = configuration.revision;
   }
 
-  async validate(_request: ValidationRequest): Promise<LocalValidationEvidence> {
+  async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
     const revision = typeof this.configuration?.revision === 'string' && this.configuration.revision.trim() !== ''
       ? this.configuration.revision
       : null;
     const configured = this.configuration?.commands;
     if (revision === null || !Array.isArray(configured) || configured.length === 0) {
-      return { status: 'unknown', configRevision: revision, commands: [] };
+      return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
     }
     const evidence: LocalValidationCommandEvidence[] = [];
-    if (!ownedWorkspaceMatches(_request)) {
+    const configuredWorkspace = this.configuration.workspacePath;
+    const workspacePath = request.workspacePath ?? configuredWorkspace;
+    const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
+    if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
     for (let index = 0; index < configured.length; index += 1) {
@@ -153,14 +179,14 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      const result = await execute(index, command, _request.workspacePath!);
+      const result = await execute(index, command, workspacePath);
       evidence.push(result);
       if (result.outcome === 'failed' || result.outcome === 'timed_out') {
         return { status: 'failed', configRevision: revision, commands: evidence };
       }
       if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
     }
-    if (!ownedWorkspaceMatches(_request)) {
+    if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity)) {
       evidence.push(workspaceUnavailable(evidence.length));
       return { status: 'unknown', configRevision: revision, commands: evidence };
     }

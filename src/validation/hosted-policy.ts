@@ -66,15 +66,17 @@ export function evaluateHostedCheckPolicy(
     return 'not_required';
   }
 
+  const requiredNames = policy.requiredCheckNames ?? [];
+  if (requiredNames.some((name) => !observedNames.includes(name))) {
+    return 'unknown';
+  }
+
   if (overall === 'failing') return 'failed';
   if (overall === 'pending') return 'waiting';
 
   if (policy.mode !== 'required' || overall !== 'passing' || observedNames.length === 0) {
     return 'unknown';
   }
-
-  const requiredNames = policy.requiredCheckNames ?? [];
-  if (requiredNames.some((name) => !observedNames.includes(name))) return 'unknown';
 
   return 'passed';
 }

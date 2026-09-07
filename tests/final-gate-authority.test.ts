@@ -51,7 +51,10 @@ function finalGateRun(id = 'final-gate-authority'): Run {
   run = applyTransition(run, { type: 'start' }, T0);
   run = applyTransition(
     run,
-    { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD },
+    {
+      type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD,
+      pullRequest: { number: 7, headSha: HEAD },
+    },
     T0,
   );
   run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
@@ -233,6 +236,60 @@ describe('final-gate authority', () => {
     assert.notEqual(result.run.state, 'NEEDS_HUMAN');
     assert.match(result.reason, /waiting for required hosted checks/i);
     assert.equal(result.run.interrupt?.kind, 'waiting_dependency');
+  });
+
+  it('fails closed when final merge-state evidence is absent even if every other fact is green', async () => {
+    const store = new MemoryStore();
+    store.create(finalGateRun('merge-state-unavailable'));
+    const ready = readySnapshot(HEAD);
+    const unavailable = { ...ready, pullRequest: { ...ready.pullRequest!, mergeStateStatus: null } };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubReturning(unavailable),
+        implementation: unusedImplementation,
+        reviewer: unusedReviewer,
+        validation: existingValidation,
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
+      'merge-state-unavailable',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.notEqual(result.run.state, 'MERGE_READY');
+    assert.match(result.reason, /merge state is unavailable/i);
+  });
+
+  it('revalidates instead of admitting readiness when policy identity changes during the final live reread', async () => {
+    const store = new MemoryStore();
+    store.create(finalGateRun('final-policy-change'));
+    let revision = 'test-config-v1';
+    const github: GitHubAdapter = {
+      ...githubReturning(readySnapshot(HEAD)),
+      async readLiveSnapshot() {
+        revision = 'test-config-v2';
+        return readySnapshot(HEAD);
+      },
+    };
+    const changingValidation: ValidationAdapter = {
+      kind: 'validation',
+      get configRevision() { return revision; },
+      async validate() { throw new Error('validation must not run from FINAL_GATE'); },
+    };
+
+    const result = await runWorkflow(
+      {
+        store, github, implementation: unusedImplementation, reviewer: unusedReviewer,
+        validation: changingValidation,
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
+      'final-policy-change',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.notEqual(result.outcome, 'merge_ready');
+    assert.ok(result.run.history.some((entry) => entry.type === 'revalidate'));
   });
 
   it('does not infer a hosted policy from a non-empty passing observation', () => {

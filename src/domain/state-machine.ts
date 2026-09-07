@@ -227,7 +227,9 @@ export type HostedValidationPolicyIdentity =
 export function isValidationFresh(run: Run, active: ActiveValidationConfiguration): boolean {
   return run.validationResult !== undefined &&
     run.headSha !== undefined && run.headSha.trim() !== '' &&
+    run.pullRequest !== undefined && run.pullRequest.headSha === run.headSha &&
     run.validationResult.headSha === run.headSha &&
+    run.validationResult.hosted.pullRequestNumber === run.pullRequest.number &&
     run.validationResult.status === 'passed' &&
     validationEvidenceMatchesActive(run.validationResult, active);
 }
@@ -387,7 +389,8 @@ function assertPayload(run: Run, input: TransitionInput): void {
     }
   }
   const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
-  if (input.pullRequest !== undefined && input.type !== 'agent_succeeded' && input.type !== 'validation_passed' && !authorizedHumanHeadSync) {
+  const validationOutcomeCarriesPullRequest = from === 'VALIDATING' && input.validationResult !== undefined;
+  if (input.pullRequest !== undefined && input.type !== 'agent_succeeded' && !validationOutcomeCarriesPullRequest && !authorizedHumanHeadSync) {
     throw new InvalidTransitionError('unexpected-payload', from, input.type, 'Pull request identity is only accepted with implementation success or validation.');
   }
   if (input.pullRequest !== undefined) {
@@ -400,8 +403,11 @@ function assertPayload(run: Run, input: TransitionInput): void {
       throw new InvalidTransitionError('invalid-pull-request-identity', from, input.type, 'Pull request identity must be positive and bound to the exact implementation HEAD.');
     }
   }
-  if ((run.bootstrap !== undefined && input.type === 'agent_succeeded' ||
-      run.pullRequest !== undefined && authorizedHumanHeadSync) && input.pullRequest === undefined) {
+  if (
+    (((run.bootstrap !== undefined || run.pullRequest !== undefined) && input.type === 'agent_succeeded') ||
+      (run.pullRequest !== undefined && authorizedHumanHeadSync)) &&
+    input.pullRequest === undefined
+  ) {
     throw new InvalidTransitionError('missing-payload', from, input.type, 'An owned HEAD acceptance requires the verified pull request identity in the same transition.');
   }
   if (input.executor !== undefined && (input.type !== 'escalate' || from !== 'IMPLEMENTING')) {
@@ -575,6 +581,17 @@ function assertPayload(run: Run, input: TransitionInput): void {
         from,
         input.type,
         `Transition "${input.type}" requires a reviewResult bound to the run's current HEAD "${run.headSha ?? '(none)'}", got "${review.headSha}".`,
+      );
+    }
+    if (run.pullRequest === undefined || run.headSha === undefined ||
+      !isValidationResultCoherent(run.validationResult) ||
+      run.validationResult.headSha !== run.headSha ||
+      run.validationResult.hosted.pullRequestNumber !== run.pullRequest.number) {
+      throw new InvalidTransitionError(
+        'stale-validation',
+        from,
+        input.type,
+        `Transition "${input.type}" requires coherent validation evidence for the accepted pull request and exact HEAD before a review result can be admitted.`,
       );
     }
   }

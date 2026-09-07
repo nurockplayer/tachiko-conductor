@@ -23,7 +23,10 @@ const ACCEPTED_PR = 7;
 
 /** Build a run pinned to an arbitrary state for closure-boundary assertions. */
 function runIn(state: WorkflowState, overrides: Partial<Run> = {}): Run {
-  return { ...newRun(), state, ...overrides };
+  const run = { ...newRun(), state, ...overrides };
+  return run.headSha === undefined || run.pullRequest !== undefined
+    ? run
+    : { ...run, pullRequest: { number: ACCEPTED_PR, headSha: run.headSha } };
 }
 
 describe('validation closure regressions', () => {
@@ -87,6 +90,7 @@ describe('validation closure regressions', () => {
         type: 'agent_succeeded',
         agentResult: successResult(NEW_HEAD),
         headSha: NEW_HEAD,
+        pullRequest: { number: ACCEPTED_PR, headSha: NEW_HEAD },
       },
       T0,
     );

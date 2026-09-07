@@ -12,6 +12,12 @@ export interface LocalValidationCommandConfiguration {
 export interface LocalValidationConfiguration {
   readonly revision: string;
   readonly commands: readonly LocalValidationCommandConfiguration[];
+  /**
+   * Explicit clean checkout for a supported pre-existing-PR run. It is never
+   * inferred from the conductor process cwd and must prove target repository
+   * identity before commands execute.
+   */
+  readonly workspacePath?: string;
 }
 
 /** Explicit repository/run policy used to interpret the live hosted check list. */

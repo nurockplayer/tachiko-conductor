@@ -139,6 +139,15 @@ describe('CLI command layer', () => {
       }),
       { revision: 'repo-v1', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
     );
+    assert.deepEqual(
+      resolveLocalValidationConfiguration({
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
+          revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr',
+          commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }],
+        }),
+      }),
+      { revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
+    );
     assert.throws(
       () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: '{bad json' }),
       /must be valid JSON/,
@@ -146,6 +155,14 @@ describe('CLI command layer', () => {
     assert.throws(
       () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [{ argv: [], timeoutMs: 0 }] }) }),
       /argv must be a non-empty string array/,
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [] }) }),
+      /must contain at least one command/,
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', workspacePath: 'relative', commands: [{ argv: ['tool'], timeoutMs: 100 }] }) }),
+      /workspacePath must be an absolute non-empty path/,
     );
   });
 

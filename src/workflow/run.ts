@@ -404,7 +404,14 @@ export async function runWorkflow(
           }
           run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha, pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha } }, now());
         } else {
-          run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha }, now());
+          if (result.headSha === undefined || snapshot.pullRequest === null || snapshot.headSha !== result.headSha ||
+            pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true }) !== null) {
+            return park(run, 'Live pull request does not prove the implementation exact HEAD and accepted PR identity.', store, now);
+          }
+          run = applyTransition(run, {
+            type: 'agent_succeeded', agentResult: result, headSha: result.headSha,
+            pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha },
+          }, now());
         }
         store.update(run);
         break;
@@ -491,7 +498,10 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
         if (validationResult.status === 'failed') {
-          run = applyTransition(run, { type: 'validation_failed', validationResult }, now());
+          run = applyTransition(run, {
+            type: 'validation_failed', validationResult,
+            pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+          }, now());
           store.update(run);
           break;
         }
@@ -501,6 +511,7 @@ export async function runWorkflow(
             run,
             {
               type: 'wait_dependency', reason, validationResult,
+              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
               interrupt: { evidence: reason, choices: [RETRY_READINESS_DECISION, CANCEL_RUN_DECISION] },
             },
             now(),
@@ -514,6 +525,7 @@ export async function runWorkflow(
             run,
             {
               type: 'escalate', reason, validationResult,
+              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
               interrupt: { evidence: reason, choices: ['Restore required validation evidence and retry', CANCEL_RUN_DECISION] },
             },
             now(),
@@ -639,6 +651,14 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
+        const currentValidationAuthority = activeValidationConfiguration(deps);
+        if (!isValidationFresh(run, currentValidationAuthority)) {
+          const reason = 'Final gate observed a changed or invalid validation-policy identity while rereading live GitHub state.';
+          run = applyTransition(run, { type: 'revalidate', reason }, now());
+          store.update(run);
+          break;
+        }
+
         const persistedValidation = run.validationResult;
         if (persistedValidation === undefined ||
           persistedValidation.hosted.pullRequestNumber !== snapshot.pullRequest?.number ||
@@ -671,8 +691,8 @@ export async function runWorkflow(
           pullRequest === null || pullRequest.state !== 'open' ? 'the pull request is not open' : null,
           pullRequest?.isDraft === true ? 'the pull request is still a draft' : null,
           pullRequest?.mergeable !== true ? 'GitHub does not report the pull request as mergeable' : null,
-          mergeState !== null && mergeState !== 'CLEAN' && mergeState !== 'HAS_HOOKS'
-            ? `merge state is ${mergeState}`
+          mergeState === null || (mergeState !== 'CLEAN' && mergeState !== 'HAS_HOOKS')
+            ? `merge state is ${mergeState ?? 'unavailable'}`
             : null,
           currentHosted.status === 'failed' ? 'required hosted checks are failing' : null,
           currentHosted.status === 'unknown' ? 'required hosted check evidence is unavailable or incomplete' : null,

@@ -52,7 +52,7 @@ function isHostedEvidence(value: unknown): value is HostedValidationEvidence {
   if (hosted.policyMode === 'unconfigured') {
     return hosted.status === 'unknown';
   }
-  if (hosted.policyMode === 'required' && hosted.overall === 'passing' &&
+  if (hosted.policyMode === 'required' &&
     (observedCheckNames.length === 0 || requiredCheckNames.some((name) => !observedCheckNames.includes(name)))) {
     return hosted.status === 'unknown';
   }

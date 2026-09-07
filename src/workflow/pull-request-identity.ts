@@ -5,7 +5,16 @@ import type { Run } from '../domain/types.js';
 export function pullRequestIdentityConflict(run: Run, snapshot: GitHubLiveSnapshot, options: { readonly allowHeadAdvance?: boolean } = {}): string | null {
   const expected = run.bootstrap;
   const actual = snapshot.pullRequest;
-  if (expected === undefined) return null;
+  if (expected === undefined) {
+    const accepted = run.pullRequest;
+    if (accepted === undefined) return null;
+    if (actual === null || actual.state !== 'open' || snapshot.issue.state !== 'open' ||
+      snapshot.headSha === null || actual.headSha !== snapshot.headSha || actual.number !== accepted.number ||
+      (!options.allowHeadAdvance && actual.headSha !== accepted.headSha)) {
+      return `Live pull request does not match the accepted PR #${accepted.number} and exact HEAD identity.`;
+    }
+    return null;
+  }
   if (actual === null || actual.headRepository === undefined || actual.headRepository === null ||
     actual.headRef === undefined || actual.baseRef === undefined ||
     actual.state !== 'open' || snapshot.issue.state !== 'open' ||

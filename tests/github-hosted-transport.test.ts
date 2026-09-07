@@ -24,6 +24,8 @@ type Failure = {
   readonly outcome: ProcessResult | Error;
 };
 
+type HostedPages = ReadonlyMap<string, readonly unknown[]>;
+
 function result(stdout: string, stderr = '', exitCode = 0): ProcessResult {
   return { stdout, stderr, exitCode };
 }
@@ -87,7 +89,10 @@ class GitHubProcessFixture implements ProcessRunner {
   readonly calls: Array<{ readonly file: string; readonly args: readonly string[]; readonly timeoutMs: number }> = [];
   private readonly occurrences = new Map<string, number>();
 
-  constructor(private readonly failure?: Failure) {}
+  constructor(
+    private readonly failure?: Failure,
+    private readonly hostedPages?: HostedPages,
+  ) {}
 
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     this.calls.push({ file, args, timeoutMs: options.timeoutMs });
@@ -105,11 +110,19 @@ class GitHubProcessFixture implements ProcessRunner {
       return this.failure.outcome;
     }
 
-    const payload = this.payload(path, occurrence);
+    const payload = this.payload(path, occurrence, args);
     return result(JSON.stringify(args.includes('--paginate') ? [payload] : payload));
   }
 
-  private payload(path: string, occurrence: number): unknown {
+  private payload(path: string, occurrence: number, args: readonly string[]): unknown {
+    const pages = this.hostedPages?.get(path);
+    if (pages !== undefined) {
+      const pageArgument = args.find((argument) => /^page=\d+$/.test(argument));
+      const page = pageArgument === undefined ? 1 : Number(pageArgument.slice('page='.length));
+      const payload = pages[page - 1];
+      if (payload === undefined) throw new Error(`No hosted fixture page ${page} for ${path}`);
+      return payload;
+    }
     if (path === 'repos/acme/widgets/issues/42') return issue();
     if (path === 'repos/acme/widgets/issues/42/timeline') return [crossReference()];
     if (path === PR_PATH) return pull();
@@ -117,7 +130,7 @@ class GitHubProcessFixture implements ProcessRunner {
     if (path === 'repos/acme/widgets/issues/7/comments') return [];
     if (path === 'repos/acme/widgets/pulls/7/reviews') return [];
     if (path === 'repos/acme/widgets/pulls/7/comments') return [];
-    if (path === STATUS_PATH) return { state: 'success', statuses: [] };
+    if (path === STATUS_PATH) return { state: 'success', total_count: 0, statuses: [] };
     if (path === CHECK_RUNS_PATH) return { total_count: 0, check_runs: [] };
     if (path === 'graphql') return reviewThreads();
     throw new Error(`No fixture payload for ${path} occurrence ${occurrence}`);
@@ -157,7 +170,111 @@ function assertHostedUnavailable(
   assert.ok(snapshot.problems.some((problem) => problem.code === 'CHECKS_UNAVAILABLE'));
 }
 
+function passingStatuses(count: number): readonly Record<string, unknown>[] {
+  return Array.from({ length: count }, (_, index) => ({
+    id: index + 1,
+    context: `status-${String(index + 1)}`,
+    state: 'success',
+  }));
+}
+
+function pendingCheckRun(): Record<string, unknown> {
+  return { id: 999, name: 'later-pending', status: 'in_progress', conclusion: null };
+}
+
 describe('LiveGitHubAdapter hosted observation transport boundary', () => {
+  it('does not pass an all-green first status page when a later page is failing', async () => {
+    const runner = new GitHubProcessFixture(
+      undefined,
+      new Map([
+        [
+          STATUS_PATH,
+          [
+            { state: 'success', total_count: 101, statuses: passingStatuses(100) },
+            { state: 'failure', total_count: 101, statuses: [{ id: 101, context: 'later-failure', state: 'failure' }] },
+          ],
+        ],
+      ]),
+    );
+
+    const snapshot = await adapterFor(runner).readLiveSnapshot(TARGET);
+
+    assertCoreAuthority(snapshot);
+    assert.equal(snapshot.checks.availability, 'available');
+    assert.equal(snapshot.checks.overall, 'failing');
+    assert.ok(snapshot.checks.checks.some((check) => check.name === 'later-failure' && check.state === 'failing'));
+    const statusCalls = runner.calls.filter((call) => call.args[3] === STATUS_PATH);
+    assert.equal(statusCalls.length, 2);
+    assert.ok(statusCalls[1]?.args.includes('page=2'));
+  });
+
+  it('does not pass an all-green first check-runs page when a later page is pending', async () => {
+    const runner = new GitHubProcessFixture(
+      undefined,
+      new Map([
+        [
+          CHECK_RUNS_PATH,
+          [
+            {
+              total_count: 101,
+              check_runs: Array.from({ length: 100 }, (_, index) => ({
+                id: index + 1,
+                name: `check-${String(index + 1)}`,
+                status: 'completed',
+                conclusion: 'success',
+              })),
+            },
+            { total_count: 101, check_runs: [pendingCheckRun()] },
+          ],
+        ],
+      ]),
+    );
+
+    const snapshot = await adapterFor(runner).readLiveSnapshot(TARGET);
+
+    assertCoreAuthority(snapshot);
+    assert.equal(snapshot.checks.availability, 'available');
+    assert.equal(snapshot.checks.overall, 'pending');
+    assert.ok(snapshot.checks.checks.some((check) => check.name === 'later-pending' && check.state === 'pending'));
+    const checkRunCalls = runner.calls.filter((call) => call.args[3] === CHECK_RUNS_PATH);
+    assert.equal(checkRunCalls.length, 2);
+    assert.ok(checkRunCalls[1]?.args.includes('page=2'));
+  });
+
+  it('marks advertised-but-missing hosted entries unavailable rather than passing', async () => {
+    const runner = new GitHubProcessFixture(
+      undefined,
+      new Map([
+        [
+          STATUS_PATH,
+          [
+            { state: 'success', total_count: 2, statuses: passingStatuses(1) },
+            { state: 'success', total_count: 2, statuses: [] },
+          ],
+        ],
+      ]),
+    );
+
+    const snapshot = await adapterFor(runner).readLiveSnapshot(TARGET);
+
+    assertCoreAuthority(snapshot);
+    assertHostedUnavailable(snapshot);
+  });
+
+  it('keeps core authority when a later hosted page fails to fetch', async () => {
+    const runner = new GitHubProcessFixture(
+      { path: STATUS_PATH, occurrence: 2, outcome: httpFailure(503) },
+      new Map([
+        [STATUS_PATH, [{ state: 'success', total_count: 101, statuses: passingStatuses(100) }]],
+      ]),
+    );
+
+    const snapshot = await adapterFor(runner).readLiveSnapshot(TARGET);
+
+    assertCoreAuthority(snapshot);
+    assertHostedUnavailable(snapshot);
+  });
+
   it('retains core authority when status transport times out', async () => {
     const runner = new GitHubProcessFixture({ path: STATUS_PATH, outcome: timeout() });
     const snapshot = await adapterFor(runner).readLiveSnapshot(TARGET);

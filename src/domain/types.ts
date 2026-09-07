@@ -183,8 +183,12 @@ export interface Interrupt {
 
 /** One applied step in a run's history. */
 export interface TransitionRecord {
-  /** The workflow-owned final authority records this event after live reconciliation. */
-  readonly type: TransitionType | 'final_gate_verified';
+  /**
+   * The workflow-owned final authority records final_gate_verified after live
+   * reconciliation. gate_passed is retained only so old JSON history remains
+   * readable; it is deliberately not a callable TransitionType.
+   */
+  readonly type: TransitionType | 'final_gate_verified' | 'gate_passed';
   readonly from: WorkflowState;
   readonly to: WorkflowState;
   readonly at: string;

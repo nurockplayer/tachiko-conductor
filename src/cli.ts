@@ -185,6 +185,9 @@ export function resolveLocalValidationConfiguration(
   if (!Array.isArray(record.commands)) {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.commands must be an array.');
   }
+  if (record.commands.length === 0) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.commands must contain at least one command.');
+  }
   const commands = record.commands.map((value, index) => {
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
       throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}] must be an object.`);
@@ -203,7 +206,15 @@ export function resolveLocalValidationConfiguration(
     }
     return { argv: command.argv as string[], timeoutMs: command.timeoutMs as number };
   });
-  return { revision: record.revision, commands };
+  if (record.workspacePath !== undefined &&
+    (typeof record.workspacePath !== 'string' || record.workspacePath.trim() === '' || !path.isAbsolute(record.workspacePath))) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.workspacePath must be an absolute non-empty path when supplied.');
+  }
+  return {
+    revision: record.revision,
+    commands,
+    ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
+  };
 }
 
 /** Parse the explicit repository/run contract for hosted checks. */
