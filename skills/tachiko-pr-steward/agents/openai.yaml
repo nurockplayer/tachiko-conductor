@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tachiko PR Steward"
+  short_description: "Review exact-HEAD PR state and guard implementation convergence"
+  default_prompt: "Use $tachiko-pr-steward to review this PR at exact HEAD, classify blockers versus follow-ups, and keep the implementation converging."
