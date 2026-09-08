@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tachiko Project Steward"
+  short_description: "Inspect live GitHub state and choose the next safe action"
+  default_prompt: "Use $tachiko-project-steward to inspect this project's live GitHub state, explain where it stands, and handle the safest next action."
