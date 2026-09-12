@@ -1,0 +1,4 @@
+interface:
+  display_name: "Tachiko Codex Handoff"
+  short_description: "Prepare grounded Codex handoffs without prompt bloat"
+  default_prompt: "Use $tachiko-codex-handoff to ground this implementation in GitHub, choose the right model and effort, and hand it to Codex with a concise prompt."
