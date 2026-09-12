@@ -9,7 +9,7 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.j
 import type { ReviewerAdapter } from '../src/adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
 import { createRun } from '../src/domain/run.js';
-import { applyTransition } from '../src/domain/state-machine.js';
+import { InvalidTransitionError, applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, LocalValidationEvidence, Run } from '../src/domain/types.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
@@ -25,12 +25,12 @@ function tempDir(prefix: string): string {
   return dir;
 }
 
-function liveSnapshot(headSha: string): GitHubLiveSnapshot {
+function liveSnapshot(headSha: string, pullRequestNumber = 7): GitHubLiveSnapshot {
   return {
     repository: { owner: TARGET.owner, repo: TARGET.repo, defaultBranch: 'main', defaultBranchHeadSha: 'base' },
     issue: { id: 'I_42', number: TARGET.issueNumber, title: 'Repair validation', body: 'Original issue instructions.', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
     pullRequest: {
-      id: 'PR_7', number: 7, title: 'Repair validation', url: '', state: 'open', isDraft: false,
+      id: `PR_${pullRequestNumber}`, number: pullRequestNumber, title: 'Repair validation', url: '', state: 'open', isDraft: false,
       mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: T0, headSha, baseSha: 'base',
       headRef: 'issue-42', headRepository: { owner: TARGET.owner, repo: TARGET.repo }, baseRef: 'main',
     },
@@ -154,7 +154,26 @@ describe('C20 consolidation regressions', () => {
     assert.deepEqual(persisted?.pullRequest, { number: 7, headSha: NEXT_HEAD });
   });
 
-  it('F06 rereads changed live authority after awaited validation before admitting evidence', async () => {
+  it('F03 refuses a fresh-store validation repair when the accepted PR number changed at the same failing HEAD', async () => {
+    const dir = tempDir('tachiko-c20-f03-pr-identity-');
+    new JsonFileStore({ dir }).create(validationRepairRun('validation-restart-pr-identity'));
+    const implementation = new CapturingImplementation();
+
+    const result = await runWorkflow(
+      {
+        store: new JsonFileStore({ dir }), github: new QueuedGitHub([liveSnapshot(HEAD, 8)]),
+        implementation, reviewer: unusedReviewer,
+      },
+      'validation-restart-pr-identity',
+      { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(implementation.requests.length, 0);
+    assert.match('reason' in result ? result.reason : '', /pull request|accepted PR/i);
+  });
+
+  it('F06 rejects policy authority changed during awaited validation before admitting evidence', async () => {
     const dir = tempDir('tachiko-c20-f06-');
     let run = createRun(TARGET, T0, 'validation-authority-drift');
     run = applyTransition(run, { type: 'start' }, T0);
@@ -188,5 +207,57 @@ describe('C20 consolidation regressions', () => {
     assert.equal(github.reads.length, 1);
     assert.equal(store.updates.some((run) => run.state === 'REVIEWING'), false);
     assert.equal(new JsonFileStore({ dir }).read('validation-authority-drift')?.state, 'NEEDS_HUMAN');
+  });
+
+  it('F06 rereads a changed live HEAD after awaited validation before persisting validation_passed', async () => {
+    const dir = tempDir('tachiko-c20-f06-live-head-');
+    let run = createRun(TARGET, T0, 'validation-live-head-drift');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded', headSha: HEAD, agentResult: successResult(HEAD), pullRequest: { number: 7, headSha: HEAD },
+    }, T0);
+    new JsonFileStore({ dir }).create(run);
+
+    const validation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'local-v1',
+      async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
+        await Promise.resolve();
+        return { ...validationPassed(request.headSha).local, configRevision: 'local-v1' };
+      },
+    };
+    const github = new QueuedGitHub([liveSnapshot(HEAD), liveSnapshot(NEXT_HEAD)]);
+    const store = new RecordingJsonStore(new JsonFileStore({ dir }));
+
+    const result = await runWorkflow(
+      {
+        store, github, implementation: new CapturingImplementation(), reviewer: unusedReviewer, validation,
+        hostedCheckPolicy: { revision: 'hosted-v1', policy: { mode: 'required' } },
+      },
+      'validation-live-head-drift',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(github.reads.length, 2);
+    assert.equal(store.updates.some((entry) => entry.state === 'REVIEWING'), false);
+    assert.equal(store.updates.some((entry) => entry.history.at(-1)?.type === 'validation_passed'), false);
+  });
+
+  it('F06 rejects public approval when supplied current validation authority differs from coherent evidence', () => {
+    let run = createRun(TARGET, T0, 'public-review-authority');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded', headSha: HEAD, agentResult: successResult(HEAD), pullRequest: { number: 7, headSha: HEAD },
+    }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    assert.throws(
+      () => applyTransition(run, {
+        type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'probe', headSha: HEAD, findings: [] },
+      }, T0, {
+        local: { kind: 'configured', revision: 'local-v2' },
+        hosted: { kind: 'configured', revision: 'test-hosted-policy-v1', mode: 'required' },
+      }),
+      (error: unknown) => error instanceof InvalidTransitionError && error.code === 'stale-validation',
+    );
   });
 });

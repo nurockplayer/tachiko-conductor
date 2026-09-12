@@ -310,7 +310,11 @@ function sameBootstrap(a: NonNullable<Run['bootstrap']>, b: NonNullable<Run['boo
     a.workspacePath === b.workspacePath;
 }
 
-function assertPayload(run: Run, input: TransitionInput): void {
+function assertPayload(
+  run: Run,
+  input: TransitionInput,
+  activeValidation?: ActiveValidationConfiguration,
+): void {
   const from = run.state;
   if (REQUIRES_AGENT_RESULT.has(input.type) && input.agentResult === undefined) {
     throw new InvalidTransitionError(
@@ -594,6 +598,14 @@ function assertPayload(run: Run, input: TransitionInput): void {
         `Transition "${input.type}" requires coherent validation evidence for the accepted pull request and exact HEAD before a review result can be admitted.`,
       );
     }
+    if (activeValidation !== undefined && !isValidationFresh(run, activeValidation)) {
+      throw new InvalidTransitionError(
+        'stale-validation',
+        from,
+        input.type,
+        `Transition "${input.type}" requires validation evidence matching the current validation-policy authority.`,
+      );
+    }
   }
 }
 
@@ -608,6 +620,7 @@ export function applyTransition(
   run: Run,
   input: TransitionInput,
   now: string = new Date().toISOString(),
+  activeValidation?: ActiveValidationConfiguration,
 ): Run {
   const from = run.state;
   const target = TRANSITION_TABLE[from][input.type];
@@ -624,7 +637,7 @@ export function applyTransition(
     );
   }
 
-  assertPayload(run, input);
+  assertPayload(run, input, activeValidation);
   const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
 
   let to: WorkflowState;

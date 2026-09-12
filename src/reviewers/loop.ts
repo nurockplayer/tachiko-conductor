@@ -99,7 +99,7 @@ function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => str
 }
 
 type ReviewAdmission =
-  | { readonly kind: 'admitted' }
+  | { readonly kind: 'admitted'; readonly activeValidation: ActiveValidationConfiguration }
   | { readonly kind: 'revalidate'; readonly reason: string }
   | { readonly kind: 'needs_human'; readonly reason: string };
 
@@ -145,7 +145,7 @@ function reviewAdmission(
   if (!isValidationFresh(run, active)) {
     return { kind: 'revalidate', reason: 'Persisted validation evidence does not match the freshly resolved active validation-policy identity.' };
   }
-  return { kind: 'admitted' };
+  return { kind: 'admitted', activeValidation: active };
 }
 
 function persistRevalidation(run: Run, reason: string, store: RunStore, now: () => string): ReviewLoopResult {
@@ -541,12 +541,12 @@ export async function runReviewLoop(
     }
 
     if (reviewResult.verdict === 'approve') {
-      run = applyTransition(run, { type: 'review_approved', reviewResult }, now());
+      run = applyTransition(run, { type: 'review_approved', reviewResult }, now(), afterReview.activeValidation);
       store.update(run);
       return { outcome: 'approved', run };
     }
 
-    run = applyTransition(run, { type: 'changes_requested', reviewResult }, now());
+    run = applyTransition(run, { type: 'changes_requested', reviewResult }, now(), afterReview.activeValidation);
     store.update(run);
   }
 }

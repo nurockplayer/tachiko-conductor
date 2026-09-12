@@ -249,6 +249,19 @@ export async function runWorkflow(
           run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
           run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
         const pendingRepair = pendingReviewFix || pendingValidationRepair;
+        if (pendingRepair) {
+          const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (conflict !== null) return park(run, conflict, store, now);
+          if (snapshot.headSha !== run.headSha) {
+            return park(
+              run,
+              `Live GitHub HEAD ${snapshot.headSha ?? '(none)'} does not match the interrupted repair HEAD ${run.headSha ?? '(none)'}.`,
+              store,
+              now,
+              [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
+            );
+          }
+        }
         let bootstrap = run.bootstrap;
         let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
         let initialRecoveryCandidate: { number: number; headSha: string } | undefined;
@@ -533,6 +546,18 @@ export async function runWorkflow(
             ? 'Validation-policy authority changed during validation; refusing to admit stale evidence.'
             : `${currentInvalidAuthority} Refusing validation evidence produced before the authority changed.`;
           return park(run, reason, store, now, ['Restore stable validation-policy authority and retry', CANCEL_RUN_DECISION]);
+        }
+        let postValidationSnapshot: GitHubLiveSnapshot;
+        try {
+          postValidationSnapshot = await github.readLiveSnapshot(target);
+        } catch (error) {
+          return githubFailureOutcome(run, error, store, now);
+        }
+        const postValidationConflict = pullRequestIdentityConflict(run, postValidationSnapshot);
+        if (postValidationConflict !== null) return park(run, postValidationConflict, store, now);
+        if (postValidationSnapshot.headSha !== run.headSha) {
+          const reason = `Live GitHub HEAD changed during validation from ${run.headSha ?? '(none)'} to ${postValidationSnapshot.headSha ?? '(none)'}.`;
+          return park(run, reason, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
         }
         if (validationResult.status === 'failed') {
           run = applyTransition(run, {
