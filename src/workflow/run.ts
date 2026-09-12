@@ -174,6 +174,18 @@ function invalidValidationAuthority(active: ActiveValidationConfiguration): stri
   return null;
 }
 
+function sameValidationAuthority(
+  left: ActiveValidationConfiguration,
+  right: ActiveValidationConfiguration,
+): boolean {
+  const sameLocal = left.local.kind === right.local.kind &&
+    (left.local.kind !== 'configured' || (right.local.kind === 'configured' && left.local.revision === right.local.revision));
+  const sameHosted = left.hosted.kind === right.hosted.kind &&
+    (left.hosted.kind !== 'configured' || (right.hosted.kind === 'configured' &&
+      left.hosted.revision === right.hosted.revision && left.hosted.mode === right.hosted.mode));
+  return sameLocal && sameHosted;
+}
+
 /**
  * The only code path which produces MERGE_READY.  It is intentionally local
  * to the workflow so callers cannot advance cached state around the live
@@ -233,6 +245,10 @@ export async function runWorkflow(
         }
         const pendingReviewFix =
           run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
+        const pendingValidationRepair = run.validationResult?.status === 'failed' &&
+          run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
+          run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
+        const pendingRepair = pendingReviewFix || pendingValidationRepair;
         let bootstrap = run.bootstrap;
         let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
         let initialRecoveryCandidate: { number: number; headSha: string } | undefined;
@@ -254,7 +270,7 @@ export async function runWorkflow(
             initialRecoveryCandidate = { number: snapshot.pullRequest!.number, headSha: snapshot.headSha! };
           }
         }
-        if (pendingReviewFix && snapshot.headSha !== run.headSha) {
+        if (pendingRepair && snapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
             run,
@@ -272,7 +288,7 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
-        if (!pendingReviewFix && snapshot.pullRequest === null && bootstrap === undefined) {
+        if (!pendingRepair && snapshot.pullRequest === null && bootstrap === undefined) {
           if (deps.bootstrap === undefined || snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null) {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
@@ -318,12 +334,16 @@ export async function runWorkflow(
             if (snapshot.headSha !== run.headSha) return park(run, `Live GitHub HEAD changed during bootstrap recovery.`, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
           } else if (run.headSha !== undefined || recoveryAuthority !== undefined) {
             return park(run, 'The owned pull request disappeared during workspace recovery.', store, now);
-          } else if (!pendingReviewFix && (snapshot.repository.defaultBranch !== bootstrap.baseBranch || snapshot.repository.defaultBranchHeadSha !== bootstrap.baseSha)) {
+          } else if (!pendingRepair && (snapshot.repository.defaultBranch !== bootstrap.baseBranch || snapshot.repository.defaultBranchHeadSha !== bootstrap.baseSha)) {
             return bootstrapFailureOutcome(run, new Error('Live default branch changed after bootstrap preparation.'), store, now);
           }
         }
-        const pendingFixInstructions = pendingReviewFix ? renderBlockingFindings(run) : null;
-        const baseSha = pendingReviewFix
+        const pendingFixInstructions = pendingReviewFix
+          ? renderBlockingFindings(run)
+          : pendingValidationRepair
+            ? 'Exact-HEAD validation failed. Repair the implementation and its required validation before returning a new exact HEAD.'
+            : null;
+        const baseSha = pendingRepair
           ? run.headSha
           : snapshot.pullRequest?.baseSha ?? snapshot.repository.defaultBranchHeadSha;
         if (baseSha === null || baseSha === undefined || baseSha === '') {
@@ -393,7 +413,7 @@ export async function runWorkflow(
         if (bootstrap !== undefined) {
           if (result.headSha === undefined || deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
           try {
-            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingReviewFix ? run.headSha : undefined, workspaceGuard });
+            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -506,6 +526,14 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
+        const currentValidation = activeValidationConfiguration(deps);
+        const currentInvalidAuthority = invalidValidationAuthority(currentValidation);
+        if (currentInvalidAuthority !== null || !sameValidationAuthority(activeValidation, currentValidation)) {
+          const reason = currentInvalidAuthority === null
+            ? 'Validation-policy authority changed during validation; refusing to admit stale evidence.'
+            : `${currentInvalidAuthority} Refusing validation evidence produced before the authority changed.`;
+          return park(run, reason, store, now, ['Restore stable validation-policy authority and retry', CANCEL_RUN_DECISION]);
+        }
         if (validationResult.status === 'failed') {
           run = applyTransition(run, {
             type: 'validation_failed', validationResult,
@@ -542,7 +570,7 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
-        if (!validationEvidenceMatchesActive(validationResult, activeValidation)) {
+        if (!validationEvidenceMatchesActive(validationResult, currentValidation)) {
           const reason = `Validation evidence for ${run.headSha} does not match the active validation-policy identity.`;
           run = applyTransition(
             run,
@@ -737,6 +765,10 @@ export async function runWorkflow(
       }
 
       case 'MERGE_READY':
+        if (run.history.some((entry) => entry.type === 'gate_passed')) {
+          const reason = 'Historical gate_passed readiness is read-compatible only; current validation, review, and live GitHub authority must be re-established.';
+          return park(run, reason, store, now, ['Re-establish current readiness authority', CANCEL_RUN_DECISION]);
+        }
         return { outcome: 'merge_ready', run };
 
       case 'MERGED':
