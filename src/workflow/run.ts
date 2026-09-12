@@ -567,6 +567,12 @@ export async function runWorkflow(
             : `${postReadInvalidAuthority} Refusing validation evidence after the post-validation live reread.`;
           return park(run, reason, store, now, ['Restore stable validation-policy authority and retry', CANCEL_RUN_DECISION]);
         }
+        // Local evidence was observed for the still-current exact HEAD, but
+        // hosted readiness is live state: do not admit the pre-await snapshot
+        // after the post-validation reread has observed different checks.
+        validationResult = combineValidation(
+          run.headSha!, validationResult.local, hostedValidation(postValidationSnapshot, deps.hostedCheckPolicy),
+        );
         if (validationResult.status === 'failed') {
           run = applyTransition(run, {
             type: 'validation_failed', validationResult,

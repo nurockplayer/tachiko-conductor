@@ -237,6 +237,58 @@ describe('runWorkflow', () => {
     assert.equal(revisedValidation.requests.length, 1);
   });
 
+  it('routes same-PR exact-HEAD hosted failures observed during local validation through repair without reviewer admission', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-post-await-hosted-failure');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+
+    let hostedFailed = false;
+    const github: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() { throw new Error('unused'); },
+      async readBranch() { throw new Error('unused'); },
+      async listPullRequests() { throw new Error('unused'); },
+      async readLiveSnapshot() {
+        const state = hostedFailed ? 'failing' as const : 'passing' as const;
+        return {
+          ...snapshot(HEAD),
+          checks: { availability: 'available', overall: state, checks: [{ id: 'ci', name: 'ci', state, url: null, updatedAt: T0 }] },
+        };
+      },
+    };
+    const validation: ValidationAdapter = {
+      kind: 'validation',
+      configRevision: 'test-config-v1',
+      async validate(request) {
+        await Promise.resolve();
+        hostedFailed = true;
+        return { ...validationPassed(request.headSha).local, configRevision: 'test-config-v1' };
+      },
+    };
+    let reviewerCalls = 0;
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review(request) {
+        reviewerCalls += 1;
+        return approve(request.headSha);
+      },
+    };
+
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.validationResult?.status, 'failed');
+    assert.equal(result.run.validationResult?.hosted.status, 'failed');
+    assert.equal(reviewerCalls, 0);
+    assert.ok(result.run.history.some((entry) => entry.type === 'validation_failed'));
+  });
+
   it('does not treat unavailable hosted checks as a passing validation source', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'validation-hosted-unavailable');
