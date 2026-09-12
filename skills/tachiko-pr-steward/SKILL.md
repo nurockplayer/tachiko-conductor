@@ -14,25 +14,27 @@ Guard convergence on an active pull request without duplicating implementation o
 3. Review the implementation against the Issue contract, not merely whether tests pass.
 4. If the PR HEAD changes during review or after an earlier approval, treat the old approval as stale and review the new exact HEAD before declaring it ready.
 
+Status/review requests such as 看 PR, 審查進度, or 看有沒有走歪 are read-only by default. Do not post reviews, comments, handoff updates, resolve threads, or create follow-up Issues unless the user has authorized GitHub writes for the current task.
+
 ## Classify findings
 
 For each meaningful finding, assign one outcome:
 
-- **Blocking** — violates the current Issue contract, breaks correctness/safety, invalidates required evidence, or leaves required work incomplete. Post a focused steward finding or review and make sure the canonical handoff reflects the blocker when that workflow is in use.
-- **Follow-up** — valid improvement but outside the current contract. Create or recommend a focused follow-up Issue instead of derailing the PR when the user has authorized project-management actions.
+- **Blocking** — violates the current Issue contract, breaks correctness/safety, invalidates required evidence, or leaves required work incomplete. Report the blocker. When write authorization exists, post a focused steward finding or review and make sure the canonical handoff reflects the blocker when that workflow is in use.
+- **Follow-up** — valid improvement but outside the current contract. Recommend a focused follow-up Issue instead of derailing the PR; create it only when the user has authorized project-management writes.
 - **Note** — non-blocking observation that does not justify churn.
 
-Do not assume an implementation agent will notice every inline review comment. For blocking findings, make the required state visible in the PR's canonical handoff or top-level steward comment when that convention exists.
+Do not assume an implementation agent will notice every inline review comment. When write authorization exists, make blocking state visible in the PR's canonical handoff or top-level steward comment when that convention exists. Without write authorization, surface the blocker in the response only.
 
 ## Steward behavior
 
-- Prefer updating the existing canonical `agent-handoff:v1` over posting duplicate handoff comments.
+- When GitHub writes are authorized, prefer updating the existing canonical `agent-handoff:v1` over posting duplicate handoff comments.
 - Keep comments evidence-backed and scoped. Avoid speculative rewrites of the Issue during review.
 - Do not open a competing implementation branch while another agent owns the PR.
 - Never force push. Never merge unless the user has explicitly authorized that merge.
 - Before a final recommendation, re-read live PR state so CI, review threads, mergeability, and exact HEAD are current.
 
-For recurring checks, compare against the previous observed state and surface meaningful deltas: new commits, new blockers, resolved blockers, CI/review changes, stalls, or scope drift. Keep unchanged status brief.
+For recurring checks, compare against the previous observed state and surface meaningful deltas: new commits, new blockers, resolved blockers, CI/review changes, stalls, or scope drift. Keep unchanged status brief. Recurring observation does not itself authorize repository mutation.
 
 ## Output
 
