@@ -31,7 +31,7 @@ import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/doma
 import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
-import { T0, TARGET, successResult, validationPassed } from './helpers.js';
+import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -368,6 +368,7 @@ describe('workflow run and resume commands', () => {
   }
 
   function githubAdapter(liveHeads: string[]): GitHubAdapter {
+    let latest: string | undefined;
     return {
       kind: 'github',
       async readIssue() {
@@ -380,7 +381,9 @@ describe('workflow run and resume commands', () => {
         throw new Error('unused');
       },
       async readLiveSnapshot() {
-        const head = liveHeads.shift();
+        const queued = liveHeads.shift();
+        if (queued !== undefined) latest = queued;
+        const head = queued ?? latest;
         if (head === undefined) throw new Error('No live snapshot queued');
         return snapshot(head);
       },
@@ -566,6 +569,7 @@ describe('workflow run and resume commands', () => {
         },
       },
       T0,
+      TEST_VALIDATION_AUTHORITY,
     );
     run = applyTransition(run, { type: 'start_fix' }, T0);
     run = applyTransition(

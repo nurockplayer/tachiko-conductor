@@ -20,7 +20,7 @@ import type { ProcessResult, ProcessRunOptions, ProcessRunner } from '../src/git
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
-import { TARGET, T0, successResult, validationPassed } from './helpers.js';
+import { TARGET, T0, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 
 const HEAD = 'a'.repeat(40);
 const HEAD2 = 'b'.repeat(40);
@@ -147,7 +147,7 @@ function runAtReviewFix(route: 'direct' | 'resumed', id: string): Run {
   run = applyTransition(run, {
     type: 'changes_requested',
     reviewResult: { verdict: 'request_changes', reviewerName: 'controlled', headSha: HEAD, findings: [{ severity: 'blocking', summary: 'repair continuity' }] },
-  }, T0);
+  }, T0, TEST_VALIDATION_AUTHORITY);
   return route === 'direct' ? run : applyTransition(run, { type: 'start_fix' }, T0);
 }
 
