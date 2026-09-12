@@ -18,7 +18,7 @@ import {
   type WorkflowState,
 } from '../src/domain/types.js';
 import { LIVE_HEAD_SYNC_DECISION } from '../src/domain/decisions.js';
-import { T0, approval, changesRequested, failureResult, newRun, successResult, validationFailed, validationPassed } from './helpers.js';
+import { T0, TEST_VALIDATION_AUTHORITY, approval, changesRequested, failureResult, newRun, successResult, validationFailed, validationPassed } from './helpers.js';
 
 /** Build a run pinned to an arbitrary state (for edge-case tests). */
 function runIn(state: WorkflowState, overrides: Partial<Run> = {}): Run {
@@ -78,7 +78,7 @@ describe('state machine — happy path', () => {
     run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1'), pullRequest: { number: 7, headSha: 'sha-1' } }, T0);
     assert.equal(run.state, 'REVIEWING');
 
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0, TEST_VALIDATION_AUTHORITY);
     assert.equal(run.state, 'FINAL_GATE');
 
     assert.equal(run.state, 'FINAL_GATE');
@@ -117,7 +117,7 @@ describe('state machine — happy path', () => {
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-1') }, T0);
     run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1'), pullRequest: { number: 7, headSha: 'sha-1' } }, T0);
-    run = applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-1') }, T0);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-1') }, T0, TEST_VALIDATION_AUTHORITY);
     assert.equal(run.state, 'CHANGES_REQUESTED');
     assert.equal(run.reviewResult?.verdict, 'request_changes');
     assert.equal(run.reviewResult?.findings.length, 1);
@@ -264,7 +264,7 @@ describe('state machine — final gate review freshness', () => {
     run = applyTransition(run, { type: 'gate_blocked' }, T0);
     assert.equal(run.state, 'REVIEWING');
 
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-2') }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-2') }, T0, TEST_VALIDATION_AUTHORITY);
     assert.equal(run.state, 'FINAL_GATE');
     assert.equal(isReviewFresh(run), true);
 
@@ -356,7 +356,7 @@ describe('state machine — review events must be bound to the current HEAD', ()
     const next = applyTransition(
       run,
       { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'sha-2') },
-      T0,
+      T0, TEST_VALIDATION_AUTHORITY,
     );
     assert.equal(next.state, 'CHANGES_REQUESTED');
     assert.equal(next.reviewResult?.verdict, 'request_changes');

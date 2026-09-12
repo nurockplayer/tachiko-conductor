@@ -19,7 +19,7 @@ import type { AgentResult, ImplementationBootstrapIdentity, LocalValidationEvide
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { resumeCommand } from '../src/cli.js';
 import { runWorkflow } from '../src/workflow/run.js';
-import { TARGET, T0, successResult, validationPassed } from './helpers.js';
+import { TARGET, T0, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 import { createBootstrapGitFixture, type BootstrapGitFixture } from './bootstrap-fixture.js';
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
 
@@ -78,14 +78,19 @@ function snapshot(headSha: string, pull: ReturnType<typeof pr> | null = pr(7, he
 
 class QueueGithub implements GitHubAdapter {
   readonly kind = 'github' as const;
+  private latest: GitHubLiveSnapshot | undefined;
   constructor(private readonly queue: Array<GitHubLiveSnapshot | (() => GitHubLiveSnapshot)>) {}
   async readIssue(): Promise<never> { throw new Error('unused'); }
   async readBranch(): Promise<never> { throw new Error('unused'); }
   async listPullRequests(): Promise<never> { throw new Error('unused'); }
   async readLiveSnapshot() {
     const next = this.queue.shift();
-    if (next === undefined) throw new Error('No live snapshot queued');
-    return typeof next === 'function' ? next() : next;
+    if (next === undefined) {
+      if (this.latest === undefined) throw new Error('No live snapshot queued');
+      return this.latest;
+    }
+    this.latest = typeof next === 'function' ? next() : next;
+    return this.latest;
   }
 }
 
@@ -226,7 +231,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     ];
     for (const [label, mutation] of driftCases) {
       let run = withBootstrap(createRun(TARGET, T0, `final-${label.replace(/\W+/g, '-')}`));
-      run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] } }, T0);
+      run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] } }, T0, TEST_VALIDATION_AUTHORITY);
       const result = await runWorkflow({
         store: { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined },
         github: new QueueGithub([snapshot(OLD, pr(7, OLD, mutation))]),
@@ -331,7 +336,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     for (const state of ['IMPLEMENTING', 'VALIDATING', 'REVIEWING', 'CHANGES_REQUESTED'] as const) {
       let run = withBootstrap(createRun(TARGET, T0, `tuple-${state}`));
       if (state === 'VALIDATING' || state === 'IMPLEMENTING') run = { ...run, state };
-      if (state === 'CHANGES_REQUESTED') run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'reviewer', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0);
+      if (state === 'CHANGES_REQUESTED') run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'reviewer', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
       const calls: string[] = [];
       const result = await runWorkflow({
         store: { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined },
@@ -425,7 +430,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
         hosted: { ...validationPassed(oldHead).hosted, pullRequestNumber: 21 },
       },
     }, T0);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'old-reviewer', headSha: oldHead, findings: [] } }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'old-reviewer', headSha: oldHead, findings: [] } }, T0, TEST_VALIDATION_AUTHORITY);
     store.create(run);
     const live = () => {
       const head = fixHead ?? newHead;
@@ -534,7 +539,7 @@ for (const route of ['direct', 'resumed'] as const) {
       run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: i }, T0);
       run = applyTransition(run, { type: 'agent_succeeded', headSha: f.baseSha, pullRequest: { number: 7, headSha: f.baseSha }, agentResult: { ...successResult(f.baseSha), executor: { provider: 'fixture', sessionId: 'kept' } } }, T0);
       run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(f.baseSha) }, T0);
-      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: f.baseSha, findings: [{ severity: 'blocking', summary: 'required fix' }] } }, T0);
+      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: f.baseSha, findings: [{ severity: 'blocking', summary: 'required fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
       if (route === 'resumed') run = applyTransition(run, { type: 'start_fix' }, T0);
       new JsonFileStore({ dir }).create(run);
       let head = f.baseSha;
@@ -573,7 +578,7 @@ for (const state of ['IMPLEMENTING', 'CHANGES_REQUESTED'] as const) {
   for (const drift of ['head', 'disappeared', 'post-tuple'] as const) {
     it(`E2 ${state} admission/re-read ${drift} parks before execution`, async () => {
       let run = withBootstrap(createRun(TARGET, T0, `admission-${state}-${drift}`));
-      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0);
+      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
       if (state === 'IMPLEMENTING') run = applyTransition(run, { type: 'start_fix' }, T0);
       const calls: string[] = [];
       const live = drift === 'head' ? snapshot(NEW) : drift === 'disappeared' ? snapshot(OLD, null, { headSha: null }) : snapshot(OLD, pr(8, OLD));
@@ -610,7 +615,7 @@ for (const route of ['initial', 'direct', 'resumed'] as const) {
         f.git(i.workspacePath, ['push', 'origin', i.branch]);
         run = applyTransition(run, { type: 'agent_succeeded', headSha: head, pullRequest: { number: 7, headSha: head }, agentResult: successResult(head) }, T0);
         run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(head) }, T0);
-        run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: head, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0);
+        run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: head, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
         if (route === 'resumed') run = applyTransition(run, { type: 'start_fix' }, T0);
       }
       const store = new JsonFileStore({ dir }); store.create(run);
@@ -689,7 +694,7 @@ it('E1 rejects unproved HEAD-writing payloads and keeps JSON invariant on other 
     { type: 'validation_passed' as const, headSha: NEW },
     { type: 'start_fix' as const, pullRequest: { number: 8, headSha: OLD } },
   ]) assert.throws(() => applyTransition(r, input, T0));
-  r = applyTransition(r, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0);
+  r = applyTransition(r, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
   r = applyTransition(r, { type: 'start_fix' }, T0); store.update(r);
   assert.throws(() => applyTransition(r, { type: 'agent_succeeded', agentResult: successResult(NEW), headSha: NEW }, T0), /verified pull request identity/);
   assert.throws(() => applyTransition(r, { type: 'agent_succeeded', agentResult: successResult(NEW), headSha: NEW, pullRequest: { number: 8, headSha: NEW } }, T0), /Pull request identity/);

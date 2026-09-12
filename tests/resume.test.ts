@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
-import { T0, TARGET, approval, successResult, validationPassed } from './helpers.js';
+import { T0, TARGET, TEST_VALIDATION_AUTHORITY, approval, successResult, validationPassed } from './helpers.js';
 
 describe('resume across process restarts', () => {
   it('recovers the run state and continues from where it stopped', () => {
@@ -29,7 +29,7 @@ describe('resume across process restarts', () => {
       assert.equal(resumed?.state, 'REVIEWING');
       assert.equal(resumed?.headSha, 'sha-1');
 
-      resumed = applyTransition(resumed!, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0);
+      resumed = applyTransition(resumed!, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0, TEST_VALIDATION_AUTHORITY);
       assert.equal(resumed.state, 'FINAL_GATE');
       // Readiness is intentionally owned by the live workflow, not a public
       // transition. Simulate only a workflow-produced persisted snapshot.

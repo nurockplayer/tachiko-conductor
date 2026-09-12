@@ -559,6 +559,14 @@ export async function runWorkflow(
           const reason = `Live GitHub HEAD changed during validation from ${run.headSha ?? '(none)'} to ${postValidationSnapshot.headSha ?? '(none)'}.`;
           return park(run, reason, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
         }
+        const postReadValidation = activeValidationConfiguration(deps);
+        const postReadInvalidAuthority = invalidValidationAuthority(postReadValidation);
+        if (postReadInvalidAuthority !== null || !sameValidationAuthority(currentValidation, postReadValidation)) {
+          const reason = postReadInvalidAuthority === null
+            ? 'Validation-policy authority changed during the post-validation live reread; refusing to admit stale evidence.'
+            : `${postReadInvalidAuthority} Refusing validation evidence after the post-validation live reread.`;
+          return park(run, reason, store, now, ['Restore stable validation-policy authority and retry', CANCEL_RUN_DECISION]);
+        }
         if (validationResult.status === 'failed') {
           run = applyTransition(run, {
             type: 'validation_failed', validationResult,
@@ -595,7 +603,7 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
-        if (!validationEvidenceMatchesActive(validationResult, currentValidation)) {
+        if (!validationEvidenceMatchesActive(validationResult, postReadValidation)) {
           const reason = `Validation evidence for ${run.headSha} does not match the active validation-policy identity.`;
           run = applyTransition(
             run,

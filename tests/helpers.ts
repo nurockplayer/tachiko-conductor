@@ -1,7 +1,13 @@
 import { createRun } from '../src/domain/run.js';
+import type { ActiveValidationConfiguration } from '../src/domain/state-machine.js';
 import type { AgentResult, IssueTarget, ReviewResult, Run, Target, ValidationResult } from '../src/domain/types.js';
 
 export const T0 = '2026-08-14T00:00:00.000Z';
+
+export const TEST_VALIDATION_AUTHORITY: ActiveValidationConfiguration = {
+  local: { kind: 'configured', revision: 'test-config-v1' },
+  hosted: { kind: 'configured', revision: 'test-hosted-policy-v1', mode: 'required' },
+};
 
 export const TARGET: IssueTarget = { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 };
 

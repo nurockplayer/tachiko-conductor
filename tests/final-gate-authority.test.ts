@@ -16,7 +16,7 @@ import type { Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import { evaluateHostedCheckPolicy } from '../src/validation/hosted-policy.js';
 import { runWorkflow } from '../src/workflow/run.js';
-import { TARGET, approval, successResult, validationPassed } from './helpers.js';
+import { TARGET, TEST_VALIDATION_AUTHORITY, approval, successResult, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -62,6 +62,7 @@ function finalGateRun(id = 'final-gate-authority'): Run {
     run,
     { type: 'review_approved', reviewResult: approval('sol', HEAD) },
     T0,
+    TEST_VALIDATION_AUTHORITY,
   );
 }
 

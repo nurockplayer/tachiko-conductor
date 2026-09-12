@@ -13,7 +13,7 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import type { IssueTarget, Run } from '../src/domain/types.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
-import { TARGET, approval, successResult, validationPassed } from './helpers.js';
+import { TARGET, TEST_VALIDATION_AUTHORITY, approval, successResult, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -158,7 +158,7 @@ function finalGateRun(): Run {
     T0,
   );
   run = applyTransition(run, { type: 'validation_passed', validationResult: validation }, T0);
-  return applyTransition(run, { type: 'review_approved', reviewResult: approval('sol', HEAD) }, T0);
+  return applyTransition(run, { type: 'review_approved', reviewResult: approval('sol', HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
 }
 
 describe('final-gate durable restart proof', () => {

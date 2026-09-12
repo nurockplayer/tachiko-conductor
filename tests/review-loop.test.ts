@@ -451,6 +451,7 @@ describe('runReviewLoop', () => {
       reviewingRun(),
       { type: 'changes_requested', reviewResult: requested },
       T0,
+      reviewAuthority(),
     );
     store.create(interrupted);
     const reviewer = new FakeReviewer([]);
@@ -474,6 +475,7 @@ describe('runReviewLoop', () => {
       reviewingRun(),
       { type: 'changes_requested', reviewResult: requestChanges(HEAD) },
       T0,
+      reviewAuthority(),
     );
     run = applyTransition(
       run,
@@ -503,7 +505,7 @@ describe('runReviewLoop', () => {
   it('resumes a persisted CHANGES_REQUESTED run by fixing before re-reviewing', async () => {
     const store = new MemoryStore();
     const requested = requestChanges(HEAD);
-    store.create(applyTransition(reviewingRun(), { type: 'changes_requested', reviewResult: requested }, T0));
+    store.create(applyTransition(reviewingRun(), { type: 'changes_requested', reviewResult: requested }, T0, reviewAuthority()));
     const reviewer = new FakeReviewer([approve(HEAD2)]);
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 

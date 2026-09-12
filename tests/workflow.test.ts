@@ -13,7 +13,7 @@ import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '..
 import type { RunStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
-import { TARGET, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
+import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -544,7 +544,7 @@ describe('runWorkflow', () => {
   it('passes the final gate for a persisted run already parked in FINAL_GATE', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
     const implementation = new FakeImplementation([]);
     const reviewer = new FakeReviewer([]);
@@ -562,7 +562,7 @@ describe('runWorkflow', () => {
   it('returns a terminal outcome for a run already in MERGED without looping', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     run = { ...run, state: 'MERGE_READY', history: [...run.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
     run = applyTransition(run, { type: 'merged' }, T0);
     store.update(run);
@@ -659,7 +659,7 @@ describe('runWorkflow', () => {
   it('resumes a persisted in-flight fix with the blocking findings instead of the issue body', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     run = applyTransition(run, { type: 'start_fix' }, T0);
     store.update(run);
     const implementation = new FakeImplementation([successResult(HEAD2, 'fixed after restart')]);
@@ -679,7 +679,7 @@ describe('runWorkflow', () => {
   it('never passes the final gate when live HEAD drifted after approval', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
 
     const result = await runWorkflow(
@@ -699,7 +699,7 @@ describe('runWorkflow', () => {
   it('waits instead of declaring readiness while exact-HEAD checks are pending', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
     const pending = { ...snapshot(HEAD), checks: { availability: 'available' as const, overall: 'pending' as const, checks: [] } };
     const github = githubAdapter([]);
@@ -719,7 +719,7 @@ describe('runWorkflow', () => {
   it('fails closed when review-thread state is unavailable at the final gate', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
     const unavailable = {
       ...snapshot(HEAD),
@@ -741,7 +741,7 @@ describe('runWorkflow', () => {
   it('blocks a non-clean REST mergeable state at the final gate', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
     const blocked = {
       ...snapshot(HEAD),

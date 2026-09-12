@@ -260,4 +260,70 @@ describe('C20 consolidation regressions', () => {
       (error: unknown) => error instanceof InvalidTransitionError && error.code === 'stale-validation',
     );
   });
+
+  it('F06 rejects public approval when current validation authority is omitted', () => {
+    let run = createRun(TARGET, T0, 'public-review-missing-authority');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded', headSha: HEAD, agentResult: successResult(HEAD), pullRequest: { number: 7, headSha: HEAD },
+    }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+
+    assert.throws(
+      () => applyTransition(run, {
+        type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'probe', headSha: HEAD, findings: [] },
+      }, T0),
+      (error: unknown) => error instanceof InvalidTransitionError && error.code === 'stale-validation',
+    );
+  });
+
+  it('F06 re-resolves policy changed during the awaited post-validation live reread', async () => {
+    const dir = tempDir('tachiko-c20-f06-post-read-policy-');
+    let run = createRun(TARGET, T0, 'validation-post-read-policy-drift');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded', headSha: HEAD, agentResult: successResult(HEAD), pullRequest: { number: 7, headSha: HEAD },
+    }, T0);
+    new JsonFileStore({ dir }).create(run);
+
+    let localRevision = 'local-v1';
+    const validation: ValidationAdapter = {
+      kind: 'validation',
+      get configRevision() { return localRevision; },
+      async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
+        await Promise.resolve();
+        return { ...validationPassed(request.headSha).local, configRevision: 'local-v1' };
+      },
+    };
+    let reads = 0;
+    const github: GitHubAdapter = {
+      kind: 'github',
+      async readIssue(): Promise<never> { throw new Error('unused'); },
+      async readBranch(): Promise<never> { throw new Error('unused'); },
+      async listPullRequests(): Promise<never> { throw new Error('unused'); },
+      async readLiveSnapshot() {
+        reads += 1;
+        if (reads === 2) {
+          await Promise.resolve();
+          localRevision = 'local-v2';
+        }
+        return liveSnapshot(HEAD);
+      },
+    };
+    const store = new RecordingJsonStore(new JsonFileStore({ dir }));
+
+    const result = await runWorkflow(
+      {
+        store, github, implementation: new CapturingImplementation(), reviewer: unusedReviewer, validation,
+        hostedCheckPolicy: { revision: 'hosted-v1', policy: { mode: 'required' } },
+      },
+      'validation-post-read-policy-drift',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.ok(reads >= 2);
+    assert.equal(store.updates.some((entry) => entry.state === 'REVIEWING'), false);
+    assert.equal(store.updates.some((entry) => entry.history.at(-1)?.type === 'validation_passed'), false);
+  });
 });

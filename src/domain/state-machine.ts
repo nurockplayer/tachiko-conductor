@@ -598,12 +598,12 @@ function assertPayload(
         `Transition "${input.type}" requires coherent validation evidence for the accepted pull request and exact HEAD before a review result can be admitted.`,
       );
     }
-    if (activeValidation !== undefined && !isValidationFresh(run, activeValidation)) {
+    if (activeValidation === undefined || !isValidationFresh(run, activeValidation)) {
       throw new InvalidTransitionError(
         'stale-validation',
         from,
         input.type,
-        `Transition "${input.type}" requires validation evidence matching the current validation-policy authority.`,
+        `Transition "${input.type}" requires current validation-policy authority matching its validation evidence.`,
       );
     }
   }
