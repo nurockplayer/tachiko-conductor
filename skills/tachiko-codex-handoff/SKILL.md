@@ -23,7 +23,7 @@ Keep the prompt concise and do not copy the Issue body back into it. Include onl
 - instruction that the Issue is the implementation contract and scope must not be broadened;
 - isolated branch/worktree expectations when new implementation work is required;
 - repository-required validation, tests, browser/source evidence, or build checks by reference to the Issue rather than duplication;
-- one canonical `agent-handoff:v1` when the repository workflow uses it, updated only at meaningful milestones;
+- one canonical handoff comment when the repository workflow uses it. The comment must contain the exact marker `<!-- agent-handoff:v1 -->`, followed by at least one non-empty level-two (`##`) section. Prefer a compact structure such as `## STATUS`, `## CURRENT STATE`, `## EVIDENCE`, and `## NEXT ACTION`; put the exact 40-character HEAD SHA and `PR: #<number>` in `## CURRENT STATE` when a PR exists so the live parser can bind identity. Update that same comment only at meaningful milestones rather than posting duplicates;
 - no force push and no merge without explicit approval;
 - progress updates to GitHub at meaningful milestones and re-reading the latest Issue/PR comments before major phase transitions;
 - a fresh independent exact-HEAD review before final handoff when project policy requires it;
