@@ -6,17 +6,19 @@ import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
+import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
-import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
+import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
-import { TARGET, failureResult, successResult } from './helpers.js';
+import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const HEAD2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+const TEST_HOSTED_POLICY = { revision: 'test-hosted-policy-v1', policy: { mode: 'required' as const } };
 
 class MemoryStore implements RunStore {
   readonly name = 'memory';
@@ -58,7 +60,7 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
     },
     pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha, headRef: 'tachiko/issue-42-test', headRepository: { owner: 'acme', repo: 'widgets' }, baseRef: 'main' },
     headSha,
-    checks: { availability: 'available', overall: 'passing', checks: [] },
+    checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
     conversations: [],
     handoff: null,
@@ -68,6 +70,7 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
 }
 
 function githubAdapter(liveHeads: Array<string | null>): GitHubAdapter {
+  let latest: string | null | undefined;
   return {
     kind: 'github',
     async readIssue() {
@@ -80,7 +83,9 @@ function githubAdapter(liveHeads: Array<string | null>): GitHubAdapter {
       throw new Error('unused');
     },
     async readLiveSnapshot() {
-      const head = liveHeads.shift();
+      const queued = liveHeads.shift();
+      if (queued !== undefined) latest = queued;
+      const head = queued ?? latest;
       if (head === undefined) throw new Error('No live snapshot queued');
       if (head === null) return { ...snapshot(HEAD), headSha: null, pullRequest: null };
       return snapshot(head);
@@ -111,6 +116,21 @@ class FakeImplementation implements ImplementationAgent {
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
     return outcome;
+  }
+}
+
+class FakeValidation implements ValidationAdapter {
+  readonly kind = 'validation' as const;
+  readonly configRevision: string;
+  readonly requests: ValidationRequest[] = [];
+
+  constructor(private readonly outcomes: LocalValidationEvidence[] = [], revision = 'test-config-v1') {
+    this.configRevision = revision;
+  }
+
+  async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
+    this.requests.push(request);
+    return this.outcomes.shift() ?? { ...validationPassed(request.headSha).local, configRevision: this.configRevision };
   }
 }
 
@@ -153,12 +173,248 @@ function reviewingRun(store: RunStore, id = 'run-1', headSha = HEAD): Run {
   let run = createRun(TARGET, T0, id);
   run = applyTransition(run, { type: 'start' }, T0);
   run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha }, T0);
-  run = applyTransition(run, { type: 'validation_passed' }, T0);
+  run = applyTransition(run, {
+    type: 'validation_passed',
+    validationResult: validationPassed(headSha),
+    pullRequest: { number: 7, headSha },
+  }, T0);
   store.create(run);
   return run;
 }
 
 describe('runWorkflow', () => {
+  it('fails closed in VALIDATING when no explicit local validation adapter is configured', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-missing');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      checks: { availability: 'available', overall: 'pending', checks: [] },
+    });
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(result.run.validationResult?.status, 'unknown');
+    assert.equal(result.run.validationResult?.hosted.status, 'unknown');
+  });
+
+  it('persists local evidence while hosted checks wait, then resumes with a fresh hosted pass', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-wait');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const validation = new FakeValidation();
+    const pending = { ...snapshot(HEAD), checks: { availability: 'available' as const, overall: 'pending' as const, checks: [] } };
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => pending;
+
+    const waiting = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation, hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(waiting.run.state, 'WAITING_DEPENDENCY');
+    assert.equal(waiting.run.validationResult?.status, 'waiting');
+    assert.equal(validation.requests.length, 1);
+
+    store.update(applyTransition(waiting.run, { type: 'dependency_satisfied', reason: 'Retry readiness checks' }, T0));
+    const revisedValidation = new FakeValidation([], 'test-config-v2');
+    const resumed = await runWorkflow(
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(HEAD)]), validation: revisedValidation, hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(resumed.outcome, 'merge_ready');
+    assert.equal(resumed.run.validationResult?.status, 'passed');
+    assert.equal(validation.requests.length, 1);
+    assert.equal(revisedValidation.requests.length, 1);
+  });
+
+  it('routes same-PR exact-HEAD hosted failures observed during local validation through repair without reviewer admission', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-post-await-hosted-failure');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+
+    let hostedFailed = false;
+    const github: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() { throw new Error('unused'); },
+      async readBranch() { throw new Error('unused'); },
+      async listPullRequests() { throw new Error('unused'); },
+      async readLiveSnapshot() {
+        const state = hostedFailed ? 'failing' as const : 'passing' as const;
+        return {
+          ...snapshot(HEAD),
+          checks: { availability: 'available', overall: state, checks: [{ id: 'ci', name: 'ci', state, url: null, updatedAt: T0 }] },
+        };
+      },
+    };
+    const validation: ValidationAdapter = {
+      kind: 'validation',
+      configRevision: 'test-config-v1',
+      async validate(request) {
+        await Promise.resolve();
+        hostedFailed = true;
+        return { ...validationPassed(request.headSha).local, configRevision: 'test-config-v1' };
+      },
+    };
+    let reviewerCalls = 0;
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review(request) {
+        reviewerCalls += 1;
+        return approve(request.headSha);
+      },
+    };
+
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.validationResult?.status, 'failed');
+    assert.equal(result.run.validationResult?.hosted.status, 'failed');
+    assert.equal(reviewerCalls, 0);
+    assert.ok(result.run.history.some((entry) => entry.type === 'validation_failed'));
+  });
+
+  it('does not treat unavailable hosted checks as a passing validation source', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-hosted-unavailable');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      checks: { availability: 'unavailable', overall: 'passing', checks: [] },
+    });
+
+    const result = await runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.validationResult?.status, 'unknown');
+    assert.equal(result.run.validationResult?.hosted.status, 'unknown');
+  });
+
+  it('keeps an explicit not-required hosted policy neutral when its observation endpoint is unavailable', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-hosted-neutral');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => ({
+      ...snapshot(HEAD),
+      checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
+    });
+
+    const result = await runWorkflow(
+      {
+        store,
+        github,
+        implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([approve(HEAD)]),
+        validation: new FakeValidation(),
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'not_required' } },
+      },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(result.run.validationResult?.hosted.status, 'not_required');
+  });
+
+  it('parks an anonymous configured validation adapter before it can execute or enter review', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-anonymous');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    let calls = 0;
+    const anonymous = {
+      kind: 'validation' as const,
+      async validate() {
+        calls += 1;
+        return validationPassed(HEAD).local;
+      },
+    } as unknown as ValidationAdapter;
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: anonymous, hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(calls, 0);
+    assert.match(result.reason, /no usable stable revision/i);
+  });
+
+  it('does not re-review a persisted run after its configured validation authority loses identity', async () => {
+    const store = new MemoryStore();
+    reviewingRun(store, 'review-anonymous', HEAD);
+    let reviewCalls = 0;
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review() {
+        reviewCalls += 1;
+        return approve(HEAD);
+      },
+    };
+    const anonymous = {
+      kind: 'validation' as const,
+      async validate() { return validationPassed(HEAD).local; },
+    } as unknown as ValidationAdapter;
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation: new FakeImplementation([]), reviewer, validation: anonymous, hostedCheckPolicy: TEST_HOSTED_POLICY },
+      'review-anonymous',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(reviewCalls, 0);
+  });
+
+  it('routes a failed validation through a bounded implementation repair instead of terminal failure', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-failure-repair');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([successResult(HEAD2, 'repair failed validation')]);
+    const result = await runWorkflow(
+      {
+        store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation,
+        reviewer: new FakeReviewer([approve(HEAD2)]),
+        validation: new FakeValidation([validationFailed(HEAD).local]), hostedCheckPolicy: TEST_HOSTED_POLICY,
+      },
+      run.id, { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests.length, 1);
+    assert.equal(result.run.headSha, HEAD2);
+  });
+
   it('drives READY → implementation → review changes → fix → PASS → MERGE_READY', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-1'));
@@ -166,7 +422,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -174,7 +430,7 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'MERGE_READY');
     assert.equal(result.run.headSha, HEAD2);
-    assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'gate_passed'));
+    assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'final_gate_verified'));
   });
 
   it('resolves a fresh ephemeral MCP capability before initial implementation and every review fix', async () => {
@@ -196,9 +452,10 @@ describe('runWorkflow', () => {
     const result = await runWorkflow(
       {
         store,
-        github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2]),
+        github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]),
         implementation,
         reviewer,
+        validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
         resolveImplementationCapabilities: async () => [capabilities[capabilityIndex++]!],
       },
       'run-capability',
@@ -265,10 +522,19 @@ describe('runWorkflow', () => {
       successResult(HEAD2, 'fixed after takeover'),
     ]);
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
-    const github = githubAdapter([HEAD, HEAD, HEAD2, HEAD2, HEAD2]);
+    const github = githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]);
 
     const parked = await runReviewLoop(
-      { store, github, implementation, reviewer },
+      {
+        store,
+        github,
+        implementation,
+        reviewer,
+        resolveValidationAuthority: () => ({
+          local: { kind: 'configured' as const, revision: 'test-config-v1' },
+          hosted: { kind: 'configured' as const, revision: 'test-hosted-policy-v1', mode: 'required' as const },
+        }),
+      },
       'run-resume-fix',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -277,7 +543,7 @@ describe('runWorkflow', () => {
     store.update(resumed);
 
     const result = await runWorkflow(
-      { store, github, implementation, reviewer },
+      { store, github, implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-resume-fix',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -299,7 +565,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 2, now: () => T0 },
     );
@@ -318,7 +584,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -330,13 +596,13 @@ describe('runWorkflow', () => {
   it('passes the final gate for a persisted run already parked in FINAL_GATE', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
     const implementation = new FakeImplementation([]);
     const reviewer = new FakeReviewer([]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -348,8 +614,8 @@ describe('runWorkflow', () => {
   it('returns a terminal outcome for a run already in MERGED without looping', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
-    run = applyTransition(run, { type: 'gate_passed' }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    run = { ...run, state: 'MERGE_READY', history: [...run.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
     run = applyTransition(run, { type: 'merged' }, T0);
     store.update(run);
     const implementation = new FakeImplementation([]);
@@ -372,7 +638,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([null, null, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer, bootstrap: new FakeBootstrap() },
+      { store, github: githubAdapter([null, null, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer, bootstrap: new FakeBootstrap(), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -405,7 +671,7 @@ describe('runWorkflow', () => {
     store.create(run);
     const implementation = new FakeImplementation([]);
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([approve(HEAD)]), bootstrap: new FakeBootstrap() },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([approve(HEAD)]), bootstrap: new FakeBootstrap(), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-crash-window', { maxReviewAttempts: 3, now: () => T0 },
     );
     assert.equal(result.outcome, 'merge_ready');
@@ -430,7 +696,7 @@ describe('runWorkflow', () => {
     const reviewer = new FakeReviewer([approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -445,14 +711,14 @@ describe('runWorkflow', () => {
   it('resumes a persisted in-flight fix with the blocking findings instead of the issue body', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     run = applyTransition(run, { type: 'start_fix' }, T0);
     store.update(run);
     const implementation = new FakeImplementation([successResult(HEAD2, 'fixed after restart')]);
     const reviewer = new FakeReviewer([approve(HEAD2)]);
 
     const result = await runWorkflow(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -465,7 +731,7 @@ describe('runWorkflow', () => {
   it('never passes the final gate when live HEAD drifted after approval', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
 
     const result = await runWorkflow(
@@ -485,19 +751,19 @@ describe('runWorkflow', () => {
   it('waits instead of declaring readiness while exact-HEAD checks are pending', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
     const pending = { ...snapshot(HEAD), checks: { availability: 'available' as const, overall: 'pending' as const, checks: [] } };
     const github = githubAdapter([]);
     github.readLiveSnapshot = async () => pending;
 
     const result = await runWorkflow(
-      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.outcome, 'waiting_dependency');
     assert.equal(result.run.state, 'WAITING_DEPENDENCY');
     assert.deepEqual(result.run.interrupt?.choices, ['Retry readiness checks', 'Cancel the run']);
   });
@@ -505,7 +771,7 @@ describe('runWorkflow', () => {
   it('fails closed when review-thread state is unavailable at the final gate', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
     const unavailable = {
       ...snapshot(HEAD),
@@ -515,7 +781,7 @@ describe('runWorkflow', () => {
     github.readLiveSnapshot = async () => unavailable;
 
     const result = await runWorkflow(
-      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );
@@ -527,7 +793,7 @@ describe('runWorkflow', () => {
   it('blocks a non-clean REST mergeable state at the final gate', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
     store.update(run);
     const blocked = {
       ...snapshot(HEAD),
@@ -537,7 +803,7 @@ describe('runWorkflow', () => {
     github.readLiveSnapshot = async () => blocked;
 
     const result = await runWorkflow(
-      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]) },
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
       'run-1',
       { maxReviewAttempts: 3, now: () => T0 },
     );

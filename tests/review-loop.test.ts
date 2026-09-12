@@ -1,21 +1,31 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
-import { applyTransition } from '../src/domain/state-machine.js';
+import { applyTransition, type ActiveValidationConfiguration } from '../src/domain/state-machine.js';
 import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
 import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
-import type { RunStore } from '../src/store/json-file-store.js';
-import { TARGET, failureResult, successResult } from './helpers.js';
+import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
+import { TARGET, failureResult, successResult, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const HEAD2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const HEAD3 = 'cccccccccccccccccccccccccccccccccccccccc';
+
+function reviewAuthority() {
+  return {
+    local: { kind: 'configured' as const, revision: 'test-config-v1' },
+    hosted: { kind: 'configured' as const, revision: 'test-hosted-policy-v1', mode: 'required' as const },
+  };
+}
 
 class MemoryStore implements RunStore {
   readonly name = 'memory';
@@ -47,7 +57,11 @@ function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string): Run {
   run = applyTransition(run, { type: 'start' }, T0);
   const agentResult = { ...successResult(headSha), ...(sessionId === undefined ? {} : { sessionId }) };
   run = applyTransition(run, { type: 'agent_succeeded', agentResult, headSha }, T0);
-  run = applyTransition(run, { type: 'validation_passed' }, T0);
+  run = applyTransition(run, {
+    type: 'validation_passed',
+    validationResult: validationPassed(headSha),
+    pullRequest: { number: 7, headSha },
+  }, T0);
   return run;
 }
 
@@ -158,7 +172,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -167,26 +181,186 @@ describe('runReviewLoop', () => {
     assert.equal(result.run.state, 'FINAL_GATE');
     const persisted = store.read('run-1');
     assert.equal(persisted?.state, 'FINAL_GATE');
-    assert.equal(persisted?.history.some((entry) => entry.type === 'gate_passed'), false);
+    assert.equal(persisted?.history.some((entry) => entry.type === 'final_gate_verified'), false);
   });
 
-  it('routes REQUEST_CHANGES through the fix loop back to a re-review that approves', async () => {
+  it('requires an authority resolver for direct public review-loop entry', async () => {
+    const store = new MemoryStore();
+    store.create(reviewingRun());
+
+    await assert.rejects(
+      runReviewLoop(
+        {
+          store,
+          github: githubAdapter([HEAD]),
+          implementation: new FakeImplementation([]),
+          reviewer: new FakeReviewer([]),
+        } as unknown as Parameters<typeof runReviewLoop>[0],
+        'run-1',
+        { maxAttempts: 3, now: () => T0 },
+      ),
+      /requires a current validation-authority resolver/,
+    );
+  });
+
+  it('does not invoke a reviewer when fresh policy identity differs or is removed', async () => {
+    const authorities: ReadonlyArray<{ readonly id: string; readonly resolve: () => ActiveValidationConfiguration }> = [
+      { id: 'policy-revision', resolve: () => ({
+        local: { kind: 'configured' as const, revision: 'test-config-v2' },
+        hosted: { kind: 'configured' as const, revision: 'test-hosted-policy-v1', mode: 'required' as const },
+      }) },
+      { id: 'policy-removed', resolve: () => ({ local: { kind: 'absent' as const }, hosted: { kind: 'absent' as const } }) },
+    ];
+    for (const { id, resolve } of authorities) {
+      const store = new MemoryStore();
+      store.create(reviewingRun(HEAD, id));
+      const reviewer = new FakeReviewer([approve(HEAD)]);
+      const result = await runReviewLoop(
+        {
+          store,
+          github: githubAdapter([HEAD]),
+          implementation: new FakeImplementation([]),
+          reviewer,
+          resolveValidationAuthority: resolve,
+        },
+        store.list()[0]!.id,
+        { maxAttempts: 3, now: () => T0 },
+      );
+      assert.equal(result.outcome, 'revalidating');
+      assert.equal(result.run.state, 'VALIDATING');
+      assert.equal(result.run.reviewResult, undefined);
+      assert.equal(reviewer.requests.length, 0);
+    }
+  });
+
+  it('F06 persists REVIEWING, then a fresh JsonFileStore revalidates changed policy before any reviewer call', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-reviewing-restart-'));
+    try {
+      const first = new JsonFileStore({ dir });
+      first.create(reviewingRun(HEAD, 'reviewing-policy-restart'));
+      const restarted = new JsonFileStore({ dir });
+      const reviewer = new FakeReviewer([approve(HEAD)]);
+
+      const result = await runReviewLoop(
+        {
+          store: restarted,
+          github: githubAdapter([HEAD]),
+          implementation: new FakeImplementation([]),
+          reviewer,
+          resolveValidationAuthority: () => ({
+            local: { kind: 'configured', revision: 'changed-local-v2' },
+            hosted: { kind: 'configured', revision: 'test-hosted-policy-v1', mode: 'required' },
+          }),
+        },
+        'reviewing-policy-restart',
+        { maxAttempts: 3, now: () => T0 },
+      );
+
+      assert.equal(result.outcome, 'revalidating');
+      assert.equal(result.run.state, 'VALIDATING');
+      assert.equal(reviewer.requests.length, 0);
+      const persisted = new JsonFileStore({ dir }).read('reviewing-policy-restart');
+      assert.equal(persisted?.state, 'VALIDATING');
+      assert.equal(persisted?.reviewResult, undefined);
+      assert.equal(persisted?.history.at(-1)?.type, 'revalidate');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('F03 carries a validation-failure repair through a fresh store with the accepted PR and executor session', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-repair-'));
+    try {
+      let run = createRun(TARGET, T0, 'validation-repair');
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, {
+        type: 'agent_succeeded', headSha: HEAD,
+        agentResult: { ...successResult(HEAD), sessionId: 'session-validation', executor: { provider: 'codex-cli', sessionId: 'thread-validation' } },
+      }, T0);
+      run = applyTransition(run, {
+        type: 'validation_failed', validationResult: {
+          ...validationPassed(HEAD), status: 'failed',
+          local: { ...validationPassed(HEAD).local, status: 'failed', commands: [{ commandIndex: 0, executable: 'test', outcome: 'failed', exitCode: 1, durationMs: 1 }] },
+        }, pullRequest: { number: 7, headSha: HEAD },
+      }, T0);
+      new JsonFileStore({ dir }).create(run);
+
+      const implementation = new FakeImplementation([successResult(HEAD2, 'validation repair')]);
+      const result = await runReviewLoop(
+        {
+          store: new JsonFileStore({ dir }),
+          github: githubAdapter([HEAD, HEAD2]),
+          implementation,
+          reviewer: new FakeReviewer([]),
+          resolveValidationAuthority: reviewAuthority,
+        },
+        'validation-repair',
+        { maxAttempts: 3, now: () => T0 },
+      );
+
+      assert.equal(result.outcome, 'approved');
+      assert.equal(result.run.state, 'VALIDATING');
+      assert.equal(result.run.headSha, HEAD2);
+      assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD2 });
+      assert.equal(implementation.requests[0]?.sessionId, 'session-validation');
+      assert.deepEqual(implementation.requests[0]?.executor, { provider: 'codex-cli', sessionId: 'thread-validation' });
+      const persisted = new JsonFileStore({ dir }).read('validation-repair');
+      assert.equal(persisted?.history.filter((entry) => entry.type === 'start_fix').length, 1);
+      assert.deepEqual(persisted?.pullRequest, { number: 7, headSha: HEAD2 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops an awaited review when authority changes before result persistence', async () => {
+    const store = new MemoryStore();
+    store.create(reviewingRun());
+    let revision = 'test-config-v1';
+    class ChangingReviewer extends FakeReviewer {
+      override async review(request: ReviewRequest): Promise<ReviewResult> {
+        const result = await super.review(request);
+        revision = 'test-config-v2';
+        return result;
+      }
+    }
+    const reviewer = new ChangingReviewer([approve(HEAD)]);
+    const result = await runReviewLoop(
+      {
+        store,
+        github: githubAdapter([HEAD, HEAD]),
+        implementation: new FakeImplementation([]),
+        reviewer,
+        resolveValidationAuthority: () => ({
+          local: { kind: 'configured', revision },
+          hosted: { kind: 'configured', revision: 'test-hosted-policy-v1', mode: 'required' },
+        }),
+      },
+      'run-1',
+      { maxAttempts: 3, now: () => T0 },
+    );
+    assert.equal(result.outcome, 'revalidating');
+    assert.equal(result.run.state, 'VALIDATING');
+    assert.equal(result.run.reviewResult, undefined);
+    assert.equal(reviewer.requests.length, 1);
+  });
+
+  it('returns a new fix HEAD to VALIDATING instead of bypassing fresh validation', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
     const reviewer = new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]);
     const implementation = new FakeImplementation([successResult(HEAD2, 'fixed')]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
 
     assert.equal(result.outcome, 'approved');
-    assert.equal(result.run.state, 'FINAL_GATE');
+    assert.equal(result.run.state, 'VALIDATING');
     assert.equal(result.run.headSha, HEAD2);
     assert.deepEqual(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
-    assert.deepEqual(reviewer.requests.map((request) => request.headSha), [HEAD, HEAD2]);
+    assert.deepEqual(reviewer.requests.map((request) => request.headSha), [HEAD]);
   });
 
   it('routes only blocking findings to implementation', async () => {
@@ -203,7 +377,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -218,7 +392,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -242,7 +416,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -253,21 +427,20 @@ describe('runReviewLoop', () => {
     });
   });
 
-  it('escalates to NEEDS_HUMAN when the review loop exceeds maxAttempts', async () => {
+  it('returns the fixed HEAD to VALIDATING before a second review can consume the attempt budget', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
     const reviewer = new FakeReviewer([requestChanges(HEAD), requestChanges(HEAD2)]);
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD2]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 2, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'needs_human');
-    assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.match(result.reason, /did not converge/);
+    assert.equal(result.outcome, 'approved');
+    assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests.length, 1);
   });
 
@@ -278,13 +451,14 @@ describe('runReviewLoop', () => {
       reviewingRun(),
       { type: 'changes_requested', reviewResult: requested },
       T0,
+      reviewAuthority(),
     );
     store.create(interrupted);
     const reviewer = new FakeReviewer([]);
     const implementation = new FakeImplementation([]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([]), implementation, reviewer },
+      { store, github: githubAdapter([]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 1, now: () => T0 },
     );
@@ -301,6 +475,7 @@ describe('runReviewLoop', () => {
       reviewingRun(),
       { type: 'changes_requested', reviewResult: requestChanges(HEAD) },
       T0,
+      reviewAuthority(),
     );
     run = applyTransition(
       run,
@@ -317,33 +492,33 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 1, now: () => T0 },
     );
 
     assert.equal(result.outcome, 'approved');
-    assert.equal(result.run.state, 'FINAL_GATE');
+    assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests.length, 1);
   });
 
   it('resumes a persisted CHANGES_REQUESTED run by fixing before re-reviewing', async () => {
     const store = new MemoryStore();
     const requested = requestChanges(HEAD);
-    store.create(applyTransition(reviewingRun(), { type: 'changes_requested', reviewResult: requested }, T0));
+    store.create(applyTransition(reviewingRun(), { type: 'changes_requested', reviewResult: requested }, T0, reviewAuthority()));
     const reviewer = new FakeReviewer([approve(HEAD2)]);
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD2, HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD2]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 2, now: () => T0 },
     );
 
     assert.equal(result.outcome, 'approved');
-    assert.equal(result.run.state, 'FINAL_GATE');
+    assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests[0]?.baseSha, HEAD);
-    assert.deepEqual(reviewer.requests.map((reviewRequest) => reviewRequest.headSha), [HEAD2]);
+    assert.deepEqual(reviewer.requests.map((reviewRequest) => reviewRequest.headSha), []);
   });
 
   it('turns retryable and fatal reviewer failures into durable outcomes', async () => {
@@ -356,6 +531,7 @@ describe('runReviewLoop', () => {
         github: githubAdapter([HEAD]),
         implementation: new FakeImplementation([]),
         reviewer: new FakeReviewer([retryable]),
+        resolveValidationAuthority: reviewAuthority,
       },
       'retry-run',
       { maxAttempts: 3, now: () => T0 },
@@ -373,6 +549,7 @@ describe('runReviewLoop', () => {
         github: githubAdapter([HEAD]),
         implementation: new FakeImplementation([]),
         reviewer: new FakeReviewer([fatal]),
+        resolveValidationAuthority: reviewAuthority,
       },
       'fatal-run',
       { maxAttempts: 3, now: () => T0 },
@@ -389,7 +566,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([failureResult('agent crashed')]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -412,7 +589,7 @@ describe('runReviewLoop', () => {
     ]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -430,7 +607,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD2]), implementation, reviewer },
+      { store, github: githubAdapter([HEAD2]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
@@ -448,7 +625,7 @@ describe('runReviewLoop', () => {
     const implementation = new FakeImplementation([]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([null]), implementation, reviewer },
+      { store, github: githubAdapter([null]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );

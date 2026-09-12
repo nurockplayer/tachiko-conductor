@@ -12,6 +12,7 @@ import {
   parseIssueNumber,
   parseIssueRef,
   resolveCodexExecutionConfig,
+  resolveLocalValidationConfiguration,
   resolveImplementationProvider,
   resolveRunsDir,
   runCreateCommand,
@@ -30,7 +31,7 @@ import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/doma
 import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
-import { T0, TARGET, successResult } from './helpers.js';
+import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -130,6 +131,38 @@ describe('CLI command layer', () => {
     assert.throws(
       () => resolveCodexExecutionConfig({ TACHIKO_CODEX_TIMEOUT_MS: '0' }),
       /TACHIKO_CODEX_TIMEOUT_MS/,
+    );
+    assert.equal(resolveLocalValidationConfiguration({}), undefined);
+    assert.deepEqual(
+      resolveLocalValidationConfiguration({
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] }),
+      }),
+      { revision: 'repo-v1', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
+    );
+    assert.deepEqual(
+      resolveLocalValidationConfiguration({
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
+          revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr',
+          commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }],
+        }),
+      }),
+      { revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: '{bad json' }),
+      /must be valid JSON/,
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [{ argv: [], timeoutMs: 0 }] }) }),
+      /argv must be a non-empty string array/,
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [] }) }),
+      /must contain at least one command/,
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', workspacePath: 'relative', commands: [{ argv: ['tool'], timeoutMs: 100 }] }) }),
+      /workspacePath must be an absolute non-empty path/,
     );
   });
 
@@ -325,7 +358,7 @@ describe('workflow run and resume commands', () => {
       issue: { id: 'I_42', number: 42, title: 'Fix the widget', body: 'DoR-ready.', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
       pullRequest: { id: 'PR_7', number: 7, title: 'Fix', url: '', state: 'open', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN', updatedAt: '', headSha, baseSha: 'base' },
       headSha,
-      checks: { availability: 'available', overall: 'passing', checks: [] },
+      checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
       reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
       conversations: [],
       handoff: null,
@@ -335,6 +368,7 @@ describe('workflow run and resume commands', () => {
   }
 
   function githubAdapter(liveHeads: string[]): GitHubAdapter {
+    let latest: string | undefined;
     return {
       kind: 'github',
       async readIssue() {
@@ -347,7 +381,9 @@ describe('workflow run and resume commands', () => {
         throw new Error('unused');
       },
       async readLiveSnapshot() {
-        const head = liveHeads.shift();
+        const queued = liveHeads.shift();
+        if (queued !== undefined) latest = queued;
+        const head = queued ?? latest;
         if (head === undefined) throw new Error('No live snapshot queued');
         return snapshot(head);
       },
@@ -388,7 +424,11 @@ describe('workflow run and resume commands', () => {
     implementation: ImplementationAgent,
     reviewer: ReviewerAdapter,
   ): WorkflowDependencies {
-    return { store, github, implementation, reviewer };
+    return {
+      store, github, implementation, reviewer,
+      validation: { kind: 'validation', configRevision: 'test-config-v1', async validate(request) { return validationPassed(request.headSha).local; } },
+      hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+    };
   }
 
   it('starts an issue end-to-end and reaches MERGE_READY through the fake adapters', async () => {
@@ -397,7 +437,7 @@ describe('workflow run and resume commands', () => {
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await runIssueCommand(
-      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
       'acme/widgets#42',
       { now: () => T0 },
     );
@@ -412,13 +452,13 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     store.create(run);
     const implementation = new FakeImplementation([]);
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await runIssueCommand(
-      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer),
       'acme/widgets#42',
       { now: () => T0 },
     );
@@ -433,7 +473,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(
       run,
       { type: 'escalate', reason: 'architecture decision', interrupt: { evidence: 'two designs', choices: ['A', 'B'] } },
@@ -444,7 +484,7 @@ describe('workflow run and resume commands', () => {
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer),
       'run-1',
       'A',
       { now: () => T0 },
@@ -492,14 +532,14 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(run, { type: 'wait_dependency', reason: 'upstream API', interrupt: { evidence: 'waiting on API' } }, T0);
     store.create(run);
     const implementation = new FakeImplementation([]);
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD, HEAD]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer),
       'run-1',
       'dependency available now',
       { now: () => T0 },
@@ -516,7 +556,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-sync');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(
       run,
       {
@@ -529,6 +569,7 @@ describe('workflow run and resume commands', () => {
         },
       },
       T0,
+      TEST_VALIDATION_AUTHORITY,
     );
     run = applyTransition(run, { type: 'start_fix' }, T0);
     run = applyTransition(
@@ -547,7 +588,7 @@ describe('workflow run and resume commands', () => {
     ]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer),
+      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer),
       'run-sync',
       LIVE_HEAD_SYNC_DECISION,
       { now: () => T0 },
@@ -563,7 +604,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-review-sync');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(
       run,
       {
@@ -578,7 +619,7 @@ describe('workflow run and resume commands', () => {
     const outcome = await resumeCommand(
       deps(
         store,
-        githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]),
+        githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]),
         new FakeImplementation([]),
         new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] }]),
       ),
@@ -625,7 +666,7 @@ describe('workflow run and resume commands', () => {
     let run = createRun(TARGET, T0, 'run-1');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(run, {
       type: 'escalate',
       reason: 'drift',
@@ -635,7 +676,7 @@ describe('workflow run and resume commands', () => {
     const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD2, findings: [] }]);
 
     const outcome = await resumeCommand(
-      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2]), new FakeImplementation([]), reviewer),
+      deps(store, githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), new FakeImplementation([]), reviewer),
       'run-1',
       'Sync the run to the live HEAD and continue',
       { now: () => T0 },

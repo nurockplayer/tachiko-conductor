@@ -8,13 +8,15 @@ import {
 import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
-import { applyTransition, isReviewFresh } from '../domain/state-machine.js';
-import type { Run, Target } from '../domain/types.js';
+import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
+import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
+import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { parkBootstrapFailure } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
+import { evaluateHostedCheckPolicy } from '../validation/hosted-policy.js';
 
 export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
@@ -25,6 +27,10 @@ export interface WorkflowDependencies {
   readonly implementation: ImplementationAgent;
   readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly reviewer: ReviewerAdapter;
+  /** Explicit repository/run validation adapter; absence is recorded as unknown and fails closed. */
+  readonly validation?: ValidationAdapter;
+  /** Explicit repository/run policy for interpreting the exact-HEAD hosted check list. */
+  readonly hostedCheckPolicy?: HostedCheckPolicyConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
 }
 
@@ -37,6 +43,7 @@ export interface WorkflowOptions {
 export type WorkflowOutcome =
   | { readonly outcome: 'merge_ready'; readonly run: Run }
   | { readonly outcome: 'merged'; readonly run: Run }
+  | { readonly outcome: 'waiting_dependency'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
@@ -85,6 +92,117 @@ function park(run: Run, reason: string, store: RunStore, now: () => string, choi
   return { outcome: 'needs_human', run: next, reason };
 }
 
+function hostedValidation(
+  snapshot: GitHubLiveSnapshot,
+  configuredPolicy: HostedCheckPolicyConfiguration | undefined,
+): HostedValidationEvidence {
+  const observedCheckNames = snapshot.checks.checks.map((check) => check.name);
+  // GitHub observations never create their own policy authority. Without an
+  // explicit repository/run policy, every hosted result is fail-closed.
+  const effectivePolicy = configuredPolicy?.policy;
+  const status = configuredPolicy?.policy.mode === 'not_required'
+    ? evaluateHostedCheckPolicy({
+      overall: snapshot.checks.overall,
+      observedCheckNames,
+      policy: configuredPolicy.policy,
+    })
+    : snapshot.checks.availability !== 'available'
+      ? 'unknown'
+      : evaluateHostedCheckPolicy({
+      overall: snapshot.checks.overall,
+      observedCheckNames,
+      ...(effectivePolicy === undefined ? {} : { policy: effectivePolicy }),
+    });
+  return {
+    status,
+    observedAt: snapshot.observedAt,
+    pullRequestNumber: snapshot.pullRequest?.number ?? null,
+    availability: snapshot.checks.availability,
+    overall: snapshot.checks.overall,
+    policyRevision: configuredPolicy?.revision ?? null,
+    policyMode: configuredPolicy?.policy.mode ?? 'unconfigured',
+    requiredCheckNames: configuredPolicy?.policy.mode === 'required'
+      ? [...(configuredPolicy.policy.requiredCheckNames ?? [])]
+      : [],
+    observedCheckNames,
+  };
+}
+
+function unavailableLocalValidation(): LocalValidationEvidence {
+  return { status: 'unknown', configRevision: null, commands: [] };
+}
+
+function combineValidation(headSha: string, local: LocalValidationEvidence, hosted: HostedValidationEvidence): ValidationResult {
+  const status = local.status === 'failed' || hosted.status === 'failed'
+    ? 'failed'
+    : local.status === 'unknown' || hosted.status === 'unknown'
+        ? 'unknown'
+        : hosted.status === 'waiting'
+          ? 'waiting'
+          : 'passed';
+  return { headSha, status, local, hosted };
+}
+
+async function validateExactHead(
+  run: Run,
+  target: Extract<Target, { readonly kind: 'issue' }>,
+  snapshot: GitHubLiveSnapshot,
+  validation: ValidationAdapter | undefined,
+  hostedPolicy: HostedCheckPolicyConfiguration | undefined,
+): Promise<ValidationResult> {
+  if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
+  const reusable = run.validationResult;
+  const local = reusable?.headSha === run.headSha && reusable.local.status === 'passed' &&
+    validation !== undefined && validation.configRevision.trim() !== '' && reusable.local.configRevision === validation.configRevision
+    ? reusable.local
+    : validation === undefined
+      ? unavailableLocalValidation()
+      : await validation.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+  return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
+}
+
+function activeValidationConfiguration(deps: WorkflowDependencies) {
+  return {
+    local: activeLocalPolicyIdentity(deps.validation?.configRevision, deps.validation !== undefined),
+    hosted: activeHostedPolicyIdentity(deps.hostedCheckPolicy?.revision, deps.hostedCheckPolicy?.policy.mode),
+  };
+}
+
+function invalidValidationAuthority(active: ActiveValidationConfiguration): string | null {
+  if (active.local.kind === 'invalid') return 'The configured local validation authority has no usable stable revision.';
+  if (active.hosted.kind === 'invalid') return 'The configured hosted-check policy has no usable stable revision.';
+  return null;
+}
+
+function sameValidationAuthority(
+  left: ActiveValidationConfiguration,
+  right: ActiveValidationConfiguration,
+): boolean {
+  const sameLocal = left.local.kind === right.local.kind &&
+    (left.local.kind !== 'configured' || (right.local.kind === 'configured' && left.local.revision === right.local.revision));
+  const sameHosted = left.hosted.kind === right.hosted.kind &&
+    (left.hosted.kind !== 'configured' || (right.hosted.kind === 'configured' &&
+      left.hosted.revision === right.hosted.revision && left.hosted.mode === right.hosted.mode));
+  return sameLocal && sameHosted;
+}
+
+/**
+ * The only code path which produces MERGE_READY.  It is intentionally local
+ * to the workflow so callers cannot advance cached state around the live
+ * GitHub reconciliation immediately above this call site.
+ */
+function completeLiveFinalGate(run: Run, now: string, activeValidation: ActiveValidationConfiguration): Run {
+  if (run.state !== 'FINAL_GATE' || !isReviewFresh(run) || !isValidationFresh(run, activeValidation) || run.reviewResult?.verdict !== 'approve' || run.reviewResult.findings.some((finding) => finding.severity === 'blocking')) {
+    throw new Error('Live final-gate authority received a run without fresh approving review and validation evidence.');
+  }
+  return {
+    ...run,
+    state: 'MERGE_READY',
+    updatedAt: now,
+    history: [...run.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: now }],
+  };
+}
+
 /**
  * Wire the core state machine, GitHub live state, the implementation agent,
  * and the independent reviewer into one state-resume-aware workflow. Given a
@@ -127,6 +245,23 @@ export async function runWorkflow(
         }
         const pendingReviewFix =
           run.reviewResult?.verdict === 'request_changes' && run.reviewResult.headSha === run.headSha;
+        const pendingValidationRepair = run.validationResult?.status === 'failed' &&
+          run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
+          run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
+        const pendingRepair = pendingReviewFix || pendingValidationRepair;
+        if (pendingRepair) {
+          const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (conflict !== null) return park(run, conflict, store, now);
+          if (snapshot.headSha !== run.headSha) {
+            return park(
+              run,
+              `Live GitHub HEAD ${snapshot.headSha ?? '(none)'} does not match the interrupted repair HEAD ${run.headSha ?? '(none)'}.`,
+              store,
+              now,
+              [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION],
+            );
+          }
+        }
         let bootstrap = run.bootstrap;
         let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
         let initialRecoveryCandidate: { number: number; headSha: string } | undefined;
@@ -148,7 +283,7 @@ export async function runWorkflow(
             initialRecoveryCandidate = { number: snapshot.pullRequest!.number, headSha: snapshot.headSha! };
           }
         }
-        if (pendingReviewFix && snapshot.headSha !== run.headSha) {
+        if (pendingRepair && snapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
             run,
@@ -166,7 +301,7 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
-        if (!pendingReviewFix && snapshot.pullRequest === null && bootstrap === undefined) {
+        if (!pendingRepair && snapshot.pullRequest === null && bootstrap === undefined) {
           if (deps.bootstrap === undefined || snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null) {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
@@ -212,12 +347,16 @@ export async function runWorkflow(
             if (snapshot.headSha !== run.headSha) return park(run, `Live GitHub HEAD changed during bootstrap recovery.`, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
           } else if (run.headSha !== undefined || recoveryAuthority !== undefined) {
             return park(run, 'The owned pull request disappeared during workspace recovery.', store, now);
-          } else if (!pendingReviewFix && (snapshot.repository.defaultBranch !== bootstrap.baseBranch || snapshot.repository.defaultBranchHeadSha !== bootstrap.baseSha)) {
+          } else if (!pendingRepair && (snapshot.repository.defaultBranch !== bootstrap.baseBranch || snapshot.repository.defaultBranchHeadSha !== bootstrap.baseSha)) {
             return bootstrapFailureOutcome(run, new Error('Live default branch changed after bootstrap preparation.'), store, now);
           }
         }
-        const pendingFixInstructions = pendingReviewFix ? renderBlockingFindings(run) : null;
-        const baseSha = pendingReviewFix
+        const pendingFixInstructions = pendingReviewFix
+          ? renderBlockingFindings(run)
+          : pendingValidationRepair
+            ? 'Exact-HEAD validation failed. Repair the implementation and its required validation before returning a new exact HEAD.'
+            : null;
+        const baseSha = pendingRepair
           ? run.headSha
           : snapshot.pullRequest?.baseSha ?? snapshot.repository.defaultBranchHeadSha;
         if (baseSha === null || baseSha === undefined || baseSha === '') {
@@ -287,7 +426,7 @@ export async function runWorkflow(
         if (bootstrap !== undefined) {
           if (result.headSha === undefined || deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
           try {
-            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingReviewFix ? run.headSha : undefined, workspaceGuard });
+            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -298,13 +437,40 @@ export async function runWorkflow(
           }
           run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha, pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha } }, now());
         } else {
-          run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha }, now());
+          // An implementation result is only a claim.  Re-read the live PR
+          // after every unbootstrapped implementation effect as well: this
+          // covers initial work, an interrupted review fix resumed by the
+          // outer workflow, and validation-repair continuity after restart.
+          try {
+            snapshot = await github.readLiveSnapshot(target);
+          } catch (error) {
+            return githubFailureOutcome(run, error, store, now);
+          }
+          if (result.headSha === undefined || snapshot.pullRequest === null || snapshot.headSha !== result.headSha ||
+            pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true }) !== null) {
+            return park(run, 'Live pull request does not prove the implementation exact HEAD and accepted PR identity.', store, now);
+          }
+          run = applyTransition(run, {
+            type: 'agent_succeeded', agentResult: result, headSha: result.headSha,
+            pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha },
+          }, now());
         }
         store.update(run);
         break;
       }
 
       case 'VALIDATING': {
+        const activeValidation = activeValidationConfiguration(deps);
+        const invalidAuthority = invalidValidationAuthority(activeValidation);
+        if (invalidAuthority !== null) {
+          return park(
+            run,
+            `${invalidAuthority} Refusing validation and review admission until an explicit identity is configured.`,
+            store,
+            now,
+            ['Configure a stable validation-policy identity and retry', CANCEL_RUN_DECISION],
+          );
+        }
         let snapshot: GitHubLiveSnapshot;
         try {
           snapshot = await github.readLiveSnapshot(target);
@@ -336,15 +502,160 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
-        run = applyTransition(run, { type: 'validation_passed' }, now());
+        // Validation must execute against the owned checkout for this exact
+        // live HEAD. An accepted H synchronization can advance GitHub before
+        // the local worktree is fast-forwarded, so prepare and prove it again
+        // immediately before the local process boundary.
+        if (run.bootstrap !== undefined && deps.validation?.requiresOwnedWorkspace === true) {
+          if (deps.bootstrap === undefined || run.headSha === undefined) {
+            return bootstrapFailureOutcome(run, new Error('Exact-HEAD validation requires the owned workspace bootstrap.'), store, now);
+          }
+          try {
+            const identity = await deps.bootstrap.prepare({
+              runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
+              existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },
+            });
+            await deps.bootstrap.verifyDurable({ identity, expectedHeadSha: run.headSha });
+          } catch (error) {
+            return bootstrapFailureOutcome(run, error, store, now);
+          }
+        }
+        let validationResult: ValidationResult;
+        try {
+          validationResult = await validateExactHead(run, target, snapshot, deps.validation, deps.hostedCheckPolicy);
+        } catch (error) {
+          const reason = `Local validation could not be observed safely: ${error instanceof Error ? error.message : String(error)}`;
+          validationResult = combineValidation(
+            run.headSha ?? '', unavailableLocalValidation(), hostedValidation(snapshot, deps.hostedCheckPolicy),
+          );
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate', reason, validationResult,
+              interrupt: { evidence: reason, choices: ['Restore the configured validation runner and retry', CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        const currentValidation = activeValidationConfiguration(deps);
+        const currentInvalidAuthority = invalidValidationAuthority(currentValidation);
+        if (currentInvalidAuthority !== null || !sameValidationAuthority(activeValidation, currentValidation)) {
+          const reason = currentInvalidAuthority === null
+            ? 'Validation-policy authority changed during validation; refusing to admit stale evidence.'
+            : `${currentInvalidAuthority} Refusing validation evidence produced before the authority changed.`;
+          return park(run, reason, store, now, ['Restore stable validation-policy authority and retry', CANCEL_RUN_DECISION]);
+        }
+        let postValidationSnapshot: GitHubLiveSnapshot;
+        try {
+          postValidationSnapshot = await github.readLiveSnapshot(target);
+        } catch (error) {
+          return githubFailureOutcome(run, error, store, now);
+        }
+        const postValidationConflict = pullRequestIdentityConflict(run, postValidationSnapshot);
+        if (postValidationConflict !== null) return park(run, postValidationConflict, store, now);
+        if (postValidationSnapshot.headSha !== run.headSha) {
+          const reason = `Live GitHub HEAD changed during validation from ${run.headSha ?? '(none)'} to ${postValidationSnapshot.headSha ?? '(none)'}.`;
+          return park(run, reason, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
+        }
+        const postReadValidation = activeValidationConfiguration(deps);
+        const postReadInvalidAuthority = invalidValidationAuthority(postReadValidation);
+        if (postReadInvalidAuthority !== null || !sameValidationAuthority(currentValidation, postReadValidation)) {
+          const reason = postReadInvalidAuthority === null
+            ? 'Validation-policy authority changed during the post-validation live reread; refusing to admit stale evidence.'
+            : `${postReadInvalidAuthority} Refusing validation evidence after the post-validation live reread.`;
+          return park(run, reason, store, now, ['Restore stable validation-policy authority and retry', CANCEL_RUN_DECISION]);
+        }
+        // Local evidence was observed for the still-current exact HEAD, but
+        // hosted readiness is live state: do not admit the pre-await snapshot
+        // after the post-validation reread has observed different checks.
+        validationResult = combineValidation(
+          run.headSha!, validationResult.local, hostedValidation(postValidationSnapshot, deps.hostedCheckPolicy),
+        );
+        if (validationResult.status === 'failed') {
+          run = applyTransition(run, {
+            type: 'validation_failed', validationResult,
+            pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+          }, now());
+          store.update(run);
+          break;
+        }
+        if (validationResult.status === 'waiting') {
+          const reason = `Validation for ${run.headSha} is waiting for required hosted checks.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'wait_dependency', reason, validationResult,
+              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+              interrupt: { evidence: reason, choices: [RETRY_READINESS_DECISION, CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'waiting_dependency', run, reason };
+        }
+        if (validationResult.status === 'unknown') {
+          const reason = `Validation for ${run.headSha} lacks required local or hosted evidence.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate', reason, validationResult,
+              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+              interrupt: { evidence: reason, choices: ['Restore required validation evidence and retry', CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        if (!validationEvidenceMatchesActive(validationResult, postReadValidation)) {
+          const reason = `Validation evidence for ${run.headSha} does not match the active validation-policy identity.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate', reason, validationResult,
+              interrupt: { evidence: reason, choices: ['Restore matching validation evidence and retry', CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
+        run = applyTransition(
+          run,
+          {
+            type: 'validation_passed', validationResult,
+            ...(snapshot.pullRequest === null ? {} : { pullRequest: { number: snapshot.pullRequest.number, headSha: run.headSha! } }),
+          },
+          now(),
+        );
         store.update(run);
         break;
       }
 
       case 'REVIEWING':
       case 'CHANGES_REQUESTED': {
+        const invalidAuthority = invalidValidationAuthority(activeValidationConfiguration(deps));
+        if (invalidAuthority !== null) {
+          return park(
+            run,
+            `${invalidAuthority} Refusing review admission until an explicit identity is configured.`,
+            store,
+            now,
+            ['Configure a stable validation-policy identity and retry', CANCEL_RUN_DECISION],
+          );
+        }
         const loop = await runReviewLoop(
-          { store, github, implementation, reviewer, bootstrap: deps.bootstrap, resolveImplementationCapabilities: deps.resolveImplementationCapabilities },
+          {
+            store,
+            github,
+            implementation,
+            reviewer,
+            bootstrap: deps.bootstrap,
+            resolveValidationAuthority: () => activeValidationConfiguration(deps),
+            resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
+          },
           run.id,
           {
           maxAttempts: options.maxReviewAttempts,
@@ -358,8 +669,30 @@ export async function runWorkflow(
       }
 
       case 'FINAL_GATE': {
+        const invalidAuthority = invalidValidationAuthority(activeValidationConfiguration(deps));
+        if (invalidAuthority !== null) {
+          return park(
+            run,
+            `${invalidAuthority} Refusing final-gate re-entry until an explicit identity is configured.`,
+            store,
+            now,
+            ['Configure a stable validation-policy identity and retry', CANCEL_RUN_DECISION],
+          );
+        }
         if (!isReviewFresh(run)) {
           run = applyTransition(run, { type: 'gate_blocked' }, now());
+          store.update(run);
+          break;
+        }
+        if (!isValidationFresh(run, activeValidationConfiguration(deps))) {
+          const reason = `Final gate requires validation at current HEAD ${run.headSha ?? '(none)'} under the active repository/run configuration.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'revalidate', reason,
+            },
+            now(),
+          );
           store.update(run);
           break;
         }
@@ -394,18 +727,51 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
+        const currentValidationAuthority = activeValidationConfiguration(deps);
+        if (!isValidationFresh(run, currentValidationAuthority)) {
+          const reason = 'Final gate observed a changed or invalid validation-policy identity while rereading live GitHub state.';
+          run = applyTransition(run, { type: 'revalidate', reason }, now());
+          store.update(run);
+          break;
+        }
+
+        const persistedValidation = run.validationResult;
+        if (persistedValidation === undefined ||
+          persistedValidation.hosted.pullRequestNumber !== snapshot.pullRequest?.number ||
+          persistedValidation.hosted.policyRevision !== (deps.hostedCheckPolicy?.revision ?? null)) {
+          const reason = 'Final gate observed hosted validation evidence that does not match the current pull request or active policy configuration.';
+          run = applyTransition(run, { type: 'revalidate', reason }, now());
+          store.update(run);
+          break;
+        }
+
         const pullRequest = snapshot.pullRequest;
         const mergeState = pullRequest?.mergeStateStatus?.toUpperCase() ?? null;
         const contradictory = snapshot.problems.find((problem) => problem.code === 'CONTRADICTORY_STATE');
+        const currentHosted = hostedValidation(snapshot, deps.hostedCheckPolicy);
+        if (currentHosted.status === 'waiting') {
+          const reason = `Final GitHub readiness gate is waiting for required hosted checks at ${run.headSha ?? '(none)'}.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'wait_dependency', reason,
+              interrupt: { evidence: reason, choices: [RETRY_READINESS_DECISION, CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'waiting_dependency', run, reason };
+        }
         const readinessProblems = [
           snapshot.issue.state !== 'open' ? 'the issue is not open' : null,
           pullRequest === null || pullRequest.state !== 'open' ? 'the pull request is not open' : null,
           pullRequest?.isDraft === true ? 'the pull request is still a draft' : null,
           pullRequest?.mergeable !== true ? 'GitHub does not report the pull request as mergeable' : null,
-          mergeState !== null && mergeState !== 'CLEAN' && mergeState !== 'HAS_HOOKS'
-            ? `merge state is ${mergeState}`
+          mergeState === null || (mergeState !== 'CLEAN' && mergeState !== 'HAS_HOOKS')
+            ? `merge state is ${mergeState ?? 'unavailable'}`
             : null,
-          snapshot.checks.overall !== 'passing' ? `checks are ${snapshot.checks.overall}` : null,
+          currentHosted.status === 'failed' ? 'required hosted checks are failing' : null,
+          currentHosted.status === 'unknown' ? 'required hosted check evidence is unavailable or incomplete' : null,
           snapshot.reviews.unresolvedThreads === null
             ? 'review thread state is unavailable'
             : snapshot.reviews.unresolvedThreads > 0
@@ -416,15 +782,14 @@ export async function runWorkflow(
 
         if (readinessProblems.length > 0) {
           const reason = `Final GitHub readiness gate is blocked: ${readinessProblems.join('; ')}.`;
-          const checksPending = snapshot.checks.overall === 'pending' && readinessProblems.length === 1;
           run = applyTransition(
             run,
             {
-              type: checksPending ? 'wait_dependency' : 'escalate',
+              type: 'escalate',
               reason,
               interrupt: {
                 evidence: reason,
-                choices: [checksPending ? RETRY_READINESS_DECISION : 'Resolve the GitHub readiness blockers and retry', CANCEL_RUN_DECISION],
+                choices: ['Resolve the GitHub readiness blockers and retry', CANCEL_RUN_DECISION],
               },
             },
             now(),
@@ -433,12 +798,16 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
-        run = applyTransition(run, { type: 'gate_passed' }, now());
+        run = completeLiveFinalGate(run, now(), activeValidationConfiguration(deps));
         store.update(run);
         break;
       }
 
       case 'MERGE_READY':
+        if (run.history.some((entry) => entry.type === 'gate_passed')) {
+          const reason = 'Historical gate_passed readiness is read-compatible only; current validation, review, and live GitHub authority must be re-established.';
+          return park(run, reason, store, now, ['Re-establish current readiness authority', CANCEL_RUN_DECISION]);
+        }
         return { outcome: 'merge_ready', run };
 
       case 'MERGED':
@@ -448,7 +817,7 @@ export async function runWorkflow(
         return { outcome: 'needs_human', run, reason: run.interrupt?.reason ?? 'Awaiting a human decision.' };
 
       case 'WAITING_DEPENDENCY':
-        return { outcome: 'needs_human', run, reason: run.interrupt?.reason ?? 'Awaiting an external dependency.' };
+        return { outcome: 'waiting_dependency', run, reason: run.interrupt?.reason ?? 'Awaiting an external dependency.' };
 
       case 'FAILED':
         return { outcome: 'failed', run, reason: run.history.at(-1)?.reason ?? 'The run failed.' };

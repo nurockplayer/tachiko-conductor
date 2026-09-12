@@ -53,7 +53,7 @@ and per-run Claude/Codex MCP capability injection. See
 | `review_approved` | `REVIEWING` | `FINAL_GATE` |
 | `changes_requested` | `REVIEWING` | `CHANGES_REQUESTED` |
 | `start_fix` | `CHANGES_REQUESTED` | `IMPLEMENTING` |
-| `gate_passed` | `FINAL_GATE` | `MERGE_READY` |
+| `revalidate` | `FINAL_GATE` | `VALIDATING` |
 | `gate_blocked` | `FINAL_GATE` | `REVIEWING` |
 | `merged` | `MERGE_READY` | `MERGED` |
 | `wait_dependency` | any active state | `WAITING_DEPENDENCY` |
@@ -63,9 +63,9 @@ and per-run Claude/Codex MCP capability injection. See
 | `fail` | any non-terminal state | `FAILED` |
 
 Anything else throws an `InvalidTransitionError` whose message names the
-invalid transition, the current state, and the allowed transitions. The final
-gate is enforced in the core: `gate_passed` only succeeds when the latest
-review result is bound to the run's current HEAD SHA.
+invalid transition, the current state, and the allowed transitions. `MERGE_READY`
+is not a public transition: only the canonical workflow creates it after a live
+FINAL_GATE reconciliation of the PR, checks, review, and validation identities.
 
 Transitions persist only the payloads they produce: agent results are bound to
 `agent_succeeded`/`agent_failed` (and must carry a matching exit status),
@@ -112,6 +112,63 @@ choices); resume a parked run with `run resume <id> --decision <choice>`.
 When choices are present, the decision must match one exactly. `Cancel the
 run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
 independent review before the final gate.
+
+## Exact-HEAD validation
+
+`VALIDATING` requires a persisted `ValidationResult` for the current exact
+HEAD. Conductor retains compact local-command and hosted-check provenance only;
+it never stores command output, full command arguments, or secrets. A new HEAD
+makes prior evidence stale. Pending hosted checks park in `WAITING_DEPENDENCY`
+for a later re-read; unavailable or unknown evidence fails closed.
+
+Local commands are repository/run configuration and are never inferred from
+Issue text. Set `TACHIKO_LOCAL_VALIDATION_CONFIG` to a stable revision and
+bounded argv-array commands, for example:
+
+```bash
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
+```
+
+`commands` 必須至少有一個項目。既存 PR（沒有 Conductor bootstrap 記錄）必須在同一設定中明確提供絕對 `workspacePath`；Conductor 會在執行前後驗證其 clean exact HEAD 與 `origin` 的 GitHub owner/repo，絕不使用 ambient cwd。例如：
+
+```bash
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","workspacePath":"/absolute/clean/worktree","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
+```
+
+Hosted checks are independently policy-controlled. Set
+`TACHIKO_HOSTED_CHECK_POLICY_CONFIG` with a stable revision and either
+`{"mode":"not_required"}` or `{"mode":"required","requiredCheckNames":[...]}`.
+For example:
+
+```bash
+export TACHIKO_HOSTED_CHECK_POLICY_CONFIG='{"revision":"repo-hosted-v1","mode":"required","requiredCheckNames":["test"]}'
+```
+
+Absent policy is fail-closed: neither an empty nor non-empty GitHub check list
+is hosted passing evidence. Validation evidence is reusable only for the exact
+HEAD and an explicit active identity (local revision; hosted mode plus
+revision). Removing, changing, or supplying an anonymous policy/adapter is an
+identity change, never a nullable wildcard. An explicit `not_required` hosted
+policy is neutral; GitHub observations do not infer one.
+
+Historical persisted `gate_passed` entries remain read-compatible for completed
+old runs only. They are never a public transition and never certify current
+validation, review, or final readiness; current policy or live-state drift
+returns the run to validation before review can resume.
+
+An explicitly `not_required` hosted policy remains neutral even when the
+hosted-check observation endpoint is unavailable; this does not relax the
+separate live Issue/PR/exact-HEAD/merge-state reconciliation. A configured
+validation adapter or hosted policy without a non-empty revision is invalid
+operator configuration: Conductor parks before validation or review executes.
+
+Without explicit configuration, local validation is unknown and the run cannot
+advance to review. The configured runner refuses an ambient directory: it
+re-proves the clean bootstrap-owned worktree's exact HEAD before and after the
+commands. Commands use a direct process boundary (no shell), with compact
+pass, non-zero-exit, timeout, unavailable-executable, and malformed
+configuration outcomes; timeouts terminate the owned command group and settle
+within a bounded grace period.
 
 ## Implementation workspace safety
 

@@ -6,7 +6,7 @@ import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
-import { T0, TARGET, newRun, successResult } from './helpers.js';
+import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
 
@@ -68,6 +68,20 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.agentResult?.sessionId, 'legacy-session-1');
     assert.deepEqual(loaded?.executor, { provider: 'codex-cli', sessionId: 'thread-1' });
     assert.equal(loaded?.agentResult?.durationMs, 125);
+  });
+
+  it('round-trips compact exact-HEAD validation provenance through a fresh store instance', () => {
+    const { dir } = tempStore();
+    const first = new JsonFileStore({ dir });
+    let run = applyTransition(newRun('validation-ledger'), { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-validation') }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-validation') }, T0);
+    first.create(run);
+
+    const loaded = new JsonFileStore({ dir }).read('validation-ledger');
+    assert.equal(loaded?.validationResult?.headSha, 'sha-validation');
+    assert.equal(loaded?.validationResult?.status, 'passed');
+    assert.equal(loaded?.validationResult?.hosted.overall, 'passing');
   });
 
   it('returns null for unknown ids', () => {

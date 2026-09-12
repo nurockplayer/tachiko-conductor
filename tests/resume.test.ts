@@ -7,7 +7,7 @@ import { describe, it } from 'node:test';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
-import { T0, TARGET, approval, successResult } from './helpers.js';
+import { T0, TARGET, TEST_VALIDATION_AUTHORITY, approval, successResult, validationPassed } from './helpers.js';
 
 describe('resume across process restarts', () => {
   it('recovers the run state and continues from where it stopped', () => {
@@ -20,7 +20,7 @@ describe('resume across process restarts', () => {
 
       run = applyTransition(run, { type: 'start' }, T0);
       run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-1') }, T0);
-      run = applyTransition(run, { type: 'validation_passed' }, T0);
+      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-1'), pullRequest: { number: 7, headSha: 'sha-1' } }, T0);
       store1.update(run);
 
       // --- process 2 (restart): pick up and push through the gate ---
@@ -29,9 +29,11 @@ describe('resume across process restarts', () => {
       assert.equal(resumed?.state, 'REVIEWING');
       assert.equal(resumed?.headSha, 'sha-1');
 
-      resumed = applyTransition(resumed!, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0);
+      resumed = applyTransition(resumed!, { type: 'review_approved', reviewResult: approval('reviewer-1', 'sha-1') }, T0, TEST_VALIDATION_AUTHORITY);
       assert.equal(resumed.state, 'FINAL_GATE');
-      resumed = applyTransition(resumed, { type: 'gate_passed' }, T0);
+      // Readiness is intentionally owned by the live workflow, not a public
+      // transition. Simulate only a workflow-produced persisted snapshot.
+      resumed = { ...resumed, state: 'MERGE_READY', history: [...resumed.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
       assert.equal(resumed.state, 'MERGE_READY');
       store2.update(resumed);
 

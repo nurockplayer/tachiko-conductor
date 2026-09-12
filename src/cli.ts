@@ -15,6 +15,12 @@ import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
+import type { HostedCheckPolicyConfiguration, LocalValidationConfiguration } from './adapters/validation.js';
+import {
+  ConfiguredLocalValidationAdapter,
+  MAX_LOCAL_VALIDATION_TIMEOUT_MS,
+  MIN_LOCAL_VALIDATION_TIMEOUT_MS,
+} from './validation/local-command.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
 import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
 import {
@@ -152,6 +158,103 @@ export function resolveCodexExecutionConfig(env: NodeJS.ProcessEnv = process.env
     config.timeoutMs = value;
   }
   return config;
+}
+
+/**
+ * Parse the repository/run-owned local validation plan. Commands are explicit
+ * JSON data; workflow code never derives them from Issue prose or defaults.
+ */
+export function resolveLocalValidationConfiguration(
+  env: NodeJS.ProcessEnv = process.env,
+): LocalValidationConfiguration | undefined {
+  const raw = env.TACHIKO_LOCAL_VALIDATION_CONFIG;
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG must be valid JSON.');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG must be an object.');
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.revision !== 'string' || record.revision.trim() === '') {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.revision must be a non-empty string.');
+  }
+  if (!Array.isArray(record.commands)) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.commands must be an array.');
+  }
+  if (record.commands.length === 0) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.commands must contain at least one command.');
+  }
+  const commands = record.commands.map((value, index) => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}] must be an object.`);
+    }
+    const command = value as Record<string, unknown>;
+    if (!Array.isArray(command.argv) || command.argv.length === 0 || command.argv.some((part) => typeof part !== 'string' || part.trim() === '')) {
+      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].argv must be a non-empty string array.`);
+    }
+    if (!Number.isSafeInteger(command.timeoutMs) ||
+      (command.timeoutMs as number) < MIN_LOCAL_VALIDATION_TIMEOUT_MS ||
+      (command.timeoutMs as number) > MAX_LOCAL_VALIDATION_TIMEOUT_MS) {
+      throw new Error(
+        `TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].timeoutMs must be a safe integer between ` +
+        `${MIN_LOCAL_VALIDATION_TIMEOUT_MS} and ${MAX_LOCAL_VALIDATION_TIMEOUT_MS}.`,
+      );
+    }
+    return { argv: command.argv as string[], timeoutMs: command.timeoutMs as number };
+  });
+  if (record.workspacePath !== undefined &&
+    (typeof record.workspacePath !== 'string' || record.workspacePath.trim() === '' || !path.isAbsolute(record.workspacePath))) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.workspacePath must be an absolute non-empty path when supplied.');
+  }
+  return {
+    revision: record.revision,
+    commands,
+    ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
+  };
+}
+
+/** Parse the explicit repository/run contract for hosted checks. */
+export function resolveHostedCheckPolicyConfiguration(
+  env: NodeJS.ProcessEnv = process.env,
+): HostedCheckPolicyConfiguration | undefined {
+  const raw = env.TACHIKO_HOSTED_CHECK_POLICY_CONFIG;
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG must be valid JSON.');
+  }
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG must be an object.');
+  }
+  const record = parsed as Record<string, unknown>;
+  if (typeof record.revision !== 'string' || record.revision.trim() === '') {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.revision must be a non-empty string.');
+  }
+  if (record.mode !== 'required' && record.mode !== 'not_required') {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.mode must be required or not_required.');
+  }
+  if (record.requiredCheckNames !== undefined &&
+    (!Array.isArray(record.requiredCheckNames) || record.requiredCheckNames.some((name) => typeof name !== 'string' || name.trim() === ''))) {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.requiredCheckNames must be a non-empty string array when supplied.');
+  }
+  if (record.mode === 'not_required' && record.requiredCheckNames !== undefined) {
+    throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.requiredCheckNames is only valid when mode is required.');
+  }
+  return {
+    revision: record.revision,
+    policy: record.mode === 'not_required'
+      ? { mode: 'not_required' }
+      : {
+          mode: 'required',
+          ...(record.requiredCheckNames === undefined ? {} : { requiredCheckNames: record.requiredCheckNames as string[] }),
+        },
+  };
 }
 
 /** Resolve the directory where run JSON files are stored. */
@@ -491,15 +594,16 @@ export async function resumeCommand(
     run.target.kind === 'issue';
   if (synchronizeLiveHead && run.target.kind === 'issue') {
     const snapshot = await deps.github.readLiveSnapshot(run.target);
-    if (snapshot.headSha === null) {
-      throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request HEAD.`);
+    if (snapshot.headSha === null || snapshot.pullRequest === null) {
+      throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request identity and exact HEAD.`);
     }
     const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
     if (conflict !== null) throw new Error(`Cannot synchronize run "${id}": ${conflict}`);
     synchronizedHead = snapshot.headSha;
-    if (run.bootstrap !== undefined && snapshot.pullRequest !== null) {
-      synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
-    }
+    // An explicit live-HEAD sync is an owned identity adoption. Even runs
+    // without a bootstrap must carry the re-read PR tuple atomically so a
+    // later reviewer cannot see an exact HEAD detached from its acceptance.
+    synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
   }
   const resumed = applyTransition(
     run,
@@ -544,6 +648,11 @@ function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
     console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
     return;
   }
+  if (outcome.outcome === 'waiting_dependency') {
+    console.log(`Run ${run.id}: WAITING_DEPENDENCY — ${outcome.reason}`);
+    console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
+    return;
+  }
   console.error(`Run ${run.id}: FAILED — ${outcome.reason}`);
 }
 
@@ -555,6 +664,8 @@ function buildWorkflowDeps(
 ): WorkflowDependencies {
   const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
+  const localValidation = resolveLocalValidationConfiguration(env);
+  const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
   let bootstrap: ImplementationBootstrapAdapter | undefined;
   const lazyBootstrap: ImplementationBootstrapAdapter = {
     kind: 'implementation-bootstrap',
@@ -601,6 +712,8 @@ function buildWorkflowDeps(
       client: new DeepSeekApiClient(),
     }),
     bootstrap: lazyBootstrap,
+    ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
+    ...(hostedCheckPolicy === undefined ? {} : { hostedCheckPolicy }),
     resolveImplementationCapabilities,
   };
 }
