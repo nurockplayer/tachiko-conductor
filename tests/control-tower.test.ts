@@ -5,6 +5,7 @@ import { classifyReclaim, isActive, rowsForFilter, statusLine, summarize } from 
 import { goldenFixture } from '../apps/control-tower/src/lib/fixture.ts';
 import { collectGitWorktrees, parseGitWorktreePorcelain } from '../apps/control-tower/src/lib/git-worktrees.ts';
 import { collectDataVolume, parseDfKilobytes } from '../apps/control-tower/src/lib/system.ts';
+import { createSingleFlightCollector } from '../apps/control-tower/src/lib/tauri.ts';
 
 test('golden fixture preserves the approved values and all three filters', () => {
   const summary = summarize(goldenFixture);
@@ -71,4 +72,23 @@ test('unknown system memory remains unknown instead of using process RSS', () =>
   });
   assert.equal(summary.memoryUsedBytes, undefined);
   assert.equal(summary.memoryPercent, undefined);
+});
+
+test('live collector is single-flight across concurrent renderer effects', async () => {
+  let calls = 0;
+  let release: (() => void) | undefined;
+  const next = new Promise<void>((resolve) => { release = resolve; });
+  const collect = createSingleFlightCollector(async () => {
+    calls += 1;
+    await next;
+    return { mode: 'live', generatedAt: '0', rows: [], system: {} };
+  });
+  const first = collect();
+  const second = collect();
+  assert.strictEqual(first, second);
+  assert.equal(calls, 1);
+  release?.();
+  await first;
+  await collect();
+  assert.equal(calls, 2);
 });

@@ -4,7 +4,7 @@ use std::{
   io::Read,
   path::{Path, PathBuf},
   process::{Command, Stdio},
-  sync::mpsc,
+  sync::{mpsc, Mutex, OnceLock},
   thread,
   time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -20,7 +20,10 @@ use tauri::{
 const RECLAIM_UNAVAILABLE: &str = "安全回收分類器尚不可用；未推定可刪除。";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const MAX_COMMAND_OUTPUT_BYTES: usize = 1_048_576;
 const TRAY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
+
+static SNAPSHOT_COLLECTION_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -162,10 +165,19 @@ fn output_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Optio
   let (sender, receiver) = mpsc::sync_channel(1);
   let reader = thread::spawn(move || {
     let mut bytes = Vec::new();
-    let result = stdout
-      .read_to_end(&mut bytes)
-      .ok()
-      .and_then(|_| String::from_utf8(bytes).ok());
+    let result = (|| {
+      let mut chunk = [0_u8; 8_192];
+      loop {
+        let read = stdout.read(&mut chunk).ok()?;
+        if read == 0 {
+          return String::from_utf8(bytes).ok();
+        }
+        if bytes.len().saturating_add(read) > MAX_COMMAND_OUTPUT_BYTES {
+          return None;
+        }
+        bytes.extend_from_slice(&chunk[..read]);
+      }
+    })();
     let _ = sender.send(result);
   });
   let started = Instant::now();
@@ -548,7 +560,17 @@ fn collect_snapshot_for_root(
 }
 
 fn collect_control_tower_snapshot_inner() -> Result<ControlTowerSnapshot, String> {
-  collect_snapshot(&SystemCommands)
+  with_snapshot_collection_lock(|| collect_snapshot(&SystemCommands))
+}
+
+fn with_snapshot_collection_lock<T>(
+  collect: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+  let lock = SNAPSHOT_COLLECTION_LOCK.get_or_init(|| Mutex::new(()));
+  let _guard = lock
+    .lock()
+    .map_err(|_| "Control Tower snapshot collection lock is unavailable.".to_owned())?;
+  collect()
 }
 
 #[tauri::command]
@@ -708,6 +730,10 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Barrier,
+  };
 
   struct FakeCommands {
     responses: HashMap<String, String>,
@@ -902,6 +928,15 @@ mod tests {
   }
 
   #[test]
+  fn command_output_is_capped_before_a_fast_producer_can_grow_memory_unbounded() {
+    let command = format!("yes x | head -c {}", MAX_COMMAND_OUTPUT_BYTES + 1);
+    assert_eq!(
+      output_with_timeout("sh", &["-c", &command], Duration::from_secs(2)),
+      None
+    );
+  }
+
+  #[test]
   fn timeout_does_not_wait_for_a_descendant_that_inherits_stdout() {
     let started = Instant::now();
     assert_eq!(
@@ -909,5 +944,36 @@ mod tests {
       None
     );
     assert!(started.elapsed() < Duration::from_secs(1));
+  }
+
+  #[test]
+  fn tray_and_renderer_collection_share_one_native_single_flight_lock() {
+    let barrier = Arc::new(Barrier::new(2));
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let workers = (0..2)
+      .map(|_| {
+        let barrier = Arc::clone(&barrier);
+        let active = Arc::clone(&active);
+        let maximum = Arc::clone(&maximum);
+        thread::spawn(move || {
+          barrier.wait();
+          with_snapshot_collection_lock(|| {
+            let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+            maximum.fetch_max(now_active, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(20));
+            active.fetch_sub(1, Ordering::SeqCst);
+            Ok(())
+          })
+        })
+      })
+      .collect::<Vec<_>>();
+    for worker in workers {
+      worker
+        .join()
+        .expect("worker joins")
+        .expect("collector lock is available");
+    }
+    assert_eq!(maximum.load(Ordering::SeqCst), 1);
   }
 }
