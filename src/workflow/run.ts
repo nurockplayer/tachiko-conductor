@@ -10,6 +10,7 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
 import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
+import { isValidationResultCoherent } from '../domain/validation.js';
 import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
@@ -588,6 +589,23 @@ export async function runWorkflow(
         validationResult = combineValidation(
           run.headSha!, validationResult.local, hostedValidation(postValidationSnapshot, deps.hostedCheckPolicy),
         );
+        if (!isValidationResultCoherent(validationResult)) {
+          const reason = 'Local validation returned incoherent evidence; refusing to admit it.';
+          validationResult = combineValidation(
+            run.headSha!, unavailableLocalValidation(), hostedValidation(postValidationSnapshot, deps.hostedCheckPolicy),
+          );
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate', reason, validationResult,
+              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+              interrupt: { evidence: reason, choices: ['Restore the configured validation runner and retry', CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
         if (validationResult.status === 'failed') {
           run = applyTransition(run, {
             type: 'validation_failed', validationResult,

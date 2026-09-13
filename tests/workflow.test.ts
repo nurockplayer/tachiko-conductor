@@ -206,6 +206,39 @@ describe('runWorkflow', () => {
     assert.equal(result.run.validationResult?.hosted.status, 'unknown');
   });
 
+  it('F06 persists incoherent local validation evidence as a durable fail-closed interrupt', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-incoherent-adapter');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const incoherentValidation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate() {
+        return { status: 'passed', configRevision: 'test-config-v1', commands: [] } as unknown as LocalValidationEvidence;
+      },
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD]),
+        implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([]),
+        validation: incoherentValidation,
+        hostedCheckPolicy: TEST_HOSTED_POLICY,
+      },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(result.run.validationResult?.status, 'unknown');
+    assert.equal(result.run.validationResult?.local.status, 'unknown');
+    assert.equal(result.run.history.at(-1)?.type, 'escalate');
+  });
+
   it('persists local evidence while hosted checks wait, then resumes with a fresh hosted pass', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'validation-wait');
