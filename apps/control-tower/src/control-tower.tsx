@@ -39,7 +39,25 @@ function ControlTowerBody(): JSX.Element {
 
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;
-    void collectLiveSnapshot().then(setSnapshot).catch((error: unknown) => setLiveError(error instanceof Error ? error.message : String(error)));
+    let disposed = false;
+    const refresh = (): void => {
+      void collectLiveSnapshot()
+        .then((next) => {
+          if (!disposed) {
+            setSnapshot(next);
+            setLiveError(null);
+          }
+        })
+        .catch((error: unknown) => {
+          if (!disposed) setLiveError(error instanceof Error ? error.message : String(error));
+        });
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 15_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+    };
   }, []);
 
   const rows = useMemo(() => rowsForFilter(snapshot.rows, filter), [snapshot.rows, filter]);

@@ -122,6 +122,7 @@ struct RunObservation {
   id: String,
   repository: String,
   issue: Option<u64>,
+  pull_request_number: Option<u64>,
   provider: Option<String>,
   state: String,
   duration_ms: Option<u64>,
@@ -146,18 +147,28 @@ fn output_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Optio
     .stderr(Stdio::null())
     .spawn()
     .ok()?;
+  // Drain concurrently: a verbose command must not block on its stdout pipe
+  // before `try_wait` can observe its exit or timeout.
+  let mut stdout = child.stdout.take()?;
+  let reader = thread::spawn(move || {
+    let mut bytes = Vec::new();
+    stdout.read_to_end(&mut bytes).ok()?;
+    String::from_utf8(bytes).ok()
+  });
   let started = Instant::now();
   loop {
     match child.try_wait().ok()? {
       Some(status) if status.success() => {
-        let mut bytes = Vec::new();
-        child.stdout.take()?.read_to_end(&mut bytes).ok()?;
-        return String::from_utf8(bytes).ok();
+        return reader.join().ok()?;
       }
-      Some(_) => return None,
+      Some(_) => {
+        let _ = reader.join();
+        return None;
+      }
       None if started.elapsed() >= timeout => {
         let _ = child.kill();
         let _ = child.wait();
+        let _ = reader.join();
         return None;
       }
       None => thread::sleep(COMMAND_POLL_INTERVAL),
@@ -260,28 +271,22 @@ fn github_repository(commands: &dyn CommandBoundary, root: &Path) -> Option<Stri
 fn pull_request(
   commands: &dyn CommandBoundary,
   repository: &str,
-  branch: Option<&str>,
+  number: Option<u64>,
 ) -> Option<PullRequestView> {
-  let branch = branch?;
+  let number = number?;
   let json = commands.run(
     "gh",
     &[
       "pr",
-      "list",
+      "view",
+      &number.to_string(),
       "--repo",
       repository,
-      "--head",
-      branch,
-      "--state",
-      "all",
-      "--limit",
-      "1",
       "--json",
       "number,state",
     ],
   )?;
-  let entries: Vec<Value> = serde_json::from_str(&json).ok()?;
-  let item = entries.first()?;
+  let item: Value = serde_json::from_str(&json).ok()?;
   Some(PullRequestView {
     number: item.get("number")?.as_u64()?,
     state: item.get("state")?.as_str()?.to_owned(),
@@ -340,6 +345,7 @@ fn load_runs() -> HashMap<String, RunObservation> {
       id: string_at(&value, &["id"]).unwrap_or_default(),
       repository: string_at(&value, &["target", "repo"]).unwrap_or_else(|| "unknown".to_owned()),
       issue: number_at(&value, &["target", "issueNumber"]),
+      pull_request_number: number_at(&value, &["pullRequest", "number"]),
       provider: string_at(&value, &["executor", "provider"])
         .or_else(|| string_at(&value, &["agentResult", "executor", "provider"])),
       state: string_at(&value, &["state"]).unwrap_or_else(|| "unknown".to_owned()),
@@ -440,7 +446,7 @@ fn collect_snapshot_for_root(
           .unwrap_or_else(|| repository.clone()),
         // Branch text is not durable identity evidence. A missing run remains unlinked.
         issue: run.and_then(|value| value.issue),
-        pull_request: pull_request(commands, &repository, entry.branch.as_deref()),
+        pull_request: pull_request(commands, &repository, run.and_then(|value| value.pull_request_number)),
         run_id: run.map(|value| value.id.clone()),
         agent: run.map(|value| AgentView {
           provider: value
@@ -550,6 +556,21 @@ fn open_control_tower(app: &tauri::AppHandle) {
   }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TrayAction {
+  Open,
+  Quit,
+  Ignore,
+}
+
+fn tray_action(id: &str) -> TrayAction {
+  match id {
+    "open-control-tower" => TrayAction::Open,
+    "quit" => TrayAction::Quit,
+    _ => TrayAction::Ignore,
+  }
+}
+
 pub fn run() {
   tauri::Builder::default()
     .setup(|app| {
@@ -603,12 +624,10 @@ pub fn run() {
         .icon(icon)
         .tooltip("Tachiko\nOperational summary available")
         .menu(&menu)
-        .on_menu_event(|app, event| match event.id.as_ref() {
-          "open-control-tower" => {
-            open_control_tower(app);
-          }
-          "quit" => app.exit(0),
-          _ => {}
+        .on_menu_event(|app, event| match tray_action(event.id.as_ref()) {
+          TrayAction::Open => open_control_tower(app),
+          TrayAction::Quit => app.exit(0),
+          TrayAction::Ignore => {}
         })
         .build(app)?;
       Ok(())
@@ -777,10 +796,28 @@ mod tests {
   }
 
   #[test]
+  fn tray_open_and_quit_events_are_dispatched_only_from_named_actions() {
+    assert_eq!(tray_action("open-control-tower"), TrayAction::Open);
+    assert_eq!(tray_action("quit"), TrayAction::Quit);
+    assert_eq!(tray_action("agents-summary"), TrayAction::Ignore);
+  }
+
+  #[test]
   fn process_command_timeout_is_bounded() {
     assert_eq!(
       output_with_timeout("sh", &["-c", "sleep 1"], Duration::from_millis(1)),
       None
     );
+  }
+
+  #[test]
+  fn bounded_command_runner_drains_verbose_stdout_before_waiting_for_exit() {
+    let output = output_with_timeout(
+      "sh",
+      &["-c", "yes x | head -c 200000"],
+      Duration::from_secs(2),
+    )
+    .expect("a healthy verbose command is not mistaken for a timeout");
+    assert_eq!(output.len(), 200_000);
   }
 }
