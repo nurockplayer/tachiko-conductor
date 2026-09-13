@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { classifyReclaim, rowsForFilter, statusLine, summarize } from '../apps/control-tower/src/lib/dashboard.ts';
+import { classifyReclaim, isActive, rowsForFilter, statusLine, summarize } from '../apps/control-tower/src/lib/dashboard.ts';
 import { goldenFixture } from '../apps/control-tower/src/lib/fixture.ts';
 import { collectGitWorktrees, parseGitWorktreePorcelain } from '../apps/control-tower/src/lib/git-worktrees.ts';
 import { collectDataVolume, parseDfKilobytes } from '../apps/control-tower/src/lib/system.ts';
@@ -40,4 +40,35 @@ test('reclaim classifier fails closed unless all proven evidence exists', () => 
   assert.equal(classifyReclaim({ classifier: 'proven', pullRequestState: 'CLOSED', clean: true, processState: 'idle', recoverableHead: true, lockFree: true }).state, 'blocked');
   assert.equal(classifyReclaim({ classifier: 'proven', pullRequestState: 'MERGED', clean: true, processState: 'unknown', recoverableHead: true, lockFree: true }).state, 'blocked');
   assert.equal(classifyReclaim({ classifier: 'proven', pullRequestState: 'MERGED', clean: true, processState: 'idle', recoverableHead: true, lockFree: true }).state, 'reclaimable');
+});
+
+test('only durable executing states contribute to the active and system summaries', () => {
+  const terminalStates = ['MERGED', 'FAILED', 'MERGE_READY'] as const;
+  for (const state of terminalStates) {
+    assert.equal(isActive({
+      repository: 'nurockplayer/tachiko-conductor',
+      agent: { provider: 'Codex', state },
+      worktree: { path: `/tmp/${state}`, shortId: 'dead' },
+      process: { pid: 1, rssBytes: 99_000_000_000, state: 'observed' },
+      reclaim: { state: 'unknown' },
+    }), false);
+  }
+  const summary = summarize({
+    mode: 'live', generatedAt: '0',
+    rows: [{ repository: 'nurockplayer/tachiko-conductor', agent: { provider: 'Codex', state: 'VALIDATING' }, worktree: { path: '/tmp/live', shortId: 'live' }, reclaim: { state: 'unknown' } }],
+    system: { memoryTotalBytes: 100, memoryUsedBytes: 75 },
+  });
+  assert.equal(summary.activeCount, 1);
+  assert.equal(summary.memoryUsedBytes, 75);
+  assert.equal(summary.memoryPercent, 75);
+});
+
+test('unknown system memory remains unknown instead of using process RSS', () => {
+  const summary = summarize({
+    mode: 'live', generatedAt: '0',
+    rows: [{ repository: 'repo', agent: { provider: 'Codex', state: 'WORKING' }, worktree: { path: '/tmp/live', shortId: 'live' }, process: { pid: 1, rssBytes: 90_000_000_000, state: 'observed' }, reclaim: { state: 'unknown' } }],
+    system: { memoryTotalBytes: 100_000_000_000 },
+  });
+  assert.equal(summary.memoryUsedBytes, undefined);
+  assert.equal(summary.memoryPercent, undefined);
 });

@@ -12,8 +12,21 @@ export interface DashboardSummary {
   readonly reclaimCount: number;
 }
 
+const executingAgentStates = new Set([
+  'working',
+  'testing',
+  'implementing',
+  'validating',
+  'reviewing',
+  'changes_requested',
+  'final_gate',
+]);
+
 export function isActive(row: WorkUnitView): boolean {
-  return row.agent != null && row.agent.provider !== 'idle' && !['idle', 'session complete', 'no process'].includes(row.agent.state);
+  // A durable run is active only while it is in an executing state. Provider
+  // presence is merely an observation: MERGED, FAILED, and MERGE_READY runs
+  // must not be shown as executing work.
+  return row.agent !== undefined && executingAgentStates.has(row.agent.state.trim().toLowerCase());
 }
 
 export function rowsForFilter(rows: readonly WorkUnitView[], filter: DashboardFilter): readonly WorkUnitView[] {
@@ -32,7 +45,9 @@ export function summarize(snapshot: ControlTowerSnapshot): DashboardSummary {
   if (snapshot.mode === 'fixture') return goldenSummaryOverride;
   const active = snapshot.rows.filter(isActive);
   const reclaimable = snapshot.rows.filter((row) => row.reclaim.state === 'reclaimable');
-  const memoryUsedBytes = snapshot.system.memoryUsedBytes ?? active.reduce((total, row) => total + (row.process?.rssBytes ?? 0), 0);
+  // System memory is a system observation. Selected process RSS is not a
+  // substitute and remains available only in the per-worktree RAM column.
+  const memoryUsedBytes = snapshot.system.memoryUsedBytes;
   const memoryPercent = snapshot.system.memoryTotalBytes && memoryUsedBytes
     ? Math.round((memoryUsedBytes / snapshot.system.memoryTotalBytes) * 100)
     : undefined;

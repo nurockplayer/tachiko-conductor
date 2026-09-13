@@ -18,9 +18,10 @@ corepack pnpm@10.34.5 --dir apps/control-tower tauri:build
 
 `TACHIKO_CONTROL_TOWER_REPOSITORY` selects the local repository that the
 read-only native collector observes. Without a provable root it fails soft and
-keeps the deterministic fixture visible instead of guessing. `tauri:build` runs a macOS native no-bundle build. Its debug executable is
-under `apps/control-tower/src-tauri/target/debug/`; invoking Tauri's normal
-bundle command on a configured signing host produces the `.app` artifact.
+keeps the deterministic fixture visible instead of guessing. `tauri:build` runs
+a macOS release no-bundle build under
+`apps/control-tower/src-tauri/target/release/`; invoking Tauri's normal bundle
+command on a configured signing host produces the `.app` artifact.
 
 ## Read model and safety
 

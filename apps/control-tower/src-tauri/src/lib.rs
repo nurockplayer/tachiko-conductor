@@ -1,10 +1,11 @@
 use std::{
   collections::HashMap,
-  env,
-  fs,
+  env, fs,
+  io::Read,
   path::{Path, PathBuf},
-  process::Command,
-  time::{SystemTime, UNIX_EPOCH},
+  process::{Command, Stdio},
+  thread,
+  time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -16,6 +17,8 @@ use tauri::{
 };
 
 const RECLAIM_UNAVAILABLE: &str = "安全回收分類器尚不可用；未推定可刪除。";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -124,70 +127,159 @@ struct RunObservation {
   duration_ms: Option<u64>,
 }
 
-fn output(program: &str, args: &[&str]) -> Option<String> {
-  Command::new(program).args(args).output().ok().and_then(|result| {
-    if result.status.success() {
-      String::from_utf8(result.stdout).ok()
-    } else {
-      None
-    }
-  })
+trait CommandBoundary {
+  fn run(&self, program: &str, args: &[&str]) -> Option<String>;
 }
 
-fn repository_root() -> Option<PathBuf> {
+struct SystemCommands;
+
+impl CommandBoundary for SystemCommands {
+  fn run(&self, program: &str, args: &[&str]) -> Option<String> {
+    output_with_timeout(program, args, COMMAND_TIMEOUT)
+  }
+}
+
+fn output_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+  let mut child = Command::new(program)
+    .args(args)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null())
+    .spawn()
+    .ok()?;
+  let started = Instant::now();
+  loop {
+    match child.try_wait().ok()? {
+      Some(status) if status.success() => {
+        let mut bytes = Vec::new();
+        child.stdout.take()?.read_to_end(&mut bytes).ok()?;
+        return String::from_utf8(bytes).ok();
+      }
+      Some(_) => return None,
+      None if started.elapsed() >= timeout => {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
+      }
+      None => thread::sleep(COMMAND_POLL_INTERVAL),
+    }
+  }
+}
+
+fn repository_root(commands: &dyn CommandBoundary) -> Option<PathBuf> {
   let candidate = env::var_os("TACHIKO_CONTROL_TOWER_REPOSITORY")
     .map(PathBuf::from)
     .or_else(|| env::current_dir().ok())?;
-  output("git", &["-C", candidate.to_string_lossy().as_ref(), "rev-parse", "--show-toplevel"])
+  commands
+    .run(
+      "git",
+      &[
+        "-C",
+        candidate.to_string_lossy().as_ref(),
+        "rev-parse",
+        "--show-toplevel",
+      ],
+    )
     .map(|root| PathBuf::from(root.trim()))
 }
 
 fn parse_worktrees(porcelain: &str) -> Vec<ParsedWorktree> {
-  porcelain.split("\n\n").filter_map(|block| {
-    let mut entry = ParsedWorktree::default();
-    for line in block.lines() {
-      if let Some(value) = line.strip_prefix("worktree ") { entry.path = value.to_owned(); }
-      if let Some(value) = line.strip_prefix("HEAD ") { entry.head_sha = Some(value.to_owned()); }
-      if let Some(value) = line.strip_prefix("branch ") { entry.branch = Some(value.trim_start_matches("refs/heads/").to_owned()); }
-    }
-    (!entry.path.is_empty()).then_some(entry)
-  }).collect()
+  porcelain
+    .split("\n\n")
+    .filter_map(|block| {
+      let mut entry = ParsedWorktree::default();
+      for line in block.lines() {
+        if let Some(value) = line.strip_prefix("worktree ") {
+          entry.path = value.to_owned();
+        }
+        if let Some(value) = line.strip_prefix("HEAD ") {
+          entry.head_sha = Some(value.to_owned());
+        }
+        if let Some(value) = line.strip_prefix("branch ") {
+          entry.branch = Some(value.trim_start_matches("refs/heads/").to_owned());
+        }
+      }
+      (!entry.path.is_empty()).then_some(entry)
+    })
+    .collect()
 }
 
-fn is_clean(path: &str) -> Option<bool> {
-  output("git", &["-C", path, "status", "--porcelain"])
+fn is_clean(commands: &dyn CommandBoundary, path: &str) -> Option<bool> {
+  commands
+    .run("git", &["-C", path, "status", "--porcelain"])
     .map(|status| status.trim().is_empty())
 }
 
-fn directory_bytes(path: &str) -> Option<u64> {
-  output("du", &["-sk", path]).and_then(|result| {
-    result.split_whitespace().next()?.parse::<u64>().ok().map(|kilobytes| kilobytes * 1024)
+fn directory_bytes(commands: &dyn CommandBoundary, path: &str) -> Option<u64> {
+  commands.run("du", &["-sk", path]).and_then(|result| {
+    result
+      .split_whitespace()
+      .next()?
+      .parse::<u64>()
+      .ok()
+      .map(|kilobytes| kilobytes * 1024)
   })
 }
 
-fn current_process(path: &str) -> Option<ProcessView> {
+fn current_process(commands: &dyn CommandBoundary, path: &str) -> Option<ProcessView> {
   // Exact-path lsof is deliberately narrow: absence is not treated as proof of idleness.
-  let pids = output("lsof", &["-t", "--", path])?;
-  let pid = pids.lines().find_map(|line| line.trim().parse::<u32>().ok())?;
-  let rss_bytes = output("ps", &["-o", "rss=", "-p", &pid.to_string()])
+  let pids = commands.run("lsof", &["-t", "--", path])?;
+  let pid = pids
+    .lines()
+    .find_map(|line| line.trim().parse::<u32>().ok())?;
+  let rss_bytes = commands
+    .run("ps", &["-o", "rss=", "-p", &pid.to_string()])
     .and_then(|rss| rss.trim().parse::<u64>().ok())
     .map(|kilobytes| kilobytes * 1024);
-  Some(ProcessView { pid, rss_bytes, state: "observed".to_owned() })
+  Some(ProcessView {
+    pid,
+    rss_bytes,
+    state: "observed".to_owned(),
+  })
 }
 
-fn github_repository(root: &Path) -> Option<String> {
+fn github_repository(commands: &dyn CommandBoundary, root: &Path) -> Option<String> {
   let root_text = root.to_string_lossy();
-  let remote = output("git", &["-C", root_text.as_ref(), "config", "--get", "remote.origin.url"])?;
+  let remote = commands.run(
+    "git",
+    &[
+      "-C",
+      root_text.as_ref(),
+      "config",
+      "--get",
+      "remote.origin.url",
+    ],
+  )?;
   let remote = remote.trim().trim_end_matches(".git");
-  remote.strip_prefix("git@github.com:")
+  remote
+    .strip_prefix("git@github.com:")
     .or_else(|| remote.strip_prefix("https://github.com/"))
     .filter(|value| value.split('/').count() == 2)
     .map(str::to_owned)
 }
 
-fn pull_request(repository: &str, branch: Option<&str>) -> Option<PullRequestView> {
+fn pull_request(
+  commands: &dyn CommandBoundary,
+  repository: &str,
+  branch: Option<&str>,
+) -> Option<PullRequestView> {
   let branch = branch?;
-  let json = output("gh", &["pr", "list", "--repo", repository, "--head", branch, "--state", "all", "--limit", "1", "--json", "number,state"])?;
+  let json = commands.run(
+    "gh",
+    &[
+      "pr",
+      "list",
+      "--repo",
+      repository,
+      "--head",
+      branch,
+      "--state",
+      "all",
+      "--limit",
+      "1",
+      "--json",
+      "number,state",
+    ],
+  )?;
   let entries: Vec<Value> = serde_json::from_str(&json).ok()?;
   let item = entries.first()?;
   Some(PullRequestView {
@@ -196,42 +288,60 @@ fn pull_request(repository: &str, branch: Option<&str>) -> Option<PullRequestVie
   })
 }
 
-fn issue_from_branch(branch: Option<&str>) -> Option<u64> {
-  let branch = branch?;
-  let marker = branch.find("issue-")? + "issue-".len();
-  branch[marker..].chars().take_while(|character| character.is_ascii_digit()).collect::<String>().parse().ok()
-}
-
 fn run_directory() -> Option<PathBuf> {
-  env::var_os("TACHIKO_DATA_DIR").map(PathBuf::from).or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".tachiko-conductor/runs")))
+  env::var_os("TACHIKO_DATA_DIR")
+    .map(PathBuf::from)
+    .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".tachiko-conductor/runs")))
 }
 
 fn string_at(value: &Value, path: &[&str]) -> Option<String> {
   let mut cursor = value;
-  for key in path { cursor = cursor.get(*key)?; }
+  for key in path {
+    cursor = cursor.get(*key)?;
+  }
   cursor.as_str().map(str::to_owned)
 }
 
 fn number_at(value: &Value, path: &[&str]) -> Option<u64> {
   let mut cursor = value;
-  for key in path { cursor = cursor.get(*key)?; }
+  for key in path {
+    cursor = cursor.get(*key)?;
+  }
   cursor.as_u64()
 }
 
 fn load_runs() -> HashMap<String, RunObservation> {
   let mut runs = HashMap::new();
-  let Some(directory) = run_directory() else { return runs; };
-  let Ok(entries) = fs::read_dir(directory) else { return runs; };
+  let Some(directory) = run_directory() else {
+    return runs;
+  };
+  let Ok(entries) = fs::read_dir(directory) else {
+    return runs;
+  };
   for entry in entries.flatten() {
-    if entry.path().extension().and_then(|extension| extension.to_str()) != Some("json") { continue; }
-    let Ok(raw) = fs::read_to_string(entry.path()) else { continue; };
-    let Ok(value) = serde_json::from_str::<Value>(&raw) else { continue; };
-    let Some(workspace_path) = string_at(&value, &["bootstrap", "workspacePath"]) else { continue; };
+    if entry
+      .path()
+      .extension()
+      .and_then(|extension| extension.to_str())
+      != Some("json")
+    {
+      continue;
+    }
+    let Ok(raw) = fs::read_to_string(entry.path()) else {
+      continue;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+      continue;
+    };
+    let Some(workspace_path) = string_at(&value, &["bootstrap", "workspacePath"]) else {
+      continue;
+    };
     let observation = RunObservation {
       id: string_at(&value, &["id"]).unwrap_or_default(),
       repository: string_at(&value, &["target", "repo"]).unwrap_or_else(|| "unknown".to_owned()),
       issue: number_at(&value, &["target", "issueNumber"]),
-      provider: string_at(&value, &["executor", "provider"]).or_else(|| string_at(&value, &["agentResult", "executor", "provider"])),
+      provider: string_at(&value, &["executor", "provider"])
+        .or_else(|| string_at(&value, &["agentResult", "executor", "provider"])),
       state: string_at(&value, &["state"]).unwrap_or_else(|| "unknown".to_owned()),
       duration_ms: number_at(&value, &["agentResult", "durationMs"]),
     };
@@ -240,71 +350,262 @@ fn load_runs() -> HashMap<String, RunObservation> {
   runs
 }
 
-fn memory_total() -> Option<u64> {
-  output("sysctl", &["-n", "hw.memsize"]).and_then(|value| value.trim().parse().ok())
+fn memory_total(commands: &dyn CommandBoundary) -> Option<u64> {
+  commands
+    .run("sysctl", &["-n", "hw.memsize"])
+    .and_then(|value| value.trim().parse().ok())
 }
 
-fn disk_stats(path: &Path) -> (Option<u64>, Option<u64>) {
-  let Some(stats) = output("df", &["-k", path.to_string_lossy().as_ref()]) else { return (None, None); };
-  let Some(line) = stats.lines().last() else { return (None, None); };
+fn vm_stat_used_bytes(total_bytes: u64, stats: &str) -> Option<u64> {
+  let page_size = stats.lines().find_map(|line| {
+    let prefix = "page size of ";
+    let start = line.find(prefix)? + prefix.len();
+    line[start..].split_whitespace().next()?.parse::<u64>().ok()
+  })?;
+  let page_count = |label: &str| -> Option<u64> {
+    stats.lines().find_map(|line| {
+      let value = line.strip_prefix(label)?.trim().trim_end_matches('.');
+      value.parse::<u64>().ok()
+    })
+  };
+  // macOS treats speculative pages as readily reclaimable. Counting them as
+  // free avoids presenting cache as committed application memory.
+  let free_pages =
+    page_count("Pages free:")?.saturating_add(page_count("Pages speculative:").unwrap_or(0));
+  total_bytes.checked_sub(free_pages.saturating_mul(page_size))
+}
+
+fn memory_stats(commands: &dyn CommandBoundary) -> (Option<u64>, Option<u64>) {
+  let total = memory_total(commands);
+  let used = total.and_then(|total_bytes| {
+    commands
+      .run("vm_stat", &[])
+      .and_then(|stats| vm_stat_used_bytes(total_bytes, &stats))
+  });
+  (total, used)
+}
+
+fn disk_stats(commands: &dyn CommandBoundary, path: &Path) -> (Option<u64>, Option<u64>) {
+  let Some(stats) = commands.run("df", &["-k", path.to_string_lossy().as_ref()]) else {
+    return (None, None);
+  };
+  let Some(line) = stats.lines().last() else {
+    return (None, None);
+  };
   let columns: Vec<&str> = line.split_whitespace().collect();
-  let total = columns.get(1).and_then(|value| value.parse::<u64>().ok()).map(|value| value * 1024);
-  let free = columns.get(3).and_then(|value| value.parse::<u64>().ok()).map(|value| value * 1024);
+  let total = columns
+    .get(1)
+    .and_then(|value| value.parse::<u64>().ok())
+    .map(|value| value * 1024);
+  let free = columns
+    .get(3)
+    .and_then(|value| value.parse::<u64>().ok())
+    .map(|value| value * 1024);
   (total, free)
 }
 
-#[tauri::command]
-fn collect_control_tower_snapshot() -> Result<ControlTowerSnapshot, String> {
-  let root = repository_root().ok_or("無法解析 repository root；請設定 TACHIKO_CONTROL_TOWER_REPOSITORY。")?;
+fn collect_snapshot(commands: &dyn CommandBoundary) -> Result<ControlTowerSnapshot, String> {
+  let root = repository_root(commands)
+    .ok_or("無法解析 repository root；請設定 TACHIKO_CONTROL_TOWER_REPOSITORY。")?;
+  collect_snapshot_for_root(commands, &root)
+}
+
+fn collect_snapshot_for_root(
+  commands: &dyn CommandBoundary,
+  root: &Path,
+) -> Result<ControlTowerSnapshot, String> {
   let root_text = root.to_string_lossy();
-  let porcelain = output("git", &["-C", root_text.as_ref(), "worktree", "list", "--porcelain"])
+  let porcelain = commands
+    .run(
+      "git",
+      &["-C", root_text.as_ref(), "worktree", "list", "--porcelain"],
+    )
     .ok_or("無法讀取 git worktree observations。")?;
-  let repository = github_repository(&root).unwrap_or_else(|| root.file_name().and_then(|value| value.to_str()).unwrap_or("unknown").to_owned());
+  let repository = github_repository(commands, &root).unwrap_or_else(|| {
+    root
+      .file_name()
+      .and_then(|value| value.to_str())
+      .unwrap_or("unknown")
+      .to_owned()
+  });
   let runs = load_runs();
-  let rows = parse_worktrees(&porcelain).into_iter().map(|entry| {
-    let run = runs.get(&entry.path);
-    let process = current_process(&entry.path);
-    WorkUnitView {
-      repository: run.map(|value| value.repository.clone()).unwrap_or_else(|| repository.clone()),
-      issue: run.and_then(|value| value.issue).or_else(|| issue_from_branch(entry.branch.as_deref())),
-      pull_request: pull_request(&repository, entry.branch.as_deref()),
-      run_id: run.map(|value| value.id.clone()),
-      agent: run.map(|value| AgentView { provider: value.provider.clone().unwrap_or_else(|| "unknown".to_owned()), profile: None, state: value.state.clone(), duration_ms: value.duration_ms }),
-      worktree: WorktreeView { short_id: entry.head_sha.as_deref().unwrap_or("unknown").chars().take(4).collect(), path: entry.path.clone(), branch: entry.branch.clone(), head_sha: entry.head_sha.clone(), clean: is_clean(&entry.path) },
-      process,
-      disk_bytes: directory_bytes(&entry.path),
-      reclaim: ReclaimView { state: "unknown".to_owned(), reason: RECLAIM_UNAVAILABLE.to_owned() },
-    }
-  }).collect();
-  let (data_total_bytes, data_free_bytes) = disk_stats(&root);
-  let generated_at = SystemTime::now().duration_since(UNIX_EPOCH).map_err(|error| error.to_string())?.as_millis().to_string();
+  let rows = parse_worktrees(&porcelain)
+    .into_iter()
+    .map(|entry| {
+      let run = runs.get(&entry.path);
+      let process = current_process(commands, &entry.path);
+      WorkUnitView {
+        repository: run
+          .map(|value| value.repository.clone())
+          .unwrap_or_else(|| repository.clone()),
+        // Branch text is not durable identity evidence. A missing run remains unlinked.
+        issue: run.and_then(|value| value.issue),
+        pull_request: pull_request(commands, &repository, entry.branch.as_deref()),
+        run_id: run.map(|value| value.id.clone()),
+        agent: run.map(|value| AgentView {
+          provider: value
+            .provider
+            .clone()
+            .unwrap_or_else(|| "unknown".to_owned()),
+          profile: None,
+          state: value.state.clone(),
+          duration_ms: value.duration_ms,
+        }),
+        worktree: WorktreeView {
+          short_id: entry
+            .head_sha
+            .as_deref()
+            .unwrap_or("unknown")
+            .chars()
+            .take(4)
+            .collect(),
+          path: entry.path.clone(),
+          branch: entry.branch.clone(),
+          head_sha: entry.head_sha.clone(),
+          clean: is_clean(commands, &entry.path),
+        },
+        process,
+        disk_bytes: directory_bytes(commands, &entry.path),
+        reclaim: ReclaimView {
+          state: "unknown".to_owned(),
+          reason: RECLAIM_UNAVAILABLE.to_owned(),
+        },
+      }
+    })
+    .collect();
+  let (data_total_bytes, data_free_bytes) = disk_stats(commands, &root);
+  let (memory_total_bytes, memory_used_bytes) = memory_stats(commands);
+  let generated_at = SystemTime::now()
+    .duration_since(UNIX_EPOCH)
+    .map_err(|error| error.to_string())?
+    .as_millis()
+    .to_string();
   Ok(ControlTowerSnapshot {
     mode: "live",
     generated_at,
     rows,
-    system: SystemView { memory_total_bytes: memory_total(), memory_used_bytes: None, data_total_bytes, data_free_bytes },
+    system: SystemView { memory_total_bytes, memory_used_bytes, data_total_bytes, data_free_bytes },
     source_note: "Live observations use bounded Git, durable Conductor-run, process, disk and GitHub reads. Unlinked or unproven correlations remain unknown.".to_owned(),
   })
+}
+
+fn collect_control_tower_snapshot_inner() -> Result<ControlTowerSnapshot, String> {
+  collect_snapshot(&SystemCommands)
+}
+
+#[tauri::command]
+async fn collect_control_tower_snapshot() -> Result<ControlTowerSnapshot, String> {
+  tauri::async_runtime::spawn_blocking(collect_control_tower_snapshot_inner)
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+fn is_executing_state(state: &str) -> bool {
+  matches!(
+    state.trim().to_ascii_lowercase().as_str(),
+    "working"
+      | "testing"
+      | "implementing"
+      | "validating"
+      | "reviewing"
+      | "changes_requested"
+      | "final_gate"
+  )
+}
+
+fn tray_summary(snapshot: &ControlTowerSnapshot) -> (String, String, String) {
+  let active = snapshot
+    .rows
+    .iter()
+    .filter(|row| {
+      row
+        .agent
+        .as_ref()
+        .is_some_and(|agent| is_executing_state(&agent.state))
+    })
+    .count();
+  let agents = format!("Codex 執行中：{active}");
+  let disk = snapshot
+    .system
+    .data_free_bytes
+    .map(|bytes| format!("Data 磁碟：{:.1} GB 可用", bytes as f64 / 1_000_000_000.0))
+    .unwrap_or_else(|| "Data 磁碟：容量未知".to_owned());
+  let reclaimable = snapshot
+    .rows
+    .iter()
+    .filter(|row| row.reclaim.state == "reclaimable")
+    .count();
+  let reclaim = if reclaimable == 0 {
+    "可立即回收：尚無已證明項目".to_owned()
+  } else {
+    format!("可立即回收：{reclaimable} 個 worktree")
+  };
+  (agents, disk, reclaim)
+}
+
+fn open_control_tower(app: &tauri::AppHandle) {
+  if let Some(window) = app.get_webview_window("main") {
+    let _ = window.show();
+    let _ = window.set_focus();
+  }
 }
 
 pub fn run() {
   tauri::Builder::default()
     .setup(|app| {
-      let icon = app.default_window_icon().cloned().ok_or_else(|| std::io::Error::other("missing bundled Control Tower icon"))?;
-      let open = MenuItem::with_id(app, "open-control-tower", "Open Control Tower", true, None::<&str>)?;
+      let icon = app
+        .default_window_icon()
+        .cloned()
+        .ok_or_else(|| std::io::Error::other("missing bundled Control Tower icon"))?;
+      let open = MenuItem::with_id(
+        app,
+        "open-control-tower",
+        "Open Control Tower",
+        true,
+        None::<&str>,
+      )?;
+      let agents = MenuItem::with_id(
+        app,
+        "agents-summary",
+        "Codex 執行中：讀取中…",
+        false,
+        None::<&str>,
+      )?;
+      let disk = MenuItem::with_id(
+        app,
+        "disk-summary",
+        "Data 磁碟：讀取中…",
+        false,
+        None::<&str>,
+      )?;
+      let reclaim = MenuItem::with_id(
+        app,
+        "reclaim-summary",
+        "可立即回收：讀取中…",
+        false,
+        None::<&str>,
+      )?;
       let separator = PredefinedMenuItem::separator(app)?;
       let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
-      let menu = Menu::with_items(app, &[&open, &separator, &quit])?;
+      let menu = Menu::with_items(app, &[&open, &agents, &disk, &reclaim, &separator, &quit])?;
+      let agents_for_summary = agents.clone();
+      let disk_for_summary = disk.clone();
+      let reclaim_for_summary = reclaim.clone();
+      tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(snapshot) = collect_control_tower_snapshot_inner() {
+          let (agent_text, disk_text, reclaim_text) = tray_summary(&snapshot);
+          let _ = agents_for_summary.set_text(agent_text);
+          let _ = disk_for_summary.set_text(disk_text);
+          let _ = reclaim_for_summary.set_text(reclaim_text);
+        }
+      });
       TrayIconBuilder::with_id("control-tower-tray")
         .icon(icon)
         .tooltip("Tachiko\nOperational summary available")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
           "open-control-tower" => {
-            if let Some(window) = app.get_webview_window("main") {
-              let _ = window.show();
-              let _ = window.set_focus();
-            }
+            open_control_tower(app);
           }
           "quit" => app.exit(0),
           _ => {}
@@ -321,13 +622,165 @@ pub fn run() {
 mod tests {
   use super::*;
 
+  struct FakeCommands {
+    responses: HashMap<String, String>,
+  }
+
+  impl FakeCommands {
+    fn with(responses: &[(&str, &str, &str)]) -> Self {
+      let responses = responses
+        .iter()
+        .map(|(program, args, output)| (format!("{program}\u{0}{args}"), (*output).to_owned()))
+        .collect();
+      Self { responses }
+    }
+  }
+
+  impl CommandBoundary for FakeCommands {
+    fn run(&self, program: &str, args: &[&str]) -> Option<String> {
+      self
+        .responses
+        .get(&format!("{program}\u{0}{}", args.join("\u{1}")))
+        .cloned()
+    }
+  }
+
   #[test]
   fn live_snapshot_is_a_serializable_fail_closed_read_model() {
-    let snapshot = collect_control_tower_snapshot().expect("the test worktree is a Git repository");
-    let encoded = serde_json::to_value(snapshot).expect("snapshot serializes for the Tauri boundary");
+    let snapshot =
+      collect_control_tower_snapshot_inner().expect("the test worktree is a Git repository");
+    let encoded =
+      serde_json::to_value(snapshot).expect("snapshot serializes for the Tauri boundary");
     assert!(encoded.get("rows").is_some());
     assert!(encoded.get("system").is_some());
-    let rows = encoded.get("rows").and_then(Value::as_array).expect("rows are an array");
-    assert!(rows.iter().all(|row| row.get("reclaim").and_then(|reclaim| reclaim.get("state")).and_then(Value::as_str) == Some("unknown")));
+    let rows = encoded
+      .get("rows")
+      .and_then(Value::as_array)
+      .expect("rows are an array");
+    assert!(rows.iter().all(|row| row
+      .get("reclaim")
+      .and_then(|reclaim| reclaim.get("state"))
+      .and_then(Value::as_str)
+      == Some("unknown")));
+  }
+
+  #[test]
+  fn macos_vm_stat_is_a_system_memory_observation() {
+    let fake = FakeCommands::with(&[
+      ("sysctl", "-n\u{1}hw.memsize", "10000\n"),
+      ("vm_stat", "", "Mach Virtual Memory Statistics: (page size of 1000 bytes)\nPages free:                               2.\nPages speculative:                        3.\n"),
+    ]);
+    assert_eq!(memory_stats(&fake), (Some(10_000), Some(5_000)));
+  }
+
+  #[test]
+  fn injected_system_boundaries_fail_closed_on_missing_outputs() {
+    let fake = FakeCommands::with(&[]);
+    assert_eq!(memory_stats(&fake), (None, None));
+    assert_eq!(disk_stats(&fake, Path::new("/unavailable")), (None, None));
+    assert_eq!(is_clean(&fake, "/unavailable"), None);
+  }
+
+  #[test]
+  fn production_collector_uses_injected_boundaries_and_never_derives_issue_from_branch() {
+    let fake = FakeCommands::with(&[
+      ("git", "-C\u{1}/tmp/repo\u{1}worktree\u{1}list\u{1}--porcelain", "worktree /tmp/work trees/issue-32\nHEAD 1234567890\nbranch refs/heads/codex/issue-32\n"),
+      ("git", "-C\u{1}/tmp/repo\u{1}config\u{1}--get\u{1}remote.origin.url", "https://github.com/nurockplayer/tachiko-conductor.git\n"),
+      ("git", "-C\u{1}/tmp/work trees/issue-32\u{1}status\u{1}--porcelain", ""),
+      ("du", "-sk\u{1}/tmp/work trees/issue-32", "2048\t/tmp/work trees/issue-32\n"),
+      ("df", "-k\u{1}/tmp/repo", "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 400 600 40% /\n"),
+      ("sysctl", "-n\u{1}hw.memsize", "10000\n"),
+      ("vm_stat", "", "Mach Virtual Memory Statistics: (page size of 1000 bytes)\nPages free:                               4.\n"),
+    ]);
+    let snapshot = collect_snapshot_for_root(&fake, Path::new("/tmp/repo"))
+      .expect("fake observations are complete enough for a snapshot");
+    assert_eq!(snapshot.rows.len(), 1);
+    assert_eq!(snapshot.rows[0].worktree.path, "/tmp/work trees/issue-32");
+    assert_eq!(snapshot.rows[0].issue, None);
+    assert_eq!(snapshot.rows[0].disk_bytes, Some(2_097_152));
+    assert_eq!(snapshot.system.memory_used_bytes, Some(6_000));
+  }
+
+  #[test]
+  fn tray_summary_excludes_terminal_runs_and_reports_safe_reclaim_state() {
+    let snapshot = ControlTowerSnapshot {
+      mode: "live",
+      generated_at: "0".to_owned(),
+      rows: vec![
+        WorkUnitView {
+          repository: "repo".to_owned(),
+          issue: None,
+          pull_request: None,
+          run_id: None,
+          agent: Some(AgentView {
+            provider: "Codex".to_owned(),
+            profile: None,
+            state: "MERGED".to_owned(),
+            duration_ms: None,
+          }),
+          worktree: WorktreeView {
+            path: "/tmp/a".to_owned(),
+            short_id: "aaaa".to_owned(),
+            branch: None,
+            head_sha: None,
+            clean: None,
+          },
+          process: None,
+          disk_bytes: None,
+          reclaim: ReclaimView {
+            state: "unknown".to_owned(),
+            reason: RECLAIM_UNAVAILABLE.to_owned(),
+          },
+        },
+        WorkUnitView {
+          repository: "repo".to_owned(),
+          issue: None,
+          pull_request: None,
+          run_id: None,
+          agent: Some(AgentView {
+            provider: "Codex".to_owned(),
+            profile: None,
+            state: "VALIDATING".to_owned(),
+            duration_ms: None,
+          }),
+          worktree: WorktreeView {
+            path: "/tmp/b".to_owned(),
+            short_id: "bbbb".to_owned(),
+            branch: None,
+            head_sha: None,
+            clean: None,
+          },
+          process: None,
+          disk_bytes: None,
+          reclaim: ReclaimView {
+            state: "reclaimable".to_owned(),
+            reason: "proven".to_owned(),
+          },
+        },
+      ],
+      system: SystemView {
+        memory_total_bytes: None,
+        memory_used_bytes: None,
+        data_total_bytes: None,
+        data_free_bytes: Some(1_500_000_000),
+      },
+      source_note: "test".to_owned(),
+    };
+    assert_eq!(
+      tray_summary(&snapshot),
+      (
+        "Codex 執行中：1".to_owned(),
+        "Data 磁碟：1.5 GB 可用".to_owned(),
+        "可立即回收：1 個 worktree".to_owned()
+      )
+    );
+  }
+
+  #[test]
+  fn process_command_timeout_is_bounded() {
+    assert_eq!(
+      output_with_timeout("sh", &["-c", "sleep 1"], Duration::from_millis(1)),
+      None
+    );
   }
 }
