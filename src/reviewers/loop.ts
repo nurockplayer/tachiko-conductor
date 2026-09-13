@@ -57,13 +57,15 @@ function renderBlockingFindings(review: ReviewResult): string {
 
 /**
  * One persisted repair budget covers both reviewer-directed and
- * post-implementation validation repairs.  Reading history makes the limit
- * survive restart rather than resetting with a new process.
+ * post-implementation validation repairs. Reading history makes the limit
+ * survive restart rather than resetting with a new process. An authority
+ * revalidation intentionally starts a new window because it invalidates the
+ * review whose historical admission would otherwise consume that window.
  */
 function durableRepairAttempts(run: Run): number {
   let attemptWindowStart = 0;
   for (let index = run.history.length - 1; index >= 0; index -= 1) {
-    if (run.history[index]?.type === 'human_resolved') {
+    if (run.history[index]?.type === 'human_resolved' || run.history[index]?.type === 'revalidate') {
       attemptWindowStart = index + 1;
       break;
     }

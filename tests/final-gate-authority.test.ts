@@ -293,6 +293,52 @@ describe('final-gate authority', () => {
     assert.ok(result.run.history.some((entry) => entry.type === 'revalidate'));
   });
 
+  it('F06 gives policy revalidation a fresh independent-review attempt', async () => {
+    const store = new MemoryStore();
+    store.create(finalGateRun('final-policy-fresh-review'));
+    let revision = 'test-config-v1';
+    const github: GitHubAdapter = {
+      ...githubReturning(readySnapshot(HEAD)),
+      async readLiveSnapshot() {
+        revision = 'test-config-v2';
+        return readySnapshot(HEAD);
+      },
+    };
+    const validation: ValidationAdapter = {
+      kind: 'validation',
+      get configRevision() { return revision; },
+      async validate(request) {
+        return { ...validationPassed(request.headSha).local, configRevision: 'test-config-v2' };
+      },
+    };
+    let reviewerCalls = 0;
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review(request) {
+        reviewerCalls += 1;
+        return approval('fresh-policy-review', request.headSha);
+      },
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github,
+        implementation: unusedImplementation,
+        reviewer,
+        validation,
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
+      'final-policy-fresh-review',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(result.run.state, 'MERGE_READY');
+    assert.equal(reviewerCalls, 1);
+    assert.equal(result.run.history.filter((entry) => entry.type === 'revalidate').length, 1);
+  });
+
   it('does not infer a hosted policy from a non-empty passing observation', () => {
     assert.equal(
       evaluateHostedCheckPolicy({
