@@ -323,12 +323,25 @@ fn github_repository(commands: &dyn CommandBoundary, root: &Path) -> Option<Stri
   github_repository_from_remote(&remote)
 }
 
+fn github_url_path<'a>(remote: &'a str, scheme: &str) -> Option<&'a str> {
+  let remote = remote.strip_prefix(scheme)?;
+  let (authority, path) = remote.split_once('/')?;
+  // Match the bootstrap parser's authority decision: credentials and an
+  // explicit port do not change the GitHub hostname that proves repository
+  // identity. Reject malformed ports rather than guessing an identity.
+  let authority = authority.rsplit('@').next()?;
+  let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
+  (host.eq_ignore_ascii_case("github.com")
+    && (port.is_empty() || port.parse::<u16>().is_ok()))
+    .then_some(path)
+}
+
 fn github_repository_from_remote(remote: &str) -> Option<String> {
   let remote = remote.trim().trim_end_matches(".git");
   remote
     .strip_prefix("git@github.com:")
-    .or_else(|| remote.strip_prefix("https://github.com/"))
-    .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
+    .or_else(|| github_url_path(remote, "https://"))
+    .or_else(|| github_url_path(remote, "ssh://"))
     .filter(|value| value.split('/').count() == 2)
     .map(str::to_owned)
 }
@@ -836,9 +849,17 @@ mod tests {
       Some("nurockplayer/tachiko-conductor".to_owned())
     );
     assert_eq!(
+      github_repository_from_remote("ssh://git@github.com:22/nurockplayer/tachiko-conductor.git"),
+      Some("nurockplayer/tachiko-conductor".to_owned())
+    );
+    assert_eq!(
       github_repository_from_remote(
         "ssh://git@github.com/nurockplayer/tachiko-conductor/extra.git"
       ),
+      None
+    );
+    assert_eq!(
+      github_repository_from_remote("ssh://git@github.com:not-a-port/nurockplayer/tachiko-conductor.git"),
       None
     );
   }

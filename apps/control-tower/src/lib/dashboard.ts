@@ -19,6 +19,11 @@ export function formatBytes(value?: number): string {
   return `${(value / 1_000_000_000).toFixed(1)} GB`;
 }
 
+export function provenanceLabel(mode: ControlTowerSnapshot['mode']): string {
+  const flow = 'Issue → Codex → PR → Worktree → 回收';
+  return mode === 'live' ? `即時觀測 · ${flow}` : `示意資料 · ${flow}`;
+}
+
 const executingAgentStates = new Set([
   'working',
   'testing',

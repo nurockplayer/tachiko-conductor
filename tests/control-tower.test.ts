@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { classifyReclaim, formatBytes, isActive, rowsForFilter, statusLine, summarize } from '../apps/control-tower/src/lib/dashboard.ts';
+import { classifyReclaim, formatBytes, isActive, provenanceLabel, rowsForFilter, statusLine, summarize } from '../apps/control-tower/src/lib/dashboard.ts';
 import { goldenFixture } from '../apps/control-tower/src/lib/fixture.ts';
 import { collectGitWorktrees, parseGitWorktreePorcelain } from '../apps/control-tower/src/lib/git-worktrees.ts';
 import { collectDataVolume, parseDfKilobytes } from '../apps/control-tower/src/lib/system.ts';
@@ -96,4 +96,9 @@ test('live collector is single-flight across concurrent renderer effects', async
 test('zero free capacity is visible rather than rendered as unknown', () => {
   assert.equal(formatBytes(0), '0 B');
   assert.equal(formatBytes(undefined), '—');
+});
+
+test('dashboard provenance distinguishes golden fixture from successful live observations', () => {
+  assert.equal(provenanceLabel('fixture'), '示意資料 · Issue → Codex → PR → Worktree → 回收');
+  assert.equal(provenanceLabel('live'), '即時觀測 · Issue → Codex → PR → Worktree → 回收');
 });

@@ -1,6 +1,6 @@
 import { Component, useEffect, useMemo, useState, type JSX, type ReactNode } from 'react';
 import { goldenFixture } from './lib/fixture';
-import { formatBytes, rowsForFilter, statusLine, summarize } from './lib/dashboard';
+import { formatBytes, provenanceLabel, rowsForFilter, statusLine, summarize } from './lib/dashboard';
 import { collectLiveSnapshot } from './lib/tauri';
 import type { ControlTowerSnapshot, DashboardFilter, WorkUnitView } from '../../../src/operational/read-model.js';
 
@@ -65,7 +65,7 @@ function ControlTowerBody(): JSX.Element {
     <header className="tower-header">
       <div>
         <h1>執行中工作總覽</h1>
-        <p>示意資料 · Issue → Codex → PR → Worktree → 回收</p>
+        <p>{provenanceLabel(snapshot.mode)}</p>
       </div>
       <div className="filters" aria-label="工作篩選">
         {filterLabels.map(([value, label]) => <button key={value} type="button" className={filter === value ? (value === 'reclaimable' ? 'selected accent' : 'selected') : ''} onClick={() => setFilter(value)}>{label}</button>)}
