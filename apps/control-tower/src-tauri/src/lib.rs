@@ -126,6 +126,7 @@ struct ParsedWorktree {
 struct RunObservation {
   id: String,
   repository: String,
+  branch: String,
   issue: Option<u64>,
   pull_request_number: Option<u64>,
   provider: Option<String>,
@@ -400,6 +401,38 @@ fn number_at(value: &Value, path: &[&str]) -> Option<u64> {
   cursor.as_u64()
 }
 
+fn durable_run_observation(value: &Value, file_id: &str) -> Option<(String, RunObservation)> {
+  const STATES: &[&str] = &["READY", "IMPLEMENTING", "VALIDATING", "REVIEWING", "CHANGES_REQUESTED", "FINAL_GATE", "MERGE_READY", "MERGED", "WAITING_DEPENDENCY", "NEEDS_HUMAN", "FAILED"];
+  let id = string_at(value, &["id"])?;
+  let state = string_at(value, &["state"])?;
+  let owner = string_at(value, &["target", "owner"])?;
+  let repo = string_at(value, &["target", "repo"])?;
+  let issue = number_at(value, &["target", "issueNumber"])?;
+  let workspace_path = string_at(value, &["bootstrap", "workspacePath"])?;
+  let branch = string_at(value, &["bootstrap", "branch"])?;
+  let bootstrap_owner = string_at(value, &["bootstrap", "owner"])?;
+  let bootstrap_repo = string_at(value, &["bootstrap", "repo"])?;
+  let bootstrap_issue = number_at(value, &["bootstrap", "issueNumber"])?;
+  let target_kind = string_at(value, &["target", "kind"])?;
+  let history = value.get("history")?.as_array()?;
+  if id != file_id || id.is_empty() || !STATES.contains(&state.as_str()) || target_kind != "issue"
+    || issue == 0 || workspace_path.is_empty() || branch.is_empty()
+    || owner.is_empty() || repo.is_empty() || bootstrap_owner != owner || bootstrap_repo != repo || bootstrap_issue != issue
+    || !history.iter().all(Value::is_object) || string_at(value, &["createdAt"]).is_none() || string_at(value, &["updatedAt"]).is_none() {
+    return None;
+  }
+  Some((workspace_path, RunObservation {
+    id,
+    repository: format!("{owner}/{repo}"),
+    branch,
+    issue: Some(issue),
+    pull_request_number: number_at(value, &["pullRequest", "number"]),
+    provider: string_at(value, &["executor", "provider"]).or_else(|| string_at(value, &["agentResult", "executor", "provider"])),
+    state,
+    duration_ms: number_at(value, &["agentResult", "durationMs"]),
+  }))
+}
+
 fn load_runs() -> HashMap<String, RunObservation> {
   let mut runs = HashMap::new();
   let Some(directory) = run_directory() else {
@@ -423,19 +456,11 @@ fn load_runs() -> HashMap<String, RunObservation> {
     let Ok(value) = serde_json::from_str::<Value>(&raw) else {
       continue;
     };
-    let Some(workspace_path) = string_at(&value, &["bootstrap", "workspacePath"]) else {
+    let entry_path = entry.path();
+    let Some(file_id) = entry_path.file_stem().and_then(|value| value.to_str()) else {
       continue;
     };
-    let observation = RunObservation {
-      id: string_at(&value, &["id"]).unwrap_or_default(),
-      repository: string_at(&value, &["target", "repo"]).unwrap_or_else(|| "unknown".to_owned()),
-      issue: number_at(&value, &["target", "issueNumber"]),
-      pull_request_number: number_at(&value, &["pullRequest", "number"]),
-      provider: string_at(&value, &["executor", "provider"])
-        .or_else(|| string_at(&value, &["agentResult", "executor", "provider"])),
-      state: string_at(&value, &["state"]).unwrap_or_else(|| "unknown".to_owned()),
-      duration_ms: number_at(&value, &["agentResult", "durationMs"]),
-    };
+    let Some((workspace_path, observation)) = durable_run_observation(&value, file_id) else { continue; };
     runs.insert(workspace_path, observation);
   }
   runs
@@ -548,7 +573,9 @@ fn collect_snapshot_for_root_with_workspace_data_path(
   let rows = parse_worktrees(&porcelain)
     .into_iter()
     .map(|entry| {
-      let run = runs.get(&entry.path);
+      let run = runs.get(&entry.path).filter(|run| {
+        entry.branch.as_deref() == Some(run.branch.as_str()) && run.repository == repository
+      });
       let process = current_process(commands, &entry.path);
       WorkUnitView {
         repository: run
@@ -881,6 +908,21 @@ mod tests {
       ("ps", "-o\u{1}rss=\u{1}-p\u{1}41", "100\n"),
     ]);
     assert!(current_process(&fake, "/tmp/worktree").is_none());
+  }
+
+  #[test]
+  fn durable_run_observation_requires_schema_and_bootstrap_identity() {
+    assert!(durable_run_observation(&serde_json::json!({
+      "bootstrap": { "workspacePath": "/tmp/worktree" }, "state": "IMPLEMENTING"
+    }), "run-32").is_none());
+    let (path, run) = durable_run_observation(&serde_json::json!({
+      "id": "run-32", "state": "IMPLEMENTING", "createdAt": "1", "updatedAt": "1", "history": [],
+      "target": { "kind": "issue", "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 },
+      "bootstrap": { "workspacePath": "/tmp/worktree", "branch": "tachiko/issue-32", "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 }
+    }), "run-32").expect("complete durable run");
+    assert_eq!(path, "/tmp/worktree");
+    assert_eq!(run.repository, "nurockplayer/tachiko-conductor");
+    assert_eq!(run.branch, "tachiko/issue-32");
   }
 
   #[test]
