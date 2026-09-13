@@ -8,7 +8,7 @@ import {
 import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
-import { applyTransition, isValidationFresh, type ActiveValidationConfiguration } from '../domain/state-machine.js';
+import { applyTransition, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
@@ -209,6 +209,29 @@ export async function runReviewLoop(
 
   for (;;) {
     if (run.state === 'CHANGES_REQUESTED') {
+      const validationFailure = run.validationResult?.status === 'failed';
+      if (validationFailure) {
+        let activeValidation: ActiveValidationConfiguration;
+        try {
+          activeValidation = resolveValidationAuthority();
+        } catch (error) {
+          return persistRevalidation(
+            run,
+            `Failed validation evidence cannot be admitted because current validation-policy authority is unavailable: ${errorMessage(error)}`,
+            store,
+            now,
+          );
+        }
+        if (!isValidationResultCoherent(run.validationResult) ||
+          !validationEvidenceMatchesActive(run.validationResult, activeValidation)) {
+          return persistRevalidation(
+            run,
+            'Failed validation evidence is malformed or does not match the active validation-policy identity.',
+            store,
+            now,
+          );
+        }
+      }
       if (durableRepairAttempts(run) >= options.maxAttempts) {
         const reason = `Review did not converge after ${options.maxAttempts} attempt(s); the shared post-implementation repair budget was exhausted.`;
         run = applyTransition(
@@ -227,7 +250,6 @@ export async function runReviewLoop(
         return { outcome: 'needs_human', run, reason };
       }
       const pendingReview = run.reviewResult;
-      const validationFailure = run.validationResult?.status === 'failed';
       if ((pendingReview === undefined || pendingReview.verdict !== 'request_changes') && !validationFailure) {
         const reason = 'Persisted CHANGES_REQUESTED run has no actionable review or validation failure.';
         run = applyTransition(run, { type: 'fail', reason }, now());

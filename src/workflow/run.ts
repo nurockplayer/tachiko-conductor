@@ -606,6 +606,20 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
+        if (!validationEvidenceMatchesActive(validationResult, postReadValidation)) {
+          const reason = `Validation evidence for ${run.headSha} does not match the active validation-policy identity.`;
+          run = applyTransition(
+            run,
+            {
+              type: 'escalate', reason, validationResult,
+              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+              interrupt: { evidence: reason, choices: ['Restore matching validation evidence and retry', CANCEL_RUN_DECISION] },
+            },
+            now(),
+          );
+          store.update(run);
+          return { outcome: 'needs_human', run, reason };
+        }
         if (validationResult.status === 'failed') {
           run = applyTransition(run, {
             type: 'validation_failed', validationResult,
@@ -636,19 +650,6 @@ export async function runWorkflow(
               type: 'escalate', reason, validationResult,
               pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
               interrupt: { evidence: reason, choices: ['Restore required validation evidence and retry', CANCEL_RUN_DECISION] },
-            },
-            now(),
-          );
-          store.update(run);
-          return { outcome: 'needs_human', run, reason };
-        }
-        if (!validationEvidenceMatchesActive(validationResult, postReadValidation)) {
-          const reason = `Validation evidence for ${run.headSha} does not match the active validation-policy identity.`;
-          run = applyTransition(
-            run,
-            {
-              type: 'escalate', reason, validationResult,
-              interrupt: { evidence: reason, choices: ['Restore matching validation evidence and retry', CANCEL_RUN_DECISION] },
             },
             now(),
           );

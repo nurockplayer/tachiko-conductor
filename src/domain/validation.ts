@@ -20,7 +20,10 @@ function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
   )) return false;
   const final = commands.at(-1);
   if (evidence.status === 'passed') return commands.length > 0 && commands.every((command) => command.outcome === 'passed' && command.exitCode === 0);
-  if (evidence.status === 'failed') return final !== undefined && (final.outcome === 'failed' || final.outcome === 'timed_out');
+  if (evidence.status === 'failed') {
+    return final !== undefined &&
+      (final.outcome === 'timed_out' || (final.outcome === 'failed' && final.exitCode !== 0));
+  }
   return (evidence.configRevision === null && commands.length === 0) ||
     (final !== undefined && (final.outcome === 'unavailable' || final.outcome === 'malformed'));
 }

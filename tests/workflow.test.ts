@@ -239,6 +239,69 @@ describe('runWorkflow', () => {
     assert.equal(result.run.history.at(-1)?.type, 'escalate');
   });
 
+  it('F06 rejects failed local evidence that contradicts its zero exit code', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-failed-zero-exit');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const incoherentValidation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate() {
+        return {
+          status: 'failed', configRevision: 'test-config-v1',
+          commands: [{ commandIndex: 0, executable: 'test', outcome: 'failed', exitCode: 0, durationMs: 1 }],
+        } as unknown as LocalValidationEvidence;
+      },
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD]),
+        implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([]),
+        validation: incoherentValidation,
+        hostedCheckPolicy: TEST_HOSTED_POLICY,
+      },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(result.run.validationResult?.status, 'unknown');
+    assert.equal(result.run.validationResult?.local.status, 'unknown');
+  });
+
+  it('F06 revalidates stale persisted failed evidence before any implementation repair', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'validation-failure-policy-drift');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_failed', validationResult: validationFailed(HEAD) }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubAdapter([HEAD]),
+        implementation,
+        reviewer: new FakeReviewer([approve(HEAD)]),
+        validation: new FakeValidation([], 'test-config-v2'),
+        hostedCheckPolicy: TEST_HOSTED_POLICY,
+      },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(result.run.history.some((entry) => entry.type === 'revalidate'), true);
+    assert.equal(result.run.validationResult?.local.configRevision, 'test-config-v2');
+  });
+
   it('persists local evidence while hosted checks wait, then resumes with a fresh hosted pass', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'validation-wait');

@@ -101,6 +101,9 @@ export const TRANSITION_TABLE: Readonly<
   },
   CHANGES_REQUESTED: {
     start_fix: 'IMPLEMENTING',
+    // A failed validation may itself become stale or malformed before repair.
+    // Revalidate it rather than letting an untrusted failure authorize edits.
+    revalidate: 'VALIDATING',
     wait_dependency: 'WAITING_DEPENDENCY',
     escalate: 'NEEDS_HUMAN',
     fail: 'FAILED',
