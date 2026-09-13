@@ -8,6 +8,8 @@ import type { ImplementationAgent, ImplementationRequest } from '../src/adapters
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter } from '../src/adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
+import { resumeCommand } from '../src/cli.js';
+import { REESTABLISH_READINESS_DECISION } from '../src/domain/decisions.js';
 import { createRun } from '../src/domain/run.js';
 import { InvalidTransitionError, applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, LocalValidationEvidence, Run } from '../src/domain/types.js';
@@ -126,6 +128,58 @@ describe('C20 consolidation regressions', () => {
 
     assert.notEqual(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'NEEDS_HUMAN');
+  });
+
+  it('F02 re-establishes a legacy gate through current exact-HEAD validation instead of resuming MERGE_READY', async () => {
+    const dir = tempDir('tachiko-c20-f02-resume-');
+    const legacy: Run = {
+      ...createRun(TARGET, T0, 'legacy-gate-resume'), state: 'MERGE_READY',
+      history: [{ type: 'gate_passed', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }],
+    };
+    const store = new JsonFileStore({ dir });
+    store.create(legacy);
+    const parked = await runWorkflow(
+      { store, github: new QueuedGitHub([]), implementation: new CapturingImplementation(), reviewer: unusedReviewer },
+      legacy.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(parked.run.state, 'NEEDS_HUMAN');
+    assert.equal(parked.run.interrupt?.choices?.includes(REESTABLISH_READINESS_DECISION), true);
+
+    const validation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'local-v1',
+      async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
+        return { ...validationPassed(request.headSha).local, configRevision: 'local-v1' };
+      },
+    };
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review(request) {
+        return { verdict: 'approve', reviewerName: 'independent-test-reviewer', headSha: request.headSha, findings: [] };
+      },
+    };
+    const snapshots = Array.from({ length: 10 }, () => liveSnapshot(HEAD));
+    const resumed = await resumeCommand(
+      {
+        store,
+        github: new QueuedGitHub(snapshots),
+        implementation: new CapturingImplementation(),
+        reviewer,
+        validation,
+        hostedCheckPolicy: { revision: 'hosted-v1', policy: { mode: 'required' } },
+      },
+      legacy.id,
+      REESTABLISH_READINESS_DECISION,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(resumed.outcome, 'merge_ready', JSON.stringify(resumed));
+    assert.equal(resumed.run.state, 'MERGE_READY');
+    assert.equal(resumed.run.headSha, HEAD);
+    assert.deepEqual(resumed.run.pullRequest, { number: 7, headSha: HEAD });
+    assert.equal(resumed.run.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
+    assert.equal(resumed.run.history.some((entry) => entry.type === 'validation_passed'), true);
+    assert.equal(resumed.run.history.filter((entry) => entry.type === 'gate_passed').length, 1);
   });
 
   it('F03 resumes a validation-failure repair from a fresh JsonFileStore at the failing HEAD with repair intent', async () => {

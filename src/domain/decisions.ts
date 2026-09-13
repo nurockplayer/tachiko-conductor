@@ -1,6 +1,9 @@
 /** Exact bounded decision that authorizes adopting a changed live pull-request HEAD. */
 export const LIVE_HEAD_SYNC_DECISION = 'Sync the run to the live HEAD and continue';
 
+/** Exact bounded recovery for a pre-validation legacy MERGE_READY record. */
+export const REESTABLISH_READINESS_DECISION = 'Re-establish current readiness authority';
+
 /** Exact bounded decision that terminates a parked run without resuming work. */
 export const CANCEL_RUN_DECISION = 'Cancel the run';
 
@@ -15,4 +18,9 @@ const LIVE_HEAD_SYNC_INTERRUPT_STATES = new Set([
 /** States whose drift interrupt offers the bounded live-HEAD synchronization decision. */
 export function canSynchronizeInterruptedHead(state: string | undefined): boolean {
   return state !== undefined && LIVE_HEAD_SYNC_INTERRUPT_STATES.has(state);
+}
+
+/** Only a legacy merge-ready record may be returned to exact-HEAD validation. */
+export function canReestablishInterruptedReadiness(state: string | undefined): boolean {
+  return state === 'MERGE_READY';
 }

@@ -11,7 +11,7 @@ import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
 import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
-import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
+import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { parkBootstrapFailure } from './bootstrap-failure.js';
@@ -201,6 +201,21 @@ function completeLiveFinalGate(run: Run, now: string, activeValidation: ActiveVa
     updatedAt: now,
     history: [...run.history, { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: now }],
   };
+}
+
+/**
+ * Old persisted runs could contain a callable `gate_passed` record. It remains
+ * readable, but only a later workflow-owned final-gate verification proves
+ * that its readiness has been rebuilt from current authority.
+ */
+function hasUnreestablishedLegacyGate(run: Run): boolean {
+  let latestLegacyGate = -1;
+  let latestLiveFinalGate = -1;
+  run.history.forEach((entry, index) => {
+    if (entry.type === 'gate_passed') latestLegacyGate = index;
+    if (entry.type === 'final_gate_verified') latestLiveFinalGate = index;
+  });
+  return latestLegacyGate > latestLiveFinalGate;
 }
 
 /**
@@ -804,9 +819,9 @@ export async function runWorkflow(
       }
 
       case 'MERGE_READY':
-        if (run.history.some((entry) => entry.type === 'gate_passed')) {
+        if (hasUnreestablishedLegacyGate(run)) {
           const reason = 'Historical gate_passed readiness is read-compatible only; current validation, review, and live GitHub authority must be re-established.';
-          return park(run, reason, store, now, ['Re-establish current readiness authority', CANCEL_RUN_DECISION]);
+          return park(run, reason, store, now, [REESTABLISH_READINESS_DECISION, CANCEL_RUN_DECISION]);
         }
         return { outcome: 'merge_ready', run };
 

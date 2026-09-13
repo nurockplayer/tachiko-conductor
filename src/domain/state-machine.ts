@@ -1,4 +1,9 @@
-import { LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './decisions.js';
+import {
+  LIVE_HEAD_SYNC_DECISION,
+  REESTABLISH_READINESS_DECISION,
+  canReestablishInterruptedReadiness,
+  canSynchronizeInterruptedHead,
+} from './decisions.js';
 import type { ReviewResult, Run, TransitionInput, TransitionType, ValidationResult, WorkflowState } from './types.js';
 import { isValidationResultCoherent } from './validation.js';
 
@@ -148,12 +153,19 @@ const HEAD_UPDATING_TRANSITIONS: ReadonlySet<TransitionType> = new Set([
 ]);
 
 function isAuthorizedHumanHeadSync(run: Run, input: TransitionInput): boolean {
+  const offered = run.interrupt?.choices;
   return (
     input.type === 'human_resolved' &&
     input.reason?.trim() === LIVE_HEAD_SYNC_DECISION &&
     run.state === 'NEEDS_HUMAN' &&
     canSynchronizeInterruptedHead(run.interruptedFrom) &&
-    run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION) === true
+    offered?.includes(LIVE_HEAD_SYNC_DECISION) === true
+  ) || (
+    input.type === 'human_resolved' &&
+    input.reason?.trim() === REESTABLISH_READINESS_DECISION &&
+    run.state === 'NEEDS_HUMAN' &&
+    canReestablishInterruptedReadiness(run.interruptedFrom) &&
+    offered?.includes(REESTABLISH_READINESS_DECISION) === true
   );
 }
 

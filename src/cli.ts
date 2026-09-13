@@ -34,7 +34,13 @@ import {
   type StartBrowserRuntimeOptions,
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
-import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, canSynchronizeInterruptedHead } from './domain/decisions.js';
+import {
+  CANCEL_RUN_DECISION,
+  LIVE_HEAD_SYNC_DECISION,
+  REESTABLISH_READINESS_DECISION,
+  canReestablishInterruptedReadiness,
+  canSynchronizeInterruptedHead,
+} from './domain/decisions.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
 import {
   TRANSITION_TYPES,
@@ -240,7 +246,8 @@ export function resolveHostedCheckPolicyConfiguration(
     throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.mode must be required or not_required.');
   }
   if (record.requiredCheckNames !== undefined &&
-    (!Array.isArray(record.requiredCheckNames) || record.requiredCheckNames.some((name) => typeof name !== 'string' || name.trim() === ''))) {
+    (!Array.isArray(record.requiredCheckNames) || record.requiredCheckNames.length === 0 ||
+      record.requiredCheckNames.some((name) => typeof name !== 'string' || name.trim() === ''))) {
     throw new Error('TACHIKO_HOSTED_CHECK_POLICY_CONFIG.requiredCheckNames must be a non-empty string array when supplied.');
   }
   if (record.mode === 'not_required' && record.requiredCheckNames !== undefined) {
@@ -586,12 +593,18 @@ export async function resumeCommand(
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
   let synchronizedHead: string | undefined;
   let synchronizedPullRequest: Run['pullRequest'];
+  const reestablishReadiness =
+    decision.trim() === REESTABLISH_READINESS_DECISION &&
+    run.state === 'NEEDS_HUMAN' &&
+    canReestablishInterruptedReadiness(run.interruptedFrom) &&
+    run.interrupt?.choices?.includes(REESTABLISH_READINESS_DECISION) === true &&
+    run.target.kind === 'issue';
   const synchronizeLiveHead =
-    decision.trim() === LIVE_HEAD_SYNC_DECISION &&
+    (decision.trim() === LIVE_HEAD_SYNC_DECISION &&
     run.state === 'NEEDS_HUMAN' &&
     canSynchronizeInterruptedHead(run.interruptedFrom) &&
     run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION) === true &&
-    run.target.kind === 'issue';
+    run.target.kind === 'issue') || reestablishReadiness;
   if (synchronizeLiveHead && run.target.kind === 'issue') {
     const snapshot = await deps.github.readLiveSnapshot(run.target);
     if (snapshot.headSha === null || snapshot.pullRequest === null) {

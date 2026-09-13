@@ -12,6 +12,7 @@ import {
   parseIssueNumber,
   parseIssueRef,
   resolveCodexExecutionConfig,
+  resolveHostedCheckPolicyConfiguration,
   resolveLocalValidationConfiguration,
   resolveImplementationProvider,
   resolveRunsDir,
@@ -163,6 +164,12 @@ describe('CLI command layer', () => {
     assert.throws(
       () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', workspacePath: 'relative', commands: [{ argv: ['tool'], timeoutMs: 100 }] }) }),
       /workspacePath must be an absolute non-empty path/,
+    );
+    assert.throws(
+      () => resolveHostedCheckPolicyConfiguration({
+        TACHIKO_HOSTED_CHECK_POLICY_CONFIG: JSON.stringify({ revision: 'repo-v1', mode: 'required', requiredCheckNames: [] }),
+      }),
+      /requiredCheckNames must be a non-empty string array/,
     );
   });
 
