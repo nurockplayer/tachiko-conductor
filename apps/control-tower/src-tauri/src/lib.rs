@@ -410,15 +410,26 @@ fn durable_run_observation(value: &Value, file_id: &str) -> Option<(String, RunO
   let issue = number_at(value, &["target", "issueNumber"])?;
   let workspace_path = string_at(value, &["bootstrap", "workspacePath"])?;
   let branch = string_at(value, &["bootstrap", "branch"])?;
+  let base_branch = string_at(value, &["bootstrap", "baseBranch"])?;
+  let base_sha = string_at(value, &["bootstrap", "baseSha"])?;
   let bootstrap_owner = string_at(value, &["bootstrap", "owner"])?;
   let bootstrap_repo = string_at(value, &["bootstrap", "repo"])?;
   let bootstrap_issue = number_at(value, &["bootstrap", "issueNumber"])?;
   let target_kind = string_at(value, &["target", "kind"])?;
   let history = value.get("history")?.as_array()?;
+  let transitions = ["start", "bootstrap_prepared", "agent_succeeded", "agent_failed", "validation_passed", "validation_failed", "review_approved", "changes_requested", "start_fix", "gate_passed", "gate_blocked", "merged", "wait_dependency", "dependency_satisfied", "escalate", "human_resolved", "fail"];
+  let valid_history = history.iter().all(|record| {
+    let Some(record) = record.as_object() else { return false; };
+    record.get("type").and_then(Value::as_str).is_some_and(|value| transitions.contains(&value))
+      && record.get("from").and_then(Value::as_str).is_some_and(|value| STATES.contains(&value))
+      && record.get("to").and_then(Value::as_str).is_some_and(|value| STATES.contains(&value))
+      && record.get("at").and_then(Value::as_str).is_some()
+      && record.get("reason").is_none_or(Value::is_string)
+  });
   if id != file_id || id.is_empty() || !STATES.contains(&state.as_str()) || target_kind != "issue"
-    || issue == 0 || workspace_path.is_empty() || branch.is_empty()
+    || issue == 0 || workspace_path.is_empty() || branch.is_empty() || base_branch.is_empty() || base_sha.is_empty()
     || owner.is_empty() || repo.is_empty() || bootstrap_owner != owner || bootstrap_repo != repo || bootstrap_issue != issue
-    || !history.iter().all(Value::is_object) || string_at(value, &["createdAt"]).is_none() || string_at(value, &["updatedAt"]).is_none() {
+    || !valid_history || string_at(value, &["createdAt"]).is_none() || string_at(value, &["updatedAt"]).is_none() {
     return None;
   }
   Some((workspace_path, RunObservation {
@@ -918,7 +929,7 @@ mod tests {
     let (path, run) = durable_run_observation(&serde_json::json!({
       "id": "run-32", "state": "IMPLEMENTING", "createdAt": "1", "updatedAt": "1", "history": [],
       "target": { "kind": "issue", "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 },
-      "bootstrap": { "workspacePath": "/tmp/worktree", "branch": "tachiko/issue-32", "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 }
+      "bootstrap": { "workspacePath": "/tmp/worktree", "branch": "tachiko/issue-32", "baseBranch": "main", "baseSha": "base", "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 }
     }), "run-32").expect("complete durable run");
     assert_eq!(path, "/tmp/worktree");
     assert_eq!(run.repository, "nurockplayer/tachiko-conductor");
