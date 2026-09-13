@@ -1,5 +1,5 @@
 use std::{
-  collections::HashMap,
+  collections::{BTreeSet, HashMap},
   env, fs,
   io::Read,
   path::{Path, PathBuf},
@@ -292,11 +292,18 @@ fn directory_bytes(commands: &dyn CommandBoundary, path: &str) -> Option<u64> {
 }
 
 fn current_process(commands: &dyn CommandBoundary, path: &str) -> Option<ProcessView> {
-  // Exact-path lsof is deliberately narrow: absence is not treated as proof of idleness.
+  // Exact-path lsof is deliberately narrow: absence and ambiguous ownership are
+  // both unknown, never proof that a particular process owns the worktree.
   let pids = commands.run("lsof", &["-t", "--", path])?;
-  let pid = pids
+  let pids: BTreeSet<u32> = pids
     .lines()
-    .find_map(|line| line.trim().parse::<u32>().ok())?;
+    .filter(|line| !line.trim().is_empty())
+    .map(|line| line.trim().parse::<u32>().ok())
+    .collect::<Option<_>>()?;
+  if pids.len() != 1 {
+    return None;
+  }
+  let pid = *pids.first()?;
   let rss_bytes = commands
     .run("ps", &["-o", "rss=", "-p", &pid.to_string()])
     .and_then(|rss| rss.trim().parse::<u64>().ok())
@@ -488,6 +495,18 @@ fn disk_stats(commands: &dyn CommandBoundary, path: &Path) -> (Option<u64>, Opti
   (total, free)
 }
 
+fn workspace_data_path(
+  repository_root: &Path,
+  configured_workspace_root: Option<PathBuf>,
+  home: Option<PathBuf>,
+) -> PathBuf {
+  configured_workspace_root
+    .or_else(|| home.map(|home| home.join(".tachiko-conductor/workspaces")))
+    // HOME can be unavailable in a launchd context. The repository path is a
+    // truthful fallback only when no managed-workspace location is knowable.
+    .unwrap_or_else(|| repository_root.to_path_buf())
+}
+
 fn collect_snapshot(commands: &dyn CommandBoundary) -> Result<ControlTowerSnapshot, String> {
   let root = repository_root(commands)
     .ok_or("無法解析 repository root；請設定 TACHIKO_CONTROL_TOWER_REPOSITORY。")?;
@@ -497,6 +516,19 @@ fn collect_snapshot(commands: &dyn CommandBoundary) -> Result<ControlTowerSnapsh
 fn collect_snapshot_for_root(
   commands: &dyn CommandBoundary,
   root: &Path,
+) -> Result<ControlTowerSnapshot, String> {
+  let workspace_root = workspace_data_path(
+    root,
+    env::var_os("TACHIKO_WORKSPACE_ROOT").map(PathBuf::from),
+    env::var_os("HOME").map(PathBuf::from),
+  );
+  collect_snapshot_for_root_with_workspace_data_path(commands, root, &workspace_root)
+}
+
+fn collect_snapshot_for_root_with_workspace_data_path(
+  commands: &dyn CommandBoundary,
+  root: &Path,
+  workspace_root: &Path,
 ) -> Result<ControlTowerSnapshot, String> {
   let root_text = root.to_string_lossy();
   let porcelain = commands
@@ -561,7 +593,7 @@ fn collect_snapshot_for_root(
       }
     })
     .collect();
-  let (data_total_bytes, data_free_bytes) = disk_stats(commands, &root);
+  let (data_total_bytes, data_free_bytes) = disk_stats(commands, workspace_root);
   let (memory_total_bytes, memory_used_bytes) = memory_stats(commands);
   let generated_at = SystemTime::now()
     .duration_since(UNIX_EPOCH)
@@ -823,17 +855,50 @@ mod tests {
   }
 
   #[test]
+  fn data_volume_uses_the_configured_workspace_root_before_repository_root() {
+    assert_eq!(
+      workspace_data_path(
+        Path::new("/external/repository"),
+        Some(PathBuf::from("/managed/workspaces")),
+        Some(PathBuf::from("/Users/operator")),
+      ),
+      PathBuf::from("/managed/workspaces")
+    );
+    assert_eq!(
+      workspace_data_path(
+        Path::new("/repository"),
+        None,
+        Some(PathBuf::from("/Users/operator")),
+      ),
+      PathBuf::from("/Users/operator/.tachiko-conductor/workspaces")
+    );
+  }
+
+  #[test]
+  fn process_observation_is_unknown_when_path_has_multiple_processes() {
+    let fake = FakeCommands::with(&[
+      ("lsof", "-t\u{1}--\u{1}/tmp/worktree", "41\n42\n"),
+      ("ps", "-o\u{1}rss=\u{1}-p\u{1}41", "100\n"),
+    ]);
+    assert!(current_process(&fake, "/tmp/worktree").is_none());
+  }
+
+  #[test]
   fn production_collector_uses_injected_boundaries_and_never_derives_issue_from_branch() {
     let fake = FakeCommands::with(&[
       ("git", "-C\u{1}/tmp/repo\u{1}worktree\u{1}list\u{1}--porcelain", "worktree /tmp/work trees/issue-32\nHEAD 1234567890\nbranch refs/heads/codex/issue-32\n"),
       ("git", "-C\u{1}/tmp/repo\u{1}config\u{1}--get\u{1}remote.origin.url", "https://github.com/nurockplayer/tachiko-conductor.git\n"),
       ("git", "-C\u{1}/tmp/work trees/issue-32\u{1}status\u{1}--porcelain", ""),
       ("du", "-sk\u{1}/tmp/work trees/issue-32", "2048\t/tmp/work trees/issue-32\n"),
-      ("df", "-k\u{1}/tmp/repo", "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 400 600 40% /\n"),
+      ("df", "-k\u{1}/Users/tachikoma/.tachiko-conductor/workspaces", "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 400 600 40% /\n"),
       ("sysctl", "-n\u{1}hw.memsize", "10000\n"),
       ("vm_stat", "", "Mach Virtual Memory Statistics: (page size of 1000 bytes)\nPages free:                               4.\n"),
     ]);
-    let snapshot = collect_snapshot_for_root(&fake, Path::new("/tmp/repo"))
+    let snapshot = collect_snapshot_for_root_with_workspace_data_path(
+      &fake,
+      Path::new("/tmp/repo"),
+      Path::new("/Users/tachikoma/.tachiko-conductor/workspaces"),
+    )
       .expect("fake observations are complete enough for a snapshot");
     assert_eq!(snapshot.rows.len(), 1);
     assert_eq!(snapshot.rows[0].worktree.path, "/tmp/work trees/issue-32");
