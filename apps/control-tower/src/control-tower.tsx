@@ -40,23 +40,26 @@ function ControlTowerBody(): JSX.Element {
   useEffect(() => {
     if (!('__TAURI_INTERNALS__' in window)) return;
     let disposed = false;
-    const refresh = (): void => {
-      void collectLiveSnapshot()
-        .then((next) => {
-          if (!disposed) {
-            setSnapshot(next);
-            setLiveError(null);
-          }
-        })
-        .catch((error: unknown) => {
-          if (!disposed) setLiveError(error instanceof Error ? error.message : String(error));
-        });
+    let timer: number | undefined;
+    const refresh = async (): Promise<void> => {
+      try {
+        const next = await collectLiveSnapshot();
+        if (!disposed) {
+          setSnapshot(next);
+          setLiveError(null);
+        }
+      } catch (error: unknown) {
+        if (!disposed) setLiveError(error instanceof Error ? error.message : String(error));
+      } finally {
+        // Schedule only after the prior collection settles: native reads can
+        // take longer than the cadence and must never overlap or reorder.
+        if (!disposed) timer = window.setTimeout(() => { void refresh(); }, 15_000);
+      }
     };
-    refresh();
-    const interval = window.setInterval(refresh, 15_000);
+    void refresh();
     return () => {
       disposed = true;
-      window.clearInterval(interval);
+      if (timer !== undefined) window.clearTimeout(timer);
     };
   }, []);
 

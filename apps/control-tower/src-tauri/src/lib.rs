@@ -4,6 +4,7 @@ use std::{
   io::Read,
   path::{Path, PathBuf},
   process::{Command, Stdio},
+  sync::mpsc,
   thread,
   time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -19,6 +20,7 @@ use tauri::{
 const RECLAIM_UNAVAILABLE: &str = "安全回收分類器尚不可用；未推定可刪除。";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 const COMMAND_POLL_INTERVAL: Duration = Duration::from_millis(20);
+const TRAY_REFRESH_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,38 +143,84 @@ impl CommandBoundary for SystemCommands {
 }
 
 fn output_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
-  let mut child = Command::new(program)
+  let mut command = Command::new(program);
+  command
     .args(args)
     .stdout(Stdio::piped())
-    .stderr(Stdio::null())
-    .spawn()
-    .ok()?;
+    .stderr(Stdio::null());
+  #[cfg(unix)]
+  {
+    use std::os::unix::process::CommandExt;
+    // Isolate a command and any helpers it starts, so one timeout can close
+    // inherited stdout handles without waiting for descendants to exit.
+    command.process_group(0);
+  }
+  let mut child = command.spawn().ok()?;
   // Drain concurrently: a verbose command must not block on its stdout pipe
   // before `try_wait` can observe its exit or timeout.
   let mut stdout = child.stdout.take()?;
+  let (sender, receiver) = mpsc::sync_channel(1);
   let reader = thread::spawn(move || {
     let mut bytes = Vec::new();
-    stdout.read_to_end(&mut bytes).ok()?;
-    String::from_utf8(bytes).ok()
+    let result = stdout
+      .read_to_end(&mut bytes)
+      .ok()
+      .and_then(|_| String::from_utf8(bytes).ok());
+    let _ = sender.send(result);
   });
   let started = Instant::now();
   loop {
-    match child.try_wait().ok()? {
+    let status = match child.try_wait() {
+      Ok(status) => status,
+      Err(_) => {
+        terminate_process_group(&mut child);
+        let _ = child.wait();
+        drop(reader);
+        return None;
+      }
+    };
+    match status {
       Some(status) if status.success() => {
-        return reader.join().ok()?;
+        let remaining = timeout
+          .checked_sub(started.elapsed())
+          .unwrap_or(Duration::ZERO);
+        return match receiver.recv_timeout(remaining) {
+          Ok(output) => output,
+          Err(_) => {
+            terminate_process_group(&mut child);
+            None
+          }
+        };
       }
       Some(_) => {
-        let _ = reader.join();
+        terminate_process_group(&mut child);
+        drop(reader);
         return None;
       }
       None if started.elapsed() >= timeout => {
-        let _ = child.kill();
+        terminate_process_group(&mut child);
         let _ = child.wait();
-        let _ = reader.join();
+        // Do not join: a hostile descendant could still hold stdout open.
+        // The isolated process group has been terminated and this collector
+        // must return its unavailable result within the declared deadline.
+        drop(reader);
         return None;
       }
       None => thread::sleep(COMMAND_POLL_INTERVAL),
     }
+  }
+}
+
+fn terminate_process_group(child: &mut std::process::Child) {
+  #[cfg(unix)]
+  unsafe {
+    // `process_group(0)` made the direct child the group leader. A negative
+    // PID signals every helper that inherited its stdout pipe.
+    let _ = libc::kill(-(child.id() as i32), libc::SIGKILL);
+  }
+  #[cfg(not(unix))]
+  {
+    let _ = child.kill();
   }
 }
 
@@ -446,7 +494,11 @@ fn collect_snapshot_for_root(
           .unwrap_or_else(|| repository.clone()),
         // Branch text is not durable identity evidence. A missing run remains unlinked.
         issue: run.and_then(|value| value.issue),
-        pull_request: pull_request(commands, &repository, run.and_then(|value| value.pull_request_number)),
+        pull_request: pull_request(
+          commands,
+          &repository,
+          run.and_then(|value| value.pull_request_number),
+        ),
         run_id: run.map(|value| value.id.clone()),
         agent: run.map(|value| AgentView {
           provider: value
@@ -549,6 +601,22 @@ fn tray_summary(snapshot: &ControlTowerSnapshot) -> (String, String, String) {
   (agents, disk, reclaim)
 }
 
+fn unavailable_tray_summary() -> (String, String, String) {
+  (
+    "Codex 執行中：資料不可用".to_owned(),
+    "Data 磁碟：資料不可用".to_owned(),
+    "可立即回收：資料不可用".to_owned(),
+  )
+}
+
+fn tray_summary_for_refresh(
+  snapshot: Result<ControlTowerSnapshot, String>,
+) -> (String, String, String) {
+  snapshot
+    .map(|snapshot| tray_summary(&snapshot))
+    .unwrap_or_else(|_| unavailable_tray_summary())
+}
+
 fn open_control_tower(app: &tauri::AppHandle) {
   if let Some(window) = app.get_webview_window("main") {
     let _ = window.show();
@@ -612,13 +680,13 @@ pub fn run() {
       let agents_for_summary = agents.clone();
       let disk_for_summary = disk.clone();
       let reclaim_for_summary = reclaim.clone();
-      tauri::async_runtime::spawn_blocking(move || {
-        if let Ok(snapshot) = collect_control_tower_snapshot_inner() {
-          let (agent_text, disk_text, reclaim_text) = tray_summary(&snapshot);
-          let _ = agents_for_summary.set_text(agent_text);
-          let _ = disk_for_summary.set_text(disk_text);
-          let _ = reclaim_for_summary.set_text(reclaim_text);
-        }
+      thread::spawn(move || loop {
+        let (agent_text, disk_text, reclaim_text) =
+          tray_summary_for_refresh(collect_control_tower_snapshot_inner());
+        let _ = agents_for_summary.set_text(agent_text);
+        let _ = disk_for_summary.set_text(disk_text);
+        let _ = reclaim_for_summary.set_text(reclaim_text);
+        thread::sleep(TRAY_REFRESH_INTERVAL);
       });
       TrayIconBuilder::with_id("control-tower-tray")
         .icon(icon)
@@ -796,6 +864,18 @@ mod tests {
   }
 
   #[test]
+  fn tray_refresh_replaces_startup_placeholder_after_a_failed_read() {
+    assert_eq!(
+      tray_summary_for_refresh(Err("transient collector failure".to_owned())),
+      (
+        "Codex 執行中：資料不可用".to_owned(),
+        "Data 磁碟：資料不可用".to_owned(),
+        "可立即回收：資料不可用".to_owned()
+      )
+    );
+  }
+
+  #[test]
   fn tray_open_and_quit_events_are_dispatched_only_from_named_actions() {
     assert_eq!(tray_action("open-control-tower"), TrayAction::Open);
     assert_eq!(tray_action("quit"), TrayAction::Quit);
@@ -819,5 +899,15 @@ mod tests {
     )
     .expect("a healthy verbose command is not mistaken for a timeout");
     assert_eq!(output.len(), 200_000);
+  }
+
+  #[test]
+  fn timeout_does_not_wait_for_a_descendant_that_inherits_stdout() {
+    let started = Instant::now();
+    assert_eq!(
+      output_with_timeout("sh", &["-c", "sleep 60 &"], Duration::from_millis(40)),
+      None
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
   }
 }
