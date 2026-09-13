@@ -12,6 +12,13 @@ export interface DashboardSummary {
   readonly reclaimCount: number;
 }
 
+export function formatBytes(value?: number): string {
+  if (value === undefined || value < 0) return '—';
+  if (value === 0) return '0 B';
+  if (value < 1_000_000_000) return `${(value / 1_000_000).toFixed(1)} MB`;
+  return `${(value / 1_000_000_000).toFixed(1)} GB`;
+}
+
 const executingAgentStates = new Set([
   'working',
   'testing',

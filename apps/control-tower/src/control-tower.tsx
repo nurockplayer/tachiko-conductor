@@ -1,6 +1,6 @@
 import { Component, useEffect, useMemo, useState, type JSX, type ReactNode } from 'react';
 import { goldenFixture } from './lib/fixture';
-import { rowsForFilter, statusLine, summarize } from './lib/dashboard';
+import { formatBytes, rowsForFilter, statusLine, summarize } from './lib/dashboard';
 import { collectLiveSnapshot } from './lib/tauri';
 import type { ControlTowerSnapshot, DashboardFilter, WorkUnitView } from '../../../src/operational/read-model.js';
 
@@ -9,12 +9,6 @@ const filterLabels: ReadonlyArray<readonly [DashboardFilter, string]> = [
   ['active', 'Codex 執行中'],
   ['reclaimable', '可回收'],
 ];
-
-function bytes(value?: number): string {
-  if (value === undefined || value <= 0) return '—';
-  if (value < 1_000_000_000) return `${(value / 1_000_000).toFixed(1)} MB`;
-  return `${(value / 1_000_000_000).toFixed(1)} GB`;
-}
 
 function duration(value?: number): string {
   if (value === undefined) return '';
@@ -65,7 +59,7 @@ function ControlTowerBody(): JSX.Element {
 
   const rows = useMemo(() => rowsForFilter(snapshot.rows, filter), [snapshot.rows, filter]);
   const summary = useMemo(() => summarize(snapshot), [snapshot]);
-  const memoryText = bytes(summary.memoryUsedBytes);
+  const memoryText = formatBytes(summary.memoryUsedBytes);
 
   return <main className="tower-shell">
     <header className="tower-header">
@@ -81,8 +75,8 @@ function ControlTowerBody(): JSX.Element {
     <section className="summary-grid" aria-label="系統摘要">
       <SummaryCard label="Codex 執行中" value={String(summary.activeCount)} detail={`${summary.activeWorktrees} 個 worktree`} />
       <SummaryCard label="記憶體" value={memoryText} detail={summary.memoryPercent === undefined ? '使用量未知' : `${summary.memoryPercent}% 使用`} progress={summary.memoryPercent} />
-      <SummaryCard label="Data 磁碟" value={bytes(summary.diskFreeBytes)} detail={summary.diskPercentUsed === undefined ? '剩餘容量未知' : `${summary.diskPercentUsed}% · 剩餘容量`} progress={summary.diskPercentUsed} />
-      <SummaryCard label="可立即回收" value={bytes(summary.reclaimBytes)} detail={`${summary.reclaimCount} 個 worktree`} />
+      <SummaryCard label="Data 磁碟" value={formatBytes(summary.diskFreeBytes)} detail={summary.diskPercentUsed === undefined ? '剩餘容量未知' : `${summary.diskPercentUsed}% · 剩餘容量`} progress={summary.diskPercentUsed} />
+      <SummaryCard label="可立即回收" value={formatBytes(summary.reclaimBytes)} detail={`${summary.reclaimCount} 個 worktree`} />
     </section>
 
     <section className="table-card" aria-label="工作清單">
@@ -93,7 +87,7 @@ function ControlTowerBody(): JSX.Element {
           <td><strong className={!row.agent || row.agent.provider === 'idle' ? 'muted' : ''}>{!row.agent ? 'unknown' : row.agent.provider === 'idle' ? 'idle' : `● ${row.agent.provider}`}</strong><small>{row.agent ? `${row.agent.state}${row.agent.durationMs ? ` · ${duration(row.agent.durationMs)}` : ''}` : 'unlinked'}</small></td>
           <td>{row.pullRequest ? <><strong>#{row.pullRequest.number}</strong><small className={row.pullRequest.state === 'MERGED' ? 'strong' : ''}>{row.pullRequest.state}</small></> : <span className="muted">unknown</span>}</td>
           <td><code>{row.worktree.shortId}</code><small title={row.worktree.path}>{row.worktree.branch ?? row.worktree.path}</small></td>
-          <td>{bytes(row.process?.rssBytes)}</td><td><strong>{bytes(row.diskBytes)}</strong></td>
+          <td>{formatBytes(row.process?.rssBytes)}</td><td><strong>{formatBytes(row.diskBytes)}</strong></td>
           <td><span className={`pill ${row.reclaim.state}`}>{stateLabel(row)}</span><small className="row-reason">{row.reclaim.reason ?? ''}</small></td>
         </tr>)}</tbody>
       </table></div>

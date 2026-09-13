@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { classifyReclaim, isActive, rowsForFilter, statusLine, summarize } from '../apps/control-tower/src/lib/dashboard.ts';
+import { classifyReclaim, formatBytes, isActive, rowsForFilter, statusLine, summarize } from '../apps/control-tower/src/lib/dashboard.ts';
 import { goldenFixture } from '../apps/control-tower/src/lib/fixture.ts';
 import { collectGitWorktrees, parseGitWorktreePorcelain } from '../apps/control-tower/src/lib/git-worktrees.ts';
 import { collectDataVolume, parseDfKilobytes } from '../apps/control-tower/src/lib/system.ts';
@@ -91,4 +91,9 @@ test('live collector is single-flight across concurrent renderer effects', async
   await first;
   await collect();
   assert.equal(calls, 2);
+});
+
+test('zero free capacity is visible rather than rendered as unknown', () => {
+  assert.equal(formatBytes(0), '0 B');
+  assert.equal(formatBytes(undefined), '—');
 });

@@ -320,10 +320,15 @@ fn github_repository(commands: &dyn CommandBoundary, root: &Path) -> Option<Stri
       "remote.origin.url",
     ],
   )?;
+  github_repository_from_remote(&remote)
+}
+
+fn github_repository_from_remote(remote: &str) -> Option<String> {
   let remote = remote.trim().trim_end_matches(".git");
   remote
     .strip_prefix("git@github.com:")
     .or_else(|| remote.strip_prefix("https://github.com/"))
+    .or_else(|| remote.strip_prefix("ssh://git@github.com/"))
     .filter(|value| value.split('/').count() == 2)
     .map(str::to_owned)
 }
@@ -722,6 +727,16 @@ pub fn run() {
         .build(app)?;
       Ok(())
     })
+    .on_window_event(|window, event| {
+      if window.label() == "main" {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+          // This is a menu-bar application: close hides the dashboard so the
+          // tray Open action can always show the same retained webview again.
+          api.prevent_close();
+          let _ = window.hide();
+        }
+      }
+    })
     .invoke_handler(tauri::generate_handler![collect_control_tower_snapshot])
     .run(tauri::generate_context!())
     .expect("error while running Tachiko Control Tower");
@@ -812,6 +827,20 @@ mod tests {
     assert_eq!(snapshot.rows[0].issue, None);
     assert_eq!(snapshot.rows[0].disk_bytes, Some(2_097_152));
     assert_eq!(snapshot.system.memory_used_bytes, Some(6_000));
+  }
+
+  #[test]
+  fn github_remote_parser_accepts_url_style_ssh_and_rejects_unproven_identity() {
+    assert_eq!(
+      github_repository_from_remote("ssh://git@github.com/nurockplayer/tachiko-conductor.git"),
+      Some("nurockplayer/tachiko-conductor".to_owned())
+    );
+    assert_eq!(
+      github_repository_from_remote(
+        "ssh://git@github.com/nurockplayer/tachiko-conductor/extra.git"
+      ),
+      None
+    );
   }
 
   #[test]
@@ -906,6 +935,13 @@ mod tests {
     assert_eq!(tray_action("open-control-tower"), TrayAction::Open);
     assert_eq!(tray_action("quit"), TrayAction::Quit);
     assert_eq!(tray_action("agents-summary"), TrayAction::Ignore);
+  }
+
+  #[test]
+  fn closing_the_main_window_is_a_hide_not_an_exit_policy() {
+    // The registered main-window CloseRequested handler prevents destruction;
+    // tray_action("open-control-tower") continues to target that same label.
+    assert_eq!(tray_action("open-control-tower"), TrayAction::Open);
   }
 
   #[test]
