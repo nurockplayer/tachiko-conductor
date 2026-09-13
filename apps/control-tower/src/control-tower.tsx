@@ -69,7 +69,7 @@ function ControlTowerBody(): JSX.Element {
         <thead><tr><th>Issue / Repo</th><th>Codex</th><th>PR</th><th>Worktree</th><th>RAM</th><th>Disk</th><th>回收狀態</th></tr></thead>
         <tbody>{rows.map((row) => <tr key={`${row.repository}:${row.worktree.path}`}>
           <td><strong>{row.issue === undefined ? '—' : `#${row.issue}`}</strong><small>{row.repository}</small></td>
-          <td><strong className={row.agent?.provider === 'idle' ? 'muted' : ''}>{row.agent?.provider === 'idle' ? 'idle' : `● ${row.agent?.provider ?? 'unknown'}`}</strong><small>{row.agent ? `${row.agent.state}${row.agent.durationMs ? ` · ${duration(row.agent.durationMs)}` : ''}` : 'unlinked'}</small></td>
+          <td><strong className={!row.agent || row.agent.provider === 'idle' ? 'muted' : ''}>{!row.agent ? 'unknown' : row.agent.provider === 'idle' ? 'idle' : `● ${row.agent.provider}`}</strong><small>{row.agent ? `${row.agent.state}${row.agent.durationMs ? ` · ${duration(row.agent.durationMs)}` : ''}` : 'unlinked'}</small></td>
           <td>{row.pullRequest ? <><strong>#{row.pullRequest.number}</strong><small className={row.pullRequest.state === 'MERGED' ? 'strong' : ''}>{row.pullRequest.state}</small></> : <span className="muted">unknown</span>}</td>
           <td><code>{row.worktree.shortId}</code><small title={row.worktree.path}>{row.worktree.branch ?? row.worktree.path}</small></td>
           <td>{bytes(row.process?.rssBytes)}</td><td><strong>{bytes(row.diskBytes)}</strong></td>
