@@ -17,7 +17,7 @@ test('golden fixture preserves the approved values and all three filters', () =>
   assert.equal(rowsForFilter(goldenFixture.rows, 'active').length, 2);
   assert.equal(rowsForFilter(goldenFixture.rows, 'reclaimable').length, 2);
   assert.equal(statusLine('all', 4), '目前顯示全部工作。');
-  assert.equal(statusLine('active', 2), '目前顯示 2 個 Codex 執行中工作。');
+  assert.equal(statusLine('active', 2), '目前顯示 2 個執行中 agent 工作。');
   assert.equal(statusLine('reclaimable', 2), '目前顯示 2 個可回收 worktree。');
 });
 
