@@ -227,6 +227,27 @@ describe('C20 consolidation regressions', () => {
     assert.match('reason' in result ? result.reason : '', /pull request|accepted PR/i);
   });
 
+  it('F03 refuses a persisted validation failure without an accepted PR before invoking implementation', async () => {
+    const dir = tempDir('tachiko-c20-f03-unaccepted-validation-');
+    let run = createRun(TARGET, T0, 'unaccepted-validation-repair');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', headSha: HEAD, agentResult: successResult(HEAD) }, T0);
+    run = applyTransition(run, { type: 'validation_failed', validationResult: validationFailed(HEAD) }, T0);
+    new JsonFileStore({ dir }).create(run);
+    const implementation = new CapturingImplementation();
+
+    const result = await runWorkflow(
+      { store: new JsonFileStore({ dir }), github: new QueuedGitHub([]), implementation, reviewer: unusedReviewer },
+      run.id,
+      { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(implementation.requests.length, 0);
+    assert.match('reason' in result ? result.reason : '', /accepted pull request and exact HEAD/i);
+  });
+
   it('F06 rejects policy authority changed during awaited validation before admitting evidence', async () => {
     const dir = tempDir('tachiko-c20-f06-');
     let run = createRun(TARGET, T0, 'validation-authority-drift');

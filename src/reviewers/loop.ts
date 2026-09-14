@@ -257,6 +257,26 @@ export async function runReviewLoop(
         return { outcome: 'failed', run, reason };
       }
 
+      // Failed validation is not repair authority on its own. A persisted
+      // failure must already be bound to an accepted PR and exact HEAD before
+      // this loop may prepare a workspace or invoke the implementation agent.
+      if (run.pullRequest === undefined || run.headSha === undefined || run.pullRequest.headSha !== run.headSha) {
+        const reason = 'Failed validation evidence is not bound to an accepted pull request and exact HEAD; refusing to authorize a repair.';
+        run = applyTransition(
+          run,
+          {
+            type: 'escalate', reason,
+            interrupt: {
+              evidence: reason,
+              choices: ['Re-establish the accepted pull request and exact HEAD, then retry', CANCEL_RUN_DECISION],
+            },
+          },
+          now(),
+        );
+        store.update(run);
+        return { outcome: 'needs_human', run, reason };
+      }
+
       // A persisted review does not authorize local repair against a different
       // live PR. Re-read before preparation and again after local recovery.
       const checkOwnedFix = async (): Promise<ReviewLoopResult | null> => {
