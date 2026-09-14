@@ -589,10 +589,11 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
         def drain_buffered_tail() -> None:
             # Direct-child exit guarantees its own writes reached the pipe, but
             # descendants may keep the descriptor open. Drain only bytes already
-            # available, with explicit time/volume bounds, and never wait for EOF.
-            drain_deadline = time.monotonic() + 0.05
+            # available, with a strict volume bound, and never wait for EOF.
+            if testing() and os.environ.get("SCD_HEARTBEAT_TEST_PRE_DRAIN_SLEEP"):
+                time.sleep(float(os.environ["SCD_HEARTBEAT_TEST_PRE_DRAIN_SLEEP"]))
             drained = 0
-            while drained < MAX_WAKE_LOG * 2 and time.monotonic() < drain_deadline:
+            while drained < MAX_WAKE_LOG * 2:
                 try:
                     chunk = os.read(child.stdout.fileno(), 64 * 1024)
                 except BlockingIOError:

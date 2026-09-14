@@ -267,6 +267,7 @@ class HeartbeatTest(unittest.TestCase):
                     self.env,
                     SCD_HEARTBEAT_TEST_NOW=str(1000 + index),
                     MOCK_WAKE_OUTPUT=str(output_size),
+                    SCD_HEARTBEAT_TEST_PRE_DRAIN_SLEEP="0.1",
                 )
                 self.assertEqual(self.invoke("run", env=environment).returncode, 0)
                 self.assertEqual(
