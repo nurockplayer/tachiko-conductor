@@ -255,9 +255,10 @@ fn terminate_process_group(child: &mut std::process::Child) {
 }
 
 fn configured_repository_root(commands: &dyn CommandBoundary) -> Option<PathBuf> {
-  let candidate = env::var_os("TACHIKO_CONTROL_TOWER_REPOSITORY")
-    .map(PathBuf::from)
-    .or_else(|| env::current_dir().ok())?;
+  // The repository root is an optional explicit supplement to global
+  // projection/managed-worktree discovery. Finder and Dock launches must not
+  // silently turn their arbitrary current directory into a discovery root.
+  let candidate = env::var_os("TACHIKO_CONTROL_TOWER_REPOSITORY").map(PathBuf::from)?;
   commands
     .run(
       "git",
@@ -545,13 +546,10 @@ fn verified_worktree(commands: &dyn CommandBoundary, path: &str) -> Option<Verif
   })
 }
 
-fn discover_worktrees_from_root(
+fn discover_worktrees_from_identity(
   commands: &dyn CommandBoundary,
-  root: &str,
+  root_identity: &VerifiedWorktree,
 ) -> Vec<VerifiedWorktree> {
-  let Some(root_identity) = verified_worktree(commands, root) else {
-    return Vec::new();
-  };
   let Some(porcelain) = commands.run(
     "git",
     &["-C", &root_identity.path, "worktree", "list", "--porcelain"],
@@ -567,22 +565,31 @@ fn discover_worktrees_from_root(
 
 fn managed_worktree_roots(workspace_root: &Path) -> Vec<String> {
   const MAX_MANAGED_ROOTS: usize = 64;
-  let mut roots = vec![workspace_root.to_string_lossy().to_string()];
-  if let Ok(entries) = fs::read_dir(workspace_root) {
-    roots.extend(
-      entries
-        .flatten()
-        .take(MAX_MANAGED_ROOTS)
-        .filter_map(|entry| {
-          entry
-            .file_type()
-            .ok()?
-            .is_dir()
-            .then(|| entry.path().to_string_lossy().to_string())
-        }),
-    );
+  const MAX_MANAGED_DEPTH: usize = 3;
+  let mut roots = BTreeSet::from([workspace_root.to_string_lossy().to_string()]);
+  let mut pending = vec![(workspace_root.to_path_buf(), 0_usize)];
+  while let Some((directory, depth)) = pending.pop() {
+    if depth >= MAX_MANAGED_DEPTH || roots.len() >= MAX_MANAGED_ROOTS {
+      continue;
+    }
+    let Ok(entries) = fs::read_dir(directory) else {
+      continue;
+    };
+    let mut children = entries
+      .flatten()
+      .filter_map(|entry| entry.file_type().ok()?.is_dir().then_some(entry.path()))
+      .collect::<Vec<_>>();
+    children.sort();
+    for child in children {
+      if roots.len() >= MAX_MANAGED_ROOTS {
+        break;
+      }
+      if roots.insert(child.to_string_lossy().to_string()) {
+        pending.push((child, depth + 1));
+      }
+    }
   }
-  roots
+  roots.into_iter().collect()
 }
 
 /// Discover only the configured Conductor root, managed worktree roots, and
@@ -601,24 +608,44 @@ fn discover_worktrees(
   roots.extend(managed_worktree_roots(workspace_root));
   roots.extend(runs.iter().map(|run| run.workspace_path.clone()));
 
-  let mut discovered = BTreeMap::new();
+  // First identify roots, then ask each common Git directory for its worktree
+  // list once. A projected run per worktree would otherwise repeatedly list
+  // the same sibling set and make a refresh quadratic.
+  let mut identities = BTreeMap::new();
   for root in roots {
-    for worktree in discover_worktrees_from_root(commands, &root) {
+    if let Some(identity) = verified_worktree(commands, &root) {
+      identities.entry(identity.common_git.clone()).or_insert(identity);
+    }
+  }
+  let mut discovered = BTreeMap::new();
+  for identity in identities.into_values() {
+    for worktree in discover_worktrees_from_identity(commands, &identity) {
       discovered.entry(worktree.path.clone()).or_insert(worktree);
     }
   }
   discovered.into_values().collect()
 }
 
+fn verified_run_worktrees(
+  commands: &dyn CommandBoundary,
+  runs: &[RunObservation],
+) -> BTreeMap<String, VerifiedWorktree> {
+  runs
+    .iter()
+    .filter_map(|run| verified_worktree(commands, &run.workspace_path).map(|worktree| (run.id.clone(), worktree)))
+    .collect()
+}
+
 fn correlated_run<'a>(
   commands: &dyn CommandBoundary,
   runs: &'a [RunObservation],
+  run_worktrees: &BTreeMap<String, VerifiedWorktree>,
   worktree: &VerifiedWorktree,
 ) -> Option<&'a RunObservation> {
   let matches = runs
     .iter()
     .filter(|run| {
-      let Some(bootstrap) = verified_worktree(commands, &run.workspace_path) else {
+      let Some(bootstrap) = run_worktrees.get(&run.id) else {
         return false;
       };
       bootstrap.path == worktree.path
@@ -752,10 +779,11 @@ fn collect_snapshot_for_roots_with_workspace_data_path(
   workspace_root: &Path,
 ) -> Result<ControlTowerSnapshot, String> {
   let runs = load_runs(commands);
+  let run_worktrees = verified_run_worktrees(commands, &runs);
   let rows = discover_worktrees(commands, conductor_root, workspace_root, &runs)
     .into_iter()
     .map(|worktree| {
-      let correlated = correlated_run(commands, &runs, &worktree).and_then(|run| {
+      let correlated = correlated_run(commands, &runs, &run_worktrees, &worktree).and_then(|run| {
         let pull_request = pull_request(
           commands,
           &run.repository,
@@ -1011,6 +1039,7 @@ mod tests {
 
   struct FakeCommands {
     responses: HashMap<String, String>,
+    calls: Mutex<Vec<String>>,
   }
 
   impl FakeCommands {
@@ -1019,15 +1048,22 @@ mod tests {
         .iter()
         .map(|(program, args, output)| (format!("{program}\u{0}{args}"), (*output).to_owned()))
         .collect();
-      Self { responses }
+      Self { responses, calls: Mutex::new(Vec::new()) }
+    }
+
+    fn call_count(&self, program: &str, args: &str) -> usize {
+      let key = format!("{program}\u{0}{args}");
+      self.calls.lock().expect("test call log").iter().filter(|call| *call == &key).count()
     }
   }
 
   impl CommandBoundary for FakeCommands {
     fn run(&self, program: &str, args: &[&str]) -> Option<String> {
+      let key = format!("{program}\u{0}{}", args.join("\u{1}"));
+      self.calls.lock().expect("test call log").push(key.clone());
       self
         .responses
-        .get(&format!("{program}\u{0}{}", args.join("\u{1}")))
+        .get(&key)
         .cloned()
     }
   }
@@ -1082,6 +1118,45 @@ mod tests {
       Some(PathBuf::from("/Users/operator/.tachiko-conductor/workspaces"))
     );
     assert_eq!(workspace_data_path(None, None), None);
+  }
+
+  #[test]
+  fn managed_root_discovery_reaches_owner_repository_run_hierarchy() {
+    let root = std::env::temp_dir().join(format!(
+      "tachiko-control-tower-managed-roots-{}",
+      SystemTime::now().duration_since(UNIX_EPOCH).expect("clock").as_nanos()
+    ));
+    let run = root.join("nurockplayer/tachiko-conductor/issue-32");
+    fs::create_dir_all(&run).expect("create bounded managed hierarchy");
+    let roots = managed_worktree_roots(&root);
+    assert!(roots.contains(&run.to_string_lossy().to_string()));
+    fs::remove_dir_all(root).expect("remove test-only hierarchy");
+  }
+
+  #[test]
+  fn discovery_lists_each_common_git_directory_once_for_multiple_projected_runs() {
+    let fake = FakeCommands::with(&[
+      ("git", "-C\u{1}/managed/one\u{1}rev-parse\u{1}--show-toplevel", "/managed/one\n"),
+      ("git", "-C\u{1}/managed/two\u{1}rev-parse\u{1}--show-toplevel", "/managed/two\n"),
+      ("git", "-C\u{1}/managed/one\u{1}rev-parse\u{1}--path-format=absolute\u{1}--git-common-dir", "/repo/.git\n"),
+      ("git", "-C\u{1}/managed/two\u{1}rev-parse\u{1}--path-format=absolute\u{1}--git-common-dir", "/repo/.git\n"),
+      ("git", "-C\u{1}/managed/one\u{1}config\u{1}--get\u{1}remote.origin.url", "git@github.com:acme/widgets.git\n"),
+      ("git", "-C\u{1}/managed/two\u{1}config\u{1}--get\u{1}remote.origin.url", "git@github.com:acme/widgets.git\n"),
+      ("git", "-C\u{1}/managed/one\u{1}symbolic-ref\u{1}--quiet\u{1}--short\u{1}HEAD", "one\n"),
+      ("git", "-C\u{1}/managed/two\u{1}symbolic-ref\u{1}--quiet\u{1}--short\u{1}HEAD", "two\n"),
+      ("git", "-C\u{1}/managed/one\u{1}rev-parse\u{1}HEAD", "one-head\n"),
+      ("git", "-C\u{1}/managed/two\u{1}rev-parse\u{1}HEAD", "two-head\n"),
+      ("git", "-C\u{1}/managed/one\u{1}worktree\u{1}list\u{1}--porcelain", "worktree /managed/one\nHEAD one-head\nbranch refs/heads/one\n\nworktree /managed/two\nHEAD two-head\nbranch refs/heads/two\n"),
+    ]);
+    let runs = ["one", "two"].into_iter().map(|id| RunObservation {
+      id: id.to_owned(), repository: "acme/widgets".to_owned(), workspace_path: format!("/managed/{id}"),
+      branch: id.to_owned(), base_sha: "base".to_owned(), head_sha: None, pull_request_head_sha: None,
+      issue: None, pull_request_number: None, provider: None, state: "WORKING".to_owned(), duration_ms: None,
+    }).collect::<Vec<_>>();
+    let discovered = discover_worktrees(&fake, None, Path::new("/missing-managed-root"), &runs);
+    assert_eq!(discovered.len(), 2);
+    assert_eq!(fake.call_count("git", "-C\u{1}/managed/one\u{1}worktree\u{1}list\u{1}--porcelain"), 1);
+    assert_eq!(fake.call_count("git", "-C\u{1}/managed/two\u{1}worktree\u{1}list\u{1}--porcelain"), 0);
   }
 
   #[test]
@@ -1217,15 +1292,16 @@ mod tests {
       state: "VALIDATING".to_owned(),
       duration_ms: None,
     };
+    let run_worktrees = verified_run_worktrees(&fake, &[run.clone()]);
     assert_eq!(
-      correlated_run(&fake, &[run.clone()], &worktree).map(|value| value.id.as_str()),
+      correlated_run(&fake, &[run.clone()], &run_worktrees, &worktree).map(|value| value.id.as_str()),
       Some("run-1")
     );
     let stale = RunObservation {
       head_sha: Some("other-head".to_owned()),
       ..run
     };
-    assert!(correlated_run(&fake, &[stale], &worktree).is_none());
+    assert!(correlated_run(&fake, &[stale], &run_worktrees, &worktree).is_none());
   }
 
   #[test]

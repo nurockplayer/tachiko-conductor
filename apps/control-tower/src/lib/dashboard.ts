@@ -60,7 +60,7 @@ export function summarize(snapshot: ControlTowerSnapshot): DashboardSummary {
   // System memory is a system observation. Selected process RSS is not a
   // substitute and remains available only in the per-worktree RAM column.
   const memoryUsedBytes = snapshot.system.memoryUsedBytes;
-  const memoryPercent = snapshot.system.memoryTotalBytes && memoryUsedBytes
+  const memoryPercent = snapshot.system.memoryTotalBytes !== undefined && memoryUsedBytes !== undefined
     ? Math.round((memoryUsedBytes / snapshot.system.memoryTotalBytes) * 100)
     : undefined;
   const diskPercentUsed = snapshot.system.dataTotalBytes && snapshot.system.dataFreeBytes !== undefined

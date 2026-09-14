@@ -74,6 +74,15 @@ test('unknown system memory remains unknown instead of using process RSS', () =>
   assert.equal(summary.memoryPercent, undefined);
 });
 
+test('zero used system memory remains a measured zero percent', () => {
+  const summary = summarize({
+    mode: 'live', generatedAt: '0', rows: [],
+    system: { memoryTotalBytes: 100_000_000_000, memoryUsedBytes: 0 },
+  });
+  assert.equal(summary.memoryUsedBytes, 0);
+  assert.equal(summary.memoryPercent, 0);
+});
+
 test('live collector is single-flight across concurrent renderer effects', async () => {
   let calls = 0;
   let release: (() => void) | undefined;
