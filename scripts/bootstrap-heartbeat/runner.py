@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import selectors
 import shutil
 import signal
 import subprocess
@@ -36,6 +37,7 @@ CONFIG_SCHEMA = 1
 DEFAULT_POLL_SECONDS = 180
 DEFAULT_SAFETY_SECONDS = 1800
 DEFAULT_POLL_TIMEOUT_SECONDS = 60
+DEFAULT_WAKE_TIMEOUT_SECONDS = 1500
 MAX_HEARTBEAT_LOG = 64 * 1024
 MAX_WAKE_LOG = 512 * 1024
 
@@ -58,7 +60,8 @@ query TachikoConductorBootstrapHeartbeat {
     pullRequests(first: 30, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage }
       nodes {
-        number state title body isDraft headRefOid baseRefOid mergeable mergeStateStatus reviewDecision
+        number state title body isDraft headRefOid headRefName headRepository { nameWithOwner }
+        baseRefOid baseRefName mergeable mergeStateStatus reviewDecision
         closingIssuesReferences(first: 50) {
           pageInfo { hasNextPage }
           nodes { number repository { nameWithOwner } }
@@ -203,7 +206,9 @@ def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
             "number": pr["number"], "state": pr["state"], "title": pr["title"],
             "body": pr["body"],
             "isDraft": pr["isDraft"], "headRefOid": pr["headRefOid"],
-            "baseRefOid": pr["baseRefOid"], "mergeable": pr["mergeable"],
+            "headRefName": pr["headRefName"], "headRepository": pr["headRepository"],
+            "baseRefOid": pr["baseRefOid"], "baseRefName": pr["baseRefName"],
+            "mergeable": pr["mergeable"],
             "mergeStateStatus": pr["mergeStateStatus"],
             "reviewDecision": pr["reviewDecision"],
             "closingIssuesReferences": pr["closingIssuesReferences"]["nodes"],
@@ -234,6 +239,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("invalid poll_timeout_seconds")
     if config["poll_timeout_seconds"] >= config["poll_interval_seconds"]:
         raise RuntimeError("poll timeout must be shorter than poll interval")
+    if not isinstance(config.get("wake_timeout_seconds"), int) or config["wake_timeout_seconds"] < 1:
+        raise RuntimeError("invalid wake_timeout_seconds")
     if not isinstance(config.get("safety_interval_seconds"), int) or config["safety_interval_seconds"] < 1:
         raise RuntimeError("invalid safety_interval_seconds")
     command = config.get("wake_command")
@@ -339,10 +346,31 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
     verify_wake_target(config)
     child = None
     output = bytearray()
+    selector = selectors.DefaultSelector()
+
+    def signal_group(signum: int) -> None:
+        if child is not None:
+            try:
+                os.killpg(child.pid, signum)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                if child.poll() is None:
+                    child.send_signal(signum)
+
+    def group_alive() -> bool:
+        if child is None:
+            return False
+        try:
+            os.killpg(child.pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return child.poll() is None
+        return True
 
     def forward(signum: int, _frame: Any) -> None:
-        if child is not None and child.poll() is None:
-            child.send_signal(signum)
+        signal_group(signum)
 
     old_term = signal.signal(signal.SIGTERM, forward)
     old_int = signal.signal(signal.SIGINT, forward)
@@ -352,20 +380,49 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
         child = subprocess.Popen(
             config["wake_command"], cwd=config["repo"], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
-            pass_fds=(lock_fd,),
+            pass_fds=(lock_fd,), start_new_session=True,
         )
         assert child.stdout is not None
+        selector.register(child.stdout, selectors.EVENT_READ)
+        deadline = time.monotonic() + config["wake_timeout_seconds"]
+        timed_out = False
         while True:
-            chunk = child.stdout.read(64 * 1024)
-            if not chunk:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
                 break
-            output.extend(chunk)
-            if len(output) > MAX_WAKE_LOG:
-                del output[:-MAX_WAKE_LOG]
+            if not selector.get_map():
+                try:
+                    child.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                break
+            for key, _mask in selector.select(min(remaining, 1.0)):
+                chunk = os.read(key.fileobj.fileno(), 64 * 1024)
+                if chunk:
+                    output.extend(chunk)
+                    if len(output) > MAX_WAKE_LOG:
+                        del output[:-MAX_WAKE_LOG]
+                else:
+                    selector.unregister(key.fileobj)
+            if child.poll() is not None and not selector.get_map():
+                break
+        if timed_out:
+            signal_group(signal.SIGTERM)
+            terminate_deadline = time.monotonic() + 5
+            while group_alive() and time.monotonic() < terminate_deadline:
+                child.poll()
+                time.sleep(0.05)
+            if group_alive():
+                signal_group(signal.SIGKILL)
+            child.wait()
+            atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
+            return 124
         code = child.wait()
         atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
         return code
     finally:
+        selector.close()
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
 
@@ -545,6 +602,7 @@ def install(args: argparse.Namespace) -> int:
         "schema": CONFIG_SCHEMA, "gh": resolved_tool("gh"), "repo": str(repo),
         "runner": str(runner), "poll_interval_seconds": args.interval,
         "poll_timeout_seconds": DEFAULT_POLL_TIMEOUT_SECONDS,
+        "wake_timeout_seconds": DEFAULT_WAKE_TIMEOUT_SECONDS,
         "safety_interval_seconds": args.safety_interval, "wake_command": wake_command,
         "wake_env": wake_env, "required_files": required_files, "installed_at": now_epoch(),
     })

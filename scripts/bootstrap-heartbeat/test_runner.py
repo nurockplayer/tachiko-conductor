@@ -81,6 +81,7 @@ class HeartbeatTest(unittest.TestCase):
             "runner": str(RUNNER),
             "poll_interval_seconds": 180,
             "poll_timeout_seconds": 60,
+            "wake_timeout_seconds": 1500,
             "safety_interval_seconds": safety,
             "wake_command": [str(self.wake), "dispatchable-target"],
             "wake_env": {},
@@ -112,7 +113,9 @@ class HeartbeatTest(unittest.TestCase):
         pr = {
             "number": 31, "state": "OPEN", "title": "Existing lane", "body": "Closes #20",
             "isDraft": False,
-            "headRefOid": oid, "baseRefOid": "base", "mergeable": "MERGEABLE",
+            "headRefOid": oid, "headRefName": "feature",
+            "headRepository": {"nameWithOwner": "nurockplayer/tachiko-conductor"},
+            "baseRefOid": "base", "baseRefName": "main", "mergeable": "MERGEABLE",
             "mergeStateStatus": "CLEAN",
             "reviewDecision": "APPROVED",
             "closingIssuesReferences": {"pageInfo": {"hasNextPage": False}, "nodes": [
@@ -236,6 +239,9 @@ class HeartbeatTest(unittest.TestCase):
             (("defaultBranchRef", "name"), "release"),
             (("pullRequests", "nodes", 0, "mergeStateStatus"), "BLOCKED"),
             (("pullRequests", "nodes", 0, "closingIssuesReferences", "nodes"), []),
+            (("pullRequests", "nodes", 0, "baseRefName"), "release"),
+            (("pullRequests", "nodes", 0, "headRefName"), "renamed-feature"),
+            (("pullRequests", "nodes", 0, "headRepository", "nameWithOwner"), "fork/other"),
         )
         for path, value in paths_and_values:
             with self.subTest(path=path):
@@ -308,6 +314,24 @@ class HeartbeatTest(unittest.TestCase):
         time.sleep(2.1)
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
         self.assertEqual(len(self.records()), 2, "runner may recover only after the child exits")
+
+    def test_stalled_wake_times_out_without_consuming_change(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_timeout_seconds"] = 1
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        started = time.monotonic()
+        stalled = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_SLEEP="2")
+        result = self.invoke("run", env=stalled, check=False)
+        heartbeat_log = (self.state_root / "heartbeat.log").read_text(encoding="utf-8")
+        self.assertEqual(result.returncode, 124, result.stderr + heartbeat_log)
+        self.assertLess(time.monotonic() - started, 1.8)
+        self.assertEqual(self.state()["last_attempt_exit"], 124)
+        self.assertNotEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(len(self.records()), 2, "timed-out wake must leave the change retryable")
 
     def test_poll_and_config_fail_closed_and_logs_are_bounded(self) -> None:
         self.invoke("run", "--prime")
