@@ -278,7 +278,10 @@ describe('runWorkflow', () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'validation-failure-policy-drift');
     run = applyTransition(run, { type: 'start' }, T0);
-    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD,
+      pullRequest: { number: 7, headSha: HEAD },
+    }, T0);
     run = applyTransition(run, { type: 'validation_failed', validationResult: validationFailed(HEAD) }, T0);
     store.create(run);
     const implementation = new FakeImplementation([]);
