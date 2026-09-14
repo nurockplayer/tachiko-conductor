@@ -120,7 +120,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const pidFile = path.join(owned.workspacePath, 'descendant.pid');
     const source = `const {spawn}=require('node:child_process'); const fs=require('node:fs'); const child=spawn(process.execPath,['-e',\"process.on('SIGTERM',()=>{});setInterval(()=>{},1000)\"],{stdio:'ignore'}); fs.writeFileSync(${JSON.stringify(pidFile)},String(child.pid)); process.on('SIGTERM',()=>{}); setInterval(()=>{},1000);`;
     const result = await new ConfiguredLocalValidationAdapter(
-      configuration([process.execPath, '-e', source], 100),
+      configuration([process.execPath, '-e', source], 1_000),
     ).validate(owned);
     assert.equal(result.status, 'failed');
     assert.equal(result.commands[0]?.outcome, 'timed_out');
