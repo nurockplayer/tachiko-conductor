@@ -495,9 +495,9 @@ export async function runWorkflow(
         }
         const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
         if (conflict !== null) return park(run, conflict, store, now);
-        if (snapshot.headSha === null || snapshot.headSha !== run.headSha) {
+        if (snapshot.pullRequest === null || snapshot.headSha === null || snapshot.headSha !== run.headSha) {
           const reason =
-            snapshot.headSha === null
+            snapshot.pullRequest === null || snapshot.headSha === null
               ? `Implementation completed, but ${formatTarget(target)} still has no associated open pull request.`
               : `Live GitHub HEAD ${snapshot.headSha} does not match the implementation HEAD ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
@@ -548,6 +548,7 @@ export async function runWorkflow(
             run,
             {
               type: 'escalate', reason, validationResult,
+              pullRequest: { number: snapshot.pullRequest.number, headSha: run.headSha! },
               interrupt: { evidence: reason, choices: ['Restore the configured validation runner and retry', CANCEL_RUN_DECISION] },
             },
             now(),
@@ -575,6 +576,12 @@ export async function runWorkflow(
           const reason = `Live GitHub HEAD changed during validation from ${run.headSha ?? '(none)'} to ${postValidationSnapshot.headSha ?? '(none)'}.`;
           return park(run, reason, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
         }
+        if (postValidationSnapshot.pullRequest === null ||
+          postValidationSnapshot.pullRequest.number !== snapshot.pullRequest.number ||
+          postValidationSnapshot.pullRequest.headSha !== snapshot.pullRequest.headSha) {
+          const reason = 'Live pull request identity changed during validation; refusing to admit evidence from different pull-request tuples.';
+          return park(run, reason, store, now);
+        }
         const postReadValidation = activeValidationConfiguration(deps);
         const postReadInvalidAuthority = invalidValidationAuthority(postReadValidation);
         if (postReadInvalidAuthority !== null || !sameValidationAuthority(currentValidation, postReadValidation)) {
@@ -598,7 +605,7 @@ export async function runWorkflow(
             run,
             {
               type: 'escalate', reason, validationResult,
-              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+              pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
               interrupt: { evidence: reason, choices: ['Restore the configured validation runner and retry', CANCEL_RUN_DECISION] },
             },
             now(),
@@ -612,7 +619,7 @@ export async function runWorkflow(
             run,
             {
               type: 'escalate', reason, validationResult,
-              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+              pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
               interrupt: { evidence: reason, choices: ['Restore matching validation evidence and retry', CANCEL_RUN_DECISION] },
             },
             now(),
@@ -623,7 +630,7 @@ export async function runWorkflow(
         if (validationResult.status === 'failed') {
           run = applyTransition(run, {
             type: 'validation_failed', validationResult,
-            pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+            pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
           }, now());
           store.update(run);
           break;
@@ -634,7 +641,7 @@ export async function runWorkflow(
             run,
             {
               type: 'wait_dependency', reason, validationResult,
-              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+              pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
               interrupt: { evidence: reason, choices: [RETRY_READINESS_DECISION, CANCEL_RUN_DECISION] },
             },
             now(),
@@ -648,7 +655,7 @@ export async function runWorkflow(
             run,
             {
               type: 'escalate', reason, validationResult,
-              pullRequest: { number: snapshot.pullRequest!.number, headSha: run.headSha! },
+              pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
               interrupt: { evidence: reason, choices: ['Restore required validation evidence and retry', CANCEL_RUN_DECISION] },
             },
             now(),
@@ -660,7 +667,7 @@ export async function runWorkflow(
           run,
           {
             type: 'validation_passed', validationResult,
-            ...(snapshot.pullRequest === null ? {} : { pullRequest: { number: snapshot.pullRequest.number, headSha: run.headSha! } }),
+            pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
           },
           now(),
         );

@@ -237,6 +237,72 @@ describe('C20 consolidation regressions', () => {
     );
   });
 
+  it('F03 revalidates persisted failed evidence for a different PR before any implementation repair', async () => {
+    const dir = tempDir('tachiko-c20-f03-stale-validation-pr-');
+    let run = validationRepairRun('stale-validation-pr-repair');
+    run = {
+      ...run,
+      state: 'CHANGES_REQUESTED',
+      validationResult: {
+        ...run.validationResult!,
+        hosted: { ...run.validationResult!.hosted, pullRequestNumber: 8 },
+      },
+    };
+    new JsonFileStore({ dir }).create(run);
+    const implementation = new CapturingImplementation();
+    const validation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate(request) { return validationPassed(request.headSha).local; },
+    };
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review(request) { return { verdict: 'approve', reviewerName: 'fixture', headSha: request.headSha, findings: [] }; },
+    };
+
+    const result = await runWorkflow(
+      {
+        store: new JsonFileStore({ dir }), github: new QueuedGitHub(Array.from({ length: 6 }, () => liveSnapshot(HEAD))),
+        implementation, reviewer, validation,
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
+      run.id,
+      { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(result.run.history.some((entry) => entry.type === 'revalidate'), true);
+    assert.equal(result.run.validationResult?.hosted.pullRequestNumber, 7);
+  });
+
+  it('F03 parks an initial same-HEAD PR swap during validation without admitting mixed evidence', async () => {
+    const dir = tempDir('tachiko-c20-f03-initial-pr-swap-');
+    let run = createRun(TARGET, T0, 'initial-pr-swap');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', headSha: HEAD, agentResult: successResult(HEAD) }, T0);
+    new JsonFileStore({ dir }).create(run);
+    const validation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate(request) { return validationPassed(request.headSha).local; },
+    };
+
+    const result = await runWorkflow(
+      {
+        store: new JsonFileStore({ dir }), github: new QueuedGitHub([liveSnapshot(HEAD, 7), liveSnapshot(HEAD, 8)]),
+        implementation: new CapturingImplementation(), reviewer: unusedReviewer, validation,
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
+      run.id,
+      { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(result.run.pullRequest, undefined);
+    assert.equal(result.run.validationResult, undefined);
+    assert.match('reason' in result ? result.reason : '', /pull request identity changed during validation/i);
+  });
+
   it('F06 rejects policy authority changed during awaited validation before admitting evidence', async () => {
     const dir = tempDir('tachiko-c20-f06-');
     let run = createRun(TARGET, T0, 'validation-authority-drift');

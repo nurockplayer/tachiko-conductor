@@ -223,10 +223,12 @@ export async function runReviewLoop(
           );
         }
         if (!isValidationResultCoherent(run.validationResult) ||
+          run.validationResult.headSha !== run.headSha ||
+          run.validationResult.hosted.pullRequestNumber !== run.pullRequest?.number ||
           !validationEvidenceMatchesActive(run.validationResult, activeValidation)) {
           return persistRevalidation(
             run,
-            'Failed validation evidence is malformed or does not match the active validation-policy identity.',
+            'Failed validation evidence is malformed, does not match the accepted PR/exact HEAD, or does not match the active validation-policy identity.',
             store,
             now,
           );
