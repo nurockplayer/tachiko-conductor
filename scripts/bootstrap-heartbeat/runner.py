@@ -1,0 +1,614 @@
+#!/usr/bin/python3
+"""Model-free GitHub heartbeat that wakes one replaceable SCD target."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+LABEL = "io.tachiko.conductor.scd-heartbeat"
+OWNER = "nurockplayer"
+REPOSITORY = "tachiko-conductor"
+DEFAULT_REPO = Path("/Users/tachikoma/Developer/tachiko-conductor")
+DEFAULT_ROOT = Path.home() / "Library/Application Support" / LABEL
+DEFAULT_PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+DEFAULT_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+DEFAULT_PROFILE = Path.home() / ".codex/scd_mission_lead.config.toml"
+DEFAULT_PROMPT = (
+    "Continue SCD for nurockplayer/tachiko-conductor under the repository's live "
+    "standing SCD policy. Reconcile already-active owned work first, use live GitHub "
+    "authority, and stay quiet when no work or meaningful update is executable."
+)
+STATE_SCHEMA = 1
+CONFIG_SCHEMA = 1
+DEFAULT_POLL_SECONDS = 180
+DEFAULT_SAFETY_SECONDS = 1800
+HANDOFF_MARKER = "<!-- agent-handoff:v1 -->"
+MAX_HEARTBEAT_LOG = 64 * 1024
+MAX_WAKE_LOG = 512 * 1024
+
+QUERY = r"""
+query TachikoConductorBootstrapHeartbeat {
+  repository(owner: "nurockplayer", name: "tachiko-conductor") {
+    defaultBranchRef { target { oid } }
+    issues(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage }
+      nodes {
+        number state title
+        labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
+        assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
+        comments(first: 50) {
+          pageInfo { hasNextPage }
+          nodes { databaseId body }
+        }
+      }
+    }
+    pullRequests(first: 30, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage }
+      nodes {
+        number state title isDraft headRefOid baseRefOid mergeable reviewDecision
+        labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
+        assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
+        comments(first: 50) {
+          pageInfo { hasNextPage }
+          nodes { databaseId body }
+        }
+        reviews(last: 50) {
+          pageInfo { hasPreviousPage }
+          nodes { author { login } state commit { oid } }
+        }
+        reviewThreads(first: 50) {
+          pageInfo { hasNextPage }
+          nodes { isResolved comments(last: 1) { nodes { databaseId } } }
+        }
+        commits(last: 1) {
+          nodes { commit { oid statusCheckRollup {
+            state
+            contexts(first: 50) { pageInfo { hasNextPage } nodes {
+              __typename
+              ... on CheckRun { id name status conclusion }
+              ... on StatusContext { id context state }
+            } }
+          } } }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def testing() -> bool:
+    return os.environ.get("SCD_HEARTBEAT_TESTING") == "1"
+
+
+ROOT = Path(os.environ["SCD_HEARTBEAT_TEST_ROOT"]) if testing() else DEFAULT_ROOT
+CONFIG = ROOT / "config.json"
+STATE = ROOT / "state.json"
+LOCK = ROOT / "runner.lock"
+HEARTBEAT_LOG = ROOT / "heartbeat.log"
+WAKE_LOG = ROOT / "wake.log"
+
+
+def plist_path() -> Path:
+    return Path(os.environ["SCD_HEARTBEAT_TEST_PLIST"]) if testing() else DEFAULT_PLIST
+
+
+def launchctl_path() -> str:
+    return os.environ.get("SCD_HEARTBEAT_TEST_LAUNCHCTL", "/bin/launchctl") if testing() else "/bin/launchctl"
+
+
+def now_epoch() -> int:
+    return int(os.environ["SCD_HEARTBEAT_TEST_NOW"]) if testing() and "SCD_HEARTBEAT_TEST_NOW" in os.environ else int(time.time())
+
+
+def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temp = path.with_name(path.name + ".tmp")
+    with temp.open("wb") as stream:
+        stream.write(data)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temp, mode)
+    os.replace(temp, path)
+
+
+def trim(path: Path, limit: int) -> None:
+    try:
+        if path.stat().st_size > limit:
+            atomic_write(path, path.read_bytes()[-limit:])
+    except FileNotFoundError:
+        pass
+
+
+def log(message: str) -> None:
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with HEARTBEAT_LOG.open("a", encoding="utf-8") as stream:
+        stream.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + message + "\n")
+    os.chmod(HEARTBEAT_LOG, 0o600)
+    trim(HEARTBEAT_LOG, MAX_HEARTBEAT_LOG)
+
+
+def load_object(path: Path) -> dict[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (json.JSONDecodeError, OSError) as error:
+        raise RuntimeError(f"invalid {path.name}: {error}") from error
+    if not isinstance(value, dict):
+        raise RuntimeError(f"invalid {path.name}: expected object")
+    return value
+
+
+def reject_truncation(value: Any, path: str = "data") -> None:
+    if isinstance(value, dict):
+        if value.get("hasNextPage") is True or value.get("hasPreviousPage") is True:
+            raise RuntimeError("GitHub snapshot truncated at " + path)
+        for key, child in value.items():
+            reject_truncation(child, f"{path}.{key}")
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            reject_truncation(child, f"{path}[{index}]")
+
+
+def canonicalize(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: canonicalize(value[key]) for key in sorted(value)}
+    if isinstance(value, list):
+        items = [canonicalize(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+    return value
+
+
+def handoffs(comments: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        {"databaseId": node.get("databaseId"), "body": node.get("body")}
+        for node in comments.get("nodes", [])
+        if isinstance(node.get("body"), str) and HANDOFF_MARKER in node["body"]
+    ]
+
+
+def names(connection: dict[str, Any], key: str) -> list[str]:
+    return [node[key] for node in connection.get("nodes", []) if isinstance(node.get(key), str)]
+
+
+def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
+    issues = []
+    for issue in repository["issues"]["nodes"]:
+        issues.append({
+            "number": issue["number"], "state": issue["state"], "title": issue["title"],
+            "labels": names(issue["labels"], "name"),
+            "assignees": names(issue["assignees"], "login"),
+            "handoffs": handoffs(issue["comments"]),
+        })
+    prs = []
+    for pr in repository["pullRequests"]["nodes"]:
+        prs.append({
+            "number": pr["number"], "state": pr["state"], "title": pr["title"],
+            "isDraft": pr["isDraft"], "headRefOid": pr["headRefOid"],
+            "baseRefOid": pr["baseRefOid"], "mergeable": pr["mergeable"],
+            "reviewDecision": pr["reviewDecision"],
+            "labels": names(pr["labels"], "name"),
+            "assignees": names(pr["assignees"], "login"),
+            "handoffs": handoffs(pr["comments"]),
+            "reviews": pr["reviews"]["nodes"],
+            "reviewThreads": pr["reviewThreads"]["nodes"],
+            "commits": pr["commits"]["nodes"],
+        })
+    return canonicalize({
+        "defaultHead": repository["defaultBranchRef"]["target"]["oid"],
+        "issues": issues,
+        "pullRequests": prs,
+    })
+
+
+def validate_config(config: dict[str, Any]) -> dict[str, Any]:
+    if config.get("schema") != CONFIG_SCHEMA:
+        raise RuntimeError("unsupported heartbeat config schema")
+    for key in ("gh", "repo", "runner"):
+        if not isinstance(config.get(key), str) or not Path(config[key]).is_absolute():
+            raise RuntimeError("invalid absolute config path: " + key)
+    if not isinstance(config.get("safety_interval_seconds"), int) or config["safety_interval_seconds"] < 1:
+        raise RuntimeError("invalid safety_interval_seconds")
+    command = config.get("wake_command")
+    if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
+        raise RuntimeError("invalid wake_command")
+    if not Path(command[0]).is_absolute():
+        raise RuntimeError("wake executable must be absolute")
+    wake_env = config.get("wake_env", {})
+    if not isinstance(wake_env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in wake_env.items()):
+        raise RuntimeError("invalid wake_env")
+    required = config.get("required_files", [])
+    if not isinstance(required, list):
+        raise RuntimeError("invalid required_files")
+    for item in required:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not Path(item["path"]).is_absolute():
+            raise RuntimeError("invalid required file")
+        if not isinstance(item.get("sha256"), str):
+            raise RuntimeError("invalid required file digest")
+    return config
+
+
+def load_config() -> dict[str, Any]:
+    return validate_config(load_object(CONFIG))
+
+
+def github_fingerprint(config: dict[str, Any]) -> str:
+    result = subprocess.run(
+        [config["gh"], "api", "graphql", "-f", "query=" + QUERY], cwd=config["repo"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        check=False, text=True, env=os.environ.copy(),
+    )
+    if result.returncode:
+        detail = (result.stderr.strip().splitlines()[-1:] or ["unknown error"])[0][-1000:]
+        raise RuntimeError(f"GitHub poll failed ({result.returncode}): {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("GitHub poll returned invalid JSON") from error
+    if payload.get("errors"):
+        raise RuntimeError("GitHub GraphQL returned errors")
+    repository = payload.get("data", {}).get("repository")
+    if not isinstance(repository, dict) or not repository.get("defaultBranchRef"):
+        raise RuntimeError("GitHub snapshot missing repository/default branch")
+    reject_truncation(repository)
+    normalized = json.dumps(normalized_repository(repository), sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(normalized).hexdigest()
+
+
+def load_state() -> dict[str, Any]:
+    state = load_object(STATE)
+    if not state:
+        return {}
+    fields = {
+        "schema": int, "successful_fingerprint": str, "last_success_at": int,
+        "last_attempt_at": int, "last_attempt_fingerprint": str,
+        "last_attempt_exit": int, "last_attempt_reason": str,
+    }
+    for key, kind in fields.items():
+        if not isinstance(state.get(key), kind):
+            raise RuntimeError("invalid heartbeat state field: " + key)
+    if state["schema"] != STATE_SCHEMA:
+        raise RuntimeError("unsupported heartbeat state schema")
+    return state
+
+
+def save_state(state: dict[str, Any]) -> None:
+    atomic_write(STATE, (json.dumps(state, sort_keys=True) + "\n").encode())
+
+
+def prime(config: dict[str, Any], reason: str) -> None:
+    fingerprint = github_fingerprint(config)
+    now = now_epoch()
+    save_state({
+        "schema": STATE_SCHEMA, "successful_fingerprint": fingerprint,
+        "last_success_at": now, "last_attempt_at": now,
+        "last_attempt_fingerprint": fingerprint, "last_attempt_exit": 0,
+        "last_attempt_reason": "prime",
+    })
+    log(f"primed normalized GitHub baseline; no wake ({reason})")
+
+
+def verify_wake_target(config: dict[str, Any]) -> None:
+    executable = Path(config["wake_command"][0])
+    if not executable.is_file() or executable.is_symlink() or not os.access(executable, os.X_OK):
+        raise RuntimeError("wake executable unavailable or unsafe: " + str(executable))
+    if executable.stat().st_mode & 0o022:
+        raise RuntimeError("wake executable is group/world writable")
+    for required in config.get("required_files", []):
+        path = Path(required["path"])
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError("required wake file unavailable or unsafe: " + str(path))
+        metadata = path.stat()
+        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+            raise RuntimeError("required wake file ownership or permissions unsafe: " + str(path))
+        if hashlib.sha256(path.read_bytes()).hexdigest() != required["sha256"]:
+            raise RuntimeError("required wake file identity changed: " + str(path))
+
+
+def run_wake(config: dict[str, Any]) -> int:
+    verify_wake_target(config)
+    child = None
+    output = bytearray()
+
+    def forward(signum: int, _frame: Any) -> None:
+        if child is not None and child.poll() is None:
+            child.send_signal(signum)
+
+    old_term = signal.signal(signal.SIGTERM, forward)
+    old_int = signal.signal(signal.SIGINT, forward)
+    try:
+        environment = os.environ.copy()
+        environment.update(config.get("wake_env", {}))
+        child = subprocess.Popen(
+            config["wake_command"], cwd=config["repo"], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
+        )
+        assert child.stdout is not None
+        while True:
+            chunk = child.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            output.extend(chunk)
+            if len(output) > MAX_WAKE_LOG:
+                del output[:-MAX_WAKE_LOG]
+        code = child.wait()
+        atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
+        return code
+    finally:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+
+
+def acquire_lock(verbose: bool):
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(ROOT, 0o700)
+    stream = LOCK.open("a+b")
+    os.chmod(LOCK, 0o600)
+    try:
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        stream.close()
+        if verbose:
+            log("no-op: another heartbeat invocation owns the atomic lock")
+        return None
+    stream.seek(0)
+    prior = stream.read().strip()
+    if prior:
+        try:
+            metadata = json.loads(prior)
+            pid = metadata["pid"]
+            if not isinstance(pid, int) or pid < 1:
+                raise ValueError("invalid pid")
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            stream.close()
+            raise RuntimeError("ambiguous stale lock metadata; refusing wake") from error
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            log(f"recovered provably stale lock from exited pid {pid}")
+        except PermissionError as error:
+            stream.close()
+            raise RuntimeError("ambiguous stale lock owner; refusing wake") from error
+        else:
+            stream.close()
+            raise RuntimeError("ambiguous unlocked metadata names a live pid; refusing wake")
+    stream.seek(0)
+    stream.truncate()
+    stream.write((json.dumps({"pid": os.getpid(), "acquired_at": now_epoch()}) + "\n").encode())
+    stream.flush()
+    os.fsync(stream.fileno())
+    return stream
+
+
+def release_lock(stream: Any) -> None:
+    stream.seek(0)
+    stream.truncate()
+    stream.flush()
+    os.fsync(stream.fileno())
+    stream.close()
+
+
+def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
+    os.umask(0o077)
+    try:
+        lock_stream = acquire_lock(verbose)
+    except Exception as error:
+        log("lock error; no wake: " + str(error))
+        return 1
+    if lock_stream is None:
+        return 0
+    try:
+        config = load_config()
+        if do_prime:
+            prime(config, "explicit")
+            return 0
+        state = load_state()
+        if not state:
+            prime(config, "initial")
+            return 0
+        try:
+            fingerprint = github_fingerprint(config)
+        except Exception as error:
+            log("poll error; no wake: " + str(error))
+            return 1
+        now = now_epoch()
+        changed = fingerprint != state["successful_fingerprint"]
+        safety_due = now - state["last_success_at"] >= config["safety_interval_seconds"]
+        if not changed and not safety_due:
+            if verbose:
+                log("no-op: normalized GitHub state unchanged and safety interval not due")
+            return 0
+        reason = "normalized GitHub state changed" if changed else "safety reconciliation interval elapsed"
+        attempt = dict(state)
+        attempt.update(last_attempt_at=now, last_attempt_fingerprint=fingerprint,
+                       last_attempt_exit=-1, last_attempt_reason=reason)
+        save_state(attempt)
+        log("waking target: " + reason)
+        code = run_wake(config)
+        attempt["last_attempt_exit"] = code
+        if code:
+            save_state(attempt)
+            log(f"wake target failed with exit {code}; successful state not consumed")
+            return code
+        attempt.update(successful_fingerprint=fingerprint, last_success_at=now_epoch())
+        save_state(attempt)
+        log("wake target completed successfully; fingerprint and safety clock committed")
+        return 0
+    except Exception as error:
+        log("heartbeat error; no wake: " + str(error))
+        return 1
+    finally:
+        release_lock(lock_stream)
+
+
+def launchctl(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([launchctl_path(), *args], stdin=subprocess.DEVNULL,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check)
+
+
+def bootout_if_loaded(domain: str) -> bool:
+    result = launchctl("bootout", f"{domain}/{LABEL}", check=False)
+    if result.returncode == 0:
+        return True
+    detail = (result.stdout + "\n" + result.stderr).strip()
+    if "No such process" in detail or "Could not find specified service" in detail:
+        return False
+    raise RuntimeError("launchctl bootout failed: " + (detail or f"exit {result.returncode}"))
+
+
+def resolved_tool(name: str) -> str:
+    override = os.environ.get("SCD_HEARTBEAT_TEST_" + name.upper()) if testing() else None
+    path = override or shutil.which(name)
+    if not path or not Path(path).is_absolute() or not os.access(path, os.X_OK):
+        raise RuntimeError("could not resolve executable absolute path for " + name)
+    return path
+
+
+def launch_path() -> str:
+    entries = []
+    for name in ("node", "pnpm", "cargo", "git", "gh", "codex"):
+        path = shutil.which(name)
+        if path:
+            entries.append(str(Path(os.path.realpath(path)).parent))
+    entries.extend(["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+    return os.pathsep.join(dict.fromkeys(entries))
+
+
+def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dict[str, str], list[dict[str, str]]]:
+    if not codex.is_file() or not os.access(codex, os.X_OK):
+        raise RuntimeError("audited Codex executable unavailable: " + str(codex))
+    if not profile.is_file() or profile.is_symlink():
+        raise RuntimeError("SCD profile unavailable or unsafe: " + str(profile))
+    metadata = profile.stat()
+    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        raise RuntimeError("SCD profile ownership or permissions unsafe: " + str(profile))
+    digest = hashlib.sha256(profile.read_bytes()).hexdigest()
+    command = [
+        str(codex), "exec", "--profile", profile.stem.replace(".config", ""),
+        "--strict-config", "--model", "gpt-5.6-terra",
+        "-c", 'model_reasoning_effort="high"', "-C", str(repo), DEFAULT_PROMPT,
+    ]
+    return command, {"CODEX_HOME": str(profile.parent)}, [{"path": str(profile), "sha256": digest}]
+
+
+def install(args: argparse.Namespace) -> int:
+    os.umask(0o077)
+    repo = Path(args.repo).resolve()
+    runner = Path(__file__).resolve()
+    if not repo.is_dir() or not (repo / ".git").exists():
+        raise RuntimeError("repository directory is not a Git checkout: " + str(repo))
+    if args.interval < 1 or args.safety_interval < 1:
+        raise RuntimeError("intervals must be positive")
+    if args.wake_command_json:
+        try:
+            wake_command = json.loads(args.wake_command_json)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("invalid --wake-command-json") from error
+        wake_env: dict[str, str] = {}
+        required_files: list[dict[str, str]] = []
+    else:
+        wake_command, wake_env, required_files = default_wake(repo, Path(args.codex), Path(args.profile))
+    config = validate_config({
+        "schema": CONFIG_SCHEMA, "gh": resolved_tool("gh"), "repo": str(repo),
+        "runner": str(runner), "poll_interval_seconds": args.interval,
+        "safety_interval_seconds": args.safety_interval, "wake_command": wake_command,
+        "wake_env": wake_env, "required_files": required_files, "installed_at": now_epoch(),
+    })
+    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(ROOT, 0o700)
+    prior = load_state() if STATE.exists() else {}
+    atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())
+    if not prior:
+        prime(config, "first install")
+    else:
+        log("preserved valid successful state across reinstall")
+    plist = {
+        "Label": LABEL,
+        "ProgramArguments": ["/usr/bin/python3", str(runner), "run"],
+        "WorkingDirectory": str(repo),
+        "StandardInPath": "/dev/null", "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null",
+        "EnvironmentVariables": {"PATH": launch_path(), "PYTHONDONTWRITEBYTECODE": "1"},
+        "RunAtLoad": True, "StartInterval": args.interval, "ProcessType": "Background",
+        "LowPriorityIO": True, "Nice": 10, "ThrottleInterval": 30,
+    }
+    target = plist_path()
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    atomic_write(target, plistlib.dumps(plist, fmt=plistlib.FMT_XML))
+    if not args.no_load:
+        domain = f"gui/{os.getuid()}"
+        bootout_if_loaded(domain)
+        launchctl("bootstrap", domain, str(target))
+    print(f"installed {LABEL}; interval={args.interval}s safety={args.safety_interval}s")
+    print("runner=" + str(runner))
+    print("state=" + str(ROOT))
+    return 0
+
+
+def uninstall(args: argparse.Namespace) -> int:
+    if not args.no_load:
+        bootout_if_loaded(f"gui/{os.getuid()}")
+    target = plist_path()
+    if target.exists():
+        target.unlink()
+    print("unloaded and removed plist; state and logs preserved in " + str(ROOT))
+    return 0
+
+
+def status() -> int:
+    result = launchctl("print", f"gui/{os.getuid()}/{LABEL}", check=False)
+    stream = sys.stdout if result.returncode == 0 else sys.stderr
+    print(result.stdout if result.returncode == 0 else result.stderr, end="", file=stream)
+    return result.returncode
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser()
+    subs = root.add_subparsers(dest="command", required=True)
+    run = subs.add_parser("run")
+    run.add_argument("--verbose", action="store_true")
+    run.add_argument("--prime", action="store_true")
+    install_parser = subs.add_parser("install")
+    install_parser.add_argument("--repo", default=str(DEFAULT_REPO))
+    install_parser.add_argument("--interval", type=int, default=DEFAULT_POLL_SECONDS)
+    install_parser.add_argument("--safety-interval", type=int, default=DEFAULT_SAFETY_SECONDS)
+    install_parser.add_argument("--codex", default=str(DEFAULT_CODEX))
+    install_parser.add_argument("--profile", default=str(DEFAULT_PROFILE))
+    install_parser.add_argument("--wake-command-json")
+    install_parser.add_argument("--no-load", action="store_true", help=argparse.SUPPRESS)
+    uninstall_parser = subs.add_parser("uninstall")
+    uninstall_parser.add_argument("--no-load", action="store_true", help=argparse.SUPPRESS)
+    subs.add_parser("status")
+    return root
+
+
+def main() -> int:
+    args = parser().parse_args()
+    try:
+        if args.command == "run":
+            return heartbeat(args.verbose, args.prime)
+        if args.command == "install":
+            return install(args)
+        if args.command == "uninstall":
+            return uninstall(args)
+        return status()
+    except Exception as error:
+        print("error: " + str(error), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
