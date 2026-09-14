@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import path from 'node:path';
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
+import { isValidationResultCoherent } from '../domain/validation.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -146,7 +147,8 @@ function isTransitionRecord(value: unknown): boolean {
   const record = value as Record<string, unknown>;
   return (
     typeof record.type === 'string' &&
-    TRANSITION_TYPES.includes(record.type as (typeof TRANSITION_TYPES)[number]) &&
+    (TRANSITION_TYPES.includes(record.type as (typeof TRANSITION_TYPES)[number]) ||
+      record.type === 'final_gate_verified' || record.type === 'gate_passed') &&
     typeof record.from === 'string' &&
     WORKFLOW_STATES.includes(record.from as WorkflowState) &&
     typeof record.to === 'string' &&
@@ -201,6 +203,8 @@ function isRun(value: unknown): value is Run {
     (v.pullRequest === undefined || isPullRequestIdentity(v.pullRequest)) &&
     (v.pullRequest === undefined || v.headSha === undefined || (v.pullRequest as { headSha: unknown }).headSha === v.headSha) &&
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
+    (v.validationResult === undefined || isValidationResultCoherent(v.validationResult)) &&
+    (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );
 }

@@ -10,20 +10,23 @@ import type { ProcessRunner } from '../src/github/transport.js';
 import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter } from '../src/adapters/reviewer.js';
+import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
+import { ConfiguredLocalValidationAdapter } from '../src/validation/local-command.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { LIVE_HEAD_SYNC_DECISION } from '../src/domain/decisions.js';
-import type { AgentResult, ImplementationBootstrapIdentity, ReviewResult, Run } from '../src/domain/types.js';
+import type { AgentResult, ImplementationBootstrapIdentity, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { resumeCommand } from '../src/cli.js';
 import { runWorkflow } from '../src/workflow/run.js';
-import { TARGET, T0, successResult } from './helpers.js';
+import { TARGET, T0, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 import { createBootstrapGitFixture, type BootstrapGitFixture } from './bootstrap-fixture.js';
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
 
 const OLD = 'a'.repeat(40);
 const NEW = 'b'.repeat(40);
 const BASE = 'c'.repeat(40);
+const TEST_HOSTED_POLICY = { revision: 'test-hosted-policy-v1', policy: { mode: 'required' as const } };
 const dirs: string[] = [];
 const fixtures: BootstrapGitFixture[] = [];
 
@@ -63,7 +66,7 @@ function snapshot(headSha: string, pull: ReturnType<typeof pr> | null = pr(7, he
     issue: { id: 'I_42', number: TARGET.issueNumber, title: 'issue', body: 'implement it', state: 'open', url: '', createdAt: T0, updatedAt: T0 },
     pullRequest: pull as GitHubLiveSnapshot['pullRequest'],
     headSha,
-    checks: { availability: 'available', overall: 'passing', checks: [] },
+    checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
     conversations: [],
     handoff: null,
@@ -75,14 +78,19 @@ function snapshot(headSha: string, pull: ReturnType<typeof pr> | null = pr(7, he
 
 class QueueGithub implements GitHubAdapter {
   readonly kind = 'github' as const;
+  private latest: GitHubLiveSnapshot | undefined;
   constructor(private readonly queue: Array<GitHubLiveSnapshot | (() => GitHubLiveSnapshot)>) {}
   async readIssue(): Promise<never> { throw new Error('unused'); }
   async readBranch(): Promise<never> { throw new Error('unused'); }
   async listPullRequests(): Promise<never> { throw new Error('unused'); }
   async readLiveSnapshot() {
     const next = this.queue.shift();
-    if (next === undefined) throw new Error('No live snapshot queued');
-    return typeof next === 'function' ? next() : next;
+    if (next === undefined) {
+      if (this.latest === undefined) throw new Error('No live snapshot queued');
+      return this.latest;
+    }
+    this.latest = typeof next === 'function' ? next() : next;
+    return this.latest;
   }
 }
 
@@ -102,11 +110,21 @@ class ApprovingReviewer implements ReviewerAdapter {
   }
 }
 
+class PassingValidation implements ValidationAdapter {
+  readonly kind = 'validation' as const;
+  readonly configRevision = 'test-config-v1';
+  readonly requests: ValidationRequest[] = [];
+  async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
+    this.requests.push(request);
+    return validationPassed(request.headSha).local;
+  }
+}
+
 function withBootstrap(run: Run, headSha = OLD, pullRequestHeadSha = OLD): Run {
   let current = applyTransition(run, { type: 'start' }, T0);
   current = applyTransition(current, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
   current = applyTransition(current, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha, pullRequest: { number: 7, headSha: pullRequestHeadSha } }, T0);
-  current = applyTransition(current, { type: 'validation_passed' }, T0);
+  current = applyTransition(current, { type: 'validation_passed', validationResult: validationPassed(headSha) }, T0);
   return current;
 }
 
@@ -132,9 +150,11 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     store.create(parkedForSync());
     const deps = {
       store,
-      github: new QueueGithub([snapshot(NEW), snapshot(NEW), snapshot(NEW), snapshot(NEW)]),
+      github: new QueueGithub([snapshot(NEW), snapshot(NEW), snapshot(NEW), snapshot(NEW), snapshot(NEW)]),
       implementation: new NoopImplementation(),
       reviewer: new ApprovingReviewer(),
+      validation: new PassingValidation(),
+      hostedCheckPolicy: TEST_HOSTED_POLICY,
       maxReviewAttempts: 2,
     };
 
@@ -211,7 +231,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     ];
     for (const [label, mutation] of driftCases) {
       let run = withBootstrap(createRun(TARGET, T0, `final-${label.replace(/\W+/g, '-')}`));
-      run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] } }, T0);
+      run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] } }, T0, TEST_VALIDATION_AUTHORITY);
       const result = await runWorkflow({
         store: { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined },
         github: new QueueGithub([snapshot(OLD, pr(7, OLD, mutation))]),
@@ -263,10 +283,11 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       () => published(),
       () => published(),
       () => published(),
+      () => published(),
     ]);
     const run = createRun(TARGET, T0, runId);
     store.create(run);
-    const outcome = await runWorkflow({ store, github: live, implementation: realImplementation, bootstrap, reviewer: new ApprovingReviewer() }, runId, { maxReviewAttempts: 1, now: () => T0 });
+    const outcome = await runWorkflow({ store, github: live, implementation: realImplementation, bootstrap, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, { maxReviewAttempts: 1, now: () => T0 });
     assert.equal(outcome.outcome, 'merge_ready', JSON.stringify(outcome));
     const restarted = new JsonFileStore({ dir }).read(runId)!;
     assert.equal(restarted.state, 'MERGE_READY');
@@ -296,10 +317,12 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     const implementation = new NoopImplementation();
     const outcome = await runWorkflow({
       store,
-      github: new QueueGithub([live, live, live, live, live]),
+      github: new QueueGithub([live, live, live, live, live, live]),
       implementation,
       bootstrap,
       reviewer: new ApprovingReviewer(),
+      validation: new PassingValidation(),
+      hostedCheckPolicy: TEST_HOSTED_POLICY,
     }, runId, { maxReviewAttempts: 1, now: () => T0 });
     assert.equal(outcome.outcome, 'merge_ready', JSON.stringify(outcome));
     assert.equal(implementation.requests.length, 0);
@@ -313,13 +336,15 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     for (const state of ['IMPLEMENTING', 'VALIDATING', 'REVIEWING', 'CHANGES_REQUESTED'] as const) {
       let run = withBootstrap(createRun(TARGET, T0, `tuple-${state}`));
       if (state === 'VALIDATING' || state === 'IMPLEMENTING') run = { ...run, state };
-      if (state === 'CHANGES_REQUESTED') run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'reviewer', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0);
+      if (state === 'CHANGES_REQUESTED') run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'reviewer', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
       const calls: string[] = [];
       const result = await runWorkflow({
         store: { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined },
         github: new QueueGithub([snapshot(OLD, pr(8, OLD))]),
         implementation: { kind: 'implementation-agent', run: async () => { calls.push('agent'); return successResult(NEW); } },
         reviewer: { kind: 'reviewer', review: async () => { calls.push('reviewer'); return { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] }; } },
+        validation: new PassingValidation(),
+        hostedCheckPolicy: TEST_HOSTED_POLICY,
         bootstrap: { kind: 'implementation-bootstrap', plan: async () => identity, prepare: async () => { calls.push('prepare'); return identity; }, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => ({ headSha: NEW, branch: identity.branch }) },
       }, run.id, { maxReviewAttempts: 1, now: () => T0 });
       assert.equal(result.outcome, 'needs_human', state);
@@ -398,8 +423,14 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: prepared }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: { ...successResult(oldHead, 'prior implementation'), executor: { provider: 'fixture', sessionId: 'executor-1' } }, headSha: oldHead, pullRequest: { number: 21, headSha: oldHead } }, T0);
-    run = applyTransition(run, { type: 'validation_passed' }, T0);
-    run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'old-reviewer', headSha: oldHead, findings: [] } }, T0);
+    run = applyTransition(run, {
+      type: 'validation_passed',
+      validationResult: {
+        ...validationPassed(oldHead),
+        hosted: { ...validationPassed(oldHead).hosted, pullRequestNumber: 21 },
+      },
+    }, T0);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'old-reviewer', headSha: oldHead, findings: [] } }, T0, TEST_VALIDATION_AUTHORITY);
     store.create(run);
     const live = () => {
       const head = fixHead ?? newHead;
@@ -423,15 +454,19 @@ describe('bootstrap lifecycle acceptance coverage', () => {
         : { verdict: 'approve', reviewerName: 'fixture-reviewer', headSha: request.headSha, findings: [] };
     } };
     const github = new QueueGithub(Array.from({ length: 12 }, () => live));
+    const validation = new ConfiguredLocalValidationAdapter({
+      revision: 'fixture-owned-worktree-v1',
+      commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
+    });
     const beforeRecovery = fixture.commands.length;
-    const offered = await runWorkflow({ store, github, implementation, bootstrap, reviewer }, runId, { now: () => T0, maxReviewAttempts: 2 });
+    const offered = await runWorkflow({ store, github, implementation, bootstrap, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, { now: () => T0, maxReviewAttempts: 2 });
     assert.equal(offered.outcome, 'needs_human');
     assert.ok(offered.run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION));
     assert.equal(reviews, 0);
-    const outcome = await resumeCommand({ store: new JsonFileStore({ dir }), github, implementation, bootstrap, reviewer }, runId, LIVE_HEAD_SYNC_DECISION, { now: () => T0, maxReviewAttempts: 2 });
+    const outcome = await resumeCommand({ store: new JsonFileStore({ dir }), github, implementation, bootstrap, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, LIVE_HEAD_SYNC_DECISION, { now: () => T0, maxReviewAttempts: 2 });
+    assert.equal(outcome.outcome, 'merge_ready', JSON.stringify(outcome));
     assert.deepEqual(reviewedHeads, [newHead, fixHead]);
     assert.deepEqual(fixture.commands.slice(beforeRecovery).filter((c) => c.args[0] === 'merge').map((c) => c.args), [['merge', '--ff-only', newHead]]);
-    assert.equal(outcome.outcome, 'merge_ready', JSON.stringify(outcome));
     const persisted = new JsonFileStore({ dir }).read(runId)!;
     assert.equal(persisted.state, 'MERGE_READY');
     assert.equal(persisted.headSha, fixHead);
@@ -439,6 +474,8 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     assert.equal(persisted.history.filter((entry) => entry.type === 'review_approved').length, 2);
     assert.equal(persisted.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
     assert.equal(persisted.executor?.provider, 'fixture');
+    assert.equal(persisted.validationResult?.local.configRevision, 'fixture-owned-worktree-v1');
+    assert.equal(persisted.validationResult?.local.commands[0]?.outcome, 'passed');
   });
 
   for (const checkpoint of ['identity', 'branch', 'published-checkpoint'] as const) {
@@ -475,7 +512,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       } };
       const store = new JsonFileStore({ dir });
       const deps = { store, github: new QueueGithub(Array.from({ length: 8 }, () => live)), implementation,
-        bootstrap: new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner }), reviewer: new ApprovingReviewer() };
+        bootstrap: new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner }), reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY };
       const result = await runWorkflow(deps, runId, { maxReviewAttempts: 1, now: () => T0 });
       assert.equal(result.outcome, 'merge_ready', JSON.stringify(result));
       assert.equal((await runWorkflow({ ...deps, store: new JsonFileStore({ dir }) }, runId, { maxReviewAttempts: 1 })).outcome, 'merge_ready');
@@ -501,8 +538,8 @@ for (const route of ['direct', 'resumed'] as const) {
       let run = applyTransition(createRun(TARGET, T0, id), { type: 'start' }, T0);
       run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: i }, T0);
       run = applyTransition(run, { type: 'agent_succeeded', headSha: f.baseSha, pullRequest: { number: 7, headSha: f.baseSha }, agentResult: { ...successResult(f.baseSha), executor: { provider: 'fixture', sessionId: 'kept' } } }, T0);
-      run = applyTransition(run, { type: 'validation_passed' }, T0);
-      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: f.baseSha, findings: [{ severity: 'blocking', summary: 'required fix' }] } }, T0);
+      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(f.baseSha) }, T0);
+      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: f.baseSha, findings: [{ severity: 'blocking', summary: 'required fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
       if (route === 'resumed') run = applyTransition(run, { type: 'start_fix' }, T0);
       new JsonFileStore({ dir }).create(run);
       let head = f.baseSha;
@@ -525,7 +562,7 @@ for (const route of ['direct', 'resumed'] as const) {
         } else f.git(i.workspacePath, ['push', 'origin', i.branch]);
         return successResult(head);
       } };
-      const result = await runWorkflow({ store: new JsonFileStore({ dir }), bootstrap: b, github: new QueueGithub(Array.from({ length: 12 }, () => live)), implementation, reviewer: new ApprovingReviewer() }, id, { maxReviewAttempts: 3, now: () => T0 });
+      const result = await runWorkflow({ store: new JsonFileStore({ dir }), bootstrap: b, github: new QueueGithub(Array.from({ length: 12 }, () => live)), implementation, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, id, { maxReviewAttempts: 3, now: () => T0 });
       assert.equal(result.outcome, delta === 'valid' ? 'merge_ready' : 'needs_human', JSON.stringify(result));
       assert.equal(calls, 1);
       const persisted = new JsonFileStore({ dir }).read(id)!;
@@ -541,7 +578,7 @@ for (const state of ['IMPLEMENTING', 'CHANGES_REQUESTED'] as const) {
   for (const drift of ['head', 'disappeared', 'post-tuple'] as const) {
     it(`E2 ${state} admission/re-read ${drift} parks before execution`, async () => {
       let run = withBootstrap(createRun(TARGET, T0, `admission-${state}-${drift}`));
-      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0);
+      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
       if (state === 'IMPLEMENTING') run = applyTransition(run, { type: 'start_fix' }, T0);
       const calls: string[] = [];
       const live = drift === 'head' ? snapshot(NEW) : drift === 'disappeared' ? snapshot(OLD, null, { headSha: null }) : snapshot(OLD, pr(8, OLD));
@@ -577,8 +614,8 @@ for (const route of ['initial', 'direct', 'resumed'] as const) {
         head = f.commit(i.workspacePath, 'prior.txt', 'prior implementation\n');
         f.git(i.workspacePath, ['push', 'origin', i.branch]);
         run = applyTransition(run, { type: 'agent_succeeded', headSha: head, pullRequest: { number: 7, headSha: head }, agentResult: successResult(head) }, T0);
-        run = applyTransition(run, { type: 'validation_passed' }, T0);
-        run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: head, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0);
+        run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(head) }, T0);
+        run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: head, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
         if (route === 'resumed') run = applyTransition(run, { type: 'start_fix' }, T0);
       }
       const store = new JsonFileStore({ dir }); store.create(run);
@@ -603,7 +640,7 @@ for (const route of ['initial', 'direct', 'resumed'] as const) {
         : snapshot(head, pr(7, head, { headRef: i.branch, baseRef: i.baseBranch }));
       const deps = { store, bootstrap: b, github: new QueueGithub(Array.from({ length: 20 }, () => live)),
         implementation: provider === 'claude' ? new ClaudeCodeAdapter({ runner }) : new CodexCliAdapter({ runner }),
-        reviewer: new ApprovingReviewer(), resolveImplementationCapabilities: async () => {
+        reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY, resolveImplementationCapabilities: async () => {
           if (failing && phase === 'pre') writeFileSync(`${i.workspacePath}/dirty.txt`, 'capability-time race\n');
           return [];
         } };
@@ -638,7 +675,7 @@ for (const resultKind of ['no-delta', 'orphan'] as const) {
     const store = new JsonFileStore({ dir }); store.create(run);
     const implementation = new NoopImplementation();
     const live = () => snapshot(head, pr(7, head, { headRef: i.branch }));
-    const result = await runWorkflow({ store, bootstrap: b, github: new QueueGithub([live, live]), implementation, reviewer: new ApprovingReviewer() }, runId, { now: () => T0, maxReviewAttempts: 2 });
+    const result = await runWorkflow({ store, bootstrap: b, github: new QueueGithub([live, live]), implementation, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, { now: () => T0, maxReviewAttempts: 2 });
     assert.equal(result.outcome, 'needs_human');
     assert.equal(implementation.requests.length, 0);
     const persisted = new JsonFileStore({ dir }).read(runId)!;
@@ -657,7 +694,7 @@ it('E1 rejects unproved HEAD-writing payloads and keeps JSON invariant on other 
     { type: 'validation_passed' as const, headSha: NEW },
     { type: 'start_fix' as const, pullRequest: { number: 8, headSha: OLD } },
   ]) assert.throws(() => applyTransition(r, input, T0));
-  r = applyTransition(r, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0);
+  r = applyTransition(r, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'fixture', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
   r = applyTransition(r, { type: 'start_fix' }, T0); store.update(r);
   assert.throws(() => applyTransition(r, { type: 'agent_succeeded', agentResult: successResult(NEW), headSha: NEW }, T0), /verified pull request identity/);
   assert.throws(() => applyTransition(r, { type: 'agent_succeeded', agentResult: successResult(NEW), headSha: NEW, pullRequest: { number: 8, headSha: NEW } }, T0), /Pull request identity/);

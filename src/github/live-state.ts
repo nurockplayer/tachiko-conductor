@@ -29,6 +29,11 @@ const KIND_ORDER: Readonly<Record<GitHubConversationEntry['kind'], number>> = {
   review_comment: 2,
 };
 
+/** GitHub REST permits up to 100 entries per page for these two endpoints. */
+const HOSTED_PAGE_SIZE = 100;
+/** A bounded read must never silently turn an unbounded provider result green. */
+const MAX_HOSTED_PAGES = 100;
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -41,6 +46,17 @@ function invalid(path: string, detail: string): GitHubLiveStateError {
   });
 }
 
+/**
+ * Hosted checks are observations, not part of the core PR identity read.  The
+ * diagnostic deliberately retains only a typed error code: callers need to
+ * know that the channel was unavailable without treating CLI output as a new
+ * source of authority (or persisting potentially sensitive transport text).
+ */
+function hostedFailureCode(error: unknown): string {
+  if (error instanceof GitHubLiveStateError) return error.code;
+  return 'UNKNOWN';
+}
+
 function requireString(record: Record<string, unknown>, field: string, path: string): string {
   const value = record[field];
   if (typeof value !== 'string' || value === '') throw invalid(path, `missing or empty "${field}"`);
@@ -50,6 +66,14 @@ function requireString(record: Record<string, unknown>, field: string, path: str
 function requirePositiveInt(record: Record<string, unknown>, field: string, path: string): number {
   const value = record[field];
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
+    throw invalid(path, `missing or invalid "${field}"`);
+  }
+  return value;
+}
+
+function requireNonNegativeInt(record: Record<string, unknown>, field: string, path: string): number {
+  const value = record[field];
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
     throw invalid(path, `missing or invalid "${field}"`);
   }
   return value;
@@ -304,9 +328,40 @@ export class LiveGitHubAdapter implements GitHubAdapter {
 
       const statusPath = `repos/${owner}/${repo}/commits/${headSha}/status`;
       const checkRunsPath = `repos/${owner}/${repo}/commits/${headSha}/check-runs`;
-      const status = asRecord(await this.transport.get(statusPath));
-      const checkRuns = asRecord(await this.transport.get(checkRunsPath));
-      checks = this.normalizeChecks(status, statusPath, checkRuns, checkRunsPath, problems);
+      // Status and check-runs are a single hosted-observation channel.  Their
+      // failure must not erase an otherwise coherent core Issue/PR/HEAD read,
+      // but neither endpoint may make a partial observation look complete.
+      const [statusResult, checkRunsResult] = await Promise.allSettled([
+        this.readCompleteHostedObservation(statusPath, 'statuses'),
+        this.readCompleteHostedObservation(checkRunsPath, 'check_runs'),
+      ]);
+      if (statusResult.status === 'rejected' || checkRunsResult.status === 'rejected') {
+        const failures = [
+          ...(statusResult.status === 'rejected' ? [{ path: statusPath, code: hostedFailureCode(statusResult.reason) }] : []),
+          ...(checkRunsResult.status === 'rejected' ? [{ path: checkRunsPath, code: hostedFailureCode(checkRunsResult.reason) }] : []),
+        ];
+        problems.push({
+          code: 'CHECKS_UNAVAILABLE',
+          message: 'Hosted status/check-run observation is unavailable; core GitHub authority remains available.',
+          details: { failures },
+        });
+      } else {
+        try {
+          const hostedProblems: GitHubProblem[] = [];
+          checks = this.normalizeChecks(
+            asRecord(statusResult.value), statusPath,
+            asRecord(checkRunsResult.value), checkRunsPath,
+            hostedProblems,
+          );
+          problems.push(...hostedProblems);
+        } catch (error) {
+          problems.push({
+            code: 'CHECKS_UNAVAILABLE',
+            message: 'Hosted status/check-run observation is malformed; core GitHub authority remains available.',
+            details: { failures: [{ path: statusPath, code: hostedFailureCode(error) }] },
+          });
+        }
+      }
 
       reviews = {
         ...this.normalizeReviews(prReviews, reviewsPath, headSha, problems),
@@ -315,6 +370,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
 
       const reread = asRecordOrThrow(await this.transport.get(path), path);
       const rereadHead = asRecord(reread.head);
+      const rereadLive = this.normalizeLivePullRequest(reread, path);
       const tuple = (value: Record<string, unknown>): string => {
         const head = asRecord(value.head);
         const repository = asRecord(head?.repo);
@@ -323,7 +379,9 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       if (
         reread.number !== raw.number ||
         reread.state !== raw.state ||
-        rereadHead?.sha !== headSha || tuple(reread) !== tuple(raw)
+        rereadHead?.sha !== headSha || tuple(reread) !== tuple(raw) ||
+        rereadLive.isDraft !== live.isDraft || rereadLive.mergeable !== live.mergeable ||
+        rereadLive.mergeStateStatus !== live.mergeStateStatus || rereadLive.baseSha !== live.baseSha
       ) {
         throw new GitHubLiveStateError(
           'GH_SNAPSHOT_CHANGED',
@@ -365,6 +423,54 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       baseSha: requireString(base, 'sha', path),
       state: normalizePullState(record),
     };
+  }
+
+  /**
+   * Read a complete, bounded hosted observation.  These endpoints wrap their
+   * entries in an object instead of the array shape used by getPaginated(), so
+   * use their advertised total when available and otherwise only accept a
+   * terminal short page.  Any count drift, missing page, or page-limit breach
+   * is deliberately an unavailable hosted channel rather than partial green.
+   */
+  private async readCompleteHostedObservation(
+    path: string,
+    entriesField: 'statuses' | 'check_runs',
+  ): Promise<Record<string, unknown>> {
+    const entries: unknown[] = [];
+    let advertisedCount: number | null = null;
+
+    for (let page = 1; page <= MAX_HOSTED_PAGES; page += 1) {
+      const raw = asRecord(await this.transport.get(path, {
+        page: String(page),
+        per_page: String(HOSTED_PAGE_SIZE),
+      }));
+      if (raw === null) throw invalid(path, 'hosted observation is not an object');
+      const pageEntries = raw[entriesField];
+      if (!Array.isArray(pageEntries)) throw invalid(path, `missing ${entriesField} array`);
+
+      if (raw.total_count !== undefined) {
+        const count = requireNonNegativeInt(raw, 'total_count', path);
+        if (advertisedCount !== null && advertisedCount !== count) {
+          throw invalid(path, 'total_count changed while hosted observations were being read');
+        }
+        advertisedCount = count;
+      }
+      if (advertisedCount !== null && entries.length + pageEntries.length > advertisedCount) {
+        throw invalid(path, 'hosted observation contains more entries than total_count');
+      }
+      entries.push(...pageEntries);
+
+      if (advertisedCount !== null) {
+        if (entries.length === advertisedCount) return { ...raw, [entriesField]: entries };
+        if (pageEntries.length === 0) {
+          throw invalid(path, 'hosted observation ended before total_count entries were returned');
+        }
+        continue;
+      }
+      if (pageEntries.length < HOSTED_PAGE_SIZE) return { ...raw, [entriesField]: entries };
+    }
+
+    throw invalid(path, `hosted observation exceeded ${String(MAX_HOSTED_PAGES)} pages`);
   }
 
   private normalizeIssue(record: Record<string, unknown>, path: string): GitHubLiveSnapshot['issue'] {
@@ -618,60 +724,47 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     checkRunsPath: string,
     problems: GitHubProblem[],
   ): GitHubCheckSummary {
+    if (status === null || !Array.isArray(status.statuses)) {
+      throw invalid(statusPath, 'missing statuses array');
+    }
+    if (checkRuns === null || !Array.isArray(checkRuns.check_runs)) {
+      throw invalid(checkRunsPath, 'missing check_runs array');
+    }
     const checks: GitHubCheckSnapshot[] = [];
-    let available = false;
-
-    if (status !== null) {
-      const statuses = status.statuses;
-      if (Array.isArray(statuses)) {
-        available = true;
-        for (const item of statuses) {
-          const record = asRecord(item);
-          if (record === null) throw invalid(statusPath, 'status entry is not an object');
-          checks.push({
-            id: String(record.id ?? ''),
-            name: requireString(record, 'context', statusPath),
-            state: normalizeStatusState(String(record.state ?? '')),
-            url: typeof record.target_url === 'string' ? record.target_url : null,
-            updatedAt: typeof record.updated_at === 'string' ? record.updated_at : null,
-          });
-        }
+    for (const item of status.statuses) {
+      const record = asRecord(item);
+      if (record === null) throw invalid(statusPath, 'status entry is not an object');
+      checks.push({
+        id: String(record.id ?? ''),
+        name: requireString(record, 'context', statusPath),
+        state: normalizeStatusState(String(record.state ?? '')),
+        url: typeof record.target_url === 'string' ? record.target_url : null,
+        updatedAt: typeof record.updated_at === 'string' ? record.updated_at : null,
+      });
+    }
+    for (const item of checkRuns.check_runs) {
+      const record = asRecord(item);
+      if (record === null) throw invalid(checkRunsPath, 'check run entry is not an object');
+      const state = normalizeCheckRunState(String(record.status ?? ''), record.conclusion);
+      const id = requireString(record, 'name', checkRunsPath);
+      if (state === 'unknown') {
+        problems.push({
+          code: 'UNKNOWN_CHECK_STATE',
+          message: `Check run "${id}" has an unrecognized status/conclusion.`,
+          sourceId: String(record.id ?? ''),
+          details: { name: id, status: record.status, conclusion: record.conclusion },
+        });
       }
+      checks.push({
+        id: String(record.id ?? ''),
+        name: id,
+        state,
+        url: typeof record.html_url === 'string' ? record.html_url : null,
+        updatedAt: typeof record.completed_at === 'string' ? record.completed_at : null,
+      });
     }
 
-    if (checkRuns !== null) {
-      const runs = checkRuns.check_runs;
-      if (Array.isArray(runs)) {
-        available = true;
-        for (const item of runs) {
-          const record = asRecord(item);
-          if (record === null) throw invalid(checkRunsPath, 'check run entry is not an object');
-          const state = normalizeCheckRunState(String(record.status ?? ''), record.conclusion);
-          const id = requireString(record, 'name', checkRunsPath);
-          if (state === 'unknown') {
-            problems.push({
-              code: 'UNKNOWN_CHECK_STATE',
-              message: `Check run "${id}" has an unrecognized status/conclusion.`,
-              sourceId: String(record.id ?? ''),
-              details: { name: id, status: record.status, conclusion: record.conclusion },
-            });
-          }
-          checks.push({
-            id: String(record.id ?? ''),
-            name: id,
-            state,
-            url: typeof record.html_url === 'string' ? record.html_url : null,
-            updatedAt: typeof record.completed_at === 'string' ? record.completed_at : null,
-          });
-        }
-      }
-    }
-
-    if (checks.length === 0) {
-      return available
-        ? { availability: 'available', overall: 'passing', checks: [] }
-        : { availability: 'unavailable', overall: 'unavailable', checks: [] };
-    }
+    if (checks.length === 0) return { availability: 'available', overall: 'passing', checks: [] };
     const states = new Set(checks.map((check) => check.state));
     const overall: GitHubCheckSummary['overall'] = states.has('failing')
       ? 'failing'

@@ -11,6 +11,7 @@ import type { ImplementationAgent, WorkspaceGuard } from '../src/adapters/agent.
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
+import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
 import { resumeCommand } from '../src/cli.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
@@ -19,11 +20,12 @@ import type { ProcessResult, ProcessRunOptions, ProcessRunner } from '../src/git
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { runWorkflow } from '../src/workflow/run.js';
-import { TARGET, T0, successResult } from './helpers.js';
+import { TARGET, T0, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 
 const HEAD = 'a'.repeat(40);
 const HEAD2 = 'b'.repeat(40);
 const BASE = 'c'.repeat(40);
+const TEST_HOSTED_POLICY = { revision: 'test-hosted-policy-v1', policy: { mode: 'required' as const } };
 const RESUME_WORKSPACE_DECISION = 'Resolve the workspace identity and retry';
 
 type Provider = 'claude-code' | 'codex-cli';
@@ -119,7 +121,7 @@ class LiveGithub implements GitHubAdapter {
         headRef: identity.branch, headRepository: { owner: TARGET.owner, repo: TARGET.repo }, baseRef: identity.baseBranch,
       },
       headSha,
-      checks: { availability: 'available', overall: 'passing', checks: [] },
+      checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
       reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
       conversations: [], handoff: null, problems: [], observedAt: T0,
     };
@@ -141,11 +143,11 @@ function runAtReviewFix(route: 'direct' | 'resumed', id: string): Run {
     type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD,
     pullRequest: { number: 7, headSha: HEAD },
   }, T0);
-  run = applyTransition(run, { type: 'validation_passed' }, T0);
+  run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
   run = applyTransition(run, {
     type: 'changes_requested',
     reviewResult: { verdict: 'request_changes', reviewerName: 'controlled', headSha: HEAD, findings: [{ severity: 'blocking', summary: 'repair continuity' }] },
-  }, T0);
+  }, T0, TEST_VALIDATION_AUTHORITY);
   return route === 'direct' ? run : applyTransition(run, { type: 'start_fix' }, T0);
 }
 
@@ -173,6 +175,16 @@ for (const provider of ['claude-code', 'codex-cli'] as const) {
           implementation: providerAgent(provider, runner),
           bootstrap,
           reviewer: new ApprovingReviewer(),
+          validation: {
+            kind: 'validation',
+            configRevision: 'test-config-v1',
+            async validate(request: ValidationRequest) { return validationPassed(request.headSha).local; },
+          } satisfies ValidationAdapter,
+          hostedCheckPolicy: TEST_HOSTED_POLICY,
+          resolveValidationAuthority: () => ({
+            local: { kind: 'configured' as const, revision: 'test-config-v1' },
+            hosted: { kind: 'configured' as const, revision: 'test-hosted-policy-v1', mode: 'required' as const },
+          }),
         };
         try {
           const parked = route === 'direct'

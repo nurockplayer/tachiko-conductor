@@ -54,7 +54,7 @@ export const TRANSITION_TYPES = [
   'review_approved',
   'changes_requested',
   'start_fix',
-  'gate_passed',
+  'revalidate',
   'gate_blocked',
   'merged',
   'wait_dependency',
@@ -123,6 +123,50 @@ export interface ReviewResult {
   readonly findings: readonly ReviewFinding[];
 }
 
+/** A fail-closed validation outcome. `waiting` is reserved for a re-checkable external dependency. */
+export type ValidationStatus = 'passed' | 'failed' | 'waiting' | 'unknown';
+
+/** Compact, secret-free result for one explicitly configured local command. */
+export interface LocalValidationCommandEvidence {
+  readonly commandIndex: number;
+  readonly executable: string;
+  readonly outcome: 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed';
+  readonly exitCode: number | null;
+  readonly durationMs: number;
+}
+
+/** Durable provenance for deterministic local validation. It intentionally excludes command output. */
+export interface LocalValidationEvidence {
+  readonly status: Exclude<ValidationStatus, 'waiting'>;
+  readonly configRevision: string | null;
+  readonly commands: readonly LocalValidationCommandEvidence[];
+}
+
+/** Compact snapshot of hosted checks observed for the run's exact PR HEAD. */
+export interface HostedValidationEvidence {
+  /** `not_required` is neutral policy evidence, never a synthetic passing check. */
+  readonly status: ValidationStatus | 'not_required';
+  readonly observedAt: string;
+  readonly pullRequestNumber: number | null;
+  readonly availability: 'available' | 'unavailable';
+  readonly overall: 'pending' | 'passing' | 'failing' | 'unknown' | 'unavailable';
+  /** Identity of the policy which interpreted the live check list, when configured. */
+  readonly policyRevision: string | null;
+  readonly policyMode: 'required' | 'not_required' | 'unconfigured';
+  /** Required check names from that policy, when its mode is `required`. */
+  readonly requiredCheckNames: readonly string[];
+  /** Names observed at the exact PR HEAD; URLs and raw command output are not persisted. */
+  readonly observedCheckNames: readonly string[];
+}
+
+/** The persisted exact-HEAD validation ledger consumed by review and final readiness. */
+export interface ValidationResult {
+  readonly headSha: string;
+  readonly status: ValidationStatus;
+  readonly local: LocalValidationEvidence;
+  readonly hosted: HostedValidationEvidence;
+}
+
 /** Why a run is paused waiting on a human or an external dependency. */
 export type InterruptKind = 'needs_human' | 'waiting_dependency';
 
@@ -139,7 +183,12 @@ export interface Interrupt {
 
 /** One applied step in a run's history. */
 export interface TransitionRecord {
-  readonly type: TransitionType;
+  /**
+   * The workflow-owned final authority records final_gate_verified after live
+   * reconciliation. gate_passed is retained only so old JSON history remains
+   * readable; it is deliberately not a callable TransitionType.
+   */
+  readonly type: TransitionType | 'final_gate_verified' | 'gate_passed';
   readonly from: WorkflowState;
   readonly to: WorkflowState;
   readonly at: string;
@@ -154,6 +203,8 @@ export interface TransitionInput {
   readonly agentResult?: AgentResult;
   /** Carried into the run; required for `review_approved` / `changes_requested`. */
   readonly reviewResult?: ReviewResult;
+  /** Exact-HEAD validation evidence produced at the validation boundary. */
+  readonly validationResult?: ValidationResult;
   /** Explicitly updates the run's current HEAD SHA. */
   readonly headSha?: string;
   /** Executor identity captured while an implementation is interrupted for human takeover. */
@@ -192,6 +243,8 @@ export interface Run {
   readonly pullRequest?: ImplementationPullRequestIdentity;
   /** Latest review result, bound to an exact HEAD SHA. */
   readonly reviewResult?: ReviewResult;
+  /** Latest validation result, bound to an exact HEAD SHA. */
+  readonly validationResult?: ValidationResult;
   /** Current HEAD SHA of the implementation, when known. */
   readonly headSha?: string;
 }

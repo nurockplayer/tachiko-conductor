@@ -465,6 +465,10 @@ PR: #7`;
       { head: { sha: HEAD, ref: 'owned', repo: { name: 'widgets', owner: { login: 'other' } } } },
       { head: { sha: HEAD, ref: 'owned', repo: null } },
       { base: { sha: BASE, ref: 'release' } },
+      { draft: true },
+      { mergeable: false },
+      { mergeable_state: 'blocked' },
+      { base: { sha: 'c'.repeat(40), ref: 'main' } },
     ];
     for (const delta of changed) {
       const transport = prTransport().queue('repos/acme/widgets/pulls/7', first, { ...first, ...delta });
@@ -473,14 +477,20 @@ PR: #7`;
     }
   });
 
-  it('propagates a transport failure without returning a partial snapshot', async () => {
+  it('keeps core authority while recording a hosted status transport failure', async () => {
     const transport = prTransport().fault(
       'repos/acme/widgets/commits/' + HEAD + '/status',
       new GitHubLiveStateError('GH_RATE_LIMITED', 'rate limited', { retryable: true }),
     );
     const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
 
-    await expectError(adapter.readLiveSnapshot(TARGET), 'GH_RATE_LIMITED', true);
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.issue.number, 42);
+    assert.equal(snapshot.pullRequest?.number, 7);
+    assert.equal(snapshot.headSha, HEAD);
+    assert.deepEqual(snapshot.checks, { availability: 'unavailable', overall: 'unavailable', checks: [] });
+    assert.ok(snapshot.problems.some((problem) => problem.code === 'CHECKS_UNAVAILABLE'));
   });
 
   it('marks a handoff claiming a stale HEAD as stale and never lets it supply the live HEAD', async () => {
