@@ -71,7 +71,12 @@ query TachikoConductorBootstrapHeartbeat {
         }
         reviewThreads(first: 50) {
           pageInfo { hasNextPage }
-          nodes { isResolved comments(last: 1) { nodes { databaseId } } }
+          nodes {
+            isResolved
+            comments(last: 1) {
+              nodes { databaseId body updatedAt }
+            }
+          }
         }
         commits(last: 1) {
           nodes { commit { oid statusCheckRollup {

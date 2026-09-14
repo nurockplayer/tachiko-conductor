@@ -118,7 +118,12 @@ class HeartbeatTest(unittest.TestCase):
             "reviews": {"pageInfo": {"hasPreviousPage": False}, "nodes": [
                 {"author": {"login": "reviewer"}, "state": "APPROVED", "commit": {"oid": oid}}
             ]},
-            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": []},
+            "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": [{
+                "isResolved": False,
+                "comments": {"nodes": [{
+                    "databaseId": 51, "body": "review feedback v1", "updatedAt": "2026-09-14T00:00:00Z"
+                }]},
+            }]},
             "commits": {"nodes": [{"commit": {"oid": oid, "statusCheckRollup": {
                 "state": "SUCCESS", "contexts": {
                     "pageInfo": {"hasNextPage": False}, "nodes": []
@@ -190,6 +195,16 @@ class HeartbeatTest(unittest.TestCase):
         self.payload.write_text(json.dumps(data), encoding="utf-8")
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
         self.assertEqual(len(self.records()), 1, "Issue body edits must wake before the safety interval")
+
+    def test_existing_inline_review_comment_edit_is_meaningful(self) -> None:
+        self.invoke("run", "--prime")
+        data = json.loads(self.payload.read_text(encoding="utf-8"))
+        comment = data["data"]["repository"]["pullRequests"]["nodes"][0]["reviewThreads"]["nodes"][0]["comments"]["nodes"][0]
+        comment["body"] = "review feedback v2"
+        comment["updatedAt"] = "2026-09-14T00:01:00Z"
+        self.payload.write_text(json.dumps(data), encoding="utf-8")
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(len(self.records()), 1, "edited inline feedback must wake before safety")
 
     def test_overlap_and_stale_lock_policy(self) -> None:
         self.invoke("run", "--prime")
