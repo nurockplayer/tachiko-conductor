@@ -82,7 +82,9 @@ before wake-guard creation to recover from PID reuse without accepting an ambigu
   executes a private snapshot copied from the already-verified executable descriptor, so a
   pathname replacement between verification and launch cannot change the executed bytes. The
   default Codex target's verified code-mode companion is materialized beside that snapshot so
-  location-based runtime discovery remains intact without reopening unverified bytes.
+  location-based runtime discovery remains intact without reopening unverified bytes. Like the
+  main executable, that copied companion permits standard macOS application-directory ancestry;
+  its opened leaf must still have a pinned digest, safe ownership and safe permissions.
 - One advisory `flock` covers collection and the entire direct wake. A dedicated same-host guard
   retains it if the supervisor dies, while the wake target and its background descendants never
   inherit the descriptor. Normal direct-child completion releases the guard without waiting for
