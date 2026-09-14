@@ -228,20 +228,20 @@ def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
 
 
 def validate_config(config: dict[str, Any]) -> dict[str, Any]:
-    if config.get("schema") != CONFIG_SCHEMA:
+    if type(config.get("schema")) is not int or config["schema"] != CONFIG_SCHEMA:
         raise RuntimeError("unsupported heartbeat config schema")
     for key in ("gh", "repo", "runner"):
         if not isinstance(config.get(key), str) or not Path(config[key]).is_absolute():
             raise RuntimeError("invalid absolute config path: " + key)
-    if not isinstance(config.get("poll_interval_seconds"), int) or config["poll_interval_seconds"] < 1:
+    if type(config.get("poll_interval_seconds")) is not int or config["poll_interval_seconds"] < 1:
         raise RuntimeError("invalid poll_interval_seconds")
-    if not isinstance(config.get("poll_timeout_seconds"), int) or config["poll_timeout_seconds"] < 1:
+    if type(config.get("poll_timeout_seconds")) is not int or config["poll_timeout_seconds"] < 1:
         raise RuntimeError("invalid poll_timeout_seconds")
     if config["poll_timeout_seconds"] >= config["poll_interval_seconds"]:
         raise RuntimeError("poll timeout must be shorter than poll interval")
-    if not isinstance(config.get("wake_timeout_seconds"), int) or config["wake_timeout_seconds"] < 1:
+    if type(config.get("wake_timeout_seconds")) is not int or config["wake_timeout_seconds"] < 1:
         raise RuntimeError("invalid wake_timeout_seconds")
-    if not isinstance(config.get("safety_interval_seconds"), int) or config["safety_interval_seconds"] < 1:
+    if type(config.get("safety_interval_seconds")) is not int or config["safety_interval_seconds"] < 1:
         raise RuntimeError("invalid safety_interval_seconds")
     command = config.get("wake_command")
     if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
@@ -302,7 +302,7 @@ def load_state() -> dict[str, Any]:
         "last_attempt_exit": int, "last_attempt_reason": str,
     }
     for key, kind in fields.items():
-        if not isinstance(state.get(key), kind):
+        if type(state.get(key)) is not kind:
             raise RuntimeError("invalid heartbeat state field: " + key)
     if state["schema"] != STATE_SCHEMA:
         raise RuntimeError("unsupported heartbeat state schema")
@@ -445,7 +445,7 @@ def acquire_lock(verbose: bool):
         try:
             metadata = json.loads(prior)
             pid = metadata["pid"]
-            if not isinstance(pid, int) or pid < 1:
+            if type(pid) is not int or pid < 1:
                 raise ValueError("invalid pid")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             stream.close()

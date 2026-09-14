@@ -285,6 +285,10 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(self.invoke("run", check=False).returncode, 1)
         self.assertEqual(len(self.records()), 1, "ambiguous lock metadata must fail closed")
 
+        (self.state_root / "runner.lock").write_text('{"pid":true}\n', encoding="utf-8")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+        self.assertEqual(len(self.records()), 1, "boolean lock pid must fail closed")
+
         (self.state_root / "runner.lock").write_text(json.dumps({"pid": os.getpid()}) + "\n", encoding="utf-8")
         self.assertEqual(self.invoke("run", check=False).returncode, 1)
         self.assertEqual(len(self.records()), 1, "unlocked metadata naming live pid is ambiguous")
@@ -355,6 +359,34 @@ class HeartbeatTest(unittest.TestCase):
         self.write_payload("B")
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1180", MOCK_WAKE_OUTPUT=str(700 * 1024)))
         self.assertLessEqual((self.state_root / "wake.log").stat().st_size, 512 * 1024)
+
+    def test_boolean_integer_fields_fail_closed(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        valid_config = json.loads(config_path.read_text(encoding="utf-8"))
+        for field in (
+            "schema", "poll_interval_seconds", "poll_timeout_seconds",
+            "wake_timeout_seconds", "safety_interval_seconds",
+        ):
+            with self.subTest(config_field=field):
+                invalid_config = dict(valid_config, **{field: True})
+                config_path.write_text(json.dumps(invalid_config), encoding="utf-8")
+                self.assertEqual(self.invoke("run", check=False).returncode, 1)
+                self.assertEqual(self.records(), [], "boolean config integer must never wake")
+        config_path.write_text(json.dumps(valid_config), encoding="utf-8")
+
+        state_path = self.state_root / "state.json"
+        valid_state = self.state()
+        for field in (
+            "schema", "last_success_at", "last_attempt_at", "last_attempt_exit",
+        ):
+            with self.subTest(state_field=field):
+                invalid_state = dict(valid_state, **{field: True})
+                state_path.write_text(json.dumps(invalid_state), encoding="utf-8")
+                self.assertEqual(self.invoke("run", check=False).returncode, 1)
+                self.assertEqual(self.records(), [], "boolean state integer must never wake")
+        state_path.write_text(json.dumps(valid_state), encoding="utf-8")
 
     def test_install_status_uninstall_and_plist_are_idempotent(self) -> None:
         if (self.state_root / "state.json").exists():
