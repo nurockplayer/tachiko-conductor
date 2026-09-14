@@ -85,7 +85,9 @@ class HeartbeatTest(unittest.TestCase):
             "safety_interval_seconds": safety,
             "wake_command": [str(self.wake), "dispatchable-target"],
             "wake_env": {},
-            "required_files": [],
+            "required_files": [{
+                "path": str(self.wake), "sha256": hashlib.sha256(self.wake.read_bytes()).hexdigest()
+            }],
             "installed_at": 1000,
         }
         (self.state_root / "config.json").write_text(json.dumps(config), encoding="utf-8")
@@ -419,28 +421,29 @@ class HeartbeatTest(unittest.TestCase):
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config["required_files"] = [{
             "path": str(self.gh), "sha256": hashlib.sha256(self.gh.read_bytes()).hexdigest()
-        }]
+        }, *config["required_files"]]
         config_path.write_text(json.dumps(config), encoding="utf-8")
         self.write_payload("B")
         self.gh.write_text(self.gh.read_text(encoding="utf-8") + "# changed\n", encoding="utf-8")
         self.assertEqual(self.invoke("run", check=False).returncode, 1)
         self.assertEqual(self.records(), [])
 
-    def test_replaceable_wake_path_must_not_be_group_or_world_writable(self) -> None:
-        unsafe_dir = self.root / "unsafe-wake-parent"
-        unsafe_dir.mkdir(mode=0o777)
-        unsafe_dir.chmod(0o777)
-        unsafe_wake = unsafe_dir / "wake"
-        unsafe_wake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        unsafe_wake.chmod(0o700)
-        config_path = self.state_root / "config.json"
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-        config["wake_command"] = [str(unsafe_wake)]
-        config_path.write_text(json.dumps(config), encoding="utf-8")
+    def test_replaceable_wake_executable_identity_is_pinned(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")
+        self.wake.write_text(self.wake.read_text(encoding="utf-8") + "# replaced\n", encoding="utf-8")
+        self.wake.chmod(0o700)
         self.assertEqual(self.invoke("run", check=False).returncode, 1)
-        self.assertEqual(self.records(), [], "unsafe executable path must never wake")
+        self.assertEqual(self.records(), [], "replaced wake executable must never run")
+
+    def test_custom_install_pins_wake_executable_identity(self) -> None:
+        config_path = self.state_root / "config.json"
+        command = json.dumps([str(self.wake), "pinned-target"])
+        self.invoke("install", "--repo", str(Path.cwd()), "--wake-command-json", command, "--no-load")
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertIn({
+            "path": str(self.wake), "sha256": hashlib.sha256(self.wake.read_bytes()).hexdigest()
+        }, config["required_files"])
 
 
 if __name__ == "__main__":

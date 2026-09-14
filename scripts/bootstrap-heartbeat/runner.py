@@ -329,12 +329,9 @@ def verify_wake_target(config: dict[str, Any]) -> None:
     executable = Path(config["wake_command"][0])
     if not executable.is_file() or executable.is_symlink() or not os.access(executable, os.X_OK):
         raise RuntimeError("wake executable unavailable or unsafe: " + str(executable))
-    resolved_executable = executable.resolve(strict=True)
-    trusted_owners = {0, os.getuid()}
-    for component in (resolved_executable, *resolved_executable.parents):
-        metadata = component.stat()
-        if metadata.st_uid not in trusted_owners or metadata.st_mode & 0o022:
-            raise RuntimeError("wake executable ownership/path is unsafe: " + str(component))
+    metadata = executable.stat()
+    if metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022:
+        raise RuntimeError("wake executable ownership or permissions unsafe: " + str(executable))
     for required in config.get("required_files", []):
         path = Path(required["path"])
         if not path.is_file() or path.is_symlink():
@@ -582,7 +579,11 @@ def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dic
         "--strict-config", "--model", "gpt-5.6-terra",
         "-c", 'model_reasoning_effort="high"', "-C", str(repo), DEFAULT_PROMPT,
     ]
-    return command, {"CODEX_HOME": str(profile.parent)}, [{"path": str(profile), "sha256": digest}]
+    required_files = [
+        {"path": str(codex), "sha256": hashlib.sha256(codex.read_bytes()).hexdigest()},
+        {"path": str(profile), "sha256": digest},
+    ]
+    return command, {"CODEX_HOME": str(profile.parent)}, required_files
 
 
 def install(args: argparse.Namespace) -> int:
@@ -599,7 +600,15 @@ def install(args: argparse.Namespace) -> int:
         except json.JSONDecodeError as error:
             raise RuntimeError("invalid --wake-command-json") from error
         wake_env: dict[str, str] = {}
-        required_files: list[dict[str, str]] = []
+        if not isinstance(wake_command, list) or not wake_command or not isinstance(wake_command[0], str):
+            raise RuntimeError("invalid --wake-command-json")
+        wake_executable = Path(wake_command[0])
+        if not wake_executable.is_absolute() or not wake_executable.is_file():
+            raise RuntimeError("custom wake executable unavailable")
+        required_files = [{
+            "path": str(wake_executable),
+            "sha256": hashlib.sha256(wake_executable.read_bytes()).hexdigest(),
+        }]
     else:
         wake_command, wake_env, required_files = default_wake(repo, Path(args.codex), Path(args.profile))
     config = validate_config({
