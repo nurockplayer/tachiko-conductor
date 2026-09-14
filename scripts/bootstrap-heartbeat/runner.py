@@ -240,6 +240,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     for key in ("gh", "repo", "runner"):
         if not isinstance(config.get(key), str) or not Path(config[key]).is_absolute():
             raise RuntimeError("invalid absolute config path: " + key)
+    gh_digest = config.get("gh_sha256")
+    if (not isinstance(gh_digest, str) or len(gh_digest) != 64
+            or any(character not in "0123456789abcdef" for character in gh_digest)
+            or Path(config["gh"]) != ROOT / ("verified-gh-" + gh_digest)):
+        raise RuntimeError("invalid pinned GitHub CLI identity")
     if type(config.get("poll_interval_seconds")) is not int or config["poll_interval_seconds"] < 1:
         raise RuntimeError("invalid poll_interval_seconds")
     if type(config.get("poll_timeout_seconds")) is not int or config["poll_timeout_seconds"] < 1:
@@ -361,8 +366,8 @@ def verify_trusted_path(path: Path) -> None:
             raise RuntimeError("wake file path ownership or permissions unsafe: " + str(component))
 
 
-def materialize_verified_executable(source_fd: int) -> Path:
-    target = ROOT / "verified-wake-executable"
+def materialize_verified_executable(source_fd: int, name: str = "verified-wake-executable") -> Path:
+    target = ROOT / name
     temporary = target.with_name(target.name + ".tmp")
     os.lseek(source_fd, 0, os.SEEK_SET)
     with temporary.open("wb") as stream:
@@ -410,6 +415,22 @@ def verify_wake_target(config: dict[str, Any]) -> Path:
         return materialize_verified_executable(executable_fd)
     finally:
         os.close(executable_fd)
+
+
+def pin_github_tool(path: Path) -> tuple[Path, str]:
+    if not path.is_file() or path.is_symlink() or not os.access(path, os.X_OK):
+        raise RuntimeError("GitHub CLI unavailable or unsafe: " + str(path))
+    source_fd = os.open(path, os.O_RDONLY)
+    try:
+        metadata = os.fstat(source_fd)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
+                or metadata.st_mode & 0o022):
+            raise RuntimeError("GitHub CLI ownership or permissions unsafe: " + str(path))
+        digest = fd_sha256(source_fd)
+        target = materialize_verified_executable(source_fd, "verified-gh-" + digest)
+        return target, digest
+    finally:
+        os.close(source_fd)
 
 
 def linux_process_identity(pid: int) -> tuple[str, str] | None:
@@ -800,7 +821,6 @@ def resolved_tool(name: str) -> str:
     resolved = Path(os.path.realpath(path))
     if not resolved.is_absolute() or not resolved.is_file() or not os.access(resolved, os.X_OK):
         raise RuntimeError("could not resolve executable absolute path for " + name)
-    verify_trusted_path(resolved)
     return str(resolved)
 
 
@@ -874,15 +894,16 @@ def install(args: argparse.Namespace) -> int:
                 })
     else:
         wake_command, wake_env, required_files = default_wake(repo, Path(args.codex), Path(args.profile))
-    config = validate_config({
-        "schema": CONFIG_SCHEMA, "gh": resolved_tool("gh"), "repo": str(repo),
+    gh_source = Path(resolved_tool("gh"))
+    config_values = {
+        "schema": CONFIG_SCHEMA, "gh": str(gh_source), "gh_sha256": "", "repo": str(repo),
         "runner": str(runner), "poll_interval_seconds": args.interval,
         "poll_timeout_seconds": DEFAULT_POLL_TIMEOUT_SECONDS,
         "wake_timeout_seconds": DEFAULT_WAKE_TIMEOUT_SECONDS,
         "safety_interval_seconds": args.safety_interval,
         "wake_executable_relocatable": True, "wake_command": wake_command,
         "wake_env": wake_env, "required_files": required_files, "installed_at": now_epoch(),
-    })
+    }
     plist = {
         "Label": LABEL,
         "ProgramArguments": ["/usr/bin/python3", str(runner), "run"],
@@ -895,6 +916,9 @@ def install(args: argparse.Namespace) -> int:
     target = plist_path()
     lock_stream = acquire_operator_lock("install")
     try:
+        gh_snapshot, gh_digest = pin_github_tool(gh_source)
+        config_values.update(gh=str(gh_snapshot), gh_sha256=gh_digest)
+        config = validate_config(config_values)
         verify_wake_target(config)
         prior = load_state() if STATE.exists() else {}
         atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())

@@ -26,8 +26,10 @@ the target must also print `TACHIKO_HEARTBEAT_SETTLED_V1` on its own final line 
 fingerprint and reset the safety clock. Installation resolves `gh`, validates the audited ChatGPT-bundled Codex executable,
 records the exact user-owned SCD profile digest, primes a GitHub baseline without waking Codex,
 and loads `io.tachiko.conductor.scd-heartbeat`.
-The resolved `gh` executable is bound to its real path and requires a root/current-user-owned,
-non-group/world-writable path chain before installation.
+The resolved `gh` executable is opened and checked for root/current-user ownership and safe leaf
+permissions during installation, then copied from that verified descriptor into a digest-named,
+mode-0700 snapshot in the private state directory. Polls execute those pinned bytes rather than
+reopening a replaceable Homebrew path.
 
 State and bounded logs live in
 `~/Library/Application Support/io.tachiko.conductor.scd-heartbeat/`; the generated plist lives

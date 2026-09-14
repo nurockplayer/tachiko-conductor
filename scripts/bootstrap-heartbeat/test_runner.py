@@ -89,9 +89,14 @@ class HeartbeatTest(unittest.TestCase):
 
     def write_config(self, *, safety: int = 1800) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
+        gh_digest = hashlib.sha256(self.gh.read_bytes()).hexdigest()
+        gh_snapshot = self.state_root / ("verified-gh-" + gh_digest)
+        gh_snapshot.write_bytes(self.gh.read_bytes())
+        gh_snapshot.chmod(0o700)
         config = {
             "schema": 1,
-            "gh": str(self.gh),
+            "gh": str(gh_snapshot),
+            "gh_sha256": gh_digest,
             "repo": str(Path.cwd()),
             "runner": str(RUNNER),
             "poll_interval_seconds": 180,
@@ -661,22 +666,27 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), snapshot_before)
         active.communicate(timeout=5)
 
-    def test_install_rejects_untrusted_github_cli_path(self) -> None:
-        unsafe_parent = self.root / "untrusted-gh-parent"
-        unsafe_parent.mkdir(mode=0o777)
-        unsafe_parent.chmod(0o777)
-        unsafe_gh = unsafe_parent / "gh"
-        unsafe_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-        unsafe_gh.chmod(0o700)
+    def test_install_pins_github_cli_bytes_across_source_replacement(self) -> None:
+        replaceable_parent = self.root / "replaceable-gh-parent"
+        replaceable_parent.mkdir(mode=0o777)
+        replaceable_parent.chmod(0o777)
+        replaceable_gh = replaceable_parent / "gh"
+        replaceable_gh.write_bytes(self.gh.read_bytes())
+        replaceable_gh.chmod(0o700)
         command = json.dumps([str(self.wake), "future-dispatch-once"])
-        environment = dict(self.env, SCD_HEARTBEAT_TEST_GH=str(unsafe_gh))
+        environment = dict(self.env, SCD_HEARTBEAT_TEST_GH=str(replaceable_gh))
         result = self.invoke(
             "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
             "--acknowledge-relocatable-wake-target", "--no-load",
             env=environment, check=False,
         )
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("wake file path ownership or permissions unsafe", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(Path(config["gh"]).parent, self.state_root)
+        self.assertEqual(Path(config["gh"]).name, "verified-gh-" + config["gh_sha256"])
+        replaceable_gh.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        replaceable_gh.chmod(0o700)
+        self.assertEqual(self.invoke("run", "--prime", env=environment).returncode, 0)
 
     def test_required_wake_identity_fails_closed(self) -> None:
         self.invoke("run", "--prime")
