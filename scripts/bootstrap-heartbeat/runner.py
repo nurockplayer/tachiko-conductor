@@ -35,7 +35,6 @@ STATE_SCHEMA = 1
 CONFIG_SCHEMA = 1
 DEFAULT_POLL_SECONDS = 180
 DEFAULT_SAFETY_SECONDS = 1800
-HANDOFF_MARKER = "<!-- agent-handoff:v1 -->"
 MAX_HEARTBEAT_LOG = 64 * 1024
 MAX_WAKE_LOG = 512 * 1024
 
@@ -51,7 +50,7 @@ query TachikoConductorBootstrapHeartbeat {
         assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
         comments(first: 50) {
           pageInfo { hasNextPage }
-          nodes { databaseId body }
+          nodes { databaseId body updatedAt }
         }
       }
     }
@@ -63,17 +62,18 @@ query TachikoConductorBootstrapHeartbeat {
         assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
         comments(first: 50) {
           pageInfo { hasNextPage }
-          nodes { databaseId body }
+          nodes { databaseId body updatedAt }
         }
         reviews(last: 50) {
           pageInfo { hasPreviousPage }
-          nodes { author { login } state commit { oid } }
+          nodes { databaseId author { login } state body submittedAt updatedAt commit { oid } }
         }
         reviewThreads(first: 50) {
           pageInfo { hasNextPage }
           nodes {
             isResolved
-            comments(last: 1) {
+            comments(first: 50) {
+              pageInfo { hasNextPage }
               nodes { databaseId body updatedAt }
             }
           }
@@ -178,14 +178,6 @@ def canonicalize(value: Any) -> Any:
     return value
 
 
-def handoffs(comments: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        {"databaseId": node.get("databaseId"), "body": node.get("body")}
-        for node in comments.get("nodes", [])
-        if isinstance(node.get("body"), str) and HANDOFF_MARKER in node["body"]
-    ]
-
-
 def names(connection: dict[str, Any], key: str) -> list[str]:
     return [node[key] for node in connection.get("nodes", []) if isinstance(node.get(key), str)]
 
@@ -198,7 +190,7 @@ def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
             "body": issue["body"],
             "labels": names(issue["labels"], "name"),
             "assignees": names(issue["assignees"], "login"),
-            "handoffs": handoffs(issue["comments"]),
+            "comments": issue["comments"]["nodes"],
         })
     prs = []
     for pr in repository["pullRequests"]["nodes"]:
@@ -210,7 +202,7 @@ def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
             "reviewDecision": pr["reviewDecision"],
             "labels": names(pr["labels"], "name"),
             "assignees": names(pr["assignees"], "login"),
-            "handoffs": handoffs(pr["comments"]),
+            "comments": pr["comments"]["nodes"],
             "reviews": pr["reviews"]["nodes"],
             "reviewThreads": pr["reviewThreads"]["nodes"],
             "commits": pr["commits"]["nodes"],

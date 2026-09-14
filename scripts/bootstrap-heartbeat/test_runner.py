@@ -94,8 +94,8 @@ class HeartbeatTest(unittest.TestCase):
                 "labels": {"pageInfo": {"hasNextPage": False}, "nodes": []},
                 "assignees": {"pageInfo": {"hasNextPage": False}, "nodes": [{"login": "owner"}]},
                 "comments": {"pageInfo": {"hasNextPage": truncated}, "nodes": [
-                    {"databaseId": 1, "body": "ordinary comment ignored"},
-                    {"databaseId": 2, "body": "<!-- agent-handoff:v1 -->\nREADY"},
+                    {"databaseId": 1, "body": "ordinary comment", "updatedAt": "2026-09-14T00:00:00Z"},
+                    {"databaseId": 2, "body": "<!-- agent-handoff:v1 -->\nREADY", "updatedAt": "2026-09-14T00:00:00Z"},
                 ]},
             },
             {
@@ -116,12 +116,16 @@ class HeartbeatTest(unittest.TestCase):
             "assignees": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             "comments": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             "reviews": {"pageInfo": {"hasPreviousPage": False}, "nodes": [
-                {"author": {"login": "reviewer"}, "state": "APPROVED", "commit": {"oid": oid}}
+                {"databaseId": 41, "author": {"login": "reviewer"}, "state": "APPROVED",
+                 "body": "top-level review", "submittedAt": "2026-09-14T00:00:00Z",
+                 "updatedAt": "2026-09-14T00:00:00Z", "commit": {"oid": oid}}
             ]},
             "reviewThreads": {"pageInfo": {"hasNextPage": False}, "nodes": [{
                 "isResolved": False,
-                "comments": {"nodes": [{
+                "comments": {"pageInfo": {"hasNextPage": False}, "nodes": [{
                     "databaseId": 51, "body": "review feedback v1", "updatedAt": "2026-09-14T00:00:00Z"
+                }, {
+                    "databaseId": 52, "body": "later reply", "updatedAt": "2026-09-14T00:00:30Z"
                 }]},
             }]},
             "commits": {"nodes": [{"commit": {"oid": oid, "statusCheckRollup": {
@@ -177,16 +181,21 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(len(self.records()), 4, "failed wake must retry unconsumed change")
         self.assertEqual(self.records()[0]["args"], ["dispatchable-target"])
 
-    def test_canonicalization_ignores_order_and_ordinary_comment(self) -> None:
+    def test_canonicalization_ignores_connection_order(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("A", reverse=True)
-        data = json.loads(self.payload.read_text(encoding="utf-8"))
-        data["data"]["repository"]["issues"]["nodes"][0]["comments"]["nodes"].append(
-            {"databaseId": 99, "body": "another non-handoff comment"}
-        )
-        self.payload.write_text(json.dumps(data), encoding="utf-8")
         self.invoke("run", "--verbose", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1179"))
         self.assertEqual(self.records(), [])
+
+    def test_ordinary_execution_comment_edit_is_meaningful(self) -> None:
+        self.invoke("run", "--prime")
+        data = json.loads(self.payload.read_text(encoding="utf-8"))
+        comment = data["data"]["repository"]["issues"]["nodes"][0]["comments"]["nodes"][0]
+        comment["body"] = "clarified execution comment"
+        comment["updatedAt"] = "2026-09-14T00:01:00Z"
+        self.payload.write_text(json.dumps(data), encoding="utf-8")
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(len(self.records()), 1, "ordinary execution comments must wake promptly")
 
     def test_issue_contract_body_edit_is_meaningful(self) -> None:
         self.invoke("run", "--prime")
@@ -204,7 +213,17 @@ class HeartbeatTest(unittest.TestCase):
         comment["updatedAt"] = "2026-09-14T00:01:00Z"
         self.payload.write_text(json.dumps(data), encoding="utf-8")
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
-        self.assertEqual(len(self.records()), 1, "edited inline feedback must wake before safety")
+        self.assertEqual(len(self.records()), 1, "edited earlier inline feedback must wake before safety")
+
+    def test_top_level_review_body_edit_is_meaningful(self) -> None:
+        self.invoke("run", "--prime")
+        data = json.loads(self.payload.read_text(encoding="utf-8"))
+        review = data["data"]["repository"]["pullRequests"]["nodes"][0]["reviews"]["nodes"][0]
+        review["body"] = "corrected top-level review"
+        review["updatedAt"] = "2026-09-14T00:01:00Z"
+        self.payload.write_text(json.dumps(data), encoding="utf-8")
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(len(self.records()), 1, "edited top-level review must wake before safety")
 
     def test_overlap_and_stale_lock_policy(self) -> None:
         self.invoke("run", "--prime")
