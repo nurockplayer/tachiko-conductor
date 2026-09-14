@@ -19,7 +19,8 @@ scripts/bootstrap-heartbeat/uninstall.sh
 
 Installation defaults to a 180-second LaunchAgent interval and a 1,800-second safety interval.
 Each GitHub poll has a 60-second subprocess timeout so a stalled request cannot retain the lock
-forever. Wake execution has a 1,500-second deadline; timeout terminates its isolated process
+forever. The bounded GraphQL projection rejects truncation and any GitHub-reported query cost over
+100 points, keeping the 180-second schedule sustainable. Wake execution has a 1,500-second deadline; timeout terminates its isolated process
 group and leaves the fingerprint unconsumed for retry. Installation resolves `gh`, validates the audited ChatGPT-bundled Codex executable,
 records the exact user-owned SCD profile digest, primes a GitHub baseline without waking Codex,
 and loads `io.tachiko.conductor.scd-heartbeat`.

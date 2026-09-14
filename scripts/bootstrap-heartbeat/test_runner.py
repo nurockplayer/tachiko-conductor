@@ -146,7 +146,9 @@ class HeartbeatTest(unittest.TestCase):
                 }
             }}}]},
         }
-        data = {"data": {"repository": {
+        data = {"data": {"rateLimit": {
+            "cost": 75, "remaining": 4925, "resetAt": "2026-09-14T01:00:00Z",
+        }, "repository": {
             "defaultBranchRef": {"name": "main", "target": {"oid": oid}},
             "issues": {"pageInfo": {"hasNextPage": False}, "nodes": issues},
             "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": [pr]},
@@ -270,6 +272,13 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(self.invoke("run", env=dict(self.env, MOCK_GH_SLEEP="2"), check=False).returncode, 1)
         self.assertLess(time.monotonic() - started, 1.8)
         self.assertEqual(self.records(), [], "timed-out poll must never wake")
+
+    def test_expensive_github_query_fails_closed(self) -> None:
+        data = json.loads(self.payload.read_text(encoding="utf-8"))
+        data["data"]["rateLimit"]["cost"] = 101
+        self.payload.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(self.invoke("run", "--prime", check=False).returncode, 1)
+        self.assertEqual(self.records(), [], "over-budget polling must never wake")
 
     def test_overlap_and_stale_lock_policy(self) -> None:
         self.invoke("run", "--prime")

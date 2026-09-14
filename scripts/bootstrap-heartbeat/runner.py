@@ -41,47 +41,49 @@ DEFAULT_POLL_TIMEOUT_SECONDS = 60
 DEFAULT_WAKE_TIMEOUT_SECONDS = 1500
 MAX_HEARTBEAT_LOG = 64 * 1024
 MAX_WAKE_LOG = 512 * 1024
+MAX_POLL_QUERY_COST = 100
 
 QUERY = r"""
 query TachikoConductorBootstrapHeartbeat {
+  rateLimit { cost remaining resetAt }
   repository(owner: "nurockplayer", name: "tachiko-conductor") {
     defaultBranchRef { name target { oid } }
-    issues(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+    issues(first: 25, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage }
       nodes {
         number state title body
         labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
         assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
-        comments(first: 50) {
+        comments(first: 25) {
           pageInfo { hasNextPage }
           nodes { databaseId body updatedAt }
         }
       }
     }
-    pullRequests(first: 30, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
+    pullRequests(first: 10, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage }
       nodes {
         number state title body isDraft headRefOid headRefName headRepository { nameWithOwner }
         baseRefOid baseRefName mergeable mergeStateStatus reviewDecision
-        closingIssuesReferences(first: 50) {
+        closingIssuesReferences(first: 20) {
           pageInfo { hasNextPage }
           nodes { number repository { nameWithOwner } }
         }
         labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
         assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
-        comments(first: 50) {
+        comments(first: 25) {
           pageInfo { hasNextPage }
           nodes { databaseId body updatedAt }
         }
-        reviews(last: 50) {
+        reviews(last: 100) {
           pageInfo { hasPreviousPage }
           nodes { databaseId author { login } state body submittedAt updatedAt commit { oid } }
         }
-        reviewThreads(first: 50) {
+        reviewThreads(first: 25) {
           pageInfo { hasNextPage }
           nodes {
             isResolved
-            comments(first: 50) {
+            comments(first: 10) {
               pageInfo { hasNextPage }
               nodes { databaseId body updatedAt }
             }
@@ -269,7 +271,7 @@ def load_config() -> dict[str, Any]:
     return validate_config(load_object(CONFIG))
 
 
-def github_fingerprint(config: dict[str, Any]) -> str:
+def github_fingerprint(config: dict[str, Any], verbose: bool = False) -> str:
     try:
         result = subprocess.run(
             [config["gh"], "api", "graphql", "-f", "query=" + QUERY], cwd=config["repo"],
@@ -287,7 +289,17 @@ def github_fingerprint(config: dict[str, Any]) -> str:
         raise RuntimeError("GitHub poll returned invalid JSON") from error
     if payload.get("errors"):
         raise RuntimeError("GitHub GraphQL returned errors")
-    repository = payload.get("data", {}).get("repository")
+    data = payload.get("data", {})
+    rate_limit = data.get("rateLimit")
+    if not isinstance(rate_limit, dict) or type(rate_limit.get("cost")) is not int:
+        raise RuntimeError("GitHub snapshot missing query cost")
+    if rate_limit["cost"] > MAX_POLL_QUERY_COST:
+        raise RuntimeError(
+            f"GitHub poll query cost {rate_limit['cost']} exceeds {MAX_POLL_QUERY_COST}; refusing wake"
+        )
+    if verbose:
+        log(f"GitHub poll query cost: {rate_limit['cost']} points")
+    repository = data.get("repository")
     if not isinstance(repository, dict) or not repository.get("defaultBranchRef"):
         raise RuntimeError("GitHub snapshot missing repository/default branch")
     reject_truncation(repository)
@@ -549,7 +561,7 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
             prime(config, "initial")
             return 0
         try:
-            fingerprint = github_fingerprint(config)
+            fingerprint = github_fingerprint(config, verbose)
         except Exception as error:
             log("poll error; no wake: " + str(error))
             return 1
