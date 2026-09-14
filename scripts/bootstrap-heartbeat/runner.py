@@ -408,9 +408,43 @@ def verify_wake_target(config: dict[str, Any]) -> Path:
         os.close(executable_fd)
 
 
+def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
+    read_fd, write_fd = os.pipe()
+    guard_pid = os.fork()
+    if guard_pid:
+        os.close(read_fd)
+        return guard_pid, write_fd
+    try:
+        os.close(write_fd)
+        message = os.read(read_fd, 64)
+        os.close(read_fd)
+        if not message:
+            time.sleep(timeout_seconds + 10)
+            os._exit(0)
+        target_pid = int(message.strip())
+        if target_pid < 1:
+            os._exit(0)
+        deadline = time.monotonic() + timeout_seconds + 10
+        while time.monotonic() < deadline:
+            try:
+                os.kill(target_pid, 0)
+            except ProcessLookupError:
+                break
+            except PermissionError:
+                pass
+            time.sleep(0.05)
+    except BaseException:
+        time.sleep(timeout_seconds + 10)
+    finally:
+        os.close(lock_fd)
+    os._exit(0)
+
+
 def run_wake(config: dict[str, Any], lock_fd: int) -> int:
     verified_executable = verify_wake_target(config)
     child = None
+    guard_pid, guard_write_fd = spawn_lock_guard(lock_fd, config["wake_timeout_seconds"])
+    guard_started = False
     output = bytearray()
     selector = selectors.DefaultSelector()
 
@@ -446,8 +480,11 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
         child = subprocess.Popen(
             config["wake_command"], cwd=config["repo"], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
-            executable=str(verified_executable), pass_fds=(lock_fd,), start_new_session=True,
+            executable=str(verified_executable), start_new_session=True,
         )
+        os.write(guard_write_fd, (str(child.pid) + "\n").encode())
+        os.close(guard_write_fd)
+        guard_started = True
         assert child.stdout is not None
         selector.register(child.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + config["wake_timeout_seconds"]
@@ -488,6 +525,14 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
         atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
         return code
     finally:
+        if not guard_started:
+            try:
+                os.write(guard_write_fd, b"0\n")
+            except OSError:
+                pass
+            os.close(guard_write_fd)
+        if child is None or child.poll() is not None:
+            os.waitpid(guard_pid, 0)
         selector.close()
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)

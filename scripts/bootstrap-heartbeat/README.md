@@ -61,8 +61,9 @@ Installation rejects executable symlinks up front rather than accepting an unusa
   writable, and are SHA-256 pinned at install time alongside the default SCD profile. Each wake
   executes a private snapshot copied from the already-verified executable descriptor, so a
   pathname replacement between verification and launch cannot change the executed bytes.
-- One advisory `flock` covers collection and the entire wake. Concurrent launchd fires observe the
-  lock and exit without creating another writer.
+- One advisory `flock` covers collection and the entire direct wake. A dedicated same-host guard
+  retains it if the supervisor dies, while the wake target and its background descendants never
+  inherit the descriptor. Concurrent launchd fires cannot create another writer.
 - Invalid lock metadata or unlocked metadata naming a live/unknown owner fails closed. Metadata for
   a provably exited PID can be recovered because the kernel lock has already been released.
 - A failed wake does not consume the changed fingerprint or reset the safety clock.

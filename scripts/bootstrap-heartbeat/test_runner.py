@@ -42,6 +42,12 @@ class HeartbeatTest(unittest.TestCase):
             "with pathlib.Path(os.environ['MOCK_WAKE_CALLS']).open('a') as f: "
             "f.write(json.dumps({'args': sys.argv[1:]}) + '\\n')\n"
             "print('x' * int(os.environ.get('MOCK_WAKE_OUTPUT', '0')))\n"
+            "background = float(os.environ.get('MOCK_WAKE_BACKGROUND_SLEEP', '0'))\n"
+            "if background:\n"
+            "    pid = os.fork()\n"
+            "    if pid == 0:\n"
+            "        os.close(1); os.close(2); time.sleep(background); os._exit(0)\n"
+            "    pathlib.Path(os.environ['MOCK_WAKE_BACKGROUND_PID']).write_text(str(pid))\n"
             "time.sleep(float(os.environ.get('MOCK_WAKE_SLEEP', '0')))\n"
             "sys.exit(int(os.environ.get('MOCK_WAKE_EXIT', '0')))\n",
             encoding="utf-8",
@@ -66,6 +72,7 @@ class HeartbeatTest(unittest.TestCase):
             "SCD_HEARTBEAT_TEST_NOW": "1000",
             "MOCK_GH_PAYLOAD": str(self.payload),
             "MOCK_WAKE_CALLS": str(self.calls),
+            "MOCK_WAKE_BACKGROUND_PID": str(self.root / "background.pid"),
         })
         self.write_config()
 
@@ -330,6 +337,27 @@ class HeartbeatTest(unittest.TestCase):
         time.sleep(2.1)
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
         self.assertEqual(len(self.records()), 2, "runner may recover only after the child exits")
+
+    def test_wake_descendant_cannot_retain_lock_after_direct_child_exits(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        background_pid_path = self.root / "background.pid"
+        background = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_BACKGROUND_SLEEP="5")
+        self.invoke("run", env=background)
+        background_pid = int(background_pid_path.read_text(encoding="utf-8"))
+        try:
+            os.kill(background_pid, 0)
+            self.write_payload("C")
+            self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+            self.assertEqual(
+                len(self.records()), 2,
+                "a background descendant must not retain the single-writer lock",
+            )
+        finally:
+            try:
+                os.kill(background_pid, 9)
+            except ProcessLookupError:
+                pass
 
     def test_stalled_wake_times_out_without_consuming_change(self) -> None:
         self.invoke("run", "--prime")
