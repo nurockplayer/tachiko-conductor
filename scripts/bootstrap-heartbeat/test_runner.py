@@ -338,6 +338,35 @@ class HeartbeatTest(unittest.TestCase):
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
         self.assertEqual(len(self.records()), 2, "runner may recover only after the child exits")
 
+    def test_lock_guard_enforces_timeout_after_supervisor_is_killed(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_timeout_seconds"] = 1
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        sleeping = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_SLEEP="10")
+        first = subprocess.Popen([sys.executable, str(RUNNER), "run"], env=sleeping)
+        deadline = time.time() + 5
+        while len(self.records()) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(self.records()), 1, "first wake target must have started")
+        first.kill()
+        first.wait(timeout=5)
+        self.invoke("run", "--verbose", env=sleeping)
+        self.assertEqual(len(self.records()), 1, "guard must retain the lock after supervisor death")
+
+        deadline = time.time() + 7
+        while time.time() < deadline:
+            self.invoke("run", "--verbose", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+            if len(self.records()) == 2:
+                break
+            time.sleep(0.1)
+        self.assertEqual(
+            len(self.records()), 2,
+            "guard must terminate the timed-out direct target before releasing the lock",
+        )
+
     def test_wake_descendant_cannot_retain_lock_after_direct_child_exits(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")

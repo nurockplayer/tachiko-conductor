@@ -408,6 +408,18 @@ def verify_wake_target(config: dict[str, Any]) -> Path:
         os.close(executable_fd)
 
 
+def linux_process_identity(pid: int) -> tuple[str, str] | None:
+    try:
+        raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+        return None
+    closing = raw.rfind(")")
+    fields = raw[closing + 2:].split() if closing >= 0 else []
+    if len(fields) < 20:
+        return None
+    return fields[0], fields[19]
+
+
 def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
     read_fd, write_fd = os.pipe()
     guard_pid = os.fork()
@@ -419,19 +431,39 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
         message = os.read(read_fd, 64)
         os.close(read_fd)
         if not message:
-            time.sleep(timeout_seconds + 10)
             os._exit(0)
         target_pid = int(message.strip())
         if target_pid < 1:
             os._exit(0)
-        deadline = time.monotonic() + timeout_seconds + 10
-        while time.monotonic() < deadline:
+        initial_linux_identity = linux_process_identity(target_pid) if Path("/proc").is_dir() else None
+        deadline = time.monotonic() + timeout_seconds
+        terminate_deadline: float | None = None
+        killed = False
+        while True:
+            if initial_linux_identity is not None:
+                current_identity = linux_process_identity(target_pid)
+                if (current_identity is None or current_identity[0] == "Z"
+                        or current_identity[1] != initial_linux_identity[1]):
+                    break
             try:
                 os.kill(target_pid, 0)
             except ProcessLookupError:
                 break
             except PermissionError:
                 pass
+            now = time.monotonic()
+            if terminate_deadline is None and now >= deadline:
+                try:
+                    os.killpg(target_pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                terminate_deadline = now + 5
+            elif terminate_deadline is not None and not killed and now >= terminate_deadline:
+                try:
+                    os.killpg(target_pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                killed = True
             time.sleep(0.05)
     except BaseException:
         time.sleep(timeout_seconds + 10)
@@ -477,12 +509,17 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
     try:
         environment = os.environ.copy()
         environment.update(config.get("wake_env", {}))
+
+        def publish_guard_pid() -> None:
+            os.write(guard_write_fd, (str(os.getpid()) + "\n").encode())
+            os.close(guard_write_fd)
+
         child = subprocess.Popen(
             config["wake_command"], cwd=config["repo"], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
             executable=str(verified_executable), start_new_session=True,
+            pass_fds=(guard_write_fd,), preexec_fn=publish_guard_pid,
         )
-        os.write(guard_write_fd, (str(child.pid) + "\n").encode())
         os.close(guard_write_fd)
         guard_started = True
         assert child.stdout is not None
