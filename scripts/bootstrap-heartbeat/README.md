@@ -41,11 +41,17 @@ After the native dispatcher is available, reinstall with an explicit command suc
 
 ```sh
 scripts/bootstrap-heartbeat/install.sh \
-  --wake-command-json '["/absolute/path/to/tachiko","dispatch","once"]'
+  --acknowledge-relocatable-wake-target \
+  --wake-command-json '["/absolute/path/to/node","/absolute/path/to/tachiko-conductor/dist/cli.js","dispatch","once"]' \
+  --required-file /absolute/path/to/tachiko-conductor/dist/cli.js
 ```
 
 That changes only the launcher boundary. Fingerprinting, wake policy, lock, state, and LaunchAgent
-remain unchanged.
+remain unchanged. The acknowledgement is required because wake execution uses a private verified
+snapshot: only the first argv entry must be relocation-safe. Location-dependent CLI scripts remain
+at their original path by running them as an argument to a relocation-safe interpreter, as in the
+future `tachiko dispatch once` example above; `--required-file` pins and validates that entry file.
+Installation rejects executable symlinks up front rather than accepting an unusable configuration.
 
 ## Fail-closed behavior
 

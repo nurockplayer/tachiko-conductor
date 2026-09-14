@@ -83,6 +83,7 @@ class HeartbeatTest(unittest.TestCase):
             "poll_timeout_seconds": 60,
             "wake_timeout_seconds": 1500,
             "safety_interval_seconds": safety,
+            "wake_executable_relocatable": True,
             "wake_command": [str(self.wake), "dispatchable-target"],
             "wake_env": {},
             "required_files": [{
@@ -396,7 +397,7 @@ class HeartbeatTest(unittest.TestCase):
         command = json.dumps([str(self.wake), "future-dispatch-once"])
         args = (
             "--repo", str(Path.cwd()), "--interval", "180", "--safety-interval", "1800",
-            "--wake-command-json", command, "--no-load",
+            "--wake-command-json", command, "--acknowledge-relocatable-wake-target", "--no-load",
         )
         self.invoke("install", *args)
         before = (self.state_root / "state.json").read_bytes()
@@ -477,11 +478,64 @@ class HeartbeatTest(unittest.TestCase):
     def test_custom_install_pins_wake_executable_identity(self) -> None:
         config_path = self.state_root / "config.json"
         command = json.dumps([str(self.wake), "pinned-target"])
-        self.invoke("install", "--repo", str(Path.cwd()), "--wake-command-json", command, "--no-load")
+        self.invoke(
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load",
+        )
         config = json.loads(config_path.read_text(encoding="utf-8"))
         self.assertIn({
             "path": str(self.wake), "sha256": hashlib.sha256(self.wake.read_bytes()).hexdigest()
         }, config["required_files"])
+
+    def test_custom_install_rejects_location_dependent_or_symlink_target(self) -> None:
+        command = json.dumps([str(self.wake), "target"])
+        result = self.invoke(
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--no-load", check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("requires --acknowledge-relocatable-wake-target", result.stderr)
+
+        link = self.root / "wake-link"
+        link.symlink_to(self.wake)
+        result = self.invoke(
+            "install", "--repo", str(Path.cwd()),
+            "--wake-command-json", json.dumps([str(link)]),
+            "--acknowledge-relocatable-wake-target", "--no-load", check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("custom wake executable unavailable", result.stderr)
+
+    def test_location_dependent_target_runs_as_pinned_original_path_argument(self) -> None:
+        interpreter = self.root / "relocation-safe-interpreter"
+        interpreter.write_text(
+            "#!/usr/bin/python3\nimport runpy, sys\nsys.argv = sys.argv[1:]\n"
+            "runpy.run_path(sys.argv[0], run_name='__main__')\n",
+            encoding="utf-8",
+        )
+        interpreter.chmod(0o700)
+        cli = self.root / "location-dependent-cli.py"
+        cli.write_text(
+            "import json, os, pathlib, sys\n"
+            "with pathlib.Path(os.environ['MOCK_WAKE_CALLS']).open('a') as stream:\n"
+            "    stream.write(json.dumps({'args': sys.argv[1:]}) + '\\n')\n",
+            encoding="utf-8",
+        )
+        cli.chmod(0o600)
+        command = json.dumps([str(interpreter), str(cli), "dispatch", "once"])
+        self.invoke(
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--required-file", str(cli),
+            "--no-load",
+        )
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        self.assertIn({
+            "path": str(cli), "sha256": hashlib.sha256(cli.read_bytes()).hexdigest()
+        }, config["required_files"])
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.invoke("run")
+        self.assertEqual(self.records()[-1]["args"], ["dispatch", "once"])
 
     def test_root_owned_pinned_wake_executable_is_trusted(self) -> None:
         system_true = Path("/usr/bin/true")

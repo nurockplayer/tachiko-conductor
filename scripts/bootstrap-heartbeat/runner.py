@@ -244,6 +244,8 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("invalid wake_timeout_seconds")
     if type(config.get("safety_interval_seconds")) is not int or config["safety_interval_seconds"] < 1:
         raise RuntimeError("invalid safety_interval_seconds")
+    if config.get("wake_executable_relocatable") is not True:
+        raise RuntimeError("wake executable must be explicitly relocation-safe")
     command = config.get("wake_command")
     if not isinstance(command, list) or not command or not all(isinstance(item, str) and item for item in command):
         raise RuntimeError("invalid wake_command")
@@ -646,6 +648,11 @@ def install(args: argparse.Namespace) -> int:
     if args.interval < 1 or args.safety_interval < 1:
         raise RuntimeError("intervals must be positive")
     if args.wake_command_json:
+        if not args.acknowledge_relocatable_wake_target:
+            raise RuntimeError(
+                "custom wake target requires --acknowledge-relocatable-wake-target; "
+                "scripts and binaries that depend on their executable location are unsupported"
+            )
         try:
             wake_command = json.loads(args.wake_command_json)
         except json.JSONDecodeError as error:
@@ -654,12 +661,21 @@ def install(args: argparse.Namespace) -> int:
         if not isinstance(wake_command, list) or not wake_command or not isinstance(wake_command[0], str):
             raise RuntimeError("invalid --wake-command-json")
         wake_executable = Path(wake_command[0])
-        if not wake_executable.is_absolute() or not wake_executable.is_file():
+        if not wake_executable.is_absolute() or not wake_executable.is_file() or wake_executable.is_symlink():
             raise RuntimeError("custom wake executable unavailable")
         required_files = [{
             "path": str(wake_executable),
             "sha256": hashlib.sha256(wake_executable.read_bytes()).hexdigest(),
         }]
+        for required_name in args.required_file:
+            required_path = Path(required_name)
+            if not required_path.is_absolute() or not required_path.is_file() or required_path.is_symlink():
+                raise RuntimeError("custom required wake file unavailable: " + str(required_path))
+            if required_path.resolve() != wake_executable.resolve():
+                required_files.append({
+                    "path": str(required_path),
+                    "sha256": hashlib.sha256(required_path.read_bytes()).hexdigest(),
+                })
     else:
         wake_command, wake_env, required_files = default_wake(repo, Path(args.codex), Path(args.profile))
     config = validate_config({
@@ -667,11 +683,13 @@ def install(args: argparse.Namespace) -> int:
         "runner": str(runner), "poll_interval_seconds": args.interval,
         "poll_timeout_seconds": DEFAULT_POLL_TIMEOUT_SECONDS,
         "wake_timeout_seconds": DEFAULT_WAKE_TIMEOUT_SECONDS,
-        "safety_interval_seconds": args.safety_interval, "wake_command": wake_command,
+        "safety_interval_seconds": args.safety_interval,
+        "wake_executable_relocatable": True, "wake_command": wake_command,
         "wake_env": wake_env, "required_files": required_files, "installed_at": now_epoch(),
     })
     ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
     os.chmod(ROOT, 0o700)
+    verify_wake_target(config)
     prior = load_state() if STATE.exists() else {}
     atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())
     if not prior:
@@ -730,6 +748,8 @@ def parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--codex", default=str(DEFAULT_CODEX))
     install_parser.add_argument("--profile", default=str(DEFAULT_PROFILE))
     install_parser.add_argument("--wake-command-json")
+    install_parser.add_argument("--acknowledge-relocatable-wake-target", action="store_true")
+    install_parser.add_argument("--required-file", action="append", default=[])
     install_parser.add_argument("--no-load", action="store_true", help=argparse.SUPPRESS)
     uninstall_parser = subs.add_parser("uninstall")
     uninstall_parser.add_argument("--no-load", action="store_true", help=argparse.SUPPRESS)
