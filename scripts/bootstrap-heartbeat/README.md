@@ -20,7 +20,8 @@ scripts/bootstrap-heartbeat/uninstall.sh
 Installation defaults to a 180-second LaunchAgent interval and a 1,800-second safety interval.
 Each GitHub poll has a 60-second subprocess timeout so a stalled request cannot retain the lock
 forever. The bounded GraphQL projection rejects truncation and any GitHub-reported query cost over
-100 points, keeping the 180-second schedule sustainable. Wake execution has a 1,500-second deadline; timeout terminates its isolated process
+100 points, keeping the 180-second schedule sustainable; each open PR includes at most 100 review
+threads so a long-lived lane stays observable without unbounded pagination. Wake execution has a 1,500-second deadline; timeout terminates its isolated process
 group and leaves the fingerprint unconsumed for retry. Exit zero alone is a re-entry boundary:
 the target must also print `TACHIKO_HEARTBEAT_SETTLED_V1` on its own final line to consume the
 fingerprint and reset the safety clock. Installation resolves `gh`, validates the audited ChatGPT-bundled Codex executable,

@@ -83,7 +83,7 @@ query TachikoConductorBootstrapHeartbeat {
           pageInfo { hasPreviousPage }
           nodes { databaseId author { login } state body submittedAt updatedAt commit { oid } }
         }
-        reviewThreads(first: 25) {
+        reviewThreads(first: 100) {
           pageInfo { hasNextPage }
           nodes {
             isResolved

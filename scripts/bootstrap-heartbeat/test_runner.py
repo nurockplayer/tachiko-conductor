@@ -95,6 +95,11 @@ class HeartbeatTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def test_query_budget_covers_long_lived_review_threads(self) -> None:
+        source = RUNNER.read_text(encoding="utf-8")
+        self.assertIn("reviewThreads(first: 100)", source)
+        self.assertIn("MAX_POLL_QUERY_COST = 100", source)
+
     def write_config(self, *, safety: int = 1800) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
         gh_digest = hashlib.sha256(self.gh.read_bytes()).hexdigest()
