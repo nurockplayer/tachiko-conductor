@@ -535,6 +535,30 @@ def process_group_has_live_members(process_group: int) -> bool | None:
     return False
 
 
+def process_identity(pid: int) -> str | None:
+    if Path("/proc").is_dir():
+        identity = linux_process_identity(pid)
+        if identity is None or identity[0] == "Z":
+            return None
+        return "linux-start:" + identity[1]
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-p", str(pid), "-o", "uid=,lstart=,command="],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=2, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("could not inspect lock owner process identity") from error
+    value = " ".join(result.stdout.split())
+    if result.returncode != 0:
+        if not value:
+            return None
+        raise RuntimeError("could not inspect lock owner process identity")
+    if not value:
+        return None
+    return "ps:" + value
+
+
 def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
     read_fd, write_fd = os.pipe()
     guard_pid = os.fork()
@@ -758,24 +782,29 @@ def acquire_lock(verbose: bool):
         try:
             metadata = json.loads(prior)
             pid = metadata["pid"]
-            if type(pid) is not int or pid < 1:
-                raise ValueError("invalid pid")
+            prior_identity = metadata["process_identity"]
+            if type(pid) is not int or pid < 1 or not isinstance(prior_identity, str) or not prior_identity:
+                raise ValueError("invalid lock owner identity")
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             stream.close()
             raise RuntimeError("ambiguous stale lock metadata; refusing wake") from error
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        current_identity = process_identity(pid)
+        if current_identity is None:
             log(f"recovered provably stale lock from exited pid {pid}")
-        except PermissionError as error:
-            stream.close()
-            raise RuntimeError("ambiguous stale lock owner; refusing wake") from error
+        elif current_identity != prior_identity:
+            log(f"recovered provably stale lock from reused pid {pid}")
         else:
             stream.close()
-            raise RuntimeError("ambiguous unlocked metadata names a live pid; refusing wake")
+            raise RuntimeError("ambiguous unlocked metadata names the same live process; refusing wake")
+    current_identity = process_identity(os.getpid())
+    if current_identity is None:
+        stream.close()
+        raise RuntimeError("could not establish current lock owner process identity")
     stream.seek(0)
     stream.truncate()
-    stream.write((json.dumps({"pid": os.getpid(), "acquired_at": now_epoch()}) + "\n").encode())
+    stream.write((json.dumps({
+        "pid": os.getpid(), "process_identity": current_identity, "acquired_at": now_epoch(),
+    }) + "\n").encode())
     stream.flush()
     os.fsync(stream.fileno())
     return stream

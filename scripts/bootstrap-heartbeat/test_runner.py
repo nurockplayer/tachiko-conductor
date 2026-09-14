@@ -403,9 +403,33 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(self.invoke("run", check=False).returncode, 1)
         self.assertEqual(len(self.records()), 1, "unlocked metadata naming live pid is ambiguous")
 
-        (self.state_root / "runner.lock").write_text('{"pid":999999}\n', encoding="utf-8")
+        (self.state_root / "runner.lock").write_text(
+            '{"pid":999999,"process_identity":"expired"}\n', encoding="utf-8"
+        )
         self.invoke("run")
         self.assertEqual(len(self.records()), 2, "provably exited stale owner may recover")
+
+    def test_poll_crash_recovers_from_reused_pid_identity(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        sleeping = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_GH_SLEEP="2")
+        first = subprocess.Popen([sys.executable, str(RUNNER), "run"], env=sleeping)
+        lock_path = self.state_root / "runner.lock"
+        deadline = time.time() + 5
+        metadata: dict[str, object] = {}
+        while time.time() < deadline:
+            raw = lock_path.read_text(encoding="utf-8")
+            if raw.strip():
+                metadata = json.loads(raw)
+                break
+            time.sleep(0.02)
+        self.assertIn("process_identity", metadata)
+        first.kill()
+        first.wait(timeout=5)
+        metadata["pid"] = os.getpid()
+        lock_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(len(self.records()), 1, "a reused PID with different identity must recover")
 
     def test_wake_child_keeps_lock_if_supervisor_is_killed(self) -> None:
         self.invoke("run", "--prime")

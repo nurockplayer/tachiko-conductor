@@ -70,7 +70,8 @@ there is no executable work. A successful process exit without that acknowledgem
 eligible for the next poll instead of sleeping until the safety interval.
 Install and uninstall acquire the same heartbeat flock as polling and wake execution. They fail
 closed while a poll or wake is active, so config, plist, and verified executable snapshots cannot
-be replaced concurrently.
+be replaced concurrently. Lock metadata includes the OS process-start identity, allowing a crash
+before wake-guard creation to recover from PID reuse without accepting an ambiguous same-process owner.
 
 ## Fail-closed behavior
 
