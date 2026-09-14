@@ -21,7 +21,7 @@ RUNNER = HERE / "runner.py"
 
 class HeartbeatTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(prefix="tachiko-conductor-heartbeat-")
+        self.temp = tempfile.TemporaryDirectory(prefix=".tachiko-conductor-heartbeat-", dir=Path.home())
         self.root = Path(self.temp.name)
         self.state_root = self.root / "state"
         self.payload = self.root / "payload.json"
