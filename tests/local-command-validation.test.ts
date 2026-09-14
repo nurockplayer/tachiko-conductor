@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -128,6 +128,31 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.ok(Number.isSafeInteger(pid));
     assert.throws(() => process.kill(pid, 0), (error: unknown) =>
       typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ESRCH');
+  });
+
+  it('classifies a Windows process-tree timeout as timed_out after taskkill settles it', async () => {
+    const owned = request();
+    const taskkillDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-taskkill-'));
+    dirs.push(taskkillDir);
+    const taskkill = path.join(taskkillDir, 'taskkill');
+    writeFileSync(taskkill, '#!/bin/sh\nkill -KILL "$2"\n', 'utf8');
+    chmodSync(taskkill, 0o755);
+    const originalPlatform = process.platform;
+    const originalPath = process.env.PATH;
+    Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' });
+    process.env.PATH = `${taskkillDir}${path.delimiter}${originalPath ?? ''}`;
+    try {
+      const result = await new ConfiguredLocalValidationAdapter(
+        configuration([process.execPath, '-e', 'setInterval(() => {}, 1_000)'], 100),
+      ).validate(owned);
+
+      assert.equal(result.status, 'failed');
+      assert.equal(result.commands[0]?.outcome, 'timed_out');
+    } finally {
+      Object.defineProperty(process, 'platform', { configurable: true, value: originalPlatform });
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
   });
 
   it('fails closed for malformed configuration and an unavailable executable', async () => {

@@ -12,7 +12,7 @@ import { applyTransition, isValidationFresh, validationEvidenceMatchesActive, ty
 import { isValidationResultCoherent } from '../domain/validation.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
-import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION } from '../domain/decisions.js';
+import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUEST_DECISION } from '../domain/decisions.js';
 import { parkBootstrapFailure } from '../workflow/bootstrap-failure.js';
 import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 
@@ -271,7 +271,7 @@ export async function runReviewLoop(
             type: 'escalate', reason,
             interrupt: {
               evidence: reason,
-              choices: ['Re-establish the accepted pull request and exact HEAD, then retry', CANCEL_RUN_DECISION],
+              choices: [RECOVER_LEGACY_PULL_REQUEST_DECISION, CANCEL_RUN_DECISION],
             },
           },
           now(),

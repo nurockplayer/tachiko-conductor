@@ -208,6 +208,47 @@ describe('C20 consolidation regressions', () => {
     assert.deepEqual(persisted?.pullRequest, { number: 7, headSha: NEXT_HEAD });
   });
 
+  it('recovers a legacy requested-change PR tuple during resume before dispatching its repair', async () => {
+    const dir = tempDir('tachiko-c20-legacy-requested-change-');
+    const legacy: Run = {
+      ...createRun(TARGET, T0, 'legacy-requested-change'),
+      state: 'CHANGES_REQUESTED',
+      headSha: HEAD,
+      agentResult: successResult(HEAD),
+      reviewResult: {
+        verdict: 'request_changes', reviewerName: 'legacy-reviewer', headSha: HEAD,
+        findings: [{ severity: 'blocking', summary: 'repair the legacy finding' }],
+      },
+      history: [{ type: 'changes_requested', from: 'REVIEWING', to: 'CHANGES_REQUESTED', at: T0 }],
+    };
+    const store = new JsonFileStore({ dir });
+    store.create(legacy);
+    const initial = await runWorkflow(
+      { store, github: new QueuedGitHub([]), implementation: new CapturingImplementation(), reviewer: unusedReviewer },
+      legacy.id,
+      { maxReviewAttempts: 2, now: () => T0 },
+    );
+    assert.equal(initial.outcome, 'needs_human');
+    const decision = initial.run.interrupt?.choices?.[0];
+    assert.equal(decision, 'Re-establish the accepted pull request and exact HEAD, then retry');
+
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run() { return { exitStatus: 'failure', summary: 'expected test stop' }; },
+    };
+    const resumed = await resumeCommand(
+      { store, github: new QueuedGitHub([liveSnapshot(HEAD), liveSnapshot(HEAD)]), implementation, reviewer: unusedReviewer },
+      legacy.id,
+      decision!,
+      { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(resumed.outcome, 'failed');
+    assert.equal(resumed.run.state, 'FAILED');
+    assert.deepEqual(resumed.run.pullRequest, { number: 7, headSha: HEAD });
+    assert.equal(resumed.run.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'CHANGES_REQUESTED'), true);
+  });
+
   it('F03 refuses a fresh-store validation repair when the accepted PR number changed at the same failing HEAD', async () => {
     const dir = tempDir('tachiko-c20-f03-pr-identity-');
     new JsonFileStore({ dir }).create(validationRepairRun('validation-restart-pr-identity'));

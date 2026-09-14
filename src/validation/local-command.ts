@@ -71,6 +71,25 @@ function terminateProcessGroup(pid: number | undefined, signal: NodeJS.Signals):
   }
 }
 
+async function terminateWindowsProcessTree(pid: number | undefined): Promise<boolean> {
+  if (pid === undefined) return false;
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (value: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(value);
+    };
+    const taskkill = spawn('taskkill', ['/pid', String(pid), '/t', '/f'], {
+      shell: false, stdio: 'ignore', windowsHide: true,
+    });
+    const timer = setTimeout(() => finish(false), TERMINATION_GRACE_MS);
+    taskkill.once('error', () => finish(false));
+    taskkill.once('close', (code) => finish(code === 0));
+  });
+}
+
 function processGroupHasSettled(pid: number | undefined): boolean {
   if (pid === undefined || process.platform === 'win32') return false;
   try {
@@ -114,6 +133,10 @@ async function execute(
     const settleTimedOutProcess = async (child: ReturnType<typeof spawn>): Promise<void> => {
       if (settling || settled) return;
       settling = true;
+      if (process.platform === 'win32') {
+        finish((await terminateWindowsProcessTree(child.pid)) ? 'timed_out' : 'unavailable', null);
+        return;
+      }
       terminateProcessGroup(child.pid, 'SIGKILL');
       // A child `close` event only proves the direct process exited.  For a
       // detached validation command, prove the owned group has no surviving
@@ -132,6 +155,10 @@ async function execute(
     }
     timer = setTimeout(() => {
       timedOut = true;
+      if (process.platform === 'win32') {
+        void settleTimedOutProcess(child);
+        return;
+      }
       if (!terminateProcessGroup(child.pid, 'SIGTERM')) child.kill('SIGTERM');
       forceTimer = setTimeout(() => {
         void settleTimedOutProcess(child);

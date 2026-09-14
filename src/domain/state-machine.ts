@@ -1,5 +1,6 @@
 import {
   LIVE_HEAD_SYNC_DECISION,
+  RECOVER_LEGACY_PULL_REQUEST_DECISION,
   REESTABLISH_READINESS_DECISION,
   canReestablishInterruptedReadiness,
   canSynchronizeInterruptedHead,
@@ -170,6 +171,15 @@ function isAuthorizedHumanHeadSync(run: Run, input: TransitionInput): boolean {
     canReestablishInterruptedReadiness(run.interruptedFrom) &&
     offered?.includes(REESTABLISH_READINESS_DECISION) === true
   );
+}
+
+function isAuthorizedLegacyPullRequestRecovery(run: Run, input: TransitionInput): boolean {
+  return input.type === 'human_resolved' &&
+    input.reason?.trim() === RECOVER_LEGACY_PULL_REQUEST_DECISION &&
+    run.state === 'NEEDS_HUMAN' &&
+    run.interruptedFrom === 'CHANGES_REQUESTED' &&
+    run.pullRequest === undefined &&
+    run.interrupt?.choices?.includes(RECOVER_LEGACY_PULL_REQUEST_DECISION) === true;
 }
 
 /** Whether a transition requires a result payload, and which kind. */
@@ -415,8 +425,9 @@ function assertPayload(
     }
   }
   const authorizedHumanHeadSync = isAuthorizedHumanHeadSync(run, input);
+  const authorizedLegacyPullRequestRecovery = isAuthorizedLegacyPullRequestRecovery(run, input);
   const validationOutcomeCarriesPullRequest = from === 'VALIDATING' && input.validationResult !== undefined;
-  if (input.pullRequest !== undefined && input.type !== 'agent_succeeded' && !validationOutcomeCarriesPullRequest && !authorizedHumanHeadSync) {
+  if (input.pullRequest !== undefined && input.type !== 'agent_succeeded' && !validationOutcomeCarriesPullRequest && !authorizedHumanHeadSync && !authorizedLegacyPullRequestRecovery) {
     throw new InvalidTransitionError('unexpected-payload', from, input.type, 'Pull request identity is only accepted with implementation success or validation.');
   }
   if (input.pullRequest !== undefined) {

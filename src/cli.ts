@@ -37,7 +37,9 @@ import { createRun } from './domain/run.js';
 import {
   CANCEL_RUN_DECISION,
   LIVE_HEAD_SYNC_DECISION,
+  RECOVER_LEGACY_PULL_REQUEST_DECISION,
   REESTABLISH_READINESS_DECISION,
+  canRecoverLegacyPullRequest,
   canReestablishInterruptedReadiness,
   canSynchronizeInterruptedHead,
 } from './domain/decisions.js';
@@ -599,24 +601,34 @@ export async function resumeCommand(
     canReestablishInterruptedReadiness(run.interruptedFrom) &&
     run.interrupt?.choices?.includes(REESTABLISH_READINESS_DECISION) === true &&
     run.target.kind === 'issue';
+  const recoverLegacyPullRequest =
+    decision.trim() === RECOVER_LEGACY_PULL_REQUEST_DECISION &&
+    run.state === 'NEEDS_HUMAN' &&
+    canRecoverLegacyPullRequest(run.interruptedFrom) &&
+    run.pullRequest === undefined &&
+    run.interrupt?.choices?.includes(RECOVER_LEGACY_PULL_REQUEST_DECISION) === true &&
+    run.target.kind === 'issue';
   const synchronizeLiveHead =
     (decision.trim() === LIVE_HEAD_SYNC_DECISION &&
     run.state === 'NEEDS_HUMAN' &&
     canSynchronizeInterruptedHead(run.interruptedFrom) &&
     run.interrupt?.choices?.includes(LIVE_HEAD_SYNC_DECISION) === true &&
     run.target.kind === 'issue') || reestablishReadiness;
-  if (synchronizeLiveHead && run.target.kind === 'issue') {
+  if ((synchronizeLiveHead || recoverLegacyPullRequest) && run.target.kind === 'issue') {
     const snapshot = await deps.github.readLiveSnapshot(run.target);
     if (snapshot.headSha === null || snapshot.pullRequest === null) {
       throw new Error(`Cannot synchronize run "${id}": its issue has no live pull request identity and exact HEAD.`);
     }
     const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
     if (conflict !== null) throw new Error(`Cannot synchronize run "${id}": ${conflict}`);
-    synchronizedHead = snapshot.headSha;
+    if (recoverLegacyPullRequest && snapshot.headSha !== run.headSha) {
+      throw new Error(`Cannot recover run "${id}": live GitHub HEAD does not match its legacy requested-change HEAD.`);
+    }
     // An explicit live-HEAD sync is an owned identity adoption. Even runs
     // without a bootstrap must carry the re-read PR tuple atomically so a
     // later reviewer cannot see an exact HEAD detached from its acceptance.
     synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
+    if (synchronizeLiveHead) synchronizedHead = snapshot.headSha;
   }
   const resumed = applyTransition(
     run,
