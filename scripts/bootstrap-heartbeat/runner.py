@@ -273,11 +273,17 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     required = config.get("required_files", [])
     if not isinstance(required, list):
         raise RuntimeError("invalid required_files")
+    installed_names: set[str] = set()
     for item in required:
         if not isinstance(item, dict) or not isinstance(item.get("path"), str) or not Path(item["path"]).is_absolute():
             raise RuntimeError("invalid required file")
         if not isinstance(item.get("sha256"), str):
             raise RuntimeError("invalid required file digest")
+        installed_name = item.get("installed_name")
+        if installed_name is not None:
+            if installed_name != "codex-code-mode-host" or installed_name in installed_names:
+                raise RuntimeError("invalid required companion name")
+            installed_names.add(installed_name)
     return config
 
 
@@ -417,6 +423,11 @@ def verify_wake_target(config: dict[str, Any]) -> Path:
                     raise RuntimeError("required wake file unavailable or unsafe: " + str(path))
                 if fd_sha256(required_fd) != required["sha256"]:
                     raise RuntimeError("required wake file identity changed: " + str(path))
+                installed_name = required.get("installed_name")
+                if installed_name is not None:
+                    if not metadata.st_mode & 0o111:
+                        raise RuntimeError("required wake companion is not executable: " + str(path))
+                    materialize_verified_executable(required_fd, installed_name)
             finally:
                 os.close(required_fd)
         if not executable_pinned:
@@ -926,6 +937,9 @@ def launch_path() -> str:
 def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dict[str, str], list[dict[str, str]]]:
     if not codex.is_file() or not os.access(codex, os.X_OK):
         raise RuntimeError("audited Codex executable unavailable: " + str(codex))
+    companion = codex.with_name("codex-code-mode-host")
+    if not companion.is_file() or companion.is_symlink() or not os.access(companion, os.X_OK):
+        raise RuntimeError("audited Codex code-mode companion unavailable: " + str(companion))
     if not profile.is_file() or profile.is_symlink():
         raise RuntimeError("SCD profile unavailable or unsafe: " + str(profile))
     metadata = profile.stat()
@@ -939,6 +953,10 @@ def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dic
     ]
     required_files = [
         {"path": str(codex), "sha256": hashlib.sha256(codex.read_bytes()).hexdigest()},
+        {
+            "path": str(companion), "sha256": hashlib.sha256(companion.read_bytes()).hexdigest(),
+            "installed_name": "codex-code-mode-host",
+        },
         {"path": str(profile), "sha256": digest},
     ]
     return command, {"CODEX_HOME": str(profile.parent)}, required_files

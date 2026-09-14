@@ -39,6 +39,9 @@ class HeartbeatTest(unittest.TestCase):
         self.wake.write_text(
             "#!/usr/bin/python3\n"
             "import json, os, pathlib, sys, time\n"
+            "if os.environ.get('MOCK_WAKE_REQUIRE_COMPANION') == '1':\n"
+            "    companion = pathlib.Path(os.environ['SCD_HEARTBEAT_TEST_ROOT']) / 'codex-code-mode-host'\n"
+            "    if companion.read_text() != 'trusted companion\\n': sys.exit(86)\n"
             "with pathlib.Path(os.environ['MOCK_WAKE_CALLS']).open('a') as f: "
             "f.write(json.dumps({'args': sys.argv[1:]}) + '\\n')\n"
             "print('x' * int(os.environ.get('MOCK_WAKE_OUTPUT', '0')))\n"
@@ -858,6 +861,54 @@ class HeartbeatTest(unittest.TestCase):
             self.records()[-1]["args"], ["verified-snapshot"],
             "execution must stay bound to the verified bytes, not the replaced pathname",
         )
+
+    def test_verified_wake_materializes_pinned_adjacent_companion(self) -> None:
+        companion = self.root / "source-code-mode-host"
+        companion.write_text("trusted companion\n", encoding="utf-8")
+        companion.chmod(0o700)
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_env"] = {"MOCK_WAKE_REQUIRE_COMPANION": "1"}
+        config["required_files"].append({
+            "path": str(companion), "sha256": hashlib.sha256(companion.read_bytes()).hexdigest(),
+            "installed_name": "codex-code-mode-host",
+        })
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.invoke("run")
+
+        installed = self.state_root / "codex-code-mode-host"
+        self.assertEqual(installed.read_text(encoding="utf-8"), "trusted companion\n")
+        self.assertEqual(self.records()[-1]["args"], ["dispatchable-target"])
+
+    def test_replaced_adjacent_companion_fails_closed(self) -> None:
+        companion = self.root / "source-code-mode-host"
+        companion.write_text("trusted companion\n", encoding="utf-8")
+        companion.chmod(0o700)
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["required_files"].append({
+            "path": str(companion), "sha256": hashlib.sha256(companion.read_bytes()).hexdigest(),
+            "installed_name": "codex-code-mode-host",
+        })
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        companion.write_text("replaced companion\n", encoding="utf-8")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+        self.assertEqual(self.records(), [])
+
+    def test_adjacent_companion_name_is_fixed_and_cannot_escape_state_root(self) -> None:
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["required_files"][0]["installed_name"] = "../untrusted-host"
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.write_payload("B")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+        self.assertEqual(self.records(), [])
 
     def test_custom_install_pins_wake_executable_identity(self) -> None:
         config_path = self.state_root / "config.json"
