@@ -108,7 +108,11 @@ describe('state machine — happy path', () => {
     let run = newRun();
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult() }, T0);
-    run = applyTransition(run, { type: 'validation_failed', validationResult: validationFailed() }, T0);
+    run = applyTransition(
+      run,
+      { type: 'validation_failed', validationResult: validationFailed(), pullRequest: { number: 7, headSha: 'sha-1' } },
+      T0,
+    );
     assert.equal(run.state, 'CHANGES_REQUESTED');
   });
 

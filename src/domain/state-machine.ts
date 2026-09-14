@@ -376,9 +376,16 @@ function assertPayload(
   }
   if (input.validationResult !== undefined) {
     assertValidationResult(run, input.validationResult, from, input.type);
-    const acceptedPullRequestNumber = input.pullRequest?.number ?? run.pullRequest?.number;
-    if (acceptedPullRequestNumber !== undefined &&
-      input.validationResult.hosted.pullRequestNumber !== acceptedPullRequestNumber) {
+    const acceptedPullRequest = input.pullRequest ?? run.pullRequest;
+    if (acceptedPullRequest === undefined || acceptedPullRequest.headSha !== run.headSha) {
+      throw new InvalidTransitionError(
+        'missing-payload',
+        from,
+        input.type,
+        'Validation evidence requires an accepted pull request bound to the run\'s exact HEAD.',
+      );
+    }
+    if (input.validationResult.hosted.pullRequestNumber !== acceptedPullRequest.number) {
       throw new InvalidTransitionError(
         'invalid-validation-result',
         from,

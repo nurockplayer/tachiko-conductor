@@ -75,7 +75,11 @@ describe('JsonFileStore — persistence round-trips', () => {
     const first = new JsonFileStore({ dir });
     let run = applyTransition(newRun('validation-ledger'), { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('sha-validation') }, T0);
-    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('sha-validation') }, T0);
+    run = applyTransition(
+      run,
+      { type: 'validation_passed', validationResult: validationPassed('sha-validation'), pullRequest: { number: 7, headSha: 'sha-validation' } },
+      T0,
+    );
     first.create(run);
 
     const loaded = new JsonFileStore({ dir }).read('validation-ledger');
