@@ -576,11 +576,35 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
         os.close(guard_write_fd)
         guard_started = True
         assert child.stdout is not None
+        os.set_blocking(child.stdout.fileno(), False)
         selector.register(child.stdout, selectors.EVENT_READ)
         deadline = time.monotonic() + config["wake_timeout_seconds"]
         timed_out = False
+
+        def remember(chunk: bytes) -> None:
+            output.extend(chunk)
+            if len(output) > MAX_WAKE_LOG:
+                del output[:-MAX_WAKE_LOG]
+
+        def drain_buffered_tail() -> None:
+            # Direct-child exit guarantees its own writes reached the pipe, but
+            # descendants may keep the descriptor open. Drain only bytes already
+            # available, with explicit time/volume bounds, and never wait for EOF.
+            drain_deadline = time.monotonic() + 0.05
+            drained = 0
+            while drained < MAX_WAKE_LOG * 2 and time.monotonic() < drain_deadline:
+                try:
+                    chunk = os.read(child.stdout.fileno(), 64 * 1024)
+                except BlockingIOError:
+                    break
+                if not chunk:
+                    break
+                drained += len(chunk)
+                remember(chunk)
+
         while True:
             if child.poll() is not None:
+                drain_buffered_tail()
                 break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -595,15 +619,14 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
             for key, _mask in selector.select(min(remaining, 0.1)):
                 chunk = os.read(key.fileobj.fileno(), 64 * 1024)
                 if chunk:
-                    output.extend(chunk)
-                    if len(output) > MAX_WAKE_LOG:
-                        del output[:-MAX_WAKE_LOG]
+                    remember(chunk)
                 else:
                     selector.unregister(key.fileobj)
             # The direct target defines completion. A detached descendant may
             # legitimately keep inherited output descriptors open; waiting for
             # pipe EOF would turn a successful direct exit into a false timeout.
             if child.poll() is not None:
+                drain_buffered_tail()
                 break
         if timed_out:
             signal_group(signal.SIGTERM)

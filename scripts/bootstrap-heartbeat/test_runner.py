@@ -258,6 +258,23 @@ class HeartbeatTest(unittest.TestCase):
             "the exact marker as final non-empty line must settle",
         )
 
+    def test_fast_exit_and_large_output_tail_preserve_final_settled_marker(self) -> None:
+        self.invoke("run", "--prime")
+        for index, output_size in enumerate((0, 700 * 1024), start=1):
+            with self.subTest(output_size=output_size):
+                self.write_payload(f"tail-{index}")
+                environment = dict(
+                    self.env,
+                    SCD_HEARTBEAT_TEST_NOW=str(1000 + index),
+                    MOCK_WAKE_OUTPUT=str(output_size),
+                )
+                self.assertEqual(self.invoke("run", env=environment).returncode, 0)
+                self.assertEqual(
+                    self.state()["successful_fingerprint"],
+                    self.state()["last_attempt_fingerprint"],
+                    "the final marker must be drained and committed after direct exit",
+                )
+
     def test_ordinary_execution_comment_edit_is_meaningful(self) -> None:
         self.invoke("run", "--prime")
         data = json.loads(self.payload.read_text(encoding="utf-8"))
