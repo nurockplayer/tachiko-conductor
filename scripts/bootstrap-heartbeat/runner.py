@@ -318,7 +318,7 @@ def verify_wake_target(config: dict[str, Any]) -> None:
             raise RuntimeError("required wake file identity changed: " + str(path))
 
 
-def run_wake(config: dict[str, Any]) -> int:
+def run_wake(config: dict[str, Any], lock_fd: int) -> int:
     verify_wake_target(config)
     child = None
     output = bytearray()
@@ -335,6 +335,7 @@ def run_wake(config: dict[str, Any]) -> int:
         child = subprocess.Popen(
             config["wake_command"], cwd=config["repo"], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
+            pass_fds=(lock_fd,),
         )
         assert child.stdout is not None
         while True:
@@ -437,7 +438,9 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
                        last_attempt_exit=-1, last_attempt_reason=reason)
         save_state(attempt)
         log("waking target: " + reason)
-        code = run_wake(config)
+        # The child retains the flock if this supervisor is killed. A replacement
+        # runner therefore cannot overlap an orphaned wake target on this host.
+        code = run_wake(config, lock_stream.fileno())
         attempt["last_attempt_exit"] = code
         if code:
             save_state(attempt)

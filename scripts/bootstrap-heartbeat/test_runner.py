@@ -250,6 +250,28 @@ class HeartbeatTest(unittest.TestCase):
         self.invoke("run")
         self.assertEqual(len(self.records()), 2, "provably exited stale owner may recover")
 
+    def test_wake_child_keeps_lock_if_supervisor_is_killed(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        sleeping = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_SLEEP="2")
+        first = subprocess.Popen([sys.executable, str(RUNNER), "run"], env=sleeping)
+        deadline = time.time() + 5
+        while len(self.records()) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(self.records()), 1, "first wake target must have started")
+
+        first.kill()
+        first.wait(timeout=5)
+        self.invoke("run", "--verbose", env=sleeping)
+        self.assertEqual(
+            len(self.records()), 1,
+            "orphaned wake child must retain the lock after supervisor death",
+        )
+
+        time.sleep(2.1)
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(len(self.records()), 2, "runner may recover only after the child exits")
+
     def test_poll_and_config_fail_closed_and_logs_are_bounded(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B", truncated=True)
