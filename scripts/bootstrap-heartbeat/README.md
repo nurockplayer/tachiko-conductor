@@ -30,6 +30,8 @@ The resolved `gh` executable is opened and checked for root/current-user ownersh
 permissions during installation, then copied from that verified descriptor into a digest-named,
 mode-0700 snapshot in the private state directory. Polls execute those pinned bytes rather than
 reopening a replaceable Homebrew path; a successful reinstall prunes older digest snapshots.
+Installation updates config, plist, pinned snapshots, and the loaded service as one rollback-capable
+operation; an activation failure restores the previous installed files and loaded service.
 
 State and bounded logs live in
 `~/Library/Application Support/io.tachiko.conductor.scd-heartbeat/`; the generated plist lives

@@ -63,7 +63,14 @@ class HeartbeatTest(unittest.TestCase):
         self.launchctl.write_text(
             "#!/bin/sh\n"
             "if [ \"${1:-}\" = print ]; then echo 'mock launch agent loaded'; exit 0; fi\n"
-            "if [ \"${1:-}\" = bootout ]; then echo 'Could not find specified service' >&2; exit 3; fi\n"
+            "if [ \"${1:-}\" = bootout ]; then\n"
+            "  if [ \"${MOCK_LAUNCHCTL_LOADED:-}\" = 1 ]; then exit 0; fi\n"
+            "  echo 'Could not find specified service' >&2; exit 3\n"
+            "fi\n"
+            "if [ \"${1:-}\" = bootstrap ] && [ \"${MOCK_LAUNCHCTL_FAIL_ONCE:-}\" = 1 ] && "
+            "[ ! -e \"${MOCK_LAUNCHCTL_FAIL_MARKER}\" ]; then\n"
+            "  : > \"${MOCK_LAUNCHCTL_FAIL_MARKER}\"; exit 9\n"
+            "fi\n"
             "exit 0\n",
             encoding="utf-8",
         )
@@ -81,6 +88,7 @@ class HeartbeatTest(unittest.TestCase):
             "MOCK_GH_PAYLOAD": str(self.payload),
             "MOCK_WAKE_CALLS": str(self.calls),
             "MOCK_WAKE_BACKGROUND_PID": str(self.root / "background.pid"),
+            "MOCK_LAUNCHCTL_FAIL_MARKER": str(self.root / "launchctl-failed-once"),
         })
         self.write_config()
 
@@ -717,6 +725,41 @@ class HeartbeatTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 1)
         self.assertEqual(list(self.state_root.glob("verified-gh-*")), snapshots_before)
+
+    def test_failed_activation_restores_previous_install_transaction(self) -> None:
+        original_command = json.dumps([str(self.wake), "original"])
+        self.invoke(
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", original_command,
+            "--acknowledge-relocatable-wake-target", "--no-load",
+        )
+        before = {
+            "config": (self.state_root / "config.json").read_bytes(),
+            "state": (self.state_root / "state.json").read_bytes(),
+            "plist": self.plist.read_bytes(),
+            "snapshots": sorted(path.name for path in self.state_root.glob("verified-gh-*")),
+        }
+        upgraded_gh = self.root / "upgraded-gh"
+        upgraded_gh.write_bytes(self.gh.read_bytes() + b"# upgraded\n")
+        upgraded_gh.chmod(0o700)
+        alternate = self.root / "alternate-transaction-wake"
+        alternate.write_text("#!/bin/sh\nprintf 'TACHIKO_HEARTBEAT_SETTLED_V1\\n'\n", encoding="utf-8")
+        alternate.chmod(0o700)
+        environment = dict(
+            self.env, SCD_HEARTBEAT_TEST_GH=str(upgraded_gh),
+            MOCK_LAUNCHCTL_LOADED="1", MOCK_LAUNCHCTL_FAIL_ONCE="1",
+        )
+        result = self.invoke(
+            "install", "--repo", str(Path.cwd()),
+            "--wake-command-json", json.dumps([str(alternate)]),
+            "--acknowledge-relocatable-wake-target", env=environment, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual((self.state_root / "config.json").read_bytes(), before["config"])
+        self.assertEqual((self.state_root / "state.json").read_bytes(), before["state"])
+        self.assertEqual(self.plist.read_bytes(), before["plist"])
+        self.assertEqual(
+            sorted(path.name for path in self.state_root.glob("verified-gh-*")), before["snapshots"]
+        )
 
     def test_required_wake_identity_fails_closed(self) -> None:
         self.invoke("run", "--prime")

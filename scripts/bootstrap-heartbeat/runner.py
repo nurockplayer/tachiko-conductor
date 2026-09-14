@@ -450,6 +450,14 @@ def prune_stale_github_snapshots(current: Path) -> None:
             candidate.unlink()
 
 
+def restore_optional_file(path: Path, previous: bytes | None) -> None:
+    if previous is None:
+        if path.exists():
+            path.unlink()
+    else:
+        atomic_write(path, previous)
+
+
 def linux_process_identity(pid: int) -> tuple[str, str] | None:
     try:
         raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
@@ -938,9 +946,14 @@ def install(args: argparse.Namespace) -> int:
     }
     target = plist_path()
     lock_stream = acquire_operator_lock("install")
+    previous_config = CONFIG.read_bytes() if CONFIG.exists() else None
+    previous_state = STATE.read_bytes() if STATE.exists() else None
+    previous_plist = target.read_bytes() if target.exists() else None
     gh_snapshot: Path | None = None
     gh_snapshot_created = False
-    config_committed = False
+    service_transitioned = False
+    previous_service_loaded = False
+    domain = f"gui/{os.getuid()}"
     try:
         gh_snapshot, gh_digest, gh_snapshot_created = pin_github_tool(gh_source)
         config_values.update(gh=str(gh_snapshot), gh_sha256=gh_digest)
@@ -948,21 +961,38 @@ def install(args: argparse.Namespace) -> int:
         verify_wake_target(config)
         prior = load_state() if STATE.exists() else {}
         atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())
-        config_committed = True
-        prune_stale_github_snapshots(gh_snapshot)
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write(target, plistlib.dumps(plist, fmt=plistlib.FMT_XML))
+        if not args.no_load:
+            previous_service_loaded = bootout_if_loaded(domain)
+            service_transitioned = True
+            launchctl("bootstrap", domain, str(target))
         if not prior:
             prime(config, "first install")
         else:
             log("preserved valid successful state across reinstall")
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        atomic_write(target, plistlib.dumps(plist, fmt=plistlib.FMT_XML))
-        if not args.no_load:
-            domain = f"gui/{os.getuid()}"
-            bootout_if_loaded(domain)
-            launchctl("bootstrap", domain, str(target))
-    except Exception:
-        if gh_snapshot_created and not config_committed and gh_snapshot is not None and gh_snapshot.exists():
-            gh_snapshot.unlink()
+        prune_stale_github_snapshots(gh_snapshot)
+    except Exception as error:
+        rollback_errors: list[str] = []
+        for path, previous in ((CONFIG, previous_config), (STATE, previous_state), (target, previous_plist)):
+            try:
+                restore_optional_file(path, previous)
+            except OSError as rollback_error:
+                rollback_errors.append(f"restore {path}: {rollback_error}")
+        if gh_snapshot_created and gh_snapshot is not None and gh_snapshot.exists():
+            try:
+                gh_snapshot.unlink()
+            except OSError as rollback_error:
+                rollback_errors.append(f"remove {gh_snapshot}: {rollback_error}")
+        if service_transitioned:
+            try:
+                bootout_if_loaded(domain)
+                if previous_service_loaded and previous_plist is not None:
+                    launchctl("bootstrap", domain, str(target))
+            except (OSError, subprocess.SubprocessError, RuntimeError) as rollback_error:
+                rollback_errors.append("restore launch service: " + str(rollback_error))
+        if rollback_errors:
+            raise RuntimeError(str(error) + "; rollback failed: " + "; ".join(rollback_errors)) from error
         raise
     finally:
         release_lock(lock_stream)
