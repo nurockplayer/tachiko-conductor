@@ -48,7 +48,9 @@ class HeartbeatTest(unittest.TestCase):
             "    if pid == 0:\n"
             "        if os.environ.get('MOCK_WAKE_BACKGROUND_IGNORE_TERM') == '1':\n"
             "            import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-            "        os.close(1); os.close(2); time.sleep(background); os._exit(0)\n"
+            "        if os.environ.get('MOCK_WAKE_BACKGROUND_KEEP_OUTPUT') != '1':\n"
+            "            os.close(1); os.close(2)\n"
+            "        time.sleep(background); os._exit(0)\n"
             "    pathlib.Path(os.environ['MOCK_WAKE_BACKGROUND_PID']).write_text(str(pid))\n"
             "time.sleep(float(os.environ.get('MOCK_WAKE_SLEEP', '0')))\n"
             "sys.exit(int(os.environ.get('MOCK_WAKE_EXIT', '0')))\n",
@@ -417,6 +419,33 @@ class HeartbeatTest(unittest.TestCase):
                 len(self.records()), 2,
                 "a background descendant must not retain the single-writer lock",
             )
+        finally:
+            try:
+                os.kill(background_pid, 9)
+            except ProcessLookupError:
+                pass
+
+    def test_direct_exit_does_not_wait_for_descendant_output_eof(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_timeout_seconds"] = 2
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        background_pid_path = self.root / "background.pid"
+        environment = dict(
+            self.env,
+            SCD_HEARTBEAT_TEST_NOW="1001",
+            MOCK_WAKE_BACKGROUND_SLEEP="5",
+            MOCK_WAKE_BACKGROUND_KEEP_OUTPUT="1",
+        )
+        started = time.monotonic()
+        result = self.invoke("run", env=environment, check=False)
+        background_pid = int(background_pid_path.read_text(encoding="utf-8"))
+        try:
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertEqual(self.state()["last_attempt_exit"], 0)
         finally:
             try:
                 os.kill(background_pid, 9)

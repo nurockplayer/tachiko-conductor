@@ -576,6 +576,8 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
         deadline = time.monotonic() + config["wake_timeout_seconds"]
         timed_out = False
         while True:
+            if child.poll() is not None:
+                break
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
@@ -586,7 +588,7 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
                 except subprocess.TimeoutExpired:
                     timed_out = True
                 break
-            for key, _mask in selector.select(min(remaining, 1.0)):
+            for key, _mask in selector.select(min(remaining, 0.1)):
                 chunk = os.read(key.fileobj.fileno(), 64 * 1024)
                 if chunk:
                     output.extend(chunk)
@@ -594,7 +596,10 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
                         del output[:-MAX_WAKE_LOG]
                 else:
                     selector.unregister(key.fileobj)
-            if child.poll() is not None and not selector.get_map():
+            # The direct target defines completion. A detached descendant may
+            # legitimately keep inherited output descriptors open; waiting for
+            # pipe EOF would turn a successful direct exit into a false timeout.
+            if child.poll() is not None:
                 break
         if timed_out:
             signal_group(signal.SIGTERM)
