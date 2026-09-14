@@ -415,15 +415,19 @@ def verify_wake_target(config: dict[str, Any]) -> Path:
                 if required["sha256"] != executable_digest:
                     raise RuntimeError("required wake file identity changed: " + str(path))
                 continue
-            verify_trusted_path(path)
+            installed_name = required.get("installed_name")
+            if installed_name is None:
+                verify_trusted_path(path)
             required_fd = os.open(path, os.O_RDONLY)
             try:
                 metadata = os.fstat(required_fd)
                 if not stat.S_ISREG(metadata.st_mode):
                     raise RuntimeError("required wake file unavailable or unsafe: " + str(path))
+                if installed_name is not None and (
+                        metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022):
+                    raise RuntimeError("required wake companion ownership or permissions unsafe: " + str(path))
                 if fd_sha256(required_fd) != required["sha256"]:
                     raise RuntimeError("required wake file identity changed: " + str(path))
-                installed_name = required.get("installed_name")
                 if installed_name is not None:
                     if not metadata.st_mode & 0o111:
                         raise RuntimeError("required wake companion is not executable: " + str(path))

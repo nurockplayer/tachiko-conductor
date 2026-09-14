@@ -862,8 +862,11 @@ class HeartbeatTest(unittest.TestCase):
             "execution must stay bound to the verified bytes, not the replaced pathname",
         )
 
-    def test_verified_wake_materializes_pinned_adjacent_companion(self) -> None:
-        companion = self.root / "source-code-mode-host"
+    def test_verified_wake_materializes_pinned_adjacent_companion_from_writable_ancestor(self) -> None:
+        companion_parent = self.root / "application-directory"
+        companion_parent.mkdir(mode=0o777)
+        companion_parent.chmod(0o777)
+        companion = companion_parent / "source-code-mode-host"
         companion.write_text("trusted companion\n", encoding="utf-8")
         companion.chmod(0o700)
         config_path = self.state_root / "config.json"
