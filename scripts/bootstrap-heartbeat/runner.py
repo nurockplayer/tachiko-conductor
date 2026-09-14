@@ -35,13 +35,14 @@ STATE_SCHEMA = 1
 CONFIG_SCHEMA = 1
 DEFAULT_POLL_SECONDS = 180
 DEFAULT_SAFETY_SECONDS = 1800
+DEFAULT_POLL_TIMEOUT_SECONDS = 60
 MAX_HEARTBEAT_LOG = 64 * 1024
 MAX_WAKE_LOG = 512 * 1024
 
 QUERY = r"""
 query TachikoConductorBootstrapHeartbeat {
   repository(owner: "nurockplayer", name: "tachiko-conductor") {
-    defaultBranchRef { target { oid } }
+    defaultBranchRef { name target { oid } }
     issues(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage }
       nodes {
@@ -57,7 +58,11 @@ query TachikoConductorBootstrapHeartbeat {
     pullRequests(first: 30, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage }
       nodes {
-        number state title body isDraft headRefOid baseRefOid mergeable reviewDecision
+        number state title body isDraft headRefOid baseRefOid mergeable mergeStateStatus reviewDecision
+        closingIssuesReferences(first: 50) {
+          pageInfo { hasNextPage }
+          nodes { number repository { nameWithOwner } }
+        }
         labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
         assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
         comments(first: 50) {
@@ -199,7 +204,9 @@ def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
             "body": pr["body"],
             "isDraft": pr["isDraft"], "headRefOid": pr["headRefOid"],
             "baseRefOid": pr["baseRefOid"], "mergeable": pr["mergeable"],
+            "mergeStateStatus": pr["mergeStateStatus"],
             "reviewDecision": pr["reviewDecision"],
+            "closingIssuesReferences": pr["closingIssuesReferences"]["nodes"],
             "labels": names(pr["labels"], "name"),
             "assignees": names(pr["assignees"], "login"),
             "comments": pr["comments"]["nodes"],
@@ -208,6 +215,7 @@ def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
             "commits": pr["commits"]["nodes"],
         })
     return canonicalize({
+        "defaultBranch": repository["defaultBranchRef"]["name"],
         "defaultHead": repository["defaultBranchRef"]["target"]["oid"],
         "issues": issues,
         "pullRequests": prs,
@@ -220,6 +228,12 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     for key in ("gh", "repo", "runner"):
         if not isinstance(config.get(key), str) or not Path(config[key]).is_absolute():
             raise RuntimeError("invalid absolute config path: " + key)
+    if not isinstance(config.get("poll_interval_seconds"), int) or config["poll_interval_seconds"] < 1:
+        raise RuntimeError("invalid poll_interval_seconds")
+    if not isinstance(config.get("poll_timeout_seconds"), int) or config["poll_timeout_seconds"] < 1:
+        raise RuntimeError("invalid poll_timeout_seconds")
+    if config["poll_timeout_seconds"] >= config["poll_interval_seconds"]:
+        raise RuntimeError("poll timeout must be shorter than poll interval")
     if not isinstance(config.get("safety_interval_seconds"), int) or config["safety_interval_seconds"] < 1:
         raise RuntimeError("invalid safety_interval_seconds")
     command = config.get("wake_command")
@@ -246,11 +260,14 @@ def load_config() -> dict[str, Any]:
 
 
 def github_fingerprint(config: dict[str, Any]) -> str:
-    result = subprocess.run(
-        [config["gh"], "api", "graphql", "-f", "query=" + QUERY], cwd=config["repo"],
-        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        check=False, text=True, env=os.environ.copy(),
-    )
+    try:
+        result = subprocess.run(
+            [config["gh"], "api", "graphql", "-f", "query=" + QUERY], cwd=config["repo"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            check=False, text=True, env=os.environ.copy(), timeout=config["poll_timeout_seconds"],
+        )
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("GitHub poll timed out; refusing wake") from error
     if result.returncode:
         detail = (result.stderr.strip().splitlines()[-1:] or ["unknown error"])[0][-1000:]
         raise RuntimeError(f"GitHub poll failed ({result.returncode}): {detail}")
@@ -527,6 +544,7 @@ def install(args: argparse.Namespace) -> int:
     config = validate_config({
         "schema": CONFIG_SCHEMA, "gh": resolved_tool("gh"), "repo": str(repo),
         "runner": str(runner), "poll_interval_seconds": args.interval,
+        "poll_timeout_seconds": DEFAULT_POLL_TIMEOUT_SECONDS,
         "safety_interval_seconds": args.safety_interval, "wake_command": wake_command,
         "wake_env": wake_env, "required_files": required_files, "installed_at": now_epoch(),
     })

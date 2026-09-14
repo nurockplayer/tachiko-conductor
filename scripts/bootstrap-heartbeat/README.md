@@ -18,9 +18,10 @@ scripts/bootstrap-heartbeat/uninstall.sh
 ```
 
 Installation defaults to a 180-second LaunchAgent interval and a 1,800-second safety interval.
-It resolves `gh`, validates the audited ChatGPT-bundled Codex executable, records the exact
-user-owned SCD profile digest, primes a GitHub baseline without waking Codex, and loads
-`io.tachiko.conductor.scd-heartbeat`.
+Each GitHub poll has a 60-second subprocess timeout so a stalled request cannot retain the lock
+forever. Installation resolves `gh`, validates the audited ChatGPT-bundled Codex executable,
+records the exact user-owned SCD profile digest, primes a GitHub baseline without waking Codex,
+and loads `io.tachiko.conductor.scd-heartbeat`.
 
 State and bounded logs live in
 `~/Library/Application Support/io.tachiko.conductor.scd-heartbeat/`; the generated plist lives

@@ -31,7 +31,8 @@ class HeartbeatTest(unittest.TestCase):
         self.launchctl = self.root / "launchctl"
         self.plist = self.root / "LaunchAgents" / "heartbeat.plist"
         self.gh.write_text(
-            "#!/usr/bin/python3\nimport os, pathlib\n"
+            "#!/usr/bin/python3\nimport os, pathlib, time\n"
+            "time.sleep(float(os.environ.get('MOCK_GH_SLEEP', '0')))\n"
             "print(pathlib.Path(os.environ['MOCK_GH_PAYLOAD']).read_text(), end='')\n",
             encoding="utf-8",
         )
@@ -79,6 +80,7 @@ class HeartbeatTest(unittest.TestCase):
             "repo": str(Path.cwd()),
             "runner": str(RUNNER),
             "poll_interval_seconds": 180,
+            "poll_timeout_seconds": 60,
             "safety_interval_seconds": safety,
             "wake_command": [str(self.wake), "dispatchable-target"],
             "wake_env": {},
@@ -111,7 +113,11 @@ class HeartbeatTest(unittest.TestCase):
             "number": 31, "state": "OPEN", "title": "Existing lane", "body": "Closes #20",
             "isDraft": False,
             "headRefOid": oid, "baseRefOid": "base", "mergeable": "MERGEABLE",
+            "mergeStateStatus": "CLEAN",
             "reviewDecision": "APPROVED",
+            "closingIssuesReferences": {"pageInfo": {"hasNextPage": False}, "nodes": [
+                {"number": 36, "repository": {"nameWithOwner": "nurockplayer/tachiko-conductor"}}
+            ]},
             "labels": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             "assignees": {"pageInfo": {"hasNextPage": False}, "nodes": []},
             "comments": {"pageInfo": {"hasNextPage": False}, "nodes": []},
@@ -135,7 +141,7 @@ class HeartbeatTest(unittest.TestCase):
             }}}]},
         }
         data = {"data": {"repository": {
-            "defaultBranchRef": {"target": {"oid": oid}},
+            "defaultBranchRef": {"name": "main", "target": {"oid": oid}},
             "issues": {"pageInfo": {"hasNextPage": False}, "nodes": issues},
             "pullRequests": {"pageInfo": {"hasNextPage": False}, "nodes": [pr]},
         }}}
@@ -224,6 +230,37 @@ class HeartbeatTest(unittest.TestCase):
         self.payload.write_text(json.dumps(data), encoding="utf-8")
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
         self.assertEqual(len(self.records()), 1, "edited top-level review must wake before safety")
+
+    def test_bootstrap_authority_changes_are_meaningful(self) -> None:
+        paths_and_values = (
+            (("defaultBranchRef", "name"), "release"),
+            (("pullRequests", "nodes", 0, "mergeStateStatus"), "BLOCKED"),
+            (("pullRequests", "nodes", 0, "closingIssuesReferences", "nodes"), []),
+        )
+        for path, value in paths_and_values:
+            with self.subTest(path=path):
+                self.invoke("run", "--prime")
+                data = json.loads(self.payload.read_text(encoding="utf-8"))
+                target = data["data"]["repository"]
+                for part in path[:-1]:
+                    target = target[part]
+                target[path[-1]] = value
+                self.payload.write_text(json.dumps(data), encoding="utf-8")
+                self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+                self.assertEqual(len(self.records()), 1, "bootstrap authority change must wake")
+                self.calls.unlink()
+                self.write_payload("A")
+
+    def test_stalled_github_poll_times_out_and_fails_closed(self) -> None:
+        self.invoke("run", "--prime")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["poll_timeout_seconds"] = 1
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        started = time.monotonic()
+        self.assertEqual(self.invoke("run", env=dict(self.env, MOCK_GH_SLEEP="2"), check=False).returncode, 1)
+        self.assertLess(time.monotonic() - started, 1.8)
+        self.assertEqual(self.records(), [], "timed-out poll must never wake")
 
     def test_overlap_and_stale_lock_policy(self) -> None:
         self.invoke("run", "--prime")
