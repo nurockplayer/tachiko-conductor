@@ -21,7 +21,9 @@ Installation defaults to a 180-second LaunchAgent interval and a 1,800-second sa
 Each GitHub poll has a 60-second subprocess timeout so a stalled request cannot retain the lock
 forever. The bounded GraphQL projection rejects truncation and any GitHub-reported query cost over
 100 points, keeping the 180-second schedule sustainable. Wake execution has a 1,500-second deadline; timeout terminates its isolated process
-group and leaves the fingerprint unconsumed for retry. Installation resolves `gh`, validates the audited ChatGPT-bundled Codex executable,
+group and leaves the fingerprint unconsumed for retry. Exit zero alone is a re-entry boundary:
+the target must also print `TACHIKO_HEARTBEAT_SETTLED_V1` on its own final line to consume the
+fingerprint and reset the safety clock. Installation resolves `gh`, validates the audited ChatGPT-bundled Codex executable,
 records the exact user-owned SCD profile digest, primes a GitHub baseline without waking Codex,
 and loads `io.tachiko.conductor.scd-heartbeat`.
 
@@ -53,6 +55,13 @@ snapshot: only the first argv entry must be relocation-safe. Location-dependent 
 at their original path by running them as an argument to a relocation-safe interpreter, as in the
 future `tachiko dispatch once` example above; `--required-file` pins and validates that entry file.
 Installation rejects executable symlinks up front rather than accepting an unusable configuration.
+Every replaceable target uses the same provider-neutral completion protocol: emit
+`TACHIKO_HEARTBEAT_SETTLED_V1` only after all currently executable in-scope work is settled or
+there is no executable work. A successful process exit without that acknowledgement remains
+eligible for the next poll instead of sleeping until the safety interval.
+Install and uninstall acquire the same heartbeat flock as polling and wake execution. They fail
+closed while a poll or wake is active, so config, plist, and verified executable snapshots cannot
+be replaced concurrently.
 
 ## Fail-closed behavior
 
@@ -70,6 +79,7 @@ Installation rejects executable symlinks up front rather than accepting an unusa
 - Invalid lock metadata or unlocked metadata naming a live/unknown owner fails closed. Metadata for
   a provably exited PID can be recovered because the kernel lock has already been released.
 - A failed wake does not consume the changed fingerprint or reset the safety clock.
+- A zero-exit wake without the explicit settled acknowledgement also does not consume it.
 
 Run focused tests with:
 

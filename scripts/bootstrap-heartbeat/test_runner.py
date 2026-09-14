@@ -53,6 +53,8 @@ class HeartbeatTest(unittest.TestCase):
             "        time.sleep(background); os._exit(0)\n"
             "    pathlib.Path(os.environ['MOCK_WAKE_BACKGROUND_PID']).write_text(str(pid))\n"
             "time.sleep(float(os.environ.get('MOCK_WAKE_SLEEP', '0')))\n"
+            "if os.environ.get('MOCK_WAKE_SETTLED', '1') == '1':\n"
+            "    print('TACHIKO_HEARTBEAT_SETTLED_V1')\n"
             "sys.exit(int(os.environ.get('MOCK_WAKE_EXIT', '0')))\n",
             encoding="utf-8",
         )
@@ -211,6 +213,27 @@ class HeartbeatTest(unittest.TestCase):
         self.write_payload("A", reverse=True)
         self.invoke("run", "--verbose", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1179"))
         self.assertEqual(self.records(), [])
+
+    def test_exit_zero_without_settled_acknowledgement_remains_retryable(self) -> None:
+        self.invoke("run", "--prime")
+        initial_success_at = self.state()["last_success_at"]
+        self.write_payload("B")
+        unfinished = dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_SETTLED="0",
+        )
+        self.assertEqual(self.invoke("run", env=unfinished).returncode, 0)
+        self.assertEqual(len(self.records()), 1)
+        self.assertNotEqual(
+            self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"],
+        )
+        self.assertEqual(self.state()["last_success_at"], initial_success_at)
+
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(len(self.records()), 2, "unsettled exit 0 must retry the same change")
+        self.assertEqual(
+            self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"],
+        )
+        self.assertEqual(self.state()["last_success_at"], 1002)
 
     def test_ordinary_execution_comment_edit_is_meaningful(self) -> None:
         self.invoke("run", "--prime")
@@ -568,6 +591,35 @@ class HeartbeatTest(unittest.TestCase):
         self.assertFalse(self.plist.exists())
         self.assertTrue((self.state_root / "state.json").exists(), "uninstall preserves evidence/state")
 
+    def test_reinstall_cannot_race_an_active_wake_snapshot(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        sleeping = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_SLEEP="2")
+        active = subprocess.Popen(
+            [sys.executable, str(RUNNER), "run"], env=sleeping,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        deadline = time.time() + 5
+        while len(self.records()) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(self.records()), 1)
+        config_before = (self.state_root / "config.json").read_bytes()
+        snapshot = self.state_root / "verified-wake-executable"
+        snapshot_before = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+        alternate = self.root / "alternate-wake"
+        alternate.write_text("#!/bin/sh\nprintf 'TACHIKO_HEARTBEAT_SETTLED_V1\\n'\n", encoding="utf-8")
+        alternate.chmod(0o700)
+        command = json.dumps([str(alternate)])
+        result = self.invoke(
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load", check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("heartbeat poll or wake is active", result.stderr)
+        self.assertEqual((self.state_root / "config.json").read_bytes(), config_before)
+        self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), snapshot_before)
+        active.communicate(timeout=5)
+
     def test_required_wake_identity_fails_closed(self) -> None:
         self.invoke("run", "--prime")
         config_path = self.state_root / "config.json"
@@ -696,13 +748,16 @@ class HeartbeatTest(unittest.TestCase):
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config["wake_command"] = [str(system_true)]
         config["required_files"] = [{
-            "path": str(system_true), "sha256": hashlib.sha256(system_true.read_bytes()).hexdigest()
+            "path": str(system_true), "sha256": hashlib.sha256(system_true.read_bytes()).hexdigest(),
         }]
         config_path.write_text(json.dumps(config), encoding="utf-8")
         self.invoke("run", "--prime")
         self.write_payload("B")
         self.assertEqual(self.invoke("run").returncode, 0)
-        self.assertEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
+        self.assertNotEqual(
+            self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"],
+            "trusted exit zero without settled acknowledgement remains retryable",
+        )
 
 
 if __name__ == "__main__":

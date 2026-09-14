@@ -28,10 +28,14 @@ DEFAULT_ROOT = Path.home() / "Library/Application Support" / LABEL
 DEFAULT_PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
 DEFAULT_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
 DEFAULT_PROFILE = Path.home() / ".codex/scd_mission_lead.config.toml"
+SETTLED_MARKER = "TACHIKO_HEARTBEAT_SETTLED_V1"
 DEFAULT_PROMPT = (
     "Continue SCD for nurockplayer/tachiko-conductor under the repository's live "
     "standing SCD policy. Reconcile already-active owned work first, use live GitHub "
-    "authority, and stay quiet when no work or meaningful update is executable."
+    "authority, and stay quiet when no work or meaningful update is executable. Only "
+    "when all currently executable in-scope work is settled or no work is executable, "
+    f"print {SETTLED_MARKER} on its own final line. Do not print that marker when ending "
+    "at a non-terminal re-entry boundary."
 )
 STATE_SCHEMA = 1
 CONFIG_SCHEMA = 1
@@ -521,7 +525,7 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
     os._exit(0)
 
 
-def run_wake(config: dict[str, Any], lock_fd: int) -> int:
+def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
     verified_executable = verify_wake_target(config)
     child = None
     guard_pid, guard_write_fd = spawn_lock_guard(lock_fd, config["wake_timeout_seconds"])
@@ -611,10 +615,11 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
                 signal_group(signal.SIGKILL)
             child.wait()
             atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
-            return 124
+            return 124, False
         code = child.wait()
         atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
-        return code
+        settled = code == 0 and SETTLED_MARKER.encode() in output.splitlines()
+        return code, settled
     finally:
         if not guard_started:
             try:
@@ -678,6 +683,16 @@ def release_lock(stream: Any) -> None:
     stream.close()
 
 
+def acquire_operator_lock(action: str):
+    try:
+        stream = acquire_lock(False)
+    except Exception as error:
+        raise RuntimeError(f"cannot {action}; heartbeat lock is not safely available: {error}") from error
+    if stream is None:
+        raise RuntimeError(f"cannot {action}; heartbeat poll or wake is active")
+    return stream
+
+
 def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
     os.umask(0o077)
     try:
@@ -714,17 +729,21 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
                        last_attempt_exit=-1, last_attempt_reason=reason)
         save_state(attempt)
         log("waking target: " + reason)
-        # The child retains the flock if this supervisor is killed. A replacement
-        # runner therefore cannot overlap an orphaned wake target on this host.
-        code = run_wake(config, lock_stream.fileno())
+        # The dedicated guard retains the flock if this supervisor is killed. A
+        # replacement runner cannot overlap an orphaned wake target on this host.
+        code, settled = run_wake(config, lock_stream.fileno())
         attempt["last_attempt_exit"] = code
         if code:
             save_state(attempt)
             log(f"wake target failed with exit {code}; successful state not consumed")
             return code
+        if not settled:
+            save_state(attempt)
+            log("wake target exited 0 without settled acknowledgement; successful state not consumed")
+            return 0
         attempt.update(successful_fingerprint=fingerprint, last_success_at=now_epoch())
         save_state(attempt)
-        log("wake target completed successfully; fingerprint and safety clock committed")
+        log("wake target acknowledged settled state; fingerprint and safety clock committed")
         return 0
     except Exception as error:
         log("heartbeat error; no wake: " + str(error))
@@ -835,15 +854,6 @@ def install(args: argparse.Namespace) -> int:
         "wake_executable_relocatable": True, "wake_command": wake_command,
         "wake_env": wake_env, "required_files": required_files, "installed_at": now_epoch(),
     })
-    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(ROOT, 0o700)
-    verify_wake_target(config)
-    prior = load_state() if STATE.exists() else {}
-    atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())
-    if not prior:
-        prime(config, "first install")
-    else:
-        log("preserved valid successful state across reinstall")
     plist = {
         "Label": LABEL,
         "ProgramArguments": ["/usr/bin/python3", str(runner), "run"],
@@ -854,12 +864,23 @@ def install(args: argparse.Namespace) -> int:
         "LowPriorityIO": True, "Nice": 10, "ThrottleInterval": 30,
     }
     target = plist_path()
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    atomic_write(target, plistlib.dumps(plist, fmt=plistlib.FMT_XML))
-    if not args.no_load:
-        domain = f"gui/{os.getuid()}"
-        bootout_if_loaded(domain)
-        launchctl("bootstrap", domain, str(target))
+    lock_stream = acquire_operator_lock("install")
+    try:
+        verify_wake_target(config)
+        prior = load_state() if STATE.exists() else {}
+        atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())
+        if not prior:
+            prime(config, "first install")
+        else:
+            log("preserved valid successful state across reinstall")
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        atomic_write(target, plistlib.dumps(plist, fmt=plistlib.FMT_XML))
+        if not args.no_load:
+            domain = f"gui/{os.getuid()}"
+            bootout_if_loaded(domain)
+            launchctl("bootstrap", domain, str(target))
+    finally:
+        release_lock(lock_stream)
     print(f"installed {LABEL}; interval={args.interval}s safety={args.safety_interval}s")
     print("runner=" + str(runner))
     print("state=" + str(ROOT))
@@ -867,11 +888,15 @@ def install(args: argparse.Namespace) -> int:
 
 
 def uninstall(args: argparse.Namespace) -> int:
-    if not args.no_load:
-        bootout_if_loaded(f"gui/{os.getuid()}")
-    target = plist_path()
-    if target.exists():
-        target.unlink()
+    lock_stream = acquire_operator_lock("uninstall")
+    try:
+        if not args.no_load:
+            bootout_if_loaded(f"gui/{os.getuid()}")
+        target = plist_path()
+        if target.exists():
+            target.unlink()
+    finally:
+        release_lock(lock_stream)
     print("unloaded and removed plist; state and logs preserved in " + str(ROOT))
     return 0
 
