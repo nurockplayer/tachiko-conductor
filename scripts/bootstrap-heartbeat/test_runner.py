@@ -426,6 +426,22 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(self.invoke("run", check=False).returncode, 1)
         self.assertEqual(self.records(), [])
 
+    def test_replaceable_wake_path_must_not_be_group_or_world_writable(self) -> None:
+        unsafe_dir = self.root / "unsafe-wake-parent"
+        unsafe_dir.mkdir(mode=0o777)
+        unsafe_dir.chmod(0o777)
+        unsafe_wake = unsafe_dir / "wake"
+        unsafe_wake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        unsafe_wake.chmod(0o700)
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_command"] = [str(unsafe_wake)]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+        self.assertEqual(self.records(), [], "unsafe executable path must never wake")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

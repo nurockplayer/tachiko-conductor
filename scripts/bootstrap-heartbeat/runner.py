@@ -329,8 +329,12 @@ def verify_wake_target(config: dict[str, Any]) -> None:
     executable = Path(config["wake_command"][0])
     if not executable.is_file() or executable.is_symlink() or not os.access(executable, os.X_OK):
         raise RuntimeError("wake executable unavailable or unsafe: " + str(executable))
-    if executable.stat().st_mode & 0o022:
-        raise RuntimeError("wake executable is group/world writable")
+    resolved_executable = executable.resolve(strict=True)
+    trusted_owners = {0, os.getuid()}
+    for component in (resolved_executable, *resolved_executable.parents):
+        metadata = component.stat()
+        if metadata.st_uid not in trusted_owners or metadata.st_mode & 0o022:
+            raise RuntimeError("wake executable ownership/path is unsafe: " + str(component))
     for required in config.get("required_files", []):
         path = Path(required["path"])
         if not path.is_file() or path.is_symlink():

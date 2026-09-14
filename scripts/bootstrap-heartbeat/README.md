@@ -50,7 +50,8 @@ remain unchanged.
 ## Fail-closed behavior
 
 - Pagination/truncation, invalid GitHub data, invalid state/config, or an unsafe wake target never
-  wakes a model.
+  wakes a model. Wake executables must be owned by root/current user and have a non-writable
+  resolved path chain.
 - One advisory `flock` covers collection and the entire wake. Concurrent launchd fires observe the
   lock and exit without creating another writer.
 - Invalid lock metadata or unlocked metadata naming a live/unknown owner fails closed. Metadata for
