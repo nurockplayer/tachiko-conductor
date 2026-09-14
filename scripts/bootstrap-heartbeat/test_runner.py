@@ -428,6 +428,24 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(self.invoke("run", check=False).returncode, 1)
         self.assertEqual(self.records(), [])
 
+    def test_required_wake_file_under_writable_ancestor_fails_closed(self) -> None:
+        self.invoke("run", "--prime")
+        unsafe_parent = self.root / "writable-parent"
+        unsafe_parent.mkdir(mode=0o777)
+        unsafe_parent.chmod(0o777)
+        required = unsafe_parent / "profile.toml"
+        required.write_text("profile = 'trusted-content'\n", encoding="utf-8")
+        required.chmod(0o600)
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["required_files"].append({
+            "path": str(required), "sha256": hashlib.sha256(required.read_bytes()).hexdigest()
+        })
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.write_payload("B")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+        self.assertEqual(self.records(), [], "unsafe required-file ancestry must never wake")
+
     def test_replaceable_wake_executable_identity_is_pinned(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")
@@ -435,6 +453,26 @@ class HeartbeatTest(unittest.TestCase):
         self.wake.chmod(0o700)
         self.assertEqual(self.invoke("run", check=False).returncode, 1)
         self.assertEqual(self.records(), [], "replaced wake executable must never run")
+
+    def test_verified_executable_snapshot_survives_path_replacement(self) -> None:
+        original_digest = hashlib.sha256(self.wake.read_bytes()).hexdigest()
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.invoke("run")
+        verified = self.state_root / "verified-wake-executable"
+        self.assertEqual(hashlib.sha256(verified.read_bytes()).hexdigest(), original_digest)
+
+        self.wake.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+        self.wake.chmod(0o700)
+        completed = subprocess.run(
+            [str(self.wake), "verified-snapshot"], executable=str(verified), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            self.records()[-1]["args"], ["verified-snapshot"],
+            "execution must stay bound to the verified bytes, not the replaced pathname",
+        )
 
     def test_custom_install_pins_wake_executable_identity(self) -> None:
         config_path = self.state_root / "config.json"

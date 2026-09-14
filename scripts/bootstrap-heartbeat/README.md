@@ -51,7 +51,9 @@ remain unchanged.
 
 - Pagination/truncation, invalid GitHub data, invalid state/config, or an unsafe wake target never
   wakes a model. Wake executables must be owned by root/current user, must not be group/world
-  writable, and are SHA-256 pinned at install time alongside the default SCD profile.
+  writable, and are SHA-256 pinned at install time alongside the default SCD profile. Each wake
+  executes a private snapshot copied from the already-verified executable descriptor, so a
+  pathname replacement between verification and launch cannot change the executed bytes.
 - One advisory `flock` covers collection and the entire wake. Concurrent launchd fires observe the
   lock and exit without creating another writer.
 - Invalid lock metadata or unlocked metadata naming a live/unknown owner fails closed. Metadata for

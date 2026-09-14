@@ -13,6 +13,7 @@ import plistlib
 import selectors
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -325,26 +326,76 @@ def prime(config: dict[str, Any], reason: str) -> None:
     log(f"primed normalized GitHub baseline; no wake ({reason})")
 
 
-def verify_wake_target(config: dict[str, Any]) -> None:
+def fd_sha256(fd: int) -> str:
+    digest = hashlib.sha256()
+    os.lseek(fd, 0, os.SEEK_SET)
+    while chunk := os.read(fd, 1024 * 1024):
+        digest.update(chunk)
+    os.lseek(fd, 0, os.SEEK_SET)
+    return digest.hexdigest()
+
+
+def verify_trusted_path(path: Path) -> None:
+    absolute = path.absolute()
+    for component in (absolute, *absolute.parents):
+        metadata = component.lstat()
+        if stat.S_ISLNK(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022:
+            raise RuntimeError("wake file path ownership or permissions unsafe: " + str(component))
+
+
+def materialize_verified_executable(source_fd: int) -> Path:
+    target = ROOT / "verified-wake-executable"
+    temporary = target.with_name(target.name + ".tmp")
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    with temporary.open("wb") as stream:
+        while chunk := os.read(source_fd, 1024 * 1024):
+            stream.write(chunk)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chmod(temporary, 0o700)
+    os.replace(temporary, target)
+    return target
+
+
+def verify_wake_target(config: dict[str, Any]) -> Path:
     executable = Path(config["wake_command"][0])
     if not executable.is_file() or executable.is_symlink() or not os.access(executable, os.X_OK):
         raise RuntimeError("wake executable unavailable or unsafe: " + str(executable))
-    metadata = executable.stat()
-    if metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022:
-        raise RuntimeError("wake executable ownership or permissions unsafe: " + str(executable))
-    for required in config.get("required_files", []):
-        path = Path(required["path"])
-        if not path.is_file() or path.is_symlink():
-            raise RuntimeError("required wake file unavailable or unsafe: " + str(path))
-        metadata = path.stat()
-        if metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022:
-            raise RuntimeError("required wake file ownership or permissions unsafe: " + str(path))
-        if hashlib.sha256(path.read_bytes()).hexdigest() != required["sha256"]:
-            raise RuntimeError("required wake file identity changed: " + str(path))
+    executable_fd = os.open(executable, os.O_RDONLY)
+    try:
+        metadata = os.fstat(executable_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022:
+            raise RuntimeError("wake executable ownership or permissions unsafe: " + str(executable))
+        executable_digest = fd_sha256(executable_fd)
+        executable_pinned = False
+        for required in config.get("required_files", []):
+            path = Path(required["path"])
+            if not path.is_file() or path.is_symlink():
+                raise RuntimeError("required wake file unavailable or unsafe: " + str(path))
+            if path.resolve(strict=True) == executable.resolve(strict=True):
+                executable_pinned = executable_pinned or required["sha256"] == executable_digest
+                if required["sha256"] != executable_digest:
+                    raise RuntimeError("required wake file identity changed: " + str(path))
+                continue
+            verify_trusted_path(path)
+            required_fd = os.open(path, os.O_RDONLY)
+            try:
+                metadata = os.fstat(required_fd)
+                if not stat.S_ISREG(metadata.st_mode):
+                    raise RuntimeError("required wake file unavailable or unsafe: " + str(path))
+                if fd_sha256(required_fd) != required["sha256"]:
+                    raise RuntimeError("required wake file identity changed: " + str(path))
+            finally:
+                os.close(required_fd)
+        if not executable_pinned:
+            raise RuntimeError("wake executable identity is not pinned: " + str(executable))
+        return materialize_verified_executable(executable_fd)
+    finally:
+        os.close(executable_fd)
 
 
 def run_wake(config: dict[str, Any], lock_fd: int) -> int:
-    verify_wake_target(config)
+    verified_executable = verify_wake_target(config)
     child = None
     output = bytearray()
     selector = selectors.DefaultSelector()
@@ -381,7 +432,7 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> int:
         child = subprocess.Popen(
             config["wake_command"], cwd=config["repo"], stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
-            pass_fds=(lock_fd,), start_new_session=True,
+            executable=str(verified_executable), pass_fds=(lock_fd,), start_new_session=True,
         )
         assert child.stdout is not None
         selector.register(child.stdout, selectors.EVENT_READ)
