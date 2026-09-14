@@ -445,6 +445,21 @@ class HeartbeatTest(unittest.TestCase):
             "path": str(self.wake), "sha256": hashlib.sha256(self.wake.read_bytes()).hexdigest()
         }, config["required_files"])
 
+    def test_root_owned_pinned_wake_executable_is_trusted(self) -> None:
+        system_true = Path("/usr/bin/true")
+        self.assertEqual(system_true.stat().st_uid, 0)
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_command"] = [str(system_true)]
+        config["required_files"] = [{
+            "path": str(system_true), "sha256": hashlib.sha256(system_true.read_bytes()).hexdigest()
+        }]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.assertEqual(self.invoke("run").returncode, 0)
+        self.assertEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

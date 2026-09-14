@@ -337,7 +337,7 @@ def verify_wake_target(config: dict[str, Any]) -> None:
         if not path.is_file() or path.is_symlink():
             raise RuntimeError("required wake file unavailable or unsafe: " + str(path))
         metadata = path.stat()
-        if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+        if metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022:
             raise RuntimeError("required wake file ownership or permissions unsafe: " + str(path))
         if hashlib.sha256(path.read_bytes()).hexdigest() != required["sha256"]:
             raise RuntimeError("required wake file identity changed: " + str(path))
