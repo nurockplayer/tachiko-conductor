@@ -407,7 +407,13 @@ class HeartbeatTest(unittest.TestCase):
             "orphaned wake child must retain the lock after supervisor death",
         )
 
-        time.sleep(2.1)
+        deadline = time.time() + 5
+        while (self.state_root / "runner.lock").read_bytes() and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(
+            (self.state_root / "runner.lock").read_bytes(), b"",
+            "the guard must clear dead-supervisor metadata before releasing the flock",
+        )
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
         self.assertEqual(len(self.records()), 2, "runner may recover only after the child exits")
 
@@ -687,6 +693,30 @@ class HeartbeatTest(unittest.TestCase):
         replaceable_gh.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
         replaceable_gh.chmod(0o700)
         self.assertEqual(self.invoke("run", "--prime", env=environment).returncode, 0)
+        replaceable_gh.write_bytes(self.gh.read_bytes() + b"# upgraded\n")
+        replaceable_gh.chmod(0o700)
+        result = self.invoke(
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load",
+            env=environment, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        snapshots = list(self.state_root.glob("verified-gh-*"))
+        self.assertEqual(snapshots, [Path(config["gh"])])
+
+    def test_failed_install_rolls_back_new_github_snapshot(self) -> None:
+        snapshots_before = list(self.state_root.glob("verified-gh-*"))
+        unsafe_wake = self.root / "unsafe-wake"
+        unsafe_wake.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        unsafe_wake.chmod(0o777)
+        command = json.dumps([str(unsafe_wake)])
+        result = self.invoke(
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load", check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(list(self.state_root.glob("verified-gh-*")), snapshots_before)
 
     def test_required_wake_identity_fails_closed(self) -> None:
         self.invoke("run", "--prime")

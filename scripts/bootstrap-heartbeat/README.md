@@ -29,7 +29,7 @@ and loads `io.tachiko.conductor.scd-heartbeat`.
 The resolved `gh` executable is opened and checked for root/current-user ownership and safe leaf
 permissions during installation, then copied from that verified descriptor into a digest-named,
 mode-0700 snapshot in the private state directory. Polls execute those pinned bytes rather than
-reopening a replaceable Homebrew path.
+reopening a replaceable Homebrew path; a successful reinstall prunes older digest snapshots.
 
 State and bounded logs live in
 `~/Library/Application Support/io.tachiko.conductor.scd-heartbeat/`; the generated plist lives

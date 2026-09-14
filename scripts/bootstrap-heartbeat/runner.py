@@ -369,14 +369,18 @@ def verify_trusted_path(path: Path) -> None:
 def materialize_verified_executable(source_fd: int, name: str = "verified-wake-executable") -> Path:
     target = ROOT / name
     temporary = target.with_name(target.name + ".tmp")
-    os.lseek(source_fd, 0, os.SEEK_SET)
-    with temporary.open("wb") as stream:
-        while chunk := os.read(source_fd, 1024 * 1024):
-            stream.write(chunk)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.chmod(temporary, 0o700)
-    os.replace(temporary, target)
+    try:
+        os.lseek(source_fd, 0, os.SEEK_SET)
+        with temporary.open("wb") as stream:
+            while chunk := os.read(source_fd, 1024 * 1024):
+                stream.write(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o700)
+        os.replace(temporary, target)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     return target
 
 
@@ -417,7 +421,7 @@ def verify_wake_target(config: dict[str, Any]) -> Path:
         os.close(executable_fd)
 
 
-def pin_github_tool(path: Path) -> tuple[Path, str]:
+def pin_github_tool(path: Path) -> tuple[Path, str, bool]:
     if not path.is_file() or path.is_symlink() or not os.access(path, os.X_OK):
         raise RuntimeError("GitHub CLI unavailable or unsafe: " + str(path))
     source_fd = os.open(path, os.O_RDONLY)
@@ -427,10 +431,23 @@ def pin_github_tool(path: Path) -> tuple[Path, str]:
                 or metadata.st_mode & 0o022):
             raise RuntimeError("GitHub CLI ownership or permissions unsafe: " + str(path))
         digest = fd_sha256(source_fd)
+        existed = (ROOT / ("verified-gh-" + digest)).exists()
         target = materialize_verified_executable(source_fd, "verified-gh-" + digest)
-        return target, digest
+        return target, digest, not existed
     finally:
         os.close(source_fd)
+
+
+def prune_stale_github_snapshots(current: Path) -> None:
+    prefix = "verified-gh-"
+    for candidate in ROOT.iterdir():
+        suffix = candidate.name.removeprefix(prefix)
+        if (candidate == current or not candidate.name.startswith(prefix) or len(suffix) != 64
+                or any(character not in "0123456789abcdef" for character in suffix)):
+            continue
+        metadata = candidate.lstat()
+        if stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            candidate.unlink()
 
 
 def linux_process_identity(pid: int) -> tuple[str, str] | None:
@@ -542,6 +559,12 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
     except BaseException:
         time.sleep(timeout_seconds + 10)
     finally:
+        try:
+            os.lseek(lock_fd, 0, os.SEEK_SET)
+            os.ftruncate(lock_fd, 0)
+            os.fsync(lock_fd)
+        except OSError:
+            pass
         os.close(lock_fd)
     os._exit(0)
 
@@ -915,13 +938,18 @@ def install(args: argparse.Namespace) -> int:
     }
     target = plist_path()
     lock_stream = acquire_operator_lock("install")
+    gh_snapshot: Path | None = None
+    gh_snapshot_created = False
+    config_committed = False
     try:
-        gh_snapshot, gh_digest = pin_github_tool(gh_source)
+        gh_snapshot, gh_digest, gh_snapshot_created = pin_github_tool(gh_source)
         config_values.update(gh=str(gh_snapshot), gh_sha256=gh_digest)
         config = validate_config(config_values)
         verify_wake_target(config)
         prior = load_state() if STATE.exists() else {}
         atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())
+        config_committed = True
+        prune_stale_github_snapshots(gh_snapshot)
         if not prior:
             prime(config, "first install")
         else:
@@ -932,6 +960,10 @@ def install(args: argparse.Namespace) -> int:
             domain = f"gui/{os.getuid()}"
             bootout_if_loaded(domain)
             launchctl("bootstrap", domain, str(target))
+    except Exception:
+        if gh_snapshot_created and not config_committed and gh_snapshot is not None and gh_snapshot.exists():
+            gh_snapshot.unlink()
+        raise
     finally:
         release_lock(lock_stream)
     print(f"installed {LABEL}; interval={args.interval}s safety={args.safety_interval}s")
