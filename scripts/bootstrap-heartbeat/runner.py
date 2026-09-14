@@ -46,7 +46,7 @@ query TachikoConductorBootstrapHeartbeat {
     issues(first: 50, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage }
       nodes {
-        number state title
+        number state title body
         labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
         assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
         comments(first: 50) {
@@ -58,7 +58,7 @@ query TachikoConductorBootstrapHeartbeat {
     pullRequests(first: 30, states: OPEN, orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage }
       nodes {
-        number state title isDraft headRefOid baseRefOid mergeable reviewDecision
+        number state title body isDraft headRefOid baseRefOid mergeable reviewDecision
         labels(first: 20) { pageInfo { hasNextPage } nodes { name } }
         assignees(first: 10) { pageInfo { hasNextPage } nodes { login } }
         comments(first: 50) {
@@ -190,6 +190,7 @@ def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
     for issue in repository["issues"]["nodes"]:
         issues.append({
             "number": issue["number"], "state": issue["state"], "title": issue["title"],
+            "body": issue["body"],
             "labels": names(issue["labels"], "name"),
             "assignees": names(issue["assignees"], "login"),
             "handoffs": handoffs(issue["comments"]),
@@ -198,6 +199,7 @@ def normalized_repository(repository: dict[str, Any]) -> dict[str, Any]:
     for pr in repository["pullRequests"]["nodes"]:
         prs.append({
             "number": pr["number"], "state": pr["state"], "title": pr["title"],
+            "body": pr["body"],
             "isDraft": pr["isDraft"], "headRefOid": pr["headRefOid"],
             "baseRefOid": pr["baseRefOid"], "mergeable": pr["mergeable"],
             "reviewDecision": pr["reviewDecision"],

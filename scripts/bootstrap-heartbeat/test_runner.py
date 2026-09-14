@@ -90,7 +90,7 @@ class HeartbeatTest(unittest.TestCase):
     def write_payload(self, oid: str, *, reverse: bool = False, truncated: bool = False) -> None:
         issues = [
             {
-                "number": 36, "state": "OPEN", "title": "Heartbeat",
+                "number": 36, "state": "OPEN", "title": "Heartbeat", "body": "contract-v1",
                 "labels": {"pageInfo": {"hasNextPage": False}, "nodes": []},
                 "assignees": {"pageInfo": {"hasNextPage": False}, "nodes": [{"login": "owner"}]},
                 "comments": {"pageInfo": {"hasNextPage": truncated}, "nodes": [
@@ -99,7 +99,7 @@ class HeartbeatTest(unittest.TestCase):
                 ]},
             },
             {
-                "number": 34, "state": "OPEN", "title": "Policy",
+                "number": 34, "state": "OPEN", "title": "Policy", "body": "standing-policy",
                 "labels": {"pageInfo": {"hasNextPage": False}, "nodes": []},
                 "assignees": {"pageInfo": {"hasNextPage": False}, "nodes": []},
                 "comments": {"pageInfo": {"hasNextPage": False}, "nodes": []},
@@ -108,7 +108,8 @@ class HeartbeatTest(unittest.TestCase):
         if reverse:
             issues.reverse()
         pr = {
-            "number": 31, "state": "OPEN", "title": "Existing lane", "isDraft": False,
+            "number": 31, "state": "OPEN", "title": "Existing lane", "body": "Closes #20",
+            "isDraft": False,
             "headRefOid": oid, "baseRefOid": "base", "mergeable": "MERGEABLE",
             "reviewDecision": "APPROVED",
             "labels": {"pageInfo": {"hasNextPage": False}, "nodes": []},
@@ -181,6 +182,14 @@ class HeartbeatTest(unittest.TestCase):
         self.payload.write_text(json.dumps(data), encoding="utf-8")
         self.invoke("run", "--verbose", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1179"))
         self.assertEqual(self.records(), [])
+
+    def test_issue_contract_body_edit_is_meaningful(self) -> None:
+        self.invoke("run", "--prime")
+        data = json.loads(self.payload.read_text(encoding="utf-8"))
+        data["data"]["repository"]["issues"]["nodes"][0]["body"] = "contract-v2"
+        self.payload.write_text(json.dumps(data), encoding="utf-8")
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(len(self.records()), 1, "Issue body edits must wake before the safety interval")
 
     def test_overlap_and_stale_lock_policy(self) -> None:
         self.invoke("run", "--prime")
