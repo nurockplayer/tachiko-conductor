@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
+import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -210,10 +211,16 @@ function isRun(value: unknown): value is Run {
 }
 
 /** Write atomically: write to `<path>.tmp`, then rename over the target. */
-function writeJsonAtomic(filePath: string, value: unknown): void {
+function serializedJson(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function writeJsonAtomic(filePath: string, value: unknown): string {
+  const serialized = serializedJson(value);
   const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  writeFileSync(tmpPath, serialized, 'utf8');
   renameSync(tmpPath, filePath);
+  return serialized;
 }
 
 function readRun(filePath: string, id: string): Run {
@@ -266,7 +273,8 @@ export class JsonFileStore implements RunStore {
     if (existsSync(filePath)) {
       throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
     }
-    writeJsonAtomic(filePath, run);
+    const serialized = writeJsonAtomic(filePath, run);
+    writeOperationalProjection(this.dir, run, serialized);
   }
 
   read(id: string): Run | null {
@@ -276,7 +284,8 @@ export class JsonFileStore implements RunStore {
   }
 
   update(run: Run): void {
-    writeJsonAtomic(this.filePathFor(run.id), run);
+    const serialized = writeJsonAtomic(this.filePathFor(run.id), run);
+    writeOperationalProjection(this.dir, run, serialized);
   }
 
   list(): Run[] {
@@ -291,6 +300,16 @@ export class JsonFileStore implements RunStore {
     if (!existsSync(filePath)) {
       throw new Error(`No run with id "${id}" exists at ${filePath}; nothing to delete.`);
     }
+    deleteOperationalProjection(this.dir, id);
     unlinkSync(filePath);
+  }
+
+  /** Rebuild sidecars only from fully validated persisted Runs. */
+  rebuildOperationalProjections(): number {
+    const runs = this.list();
+    for (const run of runs) {
+      writeOperationalProjection(this.dir, run, readFileSync(this.filePathFor(run.id), 'utf8'));
+    }
+    return runs.length;
   }
 }

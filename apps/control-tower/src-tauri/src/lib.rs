@@ -401,55 +401,50 @@ fn number_at(value: &Value, path: &[&str]) -> Option<u64> {
   cursor.as_u64()
 }
 
-fn durable_run_observation(value: &Value, file_id: &str) -> Option<(String, RunObservation)> {
-  const STATES: &[&str] = &["READY", "IMPLEMENTING", "VALIDATING", "REVIEWING", "CHANGES_REQUESTED", "FINAL_GATE", "MERGE_READY", "MERGED", "WAITING_DEPENDENCY", "NEEDS_HUMAN", "FAILED"];
-  let id = string_at(value, &["id"])?;
-  let state = string_at(value, &["state"])?;
+/// Projection-only admission. JsonFileStore validates raw Runs; Rust only
+/// checks this versioned display contract and its digest of the raw bytes.
+fn operational_run_observation(value: &Value, file_id: &str, source_digest: &str) -> Option<(String, RunObservation)> {
+  let schema_version = value.get("schemaVersion")?.as_u64()?;
+  let id = string_at(value, &["runId"])?;
+  let state = string_at(value, &["workflowState"])?;
   let owner = string_at(value, &["target", "owner"])?;
   let repo = string_at(value, &["target", "repo"])?;
-  let issue = number_at(value, &["target", "issueNumber"])?;
   let workspace_path = string_at(value, &["bootstrap", "workspacePath"])?;
   let branch = string_at(value, &["bootstrap", "branch"])?;
   let base_branch = string_at(value, &["bootstrap", "baseBranch"])?;
   let base_sha = string_at(value, &["bootstrap", "baseSha"])?;
-  let bootstrap_owner = string_at(value, &["bootstrap", "owner"])?;
-  let bootstrap_repo = string_at(value, &["bootstrap", "repo"])?;
-  let bootstrap_issue = number_at(value, &["bootstrap", "issueNumber"])?;
-  let target_kind = string_at(value, &["target", "kind"])?;
-  let history = value.get("history")?.as_array()?;
-  let transitions = ["start", "bootstrap_prepared", "agent_succeeded", "agent_failed", "validation_passed", "validation_failed", "review_approved", "changes_requested", "start_fix", "gate_passed", "gate_blocked", "merged", "wait_dependency", "dependency_satisfied", "escalate", "human_resolved", "fail"];
-  let valid_history = history.iter().all(|record| {
-    let Some(record) = record.as_object() else { return false; };
-    record.get("type").and_then(Value::as_str).is_some_and(|value| transitions.contains(&value))
-      && record.get("from").and_then(Value::as_str).is_some_and(|value| STATES.contains(&value))
-      && record.get("to").and_then(Value::as_str).is_some_and(|value| STATES.contains(&value))
-      && record.get("at").and_then(Value::as_str).is_some()
-      && record.get("reason").is_none_or(Value::is_string)
-  });
-  if id != file_id || id.is_empty() || !STATES.contains(&state.as_str()) || target_kind != "issue"
-    || issue == 0 || workspace_path.is_empty() || branch.is_empty() || base_branch.is_empty() || base_sha.is_empty()
-    || owner.is_empty() || repo.is_empty() || bootstrap_owner != owner || bootstrap_repo != repo || bootstrap_issue != issue
-    || !valid_history || string_at(value, &["createdAt"]).is_none() || string_at(value, &["updatedAt"]).is_none() {
+  if schema_version != 1 || id != file_id || id.is_empty() || state.trim().is_empty()
+    || owner.trim().is_empty() || repo.trim().is_empty() || workspace_path.is_empty()
+    || branch.is_empty() || base_branch.is_empty() || base_sha.is_empty()
+    || string_at(value, &["sourceUpdatedAt"]).is_none()
+    || string_at(value, &["sourceDigest"]).as_deref() != Some(source_digest) {
     return None;
   }
   Some((workspace_path, RunObservation {
     id,
     repository: format!("{owner}/{repo}"),
     branch,
-    issue: Some(issue),
+    issue: number_at(value, &["target", "issueNumber"]),
     pull_request_number: number_at(value, &["pullRequest", "number"]),
-    provider: string_at(value, &["executor", "provider"]).or_else(|| string_at(value, &["agentResult", "executor", "provider"])),
+    provider: string_at(value, &["executor", "provider"]),
     state,
-    duration_ms: number_at(value, &["agentResult", "durationMs"]),
+    duration_ms: number_at(value, &["durationMs"]),
   }))
 }
 
-fn load_runs() -> HashMap<String, RunObservation> {
+fn raw_digest(commands: &dyn CommandBoundary, raw_path: &Path) -> Option<String> {
+  let output = commands.run("shasum", &["-a", "256", raw_path.to_string_lossy().as_ref()])?;
+  let digest = output.split_whitespace().next()?;
+  (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(digest.to_ascii_lowercase())
+}
+
+fn load_runs(commands: &dyn CommandBoundary) -> HashMap<String, RunObservation> {
   let mut runs = HashMap::new();
   let Some(directory) = run_directory() else {
     return runs;
   };
-  let Ok(entries) = fs::read_dir(directory) else {
+  let projection_directory = directory.join(".operational/v1");
+  let Ok(entries) = fs::read_dir(projection_directory) else {
     return runs;
   };
   for entry in entries.flatten() {
@@ -471,7 +466,8 @@ fn load_runs() -> HashMap<String, RunObservation> {
     let Some(file_id) = entry_path.file_stem().and_then(|value| value.to_str()) else {
       continue;
     };
-    let Some((workspace_path, observation)) = durable_run_observation(&value, file_id) else { continue; };
+    let Some(source_digest) = raw_digest(commands, &directory.join(format!("{file_id}.json"))) else { continue; };
+    let Some((workspace_path, observation)) = operational_run_observation(&value, file_id, &source_digest) else { continue; };
     runs.insert(workspace_path, observation);
   }
   runs
@@ -580,7 +576,7 @@ fn collect_snapshot_for_root_with_workspace_data_path(
       .unwrap_or("unknown")
       .to_owned()
   });
-  let runs = load_runs();
+  let runs = load_runs(commands);
   let rows = parse_worktrees(&porcelain)
     .into_iter()
     .map(|entry| {
@@ -922,18 +918,26 @@ mod tests {
   }
 
   #[test]
-  fn durable_run_observation_requires_schema_and_bootstrap_identity() {
-    assert!(durable_run_observation(&serde_json::json!({
-      "bootstrap": { "workspacePath": "/tmp/worktree" }, "state": "IMPLEMENTING"
-    }), "run-32").is_none());
-    let (path, run) = durable_run_observation(&serde_json::json!({
-      "id": "run-32", "state": "IMPLEMENTING", "createdAt": "1", "updatedAt": "1", "history": [],
-      "target": { "kind": "issue", "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 },
-      "bootstrap": { "workspacePath": "/tmp/worktree", "branch": "tachiko/issue-32", "baseBranch": "main", "baseSha": "base", "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 }
-    }), "run-32").expect("complete durable run");
+  fn operational_projection_requires_version_digest_and_bootstrap_identity() {
+    let digest = "a".repeat(64);
+    assert!(operational_run_observation(&serde_json::json!({
+      "schemaVersion": 1, "runId": "run-32", "sourceUpdatedAt": "1", "sourceDigest": digest,
+      "workflowState": "IMPLEMENTING", "target": { "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 }
+    }), "run-32", &digest).is_none());
+    let (path, run) = operational_run_observation(&serde_json::json!({
+      "schemaVersion": 1, "runId": "run-32", "sourceUpdatedAt": "1", "sourceDigest": digest,
+      "workflowState": "IMPLEMENTING",
+      "target": { "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 },
+      "bootstrap": { "workspacePath": "/tmp/worktree", "branch": "tachiko/issue-32", "baseBranch": "main", "baseSha": "base" }
+    }), "run-32", &digest).expect("complete operational projection");
     assert_eq!(path, "/tmp/worktree");
     assert_eq!(run.repository, "nurockplayer/tachiko-conductor");
     assert_eq!(run.branch, "tachiko/issue-32");
+    assert!(operational_run_observation(&serde_json::json!({
+      "schemaVersion": 1, "runId": "run-32", "sourceUpdatedAt": "1", "sourceDigest": "b",
+      "workflowState": "IMPLEMENTING", "target": { "owner": "nurockplayer", "repo": "tachiko-conductor" },
+      "bootstrap": { "workspacePath": "/tmp/worktree", "branch": "tachiko/issue-32", "baseBranch": "main", "baseSha": "base" }
+    }), "run-32", &digest).is_none());
   }
 
   #[test]

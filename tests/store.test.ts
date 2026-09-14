@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
+import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, sha256 } from '../src/operational/projection.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
@@ -27,6 +28,52 @@ describe('JsonFileStore — persistence round-trips', () => {
     const { store } = tempStore();
     store.create(newRun('r1'));
     assert.deepEqual(store.read('r1'), newRun('r1'));
+  });
+
+  it('writes a secret-free operational projection bound to the committed raw bytes', () => {
+    const { store, dir } = tempStore();
+    let run = applyTransition(newRun('projected'), { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'bootstrap_prepared',
+      bootstrap: {
+        owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+        baseBranch: 'main', baseSha: 'base-sha', branch: 'codex/projected', workspacePath: '/tmp/projected',
+      },
+    }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded',
+      agentResult: { ...successResult('head-sha'), executor: { provider: 'codex-cli', sessionId: 'secret-session' } },
+      pullRequest: { number: 7, headSha: 'head-sha' },
+    }, T0);
+    store.create(run);
+
+    const raw = readFileSync(path.join(dir, 'projected.json'), 'utf8');
+    const projection = JSON.parse(readFileSync(operationalProjectionPath(dir, 'projected'), 'utf8')) as Record<string, unknown>;
+    assert.equal(projection.schemaVersion, OPERATIONAL_RUN_PROJECTION_VERSION);
+    assert.equal(projection.sourceDigest, sha256(raw));
+    assert.equal(projection.workflowState, 'VALIDATING');
+    assert.deepEqual(projection.target, { owner: 'acme', repo: 'widgets', issueNumber: 42 });
+    assert.deepEqual(projection.bootstrap, { workspacePath: '/tmp/projected', branch: 'codex/projected', baseBranch: 'main', baseSha: 'base-sha' });
+    assert.deepEqual(projection.executor, { provider: 'codex-cli' });
+    assert.equal(JSON.stringify(projection).includes('secret-session'), false);
+  });
+
+  it('rebuilds valid legacy projections and removes a projection with its run', () => {
+    const { store, dir } = tempStore();
+    const run = newRun('legacy-projection');
+    writeFileSync(path.join(dir, 'legacy-projection.json'), `${JSON.stringify(run, null, 2)}\n`, 'utf8');
+    assert.equal(store.rebuildOperationalProjections(), 1);
+    assert.deepEqual(JSON.parse(readFileSync(operationalProjectionPath(dir, run.id), 'utf8')) as Record<string, unknown>, {
+      schemaVersion: 1,
+      runId: run.id,
+      sourceUpdatedAt: T0,
+      sourceDigest: sha256(readFileSync(path.join(dir, 'legacy-projection.json'), 'utf8')),
+      target: { owner: 'acme', repo: 'widgets', issueNumber: 42 },
+      workflowState: 'READY',
+      createdAt: T0,
+    });
+    store.delete(run.id);
+    assert.throws(() => readFileSync(operationalProjectionPath(dir, run.id), 'utf8'));
   });
 
   it('persists updates across store instances (simulated restart)', () => {
@@ -124,7 +171,9 @@ describe('JsonFileStore — persistence round-trips', () => {
     store.create(run);
     run = applyTransition(run, { type: 'start' }, T0);
     store.update(run);
-    assert.deepEqual(readdirSync(dir), ['r1.json']);
+    assert.deepEqual(readdirSync(dir), ['.operational', 'r1.json']);
+    assert.deepEqual(readdirSync(path.join(dir, '.operational')), ['v1']);
+    assert.deepEqual(readdirSync(path.join(dir, '.operational', 'v1')), ['r1.json']);
   });
 
   it('reports corrupt run files with an actionable error', () => {
