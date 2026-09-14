@@ -795,9 +795,13 @@ def bootout_if_loaded(domain: str) -> bool:
 def resolved_tool(name: str) -> str:
     override = os.environ.get("SCD_HEARTBEAT_TEST_" + name.upper()) if testing() else None
     path = override or shutil.which(name)
-    if not path or not Path(path).is_absolute() or not os.access(path, os.X_OK):
+    if not path:
         raise RuntimeError("could not resolve executable absolute path for " + name)
-    return path
+    resolved = Path(os.path.realpath(path))
+    if not resolved.is_absolute() or not resolved.is_file() or not os.access(resolved, os.X_OK):
+        raise RuntimeError("could not resolve executable absolute path for " + name)
+    verify_trusted_path(resolved)
+    return str(resolved)
 
 
 def launch_path() -> str:

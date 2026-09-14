@@ -661,6 +661,23 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), snapshot_before)
         active.communicate(timeout=5)
 
+    def test_install_rejects_untrusted_github_cli_path(self) -> None:
+        unsafe_parent = self.root / "untrusted-gh-parent"
+        unsafe_parent.mkdir(mode=0o777)
+        unsafe_parent.chmod(0o777)
+        unsafe_gh = unsafe_parent / "gh"
+        unsafe_gh.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        unsafe_gh.chmod(0o700)
+        command = json.dumps([str(self.wake), "future-dispatch-once"])
+        environment = dict(self.env, SCD_HEARTBEAT_TEST_GH=str(unsafe_gh))
+        result = self.invoke(
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load",
+            env=environment, check=False,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("wake file path ownership or permissions unsafe", result.stderr)
+
     def test_required_wake_identity_fails_closed(self) -> None:
         self.invoke("run", "--prime")
         config_path = self.state_root / "config.json"
