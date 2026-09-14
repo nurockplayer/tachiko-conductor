@@ -560,21 +560,32 @@ describe('runReviewLoop', () => {
   });
 
   it('fails the run when the implementation cannot fix the findings', async () => {
-    const store = new MemoryStore();
-    store.create(reviewingRun());
-    const reviewer = new FakeReviewer([requestChanges(HEAD)]);
-    const implementation = new FakeImplementation([failureResult('agent crashed')]);
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-review-failure-'));
+    try {
+      const store = new JsonFileStore({ dir });
+      const run = reviewingRun();
+      store.create(run);
+      const reviewer = new FakeReviewer([requestChanges(HEAD)]);
+      const implementation = new FakeImplementation([{ ...failureResult('agent crashed'), headSha: HEAD2 }]);
 
-    const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
-      'run-1',
-      { maxAttempts: 3, now: () => T0 },
-    );
+      const result = await runReviewLoop(
+        { store, github: githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
+        run.id,
+        { maxAttempts: 3, now: () => T0 },
+      );
 
-    assert.equal(result.outcome, 'failed');
-    assert.equal(result.run.state, 'FAILED');
-    assert.equal(result.run.headSha, HEAD);
-    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
+      assert.equal(result.outcome, 'failed');
+      assert.equal(result.run.state, 'FAILED');
+      assert.equal(result.run.headSha, HEAD);
+      assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
+      const persisted = new JsonFileStore({ dir }).read(run.id);
+      assert.equal(persisted?.state, 'FAILED');
+      assert.equal(persisted?.headSha, HEAD);
+      assert.deepEqual(persisted?.pullRequest, { number: 7, headSha: HEAD });
+      assert.equal(persisted?.agentResult?.headSha, HEAD2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('parks in NEEDS_HUMAN when a review fix emits the explicit takeover protocol', async () => {
