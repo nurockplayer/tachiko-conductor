@@ -420,6 +420,42 @@ def linux_process_identity(pid: int) -> tuple[str, str] | None:
     return fields[0], fields[19]
 
 
+def process_group_has_live_members(process_group: int) -> bool | None:
+    proc = Path("/proc")
+    if proc.is_dir():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                raw = (entry / "stat").read_text(encoding="utf-8")
+            except (FileNotFoundError, PermissionError, OSError):
+                continue
+            closing = raw.rfind(")")
+            fields = raw[closing + 2:].split() if closing >= 0 else []
+            if len(fields) >= 3 and fields[0] != "Z" and fields[2] == str(process_group):
+                return True
+        return False
+    try:
+        result = subprocess.run(
+            ["/bin/ps", "-axo", "pgid=,state="], stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            check=False, timeout=2,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode:
+        return None
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        try:
+            pgid = int(fields[0])
+        except (IndexError, ValueError):
+            continue
+        if pgid == process_group and len(fields) > 1 and not fields[1].startswith("Z"):
+            return True
+    return False
+
+
 def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
     read_fd, write_fd = os.pipe()
     guard_pid = os.fork()
@@ -432,7 +468,7 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
         os.close(read_fd)
         if not message:
             os._exit(0)
-        target_pid = int(message.strip())
+        target_pid = int(message.splitlines()[0])
         if target_pid < 1:
             os._exit(0)
         initial_linux_identity = linux_process_identity(target_pid) if Path("/proc").is_dir() else None
@@ -440,30 +476,43 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
         terminate_deadline: float | None = None
         killed = False
         while True:
+            direct_exited = False
             if initial_linux_identity is not None:
                 current_identity = linux_process_identity(target_pid)
                 if (current_identity is None or current_identity[0] == "Z"
                         or current_identity[1] != initial_linux_identity[1]):
-                    break
+                    direct_exited = True
             try:
                 os.kill(target_pid, 0)
             except ProcessLookupError:
-                break
+                direct_exited = True
             except PermissionError:
                 pass
             now = time.monotonic()
-            if terminate_deadline is None and now >= deadline:
-                try:
-                    os.killpg(target_pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
-                terminate_deadline = now + 5
+            if terminate_deadline is None:
+                if now < deadline and direct_exited:
+                    break
+                if now >= deadline:
+                    try:
+                        os.killpg(target_pid, signal.SIGTERM)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+                    terminate_deadline = now + 5
             elif terminate_deadline is not None and not killed and now >= terminate_deadline:
                 try:
                     os.killpg(target_pid, signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     pass
                 killed = True
+            if terminate_deadline is not None and direct_exited:
+                group_live = process_group_has_live_members(target_pid)
+                if group_live is False:
+                    break
+                if group_live is None:
+                    try:
+                        os.killpg(target_pid, 0)
+                    except ProcessLookupError:
+                        break
             time.sleep(0.05)
     except BaseException:
         time.sleep(timeout_seconds + 10)

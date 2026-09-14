@@ -63,7 +63,9 @@ Installation rejects executable symlinks up front rather than accepting an unusa
   pathname replacement between verification and launch cannot change the executed bytes.
 - One advisory `flock` covers collection and the entire direct wake. A dedicated same-host guard
   retains it if the supervisor dies, while the wake target and its background descendants never
-  inherit the descriptor. Concurrent launchd fires cannot create another writer.
+  inherit the descriptor. Normal direct-child completion releases the guard without waiting for
+  background work; forced timeout cleanup retains it through TERM/KILL of the entire target group.
+  Concurrent launchd fires cannot create another writer.
 - Invalid lock metadata or unlocked metadata naming a live/unknown owner fails closed. Metadata for
   a provably exited PID can be recovered because the kernel lock has already been released.
 - A failed wake does not consume the changed fingerprint or reset the safety clock.

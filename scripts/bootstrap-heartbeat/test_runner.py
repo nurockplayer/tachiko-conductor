@@ -46,6 +46,8 @@ class HeartbeatTest(unittest.TestCase):
             "if background:\n"
             "    pid = os.fork()\n"
             "    if pid == 0:\n"
+            "        if os.environ.get('MOCK_WAKE_BACKGROUND_IGNORE_TERM') == '1':\n"
+            "            import signal; signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
             "        os.close(1); os.close(2); time.sleep(background); os._exit(0)\n"
             "    pathlib.Path(os.environ['MOCK_WAKE_BACKGROUND_PID']).write_text(str(pid))\n"
             "time.sleep(float(os.environ.get('MOCK_WAKE_SLEEP', '0')))\n"
@@ -367,6 +369,39 @@ class HeartbeatTest(unittest.TestCase):
             "guard must terminate the timed-out direct target before releasing the lock",
         )
 
+    def test_orphan_timeout_kills_term_resistant_process_group_before_unlock(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_timeout_seconds"] = 1
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        sleeping = dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_SLEEP="10",
+            MOCK_WAKE_BACKGROUND_SLEEP="10", MOCK_WAKE_BACKGROUND_IGNORE_TERM="1",
+        )
+        first = subprocess.Popen([sys.executable, str(RUNNER), "run"], env=sleeping)
+        deadline = time.time() + 5
+        while len(self.records()) < 1 and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(len(self.records()), 1)
+        first.kill()
+        first.wait(timeout=5)
+
+        deadline = time.time() + 4
+        while time.time() < deadline:
+            self.invoke("run", "--verbose", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+            self.assertEqual(len(self.records()), 1, "TERM-resistant descendant must keep guard locked")
+            time.sleep(0.2)
+
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            self.invoke("run", "--verbose", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+            if len(self.records()) == 2:
+                break
+            time.sleep(0.1)
+        self.assertEqual(len(self.records()), 2, "guard must unlock only after process-group cleanup")
+
     def test_wake_descendant_cannot_retain_lock_after_direct_child_exits(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")
@@ -405,6 +440,28 @@ class HeartbeatTest(unittest.TestCase):
         self.assertNotEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
         self.assertEqual(len(self.records()), 2, "timed-out wake must leave the change retryable")
+
+    def test_exec_failure_releases_guard_and_leaves_change_retryable(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        unavailable = self.root / "missing-interpreter-target"
+        unavailable.write_text("#!/definitely/missing/interpreter\n", encoding="utf-8")
+        unavailable.chmod(0o700)
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_timeout_seconds"] = 1
+        config["wake_command"] = [str(unavailable)]
+        config["required_files"] = [{
+            "path": str(unavailable),
+            "sha256": hashlib.sha256(unavailable.read_bytes()).hexdigest(),
+        }]
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        started = time.monotonic()
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+        self.assertLess(time.monotonic() - started, 2)
+        self.write_config()
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(len(self.records()), 1, "exec failure must release the guard for retry")
 
     def test_poll_and_config_fail_closed_and_logs_are_bounded(self) -> None:
         self.invoke("run", "--prime")
