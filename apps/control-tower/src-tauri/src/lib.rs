@@ -1,5 +1,5 @@
 use std::{
-  collections::{BTreeSet, HashMap},
+  collections::{BTreeMap, BTreeSet},
   env, fs,
   io::Read,
   path::{Path, PathBuf},
@@ -122,16 +122,33 @@ struct ParsedWorktree {
   branch: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct RunObservation {
   id: String,
   repository: String,
+  workspace_path: String,
   branch: String,
+  base_sha: String,
+  head_sha: Option<String>,
+  pull_request_head_sha: Option<String>,
   issue: Option<u64>,
   pull_request_number: Option<u64>,
   provider: Option<String>,
   state: String,
   duration_ms: Option<u64>,
+}
+
+/// A worktree identity is assembled only from live Git observations.  The
+/// common-Git comparison proves that a path came from the bounded `worktree
+/// list` of the repository that reported it; a branch name alone is never a
+/// correlation key.
+#[derive(Clone)]
+struct VerifiedWorktree {
+  path: String,
+  common_git: String,
+  repository: Option<String>,
+  branch: Option<String>,
+  head_sha: Option<String>,
 }
 
 trait CommandBoundary {
@@ -237,7 +254,7 @@ fn terminate_process_group(child: &mut std::process::Child) {
   }
 }
 
-fn repository_root(commands: &dyn CommandBoundary) -> Option<PathBuf> {
+fn configured_repository_root(commands: &dyn CommandBoundary) -> Option<PathBuf> {
   let candidate = env::var_os("TACHIKO_CONTROL_TOWER_REPOSITORY")
     .map(PathBuf::from)
     .or_else(|| env::current_dir().ok())?;
@@ -339,8 +356,7 @@ fn github_url_path<'a>(remote: &'a str, scheme: &str) -> Option<&'a str> {
   // identity. Reject malformed ports rather than guessing an identity.
   let authority = authority.rsplit('@').next()?;
   let (host, port) = authority.split_once(':').unwrap_or((authority, ""));
-  (host.eq_ignore_ascii_case("github.com")
-    && (port.is_empty() || port.parse::<u16>().is_ok()))
+  (host.eq_ignore_ascii_case("github.com") && (port.is_empty() || port.parse::<u16>().is_ok()))
     .then_some(path)
 }
 
@@ -358,8 +374,10 @@ fn pull_request(
   commands: &dyn CommandBoundary,
   repository: &str,
   number: Option<u64>,
+  expected_head_sha: Option<&str>,
 ) -> Option<PullRequestView> {
   let number = number?;
+  let expected_head_sha = expected_head_sha?;
   let json = commands.run(
     "gh",
     &[
@@ -369,14 +387,14 @@ fn pull_request(
       "--repo",
       repository,
       "--json",
-      "number,state",
+      "number,state,headRefOid",
     ],
   )?;
   let item: Value = serde_json::from_str(&json).ok()?;
-  Some(PullRequestView {
-    number: item.get("number")?.as_u64()?,
-    state: item.get("state")?.as_str()?.to_owned(),
-  })
+  let state = item.get("state")?.as_str()?.to_owned();
+  (item.get("number")?.as_u64()? == number
+    && item.get("headRefOid")?.as_str()? == expected_head_sha)
+    .then_some(PullRequestView { number, state })
 }
 
 fn run_directory() -> Option<PathBuf> {
@@ -403,7 +421,11 @@ fn number_at(value: &Value, path: &[&str]) -> Option<u64> {
 
 /// Projection-only admission. JsonFileStore validates raw Runs; Rust only
 /// checks this versioned display contract and its digest of the raw bytes.
-fn operational_run_observation(value: &Value, file_id: &str, source_digest: &str) -> Option<(String, RunObservation)> {
+fn operational_run_observation(
+  value: &Value,
+  file_id: &str,
+  source_digest: &str,
+) -> Option<RunObservation> {
   let schema_version = value.get("schemaVersion")?.as_u64()?;
   let id = string_at(value, &["runId"])?;
   let state = string_at(value, &["workflowState"])?;
@@ -413,33 +435,49 @@ fn operational_run_observation(value: &Value, file_id: &str, source_digest: &str
   let branch = string_at(value, &["bootstrap", "branch"])?;
   let base_branch = string_at(value, &["bootstrap", "baseBranch"])?;
   let base_sha = string_at(value, &["bootstrap", "baseSha"])?;
-  if schema_version != 1 || id != file_id || id.is_empty() || state.trim().is_empty()
-    || owner.trim().is_empty() || repo.trim().is_empty() || workspace_path.is_empty()
-    || branch.is_empty() || base_branch.is_empty() || base_sha.is_empty()
+  if schema_version != 1
+    || id != file_id
+    || id.is_empty()
+    || state.trim().is_empty()
+    || owner.trim().is_empty()
+    || repo.trim().is_empty()
+    || workspace_path.is_empty()
+    || branch.is_empty()
+    || base_branch.is_empty()
+    || base_sha.is_empty()
     || string_at(value, &["sourceUpdatedAt"]).is_none()
-    || string_at(value, &["sourceDigest"]).as_deref() != Some(source_digest) {
+    || string_at(value, &["sourceDigest"]).as_deref() != Some(source_digest)
+  {
     return None;
   }
-  Some((workspace_path, RunObservation {
+  Some(RunObservation {
     id,
     repository: format!("{owner}/{repo}"),
+    workspace_path: workspace_path.clone(),
     branch,
+    base_sha,
+    head_sha: string_at(value, &["headSha"]),
+    pull_request_head_sha: string_at(value, &["pullRequest", "headSha"]),
     issue: number_at(value, &["target", "issueNumber"]),
     pull_request_number: number_at(value, &["pullRequest", "number"]),
     provider: string_at(value, &["executor", "provider"]),
     state,
     duration_ms: number_at(value, &["durationMs"]),
-  }))
+  })
 }
 
 fn raw_digest(commands: &dyn CommandBoundary, raw_path: &Path) -> Option<String> {
-  let output = commands.run("shasum", &["-a", "256", raw_path.to_string_lossy().as_ref()])?;
+  let output = commands.run(
+    "shasum",
+    &["-a", "256", raw_path.to_string_lossy().as_ref()],
+  )?;
   let digest = output.split_whitespace().next()?;
-  (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(digest.to_ascii_lowercase())
+  (digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    .then_some(digest.to_ascii_lowercase())
 }
 
-fn load_runs(commands: &dyn CommandBoundary) -> HashMap<String, RunObservation> {
-  let mut runs = HashMap::new();
+fn load_runs(commands: &dyn CommandBoundary) -> Vec<RunObservation> {
+  let mut runs = Vec::new();
   let Some(directory) = run_directory() else {
     return runs;
   };
@@ -466,11 +504,160 @@ fn load_runs(commands: &dyn CommandBoundary) -> HashMap<String, RunObservation> 
     let Some(file_id) = entry_path.file_stem().and_then(|value| value.to_str()) else {
       continue;
     };
-    let Some(source_digest) = raw_digest(commands, &directory.join(format!("{file_id}.json"))) else { continue; };
-    let Some((workspace_path, observation)) = operational_run_observation(&value, file_id, &source_digest) else { continue; };
-    runs.insert(workspace_path, observation);
+    let Some(source_digest) = raw_digest(commands, &directory.join(format!("{file_id}.json")))
+    else {
+      continue;
+    };
+    let Some(observation) = operational_run_observation(&value, file_id, &source_digest) else {
+      continue;
+    };
+    runs.push(observation);
   }
   runs
+}
+
+fn git_text(commands: &dyn CommandBoundary, path: &str, args: &[&str]) -> Option<String> {
+  let mut git_args = vec!["-C", path];
+  git_args.extend_from_slice(args);
+  commands
+    .run("git", &git_args)
+    .map(|value| value.trim().to_owned())
+    .filter(|value| !value.is_empty())
+}
+
+fn verified_worktree(commands: &dyn CommandBoundary, path: &str) -> Option<VerifiedWorktree> {
+  let canonical_path = git_text(commands, path, &["rev-parse", "--show-toplevel"])?;
+  let common_git = git_text(
+    commands,
+    &canonical_path,
+    &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+  )?;
+  Some(VerifiedWorktree {
+    repository: github_repository(commands, Path::new(&canonical_path)),
+    branch: git_text(
+      commands,
+      &canonical_path,
+      &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    ),
+    head_sha: git_text(commands, &canonical_path, &["rev-parse", "HEAD"]),
+    path: canonical_path,
+    common_git,
+  })
+}
+
+fn discover_worktrees_from_root(
+  commands: &dyn CommandBoundary,
+  root: &str,
+) -> Vec<VerifiedWorktree> {
+  let Some(root_identity) = verified_worktree(commands, root) else {
+    return Vec::new();
+  };
+  let Some(porcelain) = commands.run(
+    "git",
+    &["-C", &root_identity.path, "worktree", "list", "--porcelain"],
+  ) else {
+    return Vec::new();
+  };
+  parse_worktrees(&porcelain)
+    .into_iter()
+    .filter_map(|entry| verified_worktree(commands, &entry.path))
+    .filter(|entry| entry.common_git == root_identity.common_git)
+    .collect()
+}
+
+fn managed_worktree_roots(workspace_root: &Path) -> Vec<String> {
+  const MAX_MANAGED_ROOTS: usize = 64;
+  let mut roots = vec![workspace_root.to_string_lossy().to_string()];
+  if let Ok(entries) = fs::read_dir(workspace_root) {
+    roots.extend(
+      entries
+        .flatten()
+        .take(MAX_MANAGED_ROOTS)
+        .filter_map(|entry| {
+          entry
+            .file_type()
+            .ok()?
+            .is_dir()
+            .then(|| entry.path().to_string_lossy().to_string())
+        }),
+    );
+  }
+  roots
+}
+
+/// Discover only the configured Conductor root, managed worktree roots, and
+/// workspace paths carried by verified projection sidecars. There is no HOME
+/// scan and no dependency on a Codex database/session format.
+fn discover_worktrees(
+  commands: &dyn CommandBoundary,
+  conductor_root: Option<&Path>,
+  workspace_root: &Path,
+  runs: &[RunObservation],
+) -> Vec<VerifiedWorktree> {
+  let mut roots = BTreeSet::new();
+  if let Some(conductor_root) = conductor_root {
+    roots.insert(conductor_root.to_string_lossy().to_string());
+  }
+  roots.extend(managed_worktree_roots(workspace_root));
+  roots.extend(runs.iter().map(|run| run.workspace_path.clone()));
+
+  let mut discovered = BTreeMap::new();
+  for root in roots {
+    for worktree in discover_worktrees_from_root(commands, &root) {
+      discovered.entry(worktree.path.clone()).or_insert(worktree);
+    }
+  }
+  discovered.into_values().collect()
+}
+
+fn correlated_run<'a>(
+  commands: &dyn CommandBoundary,
+  runs: &'a [RunObservation],
+  worktree: &VerifiedWorktree,
+) -> Option<&'a RunObservation> {
+  let matches = runs
+    .iter()
+    .filter(|run| {
+      let Some(bootstrap) = verified_worktree(commands, &run.workspace_path) else {
+        return false;
+      };
+      bootstrap.path == worktree.path
+        && bootstrap.common_git == worktree.common_git
+        && worktree
+          .repository
+          .as_deref()
+          .is_some_and(|repository| repository.eq_ignore_ascii_case(&run.repository))
+        && worktree.branch.as_deref() == Some(run.branch.as_str())
+        && worktree.head_sha.as_deref().is_some_and(|head| {
+          run
+            .head_sha
+            .as_deref()
+            .is_none_or(|expected| expected == head)
+            && run
+              .pull_request_head_sha
+              .as_deref()
+              .is_none_or(|expected| expected == head)
+            && commands
+              .run(
+                "git",
+                &[
+                  "-C",
+                  &worktree.path,
+                  "merge-base",
+                  "--is-ancestor",
+                  &run.base_sha,
+                  head,
+                ],
+              )
+              .is_some()
+        })
+    })
+    .collect::<Vec<_>>();
+  if matches.len() == 1 {
+    Some(matches[0])
+  } else {
+    None
+  }
 }
 
 fn memory_total(commands: &dyn CommandBoundary) -> Option<u64> {
@@ -508,7 +695,18 @@ fn memory_stats(commands: &dyn CommandBoundary) -> (Option<u64>, Option<u64>) {
   (total, used)
 }
 
+fn existing_ancestor(path: &Path) -> Option<PathBuf> {
+  let mut candidate = path.to_path_buf();
+  while !candidate.exists() {
+    candidate = candidate.parent()?.to_path_buf();
+  }
+  Some(candidate)
+}
+
 fn disk_stats(commands: &dyn CommandBoundary, path: &Path) -> (Option<u64>, Option<u64>) {
+  let Some(path) = existing_ancestor(path) else {
+    return (None, None);
+  };
   let Some(stats) = commands.run("df", &["-k", path.to_string_lossy().as_ref()]) else {
     return (None, None);
   };
@@ -527,74 +725,55 @@ fn disk_stats(commands: &dyn CommandBoundary, path: &Path) -> (Option<u64>, Opti
   (total, free)
 }
 
-fn workspace_data_path(
-  repository_root: &Path,
-  configured_workspace_root: Option<PathBuf>,
-  home: Option<PathBuf>,
-) -> PathBuf {
+fn workspace_data_path(configured_workspace_root: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
   configured_workspace_root
     .or_else(|| home.map(|home| home.join(".tachiko-conductor/workspaces")))
-    // HOME can be unavailable in a launchd context. The repository path is a
-    // truthful fallback only when no managed-workspace location is knowable.
-    .unwrap_or_else(|| repository_root.to_path_buf())
 }
 
 fn collect_snapshot(commands: &dyn CommandBoundary) -> Result<ControlTowerSnapshot, String> {
-  let root = repository_root(commands)
-    .ok_or("無法解析 repository root；請設定 TACHIKO_CONTROL_TOWER_REPOSITORY。")?;
-  collect_snapshot_for_root(commands, &root)
-}
-
-fn collect_snapshot_for_root(
-  commands: &dyn CommandBoundary,
-  root: &Path,
-) -> Result<ControlTowerSnapshot, String> {
   let workspace_root = workspace_data_path(
-    root,
     env::var_os("TACHIKO_WORKSPACE_ROOT").map(PathBuf::from),
     env::var_os("HOME").map(PathBuf::from),
-  );
-  collect_snapshot_for_root_with_workspace_data_path(commands, root, &workspace_root)
+  )
+  .ok_or("無法解析 managed worktree root；請設定 TACHIKO_WORKSPACE_ROOT。")?;
+  // Finder/Dock launches may have neither cwd nor a shell environment. The
+  // stable root is an optional additional discovery source; projections and
+  // managed worktree roots still provide the global desktop view without it.
+  collect_snapshot_for_roots_with_workspace_data_path(
+    commands,
+    configured_repository_root(commands).as_deref(),
+    &workspace_root,
+  )
 }
 
-fn collect_snapshot_for_root_with_workspace_data_path(
+fn collect_snapshot_for_roots_with_workspace_data_path(
   commands: &dyn CommandBoundary,
-  root: &Path,
+  conductor_root: Option<&Path>,
   workspace_root: &Path,
 ) -> Result<ControlTowerSnapshot, String> {
-  let root_text = root.to_string_lossy();
-  let porcelain = commands
-    .run(
-      "git",
-      &["-C", root_text.as_ref(), "worktree", "list", "--porcelain"],
-    )
-    .ok_or("無法讀取 git worktree observations。")?;
-  let repository = github_repository(commands, &root).unwrap_or_else(|| {
-    root
-      .file_name()
-      .and_then(|value| value.to_str())
-      .unwrap_or("unknown")
-      .to_owned()
-  });
   let runs = load_runs(commands);
-  let rows = parse_worktrees(&porcelain)
+  let rows = discover_worktrees(commands, conductor_root, workspace_root, &runs)
     .into_iter()
-    .map(|entry| {
-      let run = runs.get(&entry.path).filter(|run| {
-        entry.branch.as_deref() == Some(run.branch.as_str()) && run.repository == repository
+    .map(|worktree| {
+      let correlated = correlated_run(commands, &runs, &worktree).and_then(|run| {
+        let pull_request = pull_request(
+          commands,
+          &run.repository,
+          run.pull_request_number,
+          worktree.head_sha.as_deref(),
+        );
+        (run.pull_request_number.is_none() || pull_request.is_some()).then_some((run, pull_request))
       });
-      let process = current_process(commands, &entry.path);
+      let run = correlated.as_ref().map(|(run, _)| *run);
+      let process = current_process(commands, &worktree.path);
       WorkUnitView {
         repository: run
           .map(|value| value.repository.clone())
-          .unwrap_or_else(|| repository.clone()),
-        // Branch text is not durable identity evidence. A missing run remains unlinked.
+          .or_else(|| worktree.repository.clone())
+          .unwrap_or_else(|| "unknown".to_owned()),
+        // A missing, ambiguous, stale, or GitHub-unproven run remains unlinked.
         issue: run.and_then(|value| value.issue),
-        pull_request: pull_request(
-          commands,
-          &repository,
-          run.and_then(|value| value.pull_request_number),
-        ),
+        pull_request: correlated.and_then(|(_, pull_request)| pull_request),
         run_id: run.map(|value| value.id.clone()),
         agent: run.map(|value| AgentView {
           provider: value
@@ -606,20 +785,20 @@ fn collect_snapshot_for_root_with_workspace_data_path(
           duration_ms: value.duration_ms,
         }),
         worktree: WorktreeView {
-          short_id: entry
+          short_id: worktree
             .head_sha
             .as_deref()
             .unwrap_or("unknown")
             .chars()
             .take(4)
             .collect(),
-          path: entry.path.clone(),
-          branch: entry.branch.clone(),
-          head_sha: entry.head_sha.clone(),
-          clean: is_clean(commands, &entry.path),
+          path: worktree.path.clone(),
+          branch: worktree.branch.clone(),
+          head_sha: worktree.head_sha.clone(),
+          clean: is_clean(commands, &worktree.path),
         },
         process,
-        disk_bytes: directory_bytes(commands, &entry.path),
+        disk_bytes: directory_bytes(commands, &worktree.path),
         reclaim: ReclaimView {
           state: "unknown".to_owned(),
           reason: RECLAIM_UNAVAILABLE.to_owned(),
@@ -688,7 +867,7 @@ fn tray_summary(snapshot: &ControlTowerSnapshot) -> (String, String, String) {
         .is_some_and(|agent| is_executing_state(&agent.state))
     })
     .count();
-  let agents = format!("Codex 執行中：{active}");
+  let agents = format!("執行中 agent：{active}");
   let disk = snapshot
     .system
     .data_free_bytes
@@ -709,7 +888,7 @@ fn tray_summary(snapshot: &ControlTowerSnapshot) -> (String, String, String) {
 
 fn unavailable_tray_summary() -> (String, String, String) {
   (
-    "Codex 執行中：資料不可用".to_owned(),
+    "執行中 agent：資料不可用".to_owned(),
     "Data 磁碟：資料不可用".to_owned(),
     "可立即回收：資料不可用".to_owned(),
   )
@@ -762,7 +941,7 @@ pub fn run() {
       let agents = MenuItem::with_id(
         app,
         "agents-summary",
-        "Codex 執行中：讀取中…",
+        "執行中 agent：讀取中…",
         false,
         None::<&str>,
       )?;
@@ -824,6 +1003,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use std::collections::HashMap;
   use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Barrier,
@@ -889,22 +1069,31 @@ mod tests {
   }
 
   #[test]
-  fn data_volume_uses_the_configured_workspace_root_before_repository_root() {
+  fn data_volume_uses_the_configured_workspace_root_before_home_default() {
     assert_eq!(
       workspace_data_path(
-        Path::new("/external/repository"),
         Some(PathBuf::from("/managed/workspaces")),
         Some(PathBuf::from("/Users/operator")),
       ),
-      PathBuf::from("/managed/workspaces")
+      Some(PathBuf::from("/managed/workspaces"))
     );
     assert_eq!(
-      workspace_data_path(
-        Path::new("/repository"),
-        None,
-        Some(PathBuf::from("/Users/operator")),
-      ),
-      PathBuf::from("/Users/operator/.tachiko-conductor/workspaces")
+      workspace_data_path(None, Some(PathBuf::from("/Users/operator"))),
+      Some(PathBuf::from("/Users/operator/.tachiko-conductor/workspaces"))
+    );
+    assert_eq!(workspace_data_path(None, None), None);
+  }
+
+  #[test]
+  fn disk_stats_probes_an_existing_ancestor_for_a_fresh_workspace_root() {
+    let fake = FakeCommands::with(&[(
+      "df",
+      "-k\u{1}/",
+      "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 400 600 40% /\n",
+    )]);
+    assert_eq!(
+      disk_stats(&fake, Path::new("/tachiko-control-tower-missing-workspace/root")),
+      (Some(1_024_000), Some(614_400))
     );
   }
 
@@ -924,13 +1113,13 @@ mod tests {
       "schemaVersion": 1, "runId": "run-32", "sourceUpdatedAt": "1", "sourceDigest": digest,
       "workflowState": "IMPLEMENTING", "target": { "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 }
     }), "run-32", &digest).is_none());
-    let (path, run) = operational_run_observation(&serde_json::json!({
+    let run = operational_run_observation(&serde_json::json!({
       "schemaVersion": 1, "runId": "run-32", "sourceUpdatedAt": "1", "sourceDigest": digest,
       "workflowState": "IMPLEMENTING",
       "target": { "owner": "nurockplayer", "repo": "tachiko-conductor", "issueNumber": 32 },
       "bootstrap": { "workspacePath": "/tmp/worktree", "branch": "tachiko/issue-32", "baseBranch": "main", "baseSha": "base" }
     }), "run-32", &digest).expect("complete operational projection");
-    assert_eq!(path, "/tmp/worktree");
+    assert_eq!(run.workspace_path, "/tmp/worktree");
     assert_eq!(run.repository, "nurockplayer/tachiko-conductor");
     assert_eq!(run.branch, "tachiko/issue-32");
     assert!(operational_run_observation(&serde_json::json!({
@@ -944,24 +1133,113 @@ mod tests {
   fn production_collector_uses_injected_boundaries_and_never_derives_issue_from_branch() {
     let fake = FakeCommands::with(&[
       ("git", "-C\u{1}/tmp/repo\u{1}worktree\u{1}list\u{1}--porcelain", "worktree /tmp/work trees/issue-32\nHEAD 1234567890\nbranch refs/heads/codex/issue-32\n"),
+      ("git", "-C\u{1}/tmp/repo\u{1}rev-parse\u{1}--show-toplevel", "/tmp/repo\n"),
+      ("git", "-C\u{1}/tmp/repo\u{1}rev-parse\u{1}--path-format=absolute\u{1}--git-common-dir", "/tmp/repo/.git\n"),
       ("git", "-C\u{1}/tmp/repo\u{1}config\u{1}--get\u{1}remote.origin.url", "https://github.com/nurockplayer/tachiko-conductor.git\n"),
+      ("git", "-C\u{1}/tmp/repo\u{1}symbolic-ref\u{1}--quiet\u{1}--short\u{1}HEAD", "main\n"),
+      ("git", "-C\u{1}/tmp/repo\u{1}rev-parse\u{1}HEAD", "base\n"),
+      ("git", "-C\u{1}/tmp/work trees/issue-32\u{1}rev-parse\u{1}--show-toplevel", "/tmp/work trees/issue-32\n"),
+      ("git", "-C\u{1}/tmp/work trees/issue-32\u{1}rev-parse\u{1}--path-format=absolute\u{1}--git-common-dir", "/tmp/repo/.git\n"),
+      ("git", "-C\u{1}/tmp/work trees/issue-32\u{1}config\u{1}--get\u{1}remote.origin.url", "https://github.com/nurockplayer/tachiko-conductor.git\n"),
+      ("git", "-C\u{1}/tmp/work trees/issue-32\u{1}symbolic-ref\u{1}--quiet\u{1}--short\u{1}HEAD", "codex/issue-32\n"),
+      ("git", "-C\u{1}/tmp/work trees/issue-32\u{1}rev-parse\u{1}HEAD", "1234567890\n"),
       ("git", "-C\u{1}/tmp/work trees/issue-32\u{1}status\u{1}--porcelain", ""),
       ("du", "-sk\u{1}/tmp/work trees/issue-32", "2048\t/tmp/work trees/issue-32\n"),
       ("df", "-k\u{1}/Users/tachikoma/.tachiko-conductor/workspaces", "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/disk 1000 400 600 40% /\n"),
       ("sysctl", "-n\u{1}hw.memsize", "10000\n"),
       ("vm_stat", "", "Mach Virtual Memory Statistics: (page size of 1000 bytes)\nPages free:                               4.\n"),
     ]);
-    let snapshot = collect_snapshot_for_root_with_workspace_data_path(
+    let snapshot = collect_snapshot_for_roots_with_workspace_data_path(
       &fake,
-      Path::new("/tmp/repo"),
+      Some(Path::new("/tmp/repo")),
       Path::new("/Users/tachikoma/.tachiko-conductor/workspaces"),
     )
-      .expect("fake observations are complete enough for a snapshot");
+    .expect("fake observations are complete enough for a snapshot");
     assert_eq!(snapshot.rows.len(), 1);
     assert_eq!(snapshot.rows[0].worktree.path, "/tmp/work trees/issue-32");
     assert_eq!(snapshot.rows[0].issue, None);
     assert_eq!(snapshot.rows[0].disk_bytes, Some(2_097_152));
     assert_eq!(snapshot.system.memory_used_bytes, Some(6_000));
+  }
+
+  #[test]
+  fn correlation_requires_canonical_path_common_git_repository_branch_lineage_and_exact_head() {
+    let fake = FakeCommands::with(&[
+      (
+        "git",
+        "-C\u{1}/alias/run\u{1}rev-parse\u{1}--show-toplevel",
+        "/canonical/run\n",
+      ),
+      (
+        "git",
+        "-C\u{1}/canonical/run\u{1}rev-parse\u{1}--path-format=absolute\u{1}--git-common-dir",
+        "/canonical/.git\n",
+      ),
+      (
+        "git",
+        "-C\u{1}/canonical/run\u{1}config\u{1}--get\u{1}remote.origin.url",
+        "git@github.com:acme/widgets.git\n",
+      ),
+      (
+        "git",
+        "-C\u{1}/canonical/run\u{1}symbolic-ref\u{1}--quiet\u{1}--short\u{1}HEAD",
+        "codex/widgets\n",
+      ),
+      (
+        "git",
+        "-C\u{1}/canonical/run\u{1}rev-parse\u{1}HEAD",
+        "head\n",
+      ),
+      (
+        "git",
+        "-C\u{1}/canonical/run\u{1}merge-base\u{1}--is-ancestor\u{1}base\u{1}head",
+        "",
+      ),
+    ]);
+    let worktree = VerifiedWorktree {
+      path: "/canonical/run".to_owned(),
+      common_git: "/canonical/.git".to_owned(),
+      repository: Some("acme/widgets".to_owned()),
+      branch: Some("codex/widgets".to_owned()),
+      head_sha: Some("head".to_owned()),
+    };
+    let run = RunObservation {
+      id: "run-1".to_owned(),
+      repository: "AcMe/WiDgEtS".to_owned(),
+      workspace_path: "/alias/run".to_owned(),
+      branch: "codex/widgets".to_owned(),
+      base_sha: "base".to_owned(),
+      head_sha: Some("head".to_owned()),
+      pull_request_head_sha: Some("head".to_owned()),
+      issue: Some(1),
+      pull_request_number: Some(7),
+      provider: Some("codex-cli".to_owned()),
+      state: "VALIDATING".to_owned(),
+      duration_ms: None,
+    };
+    assert_eq!(
+      correlated_run(&fake, &[run.clone()], &worktree).map(|value| value.id.as_str()),
+      Some("run-1")
+    );
+    let stale = RunObservation {
+      head_sha: Some("other-head".to_owned()),
+      ..run
+    };
+    assert!(correlated_run(&fake, &[stale], &worktree).is_none());
+  }
+
+  #[test]
+  fn live_pull_request_must_still_name_the_observed_exact_head() {
+    let fake = FakeCommands::with(&[(
+      "gh",
+      "pr\u{1}view\u{1}7\u{1}--repo\u{1}acme/widgets\u{1}--json\u{1}number,state,headRefOid",
+      "{\"number\":7,\"state\":\"OPEN\",\"headRefOid\":\"head\"}",
+    )]);
+    assert_eq!(
+      pull_request(&fake, "acme/widgets", Some(7), Some("head")).map(|value| value.state),
+      Some("OPEN".to_owned())
+    );
+    assert!(pull_request(&fake, "acme/widgets", Some(7), Some("other-head")).is_none());
   }
 
   #[test]
@@ -981,7 +1259,9 @@ mod tests {
       None
     );
     assert_eq!(
-      github_repository_from_remote("ssh://git@github.com:not-a-port/nurockplayer/tachiko-conductor.git"),
+      github_repository_from_remote(
+        "ssh://git@github.com:not-a-port/nurockplayer/tachiko-conductor.git"
+      ),
       None
     );
   }
@@ -1054,7 +1334,7 @@ mod tests {
     assert_eq!(
       tray_summary(&snapshot),
       (
-        "Codex 執行中：1".to_owned(),
+        "執行中 agent：1".to_owned(),
         "Data 磁碟：1.5 GB 可用".to_owned(),
         "可立即回收：1 個 worktree".to_owned()
       )
@@ -1066,7 +1346,7 @@ mod tests {
     assert_eq!(
       tray_summary_for_refresh(Err("transient collector failure".to_owned())),
       (
-        "Codex 執行中：資料不可用".to_owned(),
+        "執行中 agent：資料不可用".to_owned(),
         "Data 磁碟：資料不可用".to_owned(),
         "可立即回收：資料不可用".to_owned()
       )

@@ -6,9 +6,21 @@ import type { ControlTowerSnapshot, DashboardFilter, WorkUnitView } from '../../
 
 const filterLabels: ReadonlyArray<readonly [DashboardFilter, string]> = [
   ['all', '全部'],
-  ['active', 'Codex 執行中'],
+  ['active', '執行中 agent'],
   ['reclaimable', '可回收'],
 ];
+
+function isTauriRuntime(): boolean {
+  return '__TAURI_INTERNALS__' in window;
+}
+
+function initialSnapshot(): ControlTowerSnapshot {
+  // The fixture is visual-review data only. A production collector must show
+  // an honest empty/unavailable live state rather than silently falling back.
+  return isTauriRuntime()
+    ? { mode: 'live', generatedAt: '', rows: [], system: {}, sourceNote: '正在讀取即時 operational observations。' }
+    : goldenFixture;
+}
 
 function duration(value?: number): string {
   if (value === undefined) return '';
@@ -28,11 +40,11 @@ export function ControlTower(): JSX.Element {
 
 function ControlTowerBody(): JSX.Element {
   const [filter, setFilter] = useState<DashboardFilter>('all');
-  const [snapshot, setSnapshot] = useState<ControlTowerSnapshot>(goldenFixture);
+  const [snapshot, setSnapshot] = useState<ControlTowerSnapshot>(initialSnapshot);
   const [liveError, setLiveError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!('__TAURI_INTERNALS__' in window)) return;
+    if (!isTauriRuntime()) return;
     let disposed = false;
     let timer: number | undefined;
     const refresh = async (): Promise<void> => {
@@ -73,7 +85,7 @@ function ControlTowerBody(): JSX.Element {
     </header>
 
     <section className="summary-grid" aria-label="系統摘要">
-      <SummaryCard label="Codex 執行中" value={String(summary.activeCount)} detail={`${summary.activeWorktrees} 個 worktree`} />
+      <SummaryCard label="執行中 agent" value={String(summary.activeCount)} detail={`${summary.activeWorktrees} 個 worktree`} />
       <SummaryCard label="記憶體" value={memoryText} detail={summary.memoryPercent === undefined ? '使用量未知' : `${summary.memoryPercent}% 使用`} progress={summary.memoryPercent} />
       <SummaryCard label="Data 磁碟" value={formatBytes(summary.diskFreeBytes)} detail={summary.diskPercentUsed === undefined ? '剩餘容量未知' : `${summary.diskPercentUsed}% · 剩餘容量`} progress={summary.diskPercentUsed} />
       <SummaryCard label="可立即回收" value={formatBytes(summary.reclaimBytes)} detail={`${summary.reclaimCount} 個 worktree`} />
@@ -116,7 +128,7 @@ class DashboardBoundary extends Component<{ readonly children: ReactNode }, { re
 
   render(): ReactNode {
     if (!this.state.failed) return this.props.children;
-    return <main className="tower-shell"><h1>執行中工作總覽</h1><p className="source-note error">live collector 的資料未通過 renderer 邊界；已保留 golden fixture，未推定任何 live 狀態。{this.state.message ? ` ${this.state.message}` : ''}</p></main>;
+    return <main className="tower-shell"><h1>執行中工作總覽</h1><p className="source-note error">live collector 的資料未通過 renderer 邊界；未顯示 fixture 或推定任何 live 狀態。{this.state.message ? ` ${this.state.message}` : ''}</p></main>;
   }
 }
 

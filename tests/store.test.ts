@@ -58,6 +58,26 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(JSON.stringify(projection).includes('secret-session'), false);
   });
 
+  it('keeps a committed raw transition successful when derived projection emission fails', () => {
+    const { store, dir } = tempStore();
+    let run = newRun('projection-best-effort');
+    store.create(run);
+    rmSync(path.join(dir, '.operational'), { recursive: true, force: true });
+    writeFileSync(path.join(dir, '.operational'), 'not a directory', 'utf8');
+
+    run = applyTransition(run, { type: 'start' }, T0);
+    assert.doesNotThrow(() => store.update(run));
+    assert.equal(new JsonFileStore({ dir }).read(run.id)?.state, 'IMPLEMENTING');
+    assert.throws(() => readFileSync(operationalProjectionPath(dir, run.id), 'utf8'));
+
+    rmSync(path.join(dir, '.operational'), { force: true });
+    assert.equal(store.rebuildOperationalProjections(), 1);
+    assert.equal(
+      JSON.parse(readFileSync(operationalProjectionPath(dir, run.id), 'utf8')).workflowState,
+      'IMPLEMENTING',
+    );
+  });
+
   it('rebuilds valid legacy projections and removes a projection with its run', () => {
     const { store, dir } = tempStore();
     const run = newRun('legacy-projection');

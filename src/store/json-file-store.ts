@@ -223,6 +223,21 @@ function writeJsonAtomic(filePath: string, value: unknown): string {
   return serialized;
 }
 
+/**
+ * The raw Run is the durable authority. A projection is only a derived,
+ * fail-closed operational read model, so a sidecar failure after the raw
+ * atomic rename must not misreport the already-committed transition as lost.
+ * `rebuildOperationalProjections` provides the explicit recovery path.
+ */
+function writeOperationalProjectionBestEffort(runsDir: string, run: Run, committedRunBytes: string): void {
+  try {
+    writeOperationalProjection(runsDir, run, committedRunBytes);
+  } catch {
+    // The raw Run remains valid and authoritative; a missing/stale sidecar is
+    // rejected by its digest until an explicit validated rebuild succeeds.
+  }
+}
+
 function readRun(filePath: string, id: string): Run {
   let raw: string;
   try {
@@ -274,7 +289,7 @@ export class JsonFileStore implements RunStore {
       throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
     }
     const serialized = writeJsonAtomic(filePath, run);
-    writeOperationalProjection(this.dir, run, serialized);
+    writeOperationalProjectionBestEffort(this.dir, run, serialized);
   }
 
   read(id: string): Run | null {
@@ -285,7 +300,7 @@ export class JsonFileStore implements RunStore {
 
   update(run: Run): void {
     const serialized = writeJsonAtomic(this.filePathFor(run.id), run);
-    writeOperationalProjection(this.dir, run, serialized);
+    writeOperationalProjectionBestEffort(this.dir, run, serialized);
   }
 
   list(): Run[] {

@@ -16,10 +16,14 @@ corepack pnpm@10.34.5 --dir apps/control-tower build
 corepack pnpm@10.34.5 --dir apps/control-tower tauri:build
 ```
 
-`TACHIKO_CONTROL_TOWER_REPOSITORY` selects the local repository that the
-read-only native collector observes. Without a provable root it fails soft and
-keeps the deterministic fixture visible instead of guessing. `tauri:build` runs
-a macOS release no-bundle build under
+`TACHIKO_CONTROL_TOWER_REPOSITORY` optionally adds a stable Conductor repository
+root to the read-only native collector. Finder/Dock launches do not depend on it
+or on a shell cwd: discovery begins from the bounded managed-worktree root and
+digest-verified operational projections. `TACHIKO_WORKSPACE_ROOT` optionally
+selects that managed-worktree root (the default is
+`~/.tachiko-conductor/workspaces`). Without a provable root, production renders
+an empty/unavailable live state; it never substitutes the deterministic fixture.
+`tauri:build` runs a macOS release no-bundle build under
 `apps/control-tower/src-tauri/target/release/`; invoking Tauri's normal bundle
 command on a configured signing host produces the `.app` artifact.
 
@@ -27,10 +31,16 @@ command on a configured signing host produces the `.app` artifact.
 
 The frontend consumes the provider/UI-neutral
 `src/operational/read-model.ts` (`ControlTowerSnapshot` / `WorkUnitView`), so
-future CLI or automation consumers can use the same typed projection. The native collector uses bounded reads for linked Git worktrees,
-durable Conductor run files, current process RSS when an exact path association
-is observable, worktree disk usage, data-volume capacity, system RAM, and
-GitHub PR state. It never guesses a missing Issue → run → PR → worktree link.
+future CLI or automation consumers can use the same typed projection. The native
+collector discovers only the configured Conductor root, direct managed-worktree
+roots, and workspace paths named by digest-verified operational projections; it
+does not scan HOME or depend on a Codex database/session format. Before joining
+a run to a worktree it proves canonical path, common-Git identity, GitHub remote,
+branch, bootstrap-base ancestry, and any claimed exact HEAD; a live PR must also
+still name that observed head. Missing or ambiguous evidence remains unlinked.
+It uses bounded reads for current process RSS when an exact path association is
+observable, worktree disk usage, data-volume capacity, system RAM, and GitHub PR
+state.
 
 Live reclaim state is intentionally `unknown` until a shared,
 repository-owned housekeeping classifier proves it. The UI has no direct

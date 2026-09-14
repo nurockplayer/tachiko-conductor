@@ -49,7 +49,7 @@ export function rowsForFilter(rows: readonly WorkUnitView[], filter: DashboardFi
 
 export function statusLine(filter: DashboardFilter, count: number): string {
   if (filter === 'all') return '目前顯示全部工作。';
-  if (filter === 'active') return `目前顯示 ${count} 個 Codex 執行中工作。`;
+  if (filter === 'active') return `目前顯示 ${count} 個執行中 agent 工作。`;
   return `目前顯示 ${count} 個可回收 worktree。`;
 }
 
