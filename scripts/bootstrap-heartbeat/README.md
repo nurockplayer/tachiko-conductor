@@ -25,7 +25,8 @@ threads so a long-lived lane stays observable without unbounded pagination. Wake
 group and leaves the fingerprint unconsumed for retry. Exit zero alone is a re-entry boundary:
 the target must also print `TACHIKO_HEARTBEAT_SETTLED_V1` on its own final line to consume the
 fingerprint and reset the safety clock. Installation resolves `gh`, validates the audited ChatGPT-bundled Codex executable,
-records the exact user-owned SCD profile digest, primes a GitHub baseline without waking Codex,
+pins its adjacent `codex-code-mode-host` companion, records the exact user-owned SCD profile digest,
+primes a GitHub baseline without waking Codex,
 and loads `io.tachiko.conductor.scd-heartbeat`.
 The resolved `gh` executable is opened and checked for root/current-user ownership and safe leaf
 permissions during installation, then copied from that verified descriptor into a digest-named,
@@ -79,7 +80,9 @@ before wake-guard creation to recover from PID reuse without accepting an ambigu
   wakes a model. Wake executables must be owned by root/current user, must not be group/world
   writable, and are SHA-256 pinned at install time alongside the default SCD profile. Each wake
   executes a private snapshot copied from the already-verified executable descriptor, so a
-  pathname replacement between verification and launch cannot change the executed bytes.
+  pathname replacement between verification and launch cannot change the executed bytes. The
+  default Codex target's verified code-mode companion is materialized beside that snapshot so
+  location-based runtime discovery remains intact without reopening unverified bytes.
 - One advisory `flock` covers collection and the entire direct wake. A dedicated same-host guard
   retains it if the supervisor dies, while the wake target and its background descendants never
   inherit the descriptor. Normal direct-child completion releases the guard without waiting for
