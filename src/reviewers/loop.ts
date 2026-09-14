@@ -449,7 +449,11 @@ export async function runReviewLoop(
       // A new fix creates a new exact HEAD. Validation is owned by the outer
       // workflow so it must collect fresh local and hosted evidence before a
       // reviewer can see that HEAD.
-      return { outcome: 'approved', run };
+      return {
+        outcome: 'revalidating',
+        run,
+        reason: 'A repaired exact HEAD requires fresh validation before another independent review.',
+      };
     }
 
     if (durableRepairAttempts(run) >= options.maxAttempts) {

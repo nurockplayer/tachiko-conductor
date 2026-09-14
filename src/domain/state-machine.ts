@@ -682,8 +682,10 @@ export function applyTransition(
   // HEAD changes only on implementation events or an exact, explicitly
   // offered live-HEAD synchronization decision. The value is normalized.
   // A failed execution's observed head is evidence, not a new accepted ledger
-  // head. Keep the prior ownership intact for bootstrap-bound runs.
-  const preservesOwnedHead = run.bootstrap !== undefined && input.type === 'agent_failed';
+  // head. Keep the prior ownership intact whenever the run has accepted a PR
+  // tuple, regardless of whether it uses a bootstrap workspace.
+  const preservesOwnedHead = input.type === 'agent_failed' &&
+    (run.bootstrap !== undefined || run.pullRequest !== undefined);
   const headSha = !preservesOwnedHead && (HEAD_UPDATING_TRANSITIONS.has(input.type) || authorizedHumanHeadSync)
     ? (input.headSha ?? input.agentResult?.headSha)?.trim()
     : undefined;

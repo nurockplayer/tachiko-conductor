@@ -298,7 +298,7 @@ describe('runReviewLoop', () => {
         { maxAttempts: 3, now: () => T0 },
       );
 
-      assert.equal(result.outcome, 'approved');
+      assert.equal(result.outcome, 'revalidating');
       assert.equal(result.run.state, 'VALIDATING');
       assert.equal(result.run.headSha, HEAD2);
       assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD2 });
@@ -356,7 +356,7 @@ describe('runReviewLoop', () => {
       { maxAttempts: 3, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'approved');
+    assert.equal(result.outcome, 'revalidating');
     assert.equal(result.run.state, 'VALIDATING');
     assert.equal(result.run.headSha, HEAD2);
     assert.deepEqual(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
@@ -439,7 +439,7 @@ describe('runReviewLoop', () => {
       { maxAttempts: 2, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'approved');
+    assert.equal(result.outcome, 'revalidating');
     assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests.length, 1);
   });
@@ -497,7 +497,7 @@ describe('runReviewLoop', () => {
       { maxAttempts: 1, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'approved');
+    assert.equal(result.outcome, 'revalidating');
     assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests.length, 1);
   });
@@ -515,7 +515,7 @@ describe('runReviewLoop', () => {
       { maxAttempts: 2, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'approved');
+    assert.equal(result.outcome, 'revalidating');
     assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests[0]?.baseSha, HEAD);
     assert.deepEqual(reviewer.requests.map((reviewRequest) => reviewRequest.headSha), []);
@@ -573,6 +573,8 @@ describe('runReviewLoop', () => {
 
     assert.equal(result.outcome, 'failed');
     assert.equal(result.run.state, 'FAILED');
+    assert.equal(result.run.headSha, HEAD);
+    assert.deepEqual(result.run.pullRequest, { number: 7, headSha: HEAD });
   });
 
   it('parks in NEEDS_HUMAN when a review fix emits the explicit takeover protocol', async () => {
