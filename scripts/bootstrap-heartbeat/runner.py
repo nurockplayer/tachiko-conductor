@@ -618,7 +618,8 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
             return 124, False
         code = child.wait()
         atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
-        settled = code == 0 and SETTLED_MARKER.encode() in output.splitlines()
+        nonempty_lines = [line for line in output.splitlines() if line.strip()]
+        settled = code == 0 and bool(nonempty_lines) and nonempty_lines[-1] == SETTLED_MARKER.encode()
         return code, settled
     finally:
         if not guard_started:

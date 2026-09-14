@@ -55,6 +55,8 @@ class HeartbeatTest(unittest.TestCase):
             "time.sleep(float(os.environ.get('MOCK_WAKE_SLEEP', '0')))\n"
             "if os.environ.get('MOCK_WAKE_SETTLED', '1') == '1':\n"
             "    print('TACHIKO_HEARTBEAT_SETTLED_V1')\n"
+            "if os.environ.get('MOCK_WAKE_AFTER_SETTLED'):\n"
+            "    print(os.environ['MOCK_WAKE_AFTER_SETTLED'])\n"
             "sys.exit(int(os.environ.get('MOCK_WAKE_EXIT', '0')))\n",
             encoding="utf-8",
         )
@@ -234,6 +236,27 @@ class HeartbeatTest(unittest.TestCase):
             self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"],
         )
         self.assertEqual(self.state()["last_success_at"], 1002)
+
+    def test_only_final_nonempty_output_line_acknowledges_settled(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        continued = dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001",
+            MOCK_WAKE_AFTER_SETTLED="continued non-terminal output",
+        )
+        self.assertEqual(self.invoke("run", env=continued).returncode, 0)
+        self.assertNotEqual(
+            self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"],
+            "an earlier marker followed by output must not settle",
+        )
+
+        self.assertEqual(
+            self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002")).returncode, 0,
+        )
+        self.assertEqual(
+            self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"],
+            "the exact marker as final non-empty line must settle",
+        )
 
     def test_ordinary_execution_comment_edit_is_meaningful(self) -> None:
         self.invoke("run", "--prime")
