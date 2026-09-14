@@ -235,9 +235,16 @@ describe('C20 consolidation regressions', () => {
     run = applyTransition(run, { type: 'validation_failed', validationResult: validationFailed(HEAD) }, T0);
     new JsonFileStore({ dir }).create(run);
     const implementation = new CapturingImplementation();
+    const validation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate() { throw new Error('validation must not run'); },
+    };
 
     const result = await runWorkflow(
-      { store: new JsonFileStore({ dir }), github: new QueuedGitHub([]), implementation, reviewer: unusedReviewer },
+      {
+        store: new JsonFileStore({ dir }), github: new QueuedGitHub([]), implementation, reviewer: unusedReviewer,
+        validation, hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
       run.id,
       { maxReviewAttempts: 2, now: () => T0 },
     );

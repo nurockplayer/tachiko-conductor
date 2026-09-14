@@ -257,9 +257,10 @@ export async function runReviewLoop(
         return { outcome: 'failed', run, reason };
       }
 
-      // Failed validation is not repair authority on its own. A persisted
-      // failure must already be bound to an accepted PR and exact HEAD before
-      // this loop may prepare a workspace or invoke the implementation agent.
+      // Failed validation is not repair authority on its own. After any stale
+      // evidence is revalidated, a failure must be bound to an accepted PR and
+      // exact HEAD before this loop may prepare a workspace or invoke the
+      // implementation agent.
       if (run.pullRequest === undefined || run.headSha === undefined || run.pullRequest.headSha !== run.headSha) {
         const reason = 'Failed validation evidence is not bound to an accepted pull request and exact HEAD; refusing to authorize a repair.';
         run = applyTransition(
