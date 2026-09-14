@@ -30,6 +30,8 @@ The resolved `gh` executable is opened and checked for root/current-user ownersh
 permissions during installation, then copied from that verified descriptor into a digest-named,
 mode-0700 snapshot in the private state directory. Polls execute those pinned bytes rather than
 reopening a replaceable Homebrew path; a successful reinstall prunes older digest snapshots.
+The LaunchAgent likewise executes a digest-named private snapshot of the repository runner instead
+of reopening Python source from a replaceable checkout path.
 Installation updates config, plist, pinned snapshots, and the loaded service as one rollback-capable
 operation; an activation failure restores the previous installed files and loaded service.
 

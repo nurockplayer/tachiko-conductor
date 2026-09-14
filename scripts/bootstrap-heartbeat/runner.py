@@ -245,6 +245,11 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or any(character not in "0123456789abcdef" for character in gh_digest)
             or Path(config["gh"]) != ROOT / ("verified-gh-" + gh_digest)):
         raise RuntimeError("invalid pinned GitHub CLI identity")
+    runner_digest = config.get("runner_sha256")
+    if (not isinstance(runner_digest, str) or len(runner_digest) != 64
+            or any(character not in "0123456789abcdef" for character in runner_digest)
+            or Path(config["runner"]) != ROOT / ("verified-runner-" + runner_digest)):
+        raise RuntimeError("invalid pinned heartbeat runner identity")
     if type(config.get("poll_interval_seconds")) is not int or config["poll_interval_seconds"] < 1:
         raise RuntimeError("invalid poll_interval_seconds")
     if type(config.get("poll_timeout_seconds")) is not int or config["poll_timeout_seconds"] < 1:
@@ -438,16 +443,40 @@ def pin_github_tool(path: Path) -> tuple[Path, str, bool]:
         os.close(source_fd)
 
 
-def prune_stale_github_snapshots(current: Path) -> None:
-    prefix = "verified-gh-"
-    for candidate in ROOT.iterdir():
-        suffix = candidate.name.removeprefix(prefix)
-        if (candidate == current or not candidate.name.startswith(prefix) or len(suffix) != 64
-                or any(character not in "0123456789abcdef" for character in suffix)):
-            continue
-        metadata = candidate.lstat()
-        if stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
-            candidate.unlink()
+def pin_runner_source(path: Path) -> tuple[Path, str, bool]:
+    if not path.is_file() or path.is_symlink():
+        raise RuntimeError("heartbeat runner unavailable or unsafe: " + str(path))
+    source_fd = os.open(path, os.O_RDONLY)
+    try:
+        metadata = os.fstat(source_fd)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
+                or metadata.st_mode & 0o022):
+            raise RuntimeError("heartbeat runner ownership or permissions unsafe: " + str(path))
+        digest = fd_sha256(source_fd)
+        existed = (ROOT / ("verified-runner-" + digest)).exists()
+        target = materialize_verified_executable(source_fd, "verified-runner-" + digest)
+        return target, digest, not existed
+    finally:
+        os.close(source_fd)
+
+
+def prune_stale_digest_snapshots(prefix: str, current: Path) -> None:
+    try:
+        candidates = list(ROOT.iterdir())
+    except OSError as error:
+        log("could not inspect stale digest snapshots: " + str(error))
+        return
+    for candidate in candidates:
+        try:
+            suffix = candidate.name.removeprefix(prefix)
+            if (candidate == current or not candidate.name.startswith(prefix) or len(suffix) != 64
+                    or any(character not in "0123456789abcdef" for character in suffix)):
+                continue
+            metadata = candidate.lstat()
+            if stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                candidate.unlink()
+        except OSError as error:
+            log("could not prune stale digest snapshot " + str(candidate) + ": " + str(error))
 
 
 def restore_optional_file(path: Path, previous: bytes | None) -> None:
@@ -928,16 +957,16 @@ def install(args: argparse.Namespace) -> int:
     gh_source = Path(resolved_tool("gh"))
     config_values = {
         "schema": CONFIG_SCHEMA, "gh": str(gh_source), "gh_sha256": "", "repo": str(repo),
-        "runner": str(runner), "poll_interval_seconds": args.interval,
+        "runner": str(runner), "runner_sha256": "", "poll_interval_seconds": args.interval,
         "poll_timeout_seconds": DEFAULT_POLL_TIMEOUT_SECONDS,
         "wake_timeout_seconds": DEFAULT_WAKE_TIMEOUT_SECONDS,
         "safety_interval_seconds": args.safety_interval,
         "wake_executable_relocatable": True, "wake_command": wake_command,
         "wake_env": wake_env, "required_files": required_files, "installed_at": now_epoch(),
     }
-    plist = {
+    plist: dict[str, Any] = {
         "Label": LABEL,
-        "ProgramArguments": ["/usr/bin/python3", str(runner), "run"],
+        "ProgramArguments": [],
         "WorkingDirectory": str(repo),
         "StandardInPath": "/dev/null", "StandardOutPath": "/dev/null", "StandardErrorPath": "/dev/null",
         "EnvironmentVariables": {"PATH": launch_path(), "PYTHONDONTWRITEBYTECODE": "1"},
@@ -951,12 +980,19 @@ def install(args: argparse.Namespace) -> int:
     previous_plist = target.read_bytes() if target.exists() else None
     gh_snapshot: Path | None = None
     gh_snapshot_created = False
+    runner_snapshot: Path | None = None
+    runner_snapshot_created = False
     service_transitioned = False
     previous_service_loaded = False
     domain = f"gui/{os.getuid()}"
     try:
         gh_snapshot, gh_digest, gh_snapshot_created = pin_github_tool(gh_source)
-        config_values.update(gh=str(gh_snapshot), gh_sha256=gh_digest)
+        runner_snapshot, runner_digest, runner_snapshot_created = pin_runner_source(runner)
+        config_values.update(
+            gh=str(gh_snapshot), gh_sha256=gh_digest,
+            runner=str(runner_snapshot), runner_sha256=runner_digest,
+        )
+        plist["ProgramArguments"] = ["/usr/bin/python3", str(runner_snapshot), "run"]
         config = validate_config(config_values)
         verify_wake_target(config)
         prior = load_state() if STATE.exists() else {}
@@ -971,7 +1007,8 @@ def install(args: argparse.Namespace) -> int:
             prime(config, "first install")
         else:
             log("preserved valid successful state across reinstall")
-        prune_stale_github_snapshots(gh_snapshot)
+        prune_stale_digest_snapshots("verified-gh-", gh_snapshot)
+        prune_stale_digest_snapshots("verified-runner-", runner_snapshot)
     except Exception as error:
         rollback_errors: list[str] = []
         for path, previous in ((CONFIG, previous_config), (STATE, previous_state), (target, previous_plist)):
@@ -984,6 +1021,11 @@ def install(args: argparse.Namespace) -> int:
                 gh_snapshot.unlink()
             except OSError as rollback_error:
                 rollback_errors.append(f"remove {gh_snapshot}: {rollback_error}")
+        if runner_snapshot_created and runner_snapshot is not None and runner_snapshot.exists():
+            try:
+                runner_snapshot.unlink()
+            except OSError as rollback_error:
+                rollback_errors.append(f"remove {runner_snapshot}: {rollback_error}")
         if service_transitioned:
             try:
                 bootout_if_loaded(domain)
@@ -997,7 +1039,7 @@ def install(args: argparse.Namespace) -> int:
     finally:
         release_lock(lock_stream)
     print(f"installed {LABEL}; interval={args.interval}s safety={args.safety_interval}s")
-    print("runner=" + str(runner))
+    print("runner=" + str(runner_snapshot))
     print("state=" + str(ROOT))
     return 0
 

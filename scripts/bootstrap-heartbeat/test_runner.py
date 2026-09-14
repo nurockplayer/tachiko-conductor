@@ -101,12 +101,17 @@ class HeartbeatTest(unittest.TestCase):
         gh_snapshot = self.state_root / ("verified-gh-" + gh_digest)
         gh_snapshot.write_bytes(self.gh.read_bytes())
         gh_snapshot.chmod(0o700)
+        runner_digest = hashlib.sha256(RUNNER.read_bytes()).hexdigest()
+        runner_snapshot = self.state_root / ("verified-runner-" + runner_digest)
+        runner_snapshot.write_bytes(RUNNER.read_bytes())
+        runner_snapshot.chmod(0o700)
         config = {
             "schema": 1,
             "gh": str(gh_snapshot),
             "gh_sha256": gh_digest,
             "repo": str(Path.cwd()),
-            "runner": str(RUNNER),
+            "runner": str(runner_snapshot),
+            "runner_sha256": runner_digest,
             "poll_interval_seconds": 180,
             "poll_timeout_seconds": 60,
             "wake_timeout_seconds": 1500,
@@ -640,10 +645,15 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual((self.state_root / "state.json").read_bytes(), before)
         with self.plist.open("rb") as stream:
             plist = plistlib.load(stream)
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(plist["StartInterval"], 180)
         self.assertEqual(plist["WorkingDirectory"], str(Path.cwd()))
-        self.assertEqual(plist["ProgramArguments"], ["/usr/bin/python3", str(RUNNER), "run"])
-        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(plist["ProgramArguments"], ["/usr/bin/python3", config["runner"], "run"])
+        self.assertEqual(Path(config["runner"]).parent, self.state_root)
+        self.assertEqual(Path(config["runner"]).name, "verified-runner-" + config["runner_sha256"])
+        self.assertEqual(
+            hashlib.sha256(Path(config["runner"]).read_bytes()).hexdigest(), config["runner_sha256"]
+        )
         self.assertEqual(config["wake_command"], [str(self.wake), "future-dispatch-once"])
         self.assertEqual(self.invoke("status").returncode, 0)
         self.invoke("uninstall", "--no-load")
