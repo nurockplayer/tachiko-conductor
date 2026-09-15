@@ -236,6 +236,28 @@ even if a later configuration revision remaps the profile. Unknown profiles,
 unavailable executors, malformed settings, and provider-unsupported settings
 fail before implementation starts.
 
+### Codex App Server runtime observation
+
+For a `codex-cli` execution profile, Conductor first probes a component-local
+`codex app-server --stdio` through `initialize` / `initialized`. A healthy
+server is used only as the native runtime adapter; the durable `Run`, dispatch
+claim, prepared worktree, and exact-HEAD validation remain authoritative. An
+unavailable binary or failed handshake falls back to the existing bounded
+`codex exec --json` adapter. A known active native thread is observed first and
+then parked unless its exact durable Run/executor-generation fence proves an
+allowed control action; restart never blindly starts another turn.
+
+The adapter exposes native `thread/read`, terminal `thread/resume` plus
+`turn/start`, and exact active-turn steer/interrupt operations through local
+stdio only. Server-initiated approvals fail closed. It does not open a TCP
+listener, persist App Server process state, copy raw thread transcripts, or add
+a second queue/lease/workflow store. To check only the installed local
+App-Server handshake (without starting a model turn), opt in explicitly:
+
+```bash
+TACHIKO_CODEX_APP_SERVER_SMOKE=1 node --import tsx --test tests/codex-app-server.test.ts
+```
+
 ## Exact-HEAD validation
 
 `VALIDATING` requires a persisted `ValidationResult` for the current exact

@@ -411,6 +411,11 @@ export async function runWorkflow(
             capabilities: await deps.resolveImplementationCapabilities?.(),
             ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
             ...(run.executor === undefined ? {} : { executor: run.executor }),
+            runtimeOwnership: {
+              runId: run.id,
+              generation: run.executor?.generation ?? run.id,
+              ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+            },
             ...(run.execution === undefined ? {} : { execution: run.execution }),
           });
         } catch (error) {
