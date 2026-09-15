@@ -249,4 +249,29 @@ describe('dispatch queue protocol', () => {
     });
     assert.deepEqual(executions, [undefined]);
   });
+
+  it('rejects recovery when the durable profile and retained claim disagree', async () => {
+    const runtime = new CommandRuntime(QUEUE);
+    const store = new MemoryStore();
+    const execution = { profile: 'standard' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
+    const existing = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing', execution);
+    store.create(existing);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'claim-1', runId: existing.id, profile: 'complex', state: 'running',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    await assert.rejects(
+      dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
+        workflow: { store, github: new GitHub() } as unknown as WorkflowDependencies,
+        runtime,
+        resolveExecutionProfile: () => { throw new Error('must not resolve current profile configuration'); },
+        runIssue: async () => { throw new Error('must not resume an inconsistent claim'); },
+        now: () => T0,
+      }),
+      /profile does not match the retained dispatch claim/,
+    );
+  });
 });

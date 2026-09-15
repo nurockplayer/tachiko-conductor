@@ -39,6 +39,9 @@ export async function dispatchOnceCommand(
         if (existing.execution === undefined) {
           throw new Error(`Durable run ${existing.id} does not retain the queue-selected immutable execution profile.`);
         }
+        if (existing.execution.profile !== entry.profile) {
+          throw new Error(`Durable run ${existing.id} profile does not match the retained dispatch claim.`);
+        }
         const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, undefined);
         return { runId: outcome.run.id, state: outcomeState(outcome) };
       }
