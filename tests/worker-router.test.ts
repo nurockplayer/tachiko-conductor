@@ -2,7 +2,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
-import { WORKER_ROUTER_ERROR_CODE, WorkerRouterAdapter } from '../src/agents/worker-router.js';
+import {
+  WORKER_ROUTER_ERROR_CODE,
+  WORKER_ROUTER_EXECUTABLE_ENV,
+  WorkerRouterAdapter,
+} from '../src/agents/worker-router.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
 
@@ -32,13 +36,27 @@ describe('WorkerRouterAdapter', () => {
     });
     assert.equal(response.exitStatus, 'success');
     assert.equal(response.headSha, HEAD);
-    assert.match(runner.calls[0]?.options.stdin ?? '', /GitHub Issue and repository-local instructions/);
+    assert.match(runner.calls[0]?.options.stdin ?? '', /live GitHub target and repository-local instructions/);
     assert.match(runner.calls[0]?.options.stdin ?? '', /Focus on the acceptance tests/);
     assert.match(runner.calls[0]?.options.stdin ?? '', /commit all in-scope changes and push the current branch before reporting success/i);
     assert.equal(runner.calls[0]?.file, '/router');
     assert.equal(runner.calls[0]?.options.cwd, '/prepared');
     assert.match(response.diagnostics?.join('\n') ?? '', /luna-worker/);
     assert.equal(before, 1); assert.equal(after, 1);
+  });
+
+  it('uses the configured worker-router executable without making it workflow authority', async () => {
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD)]);
+    const response = await new WorkerRouterAdapter({
+      runner,
+      env: { [WORKER_ROUTER_EXECUTABLE_ENV]: '/custom/worker-router' },
+    }).run({ target: TARGET, baseSha: 'base' });
+    assert.equal(response.exitStatus, 'success');
+    assert.equal(runner.calls[0]?.file, '/custom/worker-router');
+    assert.throws(
+      () => new WorkerRouterAdapter({ runner: new FakeRunner([]), env: { [WORKER_ROUTER_EXECUTABLE_ENV]: 'relative/router' } }),
+      /absolute non-empty path/,
+    );
   });
 
   it('captures DeepSeek provenance and bounds worker output on failure', async () => {

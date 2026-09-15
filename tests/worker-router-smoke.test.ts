@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -8,6 +8,8 @@ import { WorkerRouterAdapter } from '../src/agents/worker-router.js';
 import { TARGET } from './helpers.js';
 
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
+const SMOKE_FILE = 'WORKER_ROUTER_SMOKE.txt';
+const SMOKE_CONTENT = 'WORKER_ROUTER_SMOKE_OK\n';
 
 function disposableGitWorkspace(): { root: string; source: string; worker: string; remote: string; baseSha: string } {
   const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-worker-router-smoke-'));
@@ -42,7 +44,20 @@ describe('worker-router smoke', () => {
       const sourceBefore = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace.source, encoding: 'utf8' }).trim();
       const worktrees = execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: workspace.source, encoding: 'utf8' });
       if (!worktrees.includes(`worktree ${workspace.worker}`)) throw new Error('worker workspace is not a linked worktree');
-      const result = await new WorkerRouterAdapter().run({ target: TARGET, baseSha: workspace.baseSha, workspacePath: workspace.worker, branch: 'worker-router-smoke' });
+      const result = await new WorkerRouterAdapter().run({
+        target: TARGET,
+        baseSha: workspace.baseSha,
+        workspacePath: workspace.worker,
+        branch: 'worker-router-smoke',
+        authority: 'embedded',
+        instructions: [
+          'This is an isolated smoke fixture with no live GitHub issue authority.',
+          `Create ${SMOKE_FILE} containing exactly WORKER_ROUTER_SMOKE_OK followed by one newline.`,
+          'Do not modify any other tracked file.',
+          'Do not install dependencies or run project tests; validate only the marker file and git status.',
+          'Commit the marker file and push the current worker-router-smoke branch to origin.',
+        ].join('\n'),
+      });
       if (result.exitStatus === 'failure' && result.diagnostics?.some((value) => value.includes('NOT_FOUND'))) {
         t.skip('worker-router is not installed'); return;
       }
@@ -50,6 +65,7 @@ describe('worker-router smoke', () => {
       const workerStatus = execFileSync('git', ['status', '--porcelain'], { cwd: workspace.worker, encoding: 'utf8' });
       const workerHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace.worker, encoding: 'utf8' }).trim();
       const pushedHead = execFileSync('git', ['--git-dir', workspace.remote, 'rev-parse', 'refs/heads/worker-router-smoke'], { encoding: 'utf8' }).trim();
+      if (readFileSync(path.join(workspace.worker, SMOKE_FILE), 'utf8') !== SMOKE_CONTENT) throw new Error('worker smoke marker content is incorrect');
       if (workerStatus !== '') throw new Error(`worker worktree is dirty: ${workerStatus}`);
       if (workerHead === workspace.baseSha || workerHead !== pushedHead || workerHead !== result.headSha) throw new Error('worker did not create and push a clean advanced HEAD');
       if (execFileSync('git', ['status', '--porcelain'], { cwd: workspace.source, encoding: 'utf8' }) !== '') throw new Error('source worktree is dirty');

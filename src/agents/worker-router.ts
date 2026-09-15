@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import path from 'node:path';
 
 import { assertWorkspaceGuard, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
@@ -6,6 +7,7 @@ import { NodeProcessRunner, type ProcessRunner, type ProcessResult, type Process
 
 export const WORKER_ROUTER_PROVIDER = 'worker-router';
 export const WORKER_ROUTER_DEFAULT_EXECUTABLE = `${homedir()}/.local/bin/worker-router`;
+export const WORKER_ROUTER_EXECUTABLE_ENV = 'TACHIKO_WORKER_ROUTER_PATH';
 
 export const WORKER_ROUTER_ERROR_CODE = {
   EXIT_FAILURE: 'WORKER_ROUTER_EXIT_FAILURE',
@@ -24,6 +26,7 @@ export interface WorkerRouterAdapterOptions {
   readonly executable?: string;
   readonly cwd?: string;
   readonly timeoutMs?: number;
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 /** Stateless implementation adapter for the local worker-router executable. */
@@ -36,7 +39,12 @@ export class WorkerRouterAdapter implements ImplementationAgent {
 
   constructor(options: WorkerRouterAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
-    this.executable = options.executable ?? WORKER_ROUTER_DEFAULT_EXECUTABLE;
+    const env = options.env ?? process.env;
+    const executable = options.executable ?? env[WORKER_ROUTER_EXECUTABLE_ENV] ?? WORKER_ROUTER_DEFAULT_EXECUTABLE;
+    if (executable.trim() === '' || !path.isAbsolute(executable)) {
+      throw new Error(`${WORKER_ROUTER_EXECUTABLE_ENV} / worker-router executable must be an absolute non-empty path.`);
+    }
+    this.executable = executable;
     this.cwd = options.cwd ?? process.cwd();
     this.timeoutMs = options.timeoutMs ?? 10 * 60_000;
   }
@@ -87,9 +95,12 @@ function buildTask(request: ImplementationRequest): string {
   const target = request.target.kind === 'issue'
     ? `${request.target.owner}/${request.target.repo}#${request.target.issueNumber}`
     : `${request.target.owner}/${request.target.repo}@${request.target.branch}`;
+  const authority = request.authority === 'live-target'
+    ? 'Treat the live GitHub target and repository-local instructions as authority.'
+    : 'Treat the supplied task instructions and repository-local instructions as authority.';
   return [
     `Implement ${target} in the prepared worktree.`,
-    'Treat the GitHub Issue and repository-local instructions as authority.',
+    authority,
     'Do not expand scope.',
     'Run focused/repository-required validation.',
     'Commit all in-scope changes and push the current branch before reporting success; report blockers if either operation cannot be completed.',
