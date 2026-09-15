@@ -1,7 +1,14 @@
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
-import { assertWorkspaceGuard, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import {
+  HUMAN_TAKEOVER_DIAGNOSTIC,
+  assertWorkspaceGuard,
+  normalizeMcpHttpCapabilities,
+  type ImplementationAgent,
+  type ImplementationRequest,
+  type McpHttpCapability,
+} from '../adapters/agent.js';
 import type { AgentResult, ExecutorIdentity } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
 import { CODEX_CLI_PROVIDER } from './codex-cli.js';
@@ -16,6 +23,8 @@ export const CODEX_APP_SERVER_ERROR_CODE = {
   OWNERSHIP_UNPROVEN: 'CODEX_APP_SERVER_OWNERSHIP_UNPROVEN',
   INVALID_EXECUTOR: 'CODEX_APP_SERVER_INVALID_EXECUTOR',
   HEAD_READ_FAILED: 'HEAD_READ_FAILED',
+  TIMEOUT: 'CODEX_APP_SERVER_TIMEOUT',
+  CANCELLED: 'CODEX_APP_SERVER_CANCELLED',
 } as const;
 
 export type AppServerLifecycleEvent =
@@ -51,6 +60,8 @@ export interface AppServerThreadOptions {
   readonly reasoningEffort?: string;
   readonly sandboxMode?: string;
   readonly approvalPolicy?: string;
+  /** Per-invocation App Server config; never persist ephemeral capabilities. */
+  readonly config?: Readonly<Record<string, unknown>>;
 }
 
 /** An unavailable binary/handshake is safe to route to the existing CLI adapter. */
@@ -117,6 +128,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
     if (!hasOwnership(request)) {
       return failure(CODEX_APP_SERVER_ERROR_CODE.OWNERSHIP_UNPROVEN, 'Native runtime mutation requires an exact durable Run and executor-generation ownership fence.', request.executor);
     }
+    if (request.signal?.aborted === true) return cancelled(request.executor);
     await assertWorkspaceGuard(request.workspaceGuard);
     let client: CodexAppServerClient;
     try {
@@ -127,7 +139,12 @@ export class CodexAppServerAdapter implements ImplementationAgent {
     }
     const startedAt = Date.now();
     const workspacePath = request.workspacePath ?? this.cwd;
-    const options = { ...this.options, cwd: workspacePath };
+    const options = {
+      ...this.options,
+      cwd: workspacePath,
+      ...appServerCapabilityConfig(request.capabilities ?? []),
+    };
+    let executor: ExecutorIdentity | undefined = request.executor;
     try {
       const prompt = buildPrompt(request);
       let threadId: string;
@@ -149,21 +166,35 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       }
       await assertWorkspaceGuard(request.workspaceGuard);
       const turnId = await client.startTurn(threadId, prompt);
-      const terminal = await client.waitForTurn(threadId, turnId);
-      const executor: ExecutorIdentity = {
+      executor = {
         provider: CODEX_APP_SERVER_PROVIDER,
         sessionId: threadId,
         generation: request.runtimeOwnership.generation,
       };
+      const terminal = await waitForTurn(client.waitForTurn(threadId, turnId), this.timeoutMs, request.signal);
       if (terminal.status !== 'completed') {
         return failure(CODEX_APP_SERVER_ERROR_CODE.PROTOCOL, `Codex App Server turn ${turnId} ended ${terminal.status}.`, executor);
+      }
+      const takeoverReason = parseHumanTakeover(terminal.summary);
+      if (takeoverReason !== undefined) {
+        return {
+          exitStatus: 'failure',
+          summary: takeoverReason,
+          diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
+          executor,
+          durationMs: Date.now() - startedAt,
+        };
       }
       await assertWorkspaceGuard(request.workspaceGuard, 'after-execution', executor);
       const headSha = await this.readHead(request.signal, workspacePath);
       if (headSha === null) return failure(CODEX_APP_SERVER_ERROR_CODE.HEAD_READ_FAILED, `Codex completed, but an exact 40-hex HEAD could not be read from ${workspacePath}.`, executor);
       return { exitStatus: 'success', summary: terminal.summary ?? 'Codex App Server turn completed.', headSha, executor, durationMs: Date.now() - startedAt };
     } catch (error) {
-      return failure(CODEX_APP_SERVER_ERROR_CODE.PROTOCOL, message(error), request.executor);
+      if (error instanceof AppServerTimeoutError) {
+        return failure(CODEX_APP_SERVER_ERROR_CODE.TIMEOUT, `Codex App Server turn timed out after ${this.timeoutMs}ms.`, executor);
+      }
+      if (error instanceof AppServerCancelledError) return cancelled(executor);
+      return failure(CODEX_APP_SERVER_ERROR_CODE.PROTOCOL, message(error), executor);
     } finally {
       await client.close();
     }
@@ -228,18 +259,33 @@ function failure(code: string, detail: string, executor?: ExecutorIdentity): Age
   return { exitStatus: 'failure', summary: detail, diagnostics: [`${code}: ${detail}`], ...(executor === undefined ? {} : { executor }) };
 }
 
+function cancelled(executor?: ExecutorIdentity): AgentResult {
+  return failure(CODEX_APP_SERVER_ERROR_CODE.CANCELLED, 'Codex App Server execution was cancelled.', executor);
+}
+
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
 function buildPrompt(request: ImplementationRequest): string {
   const instructions = request.authority === 'live-target' ? request.supplementalInstructions : request.instructions;
-  return [
+  const lines = [
     `Implement ${request.target.kind === 'issue' ? `${request.target.owner}/${request.target.repo}#${request.target.issueNumber}` : `${request.target.owner}/${request.target.repo}@${request.target.branch}`} from base ${request.baseSha}.`,
     'Read the live target and repository-local instructions as authority.',
     'Run repository-required validation before reporting success.',
     instructions,
-  ].filter((line): line is string => line !== undefined && line !== '').join('\n');
+  ].filter((line): line is string => line !== undefined && line !== '');
+  if ((request.capabilities?.length ?? 0) > 0) {
+    lines.push(
+      'Browser capability policy:',
+      '- Prefer a stable API, native integration, or first-party MCP over browser automation.',
+      '- The provided browser is a dedicated Tachiko profile; never inspect or copy a personal browser profile.',
+      '- Authentication, 2FA, or CAPTCHA challenges require human takeover; do not bypass or guess them.',
+      '- Do not perform purchase, payment, billing, account deletion, credential, or security-setting changes.',
+      `- If a human boundary is reached, stop and reply exactly with "${HUMAN_TAKEOVER_DIAGNOSTIC} <reason>".`,
+    );
+  }
+  return lines.join('\n');
 }
 
 /** Actual local-only JSON-RPC App Server client. No TCP listener is created. */
@@ -262,11 +308,12 @@ export class StdioCodexAppServerClientFactory implements CodexAppServerClientFac
   }
 }
 
-class StdioCodexAppServerClient implements CodexAppServerClient {
+export class StdioCodexAppServerClient implements CodexAppServerClient {
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve(value: unknown): void; reject(error: Error): void }>();
+  private readonly pending = new Map<string | number, { resolve(value: unknown): void; reject(error: Error): void }>();
   private readonly listeners = new Set<(event: AppServerLifecycleEvent) => void>();
   private readonly completedTurns = new Map<string, { status: 'completed' | 'interrupted' | 'failed'; summary?: string }>();
+  private readonly turnSummaries = new Map<string, string>();
   private readonly turnWaiters = new Map<string, { resolve(value: { status: 'completed' | 'interrupted' | 'failed'; summary?: string }): void; reject(error: Error): void }>();
   private closed = false;
 
@@ -356,7 +403,7 @@ class StdioCodexAppServerClient implements CodexAppServerClient {
   private receive(line: string): void {
     let value: Record<string, unknown>;
     try { value = object(JSON.parse(line), 'JSON-RPC message'); } catch { return; }
-    if (typeof value.id === 'number' && typeof value.method !== 'string') {
+    if ((typeof value.id === 'number' || typeof value.id === 'string') && typeof value.method !== 'string') {
       const pending = this.pending.get(value.id);
       if (pending === undefined) return;
       this.pending.delete(value.id);
@@ -364,7 +411,7 @@ class StdioCodexAppServerClient implements CodexAppServerClient {
       else pending.resolve(value.result);
       return;
     }
-    if (typeof value.id === 'number' && typeof value.method === 'string') {
+    if ((typeof value.id === 'number' || typeof value.id === 'string') && typeof value.method === 'string') {
       // Explicit fail-closed response: no approval, permission, network, or
       // tool authority is inferred from an App Server request.
       this.child.stdin.write(`${JSON.stringify({ id: value.id, error: { code: -32002, message: 'Tachiko has no policy authorizing this App Server request.' } })}\n`);
@@ -388,8 +435,9 @@ class StdioCodexAppServerClient implements CodexAppServerClient {
       const turn = object(params.turn, 'turn/completed turn');
       const turnId = string(turn.id, 'turn id');
       const rawStatus = string(turn.status, 'turn status');
-      const status = rawStatus === 'completed' || rawStatus === 'interrupted' || rawStatus === 'failed' ? rawStatus : 'failed';
-      const complete = { status } as { status: 'completed' | 'interrupted' | 'failed'; summary?: string };
+      const status: 'completed' | 'interrupted' | 'failed' = rawStatus === 'completed' || rawStatus === 'interrupted' || rawStatus === 'failed' ? rawStatus : 'failed';
+      const summary = latestAgentMessage(array(turn.items, 'turn items')) ?? this.turnSummaries.get(turnId);
+      const complete = { status, ...(summary === undefined ? {} : { summary }) };
       this.completedTurns.set(turnId, complete);
       this.turnWaiters.get(turnId)?.resolve(complete);
       this.turnWaiters.delete(turnId);
@@ -397,6 +445,10 @@ class StdioCodexAppServerClient implements CodexAppServerClient {
     }
     if (method === 'item/completed') {
       const item = object(params.item, 'item/completed item');
+      const summary = agentMessage(item);
+      if (summary !== undefined && typeof params.turnId === 'string' && params.turnId.trim() !== '') {
+        this.turnSummaries.set(params.turnId, summary);
+      }
       this.emit({ type: 'item_completed', threadId: string(params.threadId, 'thread id'), itemId: string(item.id, 'item id') });
     }
   }
@@ -412,13 +464,69 @@ class StdioCodexAppServerClient implements CodexAppServerClient {
 }
 
 function threadParams(options: AppServerThreadOptions): Record<string, unknown> {
+  const config = {
+    ...(options.config ?? {}),
+    ...(options.reasoningEffort === undefined ? {} : { model_reasoning_effort: options.reasoningEffort }),
+  };
   return {
     cwd: options.cwd,
     ...(options.model === undefined ? {} : { model: options.model }),
-    ...(options.reasoningEffort === undefined ? {} : { config: { model_reasoning_effort: options.reasoningEffort } }),
+    ...(Object.keys(config).length === 0 ? {} : { config }),
     ...(options.sandboxMode === undefined ? {} : { sandbox: options.sandboxMode }),
     ...(options.approvalPolicy === undefined ? {} : { approvalPolicy: options.approvalPolicy }),
   };
+}
+
+function appServerCapabilityConfig(capabilities: readonly McpHttpCapability[]): Pick<AppServerThreadOptions, 'config'> {
+  if (capabilities.length === 0) return {};
+  const config: Record<string, unknown> = {};
+  for (const capability of normalizeMcpHttpCapabilities(capabilities)) {
+    config[`mcp_servers.${capability.name}`] = {
+      url: capability.endpoint,
+      required: true,
+      default_tools_approval_mode: 'approve',
+    };
+  }
+  return { config };
+}
+
+function latestAgentMessage(items: readonly unknown[]): string | undefined {
+  for (const item of items.slice().reverse()) {
+    const summary = agentMessage(object(item, 'turn item'));
+    if (summary !== undefined) return summary;
+  }
+  return undefined;
+}
+
+function agentMessage(item: Record<string, unknown>): string | undefined {
+  const type = item.type;
+  return (type === 'agentMessage' || type === 'agent_message') && typeof item.text === 'string' && item.text.trim() !== ''
+    ? item.text
+    : undefined;
+}
+
+function parseHumanTakeover(summary: string | undefined): string | undefined {
+  if (summary === undefined || !summary.startsWith(HUMAN_TAKEOVER_DIAGNOSTIC)) return undefined;
+  const reason = summary.slice(HUMAN_TAKEOVER_DIAGNOSTIC.length).trim();
+  return reason === '' ? 'A human browser takeover is required.' : reason;
+}
+
+class AppServerTimeoutError extends Error {}
+class AppServerCancelledError extends Error {}
+
+function waitForTurn<T>(turn: Promise<T>, timeoutMs: number, signal: AbortSignal | undefined): Promise<T> {
+  if (signal?.aborted === true) return Promise.reject(new AppServerCancelledError());
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => finish(() => reject(new AppServerTimeoutError())), timeoutMs);
+    const onAbort = () => finish(() => reject(new AppServerCancelledError()));
+    const finish = (complete: () => void) => {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', onAbort);
+      complete();
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    turn.then((value) => finish(() => resolve(value)), (error: unknown) => finish(() => reject(error)));
+  });
 }
 
 function textInput(text: string) { return { type: 'text', text, text_elements: [] }; }

@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { describe, it } from 'node:test';
 
 import {
   AppServerUnavailableError,
   CODEX_APP_SERVER_PROVIDER,
   CodexAppServerAdapter,
+  StdioCodexAppServerClient,
   StdioCodexAppServerClientFactory,
+  type AppServerThreadOptions,
   type AppServerLifecycleEvent,
   type CodexAppServerClient,
   type CodexAppServerClientFactory,
@@ -30,12 +34,14 @@ class HeadRunner implements ProcessRunner {
 
 class FakeClient implements CodexAppServerClient {
   readonly calls: string[] = [];
+  readonly prompts: string[] = [];
+  readonly threadOptions: AppServerThreadOptions[] = [];
   private readonly listeners = new Set<(event: AppServerLifecycleEvent) => void>();
   constructor(private observation: NativeThreadObservation = { threadId: 'thread-1', status: 'idle', history: [] }) {}
   async observeThread(threadId: string): Promise<NativeThreadObservation> { this.calls.push(`read:${threadId}`); return this.observation; }
-  async startThread(): Promise<string> { this.calls.push('thread/start'); return 'thread-new'; }
-  async resumeThread(threadId: string): Promise<string> { this.calls.push(`thread/resume:${threadId}`); return threadId; }
-  async startTurn(threadId: string): Promise<string> { this.calls.push(`turn/start:${threadId}`); return 'turn-1'; }
+  async startThread(options: AppServerThreadOptions): Promise<string> { this.threadOptions.push(options); this.calls.push('thread/start'); return 'thread-new'; }
+  async resumeThread(threadId: string, options: AppServerThreadOptions): Promise<string> { this.threadOptions.push(options); this.calls.push(`thread/resume:${threadId}`); return threadId; }
+  async startTurn(threadId: string, prompt: string): Promise<string> { this.prompts.push(prompt); this.calls.push(`turn/start:${threadId}`); return 'turn-1'; }
   async steerTurn(threadId: string, turnId: string): Promise<string> { this.calls.push(`turn/steer:${threadId}:${turnId}`); return turnId; }
   async interruptTurn(threadId: string, turnId: string): Promise<void> { this.calls.push(`turn/interrupt:${threadId}:${turnId}`); }
   async waitForTurn(): Promise<{ status: 'completed'; summary: string }> { this.calls.push('wait'); return { status: 'completed', summary: 'done' }; }
@@ -47,6 +53,13 @@ class Factory implements CodexAppServerClientFactory {
   opens = 0;
   constructor(readonly client: FakeClient) {}
   async open(): Promise<CodexAppServerClient> { this.opens += 1; return this.client; }
+}
+
+class HangingClient extends FakeClient {
+  override async waitForTurn(): Promise<{ status: 'completed'; summary: string }> {
+    this.calls.push('wait');
+    return new Promise(() => {});
+  }
 }
 
 class Fallback implements ImplementationAgent {
@@ -108,6 +121,63 @@ describe('CodexAppServerAdapter', () => {
     assert.equal(fallback.calls, 1);
   });
 
+  it('bounds a stalled native turn by the selected execution timeout', async () => {
+    const client = new HangingClient();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
+    assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'wait', 'close']);
+  });
+
+  it('stops waiting for a native turn when the selected execution is cancelled', async () => {
+    const client = new HangingClient();
+    const controller = new AbortController();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner() });
+    const pending = adapter.run(request({ signal: controller.signal }));
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_CANCELLED/);
+  });
+
+  it('preserves ephemeral browser capabilities and their takeover policy for native turns', async () => {
+    const client = new FakeClient();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner() });
+    const result = await adapter.run(request({ capabilities: [{ kind: 'mcp-http', name: 'browser', endpoint: 'https://browser.example/mcp' }] }));
+    assert.equal(result.exitStatus, 'success');
+    assert.deepEqual(client.threadOptions[0]?.config, {
+      'mcp_servers.browser': {
+        url: 'https://browser.example/mcp',
+        required: true,
+        default_tools_approval_mode: 'approve',
+      },
+    });
+    assert.match(client.prompts[0] ?? '', /Browser capability policy/);
+    assert.match(client.prompts[0] ?? '', /TACHIKO_NEEDS_HUMAN:/);
+  });
+
+  it('turns a native agent takeover message into the existing typed human boundary', async () => {
+    const client = new FakeClient();
+    client.waitForTurn = async () => ({ status: 'completed', summary: 'TACHIKO_NEEDS_HUMAN: sign-in required' });
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner() });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.deepEqual(result.diagnostics, ['TACHIKO_NEEDS_HUMAN: sign-in required']);
+  });
+
+  it('fails closed for string-id App Server approval requests', async () => {
+    const child = new FakeAppServerProcess();
+    const client = new StdioCodexAppServerClient(child as never);
+    child.stdout.write(`${JSON.stringify({ id: 'approval-1', method: 'execCommandApproval', params: {} })}\n`);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(child.writes, [{
+      id: 'approval-1',
+      error: { code: -32002, message: 'Tachiko has no policy authorizing this App Server request.' },
+    }]);
+    await client.close();
+  });
+
   it('opens the signed-in local App Server without starting a model turn when explicitly opted in', {
     skip: process.env.TACHIKO_CODEX_APP_SERVER_SMOKE !== '1',
   }, async () => {
@@ -115,3 +185,18 @@ describe('CodexAppServerAdapter', () => {
     await client.close();
   });
 });
+
+class FakeAppServerProcess extends EventEmitter {
+  readonly stdin = new PassThrough();
+  readonly stdout = new PassThrough();
+  readonly stderr = new PassThrough();
+  readonly writes: unknown[] = [];
+  killed = false;
+
+  constructor() {
+    super();
+    this.stdin.on('data', (chunk: Buffer) => this.writes.push(JSON.parse(chunk.toString())));
+  }
+
+  kill(): boolean { this.killed = true; return true; }
+}
