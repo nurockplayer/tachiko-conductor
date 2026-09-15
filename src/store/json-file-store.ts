@@ -315,8 +315,15 @@ export class JsonFileStore implements RunStore {
     if (!existsSync(filePath)) {
       throw new Error(`No run with id "${id}" exists at ${filePath}; nothing to delete.`);
     }
-    deleteOperationalProjection(this.dir, id);
     unlinkSync(filePath);
+    // The raw Run is authoritative. A derived sidecar may be stale, absent,
+    // read-only, or replaced by a directory; none of those may resurrect a
+    // successfully deleted Run or turn cleanup into a failed deletion.
+    try {
+      deleteOperationalProjection(this.dir, id);
+    } catch {
+      // A later rebuild can only emit sidecars for extant validated raw Runs.
+    }
   }
 
   /** Rebuild sidecars only from fully validated persisted Runs. */

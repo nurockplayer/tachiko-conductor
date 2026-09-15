@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
-import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, sha256 } from '../src/operational/projection.js';
+import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, operationalRunProjection, sha256 } from '../src/operational/projection.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
@@ -58,6 +58,16 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(JSON.stringify(projection).includes('secret-session'), false);
   });
 
+  it('marks only an active review-repair implementation for bounded live-head correlation', () => {
+    const run = {
+      ...newRun('review-fix-projection'),
+      state: 'IMPLEMENTING' as const,
+      history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }],
+    };
+    assert.equal(operationalRunProjection(run, '{}').reviewFixActive, true);
+    assert.equal(operationalRunProjection(newRun('not-a-review-fix'), '{}').reviewFixActive, undefined);
+  });
+
   it('keeps a committed raw transition successful when derived projection emission fails', () => {
     const { store, dir } = tempStore();
     let run = newRun('projection-best-effort');
@@ -94,6 +104,18 @@ describe('JsonFileStore — persistence round-trips', () => {
     });
     store.delete(run.id);
     assert.throws(() => readFileSync(operationalProjectionPath(dir, run.id), 'utf8'));
+  });
+
+  it('deletes the authoritative run when derived projection cleanup fails', () => {
+    const { store, dir } = tempStore();
+    const run = newRun('projection-delete-best-effort');
+    store.create(run);
+    rmSync(operationalProjectionPath(dir, run.id));
+    mkdirSync(operationalProjectionPath(dir, run.id));
+
+    assert.doesNotThrow(() => store.delete(run.id));
+    assert.equal(store.read(run.id), null);
+    assert.equal(readdirSync(operationalProjectionPath(dir, run.id)).length, 0);
   });
 
   it('persists updates across store instances (simulated restart)', () => {

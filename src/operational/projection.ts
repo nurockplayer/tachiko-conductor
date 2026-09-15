@@ -23,6 +23,8 @@ export interface OperationalRunProjectionV1 {
     readonly issueNumber?: number;
   };
   readonly workflowState: string;
+  /** True only while a persisted review-repair run is actively implementing. */
+  readonly reviewFixActive?: true;
   readonly executor?: { readonly provider: string };
   readonly bootstrap?: {
     readonly workspacePath: string;
@@ -51,6 +53,7 @@ export function sha256(bytes: string): string {
 export function operationalRunProjection(run: Run, committedRunBytes: string): OperationalRunProjectionV1 {
   const issueNumber = run.target.kind === 'issue' ? run.target.issueNumber : undefined;
   const provider = run.executor?.provider ?? run.agentResult?.executor?.provider;
+  const reviewFixActive = run.state === 'IMPLEMENTING' && run.history.at(-1)?.type === 'start_fix';
   return {
     schemaVersion: OPERATIONAL_RUN_PROJECTION_VERSION,
     runId: run.id,
@@ -62,6 +65,7 @@ export function operationalRunProjection(run: Run, committedRunBytes: string): O
       ...(issueNumber === undefined ? {} : { issueNumber }),
     },
     workflowState: run.state,
+    ...(reviewFixActive ? { reviewFixActive: true as const } : {}),
     ...(provider === undefined ? {} : { executor: { provider } }),
     ...(run.bootstrap === undefined ? {} : {
       bootstrap: {

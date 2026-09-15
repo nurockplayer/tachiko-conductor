@@ -135,6 +135,7 @@ struct RunObservation {
   pull_request_number: Option<u64>,
   provider: Option<String>,
   state: String,
+  review_fix_active: bool,
   duration_ms: Option<u64>,
 }
 
@@ -463,6 +464,7 @@ fn operational_run_observation(
     pull_request_number: number_at(value, &["pullRequest", "number"]),
     provider: string_at(value, &["executor", "provider"]),
     state,
+    review_fix_active: value.get("reviewFixActive").and_then(Value::as_bool) == Some(true),
     duration_ms: number_at(value, &["durationMs"]),
   })
 }
@@ -656,14 +658,33 @@ fn correlated_run<'a>(
           .is_some_and(|repository| repository.eq_ignore_ascii_case(&run.repository))
         && worktree.branch.as_deref() == Some(run.branch.as_str())
         && worktree.head_sha.as_deref().is_some_and(|head| {
-          run
+          let exact_head = run
             .head_sha
             .as_deref()
             .is_none_or(|expected| expected == head)
             && run
               .pull_request_head_sha
               .as_deref()
-              .is_none_or(|expected| expected == head)
+              .is_none_or(|expected| expected == head);
+          let review_fix_descendant = run.review_fix_active
+            && run.state == "IMPLEMENTING"
+            && run.head_sha.as_deref().is_some_and(|accepted_head| {
+              run.pull_request_head_sha.as_deref() == Some(accepted_head)
+                && commands
+                  .run(
+                    "git",
+                    &[
+                      "-C",
+                      &worktree.path,
+                      "merge-base",
+                      "--is-ancestor",
+                      accepted_head,
+                      head,
+                    ],
+                  )
+                  .is_some()
+            });
+          (exact_head || review_fix_descendant)
             && commands
               .run(
                 "git",
@@ -1151,7 +1172,7 @@ mod tests {
     let runs = ["one", "two"].into_iter().map(|id| RunObservation {
       id: id.to_owned(), repository: "acme/widgets".to_owned(), workspace_path: format!("/managed/{id}"),
       branch: id.to_owned(), base_sha: "base".to_owned(), head_sha: None, pull_request_head_sha: None,
-      issue: None, pull_request_number: None, provider: None, state: "WORKING".to_owned(), duration_ms: None,
+      issue: None, pull_request_number: None, provider: None, state: "WORKING".to_owned(), review_fix_active: false, duration_ms: None,
     }).collect::<Vec<_>>();
     let discovered = discover_worktrees(&fake, None, Path::new("/missing-managed-root"), &runs);
     assert_eq!(discovered.len(), 2);
@@ -1290,6 +1311,7 @@ mod tests {
       pull_request_number: Some(7),
       provider: Some("codex-cli".to_owned()),
       state: "VALIDATING".to_owned(),
+      review_fix_active: false,
       duration_ms: None,
     };
     let run_worktrees = verified_run_worktrees(&fake, &[run.clone()]);
@@ -1302,6 +1324,37 @@ mod tests {
       ..run
     };
     assert!(correlated_run(&fake, &[stale], &run_worktrees, &worktree).is_none());
+  }
+
+  #[test]
+  fn active_review_fix_can_remain_correlated_while_its_verified_worktree_advances() {
+    let fake = FakeCommands::with(&[
+      ("git", "-C\u{1}/alias/run\u{1}rev-parse\u{1}--show-toplevel", "/canonical/run\n"),
+      ("git", "-C\u{1}/canonical/run\u{1}rev-parse\u{1}--path-format=absolute\u{1}--git-common-dir", "/canonical/.git\n"),
+      ("git", "-C\u{1}/canonical/run\u{1}config\u{1}--get\u{1}remote.origin.url", "git@github.com:acme/widgets.git\n"),
+      ("git", "-C\u{1}/canonical/run\u{1}symbolic-ref\u{1}--quiet\u{1}--short\u{1}HEAD", "codex/widgets\n"),
+      ("git", "-C\u{1}/canonical/run\u{1}rev-parse\u{1}HEAD", "replacement\n"),
+      ("git", "-C\u{1}/canonical/run\u{1}merge-base\u{1}--is-ancestor\u{1}accepted\u{1}replacement", ""),
+      ("git", "-C\u{1}/canonical/run\u{1}merge-base\u{1}--is-ancestor\u{1}base\u{1}replacement", ""),
+    ]);
+    let worktree = VerifiedWorktree {
+      path: "/canonical/run".to_owned(), common_git: "/canonical/.git".to_owned(),
+      repository: Some("acme/widgets".to_owned()), branch: Some("codex/widgets".to_owned()),
+      head_sha: Some("replacement".to_owned()),
+    };
+    let repair = RunObservation {
+      id: "run-1".to_owned(), repository: "acme/widgets".to_owned(), workspace_path: "/alias/run".to_owned(),
+      branch: "codex/widgets".to_owned(), base_sha: "base".to_owned(), head_sha: Some("accepted".to_owned()),
+      pull_request_head_sha: Some("accepted".to_owned()), issue: Some(1), pull_request_number: Some(7),
+      provider: Some("codex-cli".to_owned()), state: "IMPLEMENTING".to_owned(), review_fix_active: true, duration_ms: None,
+    };
+    let run_worktrees = verified_run_worktrees(&fake, &[repair.clone()]);
+    assert_eq!(
+      correlated_run(&fake, &[repair.clone()], &run_worktrees, &worktree).map(|value| value.id.as_str()),
+      Some("run-1")
+    );
+    let not_a_review_fix = RunObservation { review_fix_active: false, ..repair };
+    assert!(correlated_run(&fake, &[not_a_review_fix], &run_worktrees, &worktree).is_none());
   }
 
   #[test]
