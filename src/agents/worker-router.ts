@@ -16,6 +16,7 @@ export const WORKER_ROUTER_ERROR_CODE = {
   EXEC_FAILURE: 'WORKER_ROUTER_EXEC_FAILURE',
   CANCELLED: 'WORKER_ROUTER_CANCELLED',
   WORKSPACE_REQUIRED: 'WORKER_ROUTER_WORKSPACE_REQUIRED',
+  CAPABILITIES_UNSUPPORTED: 'WORKER_ROUTER_CAPABILITIES_UNSUPPORTED',
   HEAD_READ_FAILED: 'WORKER_ROUTER_HEAD_READ_FAILED',
   PUBLISH_FAILED: 'WORKER_ROUTER_PUBLISH_FAILED',
 } as const;
@@ -57,6 +58,13 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       return failure(
         WORKER_ROUTER_ERROR_CODE.WORKSPACE_REQUIRED,
         `Worker router requires an explicit prepared workspacePath and branch; ambient cwd ${this.cwd} is never used for implementation.`,
+        0,
+      );
+    }
+    if ((request.capabilities?.length ?? 0) > 0) {
+      return failure(
+        WORKER_ROUTER_ERROR_CODE.CAPABILITIES_UNSUPPORTED,
+        'Worker router does not support per-run MCP capabilities; refusing to drop requested capabilities.',
         0,
       );
     }
