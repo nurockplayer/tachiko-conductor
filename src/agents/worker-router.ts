@@ -18,6 +18,7 @@ export const WORKER_ROUTER_ERROR_CODE = {
   WORKSPACE_REQUIRED: 'WORKER_ROUTER_WORKSPACE_REQUIRED',
   CAPABILITIES_UNSUPPORTED: 'WORKER_ROUTER_CAPABILITIES_UNSUPPORTED',
   HEAD_READ_FAILED: 'WORKER_ROUTER_HEAD_READ_FAILED',
+  BASE_ANCESTRY_FAILED: 'WORKER_ROUTER_BASE_ANCESTRY_FAILED',
   PUBLISH_FAILED: 'WORKER_ROUTER_PUBLISH_FAILED',
 } as const;
 
@@ -98,6 +99,15 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       const durationMs = elapsed(startedAt);
       return { ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics] };
     }
+    const ancestry = await this.verifyBaseAncestry(request.signal, cwd, request.baseSha, head);
+    if (!ancestry.ok) {
+      const durationMs = elapsed(startedAt);
+      if (ancestry.cancelled) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router ancestry verification was cancelled.', durationMs);
+      return {
+        ...failure(WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED, `Worker router HEAD ${head} does not prove descent from the authorized base.`, durationMs),
+        diagnostics: [`${WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED}: ${ancestry.detail}`, ...diagnostics, ...ancestry.diagnostics],
+      };
+    }
     const published = await this.publishHead(request.signal, cwd, head, branch);
     if (!published.ok) {
       const durationMs = elapsed(startedAt);
@@ -108,6 +118,33 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       };
     }
     return { exitStatus: 'success', summary: 'Worker router completed implementation and Conductor published the exact committed HEAD.', headSha: head, ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
+  }
+
+  private async verifyBaseAncestry(
+    signal: AbortSignal | undefined,
+    cwd: string,
+    baseSha: string,
+    head: string,
+  ): Promise<{ readonly ok: true } | { readonly ok: false; readonly cancelled: boolean; readonly detail: string; readonly diagnostics: string[] }> {
+    if (!FULL_SHA.test(baseSha)) {
+      return { ok: false, cancelled: false, detail: 'The authorized base is not an exact 40-hex SHA.', diagnostics: [] };
+    }
+    try {
+      const result = await this.runner.run('git', ['merge-base', '--is-ancestor', baseSha, head], this.options(signal, cwd, ''));
+      if (result.exitCode === 0) return { ok: true };
+      return {
+        ok: false,
+        cancelled: false,
+        detail: `git merge-base --is-ancestor exited with status ${result.exitCode}; refusing to publish without a proven ancestry chain.`,
+        diagnostics: boundedDiagnostics(result.stderr, result.stdout, undefined),
+      };
+    } catch (error) {
+      const code = errorCode(error);
+      if (isAborted(signal) || code === 'ABORT_ERR') {
+        return { ok: false, cancelled: true, detail: 'Ancestry verification was cancelled.', diagnostics: [] };
+      }
+      return { ok: false, cancelled: false, detail: `Ancestry verification failed: ${errorMessage(error)}`, diagnostics: [] };
+    }
   }
 
   private options(signal: AbortSignal | undefined, cwd: string, stdin: string): ProcessRunOptions {

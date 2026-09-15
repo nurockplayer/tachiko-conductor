@@ -23,14 +23,16 @@ class FakeRunner implements ProcessRunner {
 }
 
 const HEAD = '9d9cc7d210960f3c81d7d7498a36f65c67b9f4a9';
+const BASE = '1d9cc7d210960f3c81d7d7498a36f65c67b9f4a9';
 const result = (stdout = '', stderr = '', exitCode = 0): ProcessResult => ({ stdout, stderr, exitCode });
-const REQUEST = { target: TARGET, baseSha: 'base', workspacePath: '/prepared', branch: 'worker-router-test' } as const;
+const REQUEST = { target: TARGET, baseSha: BASE, workspacePath: '/prepared', branch: 'worker-router-test' } as const;
 
 describe('WorkerRouterAdapter', () => {
   it('runs in the prepared worktree, verifies HEAD, and publishes that exact commit', async () => {
     const runner = new FakeRunner([
       result('', '[worker-router] -> luna-worker\nimplementation details'),
       result(HEAD),
+      result(),
       result('To origin\n'),
     ]);
     let before = 0; let after = 0;
@@ -48,7 +50,7 @@ describe('WorkerRouterAdapter', () => {
     assert.match(runner.calls[0]?.options.stdin ?? '', /Do not push; Conductor publishes the exact committed HEAD/i);
     assert.equal(runner.calls[0]?.file, '/router');
     assert.equal(runner.calls[0]?.options.cwd, '/prepared');
-    assert.deepEqual(runner.calls[2]?.args, ['push', '--porcelain', 'origin', `${HEAD}:refs/heads/worker-router-test`]);
+    assert.deepEqual(runner.calls[3]?.args, ['push', '--porcelain', 'origin', `${HEAD}:refs/heads/worker-router-test`]);
     assert.match(response.diagnostics?.join('\n') ?? '', /luna-worker/);
     assert.equal(before, 1); assert.equal(after, 1);
   });
@@ -74,7 +76,7 @@ describe('WorkerRouterAdapter', () => {
   });
 
   it('uses the configured worker-router executable without making it workflow authority', async () => {
-    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result()]);
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result(), result()]);
     const response = await new WorkerRouterAdapter({
       runner,
       env: { [WORKER_ROUTER_EXECUTABLE_ENV]: '/custom/worker-router' },
@@ -132,7 +134,7 @@ describe('WorkerRouterAdapter', () => {
   });
 
   it('fails closed when deterministic publication fails', async () => {
-    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result('', 'rejected', 1)]);
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result(), result('', 'rejected', 1)]);
     const response = await new WorkerRouterAdapter({ runner }).run(REQUEST);
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED));
@@ -150,14 +152,34 @@ describe('WorkerRouterAdapter', () => {
   }
 
   it('does not resume a model session on stateless re-entry', async () => {
-    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result()]);
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result(), result()]);
     const response = await new WorkerRouterAdapter({ runner }).run({
       ...REQUEST,
       executor: { provider: 'worker-router', sessionId: 'ignored' },
     });
     assert.equal(response.exitStatus, 'success');
-    assert.equal(runner.calls.length, 3);
+    assert.equal(runner.calls.length, 4);
     assert.equal(runner.calls[0]?.options.stdin?.includes('ignored'), false);
+  });
+
+  it('fails closed before publication when the worker HEAD diverges from the authorized base', async () => {
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result('', 'not an ancestor', 1)]);
+    const response = await new WorkerRouterAdapter({ runner }).run(REQUEST);
+    assert.equal(response.exitStatus, 'failure');
+    assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED));
+    assert.deepEqual(runner.calls.map((call) => call.args), [
+      [],
+      ['rev-parse', 'HEAD'],
+      ['merge-base', '--is-ancestor', BASE, HEAD],
+    ]);
+  });
+
+  it('fails closed before publication when the authorized base cannot be resolved', async () => {
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result('', 'bad object', 128)]);
+    const response = await new WorkerRouterAdapter({ runner }).run(REQUEST);
+    assert.equal(response.exitStatus, 'failure');
+    assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED));
+    assert.equal(runner.calls.some((call) => call.args[0] === 'push'), false);
   });
 
   it('fails before spawn when the workspace guard rejects', async () => {
