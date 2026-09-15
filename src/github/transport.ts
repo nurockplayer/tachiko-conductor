@@ -26,6 +26,8 @@ export interface ProcessRunOptions {
   readonly timeoutMs: number;
   readonly cwd?: string;
   readonly signal?: AbortSignal;
+  /** Optional UTF-8 payload for non-interactive commands that read stdin. */
+  readonly stdin?: string;
 }
 
 export interface ProcessRunner {
@@ -72,7 +74,7 @@ export class NodeProcessRunner implements ProcessRunner {
       );
       // Non-interactive CLIs may wait for piped stdin even when their prompt
       // and request are fully supplied as arguments.
-      child.stdin?.end();
+      child.stdin?.end(options.stdin);
     });
   }
 }

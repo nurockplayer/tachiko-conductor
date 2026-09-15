@@ -220,8 +220,8 @@ or reviewer text. New runs require `--execution-profile` and one revisioned
 export TACHIKO_EXECUTION_PROFILE_CONFIG='{
   "revision":"execution-profiles-v1",
   "profiles":{
-    "routine":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"low","timeoutMs":600000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
-    "standard":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"medium","timeoutMs":600000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+    "routine":{"executor":"worker-router","timeoutMs":600000},
+    "standard":{"executor":"worker-router","timeoutMs":600000},
     "complex":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
     "critical":{"executor":"claude-code","model":"configured-model","timeoutMs":900000}
   }
