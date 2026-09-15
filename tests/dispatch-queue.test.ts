@@ -32,6 +32,7 @@ ready:
 
 class Comments {
   readonly comments: DispatchRuntimeComment[] = [];
+  updates = 0;
   private serial = 0;
   async listRuntimeComments(): Promise<readonly DispatchRuntimeComment[]> { return [...this.comments]; }
   async createRuntimeComment(body: string): Promise<DispatchRuntimeComment> {
@@ -40,6 +41,7 @@ class Comments {
     return comment;
   }
   async updateRuntimeComment(id: string, body: string): Promise<DispatchRuntimeComment> {
+    this.updates += 1;
     const index = this.comments.findIndex((comment) => comment.id === id);
     if (index < 0) throw new Error('missing comment');
     const comment = { id, body };
@@ -284,6 +286,76 @@ describe('dispatch queue protocol', () => {
         claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
       },
     });
+  });
+
+  it('fails closed when an unbound claim cannot distinguish multiple durable Runs from its claim window', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'old-terminal'), state: 'FAILED' });
+    const duringClaim = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'during-claim'), state: 'FAILED' as const };
+    store.create(duringClaim);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'claim-1', runId: null, profile: 'complex', state: 'claimed',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    await assert.rejects(
+      dispatchOnce({
+        queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+        leaseDurationMs: 60_000, now: () => T0,
+        async execute() { throw new Error('unbound terminal run must not execute'); },
+      }),
+      /multiple durable runs created during its claim window/,
+    );
+  });
+
+  it('reconciles the one unbound terminal Run from a claim window without re-executing it', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, '2026-09-15T00:00:00.001Z', 'during-claim'), state: 'FAILED' as const };
+    store.create(terminal);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'claim-1', runId: null, profile: 'complex', state: 'claimed',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    const result = await dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute() { throw new Error('unbound terminal run must not execute'); },
+    });
+    assert.deepEqual(result, {
+      outcome: 'existing_claim',
+      claim: {
+        issue: 18, claimId: 'claim-1', runId: terminal.id, profile: 'complex', state: 'failed',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      },
+    });
+  });
+
+  it('does not rewrite an already reconciled terminal claim on a settled wake', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'terminal'), state: 'FAILED' as const };
+    store.create(terminal);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'claim-1', runId: terminal.id, profile: 'complex', state: 'failed',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    const result = await dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute() { throw new Error('terminal run must not execute'); },
+    });
+    assert.equal(result.outcome, 'existing_claim');
+    assert.equal(runtime.updates, 0);
   });
 
   it('resumes a claimed run from its durable profile when current profile config is unavailable', async () => {

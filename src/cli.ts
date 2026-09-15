@@ -565,9 +565,11 @@ function targetsEqual(a: Target, b: Target): boolean {
   return (b as RepositoryTarget).branch === (a as RepositoryTarget).branch;
 }
 
-/** Find a persisted run whose target matches exactly, if any. */
+/** Find an active persisted run whose target matches exactly, if any. */
 export function findRunByTarget(store: RunStore, target: Target): Run | null {
-  return store.list().find((run) => targetsEqual(run.target, target)) ?? null;
+  return store.list().find((run) =>
+    targetsEqual(run.target, target) && run.state !== 'MERGED' && run.state !== 'FAILED',
+  ) ?? null;
 }
 
 export interface WorkflowCommandOptions {

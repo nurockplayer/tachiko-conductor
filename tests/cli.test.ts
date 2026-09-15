@@ -8,7 +8,9 @@ import { describe, it } from 'node:test';
 
 import {
   githubSnapshotCommand,
+  findRunByTarget,
   LIVE_HEAD_SYNC_DECISION,
+  main,
   parseIssueNumber,
   parseIssueRef,
   printDispatchResult,
@@ -85,6 +87,28 @@ describe('CLI command layer', () => {
       assert.equal(next.state, 'IMPLEMENTING');
       assert.equal(runShowCommand(store, created.id).state, 'IMPLEMENTING');
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('requires an execution profile when terminal history means run starts fresh', async () => {
+    const { store, dir } = tempStore();
+    const previousRunsDir = process.env.TACHIKO_DATA_DIR;
+    try {
+      const terminal = { ...createRun(TARGET, T0, 'terminal'), state: 'FAILED' as const };
+      store.create(terminal);
+      assert.equal(findRunByTarget(store, TARGET), null);
+      process.env.TACHIKO_DATA_DIR = dir;
+      await assert.rejects(
+        main(['run', 'acme/widgets#42']),
+        /requires --execution-profile <routine\|standard\|complex\|critical> for a new run/,
+      );
+      const active = createRun(TARGET, T0, 'active');
+      store.create(active);
+      assert.equal(findRunByTarget(store, TARGET)?.id, active.id);
+    } finally {
+      if (previousRunsDir === undefined) delete process.env.TACHIKO_DATA_DIR;
+      else process.env.TACHIKO_DATA_DIR = previousRunsDir;
       rmSync(dir, { recursive: true, force: true });
     }
   });

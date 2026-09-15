@@ -57,12 +57,30 @@ function activeRun(store: RunStore, entry: DispatchQueueEntry, options: Pick<Dis
 }
 
 function claimedRun(store: RunStore, claim: DispatchRuntimeClaim, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): Run | null {
-  if (claim.runId === null) return null;
-  const run = store.read(claim.runId);
-  if (run === null || !isTarget(run, entry, options)) {
-    throw new DispatchProtocolError('Dispatch runtime claim names a missing or different durable run; refusing recovery.');
+  if (claim.runId !== null) {
+    const run = store.read(claim.runId);
+    if (run === null || !isTarget(run, entry, options)) {
+      throw new DispatchProtocolError('Dispatch runtime claim names a missing or different durable run; refusing recovery.');
+    }
+    return run;
   }
-  return run;
+
+  // A process can die after runIssue durably creates a Run but before the
+  // runtime comment is updated with its id. An active target is still the
+  // single-owner fence. With only terminal history left, recover at most the
+  // one Run that was created no earlier than this unbound claim; older
+  // terminal history belongs to an earlier dispatch and must not be revived.
+  const matching = store.list().filter((run) => isTarget(run, entry, options));
+  const active = matching.filter((run) => isActiveRun(run));
+  if (active.length > 1) {
+    throw new DispatchProtocolError('Unbound dispatch runtime claim has multiple active durable runs; refusing ambiguous recovery.');
+  }
+  if (active.length === 1) return active[0]!;
+  const createdDuringClaim = matching.filter((run) => run.createdAt >= claim.claimedAt);
+  if (createdDuringClaim.length > 1) {
+    throw new DispatchProtocolError('Unbound dispatch runtime claim has multiple durable runs created during its claim window; refusing ambiguous recovery.');
+  }
+  return createdDuringClaim[0] ?? null;
 }
 
 /** A persisted non-terminal Run is an ownership fence even before it has a PR. */
@@ -140,6 +158,10 @@ async function updateClaim(
   return observed.claim;
 }
 
+function needsTerminalReconciliation(claim: DispatchRuntimeClaim, run: Run): boolean {
+  return claim.runId !== run.id || claim.state !== stateForExecution(run.state);
+}
+
 /**
  * Perform one v0 serial dispatch attempt. A queue comment cannot by itself
  * authorize work: every candidate is checked against current Issue/PR/Run
@@ -159,10 +181,12 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     // A terminal durable Run must never be executed again. Retain its claim
     // while its queue entry is still present, but allow the same sole runtime
     // comment to be safely superseded once the Steward has removed it.
-    const reconciled = await updateClaim(options.runtime, existing.id, existing.claim, options.now(), options.leaseDurationMs, {
-      runId: run.id,
-      state: run.state,
-    });
+    const reconciled = needsTerminalReconciliation(existing.claim, run)
+      ? await updateClaim(options.runtime, existing.id, existing.claim, options.now(), options.leaseDurationMs, {
+        runId: run.id,
+        state: run.state,
+      })
+      : existing.claim;
     const queue = parseDispatchQueue(options.queueBody);
     if (queue.some((queued) => queued.issue === entry.issue && queued.route === 'codex' && queued.profile === entry.profile)) {
       return { outcome: 'existing_claim', claim: reconciled };
