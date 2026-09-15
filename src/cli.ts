@@ -146,7 +146,10 @@ export function resolveSelectedExecutionProfile(
 /** Keep the bootstrap heartbeat's settled signal as the final stdout line. */
 export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOnceCommand>>): void {
   console.log(JSON.stringify(result, null, 2));
-  if (result.outcome === 'no_eligible_work') console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
+  const settled = result.outcome === 'no_eligible_work' ||
+    (result.outcome === 'existing_claim' && ['merge_ready', 'needs_human', 'failed'].includes(result.claim.state)) ||
+    (result.outcome === 'dispatched' && ['MERGE_READY', 'MERGED', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY', 'FAILED'].includes(result.execution.state));
+  if (settled) console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
 }
 
 /** Provider selection is external to adapters; existing installs remain on Claude by default. */
@@ -585,7 +588,9 @@ export async function runIssueCommand(
   options: WorkflowCommandOptions = {},
 ): Promise<WorkflowOutcome> {
   const target = parseIssueRef(ref);
-  let run = findRunByTarget(deps.store, target);
+  let run = deps.store.list().find((candidate) =>
+    targetsEqual(candidate.target, target) && candidate.state !== 'MERGED' && candidate.state !== 'FAILED',
+  ) ?? null;
   if (run === null) {
     run = createRun(target, undefined, undefined, options.execution);
     deps.store.create(run);
@@ -1047,6 +1052,7 @@ export async function main(argv: string[]): Promise<number> {
       runtime,
       resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
       runIssue: async (ref, execution) => await runIssueCommand(workflow, ref, execution === undefined ? {} : { execution }),
+      resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
     });
     printDispatchResult(result);
     return 0;

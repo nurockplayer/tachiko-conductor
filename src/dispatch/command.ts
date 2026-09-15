@@ -1,4 +1,5 @@
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import type { Run } from '../domain/types.js';
 import type { WorkflowDependencies, WorkflowOutcome } from '../workflow/run.js';
 import type { DispatchConfiguration } from './config.js';
 import { dispatchOnce, type DispatchOnceResult, type DispatchRuntimeApi } from './runner.js';
@@ -12,6 +13,8 @@ export interface DispatchCommandDependencies {
   readonly runtime: DispatchCommandRuntime;
   readonly resolveExecutionProfile: (profile: string) => ResolvedExecutionConfiguration;
   readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined) => Promise<WorkflowOutcome>;
+  /** Resume the Run bound by the retained runtime claim, never a target lookup. */
+  readonly resumeClaimedRun: (run: Run) => Promise<WorkflowOutcome>;
   readonly now?: () => string;
 }
 
@@ -42,7 +45,7 @@ export async function dispatchOnceCommand(
         if (existing.execution.profile !== entry.profile) {
           throw new Error(`Durable run ${existing.id} profile does not match the retained dispatch claim.`);
         }
-        const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, undefined);
+        const outcome = await deps.resumeClaimedRun(existing);
         return { runId: outcome.run.id, state: outcomeState(outcome) };
       }
       const selected = deps.resolveExecutionProfile(entry.profile);

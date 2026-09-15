@@ -44,7 +44,7 @@ function tempStore(): { store: JsonFileStore; dir: string } {
 }
 
 describe('CLI command layer', () => {
-  it('prints the heartbeat settlement marker only after no eligible dispatch work', () => {
+  it('prints the heartbeat settlement marker as the final line for every settled dispatch boundary', () => {
     const printed: string[] = [];
     const original = console.log;
     console.log = (value?: unknown) => { printed.push(String(value)); };
@@ -53,15 +53,23 @@ describe('CLI command layer', () => {
       printDispatchResult({
         outcome: 'existing_claim',
         claim: {
-          issue: 18, claimId: 'claim-1', runId: 'run-1', profile: 'complex', state: 'running',
+          issue: 18, claimId: 'claim-1', runId: 'run-1', profile: 'complex', state: 'merge_ready',
           claimedAt: T0, heartbeatAt: T0, leaseUntil: T0,
         },
+      });
+      printDispatchResult({
+        outcome: 'dispatched', entry: { issue: 18, route: 'codex', profile: 'complex' },
+        claim: {
+          issue: 18, claimId: 'claim-2', runId: 'run-2', profile: 'complex', state: 'failed',
+          claimedAt: T0, heartbeatAt: T0, leaseUntil: T0,
+        },
+        execution: { runId: 'run-2', state: 'FAILED' },
       });
     } finally {
       console.log = original;
     }
-    assert.equal(printed.filter((line) => line === 'TACHIKO_HEARTBEAT_SETTLED_V1').length, 1);
-    assert.notEqual(printed.at(-1), 'TACHIKO_HEARTBEAT_SETTLED_V1');
+    assert.equal(printed.filter((line) => line === 'TACHIKO_HEARTBEAT_SETTLED_V1').length, 3);
+    assert.equal(printed.at(-1), 'TACHIKO_HEARTBEAT_SETTLED_V1');
   });
 
   it('creates, shows, and transitions a run through the command functions', () => {
@@ -525,6 +533,24 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.outcome, 'merge_ready');
     assert.equal(store.list().length, 1);
     assert.equal(outcome.run.id, 'run-1');
+  });
+
+  it('creates fresh durable work without replacing terminal history for an explicitly re-dispatched Issue', async () => {
+    const store = new MemoryStore();
+    store.create({ ...createRun(TARGET, T0, 'old-terminal'), state: 'FAILED' });
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
+
+    const outcome = await runIssueCommand(
+      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
+      'acme/widgets#42',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(store.read('old-terminal')?.state, 'FAILED');
+    assert.equal(store.list().length, 2);
+    assert.notEqual(outcome.run.id, 'old-terminal');
   });
 
   it('resumes a parked NEEDS_HUMAN run after a supplied human decision', async () => {

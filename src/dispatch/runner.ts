@@ -47,11 +47,22 @@ function target(entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'o
   return { kind: 'issue' as const, owner: options.owner, repo: options.repo, issueNumber: entry.issue };
 }
 
-function existingRun(store: RunStore, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): Run | null {
+function isTarget(run: Run, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): boolean {
   const wanted = target(entry, options);
-  return store.list().find((run) =>
-    run.target.kind === 'issue' && run.target.owner === wanted.owner && run.target.repo === wanted.repo && run.target.issueNumber === wanted.issueNumber,
-  ) ?? null;
+  return run.target.kind === 'issue' && run.target.owner === wanted.owner && run.target.repo === wanted.repo && run.target.issueNumber === wanted.issueNumber;
+}
+
+function activeRun(store: RunStore, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): Run | null {
+  return store.list().find((run) => isTarget(run, entry, options) && isActiveRun(run)) ?? null;
+}
+
+function claimedRun(store: RunStore, claim: DispatchRuntimeClaim, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): Run | null {
+  if (claim.runId === null) return null;
+  const run = store.read(claim.runId);
+  if (run === null || !isTarget(run, entry, options)) {
+    throw new DispatchProtocolError('Dispatch runtime claim names a missing or different durable run; refusing recovery.');
+  }
+  return run;
 }
 
 /** A persisted non-terminal Run is an ownership fence even before it has a PR. */
@@ -61,8 +72,8 @@ function isActiveRun(run: Run | null): boolean {
 
 async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptions): Promise<{ readonly run: Run | null; readonly reason: string | null }> {
   const issueTarget = target(entry, options);
-  const run = existingRun(options.store, entry, options);
-  if (isActiveRun(run)) return { run, reason: `#${entry.issue}: existing durable run ${run!.id} is ${run!.state}` };
+  const run = activeRun(options.store, entry, options);
+  if (run !== null) return { run, reason: `#${entry.issue}: existing durable run ${run.id} is ${run.state}` };
   const issue = await options.github.readIssue(issueTarget);
   if (issue.state !== 'open') return { run, reason: `#${entry.issue}: Issue is ${issue.state}` };
   const pulls = await options.github.listPullRequests(issueTarget);
@@ -138,10 +149,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
   const existing = selectDispatchRuntime(await options.runtime.listRuntimeComments());
   if (existing !== null) {
     const entry: DispatchQueueEntry = { issue: existing.claim.issue, route: 'codex', profile: existing.claim.profile };
-    const run = existingRun(options.store, entry, options);
-    if (existing.claim.runId !== null && (run === null || run.id !== existing.claim.runId)) {
-      throw new DispatchProtocolError('Dispatch runtime claim names a missing or different durable run; refusing recovery.');
-    }
+    const run = claimedRun(options.store, existing.claim, entry, options);
     if (run === null || isActiveRun(run)) {
       const execution = await options.execute(entry, run);
       const claim = await updateClaim(options.runtime, existing.id, existing.claim, options.now(), options.leaseDurationMs, execution);
@@ -151,9 +159,13 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     // A terminal durable Run must never be executed again. Retain its claim
     // while its queue entry is still present, but allow the same sole runtime
     // comment to be safely superseded once the Steward has removed it.
+    const reconciled = await updateClaim(options.runtime, existing.id, existing.claim, options.now(), options.leaseDurationMs, {
+      runId: run.id,
+      state: run.state,
+    });
     const queue = parseDispatchQueue(options.queueBody);
     if (queue.some((queued) => queued.issue === entry.issue && queued.route === 'codex' && queued.profile === entry.profile)) {
-      return { outcome: 'existing_claim', claim: existing.claim };
+      return { outcome: 'existing_claim', claim: reconciled };
     }
     const reasons: string[] = [];
     for (const queued of queue) {

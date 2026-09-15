@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
+import { EXECUTION_PROFILE_NAMES } from '../execution-profiles.js';
+
 /** The Steward-owned, read-only queue marker. */
 export const DISPATCH_QUEUE_MARKER = '<!-- issue-dispatch-queue:v1 -->';
 /** The single machine-owned runtime claim marker. */
@@ -45,6 +47,10 @@ function nonEmpty(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
 }
 
+function supportedProfile(value: string): boolean {
+  return (EXECUTION_PROFILE_NAMES as readonly string[]).includes(value);
+}
+
 /**
  * Parse the intentionally tiny queue grammar. It accepts only unquoted YAML
  * scalar values so a visually similar prose comment can never become work.
@@ -70,6 +76,9 @@ export function parseDispatchQueue(body: string): readonly DispatchQueueEntry[] 
     }
     if (!nonEmpty(current.profile) || /[\s:#]/.test(current.profile)) {
       throw new DispatchProtocolError(`Queue issue #${issue} has an invalid profile.`);
+    }
+    if (!supportedProfile(current.profile)) {
+      throw new DispatchProtocolError(`Queue issue #${issue} has an unsupported execution profile "${current.profile}".`);
     }
     if (result.some((entry) => entry.issue === issue)) throw new DispatchProtocolError(`Queue contains duplicate issue #${issue}.`);
     result.push({ issue, route: current.route as DispatchQueueEntry['route'], profile: current.profile });
@@ -115,7 +124,7 @@ export function parseDispatchRuntime(body: string): DispatchRuntimeClaim | null 
   if (parsed === null) throw new DispatchProtocolError('Dispatch runtime comment must contain an object.');
   const expected = ['claimId', 'claimedAt', 'heartbeatAt', 'issue', 'leaseUntil', 'profile', 'runId', 'state'];
   if (Object.keys(parsed).sort().join(',') !== expected.join(',')) throw new DispatchProtocolError('Dispatch runtime comment has unknown or missing fields.');
-  if (!Number.isSafeInteger(parsed.issue) || (parsed.issue as number) < 1 || !nonEmpty(parsed.claimId) || !nonEmpty(parsed.profile) ||
+  if (!Number.isSafeInteger(parsed.issue) || (parsed.issue as number) < 1 || !nonEmpty(parsed.claimId) || !nonEmpty(parsed.profile) || !supportedProfile(parsed.profile) ||
     !(parsed.runId === null || nonEmpty(parsed.runId)) || !nonEmpty(parsed.claimedAt) || !nonEmpty(parsed.heartbeatAt) || !nonEmpty(parsed.leaseUntil) ||
     !['claimed', 'running', 'merge_ready', 'needs_human', 'failed'].includes(parsed.state as string)) {
     throw new DispatchProtocolError('Dispatch runtime comment has invalid field values.');

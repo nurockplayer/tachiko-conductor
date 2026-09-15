@@ -98,6 +98,7 @@ describe('dispatch queue protocol', () => {
     assert.throws(() => parseDispatchQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex`), DispatchProtocolError);
     assert.throws(() => parseDispatchQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: standard\n    profile: complex`), DispatchProtocolError);
     assert.throws(() => parseDispatchQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: standard\n  - issue: 18\n    route: codex\n    profile: complex`), DispatchProtocolError);
+    assert.throws(() => parseDispatchQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complexx`), /unsupported execution profile/);
   });
 
   it('round-trips only the complete runtime schema', () => {
@@ -223,6 +224,68 @@ describe('dispatch queue protocol', () => {
     });
   });
 
+  it('creates fresh durable work when a terminal Issue is explicitly re-dispatched', async () => {
+    const store = new MemoryStore();
+    store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'old-terminal'), state: 'FAILED' });
+    let received: Run | null | undefined;
+    await dispatchOnce({
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complex`,
+      owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime: new Comments(),
+      leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'fresh-claim',
+      async execute(_entry, existing) { received = existing; return { runId: 'fresh-run', state: 'IMPLEMENTING' }; },
+    });
+    assert.equal(received, null);
+    assert.equal(store.read('old-terminal')?.state, 'FAILED');
+  });
+
+  it('recovers only the durable Run named by a retained claim', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'old-terminal'), state: 'FAILED' });
+    const claimed = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'claimed-run');
+    store.create(claimed);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'claim-1', runId: claimed.id, profile: 'complex', state: 'running',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    let received: Run | null | undefined;
+    await dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute(_entry, existing) { received = existing; return { runId: claimed.id, state: 'IMPLEMENTING' }; },
+    });
+    assert.equal(received?.id, claimed.id);
+  });
+
+  it('reconciles a terminal durable Run to its retained runtime claim after a crash window', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'terminal'), state: 'FAILED' as const };
+    store.create(terminal);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'claim-1', runId: terminal.id, profile: 'complex', state: 'running',
+        claimedAt: T0, heartbeatAt: '2026-09-14T23:59:00.000Z', leaseUntil: T0,
+      }),
+    });
+    const result = await dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute() { throw new Error('terminal run must not execute'); },
+    });
+    assert.deepEqual(result, {
+      outcome: 'existing_claim',
+      claim: {
+        issue: 18, claimId: 'claim-1', runId: terminal.id, profile: 'complex', state: 'failed',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      },
+    });
+  });
+
   it('resumes a claimed run from its durable profile when current profile config is unavailable', async () => {
     const runtime = new CommandRuntime(QUEUE);
     const store = new MemoryStore();
@@ -241,8 +304,10 @@ describe('dispatch queue protocol', () => {
       workflow: { store, github: new GitHub() } as unknown as WorkflowDependencies,
       runtime,
       resolveExecutionProfile: () => { throw new Error('must not resolve current profile configuration'); },
-      runIssue: async (_ref, selected) => {
-        executions.push(selected);
+      runIssue: async () => { throw new Error('must not start a new claimed run'); },
+      resumeClaimedRun: async (run) => {
+        assert.equal(run.id, existing.id);
+        executions.push(undefined);
         return { outcome: 'needs_human', run: { ...existing, state: 'NEEDS_HUMAN' }, reason: 'parked for test' };
       },
       now: () => T0,
@@ -269,6 +334,7 @@ describe('dispatch queue protocol', () => {
         runtime,
         resolveExecutionProfile: () => { throw new Error('must not resolve current profile configuration'); },
         runIssue: async () => { throw new Error('must not resume an inconsistent claim'); },
+        resumeClaimedRun: async () => { throw new Error('must not resume an inconsistent claim'); },
         now: () => T0,
       }),
       /profile does not match the retained dispatch claim/,
