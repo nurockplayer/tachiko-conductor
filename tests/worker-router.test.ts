@@ -62,6 +62,17 @@ describe('WorkerRouterAdapter', () => {
     assert.equal(runner.calls.length, 0);
   });
 
+  it('fails closed before spawn when per-run MCP capabilities are requested', async () => {
+    const runner = new FakeRunner([]);
+    const response = await new WorkerRouterAdapter({ runner }).run({
+      ...REQUEST,
+      capabilities: [{ kind: 'mcp-http', name: 'browser', endpoint: 'http://127.0.0.1:3000/' }],
+    });
+    assert.equal(response.exitStatus, 'failure');
+    assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.CAPABILITIES_UNSUPPORTED));
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('uses the configured worker-router executable without making it workflow authority', async () => {
     const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result()]);
     const response = await new WorkerRouterAdapter({
