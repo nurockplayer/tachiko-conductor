@@ -82,6 +82,14 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.deepEqual(new JsonFileStore({ dir }).read('profile-run')?.execution, execution);
   });
 
+  it('persists a non-empty dispatch claim identity across restart', () => {
+    const { dir } = tempStore();
+    new JsonFileStore({ dir }).create({ ...newRun('dispatch-run'), dispatchClaimId: 'claim-1' });
+    assert.equal(new JsonFileStore({ dir }).read('dispatch-run')?.dispatchClaimId, 'claim-1');
+    writeFileSync(path.join(dir, 'blank-claim.json'), JSON.stringify({ ...newRun('blank-claim'), dispatchClaimId: '  ' }), 'utf8');
+    assert.throws(() => new JsonFileStore({ dir }).read('blank-claim'), /corrupt or incompatible/);
+  });
+
   it('rejects a persisted execution snapshot whose timeout exceeds the process runner limit', () => {
     const { store, dir } = tempStore();
     writeFileSync(

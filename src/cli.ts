@@ -66,6 +66,9 @@ import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
+import { resolveDispatchConfiguration } from './dispatch/config.js';
+import { dispatchOnceCommand } from './dispatch/command.js';
+import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -82,6 +85,7 @@ Usage:
   tachiko run show <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
+  tachiko dispatch once
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
@@ -137,6 +141,15 @@ export function resolveSelectedExecutionProfile(
   );
   assertExecutionSupportedByProvider(execution);
   return execution;
+}
+
+/** Keep the bootstrap heartbeat's settled signal as the final stdout line. */
+export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOnceCommand>>): void {
+  console.log(JSON.stringify(result, null, 2));
+  const settled = result.outcome === 'no_eligible_work' ||
+    (result.outcome === 'existing_claim' && ['merge_ready', 'needs_human', 'failed'].includes(result.claim.state)) ||
+    (result.outcome === 'dispatched' && ['MERGE_READY', 'MERGED', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY', 'FAILED'].includes(result.execution.state));
+  if (settled) console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
 }
 
 /** Provider selection is external to adapters; existing installs remain on Claude by default. */
@@ -552,9 +565,11 @@ function targetsEqual(a: Target, b: Target): boolean {
   return (b as RepositoryTarget).branch === (a as RepositoryTarget).branch;
 }
 
-/** Find a persisted run whose target matches exactly, if any. */
+/** Find an active persisted run whose target matches exactly, if any. */
 export function findRunByTarget(store: RunStore, target: Target): Run | null {
-  return store.list().find((run) => targetsEqual(run.target, target)) ?? null;
+  return store.list().find((run) =>
+    targetsEqual(run.target, target) && run.state !== 'MERGED' && run.state !== 'FAILED',
+  ) ?? null;
 }
 
 export interface WorkflowCommandOptions {
@@ -562,6 +577,8 @@ export interface WorkflowCommandOptions {
   readonly now?: () => string;
   /** Required for a newly-created production issue run; persisted runs retain their own snapshot. */
   readonly execution?: ResolvedExecutionConfiguration;
+  /** Immutable queue-claim identity when this run is created by dispatch once. */
+  readonly dispatchClaimId?: string;
 }
 
 /**
@@ -575,9 +592,14 @@ export async function runIssueCommand(
   options: WorkflowCommandOptions = {},
 ): Promise<WorkflowOutcome> {
   const target = parseIssueRef(ref);
-  let run = findRunByTarget(deps.store, target);
+  let run = deps.store.list().find((candidate) =>
+    targetsEqual(candidate.target, target) && candidate.state !== 'MERGED' && candidate.state !== 'FAILED',
+  ) ?? null;
+  if (options.dispatchClaimId !== undefined && run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
+    throw new Error(`Active durable run "${run.id}" is not bound to dispatch claim "${options.dispatchClaimId}"; refusing ambiguous recovery.`);
+  }
   if (run === null) {
-    run = createRun(target, undefined, undefined, options.execution);
+    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId);
     deps.store.create(run);
   } else if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
     throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
@@ -714,8 +736,8 @@ function buildWorkflowDeps(
   store: RunStore,
   resolveImplementationCapabilities?: ImplementationCapabilityResolver,
   env: NodeJS.ProcessEnv = process.env,
+  transport: GhCliTransport = new GhCliTransport(),
 ): WorkflowDependencies {
-  const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
   const localValidation = resolveLocalValidationConfiguration(env);
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
@@ -1020,6 +1042,27 @@ export async function main(argv: string[]): Promise<number> {
     console.error(`Unknown command: github ${subcommand ?? ''}\n`);
     console.error(USAGE);
     return 1;
+  }
+
+  if (command === 'dispatch') {
+    if (subcommand !== 'once' || rest.length > 0) {
+      console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const config = resolveDispatchConfiguration();
+    const transport = new GhCliTransport();
+    const runtime = new GitHubDispatchRuntime(transport, config);
+    const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+    const result = await dispatchOnceCommand(config, {
+      workflow,
+      runtime,
+      resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
+      runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
+      resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
+    });
+    printDispatchResult(result);
+    return 0;
   }
 
   if (command !== 'run') {

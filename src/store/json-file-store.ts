@@ -208,6 +208,7 @@ function isRun(value: unknown): value is Run {
     isTarget(v.target) &&
     typeof v.createdAt === 'string' &&
     typeof v.updatedAt === 'string' &&
+    (v.dispatchClaimId === undefined || (typeof v.dispatchClaimId === 'string' && v.dispatchClaimId.trim() !== '')) &&
     Array.isArray(v.history) &&
     v.history.every(isTransitionRecord) &&
     (v.execution === undefined || isExecutionConfiguration(v.execution)) &&

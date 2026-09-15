@@ -114,6 +114,7 @@ pnpm exec tsx src/cli.ts run create --owner acme --repo widgets --issue 42 --exe
 pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
+pnpm exec tsx src/cli.ts dispatch once
 pnpm exec tsx src/cli.ts github snapshot nurockplayer/tachiko-conductor#42
 pnpm exec tsx src/cli.ts browser bootstrap github-work
 pnpm exec tsx src/cli.ts browser start github-work --headless
@@ -129,6 +130,43 @@ choices); resume a parked run with `run resume <id> --decision <choice>`.
 When choices are present, the decision must match one exactly. `Cancel the
 run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
 independent review before the final gate.
+
+## Queue dispatch (v0)
+
+`tachiko dispatch once` is the explicit, single-owner bridge from a
+Steward-maintained GitHub queue projection to Conductor runs. It is not a
+scheduler and does not merge PRs. Configure the exact control location rather
+than inferring a repository, issue, or comment from prose:
+
+```bash
+export TACHIKO_DISPATCH_CONFIG='{
+  "revision":"dispatch-v1",
+  "owner":"nurockplayer",
+  "repo":"tachiko-work",
+  "controlIssue":206,
+  "queueCommentId":123456789,
+  "leaseDurationMs":900000
+}'
+export TACHIKO_EXECUTION_PROFILE_CONFIG='<revisioned execution-profile JSON>'
+pnpm exec tsx src/cli.ts dispatch once
+```
+
+The configured queue comment must contain `<!-- issue-dispatch-queue:v1 -->`
+and a compact `ready:` list with `issue`, `route`, and `profile` for every
+record. Only `route: codex` is executable; `human`, `work`, and `chatgpt`
+records remain untouched, and unknown/malformed/duplicate records fail closed.
+The dispatcher never edits that Steward-owned comment. It owns exactly one
+`<!-- issue-dispatch-runtime:v1 -->` comment on the configured control Issue,
+which stores the claim id, run id, profile, state and lease timestamps. It
+rereads the comment after every claim/heartbeat write, and it refuses duplicate
+or malformed runtime claims.
+
+Before a claim, the dispatcher rereads the target Issue, associated PRs, and
+local durable runs. A closed Issue, open PR, non-terminal Run, ambiguous claim,
+or missing/mismatched claimed Run is not eligible. On restart it resumes the
+same claimed Run; an expired lease is never permission to create a second one.
+This Issue deliberately does not provide a recurring scheduler or same-host
+process lock; those remain #19's boundary.
 
 ## Execution profiles
 
