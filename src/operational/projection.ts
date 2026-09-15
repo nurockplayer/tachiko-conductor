@@ -25,7 +25,11 @@ export interface OperationalRunProjectionV1 {
   readonly workflowState: string;
   /** True only while a persisted review-repair run is actively implementing. */
   readonly reviewFixActive?: true;
-  readonly executor?: { readonly provider: string };
+  readonly executor?: {
+    readonly provider: string;
+    /** Immutable execution-profile name when selected before an agent session exists. */
+    readonly profile?: string;
+  };
   readonly bootstrap?: {
     readonly workspacePath: string;
     readonly branch: string;
@@ -52,7 +56,8 @@ export function sha256(bytes: string): string {
 
 export function operationalRunProjection(run: Run, committedRunBytes: string): OperationalRunProjectionV1 {
   const issueNumber = run.target.kind === 'issue' ? run.target.issueNumber : undefined;
-  const provider = run.executor?.provider ?? run.agentResult?.executor?.provider;
+  const provider = run.executor?.provider ?? run.agentResult?.executor?.provider ?? run.execution?.executor;
+  const profile = run.execution?.profile;
   // A repair may be interrupted and later resumed. `human_resolved` then follows
   // `start_fix`, but the active implementation is still that repair until its
   // succeeding agent result records the replacement exact HEAD.
@@ -69,7 +74,7 @@ export function operationalRunProjection(run: Run, committedRunBytes: string): O
     },
     workflowState: run.state,
     ...(reviewFixActive ? { reviewFixActive: true as const } : {}),
-    ...(provider === undefined ? {} : { executor: { provider } }),
+    ...(provider === undefined ? {} : { executor: { provider, ...(profile === undefined ? {} : { profile }) } }),
     ...(run.bootstrap === undefined ? {} : {
       bootstrap: {
         workspacePath: run.bootstrap.workspacePath,

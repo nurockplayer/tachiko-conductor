@@ -134,6 +134,7 @@ struct RunObservation {
   issue: Option<u64>,
   pull_request_number: Option<u64>,
   provider: Option<String>,
+  profile: Option<String>,
   state: String,
   review_fix_active: bool,
   duration_ms: Option<u64>,
@@ -169,11 +170,32 @@ struct SystemCommands;
 
 impl CommandBoundary for SystemCommands {
   fn run(&self, program: &str, args: &[&str]) -> Option<String> {
-    output_with_timeout(program, args, COMMAND_TIMEOUT)
+    let program = if program == "gh" { github_cli_program() } else { PathBuf::from(program) };
+    output_with_timeout(&program, args, COMMAND_TIMEOUT)
   }
 }
 
-fn output_with_timeout(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+/// Finder and Dock launches do not inherit a shell PATH. Accept a validated
+/// explicit path first, then cover standard Homebrew locations before retaining
+/// PATH lookup for developer shells and non-macOS environments.
+fn github_cli_program() -> PathBuf {
+  let configured = env::var_os("TACHIKO_CONTROL_TOWER_GH").map(PathBuf::from);
+  resolve_github_cli(configured.as_deref(), |candidate| candidate.is_file())
+}
+
+fn resolve_github_cli(configured: Option<&Path>, exists: impl Fn(&Path) -> bool) -> PathBuf {
+  if let Some(path) = configured.filter(|path| path.is_absolute() && exists(path)) {
+    return path.to_path_buf();
+  }
+  for candidate in [Path::new("/opt/homebrew/bin/gh"), Path::new("/usr/local/bin/gh")] {
+    if exists(candidate) {
+      return candidate.to_path_buf();
+    }
+  }
+  PathBuf::from("gh")
+}
+
+fn output_with_timeout(program: impl AsRef<std::ffi::OsStr>, args: &[&str], timeout: Duration) -> Option<String> {
   let mut command = Command::new(program);
   command
     .args(args)
@@ -472,6 +494,7 @@ fn operational_run_observation(
     issue: number_at(value, &["target", "issueNumber"]),
     pull_request_number: number_at(value, &["pullRequest", "number"]),
     provider: string_at(value, &["executor", "provider"]),
+    profile: string_at(value, &["executor", "profile"]),
     state,
     review_fix_active: value.get("reviewFixActive").and_then(Value::as_bool) == Some(true),
     duration_ms: number_at(value, &["durationMs"]),
@@ -852,7 +875,7 @@ fn collect_snapshot_for_roots_with_workspace_data_path(
             .provider
             .clone()
             .unwrap_or_else(|| "unknown".to_owned()),
-          profile: None,
+          profile: value.profile.clone(),
           state: value.state.clone(),
           duration_ms: value.duration_ms,
         }),
@@ -1195,7 +1218,7 @@ mod tests {
     let runs = ["one", "two"].into_iter().map(|id| RunObservation {
       id: id.to_owned(), repository: "acme/widgets".to_owned(), workspace_path: format!("/managed/{id}"),
       branch: id.to_owned(), base_sha: "base".to_owned(), head_sha: None, pull_request_head_sha: None,
-      issue: None, pull_request_number: None, provider: None, state: "WORKING".to_owned(), review_fix_active: false, duration_ms: None,
+      issue: None, pull_request_number: None, provider: None, profile: None, state: "WORKING".to_owned(), review_fix_active: false, duration_ms: None,
     }).collect::<Vec<_>>();
     let discovered = discover_worktrees(&fake, None, Path::new("/missing-managed-root"), &runs);
     assert_eq!(discovered.len(), 2);
@@ -1333,6 +1356,7 @@ mod tests {
       issue: Some(1),
       pull_request_number: Some(7),
       provider: Some("codex-cli".to_owned()),
+      profile: None,
       state: "VALIDATING".to_owned(),
       review_fix_active: false,
       duration_ms: None,
@@ -1369,7 +1393,7 @@ mod tests {
       id: "run-1".to_owned(), repository: "acme/widgets".to_owned(), workspace_path: "/alias/run".to_owned(),
       branch: "codex/widgets".to_owned(), base_sha: "base".to_owned(), head_sha: Some("accepted".to_owned()),
       pull_request_head_sha: Some("accepted".to_owned()), issue: Some(1), pull_request_number: Some(7),
-      provider: Some("codex-cli".to_owned()), state: "IMPLEMENTING".to_owned(), review_fix_active: true, duration_ms: None,
+      provider: Some("codex-cli".to_owned()), profile: None, state: "IMPLEMENTING".to_owned(), review_fix_active: true, duration_ms: None,
     };
     let run_worktrees = verified_run_worktrees(&fake, &[repair.clone()]);
     let repairs = [repair.clone()];
@@ -1394,6 +1418,23 @@ mod tests {
       Some("OPEN".to_owned())
     );
     assert!(pull_request(&fake, "acme/widgets", Some(7), Some("other-head")).is_none());
+  }
+
+  #[test]
+  fn github_cli_resolution_supports_finder_launches_without_a_shell_path() {
+    let available = [PathBuf::from("/opt/homebrew/bin/gh")];
+    assert_eq!(
+      resolve_github_cli(None, |candidate| available.contains(&candidate.to_path_buf())),
+      PathBuf::from("/opt/homebrew/bin/gh")
+    );
+    assert_eq!(
+      resolve_github_cli(Some(Path::new("/custom/gh")), |candidate| candidate == Path::new("/custom/gh")),
+      PathBuf::from("/custom/gh")
+    );
+    assert_eq!(
+      resolve_github_cli(Some(Path::new("relative-gh")), |_| false),
+      PathBuf::from("gh")
+    );
   }
 
   #[test]

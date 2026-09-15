@@ -68,6 +68,16 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(operationalRunProjection(newRun('not-a-review-fix'), '{}').reviewFixActive, undefined);
   });
 
+  it('projects the selected provider and profile before an agent session exists', () => {
+    const run = {
+      ...newRun('initial-execution-projection'),
+      state: 'IMPLEMENTING' as const,
+      execution: { profile: 'standard' as const, revision: 'profiles-v1', executor: 'claude-code', timeoutMs: 1_000 },
+    };
+
+    assert.deepEqual(operationalRunProjection(run, '{}').executor, { provider: 'claude-code', profile: 'standard' });
+  });
+
   it('retains the active review-repair marker after a parked repair resumes', () => {
     const run = {
       ...newRun('resumed-review-fix-projection'),
