@@ -1,12 +1,15 @@
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { WorkflowDependencies, WorkflowOutcome } from '../workflow/run.js';
-import { GitHubDispatchRuntime } from './github-runtime.js';
 import type { DispatchConfiguration } from './config.js';
-import { dispatchOnce, type DispatchOnceResult } from './runner.js';
+import { dispatchOnce, type DispatchOnceResult, type DispatchRuntimeApi } from './runner.js';
+
+export interface DispatchCommandRuntime extends DispatchRuntimeApi {
+  readQueueComment(): Promise<string>;
+}
 
 export interface DispatchCommandDependencies {
   readonly workflow: WorkflowDependencies;
-  readonly runtime: GitHubDispatchRuntime;
+  readonly runtime: DispatchCommandRuntime;
   readonly resolveExecutionProfile: (profile: string) => ResolvedExecutionConfiguration;
   readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined) => Promise<WorkflowOutcome>;
   readonly now?: () => string;
@@ -32,11 +35,15 @@ export async function dispatchOnceCommand(
     leaseDurationMs: config.leaseDurationMs,
     now,
     async execute(entry, existing) {
-      const selected = deps.resolveExecutionProfile(entry.profile);
-      if (existing !== null && JSON.stringify(existing.execution) !== JSON.stringify(selected)) {
-        throw new Error(`Durable run ${existing.id} does not retain the queue-selected immutable execution profile.`);
+      if (existing !== null) {
+        if (existing.execution === undefined) {
+          throw new Error(`Durable run ${existing.id} does not retain the queue-selected immutable execution profile.`);
+        }
+        const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, undefined);
+        return { runId: outcome.run.id, state: outcomeState(outcome) };
       }
-      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, existing === null ? selected : undefined);
+      const selected = deps.resolveExecutionProfile(entry.profile);
+      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected);
       return { runId: outcome.run.id, state: outcomeState(outcome) };
     },
   });

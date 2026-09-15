@@ -143,6 +143,12 @@ export function resolveSelectedExecutionProfile(
   return execution;
 }
 
+/** Keep the bootstrap heartbeat's settled signal as the final stdout line. */
+export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOnceCommand>>): void {
+  console.log(JSON.stringify(result, null, 2));
+  if (result.outcome === 'no_eligible_work') console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
+}
+
 /** Provider selection is external to adapters; existing installs remain on Claude by default. */
 export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
   const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? CLAUDE_CODE_PROVIDER;
@@ -1042,7 +1048,7 @@ export async function main(argv: string[]): Promise<number> {
       resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
       runIssue: async (ref, execution) => await runIssueCommand(workflow, ref, execution === undefined ? {} : { execution }),
     });
-    console.log(JSON.stringify(result, null, 2));
+    printDispatchResult(result);
     return 0;
   }
 

@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { Run, WorkflowState } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
@@ -70,9 +72,38 @@ async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptio
 
 function stateForExecution(state: WorkflowState): DispatchRuntimeClaim['state'] {
   if (state === 'MERGE_READY') return 'merge_ready';
+  // MERGED is terminal too. The runtime protocol intentionally has no
+  // separate merged state: the durable Run remains the source of truth while
+  // this claim is retained for reconciliation.
+  if (state === 'MERGED') return 'merge_ready';
   if (state === 'NEEDS_HUMAN' || state === 'WAITING_DEPENDENCY') return 'needs_human';
   if (state === 'FAILED') return 'failed';
   return 'running';
+}
+
+async function supersedeTerminalClaim(
+  api: DispatchRuntimeApi,
+  commentId: string,
+  entry: DispatchQueueEntry,
+  options: Pick<DispatchOnceOptions, 'now' | 'leaseDurationMs' | 'createClaimId'>,
+): Promise<DispatchRuntimeClaim> {
+  const now = options.now();
+  const claim: DispatchRuntimeClaim = {
+    issue: entry.issue,
+    claimId: (options.createClaimId ?? randomUUID)(),
+    runId: null,
+    profile: entry.profile,
+    state: 'claimed',
+    claimedAt: now,
+    heartbeatAt: now,
+    leaseUntil: new Date(Date.parse(now) + options.leaseDurationMs).toISOString(),
+  };
+  await api.updateRuntimeComment(commentId, renderDispatchRuntime(claim));
+  const observed = selectDispatchRuntime(await api.listRuntimeComments());
+  if (observed === null || observed.id !== commentId || observed.claim.claimId !== claim.claimId || observed.claim.runId !== null) {
+    throw new DispatchProtocolError('Superseded dispatch runtime claim did not retain the exact new claim identity.');
+  }
+  return observed.claim;
 }
 
 async function updateClaim(
@@ -111,9 +142,42 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     if (existing.claim.runId !== null && (run === null || run.id !== existing.claim.runId)) {
       throw new DispatchProtocolError('Dispatch runtime claim names a missing or different durable run; refusing recovery.');
     }
-    const execution = await options.execute(entry, run);
-    const claim = await updateClaim(options.runtime, existing.id, existing.claim, options.now(), options.leaseDurationMs, execution);
-    return { outcome: 'dispatched', entry, claim, execution };
+    if (run === null || isActiveRun(run)) {
+      const execution = await options.execute(entry, run);
+      const claim = await updateClaim(options.runtime, existing.id, existing.claim, options.now(), options.leaseDurationMs, execution);
+      return { outcome: 'dispatched', entry, claim, execution };
+    }
+
+    // A terminal durable Run must never be executed again. Retain its claim
+    // while its queue entry is still present, but allow the same sole runtime
+    // comment to be safely superseded once the Steward has removed it.
+    const queue = parseDispatchQueue(options.queueBody);
+    if (queue.some((queued) => queued.issue === entry.issue && queued.route === 'codex' && queued.profile === entry.profile)) {
+      return { outcome: 'existing_claim', claim: existing.claim };
+    }
+    const reasons: string[] = [];
+    for (const queued of queue) {
+      if (queued.route !== 'codex') {
+        reasons.push(`#${queued.issue}: route ${queued.route} is not executable by this dispatcher`);
+        continue;
+      }
+      const checked = await eligibility(queued, options);
+      if (checked.reason !== null) {
+        reasons.push(checked.reason);
+        continue;
+      }
+      const claim = await supersedeTerminalClaim(options.runtime, existing.id, queued, options);
+      let execution: DispatchExecution;
+      try {
+        execution = await options.execute(queued, checked.run);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new DispatchProtocolError(`Claim ${claim.claimId} was retained but execution could not start safely: ${message}`);
+      }
+      const updated = await updateClaim(options.runtime, existing.id, claim, options.now(), options.leaseDurationMs, execution);
+      return { outcome: 'dispatched', entry: queued, claim: updated, execution };
+    }
+    return { outcome: 'no_eligible_work', reasons };
   }
   const queue = parseDispatchQueue(options.queueBody);
   const reasons: string[] = [];

@@ -12,11 +12,13 @@ import {
   type DispatchRuntimeComment,
 } from '../src/dispatch/queue.js';
 import { dispatchOnce } from '../src/dispatch/runner.js';
+import { dispatchOnceCommand } from '../src/dispatch/command.js';
 import { parseDispatchConfiguration } from '../src/dispatch/config.js';
 import type { GitHubAdapter, IssueSnapshot, PullRequestSnapshot } from '../src/adapters/github.js';
 import { createRun } from '../src/domain/run.js';
 import type { Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
+import type { WorkflowDependencies } from '../src/workflow/run.js';
 
 const T0 = '2026-09-15T00:00:00.000Z';
 const QUEUE = `${DISPATCH_QUEUE_MARKER}
@@ -44,6 +46,11 @@ class Comments {
     this.comments[index] = comment;
     return comment;
   }
+}
+
+class CommandRuntime extends Comments {
+  constructor(private readonly queue: string) { super(); }
+  async readQueueComment(): Promise<string> { return this.queue; }
 }
 
 class MemoryStore implements RunStore {
@@ -186,5 +193,60 @@ describe('dispatch queue protocol', () => {
     assert.equal(result.outcome, 'dispatched');
     if (result.outcome !== 'dispatched') throw new Error('expected Codex dispatch');
     assert.equal(result.entry.issue, 18);
+  });
+
+  it('never re-executes a terminal claim and safely supersedes it after its queue entry is removed', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'done'), state: 'FAILED' as const };
+    store.create(terminal);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'old-claim', runId: terminal.id, profile: 'complex', state: 'failed',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    const queue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard`;
+    const result = await dispatchOnce({
+      queueBody: queue, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'new-claim',
+      async execute(entry) { return { runId: `run-${entry.issue}`, state: 'IMPLEMENTING' }; },
+    });
+    assert.deepEqual(result, {
+      outcome: 'dispatched', entry: { issue: 19, route: 'codex', profile: 'standard' },
+      claim: {
+        issue: 19, claimId: 'new-claim', runId: 'run-19', profile: 'standard', state: 'running',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      },
+      execution: { runId: 'run-19', state: 'IMPLEMENTING' },
+    });
+  });
+
+  it('resumes a claimed run from its durable profile when current profile config is unavailable', async () => {
+    const runtime = new CommandRuntime(QUEUE);
+    const store = new MemoryStore();
+    const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
+    const existing = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing', execution);
+    store.create(existing);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'claim-1', runId: existing.id, profile: 'complex', state: 'running',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    const executions: unknown[] = [];
+    await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
+      workflow: { store, github: new GitHub() } as unknown as WorkflowDependencies,
+      runtime,
+      resolveExecutionProfile: () => { throw new Error('must not resolve current profile configuration'); },
+      runIssue: async (_ref, selected) => {
+        executions.push(selected);
+        return { outcome: 'needs_human', run: { ...existing, state: 'NEEDS_HUMAN' }, reason: 'parked for test' };
+      },
+      now: () => T0,
+    });
+    assert.deepEqual(executions, [undefined]);
   });
 });

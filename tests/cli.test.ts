@@ -11,6 +11,7 @@ import {
   LIVE_HEAD_SYNC_DECISION,
   parseIssueNumber,
   parseIssueRef,
+  printDispatchResult,
   resolveCodexExecutionConfig,
   resolveSelectedExecutionProfile,
   resolveHostedCheckPolicyConfiguration,
@@ -43,6 +44,26 @@ function tempStore(): { store: JsonFileStore; dir: string } {
 }
 
 describe('CLI command layer', () => {
+  it('prints the heartbeat settlement marker only after no eligible dispatch work', () => {
+    const printed: string[] = [];
+    const original = console.log;
+    console.log = (value?: unknown) => { printed.push(String(value)); };
+    try {
+      printDispatchResult({ outcome: 'no_eligible_work', reasons: ['#18: Issue is closed'] });
+      printDispatchResult({
+        outcome: 'existing_claim',
+        claim: {
+          issue: 18, claimId: 'claim-1', runId: 'run-1', profile: 'complex', state: 'running',
+          claimedAt: T0, heartbeatAt: T0, leaseUntil: T0,
+        },
+      });
+    } finally {
+      console.log = original;
+    }
+    assert.equal(printed.filter((line) => line === 'TACHIKO_HEARTBEAT_SETTLED_V1').length, 1);
+    assert.notEqual(printed.at(-1), 'TACHIKO_HEARTBEAT_SETTLED_V1');
+  });
+
   it('creates, shows, and transitions a run through the command functions', () => {
     const { store, dir } = tempStore();
     try {
