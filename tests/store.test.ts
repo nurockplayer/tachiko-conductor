@@ -70,6 +70,18 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.agentResult?.durationMs, 125);
   });
 
+  it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {
+    const { dir } = tempStore();
+    const execution = {
+      profile: 'standard' as const, revision: 'profiles-v1', executor: 'codex-cli', model: 'configured-model',
+      reasoningEffort: 'medium' as const, timeoutMs: 125_000, sandboxMode: 'workspace-write' as const, approvalPolicy: 'on-request' as const,
+    };
+    const first = new JsonFileStore({ dir });
+    first.create({ ...newRun('profile-run'), execution });
+
+    assert.deepEqual(new JsonFileStore({ dir }).read('profile-run')?.execution, execution);
+  });
+
   it('round-trips compact exact-HEAD validation provenance through a fresh store instance', () => {
     const { dir } = tempStore();
     const first = new JsonFileStore({ dir });

@@ -3,6 +3,7 @@ import path from 'node:path';
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
+import { EXECUTION_PROFILE_NAMES } from '../execution-profiles.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -72,6 +73,19 @@ function isExecutorIdentity(value: unknown): boolean {
     typeof executor.sessionId === 'string' &&
     executor.sessionId.trim().length > 0
   );
+}
+
+function isExecutionConfiguration(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const execution = value as Record<string, unknown>;
+  return typeof execution.profile === 'string' && EXECUTION_PROFILE_NAMES.includes(execution.profile as typeof EXECUTION_PROFILE_NAMES[number]) &&
+    typeof execution.revision === 'string' && execution.revision.trim() !== '' &&
+    typeof execution.executor === 'string' && execution.executor.trim() !== '' &&
+    typeof execution.timeoutMs === 'number' && Number.isSafeInteger(execution.timeoutMs) && execution.timeoutMs > 0 &&
+    isOptionalNonEmptyString(execution.model) &&
+    (execution.reasoningEffort === undefined || ['minimal', 'low', 'medium', 'high', 'xhigh'].includes(execution.reasoningEffort as string)) &&
+    (execution.sandboxMode === undefined || ['read-only', 'workspace-write', 'danger-full-access'].includes(execution.sandboxMode as string)) &&
+    (execution.approvalPolicy === undefined || ['untrusted', 'on-request', 'never'].includes(execution.approvalPolicy as string));
 }
 
 function isBootstrapIdentity(value: unknown, target: unknown): boolean {
@@ -195,6 +209,7 @@ function isRun(value: unknown): value is Run {
     typeof v.updatedAt === 'string' &&
     Array.isArray(v.history) &&
     v.history.every(isTransitionRecord) &&
+    (v.execution === undefined || isExecutionConfiguration(v.execution)) &&
     isOptionalString(v.headSha) &&
     (v.interrupt === undefined || isInterrupt(v.interrupt)) &&
     (v.agentResult === undefined || isAgentResult(v.agentResult)) &&

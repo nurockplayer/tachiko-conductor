@@ -91,7 +91,7 @@ with `pnpm exec playwright install --with-deps chromium` before `pnpm test`.
 ## CLI
 
 ```bash
-pnpm exec tsx src/cli.ts run owner/repo#123
+pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
 pnpm exec tsx src/cli.ts run resume <id> --decision <choice>
 pnpm exec tsx src/cli.ts run create --owner acme --repo widgets --issue 42
 pnpm exec tsx src/cli.ts run show <id>
@@ -112,6 +112,34 @@ choices); resume a parked run with `run resume <id> --decision <choice>`.
 When choices are present, the decision must match one exactly. `Cancel the
 run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
 independent review before the final gate.
+
+## Execution profiles
+
+The Project Steward explicitly selects one coarse profile when creating an
+issue run: `routine`, `standard`, `complex`, or `critical`. Conductor only
+resolves that selection; it never derives a profile from Issue prose, diffs,
+or reviewer text. New runs require `--execution-profile` and one revisioned
+`TACHIKO_EXECUTION_PROFILE_CONFIG` JSON value. For example:
+
+```bash
+export TACHIKO_EXECUTION_PROFILE_CONFIG='{
+  "revision":"execution-profiles-v1",
+  "profiles":{
+    "routine":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"low","timeoutMs":600000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+    "standard":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"medium","timeoutMs":600000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+    "complex":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+    "critical":{"executor":"claude-code","model":"configured-model","timeoutMs":900000}
+  }
+}'
+pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
+```
+
+Provider and model identifiers are configuration values, not workflow enums.
+The selected profile, config revision, executor, and secret-free resolved
+settings are persisted with the run; continuation uses that immutable snapshot
+even if a later configuration revision remaps the profile. Unknown profiles,
+unavailable executors, malformed settings, and provider-unsupported settings
+fail before implementation starts.
 
 ## Exact-HEAD validation
 
@@ -233,7 +261,9 @@ TACHIKO_IMPLEMENTATION_AGENT=codex-cli pnpm exec tsx src/cli.ts run owner/repo#1
 ```
 
 The adapter accepts resolved execution values without choosing a model or
-profile. Production wiring reads these optional values:
+profile. The profile configuration above is the production path for new runs.
+The following direct Codex environment values remain available for legacy
+persisted runs that have no profile snapshot:
 
 - `TACHIKO_CODEX_MODEL`
 - `TACHIKO_CODEX_REASONING_EFFORT` (`minimal`, `low`, `medium`, `high`, `xhigh`)

@@ -12,6 +12,7 @@ import {
   parseIssueNumber,
   parseIssueRef,
   resolveCodexExecutionConfig,
+  resolveSelectedExecutionProfile,
   resolveHostedCheckPolicyConfiguration,
   resolveLocalValidationConfiguration,
   resolveImplementationProvider,
@@ -171,6 +172,24 @@ describe('CLI command layer', () => {
       }),
       /requiredCheckNames must be a non-empty string array/,
     );
+  });
+
+  it('requires one revisioned execution-profile config to resolve a new-run selection', () => {
+    const profiles = {
+      revision: 'profiles-v1',
+      profiles: {
+        routine: { executor: 'codex-cli', timeoutMs: 1, reasoningEffort: 'low' },
+        standard: { executor: 'codex-cli', timeoutMs: 2, reasoningEffort: 'medium' },
+        complex: { executor: 'codex-cli', timeoutMs: 3, reasoningEffort: 'high' },
+        critical: { executor: 'claude-code', timeoutMs: 4 },
+      },
+    };
+    assert.deepEqual(resolveSelectedExecutionProfile('standard', {
+      TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify(profiles),
+    }), {
+      profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 2, reasoningEffort: 'medium',
+    });
+    assert.throws(() => resolveSelectedExecutionProfile('standard', {}), /TACHIKO_EXECUTION_PROFILE_CONFIG is required/);
   });
 
   it('parses issue numbers strictly without partial parses or unsafe integers', () => {
@@ -712,7 +731,19 @@ describe('CLI end-to-end across processes', () => {
   it('creates a run in one process, then reads and advances it in fresh processes', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-e2e-'));
     try {
-      const env = { ...process.env, TACHIKO_DATA_DIR: dir };
+      const env = {
+        ...process.env,
+        TACHIKO_DATA_DIR: dir,
+        TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify({
+          revision: 'profiles-v1',
+          profiles: {
+            routine: { executor: 'codex-cli', timeoutMs: 1, reasoningEffort: 'low' },
+            standard: { executor: 'codex-cli', timeoutMs: 2, reasoningEffort: 'medium' },
+            complex: { executor: 'codex-cli', timeoutMs: 3, reasoningEffort: 'high' },
+            critical: { executor: 'claude-code', timeoutMs: 4 },
+          },
+        }),
+      };
       const runCli = (args: string[]): CliResult => {
         const result = spawnSync(
           process.execPath,
@@ -722,13 +753,14 @@ describe('CLI end-to-end across processes', () => {
         return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', status: result.status };
       };
 
-      const create = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42']);
+      const create = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--execution-profile', 'standard']);
       const id = /Created run ([a-f0-9-]+)/.exec(create.stdout)?.[1];
       assert.ok(id, `expected a run id in output: ${create.stdout}`);
       assert.match(create.stdout, /"state": "READY"/);
+      assert.match(create.stdout, /"profile": "standard"/);
 
       // Supplying both --issue and --branch is rejected.
-      const both = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--branch', 'main']);
+      const both = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--branch', 'main', '--execution-profile', 'standard']);
       assert.equal(both.status, 1);
       assert.match(both.stderr, /error: run create requires exactly one of/);
 

@@ -35,6 +35,11 @@ import {
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
 import {
+  parseExecutionProfileConfiguration,
+  resolveExecutionProfile,
+  type ResolvedExecutionConfiguration,
+} from './execution-profiles.js';
+import {
   CANCEL_RUN_DECISION,
   LIVE_HEAD_SYNC_DECISION,
   RECOVER_LEGACY_PULL_REQUEST_DECISION,
@@ -70,7 +75,7 @@ import {
 const USAGE = `Tachiko Conductor — local orchestration core.
 
 Usage:
-  tachiko run owner/repo#123 [--browser-profile <profile>]
+  tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> [--browser-profile <profile>]
   tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
   tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>)
   tachiko run show <id>
@@ -114,6 +119,20 @@ export type CodexExecutionConfig = Pick<
   CodexCliAdapterOptions,
   'model' | 'reasoningEffort' | 'sandboxMode' | 'approvalPolicy' | 'timeoutMs'
 >;
+
+/** Resolve the explicit Steward-selected profile from one revisioned env config. */
+export function resolveSelectedExecutionProfile(
+  selected: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedExecutionConfiguration {
+  const raw = env.TACHIKO_EXECUTION_PROFILE_CONFIG;
+  if (raw === undefined) throw new Error('TACHIKO_EXECUTION_PROFILE_CONFIG is required when creating a new issue run.');
+  return resolveExecutionProfile(
+    parseExecutionProfileConfiguration(raw),
+    selected,
+    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER],
+  );
+}
 
 /** Provider selection is external to adapters; existing installs remain on Claude by default. */
 export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
@@ -536,6 +555,8 @@ export function findRunByTarget(store: RunStore, target: Target): Run | null {
 export interface WorkflowCommandOptions {
   readonly maxReviewAttempts?: number;
   readonly now?: () => string;
+  /** Required for a newly-created production issue run; persisted runs retain their own snapshot. */
+  readonly execution?: ResolvedExecutionConfiguration;
 }
 
 /**
@@ -551,8 +572,10 @@ export async function runIssueCommand(
   const target = parseIssueRef(ref);
   let run = findRunByTarget(deps.store, target);
   if (run === null) {
-    run = createRun(target);
+    run = createRun(target, undefined, undefined, options.execution);
     deps.store.create(run);
+  } else if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
+    throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
   }
   return runWorkflow(deps, run.id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
@@ -724,10 +747,20 @@ function buildWorkflowDeps(
       defaultProvider: resolveImplementationProvider(env),
       legacySessionProvider: CLAUDE_CODE_PROVIDER,
       providers: {
-        [CLAUDE_CODE_PROVIDER]: () => new ClaudeCodeAdapter({ cwd: process.cwd(), github }),
-        [CODEX_CLI_PROVIDER]: () => new CodexCliAdapter({
+        [CLAUDE_CODE_PROVIDER]: (execution) => new ClaudeCodeAdapter({
+          cwd: process.cwd(), github,
+          ...(execution?.model === undefined ? {} : { model: execution.model }),
+          ...(execution === undefined ? {} : { timeoutMs: execution.timeoutMs }),
+        }),
+        [CODEX_CLI_PROVIDER]: (execution) => new CodexCliAdapter({
           cwd: process.cwd(),
-          ...resolveCodexExecutionConfig(env),
+          ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
+            ...(execution.model === undefined ? {} : { model: execution.model }),
+            ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+            ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+            ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+            timeoutMs: execution.timeoutMs,
+          }),
         }),
       },
     }),
@@ -749,7 +782,7 @@ export function runCreateCommand(
   store: RunStore,
   owner: string,
   repo: string,
-  opts: { issue?: number; branch?: string },
+  opts: { issue?: number; branch?: string; execution?: ResolvedExecutionConfiguration },
 ): Run {
   const hasIssue = opts.issue !== undefined;
   const hasBranch = opts.branch !== undefined;
@@ -765,7 +798,7 @@ export function runCreateCommand(
   } else {
     target = { kind: 'repository', owner, repo, branch: opts.branch ?? 'main' };
   }
-  const run = createRun(target);
+  const run = createRun(target, undefined, undefined, opts.execution);
   store.create(run);
   return run;
 }
@@ -803,6 +836,8 @@ export interface RunView {
   target: Target;
   state: WorkflowState;
   headSha: string | null;
+  /** Persisted secret-free execution selection, when this is a profile-backed run. */
+  execution: Run['execution'] | null;
   /** Only an unresolved interrupt is a current interrupt. */
   interrupt: { kind: InterruptKind; reason: string } | null;
   transitions: number;
@@ -820,6 +855,7 @@ export function runShowView(run: Run): RunView {
     target: run.target,
     state: run.state,
     headSha: run.headSha ?? null,
+    execution: run.execution ?? null,
     interrupt: activeInterrupt,
     transitions: run.history.length,
     updatedAt: run.updatedAt,
@@ -995,6 +1031,7 @@ export async function main(argv: string[]): Promise<number> {
         repo: { type: 'string' },
         issue: { type: 'string' },
         branch: { type: 'string' },
+        'execution-profile': { type: 'string' },
       },
     });
     const { owner, repo } = values;
@@ -1002,7 +1039,11 @@ export async function main(argv: string[]): Promise<number> {
       throw new Error('run create requires --owner and --repo.');
     }
     const issue = values.issue !== undefined ? parseIssueNumber(values.issue) : undefined;
-    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch });
+    if (values['execution-profile'] === undefined) {
+      throw new Error('run create requires --execution-profile <routine|standard|complex|critical>.');
+    }
+    const execution = resolveSelectedExecutionProfile(values['execution-profile']);
+    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch, execution });
     console.log(`Created run ${run.id} (${run.state}).`);
     printRun(run);
     return 0;
@@ -1073,14 +1114,22 @@ export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: [subcommand, ...rest],
     allowPositionals: true,
-    options: { 'browser-profile': { type: 'string' } },
+    options: { 'browser-profile': { type: 'string' }, 'execution-profile': { type: 'string' } },
   });
   const [ref, extra] = positionals;
   if (ref === undefined || extra !== undefined) {
     throw new Error('run requires exactly one owner/repo#123 reference.');
   }
   const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref);
+  const target = parseIssueRef(ref);
+  const existing = findRunByTarget(store, target);
+  if (existing === null && values['execution-profile'] === undefined) {
+    throw new Error('run owner/repo#123 requires --execution-profile <routine|standard|complex|critical> for a new run.');
+  }
+  const execution = values['execution-profile'] === undefined
+    ? undefined
+    : resolveSelectedExecutionProfile(values['execution-profile']);
+  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution });
   printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }

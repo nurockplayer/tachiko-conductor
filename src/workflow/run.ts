@@ -411,6 +411,7 @@ export async function runWorkflow(
             capabilities: await deps.resolveImplementationCapabilities?.(),
             ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
             ...(run.executor === undefined ? {} : { executor: run.executor }),
+            ...(run.execution === undefined ? {} : { execution: run.execution }),
           });
         } catch (error) {
           if (isWorkspaceGuardFailure(error)) return bootstrapFailureOutcome(run, error, store, now);
