@@ -53,7 +53,10 @@ export function sha256(bytes: string): string {
 export function operationalRunProjection(run: Run, committedRunBytes: string): OperationalRunProjectionV1 {
   const issueNumber = run.target.kind === 'issue' ? run.target.issueNumber : undefined;
   const provider = run.executor?.provider ?? run.agentResult?.executor?.provider;
-  const reviewFixActive = run.state === 'IMPLEMENTING' && run.history.at(-1)?.type === 'start_fix';
+  // A repair may be interrupted and later resumed. `human_resolved` then follows
+  // `start_fix`, but the active implementation is still that repair until its
+  // succeeding agent result records the replacement exact HEAD.
+  const reviewFixActive = run.state === 'IMPLEMENTING' && run.history.some((entry) => entry.type === 'start_fix');
   return {
     schemaVersion: OPERATIONAL_RUN_PROJECTION_VERSION,
     runId: run.id,

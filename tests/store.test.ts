@@ -68,6 +68,20 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(operationalRunProjection(newRun('not-a-review-fix'), '{}').reviewFixActive, undefined);
   });
 
+  it('retains the active review-repair marker after a parked repair resumes', () => {
+    const run = {
+      ...newRun('resumed-review-fix-projection'),
+      state: 'IMPLEMENTING' as const,
+      history: [
+        { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 },
+        { type: 'escalate' as const, from: 'IMPLEMENTING' as const, to: 'NEEDS_HUMAN' as const, at: T0 },
+        { type: 'human_resolved' as const, from: 'NEEDS_HUMAN' as const, to: 'IMPLEMENTING' as const, at: T0 },
+      ],
+    };
+
+    assert.equal(operationalRunProjection(run, '{}').reviewFixActive, true);
+  });
+
   it('keeps a committed raw transition successful when derived projection emission fails', () => {
     const { store, dir } = tempStore();
     let run = newRun('projection-best-effort');
