@@ -8,10 +8,14 @@ import { describe, it } from 'node:test';
 
 import {
   githubSnapshotCommand,
+  findRunByTarget,
   LIVE_HEAD_SYNC_DECISION,
+  main,
   parseIssueNumber,
   parseIssueRef,
+  printDispatchResult,
   resolveCodexExecutionConfig,
+  resolveSelectedExecutionProfile,
   resolveHostedCheckPolicyConfiguration,
   resolveLocalValidationConfiguration,
   resolveImplementationProvider,
@@ -42,6 +46,34 @@ function tempStore(): { store: JsonFileStore; dir: string } {
 }
 
 describe('CLI command layer', () => {
+  it('prints the heartbeat settlement marker as the final line for every settled dispatch boundary', () => {
+    const printed: string[] = [];
+    const original = console.log;
+    console.log = (value?: unknown) => { printed.push(String(value)); };
+    try {
+      printDispatchResult({ outcome: 'no_eligible_work', reasons: ['#18: Issue is closed'] });
+      printDispatchResult({
+        outcome: 'existing_claim',
+        claim: {
+          issue: 18, claimId: 'claim-1', runId: 'run-1', profile: 'complex', state: 'merge_ready',
+          claimedAt: T0, heartbeatAt: T0, leaseUntil: T0,
+        },
+      });
+      printDispatchResult({
+        outcome: 'dispatched', entry: { issue: 18, route: 'codex', profile: 'complex' },
+        claim: {
+          issue: 18, claimId: 'claim-2', runId: 'run-2', profile: 'complex', state: 'failed',
+          claimedAt: T0, heartbeatAt: T0, leaseUntil: T0,
+        },
+        execution: { runId: 'run-2', state: 'FAILED' },
+      });
+    } finally {
+      console.log = original;
+    }
+    assert.equal(printed.filter((line) => line === 'TACHIKO_HEARTBEAT_SETTLED_V1').length, 3);
+    assert.equal(printed.at(-1), 'TACHIKO_HEARTBEAT_SETTLED_V1');
+  });
+
   it('creates, shows, and transitions a run through the command functions', () => {
     const { store, dir } = tempStore();
     try {
@@ -55,6 +87,28 @@ describe('CLI command layer', () => {
       assert.equal(next.state, 'IMPLEMENTING');
       assert.equal(runShowCommand(store, created.id).state, 'IMPLEMENTING');
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('requires an execution profile when terminal history means run starts fresh', async () => {
+    const { store, dir } = tempStore();
+    const previousRunsDir = process.env.TACHIKO_DATA_DIR;
+    try {
+      const terminal = { ...createRun(TARGET, T0, 'terminal'), state: 'FAILED' as const };
+      store.create(terminal);
+      assert.equal(findRunByTarget(store, TARGET), null);
+      process.env.TACHIKO_DATA_DIR = dir;
+      await assert.rejects(
+        main(['run', 'acme/widgets#42']),
+        /requires --execution-profile <routine\|standard\|complex\|critical> for a new run/,
+      );
+      const active = createRun(TARGET, T0, 'active');
+      store.create(active);
+      assert.equal(findRunByTarget(store, TARGET)?.id, active.id);
+    } finally {
+      if (previousRunsDir === undefined) delete process.env.TACHIKO_DATA_DIR;
+      else process.env.TACHIKO_DATA_DIR = previousRunsDir;
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -170,6 +224,36 @@ describe('CLI command layer', () => {
         TACHIKO_HOSTED_CHECK_POLICY_CONFIG: JSON.stringify({ revision: 'repo-v1', mode: 'required', requiredCheckNames: [] }),
       }),
       /requiredCheckNames must be a non-empty string array/,
+    );
+  });
+
+  it('requires one revisioned execution-profile config to resolve a new-run selection', () => {
+    const profiles = {
+      revision: 'profiles-v1',
+      profiles: {
+        routine: { executor: 'codex-cli', timeoutMs: 1, reasoningEffort: 'low' },
+        standard: { executor: 'codex-cli', timeoutMs: 2, reasoningEffort: 'medium' },
+        complex: { executor: 'codex-cli', timeoutMs: 3, reasoningEffort: 'high' },
+        critical: { executor: 'claude-code', timeoutMs: 4 },
+      },
+    };
+    assert.deepEqual(resolveSelectedExecutionProfile('standard', {
+      TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify(profiles),
+    }), {
+      profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 2, reasoningEffort: 'medium',
+    });
+    assert.throws(() => resolveSelectedExecutionProfile('standard', {}), /TACHIKO_EXECUTION_PROFILE_CONFIG is required/);
+    assert.throws(
+      () => resolveSelectedExecutionProfile('critical', {
+        TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify({
+          ...profiles,
+          profiles: {
+            ...profiles.profiles,
+            critical: { executor: 'claude-code', timeoutMs: 4, reasoningEffort: 'high' },
+          },
+        }),
+      }),
+      /unsupported by executor/,
     );
   });
 
@@ -475,6 +559,24 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.run.id, 'run-1');
   });
 
+  it('creates fresh durable work without replacing terminal history for an explicitly re-dispatched Issue', async () => {
+    const store = new MemoryStore();
+    store.create({ ...createRun(TARGET, T0, 'old-terminal'), state: 'FAILED' });
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }]);
+
+    const outcome = await runIssueCommand(
+      deps(store, githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]), implementation, reviewer),
+      'acme/widgets#42',
+      { now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(store.read('old-terminal')?.state, 'FAILED');
+    assert.equal(store.list().length, 2);
+    assert.notEqual(outcome.run.id, 'old-terminal');
+  });
+
   it('resumes a parked NEEDS_HUMAN run after a supplied human decision', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'run-1');
@@ -712,7 +814,19 @@ describe('CLI end-to-end across processes', () => {
   it('creates a run in one process, then reads and advances it in fresh processes', () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-e2e-'));
     try {
-      const env = { ...process.env, TACHIKO_DATA_DIR: dir };
+      const env = {
+        ...process.env,
+        TACHIKO_DATA_DIR: dir,
+        TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify({
+          revision: 'profiles-v1',
+          profiles: {
+            routine: { executor: 'codex-cli', timeoutMs: 1, reasoningEffort: 'low' },
+            standard: { executor: 'codex-cli', timeoutMs: 2, reasoningEffort: 'medium' },
+            complex: { executor: 'codex-cli', timeoutMs: 3, reasoningEffort: 'high' },
+            critical: { executor: 'claude-code', timeoutMs: 4 },
+          },
+        }),
+      };
       const runCli = (args: string[]): CliResult => {
         const result = spawnSync(
           process.execPath,
@@ -722,13 +836,22 @@ describe('CLI end-to-end across processes', () => {
         return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', status: result.status };
       };
 
-      const create = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42']);
+      const help = runCli(['--help']);
+      assert.equal(help.status, 0);
+      assert.match(
+        help.stdout,
+        /run create --owner <owner> --repo <repo> \(--issue <n> \| --branch <branch>\) --execution-profile <routine\|standard\|complex\|critical>/,
+      );
+      assert.match(help.stdout, /New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value/);
+
+      const create = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--execution-profile', 'standard']);
       const id = /Created run ([a-f0-9-]+)/.exec(create.stdout)?.[1];
       assert.ok(id, `expected a run id in output: ${create.stdout}`);
       assert.match(create.stdout, /"state": "READY"/);
+      assert.match(create.stdout, /"profile": "standard"/);
 
       // Supplying both --issue and --branch is rejected.
-      const both = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--branch', 'main']);
+      const both = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--branch', 'main', '--execution-profile', 'standard']);
       assert.equal(both.status, 1);
       assert.match(both.stderr, /error: run create requires exactly one of/);
 

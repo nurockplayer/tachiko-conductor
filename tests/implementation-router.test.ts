@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import type { AgentResult } from '../src/domain/types.js';
+import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { TARGET, successResult } from './helpers.js';
 
 class RecordingAgent implements ImplementationAgent {
@@ -71,5 +72,29 @@ describe('ImplementationAgentRegistry', () => {
     assert.equal(result.exitStatus, 'failure');
     assert.deepEqual(result.executor, executor);
     assert.match(result.diagnostics?.join('\n') ?? '', /EXECUTOR_PROVIDER_UNAVAILABLE/);
+  });
+
+  it('constructs the selected provider with the persisted resolved execution snapshot', async () => {
+    const codex = new RecordingAgent(successResult('b'.repeat(40)));
+    let constructedWith: ResolvedExecutionConfiguration | undefined;
+    const execution: ResolvedExecutionConfiguration = {
+      profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', model: 'configured-model',
+      reasoningEffort: 'medium', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'on-request',
+    };
+    const registry = new ImplementationAgentRegistry({
+      defaultProvider: 'claude-code',
+      providers: {
+        'claude-code': () => new RecordingAgent(successResult('a'.repeat(40))),
+        'codex-cli': (resolved) => {
+          constructedWith = resolved;
+          return codex;
+        },
+      },
+    });
+
+    await registry.run({ target: TARGET, baseSha: 'base', execution });
+
+    assert.deepEqual(constructedWith, execution);
+    assert.deepEqual(codex.requests[0]?.execution, execution);
   });
 });

@@ -173,6 +173,39 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.agentResult?.durationMs, 125);
   });
 
+  it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {
+    const { dir } = tempStore();
+    const execution = {
+      profile: 'standard' as const, revision: 'profiles-v1', executor: 'codex-cli', model: 'configured-model',
+      reasoningEffort: 'medium' as const, timeoutMs: 125_000, sandboxMode: 'workspace-write' as const, approvalPolicy: 'on-request' as const,
+    };
+    const first = new JsonFileStore({ dir });
+    first.create({ ...newRun('profile-run'), execution });
+
+    assert.deepEqual(new JsonFileStore({ dir }).read('profile-run')?.execution, execution);
+  });
+
+  it('persists a non-empty dispatch claim identity across restart', () => {
+    const { dir } = tempStore();
+    new JsonFileStore({ dir }).create({ ...newRun('dispatch-run'), dispatchClaimId: 'claim-1' });
+    assert.equal(new JsonFileStore({ dir }).read('dispatch-run')?.dispatchClaimId, 'claim-1');
+    writeFileSync(path.join(dir, 'blank-claim.json'), JSON.stringify({ ...newRun('blank-claim'), dispatchClaimId: '  ' }), 'utf8');
+    assert.throws(() => new JsonFileStore({ dir }).read('blank-claim'), /corrupt or incompatible/);
+  });
+
+  it('rejects a persisted execution snapshot whose timeout exceeds the process runner limit', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad-timeout.json'),
+      JSON.stringify({
+        ...newRun('bad-timeout'),
+        execution: { profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 2_147_483_648 },
+      }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad-timeout'), /corrupt or incompatible/);
+  });
+
   it('round-trips compact exact-HEAD validation provenance through a fresh store instance', () => {
     const { dir } = tempStore();
     const first = new JsonFileStore({ dir });

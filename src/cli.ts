@@ -35,6 +35,12 @@ import {
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
 import {
+  assertExecutionSupportedByProvider,
+  parseExecutionProfileConfiguration,
+  resolveExecutionProfile,
+  type ResolvedExecutionConfiguration,
+} from './execution-profiles.js';
+import {
   CANCEL_RUN_DECISION,
   LIVE_HEAD_SYNC_DECISION,
   RECOVER_LEGACY_PULL_REQUEST_DECISION,
@@ -60,6 +66,11 @@ import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
+import { resolveDispatchConfiguration } from './dispatch/config.js';
+import { dispatchOnceCommand } from './dispatch/command.js';
+import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
+import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
+import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -70,13 +81,15 @@ import {
 const USAGE = `Tachiko Conductor — local orchestration core.
 
 Usage:
-  tachiko run owner/repo#123 [--browser-profile <profile>]
+  tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> [--browser-profile <profile>]
   tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
-  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>)
+  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical>
   tachiko run show <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
   tachiko run projections rebuild
+  tachiko dispatch once
+  tachiko dispatch launchd render --program <absolute-wrapper> --working-directory <absolute-path> [--minute <0-59>]
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
@@ -103,6 +116,8 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
 Operational projections are secret-free sidecars under
 $TACHIKO_DATA_DIR/.operational/v1; rebuild them only from validated persisted runs.
+New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
+the selected --execution-profile is persisted with the run.
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
 in the foreground; use status/stop from another terminal.
@@ -117,6 +132,35 @@ export type CodexExecutionConfig = Pick<
   CodexCliAdapterOptions,
   'model' | 'reasoningEffort' | 'sandboxMode' | 'approvalPolicy' | 'timeoutMs'
 >;
+
+/** Resolve the explicit Steward-selected profile from one revisioned env config. */
+export function resolveSelectedExecutionProfile(
+  selected: string,
+  env: NodeJS.ProcessEnv = process.env,
+): ResolvedExecutionConfiguration {
+  const raw = env.TACHIKO_EXECUTION_PROFILE_CONFIG;
+  if (raw === undefined) throw new Error('TACHIKO_EXECUTION_PROFILE_CONFIG is required when creating a new run.');
+  const execution = resolveExecutionProfile(
+    parseExecutionProfileConfiguration(raw),
+    selected,
+    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER],
+  );
+  assertExecutionSupportedByProvider(execution);
+  return execution;
+}
+
+/** Keep the bootstrap heartbeat's settled signal as the final stdout line. */
+export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOnceCommand>>): void {
+  console.log(JSON.stringify(result, null, 2));
+  const settled = result.outcome === 'no_eligible_work' ||
+    (result.outcome === 'existing_claim' && ['merge_ready', 'needs_human', 'failed'].includes(result.claim.state)) ||
+    (result.outcome === 'dispatched' && ['MERGE_READY', 'MERGED', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY', 'FAILED'].includes(result.execution.state));
+  if (settled) console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
+}
+
+function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(os.homedir(), '.tachiko-conductor', 'dispatch', 'once.lock');
+}
 
 /** Provider selection is external to adapters; existing installs remain on Claude by default. */
 export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
@@ -531,14 +575,20 @@ function targetsEqual(a: Target, b: Target): boolean {
   return (b as RepositoryTarget).branch === (a as RepositoryTarget).branch;
 }
 
-/** Find a persisted run whose target matches exactly, if any. */
+/** Find an active persisted run whose target matches exactly, if any. */
 export function findRunByTarget(store: RunStore, target: Target): Run | null {
-  return store.list().find((run) => targetsEqual(run.target, target)) ?? null;
+  return store.list().find((run) =>
+    targetsEqual(run.target, target) && run.state !== 'MERGED' && run.state !== 'FAILED',
+  ) ?? null;
 }
 
 export interface WorkflowCommandOptions {
   readonly maxReviewAttempts?: number;
   readonly now?: () => string;
+  /** Required for a newly-created production issue run; persisted runs retain their own snapshot. */
+  readonly execution?: ResolvedExecutionConfiguration;
+  /** Immutable queue-claim identity when this run is created by dispatch once. */
+  readonly dispatchClaimId?: string;
 }
 
 /**
@@ -552,10 +602,17 @@ export async function runIssueCommand(
   options: WorkflowCommandOptions = {},
 ): Promise<WorkflowOutcome> {
   const target = parseIssueRef(ref);
-  let run = findRunByTarget(deps.store, target);
+  let run = deps.store.list().find((candidate) =>
+    targetsEqual(candidate.target, target) && candidate.state !== 'MERGED' && candidate.state !== 'FAILED',
+  ) ?? null;
+  if (options.dispatchClaimId !== undefined && run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
+    throw new Error(`Active durable run "${run.id}" is not bound to dispatch claim "${options.dispatchClaimId}"; refusing ambiguous recovery.`);
+  }
   if (run === null) {
-    run = createRun(target);
+    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId);
     deps.store.create(run);
+  } else if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
+    throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
   }
   return runWorkflow(deps, run.id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
@@ -689,8 +746,8 @@ function buildWorkflowDeps(
   store: RunStore,
   resolveImplementationCapabilities?: ImplementationCapabilityResolver,
   env: NodeJS.ProcessEnv = process.env,
+  transport: GhCliTransport = new GhCliTransport(),
 ): WorkflowDependencies {
-  const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
   const localValidation = resolveLocalValidationConfiguration(env);
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
@@ -727,10 +784,20 @@ function buildWorkflowDeps(
       defaultProvider: resolveImplementationProvider(env),
       legacySessionProvider: CLAUDE_CODE_PROVIDER,
       providers: {
-        [CLAUDE_CODE_PROVIDER]: () => new ClaudeCodeAdapter({ cwd: process.cwd(), github }),
-        [CODEX_CLI_PROVIDER]: () => new CodexCliAdapter({
+        [CLAUDE_CODE_PROVIDER]: (execution) => new ClaudeCodeAdapter({
+          cwd: process.cwd(), github,
+          ...(execution?.model === undefined ? {} : { model: execution.model }),
+          ...(execution === undefined ? {} : { timeoutMs: execution.timeoutMs }),
+        }),
+        [CODEX_CLI_PROVIDER]: (execution) => new CodexCliAdapter({
           cwd: process.cwd(),
-          ...resolveCodexExecutionConfig(env),
+          ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
+            ...(execution.model === undefined ? {} : { model: execution.model }),
+            ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+            ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+            ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+            timeoutMs: execution.timeoutMs,
+          }),
         }),
       },
     }),
@@ -752,7 +819,7 @@ export function runCreateCommand(
   store: RunStore,
   owner: string,
   repo: string,
-  opts: { issue?: number; branch?: string },
+  opts: { issue?: number; branch?: string; execution?: ResolvedExecutionConfiguration },
 ): Run {
   const hasIssue = opts.issue !== undefined;
   const hasBranch = opts.branch !== undefined;
@@ -768,7 +835,7 @@ export function runCreateCommand(
   } else {
     target = { kind: 'repository', owner, repo, branch: opts.branch ?? 'main' };
   }
-  const run = createRun(target);
+  const run = createRun(target, undefined, undefined, opts.execution);
   store.create(run);
   return run;
 }
@@ -806,6 +873,8 @@ export interface RunView {
   target: Target;
   state: WorkflowState;
   headSha: string | null;
+  /** Persisted secret-free execution selection, when this is a profile-backed run. */
+  execution: Run['execution'] | null;
   /** Only an unresolved interrupt is a current interrupt. */
   interrupt: { kind: InterruptKind; reason: string } | null;
   transitions: number;
@@ -823,6 +892,7 @@ export function runShowView(run: Run): RunView {
     target: run.target,
     state: run.state,
     headSha: run.headSha ?? null,
+    execution: run.execution ?? null,
     interrupt: activeInterrupt,
     transitions: run.history.length,
     updatedAt: run.updatedAt,
@@ -984,6 +1054,67 @@ export async function main(argv: string[]): Promise<number> {
     return 1;
   }
 
+  if (command === 'dispatch') {
+    if (subcommand === 'launchd' && rest[0] === 'render') {
+      const { values, positionals } = parseArgs({
+        args: rest.slice(1),
+        options: {
+          program: { type: 'string' },
+          'working-directory': { type: 'string' },
+          minute: { type: 'string' },
+          label: { type: 'string' },
+          'stdout-path': { type: 'string' },
+          'stderr-path': { type: 'string' },
+        },
+      });
+      if (positionals.length > 0 || values.program === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program and --working-directory.');
+      }
+      const minute = values.minute === undefined ? undefined : Number(values.minute);
+      console.log(renderDispatchLaunchdPlist({
+        program: values.program,
+        workingDirectory: values['working-directory'],
+        ...(minute === undefined ? {} : { minute }),
+        ...(values.label === undefined ? {} : { label: values.label }),
+        ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
+        ...(values['stderr-path'] === undefined ? {} : { standardErrorPath: values['stderr-path'] }),
+      }));
+      return 0;
+    }
+    if (subcommand !== 'once' || rest.length > 0) {
+      console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    let lock;
+    try {
+      lock = acquireDispatchInvocationLock({ lockPath: dispatchLockPath() });
+    } catch (error) {
+      if (error instanceof DispatchInvocationLockedError) {
+        console.log(JSON.stringify({ outcome: 'already_running', reason: error.message }));
+        return 0;
+      }
+      throw error;
+    }
+    try {
+      const config = resolveDispatchConfiguration();
+      const transport = new GhCliTransport();
+      const runtime = new GitHubDispatchRuntime(transport, config);
+      const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+      const result = await dispatchOnceCommand(config, {
+        workflow,
+        runtime,
+        resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
+        runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
+        resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
+      });
+      printDispatchResult(result);
+      return 0;
+    } finally {
+      lock.release();
+    }
+  }
+
   if (command !== 'run') {
     console.error(`Unknown command: ${command}\n`);
     console.error(USAGE);
@@ -998,6 +1129,7 @@ export async function main(argv: string[]): Promise<number> {
         repo: { type: 'string' },
         issue: { type: 'string' },
         branch: { type: 'string' },
+        'execution-profile': { type: 'string' },
       },
     });
     const { owner, repo } = values;
@@ -1005,7 +1137,11 @@ export async function main(argv: string[]): Promise<number> {
       throw new Error('run create requires --owner and --repo.');
     }
     const issue = values.issue !== undefined ? parseIssueNumber(values.issue) : undefined;
-    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch });
+    if (values['execution-profile'] === undefined) {
+      throw new Error('run create requires --execution-profile <routine|standard|complex|critical>.');
+    }
+    const execution = resolveSelectedExecutionProfile(values['execution-profile']);
+    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch, execution });
     console.log(`Created run ${run.id} (${run.state}).`);
     printRun(run);
     return 0;
@@ -1081,14 +1217,22 @@ export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: [subcommand, ...rest],
     allowPositionals: true,
-    options: { 'browser-profile': { type: 'string' } },
+    options: { 'browser-profile': { type: 'string' }, 'execution-profile': { type: 'string' } },
   });
   const [ref, extra] = positionals;
   if (ref === undefined || extra !== undefined) {
     throw new Error('run requires exactly one owner/repo#123 reference.');
   }
   const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref);
+  const target = parseIssueRef(ref);
+  const existing = findRunByTarget(store, target);
+  if (existing === null && values['execution-profile'] === undefined) {
+    throw new Error('run owner/repo#123 requires --execution-profile <routine|standard|complex|critical> for a new run.');
+  }
+  const execution = values['execution-profile'] === undefined
+    ? undefined
+    : resolveSelectedExecutionProfile(values['execution-profile']);
+  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution });
   printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }

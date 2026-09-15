@@ -7,6 +7,8 @@
  * workflow core only ever sees plain data.
  */
 
+import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;
 
@@ -230,7 +232,11 @@ export interface Run {
   readonly state: WorkflowState;
   readonly createdAt: string;
   readonly updatedAt: string;
+  /** Immutable dispatch claim that created this Run, when it originated from the v0 queue. */
+  readonly dispatchClaimId?: string;
   readonly history: readonly TransitionRecord[];
+  /** Steward-selected, immutable secret-free executor snapshot for this run. */
+  readonly execution?: ResolvedExecutionConfiguration;
   /** While paused in WAITING_DEPENDENCY / NEEDS_HUMAN, the state to resume to. */
   readonly interruptedFrom?: WorkflowState;
   readonly interrupt?: Interrupt;

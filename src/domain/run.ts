@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 
+import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { Run, Target } from './types.js';
 
 /**
@@ -10,6 +11,8 @@ export function createRun(
   target: Target,
   now: string = new Date().toISOString(),
   id: string = randomUUID(),
+  execution?: ResolvedExecutionConfiguration,
+  dispatchClaimId?: string,
 ): Run {
   return {
     id,
@@ -18,5 +21,7 @@ export function createRun(
     createdAt: now,
     updatedAt: now,
     history: [],
+    ...(execution === undefined ? {} : { execution }),
+    ...(dispatchClaimId === undefined ? {} : { dispatchClaimId }),
   };
 }
