@@ -35,6 +35,7 @@ import {
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
 import {
+  assertExecutionSupportedByProvider,
   parseExecutionProfileConfiguration,
   resolveExecutionProfile,
   type ResolvedExecutionConfiguration,
@@ -127,11 +128,13 @@ export function resolveSelectedExecutionProfile(
 ): ResolvedExecutionConfiguration {
   const raw = env.TACHIKO_EXECUTION_PROFILE_CONFIG;
   if (raw === undefined) throw new Error('TACHIKO_EXECUTION_PROFILE_CONFIG is required when creating a new issue run.');
-  return resolveExecutionProfile(
+  const execution = resolveExecutionProfile(
     parseExecutionProfileConfiguration(raw),
     selected,
     [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER],
   );
+  assertExecutionSupportedByProvider(execution);
+  return execution;
 }
 
 /** Provider selection is external to adapters; existing installs remain on Claude by default. */

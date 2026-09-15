@@ -29,6 +29,9 @@ export interface ExecutionProfileConfiguration {
 const REASONING_EFFORTS: readonly ExecutionReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const SANDBOX_MODES: readonly ExecutionSandboxMode[] = ['read-only', 'workspace-write', 'danger-full-access'];
 const APPROVAL_POLICIES: readonly ExecutionApprovalPolicy[] = ['untrusted', 'on-request', 'never'];
+const PROFILE_KEYS = ['executor', 'timeoutMs', 'model', 'reasoningEffort', 'sandboxMode', 'approvalPolicy'] as const;
+const CONFIGURATION_KEYS = ['revision', 'profiles'] as const;
+const MAX_PROCESS_TIMEOUT_MS = 2_147_483_647;
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
@@ -44,9 +47,12 @@ function profileName(value: string): value is ExecutionProfileName {
 
 function parseProfile(name: ExecutionProfileName, value: unknown): Omit<ResolvedExecutionConfiguration, 'profile' | 'revision'> {
   if (!isRecord(value)) throw new Error(`Execution profile "${name}" must be an object.`);
+  if (Object.keys(value).some((key) => !(PROFILE_KEYS as readonly string[]).includes(key))) {
+    throw new Error(`Execution profile "${name}" contains an unsupported setting.`);
+  }
   if (!nonEmptyString(value.executor)) throw new Error(`Execution profile "${name}".executor must be a non-empty string.`);
-  if (!Number.isSafeInteger(value.timeoutMs) || (value.timeoutMs as number) < 1) {
-    throw new Error(`Execution profile "${name}".timeoutMs must be a positive safe integer.`);
+  if (!Number.isSafeInteger(value.timeoutMs) || (value.timeoutMs as number) < 1 || (value.timeoutMs as number) > MAX_PROCESS_TIMEOUT_MS) {
+    throw new Error(`Execution profile "${name}".timeoutMs must be a positive integer no greater than ${MAX_PROCESS_TIMEOUT_MS}.`);
   }
   if (value.model !== undefined && !nonEmptyString(value.model)) {
     throw new Error(`Execution profile "${name}".model must be a non-empty string when supplied.`);
@@ -78,7 +84,8 @@ export function parseExecutionProfileConfiguration(raw: string): ExecutionProfil
   } catch {
     throw new Error('TACHIKO_EXECUTION_PROFILE_CONFIG must be valid JSON.');
   }
-  if (!isRecord(value) || !nonEmptyString(value.revision) || !isRecord(value.profiles)) {
+  if (!isRecord(value) || !nonEmptyString(value.revision) || !isRecord(value.profiles) ||
+    Object.keys(value).some((key) => !(CONFIGURATION_KEYS as readonly string[]).includes(key))) {
     throw new Error('TACHIKO_EXECUTION_PROFILE_CONFIG must contain non-empty revision and profiles object.');
   }
   const profilesInput = value.profiles;

@@ -55,5 +55,17 @@ describe('execution profiles', () => {
       }),
       /unsupported by executor/,
     );
+    assert.throws(
+      () => parseExecutionProfileConfiguration(CONFIG.replace('reasoningEffort', 'reasoningEfort')),
+      /unsupported setting/,
+    );
+    assert.throws(
+      () => parseExecutionProfileConfiguration(CONFIG.replace('timeoutMs', 'unknownTimeout')),
+      /unsupported setting/,
+    );
+    assert.throws(
+      () => parseExecutionProfileConfiguration(CONFIG.replace('"timeoutMs":60000', '"timeoutMs":2147483648')),
+      /no greater than 2147483647/,
+    );
   });
 });

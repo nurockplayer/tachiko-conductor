@@ -190,6 +190,18 @@ describe('CLI command layer', () => {
       profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 2, reasoningEffort: 'medium',
     });
     assert.throws(() => resolveSelectedExecutionProfile('standard', {}), /TACHIKO_EXECUTION_PROFILE_CONFIG is required/);
+    assert.throws(
+      () => resolveSelectedExecutionProfile('critical', {
+        TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify({
+          ...profiles,
+          profiles: {
+            ...profiles.profiles,
+            critical: { executor: 'claude-code', timeoutMs: 4, reasoningEffort: 'high' },
+          },
+        }),
+      }),
+      /unsupported by executor/,
+    );
   });
 
   it('parses issue numbers strictly without partial parses or unsafe integers', () => {
