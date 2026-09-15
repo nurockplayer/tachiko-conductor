@@ -24,13 +24,19 @@ class FakeRunner implements ProcessRunner {
 
 const HEAD = '9d9cc7d210960f3c81d7d7498a36f65c67b9f4a9';
 const result = (stdout = '', stderr = '', exitCode = 0): ProcessResult => ({ stdout, stderr, exitCode });
+const REQUEST = { target: TARGET, baseSha: 'base', workspacePath: '/prepared', branch: 'worker-router-test' } as const;
 
 describe('WorkerRouterAdapter', () => {
-  it('sends a bounded live-authority task to the prepared worktree and verifies HEAD', async () => {
-    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker\nimplementation details'), result(HEAD)]);
+  it('runs in the prepared worktree, verifies HEAD, and publishes that exact commit', async () => {
+    const runner = new FakeRunner([
+      result('', '[worker-router] -> luna-worker\nimplementation details'),
+      result(HEAD),
+      result('To origin\n'),
+    ]);
     let before = 0; let after = 0;
     const response = await new WorkerRouterAdapter({ runner, executable: '/router', timeoutMs: 9000 }).run({
-      target: TARGET, baseSha: 'base', workspacePath: '/prepared', authority: 'live-target',
+      ...REQUEST,
+      authority: 'live-target',
       supplementalInstructions: 'Focus on the acceptance tests.',
       workspaceGuard: { assertValid: (phase) => { if (phase === 'after-execution') after++; else before++; } },
     });
@@ -38,19 +44,30 @@ describe('WorkerRouterAdapter', () => {
     assert.equal(response.headSha, HEAD);
     assert.match(runner.calls[0]?.options.stdin ?? '', /live GitHub target and repository-local instructions/);
     assert.match(runner.calls[0]?.options.stdin ?? '', /Focus on the acceptance tests/);
-    assert.match(runner.calls[0]?.options.stdin ?? '', /commit all in-scope changes and push the current branch before reporting success/i);
+    assert.match(runner.calls[0]?.options.stdin ?? '', /commit all in-scope changes before reporting success/i);
+    assert.match(runner.calls[0]?.options.stdin ?? '', /Do not push; Conductor publishes the exact committed HEAD/i);
     assert.equal(runner.calls[0]?.file, '/router');
     assert.equal(runner.calls[0]?.options.cwd, '/prepared');
+    assert.deepEqual(runner.calls[2]?.args, ['push', '--porcelain', 'origin', `${HEAD}:refs/heads/worker-router-test`]);
     assert.match(response.diagnostics?.join('\n') ?? '', /luna-worker/);
     assert.equal(before, 1); assert.equal(after, 1);
   });
 
+  it('requires an explicit prepared workspace and branch instead of using ambient cwd', async () => {
+    const runner = new FakeRunner([]);
+    const missingWorkspace = await new WorkerRouterAdapter({ runner, cwd: '/ambient' }).run({ target: TARGET, baseSha: 'base', branch: 'branch' });
+    const missingBranch = await new WorkerRouterAdapter({ runner, cwd: '/ambient' }).run({ target: TARGET, baseSha: 'base', workspacePath: '/prepared' });
+    assert.match(missingWorkspace.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.WORKSPACE_REQUIRED));
+    assert.match(missingBranch.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.WORKSPACE_REQUIRED));
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('uses the configured worker-router executable without making it workflow authority', async () => {
-    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD)]);
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result()]);
     const response = await new WorkerRouterAdapter({
       runner,
       env: { [WORKER_ROUTER_EXECUTABLE_ENV]: '/custom/worker-router' },
-    }).run({ target: TARGET, baseSha: 'base' });
+    }).run(REQUEST);
     assert.equal(response.exitStatus, 'success');
     assert.equal(runner.calls[0]?.file, '/custom/worker-router');
     assert.throws(
@@ -61,7 +78,7 @@ describe('WorkerRouterAdapter', () => {
 
   it('captures DeepSeek provenance and bounds worker output on failure', async () => {
     const runner = new FakeRunner([result('', `[worker-router] -> deepseek-worker\n${'x'.repeat(5000)}`, 7)]);
-    const response = await new WorkerRouterAdapter({ runner }).run({ target: TARGET, baseSha: 'base' });
+    const response = await new WorkerRouterAdapter({ runner }).run(REQUEST);
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.join('\n') ?? '', /deepseek-worker/);
     assert.ok((response.diagnostics?.join('\n').length ?? 0) < 5000);
@@ -70,20 +87,20 @@ describe('WorkerRouterAdapter', () => {
   it('returns cancellation when the request is already aborted', async () => {
     const controller = new AbortController();
     controller.abort();
-    const response = await new WorkerRouterAdapter({ runner: new FakeRunner([]) }).run({ target: TARGET, baseSha: 'base', signal: controller.signal });
+    const response = await new WorkerRouterAdapter({ runner: new FakeRunner([]) }).run({ ...REQUEST, signal: controller.signal });
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.CANCELLED));
   });
 
   it('maps an abort thrown by the worker process to cancellation', async () => {
-    const response = await new WorkerRouterAdapter({ runner: new FakeRunner([Object.assign(new Error('aborted'), { code: 'ABORT_ERR' })]) }).run({ target: TARGET, baseSha: 'base' });
+    const response = await new WorkerRouterAdapter({ runner: new FakeRunner([Object.assign(new Error('aborted'), { code: 'ABORT_ERR' })]) }).run(REQUEST);
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.CANCELLED));
   });
 
   it('fails when the completed worker HEAD cannot be read', async () => {
     const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result('not-a-sha\n', 'fatal: not a git repository', 128)]);
-    const response = await new WorkerRouterAdapter({ runner }).run({ target: TARGET, baseSha: 'base' });
+    const response = await new WorkerRouterAdapter({ runner }).run(REQUEST);
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED));
   });
@@ -97,9 +114,18 @@ describe('WorkerRouterAdapter', () => {
       if (args.join(' ') === 'rev-parse HEAD') controller.abort();
       return value;
     };
-    const response = await new WorkerRouterAdapter({ runner }).run({ target: TARGET, baseSha: 'base', signal: controller.signal });
+    const response = await new WorkerRouterAdapter({ runner }).run({ ...REQUEST, signal: controller.signal });
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.CANCELLED));
+    assert.equal(runner.calls.length, 2);
+  });
+
+  it('fails closed when deterministic publication fails', async () => {
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result('', 'rejected', 1)]);
+    const response = await new WorkerRouterAdapter({ runner }).run(REQUEST);
+    assert.equal(response.exitStatus, 'failure');
+    assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED));
+    assert.match(response.diagnostics?.join('\n') ?? '', /rejected/);
   });
 
   for (const [name, error, code] of [
@@ -107,25 +133,27 @@ describe('WorkerRouterAdapter', () => {
     ['timeout', Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }), WORKER_ROUTER_ERROR_CODE.TIMEOUT],
   ] as const) {
     it(`returns typed failure for ${name}`, async () => {
-      const response = await new WorkerRouterAdapter({ runner: new FakeRunner([error]) }).run({ target: TARGET, baseSha: 'base' });
+      const response = await new WorkerRouterAdapter({ runner: new FakeRunner([error]) }).run(REQUEST);
       assert.match(response.diagnostics?.[0] ?? '', new RegExp(code));
     });
   }
 
   it('does not resume a model session on stateless re-entry', async () => {
-    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD)]);
+    const runner = new FakeRunner([result('', '[worker-router] -> luna-worker'), result(HEAD), result()]);
     const response = await new WorkerRouterAdapter({ runner }).run({
-      target: TARGET, baseSha: 'base', executor: { provider: 'worker-router', sessionId: 'ignored' },
+      ...REQUEST,
+      executor: { provider: 'worker-router', sessionId: 'ignored' },
     });
     assert.equal(response.exitStatus, 'success');
-    assert.equal(runner.calls.length, 2);
+    assert.equal(runner.calls.length, 3);
     assert.equal(runner.calls[0]?.options.stdin?.includes('ignored'), false);
   });
 
   it('fails before spawn when the workspace guard rejects', async () => {
     const runner = new FakeRunner([]);
     await assert.rejects(() => new WorkerRouterAdapter({ runner }).run({
-      target: TARGET, baseSha: 'base', workspaceGuard: { assertValid: () => { throw new Error('changed'); } },
+      ...REQUEST,
+      workspaceGuard: { assertValid: () => { throw new Error('changed'); } },
     }), WorkspaceGuardFailure);
     assert.equal(runner.calls.length, 0);
   });

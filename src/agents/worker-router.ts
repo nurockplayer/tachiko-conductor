@@ -15,7 +15,9 @@ export const WORKER_ROUTER_ERROR_CODE = {
   NOT_FOUND: 'WORKER_ROUTER_NOT_FOUND',
   EXEC_FAILURE: 'WORKER_ROUTER_EXEC_FAILURE',
   CANCELLED: 'WORKER_ROUTER_CANCELLED',
+  WORKSPACE_REQUIRED: 'WORKER_ROUTER_WORKSPACE_REQUIRED',
   HEAD_READ_FAILED: 'WORKER_ROUTER_HEAD_READ_FAILED',
+  PUBLISH_FAILED: 'WORKER_ROUTER_PUBLISH_FAILED',
 } as const;
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -51,7 +53,15 @@ export class WorkerRouterAdapter implements ImplementationAgent {
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', 0);
-    const cwd = request.workspacePath ?? this.cwd;
+    if (request.workspacePath === undefined || request.workspacePath.trim() === '' || request.branch === undefined || request.branch.trim() === '') {
+      return failure(
+        WORKER_ROUTER_ERROR_CODE.WORKSPACE_REQUIRED,
+        `Worker router requires an explicit prepared workspacePath and branch; ambient cwd ${this.cwd} is never used for implementation.`,
+        0,
+      );
+    }
+    const cwd = request.workspacePath;
+    const branch = request.branch;
     const task = buildTask(request);
     await assertWorkspaceGuard(request.workspaceGuard);
     const startedAt = Date.now();
@@ -66,16 +76,30 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       if (code === 'ENOENT') return failure(WORKER_ROUTER_ERROR_CODE.NOT_FOUND, `Worker router executable "${this.executable}" was not found.`, durationMs);
       return failure(WORKER_ROUTER_ERROR_CODE.EXEC_FAILURE, `Failed to run worker router: ${errorMessage(error)}`, durationMs);
     }
-    const durationMs = elapsed(startedAt);
     const provenance = workerProvenance(result.stderr);
     const diagnostics = boundedDiagnostics(result.stderr, result.stdout, provenance);
-    if (result.exitCode !== 0) return { ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics] };
-    if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', durationMs);
+    if (result.exitCode !== 0) {
+      const durationMs = elapsed(startedAt);
+      return { ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics] };
+    }
+    if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
     await assertWorkspaceGuard(request.workspaceGuard, 'after-execution');
     const head = await this.readHead(request.signal, cwd);
-    if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', durationMs);
-    if (head === null) return { ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics] };
-    return { exitStatus: 'success', summary: 'Worker router completed implementation.', headSha: head, ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs };
+    if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
+    if (head === null) {
+      const durationMs = elapsed(startedAt);
+      return { ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics] };
+    }
+    const published = await this.publishHead(request.signal, cwd, head, branch);
+    if (!published.ok) {
+      const durationMs = elapsed(startedAt);
+      if (published.cancelled) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router publication was cancelled.', durationMs);
+      return {
+        ...failure(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED, `Worker router committed ${head}, but Conductor could not publish it to origin/${branch}.`, durationMs),
+        diagnostics: [`${WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED}: ${published.detail}`, ...diagnostics, ...published.diagnostics],
+      };
+    }
+    return { exitStatus: 'success', summary: 'Worker router completed implementation and Conductor published the exact committed HEAD.', headSha: head, ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
   }
 
   private options(signal: AbortSignal | undefined, cwd: string, stdin: string): ProcessRunOptions {
@@ -88,6 +112,39 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       const sha = result.stdout.trim();
       return result.exitCode === 0 && FULL_SHA.test(sha) ? sha : null;
     } catch { return null; }
+  }
+
+  private async publishHead(
+    signal: AbortSignal | undefined,
+    cwd: string,
+    head: string,
+    branch: string,
+  ): Promise<{ readonly ok: true } | { readonly ok: false; readonly cancelled: boolean; readonly detail: string; readonly diagnostics: string[] }> {
+    try {
+      const result = await this.runner.run(
+        'git',
+        ['push', '--porcelain', 'origin', `${head}:refs/heads/${branch}`],
+        this.options(signal, cwd, ''),
+      );
+      if (result.exitCode === 0) return { ok: true };
+      return {
+        ok: false,
+        cancelled: false,
+        detail: `git push exited with status ${result.exitCode}.`,
+        diagnostics: boundedDiagnostics(result.stderr, result.stdout, undefined),
+      };
+    } catch (error) {
+      const code = errorCode(error);
+      if (isAborted(signal) || code === 'ABORT_ERR') {
+        return { ok: false, cancelled: true, detail: 'git push was cancelled.', diagnostics: [] };
+      }
+      return {
+        ok: false,
+        cancelled: false,
+        detail: `git push failed: ${errorMessage(error)}`,
+        diagnostics: [],
+      };
+    }
   }
 }
 
@@ -103,7 +160,8 @@ function buildTask(request: ImplementationRequest): string {
     authority,
     'Do not expand scope.',
     'Run focused/repository-required validation.',
-    'Commit all in-scope changes and push the current branch before reporting success; report blockers if either operation cannot be completed.',
+    'Commit all in-scope changes before reporting success.',
+    'Do not push; Conductor publishes the exact committed HEAD after workspace verification.',
     'Return blockers instead of guessing.',
     request.authority === 'live-target' ? request.supplementalInstructions : request.instructions,
   ].filter((line): line is string => line !== undefined && line !== '').join('\n') + '\n';
