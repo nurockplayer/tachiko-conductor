@@ -11,6 +11,7 @@ import {
   CodexCliAdapter,
   type CodexCliAdapterOptions,
 } from './agents/codex-cli.js';
+import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter } from './agents/codex-app-server.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
@@ -786,8 +787,42 @@ function buildWorkflowDeps(
           ...(execution?.model === undefined ? {} : { model: execution.model }),
           ...(execution === undefined ? {} : { timeoutMs: execution.timeoutMs }),
         }),
-        [CODEX_CLI_PROVIDER]: (execution) => new CodexCliAdapter({
+        [CODEX_CLI_PROVIDER]: (execution) => new CodexAppServerAdapter({
           cwd: process.cwd(),
+          fallback: new CodexCliAdapter({
+            cwd: process.cwd(),
+            ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
+              ...(execution.model === undefined ? {} : { model: execution.model }),
+              ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+              ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+              ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+              timeoutMs: execution.timeoutMs,
+            }),
+          }),
+          ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
+            ...(execution.model === undefined ? {} : { model: execution.model }),
+            ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+            ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+            ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+            timeoutMs: execution.timeoutMs,
+          }),
+        }),
+        // The configured compatible provider first attempts the local stdio
+        // App Server; only an unavailable/failed handshake falls back to the
+        // unchanged bounded CLI adapter. Durable App Server identities route
+        // back here through their own provider key after a restart.
+        [CODEX_APP_SERVER_PROVIDER]: (execution) => new CodexAppServerAdapter({
+          cwd: process.cwd(),
+          fallback: new CodexCliAdapter({
+            cwd: process.cwd(),
+            ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
+              ...(execution.model === undefined ? {} : { model: execution.model }),
+              ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+              ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+              ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+              timeoutMs: execution.timeoutMs,
+            }),
+          }),
           ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
             ...(execution.model === undefined ? {} : { model: execution.model }),
             ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),

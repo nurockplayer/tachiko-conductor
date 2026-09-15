@@ -71,7 +71,8 @@ function isExecutorIdentity(value: unknown): boolean {
     typeof executor.provider === 'string' &&
     executor.provider.trim().length > 0 &&
     typeof executor.sessionId === 'string' &&
-    executor.sessionId.trim().length > 0
+    executor.sessionId.trim().length > 0 &&
+    (executor.generation === undefined || (typeof executor.generation === 'string' && executor.generation.trim().length > 0))
   );
 }
 

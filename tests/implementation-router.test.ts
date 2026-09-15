@@ -97,4 +97,23 @@ describe('ImplementationAgentRegistry', () => {
     assert.deepEqual(constructedWith, execution);
     assert.deepEqual(codex.requests[0]?.execution, execution);
   });
+
+  it('reconstructs a persisted App Server thread through the selected compatible Codex CLI profile', async () => {
+    const appServer = new RecordingAgent(successResult('c'.repeat(40)));
+    const registry = new ImplementationAgentRegistry({
+      defaultProvider: 'claude-code',
+      providers: {
+        'claude-code': () => new RecordingAgent(successResult('a'.repeat(40))),
+        'codex-cli': () => new RecordingAgent(successResult('b'.repeat(40))),
+        'codex-app-server': () => appServer,
+      },
+    });
+    const execution: ResolvedExecutionConfiguration = { profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 10_000 };
+    const executor = { provider: 'codex-app-server', sessionId: 'thread-42', generation: 'run-42' } as const;
+
+    await registry.run({ target: TARGET, baseSha: 'base', executor, execution });
+
+    assert.equal(appServer.requests.length, 1);
+    assert.deepEqual(appServer.requests[0]?.executor, executor);
+  });
 });

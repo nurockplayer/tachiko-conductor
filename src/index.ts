@@ -10,6 +10,7 @@ export * from './adapters/reviewer.js';
 export * from './adapters/validation.js';
 export * from './agents/claude-code.js';
 export * from './agents/codex-cli.js';
+export * from './agents/codex-app-server.js';
 export * from './agents/implementation-router.js';
 export * from './reviewers/deepseek.js';
 export * from './reviewers/loop.js';
