@@ -106,7 +106,7 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 {"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
-New issue runs also require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
+New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
 the selected --execution-profile is persisted with the run.
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
@@ -129,7 +129,7 @@ export function resolveSelectedExecutionProfile(
   env: NodeJS.ProcessEnv = process.env,
 ): ResolvedExecutionConfiguration {
   const raw = env.TACHIKO_EXECUTION_PROFILE_CONFIG;
-  if (raw === undefined) throw new Error('TACHIKO_EXECUTION_PROFILE_CONFIG is required when creating a new issue run.');
+  if (raw === undefined) throw new Error('TACHIKO_EXECUTION_PROFILE_CONFIG is required when creating a new run.');
   const execution = resolveExecutionProfile(
     parseExecutionProfileConfiguration(raw),
     selected,

@@ -771,7 +771,7 @@ describe('CLI end-to-end across processes', () => {
         help.stdout,
         /run create --owner <owner> --repo <repo> \(--issue <n> \| --branch <branch>\) --execution-profile <routine\|standard\|complex\|critical>/,
       );
-      assert.match(help.stdout, /New issue runs also require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value/);
+      assert.match(help.stdout, /New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value/);
 
       const create = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--execution-profile', 'standard']);
       const id = /Created run ([a-f0-9-]+)/.exec(create.stdout)?.[1];
