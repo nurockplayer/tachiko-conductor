@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -19,6 +19,34 @@ describe('dispatch scheduler boundary', () => {
       writeFileSync(lockPath, JSON.stringify({ nonce: 'crashed', pid: 41 }));
       const recovered = acquireDispatchInvocationLock({ lockPath, nonce: () => 'recovered', isProcessAlive: () => false });
       recovered.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('does not let a stale observer remove a replacement lock acquired during takeover', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-race-'));
+    const lockPath = path.join(directory, 'once.lock');
+    let replacement: ReturnType<typeof acquireDispatchInvocationLock> | undefined;
+    try {
+      writeFileSync(lockPath, JSON.stringify({ nonce: 'crashed', pid: 41 }));
+      assert.throws(
+        () => acquireDispatchInvocationLock({
+          lockPath,
+          nonce: () => 'stale-observer',
+          isProcessAlive: () => false,
+          beforeStaleTakeover: () => {
+            replacement = acquireDispatchInvocationLock({
+              lockPath,
+              nonce: () => 'replacement',
+              isProcessAlive: () => false,
+            });
+          },
+        }),
+        DispatchInvocationLockedError,
+      );
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), { nonce: 'replacement', pid: process.pid });
+      replacement?.release();
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
