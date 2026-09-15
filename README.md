@@ -168,6 +168,46 @@ same claimed Run; an expired lease is never permission to create a second one.
 This Issue deliberately does not provide a recurring scheduler or same-host
 process lock; those remain #19's boundary.
 
+## Scheduled dispatch (macOS v0)
+
+`tachiko dispatch once` now takes a small local lock before reading GitHub. It
+complements (but never replaces) the GitHub claim lease: a concurrent same-host
+invocation returns `{ "outcome": "already_running" }` without changing GitHub
+or starting a second executor. The default lock lives outside the repository at
+`~/.tachiko-conductor/dispatch/once.lock`; override it only with an absolute
+`TACHIKO_DISPATCH_LOCK_PATH`. A malformed or live lock fails closed; a lock for
+a provably absent PID is retried once.
+
+For macOS, use `launchd` as the external hourly scheduler. First create a
+private, absolute-path wrapper that supplies the explicitly selected dispatch,
+execution, validation, and hosted-check configurations, then ends with:
+
+```sh
+exec /absolute/path/to/tachiko dispatch once
+```
+
+Do not put credentials in the generated plist. Render an hourly `HH:25`
+example (or choose a different minute) from the checked-in CLI:
+
+```bash
+pnpm exec tsx src/cli.ts dispatch launchd render \
+  --program '/absolute/path/to/run-dispatch-once.sh' \
+  --working-directory "$PWD" --minute 25 \
+  > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-once.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-once.plist"
+```
+
+Remove it with `launchctl bootout "gui/$(id -u)" <plist-path>` before deleting
+the plist. The generated schedule is deliberately only a wake-up cadence: a
+late wake remains correct, and an active durable claim is resumed before new
+queue work. No launchd installation or real GitHub/Codex invocation occurs in
+CI. An opt-in local smoke requires a disposable control Issue and all normal
+explicit configuration, then uses:
+
+```bash
+TACHIKO_DISPATCH_SMOKE=1 scripts/dispatch-smoke.sh
+```
+
 ## Execution profiles
 
 The Project Steward explicitly selects one coarse profile when creating an

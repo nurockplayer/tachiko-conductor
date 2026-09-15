@@ -69,6 +69,8 @@ import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
 import { resolveDispatchConfiguration } from './dispatch/config.js';
 import { dispatchOnceCommand } from './dispatch/command.js';
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
+import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
+import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -86,6 +88,7 @@ Usage:
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
   tachiko dispatch once
+  tachiko dispatch launchd render --program <absolute-wrapper> --working-directory <absolute-path> [--minute <0-59>]
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
@@ -150,6 +153,10 @@ export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOn
     (result.outcome === 'existing_claim' && ['merge_ready', 'needs_human', 'failed'].includes(result.claim.state)) ||
     (result.outcome === 'dispatched' && ['MERGE_READY', 'MERGED', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY', 'FAILED'].includes(result.execution.state));
   if (settled) console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
+}
+
+function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(os.homedir(), '.tachiko-conductor', 'dispatch', 'once.lock');
 }
 
 /** Provider selection is external to adapters; existing installs remain on Claude by default. */
@@ -1045,24 +1052,64 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
+    if (subcommand === 'launchd' && rest[0] === 'render') {
+      const { values, positionals } = parseArgs({
+        args: rest.slice(1),
+        options: {
+          program: { type: 'string' },
+          'working-directory': { type: 'string' },
+          minute: { type: 'string' },
+          label: { type: 'string' },
+          'stdout-path': { type: 'string' },
+          'stderr-path': { type: 'string' },
+        },
+      });
+      if (positionals.length > 0 || values.program === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program and --working-directory.');
+      }
+      const minute = values.minute === undefined ? undefined : Number(values.minute);
+      console.log(renderDispatchLaunchdPlist({
+        program: values.program,
+        workingDirectory: values['working-directory'],
+        ...(minute === undefined ? {} : { minute }),
+        ...(values.label === undefined ? {} : { label: values.label }),
+        ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
+        ...(values['stderr-path'] === undefined ? {} : { standardErrorPath: values['stderr-path'] }),
+      }));
+      return 0;
+    }
     if (subcommand !== 'once' || rest.length > 0) {
       console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
       console.error(USAGE);
       return 1;
     }
-    const config = resolveDispatchConfiguration();
-    const transport = new GhCliTransport();
-    const runtime = new GitHubDispatchRuntime(transport, config);
-    const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
-    const result = await dispatchOnceCommand(config, {
-      workflow,
-      runtime,
-      resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-      runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
-      resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
-    });
-    printDispatchResult(result);
-    return 0;
+    let lock;
+    try {
+      lock = acquireDispatchInvocationLock({ lockPath: dispatchLockPath() });
+    } catch (error) {
+      if (error instanceof DispatchInvocationLockedError) {
+        console.log(JSON.stringify({ outcome: 'already_running', reason: error.message }));
+        return 0;
+      }
+      throw error;
+    }
+    try {
+      const config = resolveDispatchConfiguration();
+      const transport = new GhCliTransport();
+      const runtime = new GitHubDispatchRuntime(transport, config);
+      const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+      const result = await dispatchOnceCommand(config, {
+        workflow,
+        runtime,
+        resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
+        runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
+        resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
+      });
+      printDispatchResult(result);
+      return 0;
+    } finally {
+      lock.release();
+    }
   }
 
   if (command !== 'run') {
