@@ -157,6 +157,16 @@ describe('CodexAppServerAdapter', () => {
     assert.match(client.prompts[0] ?? '', /TACHIKO_NEEDS_HUMAN:/);
   });
 
+  it('rejects invalid capabilities before opening an App Server child', async () => {
+    const factory = new Factory(new FakeClient());
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, runner: new HeadRunner() });
+    await assert.rejects(
+      () => adapter.run(request({ capabilities: [{ kind: 'mcp-http', name: 'invalid name', endpoint: 'https://browser.example/mcp' }] })),
+      /Invalid MCP capability name/,
+    );
+    assert.equal(factory.opens, 0);
+  });
+
   it('turns a native agent takeover message into the existing typed human boundary', async () => {
     const client = new FakeClient();
     client.waitForTurn = async () => ({ status: 'completed', summary: 'TACHIKO_NEEDS_HUMAN: sign-in required' });

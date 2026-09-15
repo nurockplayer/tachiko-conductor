@@ -130,6 +130,15 @@ export class CodexAppServerAdapter implements ImplementationAgent {
     }
     if (request.signal?.aborted === true) return cancelled(request.executor);
     await assertWorkspaceGuard(request.workspaceGuard);
+    const workspacePath = request.workspacePath ?? this.cwd;
+    // Capability normalization can reject malformed or duplicate runtime input.
+    // Complete it before opening the child process so a rejected request has no
+    // App Server lifecycle to clean up.
+    const threadOptions = {
+      ...this.options,
+      cwd: workspacePath,
+      ...appServerCapabilityConfig(request.capabilities ?? []),
+    };
     let client: CodexAppServerClient;
     try {
       client = await this.clientFactory.open();
@@ -138,18 +147,12 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       return failure(CODEX_APP_SERVER_ERROR_CODE.UNAVAILABLE, message(error), request.executor);
     }
     const startedAt = Date.now();
-    const workspacePath = request.workspacePath ?? this.cwd;
-    const options = {
-      ...this.options,
-      cwd: workspacePath,
-      ...appServerCapabilityConfig(request.capabilities ?? []),
-    };
     let executor: ExecutorIdentity | undefined = request.executor;
     try {
       const prompt = buildPrompt(request);
       let threadId: string;
       if (request.executor === undefined) {
-        threadId = await client.startThread(options);
+        threadId = await client.startThread(threadOptions);
       } else {
         const observation = await client.observeThread(request.executor.sessionId);
         if (observation.threadId !== request.executor.sessionId || observation.status === 'active' || observation.activeTurnId !== undefined) {
@@ -159,7 +162,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
             request.executor,
           );
         }
-        threadId = await client.resumeThread(request.executor.sessionId, options);
+        threadId = await client.resumeThread(request.executor.sessionId, threadOptions);
         if (threadId !== request.executor.sessionId) {
           return failure(CODEX_APP_SERVER_ERROR_CODE.RECONCILIATION_BLOCKED, 'Native resume returned a different thread identity.', request.executor);
         }
