@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { cpSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -34,6 +34,11 @@ function disposableGitWorkspace(): { root: string; source: string; worker: strin
   return { root, source, worker, remote, baseSha };
 }
 
+function canonicalGitPath(cwd: string, args: readonly string[]): string {
+  const raw = execFileSync('git', [...args], { cwd, encoding: 'utf8' }).trim();
+  return realpathSync(path.resolve(cwd, raw));
+}
+
 describe('worker-router smoke', () => {
   it('runs only when explicitly enabled', async (t) => {
     if (process.env.TACHIKO_WORKER_ROUTER_SMOKE !== '1') { t.skip('set TACHIKO_WORKER_ROUTER_SMOKE=1 to use the real local router'); return; }
@@ -42,8 +47,16 @@ describe('worker-router smoke', () => {
     let failure: unknown;
     try {
       const sourceBefore = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace.source, encoding: 'utf8' }).trim();
-      const worktrees = execFileSync('git', ['worktree', 'list', '--porcelain'], { cwd: workspace.source, encoding: 'utf8' });
-      if (!worktrees.includes(`worktree ${workspace.worker}`)) throw new Error('worker workspace is not a linked worktree');
+      const sourceCommon = canonicalGitPath(workspace.source, ['rev-parse', '--git-common-dir']);
+      const workerCommon = canonicalGitPath(workspace.worker, ['rev-parse', '--git-common-dir']);
+      const workerGitDir = canonicalGitPath(workspace.worker, ['rev-parse', '--git-dir']);
+      if (
+        sourceCommon !== workerCommon ||
+        workerGitDir === workerCommon ||
+        !workerGitDir.startsWith(`${workerCommon}${path.sep}worktrees${path.sep}`)
+      ) {
+        throw new Error('worker workspace is not a linked worktree');
+      }
       const result = await new WorkerRouterAdapter().run({
         target: SMOKE_TARGET,
         baseSha: workspace.baseSha,
