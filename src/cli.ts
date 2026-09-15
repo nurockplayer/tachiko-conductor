@@ -66,6 +66,9 @@ import { GhCliTransport } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
+import { resolveDispatchConfiguration } from './dispatch/config.js';
+import { dispatchOnceCommand } from './dispatch/command.js';
+import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -82,6 +85,7 @@ Usage:
   tachiko run show <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
+  tachiko dispatch once
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
@@ -714,8 +718,8 @@ function buildWorkflowDeps(
   store: RunStore,
   resolveImplementationCapabilities?: ImplementationCapabilityResolver,
   env: NodeJS.ProcessEnv = process.env,
+  transport: GhCliTransport = new GhCliTransport(),
 ): WorkflowDependencies {
-  const transport = new GhCliTransport();
   const github = new LiveGitHubAdapter({ transport });
   const localValidation = resolveLocalValidationConfiguration(env);
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
@@ -1020,6 +1024,26 @@ export async function main(argv: string[]): Promise<number> {
     console.error(`Unknown command: github ${subcommand ?? ''}\n`);
     console.error(USAGE);
     return 1;
+  }
+
+  if (command === 'dispatch') {
+    if (subcommand !== 'once' || rest.length > 0) {
+      console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const config = resolveDispatchConfiguration();
+    const transport = new GhCliTransport();
+    const runtime = new GitHubDispatchRuntime(transport, config);
+    const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+    const result = await dispatchOnceCommand(config, {
+      workflow,
+      runtime,
+      resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
+      runIssue: async (ref, execution) => await runIssueCommand(workflow, ref, execution === undefined ? {} : { execution }),
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return 0;
   }
 
   if (command !== 'run') {

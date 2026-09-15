@@ -11,6 +11,11 @@ export interface GitHubApiTransport {
   getRaw?(path: string, accept: string): Promise<string>;
 }
 
+/** Explicit mutation surface used only by machine-owned GitHub comments. */
+export interface GitHubWriteTransport extends GitHubApiTransport {
+  write(path: string, method: 'POST' | 'PATCH', body: Readonly<Record<string, unknown>>): Promise<unknown>;
+}
+
 export interface ProcessResult {
   readonly stdout: string;
   readonly stderr: string;
@@ -226,5 +231,20 @@ export class GhCliTransport implements GitHubApiTransport {
 
   async getRaw(path: string, accept: string): Promise<string> {
     return await this.execute(path, this.args(path, {}, accept));
+  }
+
+  async write(path: string, method: 'POST' | 'PATCH', body: Readonly<Record<string, unknown>>): Promise<unknown> {
+    const args = this.args(path).map((arg) => arg === 'GET' ? method : arg);
+    for (const [key, value] of Object.entries(body).sort(([a], [b]) => a.localeCompare(b))) {
+      args.push('-f', `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);
+    }
+    const raw = await this.execute(path, args);
+    try {
+      return JSON.parse(raw) as unknown;
+    } catch (error) {
+      throw new GitHubLiveStateError('GH_INVALID_RESPONSE', `GitHub returned invalid JSON for ${path}.`, {
+        details: { path }, cause: error,
+      });
+    }
   }
 }

@@ -89,6 +89,19 @@ describe('GhCliTransport', () => {
     assert.ok(runner.calls[0]?.args.includes('Accept: application/vnd.github.diff'));
   });
 
+  it('uses the explicit POST/PATCH surface only with a JSON body field', async () => {
+    const runner = new RecordingRunner([result('{"id":9,"body":"runtime"}'), result('{"id":9,"body":"next"}')]);
+    const transport = new GhCliTransport({ runner });
+
+    assert.deepEqual(await transport.write('repos/acme/widgets/issues/3/comments', 'POST', { body: 'runtime' }), { id: 9, body: 'runtime' });
+    assert.deepEqual(await transport.write('repos/acme/widgets/issues/comments/9', 'PATCH', { body: 'next' }), { id: 9, body: 'next' });
+    assert.deepEqual(runner.calls.map((call) => call.args.slice(0, 5)), [
+      ['api', '--method', 'POST', 'repos/acme/widgets/issues/3/comments', '-H'],
+      ['api', '--method', 'PATCH', 'repos/acme/widgets/issues/comments/9', '-H'],
+    ]);
+    assert.ok(runner.calls.every((call) => call.args.includes('-f') && call.args.includes(call === runner.calls[0] ? 'body=runtime' : 'body=next')));
+  });
+
   it('executes GraphQL with typed variables and parses the response', async () => {
     const runner = new RecordingRunner([result('{"data":{"ok":true}}')]);
     const transport = new GhCliTransport({ runner });
