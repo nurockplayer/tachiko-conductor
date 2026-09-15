@@ -226,6 +226,38 @@ describe('dispatch queue protocol', () => {
     });
   });
 
+  it('retires an absent terminal claim so an identical later re-dispatch creates fresh work', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'done'), state: 'FAILED' as const };
+    store.create(terminal);
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'old-claim', runId: terminal.id, profile: 'complex', state: 'failed',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    const empty = `${DISPATCH_QUEUE_MARKER}\nready:`;
+    assert.deepEqual(await dispatchOnce({
+      queueBody: empty, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute() { throw new Error('terminal run must not execute'); },
+    }), { outcome: 'no_eligible_work', reasons: [] });
+
+    let existing: Run | null | undefined;
+    const result = await dispatchOnce({
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complex`,
+      owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'retry-claim',
+      async execute(_entry, prior) { existing = prior; return { runId: 'retry-run', state: 'IMPLEMENTING' }; },
+    });
+    assert.equal(existing, null);
+    assert.equal(result.outcome, 'dispatched');
+    if (result.outcome !== 'dispatched') throw new Error('expected fresh re-dispatch');
+    assert.equal(result.claim.claimId, 'retry-claim');
+  });
+
   it('creates fresh durable work when a terminal Issue is explicitly re-dispatched', async () => {
     const store = new MemoryStore();
     store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'old-terminal'), state: 'FAILED' });

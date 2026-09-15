@@ -170,6 +170,21 @@ function needsTerminalReconciliation(claim: DispatchRuntimeClaim, run: Run): boo
   return claim.runId !== run.id || claim.state !== stateForExecution(run.state);
 }
 
+async function retireTerminalClaim(
+  api: DispatchRuntimeApi,
+  commentId: string,
+  claim: DispatchRuntimeClaim,
+  now: string,
+): Promise<DispatchRuntimeClaim> {
+  const retired: DispatchRuntimeClaim = { ...claim, state: 'retired', heartbeatAt: now, leaseUntil: now };
+  await api.updateRuntimeComment(commentId, renderDispatchRuntime(retired));
+  const observed = selectDispatchRuntime(await api.listRuntimeComments());
+  if (observed === null || observed.id !== commentId || observed.claim.claimId !== claim.claimId || observed.claim.state !== 'retired') {
+    throw new DispatchProtocolError('Retired dispatch runtime claim did not retain its exact claim identity.');
+  }
+  return observed.claim;
+}
+
 /**
  * Perform one v0 serial dispatch attempt. A queue comment cannot by itself
  * authorize work: every candidate is checked against current Issue/PR/Run
@@ -179,6 +194,32 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
   const existing = selectDispatchRuntime(await options.runtime.listRuntimeComments());
   if (existing !== null) {
     const entry: DispatchQueueEntry = { issue: existing.claim.issue, route: 'codex', profile: existing.claim.profile };
+    const queue = parseDispatchQueue(options.queueBody);
+    if (existing.claim.state === 'retired') {
+      const reasons: string[] = [];
+      for (const queued of queue) {
+        if (queued.route !== 'codex') {
+          reasons.push(`#${queued.issue}: route ${queued.route} is not executable by this dispatcher`);
+          continue;
+        }
+        const checked = await eligibility(queued, options);
+        if (checked.reason !== null) {
+          reasons.push(checked.reason);
+          continue;
+        }
+        const claim = await supersedeTerminalClaim(options.runtime, existing.id, queued, options);
+        let execution: DispatchExecution;
+        try {
+          execution = await options.execute(queued, checked.run, claim);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          throw new DispatchProtocolError(`Claim ${claim.claimId} was retained but execution could not start safely: ${message}`);
+        }
+        const updated = await updateClaim(options.runtime, existing.id, claim, options.now(), options.leaseDurationMs, execution);
+        return { outcome: 'dispatched', entry: queued, claim: updated, execution };
+      }
+      return { outcome: 'no_eligible_work', reasons };
+    }
     const run = claimedRun(options.store, existing.claim, entry, options);
     if (run === null || !isSettledRun(run)) {
       const execution = await options.execute(entry, run, existing.claim);
@@ -195,7 +236,6 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
         state: run.state,
       })
       : existing.claim;
-    const queue = parseDispatchQueue(options.queueBody);
     if (queue.some((queued) => queued.issue === entry.issue && queued.route === 'codex' && queued.profile === entry.profile)) {
       return { outcome: 'existing_claim', claim: reconciled };
     }
@@ -221,6 +261,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       const updated = await updateClaim(options.runtime, existing.id, claim, options.now(), options.leaseDurationMs, execution);
       return { outcome: 'dispatched', entry: queued, claim: updated, execution };
     }
+    await retireTerminalClaim(options.runtime, existing.id, reconciled, options.now());
     return { outcome: 'no_eligible_work', reasons };
   }
   const queue = parseDispatchQueue(options.queueBody);

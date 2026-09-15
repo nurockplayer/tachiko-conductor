@@ -18,7 +18,7 @@ export interface DispatchRuntimeClaim {
   readonly claimId: string;
   readonly runId: string | null;
   readonly profile: string;
-  readonly state: 'claimed' | 'running' | 'merge_ready' | 'needs_human' | 'failed';
+  readonly state: 'claimed' | 'running' | 'merge_ready' | 'needs_human' | 'failed' | 'retired';
   readonly claimedAt: string;
   readonly heartbeatAt: string;
   readonly leaseUntil: string;
@@ -126,7 +126,7 @@ export function parseDispatchRuntime(body: string): DispatchRuntimeClaim | null 
   if (Object.keys(parsed).sort().join(',') !== expected.join(',')) throw new DispatchProtocolError('Dispatch runtime comment has unknown or missing fields.');
   if (!Number.isSafeInteger(parsed.issue) || (parsed.issue as number) < 1 || !nonEmpty(parsed.claimId) || !nonEmpty(parsed.profile) || !supportedProfile(parsed.profile) ||
     !(parsed.runId === null || nonEmpty(parsed.runId)) || !nonEmpty(parsed.claimedAt) || !nonEmpty(parsed.heartbeatAt) || !nonEmpty(parsed.leaseUntil) ||
-    !['claimed', 'running', 'merge_ready', 'needs_human', 'failed'].includes(parsed.state as string)) {
+    !['claimed', 'running', 'merge_ready', 'needs_human', 'failed', 'retired'].includes(parsed.state as string)) {
     throw new DispatchProtocolError('Dispatch runtime comment has invalid field values.');
   }
   for (const time of [parsed.claimedAt, parsed.heartbeatAt, parsed.leaseUntil]) {
