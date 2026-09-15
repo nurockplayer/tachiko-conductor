@@ -31,7 +31,8 @@ const SANDBOX_MODES: readonly ExecutionSandboxMode[] = ['read-only', 'workspace-
 const APPROVAL_POLICIES: readonly ExecutionApprovalPolicy[] = ['untrusted', 'on-request', 'never'];
 const PROFILE_KEYS = ['executor', 'timeoutMs', 'model', 'reasoningEffort', 'sandboxMode', 'approvalPolicy'] as const;
 const CONFIGURATION_KEYS = ['revision', 'profiles'] as const;
-const MAX_PROCESS_TIMEOUT_MS = 2_147_483_647;
+/** Node process timers overflow above this signed 32-bit millisecond value. */
+export const MAX_EXECUTION_TIMEOUT_MS = 2_147_483_647;
 
 function nonEmptyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim() !== '';
@@ -51,8 +52,8 @@ function parseProfile(name: ExecutionProfileName, value: unknown): Omit<Resolved
     throw new Error(`Execution profile "${name}" contains an unsupported setting.`);
   }
   if (!nonEmptyString(value.executor)) throw new Error(`Execution profile "${name}".executor must be a non-empty string.`);
-  if (!Number.isSafeInteger(value.timeoutMs) || (value.timeoutMs as number) < 1 || (value.timeoutMs as number) > MAX_PROCESS_TIMEOUT_MS) {
-    throw new Error(`Execution profile "${name}".timeoutMs must be a positive integer no greater than ${MAX_PROCESS_TIMEOUT_MS}.`);
+  if (!Number.isSafeInteger(value.timeoutMs) || (value.timeoutMs as number) < 1 || (value.timeoutMs as number) > MAX_EXECUTION_TIMEOUT_MS) {
+    throw new Error(`Execution profile "${name}".timeoutMs must be a positive integer no greater than ${MAX_EXECUTION_TIMEOUT_MS}.`);
   }
   if (value.model !== undefined && !nonEmptyString(value.model)) {
     throw new Error(`Execution profile "${name}".model must be a non-empty string when supplied.`);

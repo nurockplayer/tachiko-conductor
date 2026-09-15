@@ -82,6 +82,19 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.deepEqual(new JsonFileStore({ dir }).read('profile-run')?.execution, execution);
   });
 
+  it('rejects a persisted execution snapshot whose timeout exceeds the process runner limit', () => {
+    const { store, dir } = tempStore();
+    writeFileSync(
+      path.join(dir, 'bad-timeout.json'),
+      JSON.stringify({
+        ...newRun('bad-timeout'),
+        execution: { profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 2_147_483_648 },
+      }),
+      'utf8',
+    );
+    assert.throws(() => store.read('bad-timeout'), /corrupt or incompatible/);
+  });
+
   it('round-trips compact exact-HEAD validation provenance through a fresh store instance', () => {
     const { dir } = tempStore();
     const first = new JsonFileStore({ dir });

@@ -119,7 +119,7 @@ pnpm exec tsx src/cli.ts browser bootstrap github-work
 pnpm exec tsx src/cli.ts browser start github-work --headless
 pnpm exec tsx src/cli.ts browser status github-work
 pnpm exec tsx src/cli.ts browser stop github-work
-pnpm exec tsx src/cli.ts run owner/repo#123 --browser-profile github-work
+pnpm exec tsx src/cli.ts run owner/repo#123 --browser-profile github-work --execution-profile standard
 ```
 
 `run owner/repo#123` starts or continues one issue end-to-end: implementation,
@@ -271,10 +271,11 @@ fresh work runs through `codex exec --json`, and continuation uses
 `codex exec resume <SESSION_ID> --json`. Conductor persists a provider-neutral
 `Run.executor` identity and reconstructs that same provider after restart; an
 unknown, stale, or mismatched identity fails explicitly instead of starting a
-fresh thread. Select Codex for new runs without changing existing Claude runs:
+fresh thread. Select Codex for new runs with a configured Codex execution
+profile, without changing existing Claude runs:
 
 ```bash
-TACHIKO_IMPLEMENTATION_AGENT=codex-cli pnpm exec tsx src/cli.ts run owner/repo#123
+pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
 ```
 
 The adapter accepts resolved execution values without choosing a model or
