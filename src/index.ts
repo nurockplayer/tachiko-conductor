@@ -11,6 +11,7 @@ export * from './adapters/validation.js';
 export * from './agents/claude-code.js';
 export * from './agents/codex-cli.js';
 export * from './agents/implementation-router.js';
+export * from './agents/worker-router.js';
 export * from './reviewers/deepseek.js';
 export * from './reviewers/loop.js';
 export * from './workflow/run.js';

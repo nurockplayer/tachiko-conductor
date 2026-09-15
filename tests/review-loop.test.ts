@@ -9,6 +9,7 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.j
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition, type ActiveValidationConfiguration } from '../src/domain/state-machine.js';
+import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
 import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
@@ -52,8 +53,8 @@ class MemoryStore implements RunStore {
   }
 }
 
-function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string): Run {
-  let run = createRun(TARGET, T0, id);
+function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string, execution?: ResolvedExecutionConfiguration): Run {
+  let run = createRun(TARGET, T0, id, execution);
   run = applyTransition(run, { type: 'start' }, T0);
   const agentResult = { ...successResult(headSha), ...(sessionId === undefined ? {} : { sessionId }) };
   run = applyTransition(run, { type: 'agent_succeeded', agentResult, headSha }, T0);
@@ -134,6 +135,7 @@ class FakeImplementation implements ImplementationAgent {
     instructions: string | undefined;
     sessionId: string | undefined;
     executor: ImplementationRequest['executor'];
+    execution: ImplementationRequest['execution'];
   }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
@@ -144,6 +146,7 @@ class FakeImplementation implements ImplementationAgent {
       instructions: request.instructions,
       sessionId: request.sessionId,
       executor: request.executor,
+      execution: request.execution,
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
@@ -504,8 +507,11 @@ describe('runReviewLoop', () => {
 
   it('resumes a persisted CHANGES_REQUESTED run by fixing before re-reviewing', async () => {
     const store = new MemoryStore();
+    const execution: ResolvedExecutionConfiguration = {
+      profile: 'standard', revision: 'profiles-v1', executor: 'worker-router', timeoutMs: 60_000,
+    };
     const requested = requestChanges(HEAD);
-    store.create(applyTransition(reviewingRun(), { type: 'changes_requested', reviewResult: requested }, T0, reviewAuthority()));
+    store.create(applyTransition(reviewingRun(HEAD, 'run-1', undefined, execution), { type: 'changes_requested', reviewResult: requested }, T0, reviewAuthority()));
     const reviewer = new FakeReviewer([approve(HEAD2)]);
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
@@ -518,6 +524,7 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'revalidating');
     assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests[0]?.baseSha, HEAD);
+    assert.deepEqual(implementation.requests[0]?.execution, execution);
     assert.deepEqual(reviewer.requests.map((reviewRequest) => reviewRequest.headSha), []);
   });
 

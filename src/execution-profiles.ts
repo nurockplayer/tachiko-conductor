@@ -114,10 +114,13 @@ export function resolveExecutionProfile(
   return { profile: selected, revision: configuration.revision, ...resolved };
 }
 
-/** Providers may reject generic settings they cannot safely honour. */
+/** Providers reject generic settings they cannot safely honour. */
 export function assertExecutionSupportedByProvider(execution: ResolvedExecutionConfiguration): void {
-  if (execution.executor === 'claude-code' &&
-    (execution.reasoningEffort !== undefined || execution.sandboxMode !== undefined || execution.approvalPolicy !== undefined)) {
+  const codexOnlySettings = execution.reasoningEffort !== undefined ||
+    execution.sandboxMode !== undefined || execution.approvalPolicy !== undefined;
+  const unsupported = (execution.executor === 'claude-code' && codexOnlySettings) ||
+    (execution.executor === 'worker-router' && (execution.model !== undefined || codexOnlySettings));
+  if (unsupported) {
     throw new Error(`Execution profile "${execution.profile}" requests settings unsupported by executor "${execution.executor}".`);
   }
 }

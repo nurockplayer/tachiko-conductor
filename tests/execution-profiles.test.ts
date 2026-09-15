@@ -56,6 +56,21 @@ describe('execution profiles', () => {
       /unsupported by executor/,
     );
     assert.throws(
+      () => assertExecutionSupportedByProvider({
+        profile: 'routine', revision: 'v1', executor: 'worker-router', timeoutMs: 1, model: 'ignored-model',
+      }),
+      /unsupported by executor/,
+    );
+    assert.throws(
+      () => assertExecutionSupportedByProvider({
+        profile: 'standard', revision: 'v1', executor: 'worker-router', timeoutMs: 1, sandboxMode: 'workspace-write',
+      }),
+      /unsupported by executor/,
+    );
+    assert.doesNotThrow(() => assertExecutionSupportedByProvider({
+      profile: 'routine', revision: 'v1', executor: 'worker-router', timeoutMs: 60_000,
+    }));
+    assert.throws(
       () => parseExecutionProfileConfiguration(CONFIG.replace('reasoningEffort', 'reasoningEfort')),
       /unsupported setting/,
     );

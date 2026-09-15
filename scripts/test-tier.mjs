@@ -4,6 +4,7 @@ export const integrationTest = 'browser-runtime-integration.test.ts';
 export const smokeTiers = new Map([
   ['smoke:claude', { test: 'claude-code-smoke.test.ts', environment: 'TACHIKO_SMOKE' }],
   ['smoke:codex', { test: 'codex-cli-smoke.test.ts', environment: 'TACHIKO_CODEX_SMOKE' }],
+  ['smoke:worker-router', { test: 'worker-router-smoke.test.ts', environment: 'TACHIKO_WORKER_ROUTER_SMOKE' }],
   ['smoke:browser-agent', { test: 'browser-agent-smoke.test.ts', environment: 'TACHIKO_BROWSER_AGENT_SMOKE' }],
 ]);
 
