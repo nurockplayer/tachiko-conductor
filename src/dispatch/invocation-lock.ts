@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closeSync, linkSync, mkdirSync, openSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 export class DispatchInvocationLockedError extends Error {
@@ -10,6 +10,11 @@ export class DispatchInvocationLockedError extends Error {
 }
 
 interface LockRecord {
+  readonly nonce: string;
+  readonly pid: number;
+}
+
+interface TakeoverClaim {
   readonly nonce: string;
   readonly pid: number;
 }
@@ -57,11 +62,56 @@ function staleTakeoverPath(lockPath: string, record: LockRecord): string {
   return `${lockPath}.${identity}.stale-takeover`;
 }
 
+function staleTakeoverRecoveryPath(takeoverPath: string, previousClaim: TakeoverClaim): string {
+  const identity = createHash('sha256').update(JSON.stringify(previousClaim)).digest('hex');
+  return `${takeoverPath}.${identity}.recovery`;
+}
+
+function parseTakeoverClaim(raw: string): TakeoverClaim | null {
+  return parseLock(raw);
+}
+
 function readLock(lockPath: string): LockRecord | null {
   try {
     return parseLock(readFileSync(lockPath, 'utf8'));
   } catch {
     return null;
+  }
+}
+
+function readTakeoverClaim(takeoverPath: string): TakeoverClaim | null {
+  try {
+    return parseTakeoverClaim(readlinkSync(takeoverPath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function sameTakeoverClaim(left: TakeoverClaim, right: TakeoverClaim): boolean {
+  return left.nonce === right.nonce && left.pid === right.pid;
+}
+
+function createTakeoverClaim(takeoverPath: string, claim: TakeoverClaim): boolean {
+  try {
+    // The symlink target is immutable ownership metadata created atomically
+    // with the claim pathname. It is deliberately not followed or trusted as
+    // a filesystem location.
+    symlinkSync(JSON.stringify(claim), takeoverPath);
+    return true;
+  } catch (error: unknown) {
+    if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'EEXIST') return false;
+    throw error;
+  }
+}
+
+function removeOwnedTakeoverClaim(takeoverPath: string, claim: TakeoverClaim): boolean {
+  const current = readTakeoverClaim(takeoverPath);
+  if (current === null || !sameTakeoverClaim(current, claim)) return false;
+  try {
+    unlinkSync(takeoverPath);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -96,29 +146,40 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
     if (existing === null || alive(existing.pid)) throw new DispatchInvocationLockedError(options.lockPath);
     options.beforeStaleTakeover?.();
 
-    // A deterministic hard-link claim serializes stale recovery without ever
-    // unlinking a pathname that may already name a replacement lock.
-    const takeoverPath = staleTakeoverPath(options.lockPath, existing);
-    try {
-      linkSync(options.lockPath, takeoverPath);
-    } catch {
-      throw new DispatchInvocationLockedError(options.lockPath);
-    }
-    try {
-      const claimed = readLock(takeoverPath);
-      const current = readLock(options.lockPath);
-      if (claimed === null || current === null || !sameLockRecord(claimed, existing) || !sameLockRecord(current, existing)) {
-        throw new DispatchInvocationLockedError(options.lockPath);
+    // An atomically-created symlink claim serializes stale recovery. Unlike a
+    // hard link to the stale lock, it records its own owner. A later wake
+    // leaves a dead claim immutable and claims its deterministic successor,
+    // rather than using a check-then-unlink that could delete a newly-created
+    // live claim between those two operations.
+    const takeoverRootPath = staleTakeoverPath(options.lockPath, existing);
+    let takeoverPath = takeoverRootPath;
+    const claim = { nonce, pid: process.pid };
+    for (let attempt = 0; attempt < 16; attempt += 1) {
+      if (!createTakeoverClaim(takeoverPath, claim)) {
+        const previousClaim = readTakeoverClaim(takeoverPath);
+        if (previousClaim === null || alive(previousClaim.pid)) {
+          throw new DispatchInvocationLockedError(options.lockPath);
+        }
+        takeoverPath = staleTakeoverRecoveryPath(takeoverRootPath, previousClaim);
+        continue;
       }
       try {
-        unlinkSync(options.lockPath);
-      } catch {
-        throw new DispatchInvocationLockedError(options.lockPath);
+        const current = readLock(options.lockPath);
+        if (current === null || !sameLockRecord(current, existing) || alive(current.pid)) {
+          throw new DispatchInvocationLockedError(options.lockPath);
+        }
+        try {
+          unlinkSync(options.lockPath);
+        } catch {
+          throw new DispatchInvocationLockedError(options.lockPath);
+        }
+        if (!acquire()) throw new DispatchInvocationLockedError(options.lockPath);
+        break;
+      } finally {
+        removeOwnedTakeoverClaim(takeoverPath, claim);
       }
-      if (!acquire()) throw new DispatchInvocationLockedError(options.lockPath);
-    } finally {
-      try { unlinkSync(takeoverPath); } catch { /* the stale claim is best-effort cleanup */ }
     }
+    if (readLock(options.lockPath)?.nonce !== nonce) throw new DispatchInvocationLockedError(options.lockPath);
   }
 
   return {

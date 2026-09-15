@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -47,6 +48,53 @@ describe('dispatch scheduler boundary', () => {
       );
       assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), { nonce: 'replacement', pid: process.pid });
       replacement?.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a takeover claim whose owner died before stale recovery completed', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-abandoned-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const stale = { nonce: 'crashed', pid: 41 };
+    const takeoverPath = `${lockPath}.${createHash('sha256').update(JSON.stringify(stale)).digest('hex')}.stale-takeover`;
+    try {
+      writeFileSync(lockPath, JSON.stringify(stale));
+      symlinkSync(JSON.stringify({ nonce: 'dead-takeover', pid: 42 }), takeoverPath);
+      const recovered = acquireDispatchInvocationLock({
+        lockPath,
+        nonce: () => 'recovered-after-abandoned-claim',
+        isProcessAlive: () => false,
+      });
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), {
+        nonce: 'recovered-after-abandoned-claim',
+        pid: process.pid,
+      });
+      assert.equal(readlinkSync(takeoverPath, 'utf8'), JSON.stringify({ nonce: 'dead-takeover', pid: 42 }));
+      recovered.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('leaves a takeover claim owned by a live recovery process untouched', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-live-claim-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const stale = { nonce: 'crashed', pid: 41 };
+    const takeoverPath = `${lockPath}.${createHash('sha256').update(JSON.stringify(stale)).digest('hex')}.stale-takeover`;
+    try {
+      writeFileSync(lockPath, JSON.stringify(stale));
+      symlinkSync(JSON.stringify({ nonce: 'live-takeover', pid: process.pid }), takeoverPath);
+      assert.throws(
+        () => acquireDispatchInvocationLock({
+          lockPath,
+          nonce: () => 'other-recovery',
+          isProcessAlive: (pid) => pid === process.pid,
+        }),
+        DispatchInvocationLockedError,
+      );
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), stale);
+      assert.equal(readlinkSync(takeoverPath, 'utf8'), JSON.stringify({ nonce: 'live-takeover', pid: process.pid }));
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
