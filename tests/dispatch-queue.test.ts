@@ -173,6 +173,23 @@ describe('dispatch queue protocol', () => {
     assert.deepEqual(blocked, { outcome: 'no_eligible_work', reasons: ['#18: Issue is closed', '#19: Issue is closed'] });
   });
 
+  it('refreshes a running claim while execution remains active', async () => {
+    const runtime = new Comments();
+    let complete: ((execution: { runId: string; state: 'IMPLEMENTING' }) => void) | undefined;
+    const pending = dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store: new MemoryStore(), runtime,
+      leaseDurationMs: 20, now: () => T0, createClaimId: () => 'claim-1',
+      async execute() {
+        return await new Promise<{ runId: string; state: 'IMPLEMENTING' }>((resolve) => { complete = resolve; });
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    assert.equal(selectDispatchRuntime(runtime.comments)?.claim.state, 'running');
+    assert.ok(runtime.updates > 1, 'expected at least one periodic heartbeat after execution started');
+    complete?.({ runId: 'run-18', state: 'IMPLEMENTING' });
+    await pending;
+  });
+
   it('does not claim a queued Issue with an active durable run or pull request', async () => {
     const store = new MemoryStore();
     store.create(createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing'));
