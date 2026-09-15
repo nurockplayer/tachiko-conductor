@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { closeSync, mkdirSync, openSync, readFileSync, readlinkSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readlinkSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 export class DispatchInvocationLockedError extends Error {
@@ -79,11 +79,43 @@ function readLock(lockPath: string): LockRecord | null {
   }
 }
 
-function readTakeoverClaim(takeoverPath: string): TakeoverClaim | null {
+function readSymlinkTakeoverClaim(takeoverPath: string): TakeoverClaim | null {
   try {
     return parseTakeoverClaim(readlinkSync(takeoverPath, 'utf8'));
   } catch {
     return null;
+  }
+}
+
+/**
+ * PR #44's first implementation used a hard link to the stale lock as its
+ * takeover claim. Recognize only that exact legacy shape: the claim must still
+ * alias the exact stale lock record we observed. It remains immutable and a
+ * successor symlink claim owns the recovery, so a concurrent wake cannot
+ * unlink a replacement claim by pathname.
+ */
+function readLegacyHardLinkTakeoverClaim(
+  takeoverPath: string,
+  lockPath: string,
+  expectedLock: LockRecord,
+): TakeoverClaim | null {
+  try {
+    const claimStats = statSync(takeoverPath);
+    const lockStats = statSync(lockPath);
+    if (!claimStats.isFile() || claimStats.dev !== lockStats.dev || claimStats.ino !== lockStats.ino) return null;
+    const claim = parseTakeoverClaim(readFileSync(takeoverPath, 'utf8'));
+    return claim !== null && sameLockRecord(claim, expectedLock) ? claim : null;
+  } catch {
+    return null;
+  }
+}
+
+function readTakeoverClaim(takeoverPath: string, lockPath: string, expectedLock: LockRecord): TakeoverClaim | null {
+  try {
+    return parseTakeoverClaim(readlinkSync(takeoverPath, 'utf8'));
+  } catch (error: unknown) {
+    if (typeof error !== 'object' || error === null || (error as { code?: unknown }).code !== 'EINVAL') return null;
+    return readLegacyHardLinkTakeoverClaim(takeoverPath, lockPath, expectedLock);
   }
 }
 
@@ -105,7 +137,7 @@ function createTakeoverClaim(takeoverPath: string, claim: TakeoverClaim): boolea
 }
 
 function removeOwnedTakeoverClaim(takeoverPath: string, claim: TakeoverClaim): boolean {
-  const current = readTakeoverClaim(takeoverPath);
+  const current = readSymlinkTakeoverClaim(takeoverPath);
   if (current === null || !sameTakeoverClaim(current, claim)) return false;
   try {
     unlinkSync(takeoverPath);
@@ -156,7 +188,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
     const claim = { nonce, pid: process.pid };
     for (let attempt = 0; attempt < 16; attempt += 1) {
       if (!createTakeoverClaim(takeoverPath, claim)) {
-        const previousClaim = readTakeoverClaim(takeoverPath);
+        const previousClaim = readTakeoverClaim(takeoverPath, options.lockPath, existing);
         if (previousClaim === null || alive(previousClaim.pid)) {
           throw new DispatchInvocationLockedError(options.lockPath);
         }

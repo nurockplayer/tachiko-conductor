@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -71,6 +71,30 @@ describe('dispatch scheduler boundary', () => {
         pid: process.pid,
       });
       assert.equal(readlinkSync(takeoverPath, 'utf8'), JSON.stringify({ nonce: 'dead-takeover', pid: 42 }));
+      recovered.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers an exact legacy hard-link takeover claim without unlinking it', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-legacy-hard-link-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const stale = { nonce: 'crashed', pid: 41 };
+    const takeoverPath = `${lockPath}.${createHash('sha256').update(JSON.stringify(stale)).digest('hex')}.stale-takeover`;
+    try {
+      writeFileSync(lockPath, JSON.stringify(stale));
+      linkSync(lockPath, takeoverPath);
+      const recovered = acquireDispatchInvocationLock({
+        lockPath,
+        nonce: () => 'recovered-after-legacy-hard-link',
+        isProcessAlive: () => false,
+      });
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), {
+        nonce: 'recovered-after-legacy-hard-link',
+        pid: process.pid,
+      });
+      assert.deepEqual(JSON.parse(readFileSync(takeoverPath, 'utf8')), stale);
       recovered.release();
     } finally {
       rmSync(directory, { recursive: true, force: true });
