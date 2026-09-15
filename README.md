@@ -79,14 +79,31 @@ an unreviewed SHA.
 
 ```bash
 pnpm install
-pnpm browser:install # download the pinned Chromium used by the MCP integration test
-pnpm test        # run the test suite (node:test + tsx)
+pnpm test        # deterministic unit and contract suite (node:test + tsx)
 pnpm typecheck   # type-check src and tests
 pnpm build       # emit dist/ for the `tachiko` bin
 ```
 
-On Linux CI or a minimal container, install Chromium and its system packages
-with `pnpm exec playwright install --with-deps chromium` before `pnpm test`.
+## Test tiers
+
+`pnpm test` is the deterministic default. It excludes real Playwright MCP
+browser integration and every authenticated model smoke path. Run the real
+local browser integration separately (after installing the pinned Chromium):
+
+```bash
+pnpm browser:install
+pnpm test:integration
+```
+
+On Linux CI or a minimal container, use
+`pnpm exec playwright install --with-deps chromium` before the integration
+tier. Authenticated smokes are explicit and never part of normal CI:
+
+```bash
+pnpm test:smoke:claude
+pnpm test:smoke:codex
+pnpm test:smoke:browser-agent
+```
 
 ## CLI
 
@@ -208,7 +225,7 @@ The opt-in Claude Code smoke test invokes the installed `claude` CLI
 non-interactively once and is never part of CI:
 
 ```bash
-TACHIKO_SMOKE=1 pnpm exec tsx --test tests/claude-code-smoke.test.ts
+pnpm test:smoke:claude
 ```
 
 `ClaudeCodeAdapter` returns the CLI's opaque `session_id` as
@@ -245,7 +262,7 @@ The opt-in real-Codex smoke invokes the installed/authenticated CLI in a
 read-only sandbox and is excluded from the normal suite and CI:
 
 ```bash
-TACHIKO_CODEX_SMOKE=1 pnpm exec tsx --test tests/codex-cli-smoke.test.ts
+pnpm test:smoke:codex
 ```
 
 The separate opt-in browser-agent smoke starts the managed Playwright MCP
@@ -253,7 +270,7 @@ runtime and a localhost fixture, then proves the installed Codex CLI can use
 the injected browser capability. It is also skipped in the default suite:
 
 ```bash
-TACHIKO_BROWSER_AGENT_SMOKE=1 pnpm exec tsx --test tests/browser-agent-smoke.test.ts
+pnpm test:smoke:browser-agent
 ```
 
 After `pnpm build`, the same commands work through the `tachiko` bin
