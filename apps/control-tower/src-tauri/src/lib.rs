@@ -152,6 +152,15 @@ struct VerifiedWorktree {
   head_sha: Option<String>,
 }
 
+/// A run may remain linked to its persisted PR while an explicitly active
+/// review repair has created a verified local descendant that is not pushed
+/// yet.  In that narrow case GitHub must still be checked against the
+/// persisted PR head, rather than against the unadvertised local commit.
+struct CorrelatedRun<'a> {
+  run: &'a RunObservation,
+  active_review_fix_descendant: bool,
+}
+
 trait CommandBoundary {
   fn run(&self, program: &str, args: &[&str]) -> Option<String>;
 }
@@ -643,48 +652,36 @@ fn correlated_run<'a>(
   runs: &'a [RunObservation],
   run_worktrees: &BTreeMap<String, VerifiedWorktree>,
   worktree: &VerifiedWorktree,
-) -> Option<&'a RunObservation> {
+) -> Option<CorrelatedRun<'a>> {
   let matches = runs
     .iter()
-    .filter(|run| {
+    .filter_map(|run| {
       let Some(bootstrap) = run_worktrees.get(&run.id) else {
-        return false;
+        return None;
       };
-      bootstrap.path == worktree.path
-        && bootstrap.common_git == worktree.common_git
-        && worktree
+      let head = worktree.head_sha.as_deref()?;
+      if bootstrap.path != worktree.path
+        || bootstrap.common_git != worktree.common_git
+        || !worktree
           .repository
           .as_deref()
           .is_some_and(|repository| repository.eq_ignore_ascii_case(&run.repository))
-        && worktree.branch.as_deref() == Some(run.branch.as_str())
-        && worktree.head_sha.as_deref().is_some_and(|head| {
-          let exact_head = run
-            .head_sha
-            .as_deref()
-            .is_none_or(|expected| expected == head)
-            && run
-              .pull_request_head_sha
-              .as_deref()
-              .is_none_or(|expected| expected == head);
-          let review_fix_descendant = run.review_fix_active
-            && run.state == "IMPLEMENTING"
-            && run.head_sha.as_deref().is_some_and(|accepted_head| {
-              run.pull_request_head_sha.as_deref() == Some(accepted_head)
-                && commands
-                  .run(
-                    "git",
-                    &[
-                      "-C",
-                      &worktree.path,
-                      "merge-base",
-                      "--is-ancestor",
-                      accepted_head,
-                      head,
-                    ],
-                  )
-                  .is_some()
-            });
-          (exact_head || review_fix_descendant)
+        || worktree.branch.as_deref() != Some(run.branch.as_str())
+      {
+        return None;
+      }
+      let exact_head = run
+        .head_sha
+        .as_deref()
+        .is_none_or(|expected| expected == head)
+        && run
+          .pull_request_head_sha
+          .as_deref()
+          .is_none_or(|expected| expected == head);
+      let review_fix_descendant = run.review_fix_active
+        && run.state == "IMPLEMENTING"
+        && run.head_sha.as_deref().is_some_and(|accepted_head| {
+          run.pull_request_head_sha.as_deref() == Some(accepted_head)
             && commands
               .run(
                 "git",
@@ -693,18 +690,44 @@ fn correlated_run<'a>(
                   &worktree.path,
                   "merge-base",
                   "--is-ancestor",
-                  &run.base_sha,
+                  accepted_head,
                   head,
                 ],
               )
               .is_some()
-        })
+        });
+      let active_review_fix_descendant = !exact_head && review_fix_descendant;
+      if !(exact_head || active_review_fix_descendant)
+        || commands
+          .run(
+            "git",
+            &[
+              "-C",
+              &worktree.path,
+              "merge-base",
+              "--is-ancestor",
+              &run.base_sha,
+              head,
+            ],
+          )
+          .is_none()
+      {
+        return None;
+      }
+      Some(CorrelatedRun { run, active_review_fix_descendant })
     })
     .collect::<Vec<_>>();
-  if matches.len() == 1 {
-    Some(matches[0])
+  (matches.len() == 1).then(|| matches.into_iter().next()).flatten()
+}
+
+fn pull_request_head_for_correlation<'a>(
+  correlated: &'a CorrelatedRun<'a>,
+  worktree: &'a VerifiedWorktree,
+) -> Option<&'a str> {
+  if correlated.active_review_fix_descendant {
+    correlated.run.pull_request_head_sha.as_deref()
   } else {
-    None
+    worktree.head_sha.as_deref()
   }
 }
 
@@ -807,13 +830,13 @@ fn collect_snapshot_for_roots_with_workspace_data_path(
       let correlated = correlated_run(commands, &runs, &run_worktrees, &worktree).and_then(|run| {
         let pull_request = pull_request(
           commands,
-          &run.repository,
-          run.pull_request_number,
-          worktree.head_sha.as_deref(),
+          &run.run.repository,
+          run.run.pull_request_number,
+          pull_request_head_for_correlation(&run, &worktree),
         );
-        (run.pull_request_number.is_none() || pull_request.is_some()).then_some((run, pull_request))
+        (run.run.pull_request_number.is_none() || pull_request.is_some()).then_some((run, pull_request))
       });
-      let run = correlated.as_ref().map(|(run, _)| *run);
+      let run = correlated.as_ref().map(|(run, _)| run.run);
       let process = current_process(commands, &worktree.path);
       WorkUnitView {
         repository: run
@@ -1316,7 +1339,7 @@ mod tests {
     };
     let run_worktrees = verified_run_worktrees(&fake, &[run.clone()]);
     assert_eq!(
-      correlated_run(&fake, &[run.clone()], &run_worktrees, &worktree).map(|value| value.id.as_str()),
+      correlated_run(&fake, &[run.clone()], &run_worktrees, &worktree).map(|value| value.run.id.as_str()),
       Some("run-1")
     );
     let stale = RunObservation {
@@ -1349,10 +1372,12 @@ mod tests {
       provider: Some("codex-cli".to_owned()), state: "IMPLEMENTING".to_owned(), review_fix_active: true, duration_ms: None,
     };
     let run_worktrees = verified_run_worktrees(&fake, &[repair.clone()]);
-    assert_eq!(
-      correlated_run(&fake, &[repair.clone()], &run_worktrees, &worktree).map(|value| value.id.as_str()),
-      Some("run-1")
-    );
+    let repairs = [repair.clone()];
+    let correlated = correlated_run(&fake, &repairs, &run_worktrees, &worktree)
+      .expect("the verified local descendant remains correlated during an active repair");
+    assert_eq!(correlated.run.id, "run-1");
+    assert!(correlated.active_review_fix_descendant);
+    assert_eq!(pull_request_head_for_correlation(&correlated, &worktree), Some("accepted"));
     let not_a_review_fix = RunObservation { review_fix_active: false, ..repair };
     assert!(correlated_run(&fake, &[not_a_review_fix], &run_worktrees, &worktree).is_none());
   }
