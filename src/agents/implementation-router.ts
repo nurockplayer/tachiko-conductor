@@ -1,5 +1,6 @@
 import type { ImplementationAgent, ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
+import { assertExecutionSupportedByProvider, type ResolvedExecutionConfiguration } from '../execution-profiles.js';
 
 export const EXECUTOR_ROUTING_ERROR_CODE = {
   PROVIDER_UNAVAILABLE: 'EXECUTOR_PROVIDER_UNAVAILABLE',
@@ -11,7 +12,7 @@ export interface ImplementationAgentRegistryOptions {
   readonly defaultProvider: string;
   /** Provider that owns pre-executor-metadata `sessionId` runs. */
   readonly legacySessionProvider?: string;
-  readonly providers: Readonly<Record<string, () => ImplementationAgent>>;
+  readonly providers: Readonly<Record<string, (execution?: ResolvedExecutionConfiguration) => ImplementationAgent>>;
 }
 
 /** Reconstructs the correct provider adapter from durable executor metadata. */
@@ -19,7 +20,7 @@ export class ImplementationAgentRegistry implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
   private readonly defaultProvider: string;
   private readonly legacySessionProvider: string | undefined;
-  private readonly providers: Readonly<Record<string, () => ImplementationAgent>>;
+  private readonly providers: Readonly<Record<string, (execution?: ResolvedExecutionConfiguration) => ImplementationAgent>>;
 
   constructor(options: ImplementationAgentRegistryOptions) {
     this.defaultProvider = options.defaultProvider;
@@ -28,7 +29,15 @@ export class ImplementationAgentRegistry implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
-    const provider = request.executor?.provider ?? (
+    const selectedProvider = request.execution?.executor;
+    if (request.executor !== undefined && selectedProvider !== undefined && request.executor.provider !== selectedProvider) {
+      return routingFailure(
+        EXECUTOR_ROUTING_ERROR_CODE.RECONSTRUCTION_FAILED,
+        `Persisted executor provider "${request.executor.provider}" does not match selected execution executor "${selectedProvider}".`,
+        request,
+      );
+    }
+    const provider = request.executor?.provider ?? selectedProvider ?? (
       request.sessionId === undefined ? this.defaultProvider : this.legacySessionProvider
     );
     if (provider === undefined || provider.trim() === '' || this.providers[provider] === undefined) {
@@ -41,7 +50,8 @@ export class ImplementationAgentRegistry implements ImplementationAgent {
     }
     let agent: ImplementationAgent;
     try {
-      agent = this.providers[provider]();
+      if (request.execution !== undefined) assertExecutionSupportedByProvider(request.execution);
+      agent = this.providers[provider](request.execution);
     } catch (error) {
       return routingFailure(
         EXECUTOR_ROUTING_ERROR_CODE.RECONSTRUCTION_FAILED,

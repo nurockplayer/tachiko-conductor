@@ -1,4 +1,5 @@
 import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
+import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 
 export const HUMAN_TAKEOVER_DIAGNOSTIC = 'TACHIKO_NEEDS_HUMAN:';
 
@@ -100,6 +101,8 @@ export interface ImplementationRequest {
   readonly sessionId?: string;
   /** Provider-neutral durable executor identity for exact continuation. */
   readonly executor?: ExecutorIdentity;
+  /** Immutable Steward-selected execution snapshot; adapters never select it. */
+  readonly execution?: ResolvedExecutionConfiguration;
   /** Cancels the active implementation process. */
   readonly signal?: AbortSignal;
 }

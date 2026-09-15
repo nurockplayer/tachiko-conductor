@@ -108,9 +108,9 @@ pnpm test:smoke:browser-agent
 ## CLI
 
 ```bash
-pnpm exec tsx src/cli.ts run owner/repo#123
+pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
 pnpm exec tsx src/cli.ts run resume <id> --decision <choice>
-pnpm exec tsx src/cli.ts run create --owner acme --repo widgets --issue 42
+pnpm exec tsx src/cli.ts run create --owner acme --repo widgets --issue 42 --execution-profile standard
 pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
@@ -119,7 +119,7 @@ pnpm exec tsx src/cli.ts browser bootstrap github-work
 pnpm exec tsx src/cli.ts browser start github-work --headless
 pnpm exec tsx src/cli.ts browser status github-work
 pnpm exec tsx src/cli.ts browser stop github-work
-pnpm exec tsx src/cli.ts run owner/repo#123 --browser-profile github-work
+pnpm exec tsx src/cli.ts run owner/repo#123 --browser-profile github-work --execution-profile standard
 ```
 
 `run owner/repo#123` starts or continues one issue end-to-end: implementation,
@@ -129,6 +129,34 @@ choices); resume a parked run with `run resume <id> --decision <choice>`.
 When choices are present, the decision must match one exactly. `Cancel the
 run` transitions to `FAILED`; adopting a drifted live HEAD always returns to
 independent review before the final gate.
+
+## Execution profiles
+
+The Project Steward explicitly selects one coarse profile when creating an
+issue run: `routine`, `standard`, `complex`, or `critical`. Conductor only
+resolves that selection; it never derives a profile from Issue prose, diffs,
+or reviewer text. New runs require `--execution-profile` and one revisioned
+`TACHIKO_EXECUTION_PROFILE_CONFIG` JSON value. For example:
+
+```bash
+export TACHIKO_EXECUTION_PROFILE_CONFIG='{
+  "revision":"execution-profiles-v1",
+  "profiles":{
+    "routine":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"low","timeoutMs":600000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+    "standard":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"medium","timeoutMs":600000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+    "complex":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+    "critical":{"executor":"claude-code","model":"configured-model","timeoutMs":900000}
+  }
+}'
+pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
+```
+
+Provider and model identifiers are configuration values, not workflow enums.
+The selected profile, config revision, executor, and secret-free resolved
+settings are persisted with the run; continuation uses that immutable snapshot
+even if a later configuration revision remaps the profile. Unknown profiles,
+unavailable executors, malformed settings, and provider-unsupported settings
+fail before implementation starts.
 
 ## Exact-HEAD validation
 
@@ -243,14 +271,17 @@ fresh work runs through `codex exec --json`, and continuation uses
 `codex exec resume <SESSION_ID> --json`. Conductor persists a provider-neutral
 `Run.executor` identity and reconstructs that same provider after restart; an
 unknown, stale, or mismatched identity fails explicitly instead of starting a
-fresh thread. Select Codex for new runs without changing existing Claude runs:
+fresh thread. Select Codex for new runs with a configured Codex execution
+profile, without changing existing Claude runs:
 
 ```bash
-TACHIKO_IMPLEMENTATION_AGENT=codex-cli pnpm exec tsx src/cli.ts run owner/repo#123
+pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
 ```
 
 The adapter accepts resolved execution values without choosing a model or
-profile. Production wiring reads these optional values:
+profile. The profile configuration above is the production path for new runs.
+The following direct Codex environment values remain available for legacy
+persisted runs that have no profile snapshot:
 
 - `TACHIKO_CODEX_MODEL`
 - `TACHIKO_CODEX_REASONING_EFFORT` (`minimal`, `low`, `medium`, `high`, `xhigh`)
