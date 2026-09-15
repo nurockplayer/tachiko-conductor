@@ -16,7 +16,11 @@
     "browser:install": "playwright install chromium",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "node scripts/run-test-tier.mjs unit",
+    "test:integration": "node scripts/run-test-tier.mjs integration",
+    "test:smoke:claude": "node scripts/run-test-tier.mjs smoke:claude",
+    "test:smoke:codex": "node scripts/run-test-tier.mjs smoke:codex",
+    "test:smoke:browser-agent": "node scripts/run-test-tier.mjs smoke:browser-agent"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
