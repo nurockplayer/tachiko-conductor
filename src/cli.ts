@@ -577,6 +577,8 @@ export interface WorkflowCommandOptions {
   readonly now?: () => string;
   /** Required for a newly-created production issue run; persisted runs retain their own snapshot. */
   readonly execution?: ResolvedExecutionConfiguration;
+  /** Immutable queue-claim identity when this run is created by dispatch once. */
+  readonly dispatchClaimId?: string;
 }
 
 /**
@@ -593,8 +595,11 @@ export async function runIssueCommand(
   let run = deps.store.list().find((candidate) =>
     targetsEqual(candidate.target, target) && candidate.state !== 'MERGED' && candidate.state !== 'FAILED',
   ) ?? null;
+  if (options.dispatchClaimId !== undefined && run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
+    throw new Error(`Active durable run "${run.id}" is not bound to dispatch claim "${options.dispatchClaimId}"; refusing ambiguous recovery.`);
+  }
   if (run === null) {
-    run = createRun(target, undefined, undefined, options.execution);
+    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId);
     deps.store.create(run);
   } else if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
     throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
@@ -1053,7 +1058,7 @@ export async function main(argv: string[]): Promise<number> {
       workflow,
       runtime,
       resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-      runIssue: async (ref, execution) => await runIssueCommand(workflow, ref, execution === undefined ? {} : { execution }),
+      runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
       resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
     });
     printDispatchResult(result);

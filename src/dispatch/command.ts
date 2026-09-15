@@ -12,7 +12,7 @@ export interface DispatchCommandDependencies {
   readonly workflow: WorkflowDependencies;
   readonly runtime: DispatchCommandRuntime;
   readonly resolveExecutionProfile: (profile: string) => ResolvedExecutionConfiguration;
-  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined) => Promise<WorkflowOutcome>;
+  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string) => Promise<WorkflowOutcome>;
   /** Resume the Run bound by the retained runtime claim, never a target lookup. */
   readonly resumeClaimedRun: (run: Run) => Promise<WorkflowOutcome>;
   readonly now?: () => string;
@@ -37,7 +37,7 @@ export async function dispatchOnceCommand(
     runtime: deps.runtime,
     leaseDurationMs: config.leaseDurationMs,
     now,
-    async execute(entry, existing) {
+    async execute(entry, existing, claim) {
       if (existing !== null) {
         if (existing.execution === undefined) {
           throw new Error(`Durable run ${existing.id} does not retain the queue-selected immutable execution profile.`);
@@ -49,7 +49,7 @@ export async function dispatchOnceCommand(
         return { runId: outcome.run.id, state: outcomeState(outcome) };
       }
       const selected = deps.resolveExecutionProfile(entry.profile);
-      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected);
+      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId);
       return { runId: outcome.run.id, state: outcomeState(outcome) };
     },
   });

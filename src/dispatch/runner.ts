@@ -34,7 +34,7 @@ export interface DispatchOnceOptions {
   readonly runtime: DispatchRuntimeApi;
   readonly leaseDurationMs: number;
   readonly now: () => string;
-  readonly execute: (entry: DispatchQueueEntry, existing: Run | null) => Promise<DispatchExecution>;
+  readonly execute: (entry: DispatchQueueEntry, existing: Run | null, claim: DispatchRuntimeClaim) => Promise<DispatchExecution>;
   readonly createClaimId?: () => string;
 }
 
@@ -66,26 +66,34 @@ function claimedRun(store: RunStore, claim: DispatchRuntimeClaim, entry: Dispatc
   }
 
   // A process can die after runIssue durably creates a Run but before the
-  // runtime comment is updated with its id. An active target is still the
-  // single-owner fence. With only terminal history left, recover at most the
-  // one Run that was created no earlier than this unbound claim; older
-  // terminal history belongs to an earlier dispatch and must not be revived.
+  // runtime comment is updated with its id. Time is not proof of ownership:
+  // only the immutable claim id written into the durable Run can bind that
+  // crash window. Older terminal history is harmless; later unbound activity
+  // is ambiguous and must not be adopted.
   const matching = store.list().filter((run) => isTarget(run, entry, options));
-  const active = matching.filter((run) => isActiveRun(run));
-  if (active.length > 1) {
-    throw new DispatchProtocolError('Unbound dispatch runtime claim has multiple active durable runs; refusing ambiguous recovery.');
+  const linked = matching.filter((run) => run.dispatchClaimId === claim.claimId);
+  if (linked.length > 1) {
+    throw new DispatchProtocolError('Unbound dispatch runtime claim names multiple durable runs; refusing ambiguous recovery.');
   }
-  if (active.length === 1) return active[0]!;
-  const createdDuringClaim = matching.filter((run) => run.createdAt >= claim.claimedAt);
-  if (createdDuringClaim.length > 1) {
-    throw new DispatchProtocolError('Unbound dispatch runtime claim has multiple durable runs created during its claim window; refusing ambiguous recovery.');
+  if (linked.length === 1) return linked[0]!;
+  const activeUnbound = matching.filter((run) => isActiveRun(run) && run.dispatchClaimId !== claim.claimId);
+  if (activeUnbound.length > 0) {
+    throw new DispatchProtocolError('Unbound dispatch runtime claim found an unrelated active durable run; refusing ambiguous recovery.');
   }
-  return createdDuringClaim[0] ?? null;
+  const laterUnbound = matching.filter((run) => run.createdAt >= claim.claimedAt && run.dispatchClaimId !== claim.claimId);
+  if (laterUnbound.length > 0) {
+    throw new DispatchProtocolError('Unbound dispatch runtime claim cannot prove ownership of a later durable run; refusing ambiguous recovery.');
+  }
+  return null;
 }
 
 /** A persisted non-terminal Run is an ownership fence even before it has a PR. */
 function isActiveRun(run: Run | null): boolean {
   return run !== null && run.state !== 'MERGED' && run.state !== 'FAILED';
+}
+
+function isSettledRun(run: Run): boolean {
+  return run.state === 'MERGED' || run.state === 'MERGE_READY' || run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' || run.state === 'FAILED';
 }
 
 async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptions): Promise<{ readonly run: Run | null; readonly reason: string | null }> {
@@ -172,8 +180,8 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
   if (existing !== null) {
     const entry: DispatchQueueEntry = { issue: existing.claim.issue, route: 'codex', profile: existing.claim.profile };
     const run = claimedRun(options.store, existing.claim, entry, options);
-    if (run === null || isActiveRun(run)) {
-      const execution = await options.execute(entry, run);
+    if (run === null || !isSettledRun(run)) {
+      const execution = await options.execute(entry, run, existing.claim);
       const claim = await updateClaim(options.runtime, existing.id, existing.claim, options.now(), options.leaseDurationMs, execution);
       return { outcome: 'dispatched', entry, claim, execution };
     }
@@ -205,7 +213,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       const claim = await supersedeTerminalClaim(options.runtime, existing.id, queued, options);
       let execution: DispatchExecution;
       try {
-        execution = await options.execute(queued, checked.run);
+        execution = await options.execute(queued, checked.run, claim);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         throw new DispatchProtocolError(`Claim ${claim.claimId} was retained but execution could not start safely: ${message}`);
@@ -234,7 +242,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     });
     let execution: DispatchExecution;
     try {
-      execution = await options.execute(entry, checked.run);
+      execution = await options.execute(entry, checked.run, claimed.claim);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       throw new DispatchProtocolError(`Claim ${claimed.claim.claimId} was retained but execution could not start safely: ${message}`);

@@ -288,11 +288,11 @@ describe('dispatch queue protocol', () => {
     });
   });
 
-  it('fails closed when an unbound claim cannot distinguish multiple durable Runs from its claim window', async () => {
+  it('fails closed when an unbound claim names multiple durable Runs', async () => {
     const runtime = new Comments();
     const store = new MemoryStore();
-    store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'old-terminal'), state: 'FAILED' });
-    const duringClaim = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'during-claim'), state: 'FAILED' as const };
+    store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'first', undefined, 'claim-1'), state: 'FAILED' });
+    const duringClaim = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'second', undefined, 'claim-1'), state: 'FAILED' as const };
     store.create(duringClaim);
     runtime.comments.push({
       id: 'comment-1',
@@ -307,14 +307,14 @@ describe('dispatch queue protocol', () => {
         leaseDurationMs: 60_000, now: () => T0,
         async execute() { throw new Error('unbound terminal run must not execute'); },
       }),
-      /multiple durable runs created during its claim window/,
+      /names multiple durable runs/,
     );
   });
 
-  it('reconciles the one unbound terminal Run from a claim window without re-executing it', async () => {
+  it('reconciles the one claim-bound terminal Run without re-executing it', async () => {
     const runtime = new Comments();
     const store = new MemoryStore();
-    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, '2026-09-15T00:00:00.001Z', 'during-claim'), state: 'FAILED' as const };
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, '2026-09-15T00:00:00.001Z', 'during-claim', undefined, 'claim-1'), state: 'FAILED' as const };
     store.create(terminal);
     runtime.comments.push({
       id: 'comment-1',
@@ -337,6 +337,27 @@ describe('dispatch queue protocol', () => {
     });
   });
 
+  it('refuses to adopt a later unrelated terminal Run for an unbound claim', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, '2026-09-15T00:00:00.001Z', 'manual-terminal'), state: 'FAILED' });
+    runtime.comments.push({
+      id: 'comment-1',
+      body: renderDispatchRuntime({
+        issue: 18, claimId: 'claim-1', runId: null, profile: 'complex', state: 'claimed',
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      }),
+    });
+    await assert.rejects(
+      dispatchOnce({
+        queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+        leaseDurationMs: 60_000, now: () => T0,
+        async execute() { throw new Error('must not adopt an unrelated terminal run'); },
+      }),
+      /cannot prove ownership of a later durable run/,
+    );
+  });
+
   it('does not rewrite an already reconciled terminal claim on a settled wake', async () => {
     const runtime = new Comments();
     const store = new MemoryStore();
@@ -357,6 +378,30 @@ describe('dispatch queue protocol', () => {
     assert.equal(result.outcome, 'existing_claim');
     assert.equal(runtime.updates, 0);
   });
+
+  for (const state of ['MERGE_READY', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY'] as const) {
+    it(`does not rewrite an already reconciled ${state} claim on a settled wake`, async () => {
+      const runtime = new Comments();
+      const store = new MemoryStore();
+      const settled = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, `settled-${state.toLowerCase()}`), state };
+      store.create(settled);
+      runtime.comments.push({
+        id: 'comment-1',
+        body: renderDispatchRuntime({
+          issue: 18, claimId: 'claim-1', runId: settled.id, profile: 'complex',
+          state: state === 'MERGE_READY' ? 'merge_ready' : 'needs_human',
+          claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+        }),
+      });
+      const result = await dispatchOnce({
+        queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+        leaseDurationMs: 60_000, now: () => T0,
+        async execute() { throw new Error('settled run must not execute'); },
+      });
+      assert.equal(result.outcome, 'existing_claim');
+      assert.equal(runtime.updates, 0);
+    });
+  }
 
   it('resumes a claimed run from its durable profile when current profile config is unavailable', async () => {
     const runtime = new CommandRuntime(QUEUE);
@@ -385,6 +430,31 @@ describe('dispatch queue protocol', () => {
       now: () => T0,
     });
     assert.deepEqual(executions, [undefined]);
+  });
+
+  it('passes the immutable claim id when creating a new dispatched run', async () => {
+    const runtime = new CommandRuntime(QUEUE);
+    const store = new MemoryStore();
+    const selected = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
+    const received: Array<{ ref: string; profile: string; claimId: string }> = [];
+    await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
+      workflow: { store, github: new GitHub() } as unknown as WorkflowDependencies,
+      runtime,
+      resolveExecutionProfile: (profile) => {
+        assert.equal(profile, 'complex');
+        return selected;
+      },
+      runIssue: async (ref, execution, claimId) => {
+        received.push({ ref, profile: execution?.profile ?? '', claimId });
+        return { outcome: 'needs_human', run: { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'new-run', selected, claimId), state: 'NEEDS_HUMAN' as const }, reason: 'parked for test' };
+      },
+      resumeClaimedRun: async () => { throw new Error('must create, not resume'); },
+      now: () => T0,
+    });
+    assert.equal(received.length, 1);
+    assert.equal(received[0]?.ref, 'acme/widgets#18');
+    assert.equal(received[0]?.profile, 'complex');
+    assert.equal(received[0]?.claimId, parseDispatchRuntime(runtime.comments[0]!.body)?.claimId);
   });
 
   it('rejects recovery when the durable profile and retained claim disagree', async () => {

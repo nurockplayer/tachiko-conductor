@@ -12,6 +12,7 @@ export function createRun(
   now: string = new Date().toISOString(),
   id: string = randomUUID(),
   execution?: ResolvedExecutionConfiguration,
+  dispatchClaimId?: string,
 ): Run {
   return {
     id,
@@ -21,5 +22,6 @@ export function createRun(
     updatedAt: now,
     history: [],
     ...(execution === undefined ? {} : { execution }),
+    ...(dispatchClaimId === undefined ? {} : { dispatchClaimId }),
   };
 }
