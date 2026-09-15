@@ -78,7 +78,7 @@ const USAGE = `Tachiko Conductor — local orchestration core.
 Usage:
   tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> [--browser-profile <profile>]
   tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
-  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>)
+  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical>
   tachiko run show <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
@@ -106,6 +106,8 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 {"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
+New issue runs also require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
+the selected --execution-profile is persisted with the run.
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
 in the foreground; use status/stop from another terminal.

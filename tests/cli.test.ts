@@ -765,6 +765,14 @@ describe('CLI end-to-end across processes', () => {
         return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', status: result.status };
       };
 
+      const help = runCli(['--help']);
+      assert.equal(help.status, 0);
+      assert.match(
+        help.stdout,
+        /run create --owner <owner> --repo <repo> \(--issue <n> \| --branch <branch>\) --execution-profile <routine\|standard\|complex\|critical>/,
+      );
+      assert.match(help.stdout, /New issue runs also require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value/);
+
       const create = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--execution-profile', 'standard']);
       const id = /Created run ([a-f0-9-]+)/.exec(create.stdout)?.[1];
       assert.ok(id, `expected a run id in output: ${create.stdout}`);

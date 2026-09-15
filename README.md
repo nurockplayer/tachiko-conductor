@@ -93,7 +93,7 @@ with `pnpm exec playwright install --with-deps chromium` before `pnpm test`.
 ```bash
 pnpm exec tsx src/cli.ts run owner/repo#123 --execution-profile standard
 pnpm exec tsx src/cli.ts run resume <id> --decision <choice>
-pnpm exec tsx src/cli.ts run create --owner acme --repo widgets --issue 42
+pnpm exec tsx src/cli.ts run create --owner acme --repo widgets --issue 42 --execution-profile standard
 pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
