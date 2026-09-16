@@ -175,14 +175,13 @@ describe('GhCliTransport', () => {
 });
 
 describe('NodeProcessRunner', () => {
-  it('consumes stdin pipe errors instead of allowing EPIPE to escape', async () => {
-    await assert.rejects(
-      new NodeProcessRunner().run(
-        process.execPath,
-        ['-e', 'process.stdin.destroy(); setTimeout(() => {}, 25)'],
-        { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024) },
-      ),
-      (error: unknown) => (error as { code?: unknown }).code === 'EPIPE',
+  it('waits for child settlement after stdin EPIPE instead of leaving an orphan', async () => {
+    const result = await new NodeProcessRunner().run(
+      process.execPath,
+      ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(7), 25)'],
+      { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024) },
     );
+
+    assert.equal(result.exitCode, 7);
   });
 });

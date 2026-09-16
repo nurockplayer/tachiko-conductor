@@ -43,6 +43,7 @@ export class NodeProcessRunner implements ProcessRunner {
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     return await new Promise<ProcessResult>((resolve, reject) => {
       let settled = false;
+      let stdinError: unknown;
       const finish = (action: () => void): void => {
         if (settled) return;
         settled = true;
@@ -60,6 +61,10 @@ export class NodeProcessRunner implements ProcessRunner {
         },
         (error: ProcessError | null, stdout: string, stderr: string) => {
           if (error === null) {
+            if (stdinError !== undefined) {
+              finish(() => reject(stdinError));
+              return;
+            }
             finish(() => resolve({ stdout, stderr, exitCode: 0 }));
             return;
           }
@@ -82,13 +87,15 @@ export class NodeProcessRunner implements ProcessRunner {
       // A child may close its read end before stdin is ended (for example,
       // EPIPE). Always consume the stream error so it cannot escape as an
       // unhandled process-level error.
-      child.stdin?.on('error', (error) => finish(() => reject(error)));
+      child.stdin?.on('error', (error) => {
+        stdinError ??= error;
+      });
       // Non-interactive CLIs may wait for piped stdin even when their prompt
       // and request are fully supplied as arguments.
       try {
         child.stdin?.end(options.stdin);
       } catch (error) {
-        finish(() => reject(error));
+        stdinError ??= error;
       }
     });
   }
