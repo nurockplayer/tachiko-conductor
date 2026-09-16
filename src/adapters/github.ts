@@ -152,4 +152,14 @@ export interface GitHubAdapter {
   listPullRequests(target: Target): Promise<readonly PullRequestSnapshot[]>;
   /** Full normalized live state for an issue-target run. */
   readLiveSnapshot(target: IssueTarget): Promise<GitHubLiveSnapshot>;
+  /** Conductor-owned association of a newly published implementation branch. */
+  createImplementationPullRequest?(request: CreateImplementationPullRequestRequest): Promise<{ readonly number: number }>;
+}
+
+export interface CreateImplementationPullRequestRequest {
+  readonly target: IssueTarget;
+  readonly headBranch: string;
+  readonly baseBranch: string;
+  readonly title: string;
+  readonly body: string;
 }

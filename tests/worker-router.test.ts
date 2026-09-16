@@ -89,12 +89,12 @@ describe('WorkerRouterAdapter', () => {
     );
   });
 
-  it('captures DeepSeek provenance and bounds worker output on failure', async () => {
+  it('keeps only recognized provenance and never persists worker output', async () => {
     const runner = new FakeRunner([result('', `[worker-router] -> deepseek-worker\n${'x'.repeat(5000)}`, 7)]);
     const response = await new WorkerRouterAdapter({ runner }).run(REQUEST);
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.join('\n') ?? '', /deepseek-worker/);
-    assert.ok((response.diagnostics?.join('\n').length ?? 0) < 5000);
+    assert.equal(response.diagnostics?.join('\n').includes('xxxxx'), false);
   });
 
   it('returns cancellation when the request is already aborted', async () => {
@@ -138,7 +138,7 @@ describe('WorkerRouterAdapter', () => {
     const response = await new WorkerRouterAdapter({ runner }).run(REQUEST);
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED));
-    assert.match(response.diagnostics?.join('\n') ?? '', /rejected/);
+    assert.equal(response.diagnostics?.join('\n').includes('rejected'), false);
   });
 
   for (const [name, error, code] of [

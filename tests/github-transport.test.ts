@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import { GitHubLiveStateError } from '../src/github/errors.js';
 import {
   GhCliTransport,
+  NodeProcessRunner,
   type ProcessResult,
   type ProcessRunner,
   type ProcessRunOptions,
@@ -169,6 +170,19 @@ describe('GhCliTransport', () => {
       new GhCliTransport({ runner: new RecordingRunner([timeout]) }).get('x'),
       'GH_TIMEOUT',
       true,
+    );
+  });
+});
+
+describe('NodeProcessRunner', () => {
+  it('consumes stdin pipe errors instead of allowing EPIPE to escape', async () => {
+    await assert.rejects(
+      new NodeProcessRunner().run(
+        process.execPath,
+        ['-e', 'process.stdin.destroy(); setTimeout(() => {}, 25)'],
+        { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024) },
+      ),
+      (error: unknown) => (error as { code?: unknown }).code === 'EPIPE',
     );
   });
 });

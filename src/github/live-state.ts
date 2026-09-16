@@ -12,11 +12,12 @@ import type {
   GitHubReviewSummary,
   IssueSnapshot,
   PullRequestSnapshot,
+  CreateImplementationPullRequestRequest,
 } from '../adapters/github.js';
 import type { IssueTarget, RepositoryTarget, Target } from '../domain/types.js';
 import { GitHubLiveStateError } from './errors.js';
 import { parseAgentHandoffs } from './handoff.js';
-import type { GitHubApiTransport } from './transport.js';
+import type { GitHubApiTransport, GitHubWriteTransport } from './transport.js';
 
 export interface LiveGitHubAdapterOptions {
   readonly transport: GitHubApiTransport;
@@ -180,6 +181,24 @@ export class LiveGitHubAdapter implements GitHubAdapter {
   constructor(options: LiveGitHubAdapterOptions) {
     this.transport = options.transport;
     this.now = options.now ?? (() => new Date().toISOString());
+  }
+
+  async createImplementationPullRequest(request: CreateImplementationPullRequestRequest): Promise<{ readonly number: number }> {
+    const transport = this.transport as Partial<GitHubWriteTransport>;
+    if (typeof transport.write !== 'function') {
+      throw new GitHubLiveStateError('GH_TRANSPORT_FAILED', 'GitHub write capability is unavailable for implementation PR creation.');
+    }
+    const path = `repos/${request.target.owner}/${request.target.repo}/pulls`;
+    const raw = asRecord(await transport.write(path, 'POST', {
+      title: request.title,
+      head: request.headBranch,
+      base: request.baseBranch,
+      body: request.body,
+    }));
+    if (raw === null || typeof raw.number !== 'number' || !Number.isSafeInteger(raw.number) || raw.number <= 0) {
+      throw invalid(path, 'created pull request has no valid number');
+    }
+    return { number: raw.number };
   }
 
   async readIssue(target: IssueTarget): Promise<IssueSnapshot> {

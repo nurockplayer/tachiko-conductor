@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -19,10 +19,9 @@ function disposableGitWorkspace(): { root: string; source: string; worker: strin
   const workspace = source;
   execFileSync('git', ['init', '--bare', '-q', remote]);
   execFileSync('git', ['init', '-q', '-b', 'main', workspace]);
-  for (const entry of readdirSync(REPO_ROOT)) {
-    if (entry === '.git' || entry === 'node_modules' || entry === '.tachiko') continue;
-    cpSync(path.join(REPO_ROOT, entry), path.join(workspace, entry), { recursive: true });
-  }
+  // Build the fixture from HEAD, never from arbitrary checkout contents.
+  const archive = execFileSync('git', ['archive', 'HEAD'], { cwd: REPO_ROOT });
+  execFileSync('tar', ['-x', '-f', '-', '-C', workspace], { input: archive });
   execFileSync('git', ['config', 'user.email', 'worker-router-smoke@example.invalid'], { cwd: workspace });
   execFileSync('git', ['config', 'user.name', 'worker-router-smoke'], { cwd: workspace });
   execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: workspace });
@@ -71,9 +70,6 @@ describe('worker-router smoke', () => {
           'Commit the marker file. Do not push it; Conductor owns publication.',
         ].join('\n'),
       });
-      if (result.exitStatus === 'failure' && result.diagnostics?.some((value) => value.includes('NOT_FOUND'))) {
-        t.skip('worker-router is not installed'); return;
-      }
       if (result.exitStatus !== 'success') throw new Error(result.diagnostics?.join('\n') ?? result.summary);
       const workerStatus = execFileSync('git', ['status', '--porcelain'], { cwd: workspace.worker, encoding: 'utf8' });
       const workerHead = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace.worker, encoding: 'utf8' }).trim();

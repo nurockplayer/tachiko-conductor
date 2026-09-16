@@ -42,6 +42,12 @@ interface ProcessError extends ExecFileException {
 export class NodeProcessRunner implements ProcessRunner {
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     return await new Promise<ProcessResult>((resolve, reject) => {
+      let settled = false;
+      const finish = (action: () => void): void => {
+        if (settled) return;
+        settled = true;
+        action();
+      };
       const child = execFile(
         file,
         [...args],
@@ -54,27 +60,36 @@ export class NodeProcessRunner implements ProcessRunner {
         },
         (error: ProcessError | null, stdout: string, stderr: string) => {
           if (error === null) {
-            resolve({ stdout, stderr, exitCode: 0 });
+            finish(() => resolve({ stdout, stderr, exitCode: 0 }));
             return;
           }
           if (options.signal?.aborted === true) {
-            reject(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }));
+            finish(() => reject(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' })));
             return;
           }
           if (error.killed) {
-            reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT' }));
+            finish(() => reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT' })));
             return;
           }
           if (typeof error.code === 'number') {
-            resolve({ stdout, stderr, exitCode: error.code });
+            const exitCode = error.code;
+            finish(() => resolve({ stdout, stderr, exitCode }));
             return;
           }
-          reject(error);
+          finish(() => reject(error));
         },
       );
+      // A child may close its read end before stdin is ended (for example,
+      // EPIPE). Always consume the stream error so it cannot escape as an
+      // unhandled process-level error.
+      child.stdin?.on('error', (error) => finish(() => reject(error)));
       // Non-interactive CLIs may wait for piped stdin even when their prompt
       // and request are fully supplied as arguments.
-      child.stdin?.end(options.stdin);
+      try {
+        child.stdin?.end(options.stdin);
+      } catch (error) {
+        finish(() => reject(error));
+      }
     });
   }
 }

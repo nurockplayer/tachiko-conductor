@@ -23,7 +23,6 @@ export const WORKER_ROUTER_ERROR_CODE = {
 } as const;
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
-const MAX_DIAGNOSTIC_LENGTH = 2_000;
 
 export interface WorkerRouterAdapterOptions {
   readonly runner?: ProcessRunner;
@@ -218,8 +217,11 @@ function workerProvenance(stderr: string): string | undefined {
 }
 
 function boundedDiagnostics(stderr: string, stdout: string, provenance: string | undefined): string[] {
-  const details = [provenance, stderr.trim(), stdout.trim()].filter((value): value is string => value !== undefined && value !== '');
-  return details.map((value) => value.length > MAX_DIAGNOSTIC_LENGTH ? `${value.slice(0, MAX_DIAGNOSTIC_LENGTH)}…` : value);
+  // Worker output is an untrusted transcript and may contain secrets or
+  // prompt material. Persist only the recognized provider marker.
+  void stderr;
+  void stdout;
+  return provenance === undefined ? [] : [provenance];
 }
 
 function failure(code: string, summary: string, durationMs: number): AgentResult { return { exitStatus: 'failure', summary, diagnostics: [`${code}: ${summary}`], durationMs }; }
