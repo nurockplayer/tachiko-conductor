@@ -566,18 +566,21 @@ describe('ManagedPlaywrightMcpRuntime', () => {
 
   it('does not release profile ownership until a startup-timeout child has actually exited', async () => {
     const childPidPath = path.join(os.tmpdir(), `tachiko-browser-child-${process.pid}-${Date.now()}.pid`);
+    const childSetupPath = path.join(os.tmpdir(), `tachiko-browser-child-${process.pid}-${Date.now()}.setup`);
     cleanups.push(() => rmSync(childPidPath, { force: true }));
+    cleanups.push(() => rmSync(childSetupPath, { force: true }));
     let releaseReadiness: () => void;
     const readinessGate = new Promise<void>((resolve) => { releaseReadiness = resolve; });
     const { runtime, profileRoot } = tempRuntime({
       ...process.env,
       FAKE_MCP_MODE: 'hang-ignore-term',
       FAKE_MCP_PID_PATH: childPidPath,
+      FAKE_MCP_SETUP_PATH: childSetupPath,
     }, async () => {
       // Do not let fixture setup suspend the runtime's global startup deadline.
-      // Once the child has published its PID, hold readiness until the test
-      // has attached the lifecycle assertion.
-      if (!existsSync(childPidPath)) return false;
+      // Once the child has published its PID and installed its signal handler,
+      // hold readiness until the test has attached the lifecycle assertion.
+      if (!existsSync(childPidPath) || !existsSync(childSetupPath)) return false;
       await readinessGate;
       return false;
     });
@@ -588,7 +591,7 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT),
     );
     await Promise.race([
-      waitUntil(() => existsSync(childPidPath)).then(() => undefined),
+      waitUntil(() => existsSync(childSetupPath)).then(() => undefined),
       startRejected.then(() => {
         throw new Error('Startup timed out before the fixture published its child PID.');
       }),
