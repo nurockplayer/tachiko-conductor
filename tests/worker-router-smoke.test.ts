@@ -20,8 +20,10 @@ function disposableGitWorkspace(): { root: string; source: string; worker: strin
   execFileSync('git', ['init', '--bare', '-q', remote]);
   execFileSync('git', ['init', '-q', '-b', 'main', workspace]);
   // Build the fixture from HEAD, never from arbitrary checkout contents.
-  const archive = execFileSync('git', ['archive', 'HEAD'], { cwd: REPO_ROOT });
-  execFileSync('tar', ['-x', '-f', '-', '-C', workspace], { input: archive });
+  // Write the archive to disk so fixture size is not limited by execFileSync's stdout buffer.
+  const archivePath = path.join(root, 'fixture.tar');
+  execFileSync('git', ['archive', '--format=tar', '-o', archivePath, 'HEAD'], { cwd: REPO_ROOT });
+  execFileSync('tar', ['-x', '-f', archivePath, '-C', workspace]);
   execFileSync('git', ['config', 'user.email', 'worker-router-smoke@example.invalid'], { cwd: workspace });
   execFileSync('git', ['config', 'user.name', 'worker-router-smoke'], { cwd: workspace });
   execFileSync('git', ['remote', 'add', 'origin', remote], { cwd: workspace });
