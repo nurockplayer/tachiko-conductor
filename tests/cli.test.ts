@@ -163,7 +163,7 @@ describe('CLI command layer', () => {
   });
 
   it('resolves the implementation provider and explicit Codex execution config without choosing a model', () => {
-    assert.equal(resolveImplementationProvider({}), 'claude-code');
+    assert.equal(resolveImplementationProvider({}), 'worker-router');
     assert.equal(resolveImplementationProvider({ TACHIKO_IMPLEMENTATION_AGENT: 'codex-cli' }), 'codex-cli');
     assert.deepEqual(resolveCodexExecutionConfig({}), {});
     assert.deepEqual(resolveCodexExecutionConfig({

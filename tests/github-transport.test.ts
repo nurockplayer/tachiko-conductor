@@ -4,6 +4,7 @@ import { describe, it } from 'node:test';
 import { GitHubLiveStateError } from '../src/github/errors.js';
 import {
   GhCliTransport,
+  NodeProcessRunner,
   type ProcessResult,
   type ProcessRunner,
   type ProcessRunOptions,
@@ -170,5 +171,17 @@ describe('GhCliTransport', () => {
       'GH_TIMEOUT',
       true,
     );
+  });
+});
+
+describe('NodeProcessRunner', () => {
+  it('waits for child settlement after stdin EPIPE instead of leaving an orphan', async () => {
+    const result = await new NodeProcessRunner().run(
+      process.execPath,
+      ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(7), 25)'],
+      { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024) },
+    );
+
+    assert.equal(result.exitCode, 7);
   });
 });
