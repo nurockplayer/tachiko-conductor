@@ -574,19 +574,27 @@ describe('ManagedPlaywrightMcpRuntime', () => {
       FAKE_MCP_MODE: 'hang-ignore-term',
       FAKE_MCP_PID_PATH: childPidPath,
     }, async () => {
-      // Wait until the fixture has published its child PID before exercising
-      // the startup-timeout cleanup assertion.
+      // Do not let fixture setup suspend the runtime's global startup deadline.
+      // Once the child has published its PID, hold readiness until the test
+      // has attached the lifecycle assertion.
+      if (!existsSync(childPidPath)) return false;
       await readinessGate;
       return false;
     });
 
     const starting = runtime.start({ profile: 'timeout-cleanup', port: await freePort(), startupTimeoutMs: 500, stopTimeoutMs: 150 });
-    await waitUntil(() => existsSync(childPidPath));
-    releaseReadiness!();
-    await assert.rejects(
+    const startRejected = assert.rejects(
       starting,
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT),
     );
+    await Promise.race([
+      waitUntil(() => existsSync(childPidPath)).then(() => undefined),
+      startRejected.then(() => {
+        throw new Error('Startup timed out before the fixture published its child PID.');
+      }),
+    ]);
+    releaseReadiness!();
+    await startRejected;
 
     const childPid = Number(readFileSync(childPidPath, 'utf8').trim());
     assert.equal(processIsAlive(childPid), false);
