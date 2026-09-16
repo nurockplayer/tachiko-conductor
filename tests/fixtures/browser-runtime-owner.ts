@@ -1,9 +1,9 @@
-import { writeFileSync } from 'node:fs';
+import { existsSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 
 import { ManagedPlaywrightMcpRuntime } from '../../src/browser/playwright-mcp-runtime.js';
 
-const [profileRoot, runtimeRoot, repositoryRoot, playwrightCliPath, profile, portText, snapshotPath] = process.argv.slice(2);
+const [profileRoot, runtimeRoot, repositoryRoot, playwrightCliPath, profile, portText, snapshotPath, readinessReleasePath] = process.argv.slice(2);
 if (
   profileRoot === undefined ||
   runtimeRoot === undefined ||
@@ -36,7 +36,12 @@ const runtime = new ManagedPlaywrightMcpRuntime({
   runtimeRoot,
   repositoryRoot,
   playwrightCliPath,
-  readinessProbe: tcpReadinessProbe,
+  readinessProbe: async (endpoint) => {
+    // The parent test releases readiness only after the fake MCP child has
+    // published its PID, separating fixture bootstrap from owner-death proof.
+    if (readinessReleasePath !== undefined && !existsSync(readinessReleasePath)) return false;
+    return await tcpReadinessProbe(endpoint);
+  },
 });
 const handle = await runtime.start({ profile, port: Number(portText), stopTimeoutMs: 250 });
 writeFileSync(snapshotPath, `${JSON.stringify(handle.snapshot)}\n`, { mode: 0o600 });

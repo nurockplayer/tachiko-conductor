@@ -20,6 +20,9 @@ if (process.env.FAKE_MCP_MODE === 'exit') {
 
 if (process.env.FAKE_MCP_MODE === 'hang' || process.env.FAKE_MCP_MODE === 'hang-ignore-term') {
   if (process.env.FAKE_MCP_MODE === 'hang-ignore-term') process.on('SIGTERM', () => undefined);
+  if (process.env.FAKE_MCP_SETUP_PATH) {
+    fs.writeFileSync(process.env.FAKE_MCP_SETUP_PATH, `${process.pid}\n`, { mode: 0o600 });
+  }
   process.stdin.resume();
   process.stdin.on('close', () => process.exit(0));
   setInterval(() => {}, 1_000);

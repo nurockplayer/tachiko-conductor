@@ -402,6 +402,9 @@ export async function runWorkflow(
             ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : undefined
         );
+        if (run.execution?.executor === 'worker-router' && snapshot.pullRequest !== null && bootstrap === undefined) {
+          return park(run, 'Worker-router requires a verified prepared workspace and branch for an existing implementation pull request.', store, now);
+        }
         let result;
         try {
           result = await implementation.run({
@@ -449,6 +452,18 @@ export async function runWorkflow(
           if (result.headSha === undefined || deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
           try {
             await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
+            if (run.execution?.executor === 'worker-router' && snapshot.pullRequest === null) {
+              if (deps.github.createImplementationPullRequest === undefined) {
+                return bootstrapFailureOutcome(run, new Error('Worker-router implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
+              }
+              await deps.github.createImplementationPullRequest({
+                target,
+                headBranch: bootstrap.branch,
+                baseBranch: bootstrap.baseBranch,
+                title: `Implement ${formatTarget(target)}`,
+                body: `Closes #${target.issueNumber}\n\nConductor-owned implementation pull request for ${formatTarget(target)}.`,
+              });
+            }
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);

@@ -333,6 +333,7 @@ export async function runReviewLoop(
           supplementalInstructions: blockingFindings,
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           capabilities: await deps.resolveImplementationCapabilities?.(), sessionId: run.agentResult?.sessionId, executor: run.executor,
+          ...(run.execution === undefined ? {} : { execution: run.execution }),
         });
       } catch (error) {
         if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now);

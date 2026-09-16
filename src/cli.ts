@@ -13,6 +13,7 @@ import {
 } from './agents/codex-cli.js';
 import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter } from './agents/codex-app-server.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
+import { WORKER_ROUTER_PROVIDER, WorkerRouterAdapter } from './agents/worker-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
@@ -125,7 +126,7 @@ in the foreground; use status/stop from another terminal.
 export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
 export { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
 
-export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER;
+export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER | typeof WORKER_ROUTER_PROVIDER;
 export type CodexExecutionConfig = Pick<
   CodexCliAdapterOptions,
   'model' | 'reasoningEffort' | 'sandboxMode' | 'approvalPolicy' | 'timeoutMs'
@@ -141,7 +142,7 @@ export function resolveSelectedExecutionProfile(
   const execution = resolveExecutionProfile(
     parseExecutionProfileConfiguration(raw),
     selected,
-    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER],
+    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER, WORKER_ROUTER_PROVIDER],
   );
   assertExecutionSupportedByProvider(execution);
   return execution;
@@ -160,12 +161,12 @@ function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
   return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(os.homedir(), '.tachiko-conductor', 'dispatch', 'once.lock');
 }
 
-/** Provider selection is external to adapters; existing installs remain on Claude by default. */
+/** Provider selection is external to adapters; the stateless local router is the default path. */
 export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
-  const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? CLAUDE_CODE_PROVIDER;
-  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER) return value;
+  const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? WORKER_ROUTER_PROVIDER;
+  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER || value === WORKER_ROUTER_PROVIDER) return value;
   throw new Error(
-    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER} or ${CODEX_CLI_PROVIDER}.`,
+    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER}, ${CODEX_CLI_PROVIDER}, or ${WORKER_ROUTER_PROVIDER}.`,
   );
 }
 
@@ -830,6 +831,10 @@ function buildWorkflowDeps(
             ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
             timeoutMs: execution.timeoutMs,
           }),
+        }),
+        [WORKER_ROUTER_PROVIDER]: (execution) => new WorkerRouterAdapter({
+          cwd: process.cwd(),
+          ...(execution === undefined ? {} : { timeoutMs: execution.timeoutMs }),
         }),
       },
     }),
