@@ -74,7 +74,10 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
-function tempRuntime(env: NodeJS.ProcessEnv = process.env): {
+function tempRuntime(
+  env: NodeJS.ProcessEnv = process.env,
+  readinessProbe: (endpoint: string) => Promise<boolean> = tcpReadinessProbe,
+): {
   runtime: ManagedPlaywrightMcpRuntime;
   root: string;
   profileRoot: string;
@@ -91,7 +94,7 @@ function tempRuntime(env: NodeJS.ProcessEnv = process.env): {
       repositoryRoot: REPO_ROOT,
       playwrightCliPath: FAKE_MCP,
       env,
-      readinessProbe: tcpReadinessProbe,
+      readinessProbe,
     }),
     root,
     profileRoot,
@@ -564,14 +567,24 @@ describe('ManagedPlaywrightMcpRuntime', () => {
   it('does not release profile ownership until a startup-timeout child has actually exited', async () => {
     const childPidPath = path.join(os.tmpdir(), `tachiko-browser-child-${process.pid}-${Date.now()}.pid`);
     cleanups.push(() => rmSync(childPidPath, { force: true }));
+    let releaseReadiness: () => void;
+    const readinessGate = new Promise<void>((resolve) => { releaseReadiness = resolve; });
     const { runtime, profileRoot } = tempRuntime({
       ...process.env,
       FAKE_MCP_MODE: 'hang-ignore-term',
       FAKE_MCP_PID_PATH: childPidPath,
+    }, async () => {
+      // Wait until the fixture has published its child PID before exercising
+      // the startup-timeout cleanup assertion.
+      await readinessGate;
+      return false;
     });
 
+    const starting = runtime.start({ profile: 'timeout-cleanup', port: await freePort(), startupTimeoutMs: 500, stopTimeoutMs: 150 });
+    await waitUntil(() => existsSync(childPidPath));
+    releaseReadiness!();
     await assert.rejects(
-      runtime.start({ profile: 'timeout-cleanup', port: await freePort(), startupTimeoutMs: 500, stopTimeoutMs: 150 }),
+      starting,
       (error) => assertRuntimeError(error, BROWSER_RUNTIME_ERROR_CODE.STARTUP_TIMEOUT),
     );
 
@@ -722,16 +735,19 @@ describe('ManagedPlaywrightMcpRuntime', () => {
     const runtimeRoot = path.join(root, 'runtimes');
     const snapshotPath = path.join(root, 'owner-snapshot.json');
     const childPidPath = path.join(root, 'mcp-child.pid');
+    const readinessReleasePath = path.join(root, 'release-readiness');
     const port = await freePort();
     const owner = spawn(
       process.execPath,
-      ['--import', 'tsx', RUNTIME_OWNER, profileRoot, runtimeRoot, REPO_ROOT, FAKE_MCP, 'orphan-safe', String(port), snapshotPath],
+      ['--import', 'tsx', RUNTIME_OWNER, profileRoot, runtimeRoot, REPO_ROOT, FAKE_MCP, 'orphan-safe', String(port), snapshotPath, readinessReleasePath],
       { stdio: 'ignore', env: { ...process.env, FAKE_MCP_PID_PATH: childPidPath } },
     );
     cleanups.push(() => {
       owner.kill('SIGKILL');
     });
-    await waitUntil(() => existsSync(snapshotPath) && existsSync(childPidPath));
+    await waitUntil(() => existsSync(childPidPath));
+    writeFileSync(readinessReleasePath, 'ready\n', { mode: 0o600 });
+    await waitUntil(() => existsSync(snapshotPath));
     const snapshot = JSON.parse(readFileSync(snapshotPath, 'utf8')) as { pid: number };
     const mcpPid = Number(readFileSync(childPidPath, 'utf8').trim());
     cleanups.push(() => {
