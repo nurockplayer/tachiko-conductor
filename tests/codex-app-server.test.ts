@@ -96,6 +96,28 @@ class DelayedStartTurnClient extends FakeClient {
   }
 }
 
+class LateNotificationClient extends FakeClient {
+  override async startTurn(threadId: string, prompt: string): Promise<string> {
+    this.prompts.push(prompt);
+    this.calls.push(`turn/start:${threadId}`);
+    return new Promise(() => {});
+  }
+
+  override async observeThread(threadId: string): Promise<NativeThreadObservation> {
+    this.calls.push(`read:${threadId}`);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    this.emitEvent({ type: 'turn_started', threadId, turnId: 'turn-late' });
+    return { threadId, status: 'idle', history: [] };
+  }
+}
+
+class HangingObserveClient extends FakeClient {
+  override async observeThread(threadId: string): Promise<NativeThreadObservation> {
+    this.calls.push(`read:${threadId}`);
+    return new Promise(() => {});
+  }
+}
+
 class HangingFactory implements CodexAppServerClientFactory {
   async open(): Promise<CodexAppServerClient> {
     return new Promise(() => {});
@@ -247,6 +269,35 @@ describe('CodexAppServerAdapter', () => {
     assert.deepEqual(client.calls, [
       'thread/start', 'turn/start:thread-new', 'read:thread-new', 'turn/interrupt:thread-new:turn-delayed', 'close',
     ]);
+  });
+
+  it('uses a turn/started notification that arrives during bounded cleanup discovery', async () => {
+    const client = new LateNotificationClient();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
+    assert.deepEqual(client.calls, [
+      'thread/start', 'turn/start:thread-new', 'read:thread-new', 'turn/interrupt:thread-new:turn-late', 'close',
+    ]);
+  });
+
+  it('bounds native observation by the configured execution timeout', async () => {
+    const client = new HangingObserveClient();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
+    await assert.rejects(() => adapter.observeRuntime(EXECUTOR), /timed out/i);
+    assert.deepEqual(client.calls, ['read:thread-1', 'close']);
+  });
+
+  it('cancels an in-flight active-turn control observation and closes the component', async () => {
+    const client = new HangingObserveClient();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner() });
+    const controller = new AbortController();
+    const pending = adapter.steerActiveTurn(request({ executor: EXECUTOR, signal: controller.signal }), 'turn-1', 'please stop');
+    await waitForCall(client, 'read:thread-1');
+    controller.abort();
+    await assert.rejects(() => pending, /cancelled/i);
+    assert.deepEqual(client.calls, ['read:thread-1', 'close']);
   });
 
   it('stops waiting for a native turn when the selected execution is cancelled', async () => {

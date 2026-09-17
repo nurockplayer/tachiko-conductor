@@ -144,37 +144,22 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       ...appServerCapabilityConfig(request.capabilities ?? []),
     };
     const deadlineAt = Date.now() + this.timeoutMs;
-    const openController = new AbortController();
-    const forwardOpenAbort = () => openController.abort(request.signal?.reason);
-    if (request.signal?.aborted) forwardOpenAbort();
-    else request.signal?.addEventListener('abort', forwardOpenAbort, { once: true });
-    const openTimeout = setTimeout(() => openController.abort(new AppServerTimeoutError()), this.timeoutMs);
     let client: CodexAppServerClient;
-    let openPromise: Promise<CodexAppServerClient> | undefined;
     try {
-      client = await runWithinDeadline(() => {
-        openPromise = this.clientFactory.open({ signal: openController.signal });
-        return openPromise;
-      }, deadlineAt, request.signal);
+      client = await this.openClient(deadlineAt, request.signal);
     } catch (error) {
-      if ((error instanceof AppServerTimeoutError || error instanceof AppServerCancelledError) && openPromise !== undefined) {
-        void openPromise.then((lateClient) => lateClient.close()).catch(() => undefined);
-      }
       if (error instanceof AppServerUnavailableError) return this.runFallback(request);
       if (error instanceof AppServerTimeoutError) {
         return failure(CODEX_APP_SERVER_ERROR_CODE.TIMEOUT, `Codex App Server execution timed out after ${this.timeoutMs}ms.`, request.executor);
       }
       if (error instanceof AppServerCancelledError) return cancelled(request.executor);
       return failure(CODEX_APP_SERVER_ERROR_CODE.UNAVAILABLE, message(error), request.executor);
-    } finally {
-      clearTimeout(openTimeout);
-      request.signal?.removeEventListener('abort', forwardOpenAbort);
     }
     const startedAt = Date.now();
     const withinBoundary = <T>(operation: () => Promise<T>): Promise<T> =>
       runWithinDeadline(operation, deadlineAt, request.signal);
     let executor: ExecutorIdentity | undefined = request.executor;
-    let activeTurn: { readonly threadId: string; readonly turnId: string } | undefined;
+    const activeTurn: { current?: { readonly threadId: string; readonly turnId: string } } = {};
     let threadId: string | undefined;
     let turnStartAttempted = false;
     let removeTurnListener: (() => void) | undefined;
@@ -204,24 +189,24 @@ export class CodexAppServerAdapter implements ImplementationAgent {
         if (event.type === 'approval_denied') return;
         if (event.threadId !== turnThreadId) return;
         if (event.type === 'turn_started') {
-          if (!completedTurnIds.has(event.turnId)) activeTurn = { threadId: event.threadId, turnId: event.turnId };
+          if (!completedTurnIds.has(event.turnId)) activeTurn.current = { threadId: event.threadId, turnId: event.turnId };
           return;
         }
         if (event.type === 'turn_completed') {
           completedTurnIds.add(event.turnId);
-          if (activeTurn?.threadId === event.threadId && activeTurn.turnId === event.turnId) activeTurn = undefined;
+          if (activeTurn.current?.threadId === event.threadId && activeTurn.current.turnId === event.turnId) activeTurn.current = undefined;
         }
       });
       turnStartAttempted = true;
       const turnId = await withinBoundary(() => client.startTurn(turnThreadId, prompt));
-      if (!completedTurnIds.has(turnId)) activeTurn = { threadId: turnThreadId, turnId };
+      if (!completedTurnIds.has(turnId)) activeTurn.current = { threadId: turnThreadId, turnId };
       executor = {
         provider: CODEX_APP_SERVER_PROVIDER,
         sessionId: turnThreadId,
         generation: request.runtimeOwnership.generation,
       };
       const terminal = await withinBoundary(() => client.waitForTurn(turnThreadId, turnId));
-      activeTurn = undefined;
+      activeTurn.current = undefined;
       if (terminal.status !== 'completed') {
         return failure(CODEX_APP_SERVER_ERROR_CODE.PROTOCOL, `Codex App Server turn ${turnId} ended ${terminal.status}.`, executor);
       }
@@ -257,8 +242,9 @@ export class CodexAppServerAdapter implements ImplementationAgent {
   /** Side-effect-free native observation; it never starts or resumes a turn. */
   async observeRuntime(executor: ExecutorIdentity): Promise<NativeThreadObservation> {
     if (!isAppServerExecutor(executor)) throw new Error('Native observation requires a Codex App Server executor identity.');
-    const client = await this.clientFactory.open();
-    try { return await client.observeThread(executor.sessionId); } finally { await client.close(); }
+    const deadlineAt = Date.now() + this.timeoutMs;
+    const client = await this.openClient(deadlineAt, undefined);
+    try { return await runWithinDeadline(() => client.observeThread(executor.sessionId), deadlineAt, undefined); } finally { await client.close(); }
   }
 
   /** Steer only an exact observed active turn under the durable Run fence. */
@@ -275,41 +261,48 @@ export class CodexAppServerAdapter implements ImplementationAgent {
     if (request.executor === undefined || !isAppServerExecutor(request.executor) || !hasOwnership(request)) {
       throw new Error('Native active-turn control requires an exact App Server executor and durable ownership fence.');
     }
-    const client = await this.clientFactory.open();
+    const deadlineAt = Date.now() + this.timeoutMs;
+    const client = await this.openClient(deadlineAt, request.signal);
     try {
-      const observation = await client.observeThread(request.executor.sessionId);
+      const observation = await runWithinDeadline(() => client.observeThread(request.executor!.sessionId), deadlineAt, request.signal);
       if (observation.status !== 'active' || observation.activeTurnId !== turnId) {
         throw new Error('Native active-turn control refused: the observed active turn does not match the expected turn.');
       }
       await assertWorkspaceGuard(request.workspaceGuard);
-      return await action(client, request.executor);
+      return await runWithinDeadline(() => action(client, request.executor!), deadlineAt, request.signal);
     } finally { await client.close(); }
   }
 
   private async interruptExactTurn(
     client: CodexAppServerClient,
     threadId: string | undefined,
-    activeTurn: { readonly threadId: string; readonly turnId: string } | undefined,
+    activeTurn: { current?: { readonly threadId: string; readonly turnId: string } },
     turnStartAttempted: boolean,
   ): Promise<void> {
     if (!turnStartAttempted || threadId === undefined) return;
     const deadlineAt = Date.now() + APP_SERVER_INTERRUPT_GRACE_MS;
-    let exactTurn = activeTurn;
+    let exactTurn = activeTurn.current;
     while (exactTurn === undefined && Date.now() < deadlineAt) {
+      exactTurn = activeTurn.current;
+      if (exactTurn !== undefined) break;
       try {
         const observation = await waitForNativeOperation(
           client.observeThread(threadId),
           Math.max(1, deadlineAt - Date.now()),
           undefined,
         );
-        if (observation.status === 'active' && observation.activeTurnId !== undefined) {
+        exactTurn = activeTurn.current;
+        if (exactTurn === undefined && observation.status === 'active' && observation.activeTurnId !== undefined) {
           exactTurn = { threadId, turnId: observation.activeTurnId };
+          activeTurn.current = exactTurn;
         }
       } catch {
-        break;
+        exactTurn = activeTurn.current;
+        if (exactTurn === undefined) break;
       }
       if (exactTurn === undefined) await new Promise((resolve) => setTimeout(resolve, APP_SERVER_ACTIVE_TURN_POLL_MS));
     }
+    exactTurn ??= activeTurn.current;
     if (exactTurn === undefined) return;
     try {
       await waitForNativeOperation(
@@ -319,6 +312,29 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       );
     } catch {
       // Component shutdown remains the bounded last resort when native interrupt is unavailable.
+    }
+  }
+
+  private async openClient(deadlineAt: number, signal: AbortSignal | undefined): Promise<CodexAppServerClient> {
+    const openController = new AbortController();
+    const forwardAbort = () => openController.abort(signal?.reason);
+    if (signal?.aborted) forwardAbort();
+    else signal?.addEventListener('abort', forwardAbort, { once: true });
+    const timeout = setTimeout(() => openController.abort(new AppServerTimeoutError()), Math.max(0, deadlineAt - Date.now()));
+    let openPromise: Promise<CodexAppServerClient> | undefined;
+    try {
+      return await runWithinDeadline(() => {
+        openPromise = this.clientFactory.open({ signal: openController.signal });
+        return openPromise;
+      }, deadlineAt, signal);
+    } catch (error) {
+      if ((error instanceof AppServerTimeoutError || error instanceof AppServerCancelledError) && openPromise !== undefined) {
+        void openPromise.then((lateClient) => lateClient.close()).catch(() => undefined);
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      signal?.removeEventListener('abort', forwardAbort);
     }
   }
 
@@ -621,8 +637,12 @@ function parseHumanTakeover(summary: string | undefined): string | undefined {
   return reason === '' ? 'A human browser takeover is required.' : reason;
 }
 
-class AppServerTimeoutError extends Error {}
-class AppServerCancelledError extends Error {}
+class AppServerTimeoutError extends Error {
+  constructor() { super('Codex App Server operation timed out.'); }
+}
+class AppServerCancelledError extends Error {
+  constructor() { super('Codex App Server operation was cancelled.'); }
+}
 
 const APP_SERVER_INTERRUPT_GRACE_MS = 1_000;
 const APP_SERVER_ACTIVE_TURN_POLL_MS = 25;
