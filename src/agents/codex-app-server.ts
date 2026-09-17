@@ -147,14 +147,19 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       return failure(CODEX_APP_SERVER_ERROR_CODE.UNAVAILABLE, message(error), request.executor);
     }
     const startedAt = Date.now();
+    const deadlineAt = startedAt + this.timeoutMs;
+    const withinBoundary = <T>(operation: () => Promise<T>): Promise<T> =>
+      runWithinDeadline(operation, deadlineAt, request.signal);
     let executor: ExecutorIdentity | undefined = request.executor;
+    let activeTurn: { readonly threadId: string; readonly turnId: string } | undefined;
+    let removeTurnListener: (() => void) | undefined;
     try {
       const prompt = buildPrompt(request);
       let threadId: string;
       if (request.executor === undefined) {
-        threadId = await client.startThread(threadOptions);
+        threadId = await withinBoundary(() => client.startThread(threadOptions));
       } else {
-        const observation = await client.observeThread(request.executor.sessionId);
+        const observation = await withinBoundary(() => client.observeThread(request.executor!.sessionId));
         if (observation.threadId !== request.executor.sessionId || observation.status === 'active' || observation.activeTurnId !== undefined) {
           return failure(
             CODEX_APP_SERVER_ERROR_CODE.RECONCILIATION_BLOCKED,
@@ -162,19 +167,34 @@ export class CodexAppServerAdapter implements ImplementationAgent {
             request.executor,
           );
         }
-        threadId = await client.resumeThread(request.executor.sessionId, threadOptions);
+        threadId = await withinBoundary(() => client.resumeThread(request.executor!.sessionId, threadOptions));
         if (threadId !== request.executor.sessionId) {
           return failure(CODEX_APP_SERVER_ERROR_CODE.RECONCILIATION_BLOCKED, 'Native resume returned a different thread identity.', request.executor);
         }
       }
       await assertWorkspaceGuard(request.workspaceGuard);
-      const turnId = await client.startTurn(threadId, prompt);
+      const completedTurnIds = new Set<string>();
+      removeTurnListener = client.onEvent((event) => {
+        if (event.type === 'approval_denied') return;
+        if (event.threadId !== threadId) return;
+        if (event.type === 'turn_started') {
+          if (!completedTurnIds.has(event.turnId)) activeTurn = { threadId: event.threadId, turnId: event.turnId };
+          return;
+        }
+        if (event.type === 'turn_completed') {
+          completedTurnIds.add(event.turnId);
+          if (activeTurn?.threadId === event.threadId && activeTurn.turnId === event.turnId) activeTurn = undefined;
+        }
+      });
+      const turnId = await withinBoundary(() => client.startTurn(threadId, prompt));
+      if (!completedTurnIds.has(turnId)) activeTurn = { threadId, turnId };
       executor = {
         provider: CODEX_APP_SERVER_PROVIDER,
         sessionId: threadId,
         generation: request.runtimeOwnership.generation,
       };
-      const terminal = await waitForTurn(client.waitForTurn(threadId, turnId), this.timeoutMs, request.signal);
+      const terminal = await withinBoundary(() => client.waitForTurn(threadId, turnId));
+      activeTurn = undefined;
       if (terminal.status !== 'completed') {
         return failure(CODEX_APP_SERVER_ERROR_CODE.PROTOCOL, `Codex App Server turn ${turnId} ended ${terminal.status}.`, executor);
       }
@@ -193,12 +213,16 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       if (headSha === null) return failure(CODEX_APP_SERVER_ERROR_CODE.HEAD_READ_FAILED, `Codex completed, but an exact 40-hex HEAD could not be read from ${workspacePath}.`, executor);
       return { exitStatus: 'success', summary: terminal.summary ?? 'Codex App Server turn completed.', headSha, executor, durationMs: Date.now() - startedAt };
     } catch (error) {
+      if (error instanceof AppServerTimeoutError || error instanceof AppServerCancelledError) {
+        await this.interruptExactTurn(client, activeTurn);
+      }
       if (error instanceof AppServerTimeoutError) {
-        return failure(CODEX_APP_SERVER_ERROR_CODE.TIMEOUT, `Codex App Server turn timed out after ${this.timeoutMs}ms.`, executor);
+        return failure(CODEX_APP_SERVER_ERROR_CODE.TIMEOUT, `Codex App Server execution timed out after ${this.timeoutMs}ms.`, executor);
       }
       if (error instanceof AppServerCancelledError) return cancelled(executor);
       return failure(CODEX_APP_SERVER_ERROR_CODE.PROTOCOL, message(error), executor);
     } finally {
+      removeTurnListener?.();
       await client.close();
     }
   }
@@ -230,8 +254,21 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       if (observation.status !== 'active' || observation.activeTurnId !== turnId) {
         throw new Error('Native active-turn control refused: the observed active turn does not match the expected turn.');
       }
+      await assertWorkspaceGuard(request.workspaceGuard);
       return await action(client, request.executor);
     } finally { await client.close(); }
+  }
+
+  private async interruptExactTurn(
+    client: CodexAppServerClient,
+    activeTurn: { readonly threadId: string; readonly turnId: string } | undefined,
+  ): Promise<void> {
+    if (activeTurn === undefined) return;
+    try {
+      await waitForNativeOperation(client.interruptTurn(activeTurn.threadId, activeTurn.turnId), APP_SERVER_INTERRUPT_GRACE_MS, undefined);
+    } catch {
+      // Component shutdown remains the bounded last resort when native interrupt is unavailable.
+    }
   }
 
   private async runFallback(request: ImplementationRequest): Promise<AgentResult> {
@@ -517,18 +554,35 @@ function parseHumanTakeover(summary: string | undefined): string | undefined {
 class AppServerTimeoutError extends Error {}
 class AppServerCancelledError extends Error {}
 
-function waitForTurn<T>(turn: Promise<T>, timeoutMs: number, signal: AbortSignal | undefined): Promise<T> {
+const APP_SERVER_INTERRUPT_GRACE_MS = 1_000;
+
+function runWithinDeadline<T>(operation: () => Promise<T>, deadlineAt: number, signal: AbortSignal | undefined): Promise<T> {
+  if (signal?.aborted === true) return Promise.reject(new AppServerCancelledError());
+  const timeoutMs = deadlineAt - Date.now();
+  if (timeoutMs <= 0) return Promise.reject(new AppServerTimeoutError());
+  try {
+    return waitForNativeOperation(operation(), timeoutMs, signal);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function waitForNativeOperation<T>(operation: Promise<T>, timeoutMs: number, signal: AbortSignal | undefined): Promise<T> {
   if (signal?.aborted === true) return Promise.reject(new AppServerCancelledError());
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => finish(() => reject(new AppServerTimeoutError())), timeoutMs);
-    const onAbort = () => finish(() => reject(new AppServerCancelledError()));
+    let settled = false;
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     const finish = (complete: () => void) => {
-      clearTimeout(timeout);
+      if (settled) return;
+      settled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
       signal?.removeEventListener('abort', onAbort);
       complete();
     };
+    timeout = setTimeout(() => finish(() => reject(new AppServerTimeoutError())), timeoutMs);
+    const onAbort = () => finish(() => reject(new AppServerCancelledError()));
     signal?.addEventListener('abort', onAbort, { once: true });
-    turn.then((value) => finish(() => resolve(value)), (error: unknown) => finish(() => reject(error)));
+    operation.then((value) => finish(() => resolve(value)), (error: unknown) => finish(() => reject(error)));
   });
 }
 
