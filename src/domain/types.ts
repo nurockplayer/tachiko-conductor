@@ -92,6 +92,11 @@ export type AgentExitStatus = 'success' | 'failure';
 export interface ExecutorIdentity {
   readonly provider: string;
   readonly sessionId: string;
+  /**
+   * A durable Run-owned fence for runtimes which can address an active native
+   * thread.  It is deliberately not a process id or an App Server identity.
+   */
+  readonly generation?: string;
 }
 
 export interface AgentResult {
