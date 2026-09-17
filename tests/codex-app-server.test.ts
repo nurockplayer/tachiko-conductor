@@ -83,6 +83,25 @@ class HangingStartTurnClient extends FakeClient {
   }
 }
 
+class DelayedStartTurnClient extends FakeClient {
+  override async startTurn(threadId: string, prompt: string): Promise<string> {
+    this.prompts.push(prompt);
+    this.calls.push(`turn/start:${threadId}`);
+    return new Promise(() => {});
+  }
+
+  override async observeThread(threadId: string): Promise<NativeThreadObservation> {
+    this.calls.push(`read:${threadId}`);
+    return { threadId, status: 'active', activeTurnId: 'turn-delayed', history: [] };
+  }
+}
+
+class HangingFactory implements CodexAppServerClientFactory {
+  async open(): Promise<CodexAppServerClient> {
+    return new Promise(() => {});
+  }
+}
+
 class Fallback implements ImplementationAgent {
   readonly kind = 'implementation-agent' as const;
   calls = 0;
@@ -192,6 +211,24 @@ describe('CodexAppServerAdapter', () => {
     assert.deepEqual(client.calls, ['thread/start', 'close']);
   });
 
+  it('bounds a stalled App Server handshake by the selected execution timeout', async () => {
+    const adapter = new CodexAppServerAdapter({ clientFactory: new HangingFactory(), runner: new HeadRunner(), timeoutMs: 5 });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
+  });
+
+  it('cancels a stalled App Server handshake when the selected execution is aborted', async () => {
+    const adapter = new CodexAppServerAdapter({ clientFactory: new HangingFactory(), runner: new HeadRunner() });
+    const controller = new AbortController();
+    const pending = adapter.run(request({ signal: controller.signal }));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_CANCELLED/);
+  });
+
   it('bounds a stalled turn/start RPC and interrupts the exact turn observed by notification', async () => {
     const client = new HangingStartTurnClient('turn-observed');
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
@@ -199,6 +236,17 @@ describe('CodexAppServerAdapter', () => {
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
     assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'turn/interrupt:thread-new:turn-observed', 'close']);
+  });
+
+  it('discovers and interrupts an exact turn when timeout wins before the turn/start notification is processed', async () => {
+    const client = new DelayedStartTurnClient();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
+    assert.deepEqual(client.calls, [
+      'thread/start', 'turn/start:thread-new', 'read:thread-new', 'turn/interrupt:thread-new:turn-delayed', 'close',
+    ]);
   });
 
   it('stops waiting for a native turn when the selected execution is cancelled', async () => {

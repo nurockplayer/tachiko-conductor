@@ -64,6 +64,10 @@ export interface AppServerThreadOptions {
   readonly config?: Readonly<Record<string, unknown>>;
 }
 
+export interface AppServerOpenOptions {
+  readonly signal?: AbortSignal;
+}
+
 /** An unavailable binary/handshake is safe to route to the existing CLI adapter. */
 export class AppServerUnavailableError extends Error {
   constructor(message: string) {
@@ -73,7 +77,7 @@ export class AppServerUnavailableError extends Error {
 }
 
 export interface CodexAppServerClientFactory {
-  open(): Promise<CodexAppServerClient>;
+  open(options?: AppServerOpenOptions): Promise<CodexAppServerClient>;
 }
 
 export interface CodexAppServerAdapterOptions {
@@ -139,23 +143,43 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       cwd: workspacePath,
       ...appServerCapabilityConfig(request.capabilities ?? []),
     };
+    const deadlineAt = Date.now() + this.timeoutMs;
+    const openController = new AbortController();
+    const forwardOpenAbort = () => openController.abort(request.signal?.reason);
+    if (request.signal?.aborted) forwardOpenAbort();
+    else request.signal?.addEventListener('abort', forwardOpenAbort, { once: true });
+    const openTimeout = setTimeout(() => openController.abort(new AppServerTimeoutError()), this.timeoutMs);
     let client: CodexAppServerClient;
+    let openPromise: Promise<CodexAppServerClient> | undefined;
     try {
-      client = await this.clientFactory.open();
+      client = await runWithinDeadline(() => {
+        openPromise = this.clientFactory.open({ signal: openController.signal });
+        return openPromise;
+      }, deadlineAt, request.signal);
     } catch (error) {
+      if ((error instanceof AppServerTimeoutError || error instanceof AppServerCancelledError) && openPromise !== undefined) {
+        void openPromise.then((lateClient) => lateClient.close()).catch(() => undefined);
+      }
       if (error instanceof AppServerUnavailableError) return this.runFallback(request);
+      if (error instanceof AppServerTimeoutError) {
+        return failure(CODEX_APP_SERVER_ERROR_CODE.TIMEOUT, `Codex App Server execution timed out after ${this.timeoutMs}ms.`, request.executor);
+      }
+      if (error instanceof AppServerCancelledError) return cancelled(request.executor);
       return failure(CODEX_APP_SERVER_ERROR_CODE.UNAVAILABLE, message(error), request.executor);
+    } finally {
+      clearTimeout(openTimeout);
+      request.signal?.removeEventListener('abort', forwardOpenAbort);
     }
     const startedAt = Date.now();
-    const deadlineAt = startedAt + this.timeoutMs;
     const withinBoundary = <T>(operation: () => Promise<T>): Promise<T> =>
       runWithinDeadline(operation, deadlineAt, request.signal);
     let executor: ExecutorIdentity | undefined = request.executor;
     let activeTurn: { readonly threadId: string; readonly turnId: string } | undefined;
+    let threadId: string | undefined;
+    let turnStartAttempted = false;
     let removeTurnListener: (() => void) | undefined;
     try {
       const prompt = buildPrompt(request);
-      let threadId: string;
       if (request.executor === undefined) {
         threadId = await withinBoundary(() => client.startThread(threadOptions));
       } else {
@@ -173,10 +197,12 @@ export class CodexAppServerAdapter implements ImplementationAgent {
         }
       }
       await assertWorkspaceGuard(request.workspaceGuard);
+      const turnThreadId = threadId;
+      if (turnThreadId === undefined) throw new Error('Codex App Server thread identity was not established before turn start.');
       const completedTurnIds = new Set<string>();
       removeTurnListener = client.onEvent((event) => {
         if (event.type === 'approval_denied') return;
-        if (event.threadId !== threadId) return;
+        if (event.threadId !== turnThreadId) return;
         if (event.type === 'turn_started') {
           if (!completedTurnIds.has(event.turnId)) activeTurn = { threadId: event.threadId, turnId: event.turnId };
           return;
@@ -186,14 +212,15 @@ export class CodexAppServerAdapter implements ImplementationAgent {
           if (activeTurn?.threadId === event.threadId && activeTurn.turnId === event.turnId) activeTurn = undefined;
         }
       });
-      const turnId = await withinBoundary(() => client.startTurn(threadId, prompt));
-      if (!completedTurnIds.has(turnId)) activeTurn = { threadId, turnId };
+      turnStartAttempted = true;
+      const turnId = await withinBoundary(() => client.startTurn(turnThreadId, prompt));
+      if (!completedTurnIds.has(turnId)) activeTurn = { threadId: turnThreadId, turnId };
       executor = {
         provider: CODEX_APP_SERVER_PROVIDER,
-        sessionId: threadId,
+        sessionId: turnThreadId,
         generation: request.runtimeOwnership.generation,
       };
-      const terminal = await withinBoundary(() => client.waitForTurn(threadId, turnId));
+      const terminal = await withinBoundary(() => client.waitForTurn(turnThreadId, turnId));
       activeTurn = undefined;
       if (terminal.status !== 'completed') {
         return failure(CODEX_APP_SERVER_ERROR_CODE.PROTOCOL, `Codex App Server turn ${turnId} ended ${terminal.status}.`, executor);
@@ -214,7 +241,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       return { exitStatus: 'success', summary: terminal.summary ?? 'Codex App Server turn completed.', headSha, executor, durationMs: Date.now() - startedAt };
     } catch (error) {
       if (error instanceof AppServerTimeoutError || error instanceof AppServerCancelledError) {
-        await this.interruptExactTurn(client, activeTurn);
+        await this.interruptExactTurn(client, threadId, activeTurn, turnStartAttempted);
       }
       if (error instanceof AppServerTimeoutError) {
         return failure(CODEX_APP_SERVER_ERROR_CODE.TIMEOUT, `Codex App Server execution timed out after ${this.timeoutMs}ms.`, executor);
@@ -261,11 +288,35 @@ export class CodexAppServerAdapter implements ImplementationAgent {
 
   private async interruptExactTurn(
     client: CodexAppServerClient,
+    threadId: string | undefined,
     activeTurn: { readonly threadId: string; readonly turnId: string } | undefined,
+    turnStartAttempted: boolean,
   ): Promise<void> {
-    if (activeTurn === undefined) return;
+    if (!turnStartAttempted || threadId === undefined) return;
+    const deadlineAt = Date.now() + APP_SERVER_INTERRUPT_GRACE_MS;
+    let exactTurn = activeTurn;
+    while (exactTurn === undefined && Date.now() < deadlineAt) {
+      try {
+        const observation = await waitForNativeOperation(
+          client.observeThread(threadId),
+          Math.max(1, deadlineAt - Date.now()),
+          undefined,
+        );
+        if (observation.status === 'active' && observation.activeTurnId !== undefined) {
+          exactTurn = { threadId, turnId: observation.activeTurnId };
+        }
+      } catch {
+        break;
+      }
+      if (exactTurn === undefined) await new Promise((resolve) => setTimeout(resolve, APP_SERVER_ACTIVE_TURN_POLL_MS));
+    }
+    if (exactTurn === undefined) return;
     try {
-      await waitForNativeOperation(client.interruptTurn(activeTurn.threadId, activeTurn.turnId), APP_SERVER_INTERRUPT_GRACE_MS, undefined);
+      await waitForNativeOperation(
+        client.interruptTurn(exactTurn.threadId, exactTurn.turnId),
+        Math.max(1, deadlineAt - Date.now()),
+        undefined,
+      );
     } catch {
       // Component shutdown remains the bounded last resort when native interrupt is unavailable.
     }
@@ -330,7 +381,7 @@ function buildPrompt(request: ImplementationRequest): string {
 
 /** Actual local-only JSON-RPC App Server client. No TCP listener is created. */
 export class StdioCodexAppServerClientFactory implements CodexAppServerClientFactory {
-  async open(): Promise<CodexAppServerClient> {
+  async open(options: AppServerOpenOptions = {}): Promise<CodexAppServerClient> {
     let child: ChildProcessWithoutNullStreams;
     try {
       child = spawn('codex', ['app-server', '--stdio'], { stdio: 'pipe' });
@@ -339,10 +390,11 @@ export class StdioCodexAppServerClientFactory implements CodexAppServerClientFac
     }
     const client = new StdioCodexAppServerClient(child);
     try {
-      await client.initialize();
+      await client.initialize(options.signal);
       return client;
     } catch (error) {
       await client.close();
+      if (options.signal?.aborted === true) throw options.signal.reason ?? error;
       throw new AppServerUnavailableError(message(error));
     }
   }
@@ -363,8 +415,8 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
     child.on('exit', (code) => { if (!this.closed) this.rejectAll(new Error(`Codex App Server exited before completing RPC work (${code ?? 'signal'}).`)); });
   }
 
-  async initialize(): Promise<void> {
-    await this.request('initialize', { clientInfo: { name: 'tachiko-conductor', title: 'Tachiko Conductor', version: '0.1.0' }, capabilities: null });
+  async initialize(signal?: AbortSignal): Promise<void> {
+    await this.request('initialize', { clientInfo: { name: 'tachiko-conductor', title: 'Tachiko Conductor', version: '0.1.0' }, capabilities: null }, signal);
     this.notify('initialized');
   }
 
@@ -428,12 +480,30 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
     if (!this.child.killed) this.child.kill();
   }
 
-  private request(method: string, params?: unknown): Promise<unknown> {
+  private request(method: string, params?: unknown, signal?: AbortSignal): Promise<unknown> {
     if (this.closed) return Promise.reject(new Error('Codex App Server client is closed.'));
+    if (signal?.aborted === true) return Promise.reject(signal.reason ?? new Error('Codex App Server request was cancelled.'));
     const id = this.nextId++;
     const payload = params === undefined ? { id, method } : { id, method, params };
-    this.child.stdin.write(`${JSON.stringify(payload)}\n`);
-    return new Promise((resolve, reject) => this.pending.set(id, { resolve, reject }));
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        this.pending.delete(id);
+        reject(signal?.reason ?? new Error('Codex App Server request was cancelled.'));
+      };
+      const cleanup = () => signal?.removeEventListener('abort', onAbort);
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.pending.set(id, {
+        resolve: (value) => { cleanup(); resolve(value); },
+        reject: (error) => { cleanup(); reject(error); },
+      });
+      try {
+        this.child.stdin.write(`${JSON.stringify(payload)}\n`);
+      } catch (error) {
+        this.pending.delete(id);
+        cleanup();
+        reject(error);
+      }
+    });
   }
 
   private notify(method: string, params?: unknown): void {
@@ -555,6 +625,7 @@ class AppServerTimeoutError extends Error {}
 class AppServerCancelledError extends Error {}
 
 const APP_SERVER_INTERRUPT_GRACE_MS = 1_000;
+const APP_SERVER_ACTIVE_TURN_POLL_MS = 25;
 
 function runWithinDeadline<T>(operation: () => Promise<T>, deadlineAt: number, signal: AbortSignal | undefined): Promise<T> {
   if (signal?.aborted === true) return Promise.reject(new AppServerCancelledError());
