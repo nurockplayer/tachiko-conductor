@@ -1,3 +1,4 @@
+// Spike-only executable evidence; never merge into production runtime.
 import { createHash } from 'node:crypto';
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
