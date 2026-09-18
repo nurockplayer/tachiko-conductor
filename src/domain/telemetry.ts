@@ -113,6 +113,9 @@ export interface RunTelemetryCompletionEvent {
   readonly kind: 'completion';
   readonly role: TelemetryRole;
   readonly invocationId: string;
+  readonly provider: string | null;
+  readonly model: string | null;
+  readonly reasoningEffort: string | null;
   readonly outcome: ProviderCompletionOutcome;
   readonly failureCode: string | null;
   readonly turns: MetricObservation<number>;
@@ -242,6 +245,9 @@ export interface SpawnTelemetryInput {
 export interface CompletionTelemetryInput {
   readonly role: TelemetryRole;
   readonly invocationId: string;
+  readonly provider?: string;
+  readonly model?: string;
+  readonly reasoningEffort?: string;
   readonly outcome: ProviderCompletionOutcome;
   readonly failureCode?: string;
   readonly turns?: number;
@@ -391,6 +397,9 @@ export function recordCompletionTelemetry(run: Run, input: CompletionTelemetryIn
     kind: 'completion',
     role: input.role,
     invocationId: input.invocationId,
+    provider: nonEmpty(input.provider) ? input.provider.trim() : null,
+    model: nonEmpty(input.model) ? input.model.trim() : null,
+    reasoningEffort: nonEmpty(input.reasoningEffort) ? input.reasoningEffort.trim() : null,
     outcome: input.outcome,
     failureCode: input.failureCode?.trim() === '' ? null : input.failureCode?.trim() ?? null,
     turns: numericMetric(input.turns, 'provider-did-not-report-turn-count'),
@@ -676,9 +685,9 @@ function projectInvocations(events: readonly RunTelemetryEvent[]): readonly Effi
         attempt: spawn.attempt,
         attemptKind: spawn.attemptKind,
         headSha: spawn.headSha,
-        provider: spawn.provider,
-        model: spawn.model,
-        reasoningEffort: spawn.reasoningEffort,
+        provider: completion?.provider ?? spawn.provider,
+        model: completion?.model ?? spawn.model,
+        reasoningEffort: completion?.reasoningEffort ?? spawn.reasoningEffort,
         profile: spawn.profile,
         contextMode: spawn.contextMode,
         contextJustification: spawn.contextJustification,
@@ -848,6 +857,9 @@ export function createCompletionInputFromResult(
     role,
     invocationId,
     outcome,
+    ...(telemetry?.provider === undefined && fallback.provider === undefined ? {} : { provider: telemetry?.provider ?? fallback.provider }),
+    ...(telemetry?.model === undefined && fallback.model === undefined ? {} : { model: telemetry?.model ?? fallback.model }),
+    ...(telemetry?.reasoningEffort === undefined && fallback.reasoningEffort === undefined ? {} : { reasoningEffort: telemetry?.reasoningEffort ?? fallback.reasoningEffort }),
     ...(failureCode === undefined ? {} : { failureCode }),
     ...(telemetry?.turns === undefined ? (outcome === 'configuration_preflight_failed' ? { turns: 0 } : {}) : { turns: telemetry.turns }),
     ...(telemetry?.usage === undefined ? {} : { usage: telemetry.usage }),
@@ -961,6 +973,9 @@ function isRunTelemetryEvent(value: unknown): value is RunTelemetryEvent {
   }
   if (event.kind === 'completion') {
     if ((event.role !== 'worker' && event.role !== 'reviewer') || !nonEmpty(event.invocationId) ||
+        (event.provider !== null && !nonEmpty(event.provider)) ||
+        (event.model !== null && !nonEmpty(event.model)) ||
+        (event.reasoningEffort !== null && !nonEmpty(event.reasoningEffort)) ||
         !['completed', 'failed', 'configuration_preflight_failed'].includes(event.outcome as string) ||
         (event.failureCode !== null && !nonEmpty(event.failureCode))) return false;
     if (!isMetricObservation(event.turns, finiteNonNegative)) return false;

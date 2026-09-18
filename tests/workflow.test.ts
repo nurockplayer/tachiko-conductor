@@ -573,6 +573,9 @@ describe('runWorkflow', () => {
     assert.deepEqual(projection.metrics.inputTokens, { status: 'observed', value: 1_500 });
     assert.deepEqual(projection.metrics.cachedInputTokens, { status: 'observed', value: 900 });
     assert.deepEqual(projection.metrics.workerStarts, { status: 'observed', value: 1 });
+    assert.equal(projection.invocations[0]?.provider, 'codex-app-server');
+    assert.equal(projection.invocations[0]?.model, 'configured-model');
+    assert.equal(projection.invocations[0]?.reasoningEffort, 'high');
     assert.deepEqual(projection.metrics.reviewerStarts, { status: 'observed', value: 1 });
     assert.equal(projection.metrics.largestToolResultBytes.status, 'partial');
     assert.deepEqual(
