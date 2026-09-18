@@ -68,11 +68,12 @@ jobs:
           const fs = require('node:fs');
           const path = require('node:path');
           const runtime = process.env.ISSUE70_RUNTIME_DIR;
-          const dsh = require(path.join(runtime, 'node_modules/@deepseek-ai/dsh/package.json'));
+          const dshPath = require.resolve('@deepseek-ai/dsh/package.json', { paths: [runtime] });
+          const dsh = require(dshPath);
           if (dsh.version !== '0.1.6-alpha.2') throw new Error('unexpected dsh version: ' + dsh.version);
-          const entry = require.resolve('node-pty', { paths: [runtime] });
-          const root = path.dirname(path.dirname(entry));
-          const helper = path.join(root, 'prebuilds', process.platform + '-' + process.arch, 'spawn-helper');
+          const subprocessPath = require.resolve('@deepseek-ai/dsh-subprocess-local/package.json', { paths: [path.dirname(dshPath)] });
+          const nodePtyPath = require.resolve('node-pty/package.json', { paths: [path.dirname(subprocessPath)] });
+          const helper = path.join(path.dirname(nodePtyPath), 'prebuilds', process.platform + '-' + process.arch, 'spawn-helper');
           const mode = fs.statSync(helper).mode;
           if ((mode & 0o111) === 0) throw new Error('node-pty spawn-helper is not executable');
           console.log(dsh.name + '@' + dsh.version + ' native-boundary=ready');
