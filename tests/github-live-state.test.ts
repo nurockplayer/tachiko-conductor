@@ -333,7 +333,7 @@ PR: #7`;
     const snapshot = await adapter.readLiveSnapshot(TARGET);
 
     assert.equal(snapshot.reviews.unresolvedThreads, 2);
-    assert.equal(transport.calls.filter((call) => call.kind === 'graphql').length, 2);
+    assert.equal(transport.calls.filter((call) => call.kind === 'graphql').length, 3);
   });
 
   it('gives a latest change request precedence over another author approval', async () => {
