@@ -1,0 +1,63 @@
+name: Issue 70 DeepSeek Harness ACP spike
+
+on:
+  push:
+    branches:
+      - spike/issue-70-deepseek-acp-20260919
+
+permissions:
+  contents: read
+
+jobs:
+  cancellation-ownership:
+    runs-on: macos-15
+    timeout-minutes: 20
+    env:
+      ISSUE70_BASE_SHA: 555523234732af4343426e819f7281e74d06a683
+      ISSUE70_RUNTIME_DIR: ${{ runner.temp }}/issue70-runtime
+    steps:
+      - name: Checkout spike branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node 24
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+          run_install: false
+
+      - name: Build Tachiko guard boundary
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+
+      - name: Install exact published Harness runtime
+        run: |
+          mkdir -p "$ISSUE70_RUNTIME_DIR"
+          printf '%s\n' '{"private":true,"type":"module"}' > "$ISSUE70_RUNTIME_DIR/package.json"
+          pnpm --dir "$ISSUE70_RUNTIME_DIR" add --save-exact \
+            @deepseek-ai/dsh@0.1.6-alpha.2 \
+            @agentclientprotocol/sdk@1.4.0
+          node -e 'const p=require(process.env.ISSUE70_RUNTIME_DIR+"/node_modules/@deepseek-ai/dsh/package.json"); if(p.version!=="0.1.6-alpha.2") process.exit(2); console.log(p.name+"@"+p.version)'
+
+      - name: Run bounded ACP cancellation ownership probe
+        id: spike
+        shell: bash
+        run: |
+          set -o pipefail
+          node .github/spikes/issue70-acp-spike.mjs 2>&1 | tee "$RUNNER_TEMP/issue70-evidence.log"
+
+      - name: Upload sanitized evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: issue70-acp-evidence
+          path: ${{ runner.temp }}/issue70-evidence.log
+          if-no-files-found: warn
+          retention-days: 7
