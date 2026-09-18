@@ -29,12 +29,16 @@ function result(stdout: string, stderr = '', exitCode = 0): ProcessResult {
   return { stdout, stderr, exitCode };
 }
 
-function codexJsonl(summary = 'Implemented Issue #15.', threadId = '0199a213-81c0-7800-8aa1-bbab2a035a53'): string {
+function codexJsonl(
+  summary = 'Implemented Issue #15.',
+  threadId = '0199a213-81c0-7800-8aa1-bbab2a035a53',
+  usage: Record<string, unknown> = {},
+): string {
   return [
     JSON.stringify({ type: 'thread.started', thread_id: threadId }),
     JSON.stringify({ type: 'turn.started' }),
     JSON.stringify({ type: 'item.completed', item: { id: 'item-1', type: 'agent_message', text: summary } }),
-    JSON.stringify({ type: 'turn.completed', usage: {} }),
+    JSON.stringify({ type: 'turn.completed', usage }),
   ].join('\n');
 }
 
@@ -211,7 +215,7 @@ describe('CodexCliAdapter', () => {
   });
 
   it('never reports success when the exact post-run Git HEAD cannot be established', async () => {
-    const runner = new FakeRunner([result(codexJsonl()), result('not-a-sha')]);
+    const runner = new FakeRunner([result(codexJsonl(undefined, undefined, { input_tokens: 10, output_tokens: 2 })), result('not-a-sha')]);
     const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
 
     const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
@@ -223,6 +227,7 @@ describe('CodexCliAdapter', () => {
       provider: 'codex-cli',
       sessionId: '0199a213-81c0-7800-8aa1-bbab2a035a53',
     });
+    assert.deepEqual(agentResult.telemetry?.usage, { inputTokens: 10, outputTokens: 2 });
   });
 
   it('preserves the persisted executor identity when a resume command fails', async () => {

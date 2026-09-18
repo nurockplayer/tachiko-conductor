@@ -303,11 +303,11 @@ function cloneThresholds(value: EfficiencyThresholds): EfficiencyThresholds {
 
 function assertThresholds(value: EfficiencyThresholds): void {
   if (!nonEmpty(value.revision) ||
-      value.repeatedUnchangedStateWakeups < 1 ||
-      value.reviewerStartsAtSameHead < 1 ||
-      value.largeToolResultBytes < 1 ||
-      value.repeatedConfigurationPreflightFailures < 1 ||
-      value.reviewerRestarts < 1) {
+      !Number.isSafeInteger(value.repeatedUnchangedStateWakeups) || value.repeatedUnchangedStateWakeups < 1 ||
+      !Number.isSafeInteger(value.reviewerStartsAtSameHead) || value.reviewerStartsAtSameHead < 1 ||
+      !Number.isSafeInteger(value.largeToolResultBytes) || value.largeToolResultBytes < 1 ||
+      !Number.isSafeInteger(value.repeatedConfigurationPreflightFailures) || value.repeatedConfigurationPreflightFailures < 1 ||
+      !Number.isSafeInteger(value.reviewerRestarts) || value.reviewerRestarts < 1) {
     throw new Error('Efficiency thresholds require a non-empty revision and positive safe-integer limits.');
   }
 }

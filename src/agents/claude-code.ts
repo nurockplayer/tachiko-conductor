@@ -144,6 +144,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
         sessionId: outcome.sessionId,
         ...(executor === undefined ? {} : { executor }),
+        telemetry: outcome.telemetry,
         durationMs: outcome.durationMs,
       };
     }
@@ -159,6 +160,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         diagnostics: [`${CLAUDE_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${this.cwd}.`],
         sessionId: outcome.sessionId,
         ...(executor === undefined ? {} : { executor }),
+        telemetry: outcome.telemetry,
         durationMs: outcome.durationMs,
       };
     }

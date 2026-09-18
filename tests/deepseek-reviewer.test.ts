@@ -146,7 +146,6 @@ describe('DeepSeekReviewer', () => {
       usage: { inputTokens: 1_200, cachedInputTokens: 1_000, outputTokens: 75 },
     });
   });
-+
 
   it('routes REQUEST_CHANGES with only blocking findings back to the implementation loop', async () => {
     const client = new FakeClient([

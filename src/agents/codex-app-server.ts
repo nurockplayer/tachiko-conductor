@@ -329,7 +329,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
         ...(observedUsage === undefined ? {} : { usage: observedUsage }),
         ...(capabilityProvenance === undefined ? {} : { capability: capabilityProvenance }),
         ...(firstInputTokens === undefined || peakInputTokens === undefined ? {} : { context: { initialTokens: firstInputTokens, peakTokens: peakInputTokens } }),
-        largestToolResultBytes: largestToolResultBytes ?? 0,
+        ...(largestToolResultBytes === undefined ? {} : { largestToolResultBytes }),
         failure: { category: 'executed-runtime', code: CODEX_APP_SERVER_ERROR_CODE.HEAD_READ_FAILED },
       }));
       return {
@@ -345,7 +345,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
           ...(observedUsage === undefined ? {} : { usage: observedUsage }),
           ...(capabilityProvenance === undefined ? {} : { capability: capabilityProvenance }),
           ...(firstInputTokens === undefined || peakInputTokens === undefined ? {} : { context: { initialTokens: firstInputTokens, peakTokens: peakInputTokens } }),
-          largestToolResultBytes: largestToolResultBytes ?? 0,
+          ...(largestToolResultBytes === undefined ? {} : { largestToolResultBytes }),
         }),
         durationMs: Date.now() - startedAt,
       };

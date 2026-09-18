@@ -10,6 +10,7 @@ import {
   projectRunEfficiency,
   recordCompletionTelemetry,
   recordSpawnTelemetry,
+  withRunTelemetryThresholds,
   type RunTelemetryEvent,
 } from '../src/domain/telemetry.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
@@ -198,6 +199,14 @@ describe('run efficiency telemetry', () => {
     assert.equal(waits.length, 1);
     assert.equal(waits[0]?.state, 'WAITING_DEPENDENCY');
     assert.equal(projectRunEfficiency(run).metrics.waitStatusWakeups.status, 'observed');
+  });
+
+  it('rejects non-integer thresholds at the writer boundary', () => {
+    const run = createRun(TARGET, T0, 'telemetry-invalid-threshold');
+    assert.throws(
+      () => withRunTelemetryThresholds(run, { reviewerRestarts: 1.5 }),
+      /positive safe-integer limits/,
+    );
   });
 
   it('emits deterministic warnings from structured events only', () => {

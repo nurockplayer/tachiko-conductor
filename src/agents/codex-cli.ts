@@ -211,6 +211,7 @@ export class CodexCliAdapter implements ImplementationAgent {
         `Codex completed, but an exact 40-hex HEAD could not be read from ${this.cwd}.`,
         durationMs,
         parsed.outcome.executor,
+        parsed.outcome.telemetry,
       );
     }
     return {
