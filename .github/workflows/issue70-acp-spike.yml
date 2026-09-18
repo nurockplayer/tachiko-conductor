@@ -14,6 +14,8 @@ jobs:
     timeout-minutes: 20
     env:
       ISSUE70_BASE_SHA: 555523234732af4343426e819f7281e74d06a683
+      ISSUE70_HARNESS_COMMIT: ddefc45fbc7f8e46dd73185e68295696d1297887
+      ISSUE70_HARNESS_TAG: dsh-v0.1.6-alpha.2
     steps:
       - name: Checkout spike branch
         uses: actions/checkout@v4
@@ -55,7 +57,11 @@ jobs:
             - node-pty
             - koffi
           YAML
-          pnpm dlx pnpm@11.7.0 --dir "$ISSUE70_RUNTIME_DIR" add --save-exact \
+          pnpm dlx pnpm@11.7.0 -C "$ISSUE70_RUNTIME_DIR" add --save-exact \
+            --config.strict-dep-builds=false \
+            --allow-build=@deepseek-ai/dsh-subprocess-local \
+            --allow-build=node-pty \
+            --allow-build=koffi \
             @deepseek-ai/dsh@0.1.6-alpha.2 \
             @agentclientprotocol/sdk@1.4.0
           node - <<'NODE'
