@@ -89,6 +89,7 @@ Usage:
   tachiko run show <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
+  tachiko run projections rebuild
   tachiko dispatch once
   tachiko dispatch launchd render --program <absolute-wrapper> --working-directory <absolute-path> [--minute <0-59>]
   tachiko github snapshot owner/repo#123
@@ -115,6 +116,8 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 {"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
+Operational projections are secret-free sidecars under
+$TACHIKO_DATA_DIR/.operational/v1; rebuild them only from validated persisted runs.
 New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
 the selected --execution-profile is persisted with the run.
 Browser profiles and runtime metadata are stored outside the repository under
@@ -1214,6 +1217,11 @@ export async function main(argv: string[]): Promise<number> {
     for (const run of runListCommand(store)) {
       console.log(`${run.id}\t${run.state}\t${JSON.stringify(run.target)}`);
     }
+    return 0;
+  }
+
+  if (subcommand === 'projections' && rest[0] === 'rebuild' && rest.length === 1) {
+    console.log(JSON.stringify({ ok: true, rebuilt: store.rebuildOperationalProjections() }));
     return 0;
   }
 
