@@ -46,22 +46,31 @@ jobs:
           {
             "private": true,
             "type": "module",
-            "packageManager": "pnpm@11.7.0",
-            "pnpm": {
-              "onlyBuiltDependencies": [
-                "@deepseek-ai/dsh-subprocess-local",
-                "node-pty",
-                "koffi"
-              ]
-            }
+            "packageManager": "pnpm@11.7.0"
           }
           JSON
+          cat > "$ISSUE70_RUNTIME_DIR/pnpm-workspace.yaml" <<'YAML'
+          onlyBuiltDependencies:
+            - '@deepseek-ai/dsh-subprocess-local'
+            - node-pty
+            - koffi
+          YAML
           pnpm dlx pnpm@11.7.0 --dir "$ISSUE70_RUNTIME_DIR" add --save-exact \
             @deepseek-ai/dsh@0.1.6-alpha.2 \
             @agentclientprotocol/sdk@1.4.0
-          pnpm dlx pnpm@11.7.0 --dir "$ISSUE70_RUNTIME_DIR" rebuild \
-            @deepseek-ai/dsh-subprocess-local node-pty koffi
-          node -e 'const p=require(process.env.ISSUE70_RUNTIME_DIR+"/node_modules/@deepseek-ai/dsh/package.json"); if(p.version!=="0.1.6-alpha.2") process.exit(2); console.log(p.name+"@"+p.version)'
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const runtime = process.env.ISSUE70_RUNTIME_DIR;
+          const dsh = require(path.join(runtime, 'node_modules/@deepseek-ai/dsh/package.json'));
+          if (dsh.version !== '0.1.6-alpha.2') throw new Error('unexpected dsh version: ' + dsh.version);
+          const entry = require.resolve('node-pty', { paths: [runtime] });
+          const root = path.dirname(path.dirname(entry));
+          const helper = path.join(root, 'prebuilds', process.platform + '-' + process.arch, 'spawn-helper');
+          const mode = fs.statSync(helper).mode;
+          if ((mode & 0o111) === 0) throw new Error('node-pty spawn-helper is not executable');
+          console.log(dsh.name + '@' + dsh.version + ' native-boundary=ready');
+          NODE
 
       - name: Run bounded ACP cancellation ownership probe
         id: spike
