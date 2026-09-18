@@ -2,6 +2,8 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../adapters/reviewer.js';
 import type { ReviewFinding, ReviewResult, Target } from '../domain/types.js';
 import type { GitHubApiTransport } from '../github/transport.js';
+import type { ProviderExecutionTelemetry } from '../domain/telemetry.js';
+import { providerTelemetry, tokenUsageFromProviderValue, usageContextFromTokenUsage } from '../agents/provider-telemetry.js';
 
 export type ReviewerErrorCode =
   | 'REVIEW_INVALID_OUTPUT'
@@ -34,8 +36,13 @@ export class ReviewerError extends Error {
   }
 }
 
+export interface ReviewCompletion {
+  readonly content: string;
+  readonly telemetry?: ProviderExecutionTelemetry;
+}
+
 export interface ReviewApiClient {
-  complete(prompt: string, options: { model: string }): Promise<string>;
+  complete(prompt: string, options: { model: string }): Promise<string | ReviewCompletion>;
 }
 
 export interface PullRequestDiffReader {
@@ -185,15 +192,19 @@ export class DeepSeekReviewer implements ReviewerAdapter {
       ...(beforeDiff.branchHead === undefined ? {} : { branchHead: beforeDiff.branchHead }),
     });
 
-    let raw: string;
+    let completion: string | ReviewCompletion;
     try {
-      raw = await this.client.complete(prompt, { model: this.model });
+      completion = await this.client.complete(prompt, { model: this.model });
     } catch (error) {
       throw normalizeBoundaryError('REVIEW_API_FAILED', 'Reviewer API request', error);
     }
     const afterReview = await this.readIdentity(target, headSha);
     this.assertSamePullRequest(beforeDiff, afterReview, headSha);
-    return this.parseReview(raw, headSha);
+    return this.parseReview(
+      typeof completion === 'string' ? completion : completion.content,
+      headSha,
+      typeof completion === 'string' ? undefined : completion.telemetry,
+    );
   }
 
   private async readIdentity(target: Target, expectedHeadSha: string): Promise<ReviewIdentity> {
@@ -251,7 +262,7 @@ export class DeepSeekReviewer implements ReviewerAdapter {
     }
   }
 
-  private parseReview(raw: string, headSha: string): ReviewResult {
+  private parseReview(raw: string, headSha: string, telemetry?: ProviderExecutionTelemetry): ReviewResult {
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw) as unknown;
@@ -285,7 +296,13 @@ export class DeepSeekReviewer implements ReviewerAdapter {
           { details: { findingCount: blockers.length } },
         );
       }
-      return { verdict: 'approve', reviewerName: this.reviewerName, headSha, findings: suggestions };
+      return {
+        verdict: 'approve',
+        reviewerName: this.reviewerName,
+        headSha,
+        findings: suggestions,
+        ...(telemetry === undefined ? {} : { telemetry }),
+      };
     }
     if (record.verdict === 'REQUEST_CHANGES') {
       if (blockers.length === 0) {
@@ -299,6 +316,7 @@ export class DeepSeekReviewer implements ReviewerAdapter {
         reviewerName: this.reviewerName,
         headSha,
         findings: [...blockers, ...suggestions],
+        ...(telemetry === undefined ? {} : { telemetry }),
       };
     }
     throw invalidOutput(`Unknown reviewer verdict "${String(record.verdict)}".`);
@@ -355,7 +373,7 @@ export class DeepSeekApiClient implements ReviewApiClient {
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
-  async complete(prompt: string, options: { model: string }): Promise<string> {
+  async complete(prompt: string, options: { model: string }): Promise<ReviewCompletion> {
     if (this.apiKey === '') {
       throw new ReviewerError('REVIEW_API_UNAUTHORIZED', 'DeepSeek API key is not configured.', {
         details: { hint: 'Set DEEPSEEK_API_KEY.' },
@@ -392,7 +410,7 @@ export class DeepSeekApiClient implements ReviewApiClient {
         retryable: response.status >= 500,
       });
     }
-    let data: { choices?: Array<{ message?: { content?: unknown } }> };
+    let data: { choices?: Array<{ message?: { content?: unknown } }>; model?: unknown; usage?: unknown };
     try {
       data = (await response.json()) as typeof data;
     } catch {
@@ -402,7 +420,17 @@ export class DeepSeekApiClient implements ReviewApiClient {
     if (typeof content !== 'string' || content.trim() === '') {
       throw new ReviewerError('REVIEW_INVALID_OUTPUT', 'DeepSeek returned an empty completion.', {});
     }
-    return content;
+    const usage = tokenUsageFromProviderValue(data.usage);
+    const context = usageContextFromTokenUsage(usage);
+    return {
+      content,
+      telemetry: providerTelemetry({
+        provider: 'deepseek',
+        ...(typeof data.model === 'string' && data.model.trim() !== '' ? { model: data.model } : { model: options.model }),
+        ...(usage === undefined ? {} : { usage }),
+        ...(context === undefined ? {} : { context }),
+      }),
+    };
   }
 }
 

@@ -643,6 +643,12 @@ function assertPayload(
   }
 }
 
+function stripProviderTelemetry<T extends { readonly telemetry?: unknown }>(value: T | undefined): Omit<T, 'telemetry'> | undefined {
+  if (value === undefined) return undefined;
+  const { telemetry: _telemetry, ...rest } = value;
+  return rest;
+}
+
 /**
  * Apply a transition to a run, returning the new run snapshot.
  *
@@ -650,12 +656,6 @@ function assertPayload(
  * an actionable message; the machine never silently coerces. `now` is
  * injectable so tests can be deterministic.
  */
-function stripProviderTelemetry<T extends { readonly telemetry?: unknown }>(value: T | undefined): Omit<T, 'telemetry'> | undefined {
-  if (value === undefined) return undefined;
-  const { telemetry: _telemetry, ...rest } = value;
-  return rest;
-}
-
 export function applyTransition(
   run: Run,
   input: TransitionInput,

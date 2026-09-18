@@ -146,6 +146,31 @@ describe('run efficiency telemetry', () => {
     assert.equal(executed.outcome, 'failed');
   });
 
+  it('does not count a retry after configuration preflight as an executed model retry', () => {
+    let run = createRun(TARGET, T0, 'telemetry-preflight-retry');
+    const first = recordSpawnTelemetry(run, {
+      role: 'worker', attemptKind: 'initial', headSha: HEAD, provider: 'codex-cli',
+      contextMode: 'bounded', contextJustification: 'live-target-bounded',
+    }, T0);
+    run = recordCompletionTelemetry(first.run, {
+      role: 'worker', invocationId: first.invocationId, outcome: 'configuration_preflight_failed', turns: 0,
+      failureCode: EXECUTION_CONFIGURATION_ERROR_CODE.UNSUPPORTED_MODEL_EFFORT,
+    }, T0);
+    const second = recordSpawnTelemetry(run, {
+      role: 'worker', attemptKind: 'resume', headSha: HEAD, provider: 'codex-cli',
+      contextMode: 'bounded', contextJustification: 'live-target-bounded',
+    }, T0);
+    run = recordCompletionTelemetry(second.run, {
+      role: 'worker', invocationId: second.invocationId, outcome: 'completed', turns: 1,
+      usage: { inputTokens: 100, outputTokens: 10 },
+    }, T0);
+
+    const metrics = projectRunEfficiency(run).metrics;
+    assert.deepEqual(metrics.configurationPreflightFailures, { status: 'observed', value: 1 });
+    assert.deepEqual(metrics.executedModelFailures, { status: 'observed', value: 0 });
+    assert.deepEqual(metrics.executedModelRetries, { status: 'observed', value: 0 });
+  });
+
   it('projects capability provenance when the provider reports it', () => {
     let run = createRun(TARGET, T0, 'telemetry-capability');
     const spawn = recordSpawnTelemetry(run, {

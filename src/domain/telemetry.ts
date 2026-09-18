@@ -499,12 +499,12 @@ function countSpawn(
 
 function countExecutedRetries(events: readonly RunTelemetryEvent[]): number {
   let retries = 0;
-  const priorByRoleHead = new Map<string, { failed: boolean }>();
+  const priorByRoleHead = new Map<string, 'executed' | 'configuration-preflight' | null>();
   for (const event of events) {
     if (event.kind === 'spawn') {
       const key = `${event.role}:${event.headSha ?? 'no-head'}`;
       const prior = priorByRoleHead.get(key);
-      if (event.attempt > 1 && prior?.failed === true) retries += 1;
+      if (event.attempt > 1 && prior === 'executed') retries += 1;
       continue;
     }
     if (event.kind !== 'completion') continue;
@@ -514,9 +514,14 @@ function countExecutedRetries(events: readonly RunTelemetryEvent[]): number {
     );
     if (spawn === undefined) continue;
     const key = `${spawn.role}:${spawn.headSha ?? 'no-head'}`;
-    priorByRoleHead.set(key, {
-      failed: event.outcome === 'failed' || event.outcome === 'configuration_preflight_failed',
-    });
+    priorByRoleHead.set(
+      key,
+      event.outcome === 'failed'
+        ? 'executed'
+        : event.outcome === 'configuration_preflight_failed'
+          ? 'configuration-preflight'
+          : null,
+    );
   }
   return retries;
 }

@@ -9,6 +9,7 @@ import {
   ReviewerError,
   type PullRequestDiffReader,
   type ReviewApiClient,
+  type ReviewCompletion,
 } from '../src/reviewers/deepseek.js';
 import type { GitHubApiTransport } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
@@ -66,9 +67,9 @@ function githubAdapter(outcomes: Array<GitHubLiveSnapshot | Error> = [liveSnapsh
 class FakeClient implements ReviewApiClient {
   readonly prompts: string[] = [];
 
-  constructor(private readonly responses: Array<string | Error>) {}
+  constructor(private readonly responses: Array<string | ReviewCompletion | Error>) {}
 
-  async complete(prompt: string): Promise<string> {
+  async complete(prompt: string): Promise<string | ReviewCompletion> {
     this.prompts.push(prompt);
     const response = this.responses.shift();
     if (response === undefined) throw new Error('No fake response queued');
@@ -125,6 +126,27 @@ describe('DeepSeekReviewer', () => {
     assert.match(client.prompts[0] ?? '', /diff --git a\/src\/a.ts/);
     assert.match(client.prompts[0] ?? '', /Issue\/spec context:\nDoR-ready\./);
   });
+
+  it('preserves structured reviewer usage when the API client reports it', async () => {
+    const client = new FakeClient([{
+      content: reviewerJson(),
+      telemetry: {
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        turns: 1,
+        usage: { inputTokens: 1_200, cachedInputTokens: 1_000, outputTokens: 75 },
+      },
+    }]);
+    const result = await makeReviewer(client).review(request());
+
+    assert.deepEqual(result.telemetry, {
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+      turns: 1,
+      usage: { inputTokens: 1_200, cachedInputTokens: 1_000, outputTokens: 75 },
+    });
+  });
++
 
   it('routes REQUEST_CHANGES with only blocking findings back to the implementation loop', async () => {
     const client = new FakeClient([
