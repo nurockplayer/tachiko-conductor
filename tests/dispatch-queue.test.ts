@@ -265,6 +265,26 @@ describe('dispatch queue protocol', () => {
     assert.equal(result.entry.issue, 19);
   });
 
+  it('keeps duplicate-writer protection fail-closed when association proof is unavailable', async () => {
+    const base = new IncidentalCrossReferenceTransport();
+    const transport: GitHubApiTransport = {
+      get: (path) => base.get(path),
+      getPaginated: (path) => base.getPaginated(path),
+    };
+    const result = await dispatchOnce({
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard`,
+      owner: 'acme', repo: 'widgets', store: new MemoryStore(), runtime: new Comments(),
+      github: new LiveGitHubAdapter({ transport, now: () => T0 }),
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute() { throw new Error('must fail closed before execution'); },
+    });
+
+    assert.deepEqual(result, {
+      outcome: 'no_eligible_work',
+      reasons: ['#19: an associated pull request is already open'],
+    });
+  });
+
   it('leaves human, Work, and ChatGPT entries unclaimed while continuing to a later Codex entry', async () => {
     const result = await dispatchOnce({
       queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 7\n    route: human\n    profile: standard\n  - issue: 8\n    route: work\n    profile: standard\n  - issue: 9\n    route: chatgpt\n    profile: standard\n  - issue: 18\n    route: codex\n    profile: complex`,
