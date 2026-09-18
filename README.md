@@ -236,6 +236,29 @@ even if a later configuration revision remaps the profile. Unknown profiles,
 unavailable executors, malformed settings, and provider-unsupported settings
 fail before implementation starts.
 
+### Reasoning-effort normalization and pre-spawn validation
+
+Accepted spellings are normalized to the single canonical runtime value before
+any model is spawned: case, surrounding whitespace, hyphen/underscore forms, and
+a small alias set (`High`, `XHigh`/`x-high`/`extra-high`, `min`, `med`) all
+resolve to `minimal`, `low`, `medium`, `high`, or `xhigh`. Normalization is a
+fixed point on canonical values and never downgrades a request; an unsupported
+or ambiguous value (for example `highest` or `turbo`) fails closed with a typed
+`EXECUTION_CONFIG_INVALID_REASONING_EFFORT` error.
+
+The requested model/effort pair is then validated at the provider boundary
+before any turn exists. The Codex App Server adapter prefers the runtime's own
+authoritative `model/list` catalog; when discovery is unavailable, or for the
+Codex CLI adapter, it uses the versioned local fallback
+(`codex-model-effort-fallback-v1`) and reports `verified: false` rather than
+inventing a restriction. A pair the provider positively reports as unsupported
+fails as `EXECUTION_CONFIG_UNSUPPORTED_MODEL_EFFORT` with bounded evidence
+(provider, model, requested effort, supported efforts, and whether the decision
+came from runtime discovery or fallback metadata) and starts **zero model
+turns**. These configuration codes are emitted before any process/turn is
+created, so telemetry can count preflight rejections separately from executed
+model/runtime failures.
+
 ### Codex App Server runtime observation
 
 For a `codex-cli` execution profile, Conductor first probes a component-local
@@ -384,7 +407,7 @@ The following direct Codex environment values remain available for legacy
 persisted runs that have no profile snapshot:
 
 - `TACHIKO_CODEX_MODEL`
-- `TACHIKO_CODEX_REASONING_EFFORT` (`minimal`, `low`, `medium`, `high`, `xhigh`)
+- `TACHIKO_CODEX_REASONING_EFFORT` (`minimal`, `low`, `medium`, `high`, `xhigh`; case/alias spellings are normalized)
 - `TACHIKO_CODEX_SANDBOX_MODE` (`read-only`, `workspace-write`, `danger-full-access`)
 - `TACHIKO_CODEX_APPROVAL_POLICY` (`untrusted`, `on-request`, `never`)
 - `TACHIKO_CODEX_TIMEOUT_MS` (positive integer)

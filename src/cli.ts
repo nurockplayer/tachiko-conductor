@@ -38,6 +38,7 @@ import {
 import { createRun } from './domain/run.js';
 import {
   assertExecutionSupportedByProvider,
+  normalizeReasoningEffort,
   parseExecutionProfileConfiguration,
   resolveExecutionProfile,
   type ResolvedExecutionConfiguration,
@@ -184,11 +185,12 @@ export function resolveCodexExecutionConfig(env: NodeJS.ProcessEnv = process.env
     config.model = env.TACHIKO_CODEX_MODEL;
   }
   if (env.TACHIKO_CODEX_REASONING_EFFORT !== undefined) {
-    const value = env.TACHIKO_CODEX_REASONING_EFFORT;
-    if (!['minimal', 'low', 'medium', 'high', 'xhigh'].includes(value)) {
-      throw new Error('TACHIKO_CODEX_REASONING_EFFORT must be minimal, low, medium, high, or xhigh.');
-    }
-    config.reasoningEffort = value as NonNullable<CodexCliAdapterOptions['reasoningEffort']>;
+    // Accept operator aliases/case and resolve them to the one canonical value
+    // here, before any adapter can hand the spelling to a provider spawn.
+    config.reasoningEffort = normalizeReasoningEffort(
+      env.TACHIKO_CODEX_REASONING_EFFORT,
+      { provider: CODEX_CLI_PROVIDER },
+    );
   }
   if (env.TACHIKO_CODEX_SANDBOX_MODE !== undefined) {
     const value = env.TACHIKO_CODEX_SANDBOX_MODE;

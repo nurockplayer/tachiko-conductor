@@ -11,6 +11,7 @@ import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
+import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
@@ -581,6 +582,34 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'failed');
     assert.equal(result.run.state, 'FAILED');
     assert.match(result.reason, /Implementation failed/);
+  });
+
+  it('records a configuration preflight rejection distinctly from an executed runtime failure', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-preflight'));
+    const implementation = new FakeImplementation([{
+      exitStatus: 'failure',
+      summary: 'Reasoning effort "medium" is unsupported by codex-app-server model "deepseek-flash".',
+      diagnostics: [
+        `${EXECUTION_CONFIGURATION_ERROR_CODE.UNSUPPORTED_MODEL_EFFORT}: Reasoning effort "medium" is unsupported by codex-app-server model "deepseek-flash"; the provider reports low, high, max.`,
+      ],
+      durationMs: 0,
+    }]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) },
+      'run-preflight',
+      { maxReviewAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.run.state, 'FAILED');
+    // The durable evidence keeps the configuration code, so a preflight
+    // rejection is countable apart from an executed model/runtime failure.
+    assert.ok(
+      result.run.agentResult?.diagnostics?.[0]?.startsWith(EXECUTION_CONFIGURATION_ERROR_CODE.UNSUPPORTED_MODEL_EFFORT),
+      `expected a typed configuration code, got ${JSON.stringify(result.run.agentResult?.diagnostics)}`,
+    );
+    assert.equal(result.run.agentResult?.durationMs, 0);
   });
 
   it('parks in NEEDS_HUMAN when the implementation agent emits the explicit takeover protocol', async () => {

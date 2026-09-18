@@ -12,6 +12,18 @@ import {
 import type { AgentResult, ExecutorIdentity } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
 import { CODEX_CLI_PROVIDER } from './codex-cli.js';
+import {
+  isExecutionConfigurationError,
+  normalizeReasoningEffort,
+  type ExecutionConfigurationError,
+  type ExecutionReasoningEffort,
+} from '../execution-profiles.js';
+import {
+  codexFallbackCapabilityCatalog,
+  preflightModelEffort,
+  runtimeCapabilityCatalog,
+  type ModelCapabilityCatalog,
+} from './model-capability.js';
 
 /** Provider identity is intentionally distinct from the compatible CLI fallback. */
 export const CODEX_APP_SERVER_PROVIDER = 'codex-app-server';
@@ -42,7 +54,19 @@ export interface NativeThreadObservation {
   readonly history: readonly { readonly id: string; readonly type: string }[];
 }
 
+/** One provider-reported model descriptor; raw field values stay unpersisted. */
+export interface AppServerModelDescriptor {
+  readonly model: string;
+  readonly supportedReasoningEfforts: readonly string[];
+}
+
 export interface CodexAppServerClient {
+  /**
+   * Optional authoritative capability discovery. Implementations backed by a
+   * runtime without `model/list` simply omit it, and callers fall back to the
+   * versioned local catalog rather than treating absence as a model failure.
+   */
+  listModels?(): Promise<readonly AppServerModelDescriptor[]>;
   observeThread(threadId: string): Promise<NativeThreadObservation>;
   startThread(options: AppServerThreadOptions): Promise<string>;
   resumeThread(threadId: string, options: AppServerThreadOptions): Promise<string>;
@@ -87,9 +111,11 @@ export interface CodexAppServerAdapterOptions {
   readonly cwd?: string;
   readonly timeoutMs?: number;
   readonly model?: string;
-  readonly reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  readonly reasoningEffort?: ExecutionReasoningEffort;
   readonly sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   readonly approvalPolicy?: 'untrusted' | 'on-request' | 'never';
+  /** Versioned local capability metadata used only when discovery is unavailable. */
+  readonly capabilityCatalog?: ModelCapabilityCatalog;
 }
 
 /**
@@ -106,6 +132,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
   private readonly cwd: string;
   private readonly timeoutMs: number;
   private readonly options: AppServerThreadOptions;
+  private readonly fallbackCapabilityCatalog: ModelCapabilityCatalog;
 
   constructor(options: CodexAppServerAdapterOptions = {}) {
     this.clientFactory = options.clientFactory ?? new StdioCodexAppServerClientFactory();
@@ -113,6 +140,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
     this.runner = options.runner ?? new NodeProcessRunner();
     this.cwd = options.cwd ?? process.cwd();
     this.timeoutMs = options.timeoutMs ?? 10 * 60_000;
+    this.fallbackCapabilityCatalog = options.capabilityCatalog ?? codexFallbackCapabilityCatalog();
     this.options = {
       cwd: this.cwd,
       ...(options.model === undefined ? {} : { model: options.model }),
@@ -138,11 +166,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
     // Capability normalization can reject malformed or duplicate runtime input.
     // Complete it before opening the child process so a rejected request has no
     // App Server lifecycle to clean up.
-    const threadOptions = {
-      ...this.options,
-      cwd: workspacePath,
-      ...appServerCapabilityConfig(request.capabilities ?? []),
-    };
+    const capabilityConfig = appServerCapabilityConfig(request.capabilities ?? []);
     const deadlineAt = Date.now() + this.timeoutMs;
     let client: CodexAppServerClient;
     try {
@@ -164,6 +188,25 @@ export class CodexAppServerAdapter implements ImplementationAgent {
     let turnStartAttempted = false;
     let removeTurnListener: (() => void) | undefined;
     try {
+      // Authoritative discovery when the runtime exposes it; otherwise a
+      // versioned local catalog. Either way the requested pair is validated
+      // before any thread or turn exists, so a rejection starts zero turns.
+      const catalog = await this.discoverCapabilityCatalog(client, withinBoundary);
+      const requestedEffort: ExecutionReasoningEffort | undefined = this.options.reasoningEffort === undefined
+        ? undefined
+        : normalizeReasoningEffort(this.options.reasoningEffort, { provider: CODEX_APP_SERVER_PROVIDER });
+      const preflight = preflightModelEffort({
+        provider: CODEX_APP_SERVER_PROVIDER,
+        catalog,
+        ...(this.options.model === undefined ? {} : { model: this.options.model }),
+        ...(requestedEffort === undefined ? {} : { reasoningEffort: requestedEffort }),
+      });
+      const threadOptions = {
+        ...this.options,
+        cwd: workspacePath,
+        ...(preflight.reasoningEffort === undefined ? {} : { reasoningEffort: preflight.reasoningEffort }),
+        ...capabilityConfig,
+      };
       const prompt = buildPrompt(request);
       if (request.executor === undefined) {
         threadId = await withinBoundary(() => client.startThread(threadOptions));
@@ -225,6 +268,9 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       if (headSha === null) return failure(CODEX_APP_SERVER_ERROR_CODE.HEAD_READ_FAILED, `Codex completed, but an exact 40-hex HEAD could not be read from ${workspacePath}.`, executor);
       return { exitStatus: 'success', summary: terminal.summary ?? 'Codex App Server turn completed.', headSha, executor, durationMs: Date.now() - startedAt };
     } catch (error) {
+      // A configuration rejection is not a model/runtime failure and is
+      // reported with its own countable code before any turn was attempted.
+      if (isExecutionConfigurationError(error)) return executionConfigurationFailure(error, executor);
       if (error instanceof AppServerTimeoutError || error instanceof AppServerCancelledError) {
         await this.interruptExactTurn(client, threadId, activeTurn, turnStartAttempted);
       }
@@ -312,6 +358,24 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       );
     } catch {
       // Component shutdown remains the bounded last resort when native interrupt is unavailable.
+    }
+  }
+
+  /**
+   * Resolve the capability catalog at the provider boundary. Runtime discovery
+   * wins when the installed runtime exposes it; any discovery failure degrades
+   * to the versioned local fallback and is never reported as a model failure.
+   */
+  private async discoverCapabilityCatalog(
+    client: CodexAppServerClient,
+    withinBoundary: <T>(operation: () => Promise<T>) => Promise<T>,
+  ): Promise<ModelCapabilityCatalog> {
+    if (client.listModels === undefined) return this.fallbackCapabilityCatalog;
+    try {
+      const models = await withinBoundary(() => client.listModels!());
+      return runtimeCapabilityCatalog(models, 'codex-app-server:model/list');
+    } catch {
+      return this.fallbackCapabilityCatalog;
     }
   }
 
@@ -434,6 +498,41 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
   async initialize(signal?: AbortSignal): Promise<void> {
     await this.request('initialize', { clientInfo: { name: 'tachiko-conductor', title: 'Tachiko Conductor', version: '0.1.0' }, capabilities: null }, signal);
     this.notify('initialized');
+  }
+
+  /**
+   * Authoritative provider capability discovery. Bounded pagination keeps this
+   * strictly read-only work; a runtime without `model/list` rejects the RPC and
+   * the caller degrades to the versioned fallback catalog.
+   */
+  async listModels(): Promise<readonly AppServerModelDescriptor[]> {
+    const models: AppServerModelDescriptor[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < APP_SERVER_MODEL_LIST_MAX_PAGES; page += 1) {
+      const result = object(
+        await this.request('model/list', cursor === undefined ? {} : { cursor }),
+        'model/list response',
+      );
+      for (const raw of array(result.data, 'model/list data')) {
+        const descriptor = object(raw, 'model/list entry');
+        const model = typeof descriptor.model === 'string' && descriptor.model.trim() !== ''
+          ? descriptor.model
+          : typeof descriptor.id === 'string' && descriptor.id.trim() !== '' ? descriptor.id : undefined;
+        if (model === undefined) continue;
+        const rawEfforts = descriptor.supportedReasoningEfforts;
+        // An entry without a usable effort list asserts nothing; skip it rather
+        // than fabricating an empty (and therefore falsely unsupported) set.
+        if (!Array.isArray(rawEfforts) || rawEfforts.length === 0) continue;
+        const supportedReasoningEfforts = rawEfforts
+          .map((item) => object(item, 'supportedReasoningEfforts entry').reasoningEffort)
+          .filter((value): value is string => typeof value === 'string' && value.trim() !== '');
+        if (supportedReasoningEfforts.length === 0) continue;
+        models.push({ model, supportedReasoningEfforts });
+      }
+      if (typeof result.nextCursor !== 'string' || result.nextCursor.trim() === '') break;
+      cursor = result.nextCursor;
+    }
+    return models;
   }
 
   async observeThread(threadId: string): Promise<NativeThreadObservation> {
@@ -589,6 +688,11 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
   }
 }
 
+/** Typed preflight rejection: counted apart from any executed runtime failure. */
+function executionConfigurationFailure(error: ExecutionConfigurationError, executor?: ExecutorIdentity): AgentResult {
+  return failure(error.code, error.message, executor);
+}
+
 function threadParams(options: AppServerThreadOptions): Record<string, unknown> {
   const config = {
     ...(options.config ?? {}),
@@ -636,6 +740,9 @@ function parseHumanTakeover(summary: string | undefined): string | undefined {
   const reason = summary.slice(HUMAN_TAKEOVER_DIAGNOSTIC.length).trim();
   return reason === '' ? 'A human browser takeover is required.' : reason;
 }
+
+/** Capability discovery must never become unbounded work. */
+const APP_SERVER_MODEL_LIST_MAX_PAGES = 5;
 
 class AppServerTimeoutError extends Error {
   constructor() { super('Codex App Server operation timed out.'); }
