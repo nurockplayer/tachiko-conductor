@@ -73,6 +73,44 @@ describe('CodexCliAdapter', () => {
     assert.deepEqual(runner.calls[1]?.args, ['rev-parse', 'HEAD']);
   });
 
+  it('captures structured usage, turn, context, tool-size, and capability telemetry', async () => {
+    const stdout = [
+      JSON.stringify({ type: 'thread.started', thread_id: 'telemetry-thread' }),
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'tool-1', type: 'command_execution', output: 'bounded output' } }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'message-1', type: 'agent_message', text: 'done' } }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1_200,
+          cached_input_tokens: 1_000,
+          output_tokens: 75,
+          reasoning_output_tokens: 12,
+        },
+      }),
+    ].join('\n');
+    const runner = new FakeRunner([result(stdout), result(HEAD)]);
+    const adapter = new CodexCliAdapter({
+      runner, cwd: '/tmp/repo', model: 'configured-model', reasoningEffort: 'high',
+    });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'success');
+    assert.equal(agentResult.telemetry?.provider, 'codex-cli');
+    assert.equal(agentResult.telemetry?.turns, 1);
+    assert.deepEqual(agentResult.telemetry?.usage, {
+      inputTokens: 1_200,
+      cachedInputTokens: 1_000,
+      outputTokens: 75,
+      reasoningTokens: 12,
+    });
+    assert.deepEqual(agentResult.telemetry?.context, { initialTokens: 1_200, peakTokens: 1_200 });
+    assert.ok((agentResult.telemetry?.largestToolResultBytes ?? 0) > 0);
+    assert.equal(agentResult.telemetry?.capability?.source, 'fallback');
+    assert.equal(agentResult.telemetry?.capability?.revision, CODEX_CAPABILITY_FALLBACK_REVISION);
+  });
+
   it('resumes the exact persisted Codex thread without falling back to a fresh exec', async () => {
     const threadId = '0199a213-81c0-7800-8aa1-bbab2a035a53';
     const runner = new FakeRunner([result(codexJsonl('Fixed review findings.', threadId)), result(HEAD)]);
@@ -274,6 +312,8 @@ describe('CodexCliAdapter', () => {
     assert.ok(agentResult.diagnostics?.[0]?.startsWith(EXECUTION_CONFIGURATION_ERROR_CODE.INVALID_REASONING_EFFORT));
     assert.match(agentResult.diagnostics?.[0] ?? '', /turbo/);
     assert.equal(runner.calls.length, 0, 'a preflight rejection must start zero model turns');
+    assert.equal(agentResult.telemetry?.turns, 0);
+    assert.equal(agentResult.telemetry?.failure?.category, 'configuration-preflight');
   });
 
   it('rejects an unsupported model/effort combination before starting any Codex turn', async () => {
@@ -291,6 +331,10 @@ describe('CodexCliAdapter', () => {
     assert.match(agentResult.diagnostics?.[0] ?? '', /restricted-model/);
     assert.match(agentResult.diagnostics?.[0] ?? '', /low/);
     assert.equal(runner.calls.length, 0, 'a preflight rejection must start zero model turns');
+    assert.equal(agentResult.telemetry?.turns, 0);
+    assert.equal(agentResult.telemetry?.capability?.source, 'runtime-discovery');
+    assert.equal(agentResult.telemetry?.capability?.revision, 'test-catalog-v1');
+    assert.equal(agentResult.telemetry?.failure?.category, 'configuration-preflight');
   });
 
   it('normalizes an aliased/cased effort to the canonical value at spawn without downgrading it', async () => {

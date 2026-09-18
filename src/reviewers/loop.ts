@@ -6,6 +6,7 @@ import {
   type WorkspaceGuard,
 } from '../adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
+import { createCompletionInputFromResult, recordCompletionTelemetry, recordSpawnTelemetry } from '../domain/telemetry.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
@@ -326,6 +327,19 @@ export async function runReviewLoop(
         const recovered = await checkOwnedFix();
         if (recovered !== null) return recovered;
       }
+      const workerSpawn = recordSpawnTelemetry(run, {
+        role: 'worker',
+        attemptKind: 'repair',
+        ...(run.headSha === undefined ? {} : { headSha: run.headSha }),
+        ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
+        ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
+        ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+        ...(run.execution?.profile === undefined ? {} : { profile: run.execution.profile }),
+        contextMode: 'bounded',
+        contextJustification: 'live-target-bounded',
+      }, now());
+      run = workerSpawn.run;
+      store.update(run);
       let fixResult;
       try {
         fixResult = await implementation.run({
@@ -337,8 +351,25 @@ export async function runReviewLoop(
         });
       } catch (error) {
         if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now);
+        const detail = error instanceof Error ? error.message : String(error);
+        run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+          exitStatus: 'failure',
+          summary: detail,
+          diagnostics: ['AGENT_RUNTIME_INVOCATION_FAILED: provider invocation threw before returning an AgentResult'],
+        }, {
+          ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
+          ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
+          ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+        }, 'worker', workerSpawn.invocationId), now());
+        store.update(run);
         throw error;
       }
+      run = recordCompletionTelemetry(run, createCompletionInputFromResult(fixResult, {
+        ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
+        ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
+        ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+      }, 'worker', workerSpawn.invocationId), now());
+      store.update(run);
       if (fixResult.exitStatus === 'failure') {
         const takeoverReason = humanTakeoverReason(fixResult);
         if (takeoverReason !== undefined) {
@@ -531,17 +562,35 @@ export async function runReviewLoop(
     if (beforeReview.kind === 'revalidate') return persistRevalidation(run, beforeReview.reason, store, now);
     if (beforeReview.kind === 'needs_human') return parkAdmission(run, beforeReview.reason, store, now);
 
+    const reviewHeadSha = run.headSha;
+    if (reviewHeadSha === undefined) return parkBootstrap(run, new Error('Reviewer admission requires an exact candidate HEAD.'), store, now);
+    const reviewerSpawnsForHead = (run.telemetry?.events ?? []).filter(
+      (event) => event.kind === 'spawn' && event.role === 'reviewer' && event.headSha === reviewHeadSha,
+    ).length;
+    const reviewerSpawn = recordSpawnTelemetry(run, {
+      role: 'reviewer',
+      attemptKind: reviewerSpawnsForHead === 0 ? 'review' : 'review_restart',
+      ...(run.headSha === undefined ? {} : { headSha: run.headSha }),
+      contextMode: 'bounded',
+      contextJustification: 'live-target-bounded',
+    }, now());
+    run = reviewerSpawn.run;
+    store.update(run);
     let reviewResult: ReviewResult;
     try {
       reviewResult = await reviewer.review({
         target,
-        headSha: run.headSha,
+        headSha: reviewHeadSha,
         instructions: renderBlockingFindings(
           run.reviewResult ?? { verdict: 'request_changes', reviewerName: '', headSha: '', findings: [] },
         ),
       });
     } catch (error) {
       const reason = renderFailure('Reviewer failed', error);
+      run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+        exitStatus: 'failure',
+        diagnostics: ['REVIEWER_INVOCATION_FAILED: reviewer adapter threw before returning a ReviewResult'],
+      }, {}, 'reviewer', reviewerSpawn.invocationId), now());
       const type = isRetryable(error) ? 'escalate' : 'fail';
       run = applyTransition(
         run,
@@ -562,6 +611,11 @@ export async function runReviewLoop(
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
     }
+    run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+      exitStatus: 'success',
+      ...(reviewResult.telemetry === undefined ? {} : { telemetry: reviewResult.telemetry }),
+    }, {}, 'reviewer', reviewerSpawn.invocationId), now());
+    store.update(run);
 
     let postReviewSnapshot: GitHubLiveSnapshot;
     try {

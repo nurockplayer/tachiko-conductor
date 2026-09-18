@@ -9,6 +9,7 @@ import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js
 import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
+import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
@@ -531,6 +532,62 @@ describe('runWorkflow', () => {
     assert.equal(result.run.state, 'MERGE_READY');
     assert.equal(result.run.headSha, HEAD2);
     assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'final_gate_verified'));
+  });
+
+  it('persists structured run telemetry and does not double-count on terminal re-entry', async () => {
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'run-telemetry'));
+    const implementation = new FakeImplementation([{
+      ...successResult(HEAD),
+      telemetry: {
+        provider: 'codex-app-server',
+        model: 'configured-model',
+        reasoningEffort: 'high',
+        turns: 3,
+        usage: { inputTokens: 1_000, cachedInputTokens: 900, outputTokens: 50, reasoningTokens: 10 },
+        context: { initialTokens: 300, peakTokens: 1_000 },
+        largestToolResultBytes: 4_096,
+        capability: { source: 'runtime-discovery', revision: 'codex-app-server:model/list', verified: true },
+      },
+    }]);
+    const reviewer = new FakeReviewer([{
+      ...approve(HEAD),
+      telemetry: {
+        provider: 'deepseek-reviewer',
+        model: 'reviewer-model',
+        turns: 1,
+        usage: { inputTokens: 500, cachedInputTokens: 0, outputTokens: 25 },
+      },
+    }]);
+
+    const result = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      'run-telemetry',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(result.run.agentResult?.telemetry, undefined, 'provider details live only in the run telemetry ledger');
+    assert.equal(result.run.reviewResult?.telemetry, undefined, 'reviewer details live only in the run telemetry ledger');
+    const projection = projectRunEfficiency(result.run);
+    assert.deepEqual(projection.metrics.modelTurns, { status: 'observed', value: 4 });
+    assert.deepEqual(projection.metrics.inputTokens, { status: 'observed', value: 1_500 });
+    assert.deepEqual(projection.metrics.cachedInputTokens, { status: 'observed', value: 900 });
+    assert.deepEqual(projection.metrics.workerStarts, { status: 'observed', value: 1 });
+    assert.deepEqual(projection.metrics.reviewerStarts, { status: 'observed', value: 1 });
+    assert.equal(projection.metrics.largestToolResultBytes.status, 'partial');
+    assert.deepEqual(
+      result.run.telemetry?.events.filter((event) => event.kind === 'completion').map((event) => event.capability?.source),
+      ['runtime-discovery', undefined],
+    );
+
+    const eventCount = result.run.telemetry?.events.length;
+    const rerun = await runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer, validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      'run-telemetry',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(rerun.outcome, 'merge_ready');
+    assert.equal(rerun.run.telemetry?.events.length, eventCount);
   });
 
   it('resolves a fresh ephemeral MCP capability before initial implementation and every review fix', async () => {

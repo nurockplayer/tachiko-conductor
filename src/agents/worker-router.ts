@@ -4,6 +4,7 @@ import path from 'node:path';
 import { assertWorkspaceGuard, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessRunner, type ProcessResult, type ProcessRunOptions } from '../github/transport.js';
+import { providerTelemetry } from './provider-telemetry.js';
 
 export const WORKER_ROUTER_PROVIDER = 'worker-router';
 export const WORKER_ROUTER_DEFAULT_EXECUTABLE = `${homedir()}/.local/bin/worker-router`;
@@ -116,7 +117,14 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED}: ${published.detail}`, ...diagnostics, ...published.diagnostics],
       };
     }
-    return { exitStatus: 'success', summary: 'Worker router completed implementation and Conductor published the exact committed HEAD.', headSha: head, ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
+    return {
+      exitStatus: 'success',
+      summary: 'Worker router completed implementation and Conductor published the exact committed HEAD.',
+      headSha: head,
+      telemetry: providerTelemetry({ provider: WORKER_ROUTER_PROVIDER }),
+      ...(diagnostics.length === 0 ? {} : { diagnostics }),
+      durationMs: elapsed(startedAt),
+    };
   }
 
   private async verifyBaseAncestry(

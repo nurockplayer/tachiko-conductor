@@ -10,6 +10,7 @@ import {
   type McpHttpCapability,
 } from '../adapters/agent.js';
 import type { AgentResult, ExecutorIdentity } from '../domain/types.js';
+import type { ProviderExecutionTelemetry, ProviderTokenUsage } from '../domain/telemetry.js';
 import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
 import { CODEX_CLI_PROVIDER } from './codex-cli.js';
 import {
@@ -24,6 +25,14 @@ import {
   runtimeCapabilityCatalog,
   type ModelCapabilityCatalog,
 } from './model-capability.js';
+import {
+  capabilityTelemetry,
+  maximumBytes,
+  mergeTokenUsage,
+  providerTelemetry,
+  tokenUsageFromProviderValue,
+  toolResultBytesFromItem,
+} from './provider-telemetry.js';
 
 /** Provider identity is intentionally distinct from the compatible CLI fallback. */
 export const CODEX_APP_SERVER_PROVIDER = 'codex-app-server';
@@ -42,8 +51,8 @@ export const CODEX_APP_SERVER_ERROR_CODE = {
 export type AppServerLifecycleEvent =
   | { readonly type: 'thread_started'; readonly threadId: string }
   | { readonly type: 'turn_started'; readonly threadId: string; readonly turnId: string }
-  | { readonly type: 'turn_completed'; readonly threadId: string; readonly turnId: string; readonly status: 'completed' | 'interrupted' | 'failed' }
-  | { readonly type: 'item_completed'; readonly threadId: string; readonly itemId: string }
+  | { readonly type: 'turn_completed'; readonly threadId: string; readonly turnId: string; readonly status: 'completed' | 'interrupted' | 'failed'; readonly usage?: ProviderTokenUsage }
+  | { readonly type: 'item_completed'; readonly threadId: string; readonly itemId: string; readonly toolResultBytes?: number }
   | { readonly type: 'approval_denied'; readonly method: string };
 
 export interface NativeThreadObservation {
@@ -187,6 +196,12 @@ export class CodexAppServerAdapter implements ImplementationAgent {
     let threadId: string | undefined;
     let turnStartAttempted = false;
     let removeTurnListener: (() => void) | undefined;
+    let capabilityProvenance: ReturnType<typeof capabilityTelemetry>;
+    let observedUsage: ProviderTokenUsage | undefined;
+    let firstInputTokens: number | undefined;
+    let peakInputTokens: number | undefined;
+    let largestToolResultBytes: number | undefined;
+    const observedTurnIds = new Set<string>();
     try {
       // Authoritative discovery when the runtime exposes it; otherwise a
       // versioned local catalog. Either way the requested pair is validated
@@ -201,6 +216,7 @@ export class CodexAppServerAdapter implements ImplementationAgent {
         ...(this.options.model === undefined ? {} : { model: this.options.model }),
         ...(requestedEffort === undefined ? {} : { reasoningEffort: requestedEffort }),
       });
+      capabilityProvenance = capabilityTelemetry(preflight);
       const threadOptions = {
         ...this.options,
         cwd: workspacePath,
@@ -232,12 +248,27 @@ export class CodexAppServerAdapter implements ImplementationAgent {
         if (event.type === 'approval_denied') return;
         if (event.threadId !== turnThreadId) return;
         if (event.type === 'turn_started') {
+          observedTurnIds.add(event.turnId);
           if (!completedTurnIds.has(event.turnId)) activeTurn.current = { threadId: event.threadId, turnId: event.turnId };
           return;
         }
         if (event.type === 'turn_completed') {
           completedTurnIds.add(event.turnId);
+          observedTurnIds.add(event.turnId);
+          if (event.usage !== undefined) {
+            observedUsage = mergeTokenUsage(observedUsage, event.usage);
+            if (event.usage.inputTokens !== undefined) {
+              firstInputTokens ??= event.usage.inputTokens;
+              peakInputTokens = peakInputTokens === undefined
+                ? event.usage.inputTokens
+                : Math.max(peakInputTokens, event.usage.inputTokens);
+            }
+          }
           if (activeTurn.current?.threadId === event.threadId && activeTurn.current.turnId === event.turnId) activeTurn.current = undefined;
+          return;
+        }
+        if (event.type === 'item_completed') {
+          largestToolResultBytes = maximumBytes(largestToolResultBytes, event.toolResultBytes);
         }
       });
       turnStartAttempted = true;
@@ -251,7 +282,22 @@ export class CodexAppServerAdapter implements ImplementationAgent {
       const terminal = await withinBoundary(() => client.waitForTurn(turnThreadId, turnId));
       activeTurn.current = undefined;
       if (terminal.status !== 'completed') {
-        return failure(CODEX_APP_SERVER_ERROR_CODE.PROTOCOL, `Codex App Server turn ${turnId} ended ${terminal.status}.`, executor);
+        return failure(
+          CODEX_APP_SERVER_ERROR_CODE.PROTOCOL,
+          `Codex App Server turn ${turnId} ended ${terminal.status}.`,
+          executor,
+          providerTelemetry({
+            provider: CODEX_APP_SERVER_PROVIDER,
+            ...(this.options.model === undefined ? {} : { model: this.options.model }),
+            ...(preflight.reasoningEffort === undefined ? {} : { reasoningEffort: preflight.reasoningEffort }),
+            turns: Math.max(observedTurnIds.size, 1),
+            ...(observedUsage === undefined ? {} : { usage: observedUsage }),
+            ...(capabilityProvenance === undefined ? {} : { capability: capabilityProvenance }),
+            ...(firstInputTokens === undefined || peakInputTokens === undefined ? {} : { context: { initialTokens: firstInputTokens, peakTokens: peakInputTokens } }),
+            ...(largestToolResultBytes === undefined ? {} : { largestToolResultBytes }),
+            failure: { category: 'executed-runtime', code: CODEX_APP_SERVER_ERROR_CODE.PROTOCOL },
+          }),
+        );
       }
       const takeoverReason = parseHumanTakeover(terminal.summary);
       if (takeoverReason !== undefined) {
@@ -260,13 +306,49 @@ export class CodexAppServerAdapter implements ImplementationAgent {
           summary: takeoverReason,
           diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
           executor,
+          telemetry: providerTelemetry({
+            provider: CODEX_APP_SERVER_PROVIDER,
+            ...(this.options.model === undefined ? {} : { model: this.options.model }),
+            ...(preflight.reasoningEffort === undefined ? {} : { reasoningEffort: preflight.reasoningEffort }),
+            turns: Math.max(observedTurnIds.size, 1),
+            ...(observedUsage === undefined ? {} : { usage: observedUsage }),
+            ...(capabilityProvenance === undefined ? {} : { capability: capabilityProvenance }),
+            ...(firstInputTokens === undefined || peakInputTokens === undefined ? {} : { context: { initialTokens: firstInputTokens, peakTokens: peakInputTokens } }),
+            ...(largestToolResultBytes === undefined ? {} : { largestToolResultBytes }),
+          }),
           durationMs: Date.now() - startedAt,
         };
       }
       await assertWorkspaceGuard(request.workspaceGuard, 'after-execution', executor);
       const headSha = await this.readHead(request.signal, workspacePath);
-      if (headSha === null) return failure(CODEX_APP_SERVER_ERROR_CODE.HEAD_READ_FAILED, `Codex completed, but an exact 40-hex HEAD could not be read from ${workspacePath}.`, executor);
-      return { exitStatus: 'success', summary: terminal.summary ?? 'Codex App Server turn completed.', headSha, executor, durationMs: Date.now() - startedAt };
+      if (headSha === null) return failure(CODEX_APP_SERVER_ERROR_CODE.HEAD_READ_FAILED, `Codex completed, but an exact 40-hex HEAD could not be read from ${workspacePath}.`, executor, providerTelemetry({
+        provider: CODEX_APP_SERVER_PROVIDER,
+        ...(this.options.model === undefined ? {} : { model: this.options.model }),
+        ...(preflight.reasoningEffort === undefined ? {} : { reasoningEffort: preflight.reasoningEffort }),
+        turns: Math.max(observedTurnIds.size, 1),
+        ...(observedUsage === undefined ? {} : { usage: observedUsage }),
+        ...(capabilityProvenance === undefined ? {} : { capability: capabilityProvenance }),
+        ...(firstInputTokens === undefined || peakInputTokens === undefined ? {} : { context: { initialTokens: firstInputTokens, peakTokens: peakInputTokens } }),
+        largestToolResultBytes: largestToolResultBytes ?? 0,
+        failure: { category: 'executed-runtime', code: CODEX_APP_SERVER_ERROR_CODE.HEAD_READ_FAILED },
+      }));
+      return {
+        exitStatus: 'success',
+        summary: terminal.summary ?? 'Codex App Server turn completed.',
+        headSha,
+        executor,
+        telemetry: providerTelemetry({
+          provider: CODEX_APP_SERVER_PROVIDER,
+          ...(this.options.model === undefined ? {} : { model: this.options.model }),
+          ...(preflight.reasoningEffort === undefined ? {} : { reasoningEffort: preflight.reasoningEffort }),
+          turns: Math.max(observedTurnIds.size, 1),
+          ...(observedUsage === undefined ? {} : { usage: observedUsage }),
+          ...(capabilityProvenance === undefined ? {} : { capability: capabilityProvenance }),
+          ...(firstInputTokens === undefined || peakInputTokens === undefined ? {} : { context: { initialTokens: firstInputTokens, peakTokens: peakInputTokens } }),
+          largestToolResultBytes: largestToolResultBytes ?? 0,
+        }),
+        durationMs: Date.now() - startedAt,
+      };
     } catch (error) {
       // A configuration rejection is not a model/runtime failure and is
       // reported with its own countable code before any turn was attempted.
@@ -426,8 +508,19 @@ function hasOwnership(request: ImplementationRequest): request is Implementation
     (request.executor === undefined || request.executor.generation === request.runtimeOwnership.generation);
 }
 
-function failure(code: string, detail: string, executor?: ExecutorIdentity): AgentResult {
-  return { exitStatus: 'failure', summary: detail, diagnostics: [`${code}: ${detail}`], ...(executor === undefined ? {} : { executor }) };
+function failure(
+  code: string,
+  detail: string,
+  executor?: ExecutorIdentity,
+  telemetry?: ProviderExecutionTelemetry,
+): AgentResult {
+  return {
+    exitStatus: 'failure',
+    summary: detail,
+    diagnostics: [`${code}: ${detail}`],
+    ...(executor === undefined ? {} : { executor }),
+    ...(telemetry === undefined ? {} : { telemetry }),
+  };
 }
 
 function cancelled(executor?: ExecutorIdentity): AgentResult {
@@ -662,11 +755,12 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
       const rawStatus = string(turn.status, 'turn status');
       const status: 'completed' | 'interrupted' | 'failed' = rawStatus === 'completed' || rawStatus === 'interrupted' || rawStatus === 'failed' ? rawStatus : 'failed';
       const summary = latestAgentMessage(array(turn.items, 'turn items')) ?? this.turnSummaries.get(turnId);
+      const usage = tokenUsageFromProviderValue(turn.usage ?? params.usage);
       const complete = { status, ...(summary === undefined ? {} : { summary }) };
       this.completedTurns.set(turnId, complete);
       this.turnWaiters.get(turnId)?.resolve(complete);
       this.turnWaiters.delete(turnId);
-      this.emit({ type: 'turn_completed', threadId: string(params.threadId, 'thread id'), turnId, status });
+      this.emit({ type: 'turn_completed', threadId: string(params.threadId, 'thread id'), turnId, status, ...(usage === undefined ? {} : { usage }) });
     }
     if (method === 'item/completed') {
       const item = object(params.item, 'item/completed item');
@@ -674,7 +768,8 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
       if (summary !== undefined && typeof params.turnId === 'string' && params.turnId.trim() !== '') {
         this.turnSummaries.set(params.turnId, summary);
       }
-      this.emit({ type: 'item_completed', threadId: string(params.threadId, 'thread id'), itemId: string(item.id, 'item id') });
+      const toolResultBytes = toolResultBytesFromItem(item);
+      this.emit({ type: 'item_completed', threadId: string(params.threadId, 'thread id'), itemId: string(item.id, 'item id'), ...(toolResultBytes === undefined ? {} : { toolResultBytes }) });
     }
   }
 
@@ -690,7 +785,18 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
 
 /** Typed preflight rejection: counted apart from any executed runtime failure. */
 function executionConfigurationFailure(error: ExecutionConfigurationError, executor?: ExecutorIdentity): AgentResult {
-  return failure(error.code, error.message, executor);
+  return failure(error.code, error.message, executor, providerTelemetry({
+    provider: error.evidence.provider ?? CODEX_APP_SERVER_PROVIDER,
+    ...(error.evidence.model === undefined ? {} : { model: error.evidence.model }),
+    ...(error.evidence.canonicalEffort === undefined ? {} : { reasoningEffort: error.evidence.canonicalEffort }),
+    turns: 0,
+    ...(error.evidence.capabilitySource === undefined ? {} : { capability: {
+      source: error.evidence.capabilitySource,
+      ...(error.evidence.capabilityRevision === undefined ? {} : { revision: error.evidence.capabilityRevision }),
+      verified: false,
+    } }),
+    failure: { category: 'configuration-preflight', code: error.code },
+  }));
 }
 
 function threadParams(options: AppServerThreadOptions): Record<string, unknown> {
