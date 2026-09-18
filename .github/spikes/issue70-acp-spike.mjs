@@ -407,14 +407,15 @@ async function phaseB(bootstrapAdapter) {
     result.wallTimeMs = Date.now() - startedAt;
     result.updateTypes = [...new Set(launched.updates.map(update => update.sessionUpdate).filter(Boolean))];
     result.modelRequests = MODEL_REQUESTS.filter(request => request.scenario === 'B1').length;
-    await prepared.guard.assertValid('after-execution');
-    result.guardAfter = 'PASS';
     const head = await runCommand('git', ['rev-parse', 'HEAD'], prepared.identity.workspacePath);
     const status = await runCommand('git', ['status', '--porcelain=v1', '--untracked-files=all'], prepared.identity.workspacePath);
     const diff = await runCommand('git', ['diff', '--name-status', prepared.identity.baseSha, head, '--'], prepared.identity.workspacePath);
     result.headSha = head;
     result.workspaceClean = status === '';
     result.changedFiles = diff.split('\n').filter(Boolean);
+    result.statusBeforeGuard = status;
+    try { await prepared.guard.assertValid('after-execution'); result.guardAfter = 'PASS'; }
+    catch (error) { result.guardAfter = { error: String(error) }; throw error; }
     await runCommand('git', ['push', 'origin', `HEAD:refs/heads/${prepared.identity.branch}`], prepared.identity.workspacePath);
     result.published = await runCommand('git', ['ls-remote', '--heads', 'origin', `refs/heads/${prepared.identity.branch}`], prepared.identity.workspacePath);
     result.verifyDurable = await bootstrapAdapter.verifyDurable({ identity: prepared.identity, expectedHeadSha: head, progressBaseSha: prepared.identity.baseSha, workspaceGuard: prepared.guard });
