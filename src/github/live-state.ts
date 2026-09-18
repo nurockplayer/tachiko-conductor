@@ -204,15 +204,13 @@ export class LiveGitHubAdapter implements GitHubAdapter {
   }
 
   async readIssue(target: IssueTarget): Promise<IssueSnapshot> {
-    const live = await this.readLiveSnapshot(target);
+    const path = `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}`;
+    const issue = this.normalizeIssue(asRecordOrThrow(await this.transport.get(path), path), path);
     return {
       target,
-      title: live.issue.title,
-      body: live.issue.body,
-      state: live.issue.state,
-      ...(live.pullRequest === null
-        ? {}
-        : { headSha: live.pullRequest.headSha, pullRequestNumber: live.pullRequest.number }),
+      title: issue.title,
+      body: issue.body,
+      state: issue.state,
     };
   }
 
