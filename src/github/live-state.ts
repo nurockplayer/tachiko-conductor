@@ -244,6 +244,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const record = asRecord(await this.transport.get(path));
       if (record === null) throw invalid(path, 'pull request is not an object');
+      if (!(await this.isCanonicallyAssociated(owner, repo, target.issueNumber, number, record))) continue;
       result.push(this.normalizePullRequest(record, path));
     }
     return result;
@@ -261,32 +262,16 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const timeline = await this.transport.getPaginated(`${issuePath}/timeline`);
     const numbers = await this.discoverPullRequestNumbers(owner, repo, issueNumber, timeline);
 
-    const open: OpenPullRequest[] = [];
+    const associated: OpenPullRequest[] = [];
     for (const number of numbers) {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const raw = asRecordOrThrow(await this.transport.get(path), path);
       if (requirePositiveInt(raw, 'number', path) !== number) {
         throw invalid(path, `pull request number ${String(raw.number)} does not match the referenced ${number}`);
       }
-      if (raw.state === 'open') open.push({ number, path, raw });
-    }
-    let associated = open;
-    let authoritativeClosingMatches: number | null = null;
-    if (open.length > 1 && this.transport.graphql !== undefined) {
-      const closingMatches: OpenPullRequest[] = [];
-      for (const candidate of open) {
-        if (await this.pullRequestClosesIssue(owner, repo, candidate.number, issueNumber)) {
-          closingMatches.push(candidate);
-        }
-      }
-      authoritativeClosingMatches = closingMatches.length;
-      if (closingMatches.length > 0) associated = closingMatches;
-    }
-    if (associated.length > 1 && (authoritativeClosingMatches === null || authoritativeClosingMatches === 0)) {
-      const bodyClosingMatches = associated.filter((candidate) =>
-        hasClosingReference(candidate.raw, owner, repo, issueNumber),
-      );
-      if (bodyClosingMatches.length === 1) associated = bodyClosingMatches;
+      if (raw.state !== 'open') continue;
+      if (!(await this.isCanonicallyAssociated(owner, repo, issueNumber, number, raw))) continue;
+      associated.push({ number, path, raw });
     }
     if (associated.length > 1) {
       throw new GitHubLiveStateError(
@@ -551,6 +536,26 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     };
   }
 
+  /**
+   * One fail-closed rule for Issue <-> PR association.  A timeline
+   * cross-reference only proves that a PR mentioned the Issue; it does not
+   * prove the PR implements or closes it.  Require either an explicit
+   * closing keyword in the PR body (the deterministic syntax Conductor uses
+   * for its own implementation PRs) or GitHub's first-party closing linkage.
+   */
+  private async isCanonicallyAssociated(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    pullRequestNumber: number,
+    raw: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (hasClosingReference(raw, owner, repo, issueNumber)) return true;
+    if (this.transport.graphql === undefined) return false;
+    return this.pullRequestClosesIssue(owner, repo, pullRequestNumber, issueNumber);
+  }
+
+  /** Timeline cross-references are candidates, never proof of association. */
   private async discoverPullRequestNumbers(
     owner: string,
     repo: string,

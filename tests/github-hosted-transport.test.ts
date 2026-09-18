@@ -48,6 +48,7 @@ function pull(): Record<string, unknown> {
     node_id: 'PR_7',
     number: 7,
     title: 'Implement the validation workflow',
+    body: 'Closes #42',
     state: 'open',
     draft: false,
     html_url: 'https://github.test/acme/widgets/pull/7',

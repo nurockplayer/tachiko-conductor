@@ -91,6 +91,7 @@ function pull(
     node_id: `PR_${number}`,
     number,
     title: 'Implement live state',
+    body: 'Closes #42',
     state: 'open',
     draft: false,
     html_url: `https://github.test/acme/widgets/pull/${number}`,
@@ -392,8 +393,8 @@ PR: #7`;
       .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
       .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7), crossRef(8)])
       .collection('repos/acme/widgets/issues/42/comments', [])
-      .queue('repos/acme/widgets/pulls/7', pull(), pull())
-      .queue('repos/acme/widgets/pulls/8', pull(8))
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: '' }), pull(7, HEAD, { body: '' }))
+      .queue('repos/acme/widgets/pulls/8', pull(8, HEAD, { body: 'Closes #12' }))
       .collection('repos/acme/widgets/issues/7/comments', [])
       .collection('repos/acme/widgets/pulls/7/reviews', [])
       .collection('repos/acme/widgets/pulls/7/comments', [])
@@ -421,7 +422,7 @@ PR: #7`;
       .collection('repos/acme/widgets/pulls/7/comments', [])
       .queue('repos/acme/widgets/commits/' + HEAD + '/status', { state: 'success', statuses: [] })
       .queue('repos/acme/widgets/commits/' + HEAD + '/check-runs', { total_count: 0, check_runs: [] })
-      .queueGraphql(closingIssues(), closingIssues());
+      .queueGraphql(closingIssues());
     const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
 
     const snapshot = await adapter.readLiveSnapshot(TARGET);
@@ -591,5 +592,96 @@ PR: #7`;
 
     assert.deepEqual(second, first);
     assert.equal(second.observedAt, OBSERVED_AT);
+  });
+
+  it('does not associate an unrelated open PR that only mentions the Issue in prose', async () => {
+    const transport = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .collection('repos/acme/widgets/issues/42/comments', [])
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'Follow-up work discussed in #42.' }))
+      .queueGraphql(closingIssues())
+      .queue('repos/acme/widgets', { default_branch: 'main' })
+      .queue('repos/acme/widgets/commits/main', { sha: BASE });
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.pullRequest, null);
+    assert.equal(snapshot.headSha, null);
+    assert.equal(snapshot.repository.defaultBranch, 'main');
+  });
+
+  it('keeps listPullRequests and readLiveSnapshot aligned on canonical association', async () => {
+    const proseTransport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'See #42.' }))
+      .queueGraphql(closingIssues());
+    const proseAdapter = new LiveGitHubAdapter({ transport: proseTransport, now: () => OBSERVED_AT });
+    assert.deepEqual(await proseAdapter.listPullRequests(TARGET), []);
+
+    const mergedTransport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue(
+        'repos/acme/widgets/pulls/7',
+        pull(7, HEAD, {
+          state: 'closed',
+          merged_at: '2026-08-14T02:30:00.000Z',
+          body: 'Mentions #42 but implements #32.',
+        }),
+      )
+      .queueGraphql(closingIssues());
+    const mergedAdapter = new LiveGitHubAdapter({ transport: mergedTransport, now: () => OBSERVED_AT });
+    assert.deepEqual(await mergedAdapter.listPullRequests(TARGET), []);
+  });
+
+  it('keeps a genuine open implementation PR associated so it still blocks a second writer', async () => {
+    const transport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue(
+        'repos/acme/widgets/pulls/7',
+        pull(7, HEAD, { body: 'Closes #42\n\nConductor-owned implementation pull request.' }),
+      );
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const pulls = await adapter.listPullRequests(TARGET);
+
+    assert.equal(pulls.length, 1);
+    assert.equal(pulls[0]?.number, 7);
+    assert.equal(pulls[0]?.state, 'open');
+  });
+
+  it('does not pick arbitrarily when multiple cross-references are all incidental', async () => {
+    const transport = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7), crossRef(8)])
+      .collection('repos/acme/widgets/issues/42/comments', [])
+      .queue(
+        'repos/acme/widgets/pulls/7',
+        pull(7, HEAD, { body: 'Implements #32.' }),
+        pull(7, HEAD, { body: 'Implements #32.' }),
+      )
+      .queue('repos/acme/widgets/pulls/8', pull(8, HEAD, { body: 'Docs for #12.' }))
+      .queueGraphql(closingIssues(), closingIssues())
+      .queue('repos/acme/widgets', { default_branch: 'main' })
+      .queue('repos/acme/widgets/commits/main', { sha: BASE });
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.pullRequest, null);
+  });
+
+  it('fails closed on a prose cross-reference when no first-party closing channel exists', async () => {
+    const route = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'See #42.' }));
+    const transport: GitHubApiTransport = {
+      get: (path) => route.get(path),
+      getPaginated: (path) => route.getPaginated(path),
+    };
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    assert.deepEqual(await adapter.listPullRequests(TARGET), []);
   });
 });

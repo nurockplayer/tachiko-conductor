@@ -19,6 +19,8 @@ import { createRun } from '../src/domain/run.js';
 import type { Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
+import { LiveGitHubAdapter } from '../src/github/live-state.js';
+import type { GitHubApiTransport } from '../src/github/transport.js';
 
 const T0 = '2026-09-15T00:00:00.000Z';
 const QUEUE = `${DISPATCH_QUEUE_MARKER}
@@ -72,6 +74,52 @@ class GitHub implements GitHubAdapter {
   async readBranch(): Promise<never> { throw new Error('unused'); }
   async listPullRequests(): Promise<readonly PullRequestSnapshot[]> { return this.pulls; }
   async readLiveSnapshot(): Promise<never> { throw new Error('unused'); }
+}
+
+/** Issue #19 timeline points at an unrelated open PR #33 that only mentions it. */
+class IncidentalCrossReferenceTransport implements GitHubApiTransport {
+  async get(path: string): Promise<unknown> {
+    if (path === 'repos/acme/widgets/issues/19') {
+      return {
+        node_id: 'I_19', number: 19, title: 'queued', body: '', state: 'open',
+        html_url: 'https://github.test/acme/widgets/issues/19', created_at: T0, updated_at: T0,
+      };
+    }
+    if (path === 'repos/acme/widgets/pulls/33') {
+      return {
+        node_id: 'PR_33', number: 33, title: 'Unrelated', body: 'Discussed alongside #19.', state: 'open',
+        draft: false, html_url: 'https://github.test/acme/widgets/pull/33', mergeable: true,
+        mergeable_state: 'clean', updated_at: T0, merged_at: null,
+        head: { sha: 'head-33' }, base: { sha: 'base-33' },
+      };
+    }
+    if (path === 'repos/acme/widgets') return { default_branch: 'main' };
+    if (path === 'repos/acme/widgets/commits/main') return { sha: 'main-head' };
+    throw new Error(`No fixture for ${path}`);
+  }
+
+  async getPaginated(path: string): Promise<readonly unknown[]> {
+    if (path === 'repos/acme/widgets/issues/19/timeline') {
+      return [{
+        event: 'cross-referenced',
+        source: { issue: { number: 33, pull_request: { url: 'https://api.github.com/repos/acme/widgets/pulls/33' } } },
+      }];
+    }
+    if (path === 'repos/acme/widgets/issues/19/comments') return [];
+    throw new Error(`No fixture for ${path}`);
+  }
+
+  async graphql(): Promise<unknown> {
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            closingIssuesReferences: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        },
+      },
+    };
+  }
 }
 
 describe('dispatch queue protocol', () => {
@@ -201,6 +249,20 @@ describe('dispatch queue protocol', () => {
       outcome: 'no_eligible_work',
       reasons: ['#18: existing durable run existing is READY', '#19: an associated pull request is already open'],
     });
+  });
+
+  it('does not treat an incidental open PR cross-reference as an active writer', async () => {
+    const result = await dispatchOnce({
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard`,
+      owner: 'acme', repo: 'widgets', store: new MemoryStore(), runtime: new Comments(),
+      github: new LiveGitHubAdapter({ transport: new IncidentalCrossReferenceTransport(), now: () => T0 }),
+      leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'claim-1',
+      async execute(entry) { return { runId: `run-${entry.issue}`, state: 'IMPLEMENTING' }; },
+    });
+
+    assert.equal(result.outcome, 'dispatched');
+    if (result.outcome !== 'dispatched') throw new Error('expected Codex dispatch');
+    assert.equal(result.entry.issue, 19);
   });
 
   it('leaves human, Work, and ChatGPT entries unclaimed while continuing to a later Codex entry', async () => {
