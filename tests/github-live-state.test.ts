@@ -423,7 +423,7 @@ PR: #7`;
       .collection('repos/acme/widgets/pulls/7/comments', [])
       .queue('repos/acme/widgets/commits/' + HEAD + '/status', { state: 'success', statuses: [] })
       .queue('repos/acme/widgets/commits/' + HEAD + '/check-runs', { total_count: 0, check_runs: [] })
-      .queueGraphql(closingIssues());
+      .queueGraphql(closingIssues(), closingIssues());
     const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
 
     const snapshot = await adapter.readLiveSnapshot(TARGET);
