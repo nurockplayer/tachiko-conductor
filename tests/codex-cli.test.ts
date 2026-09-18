@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
+import {
+  CODEX_CAPABILITY_FALLBACK_REVISION,
+  runtimeCapabilityCatalog,
+} from '../src/agents/model-capability.js';
+import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
 import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
@@ -254,5 +259,62 @@ describe('CodexCliAdapter', () => {
     assert.equal(agentResult.exitStatus, 'failure');
     assert.match(agentResult.diagnostics?.join('\n') ?? '', /CODEX_EXEC_FAILURE.*Duplicate MCP capability name/);
     assert.equal(runner.calls.length, 0);
+  });
+
+  it('rejects an unsupported reasoning effort before starting any Codex turn', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo', model: 'configured-model',
+      // A raw operator spelling that must not survive to the spawn boundary.
+      reasoningEffort: 'turbo' as never });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.equal(agentResult.durationMs, 0);
+    assert.ok(agentResult.diagnostics?.[0]?.startsWith(EXECUTION_CONFIGURATION_ERROR_CODE.INVALID_REASONING_EFFORT));
+    assert.match(agentResult.diagnostics?.[0] ?? '', /turbo/);
+    assert.equal(runner.calls.length, 0, 'a preflight rejection must start zero model turns');
+  });
+
+  it('rejects an unsupported model/effort combination before starting any Codex turn', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({
+      runner, cwd: '/tmp/repo', model: 'restricted-model', reasoningEffort: 'high',
+      // Injected authoritative capability data; production CLI uses the fallback.
+      capabilityCatalog: runtimeCapabilityCatalog([{ model: 'restricted-model', supportedReasoningEfforts: ['low'] }], 'test-catalog-v1'),
+    });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.ok(agentResult.diagnostics?.[0]?.startsWith(EXECUTION_CONFIGURATION_ERROR_CODE.UNSUPPORTED_MODEL_EFFORT));
+    assert.match(agentResult.diagnostics?.[0] ?? '', /restricted-model/);
+    assert.match(agentResult.diagnostics?.[0] ?? '', /low/);
+    assert.equal(runner.calls.length, 0, 'a preflight rejection must start zero model turns');
+  });
+
+  it('normalizes an aliased/cased effort to the canonical value at spawn without downgrading it', async () => {
+    const runner = new FakeRunner([result(codexJsonl()), result(HEAD)]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo', model: 'configured-model',
+      reasoningEffort: 'High' as never });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'success');
+    const args = runner.calls[0]?.args ?? [];
+    assert.ok(args.includes('model_reasoning_effort="high"'), `expected canonical effort, got ${args.join(' ')}`);
+    assert.ok(!args.some((arg) => arg.includes('medium')), 'normalization must never downgrade high');
+    assert.equal(runner.calls.length, 2);
+  });
+
+  it('uses the versioned fallback catalog and never rejects a valid level when discovery is unavailable', async () => {
+    const runner = new FakeRunner([result(codexJsonl()), result(HEAD)]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo', model: 'configured-model', reasoningEffort: 'high' });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+    assert.equal(agentResult.exitStatus, 'success');
+    assert.equal(runner.calls.length, 2);
+    // The fallback identifies itself so telemetry can attribute a stale-catalog defect.
+    assert.equal(CODEX_CAPABILITY_FALLBACK_REVISION, 'codex-model-effort-fallback-v1');
   });
 });

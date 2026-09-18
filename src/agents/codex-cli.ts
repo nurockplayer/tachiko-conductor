@@ -8,6 +8,18 @@ import {
 } from '../adapters/agent.js';
 import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
 import {
+  isExecutionConfigurationError,
+  normalizeReasoningEffort,
+  type ExecutionConfigurationError,
+  type ExecutionReasoningEffort,
+} from '../execution-profiles.js';
+import {
+  codexFallbackCapabilityCatalog,
+  preflightModelEffort,
+  type ModelCapabilityCatalog,
+  type ModelEffortPreflightResult,
+} from './model-capability.js';
+import {
   NodeProcessRunner,
   type ProcessResult,
   type ProcessRunner,
@@ -37,9 +49,11 @@ export interface CodexCliAdapterOptions {
   readonly cwd?: string;
   readonly timeoutMs?: number;
   readonly model?: string;
-  readonly reasoningEffort?: 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+  readonly reasoningEffort?: ExecutionReasoningEffort;
   readonly sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   readonly approvalPolicy?: 'untrusted' | 'on-request' | 'never';
+  /** Provider-boundary capability source; defaults to the versioned Codex fallback. */
+  readonly capabilityCatalog?: ModelCapabilityCatalog;
 }
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -67,6 +81,7 @@ export class CodexCliAdapter implements ImplementationAgent {
   private readonly reasoningEffort: CodexCliAdapterOptions['reasoningEffort'];
   private readonly sandboxMode: CodexCliAdapterOptions['sandboxMode'];
   private readonly approvalPolicy: CodexCliAdapterOptions['approvalPolicy'];
+  private readonly capabilityCatalog: ModelCapabilityCatalog;
 
   constructor(options: CodexCliAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
@@ -76,6 +91,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     this.reasoningEffort = options.reasoningEffort;
     this.sandboxMode = options.sandboxMode;
     this.approvalPolicy = options.approvalPolicy;
+    this.capabilityCatalog = options.capabilityCatalog ?? codexFallbackCapabilityCatalog();
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -88,6 +104,17 @@ export class CodexCliAdapter implements ImplementationAgent {
         executor,
       );
     }
+    // Normalize and validate the exact model/effort pair before any Codex
+    // process exists, so an unsupported configuration starts zero model turns.
+    let preflight: ModelEffortPreflightResult;
+    try {
+      preflight = this.preflightConfiguration();
+    } catch (error) {
+      if (isExecutionConfigurationError(error)) {
+        return executionConfigurationFailure(error, executor);
+      }
+      throw error;
+    }
     if (isAborted(request.signal)) return cancelledAgentResult(0, executor);
 
     const prompt = buildPrompt(request);
@@ -98,7 +125,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     try {
       result = await this.runner.run(
         'codex',
-        this.buildArgs(prompt, request.capabilities ?? [], executor),
+        this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort),
         this.processOptions(request.signal, cwd),
       );
     } catch (error) {
@@ -182,14 +209,15 @@ export class CodexCliAdapter implements ImplementationAgent {
     prompt: string,
     capabilities: readonly McpHttpCapability[],
     executor: ExecutorIdentity | undefined,
+    reasoningEffort: ExecutionReasoningEffort | undefined,
   ): string[] {
     const args = executor === undefined ? ['exec', '--json'] : ['exec', 'resume', '--json'];
     for (const capability of normalizeMcpHttpCapabilities(capabilities)) {
       args.push('-c', codexMcpConfig(capability));
     }
     if (this.model !== undefined) args.push('--model', this.model);
-    if (this.reasoningEffort !== undefined) {
-      args.push('-c', `model_reasoning_effort=${JSON.stringify(this.reasoningEffort)}`);
+    if (reasoningEffort !== undefined) {
+      args.push('-c', `model_reasoning_effort=${JSON.stringify(reasoningEffort)}`);
     }
     if (this.sandboxMode !== undefined) {
       if (executor === undefined) args.push('--sandbox', this.sandboxMode);
@@ -207,6 +235,23 @@ export class CodexCliAdapter implements ImplementationAgent {
     return signal === undefined
       ? { timeoutMs: this.timeoutMs, cwd }
       : { timeoutMs: this.timeoutMs, cwd, signal };
+  }
+
+  /**
+   * Resolve the effective model/effort pair at the provider boundary. Alias
+   * normalization is idempotent for already-canonical values, so this is safe
+   * whether the caller supplied a raw operator spelling or a resolved snapshot.
+   */
+  private preflightConfiguration(): ModelEffortPreflightResult {
+    const reasoningEffort = this.reasoningEffort === undefined
+      ? undefined
+      : normalizeReasoningEffort(this.reasoningEffort, { provider: CODEX_CLI_PROVIDER });
+    return preflightModelEffort({
+      provider: CODEX_CLI_PROVIDER,
+      catalog: this.capabilityCatalog,
+      ...(this.model === undefined ? {} : { model: this.model }),
+      ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
+    });
   }
 
   private async readHead(signal: AbortSignal | undefined, cwd: string): Promise<string | null> {
@@ -312,8 +357,13 @@ function isUsableCodexExecutor(executor: ExecutorIdentity): boolean {
   return executor.provider === CODEX_CLI_PROVIDER && executor.sessionId.trim() !== '';
 }
 
+/** Typed preflight rejection: counted apart from any executed runtime failure. */
+function executionConfigurationFailure(error: ExecutionConfigurationError, executor?: ExecutorIdentity): AgentResult {
+  return failureAgentResult(error.code, error.message, 0, executor);
+}
+
 function failureAgentResult(
-  code: CodexErrorCode,
+  code: CodexErrorCode | string,
   detail: string,
   durationMs: number,
   executor?: ExecutorIdentity,

@@ -10,12 +10,14 @@ import {
   StdioCodexAppServerClient,
   StdioCodexAppServerClientFactory,
   type AppServerThreadOptions,
+  type AppServerModelDescriptor,
   type AppServerLifecycleEvent,
   type CodexAppServerClient,
   type CodexAppServerClientFactory,
   type NativeThreadObservation,
 } from '../src/agents/codex-app-server.js';
 import { WorkspaceGuardFailure, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
+import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
 import type { AgentResult } from '../src/domain/types.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
@@ -54,6 +56,18 @@ class Factory implements CodexAppServerClientFactory {
   opens = 0;
   constructor(readonly client: FakeClient) {}
   async open(): Promise<CodexAppServerClient> { this.opens += 1; return this.client; }
+}
+
+class DiscoveringClient extends FakeClient {
+  constructor(private readonly models: readonly AppServerModelDescriptor[] | Error) { super(); }
+  async listModels(): Promise<readonly AppServerModelDescriptor[]> {
+    if (this.models instanceof Error) throw this.models;
+    return this.models;
+  }
+  /** Every call that would start or resume model work. */
+  get modelTurnCalls(): readonly string[] {
+    return this.calls.filter((call) => call.startsWith('turn/start:') || call.startsWith('thread/resume:'));
+  }
 }
 
 class HangingClient extends FakeClient {
@@ -339,6 +353,54 @@ describe('CodexAppServerAdapter', () => {
     assert.equal(factory.opens, 0);
   });
 
+  it('validates a discovered model/effort pair before creating any thread or turn', async () => {
+    const client = new DiscoveringClient([{ model: 'deepseek-flash', supportedReasoningEfforts: ['low', 'high', 'max'] }]);
+    const adapter = new CodexAppServerAdapter({
+      clientFactory: new Factory(client), runner: new HeadRunner(),
+      model: 'deepseek-flash', reasoningEffort: 'medium',
+    });
+
+    const result = await adapter.run(request());
+
+    assert.equal(result.exitStatus, 'failure');
+    assert.ok(result.diagnostics?.[0]?.startsWith(EXECUTION_CONFIGURATION_ERROR_CODE.UNSUPPORTED_MODEL_EFFORT));
+    assert.match(result.diagnostics?.[0] ?? '', /deepseek-flash/);
+    assert.ok(!client.calls.includes('thread/start'), 'preflight rejection must not create a thread');
+    assert.deepEqual(client.modelTurnCalls, [], 'preflight rejection must start zero model turns');
+    assert.ok(client.calls.includes('close'), 'the App Server component is still closed');
+  });
+
+  it('proceeds on authoritative discovery when the pair is supported', async () => {
+    const client = new DiscoveringClient([{ model: 'deepseek-flash', supportedReasoningEfforts: ['low', 'high', 'max'] }]);
+    const adapter = new CodexAppServerAdapter({
+      clientFactory: new Factory(client), runner: new HeadRunner(),
+      model: 'deepseek-flash', reasoningEffort: 'high',
+    });
+
+    const result = await adapter.run(request());
+
+    assert.equal(result.exitStatus, 'success');
+    assert.ok(client.calls.includes('thread/start'));
+    assert.ok(client.modelTurnCalls.includes('turn/start:thread-new'));
+    // The canonical value reaches the provider unchanged and undowngraded.
+    assert.equal(client.threadOptions[0]?.reasoningEffort, 'high');
+  });
+
+  it('degrades to the versioned fallback when capability discovery is unavailable', async () => {
+    const client = new DiscoveringClient(new Error('App Server RPC error: method not found'));
+    const adapter = new CodexAppServerAdapter({
+      clientFactory: new Factory(client), runner: new HeadRunner(),
+      model: 'configured-model', reasoningEffort: 'high',
+    });
+
+    const result = await adapter.run(request());
+
+    // Discovery absence is not a model failure: the run still proceeds.
+    assert.equal(result.exitStatus, 'success');
+    assert.ok(client.modelTurnCalls.includes('turn/start:thread-new'));
+    assert.equal(client.threadOptions[0]?.reasoningEffort, 'high');
+  });
+
   it('turns a native agent takeover message into the existing typed human boundary', async () => {
     const client = new FakeClient();
     client.waitForTurn = async () => ({ status: 'completed', summary: 'TACHIKO_NEEDS_HUMAN: sign-in required' });
@@ -365,6 +427,49 @@ describe('CodexAppServerAdapter', () => {
   }, async () => {
     const client = await new StdioCodexAppServerClientFactory().open();
     await client.close();
+  });
+
+  it('rejects a real unsupported model/effort combination before any turn when explicitly opted in', {
+    skip: process.env.TACHIKO_CODEX_APP_SERVER_SMOKE !== '1',
+  }, async () => {
+    const probe = await new StdioCodexAppServerClientFactory().open();
+    let target: { readonly model: string; readonly effort: string } | undefined;
+    try {
+      const models = await probe.listModels?.() ?? [];
+      for (const model of models) {
+        const missing = ['minimal', 'low', 'medium', 'high', 'xhigh']
+          .find((effort) => !model.supportedReasoningEfforts.includes(effort));
+        if (missing !== undefined) { target = { model: model.model, effort: missing }; break; }
+      }
+    } finally {
+      await probe.close();
+    }
+    if (target === undefined) return; // this runtime offers every canonical level for every model
+
+    const adapter = new CodexAppServerAdapter({
+      runner: new HeadRunner(), model: target.model, reasoningEffort: target.effort as never,
+    });
+    const result = await adapter.run(request());
+
+    assert.equal(result.exitStatus, 'failure');
+    assert.ok(result.diagnostics?.[0]?.startsWith(EXECUTION_CONFIGURATION_ERROR_CODE.UNSUPPORTED_MODEL_EFFORT));
+    assert.match(result.diagnostics?.[0] ?? '', new RegExp(target.model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
+  });
+
+  it('discovers the real provider model/effort catalog without starting a model turn when explicitly opted in', {
+    skip: process.env.TACHIKO_CODEX_APP_SERVER_SMOKE !== '1',
+  }, async () => {
+    const client = await new StdioCodexAppServerClientFactory().open();
+    try {
+      const models = await client.listModels?.();
+      assert.ok(Array.isArray(models), 'the opted-in runtime must expose a model catalog');
+      for (const model of models ?? []) {
+        assert.equal(typeof model.model, 'string');
+        assert.ok(model.supportedReasoningEfforts.every((effort: string) => typeof effort === 'string'));
+      }
+    } finally {
+      await client.close();
+    }
   });
 });
 

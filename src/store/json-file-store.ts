@@ -3,7 +3,7 @@ import path from 'node:path';
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
-import { EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
+import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -85,7 +85,7 @@ function isExecutionConfiguration(value: unknown): boolean {
     typeof execution.timeoutMs === 'number' && Number.isSafeInteger(execution.timeoutMs) &&
     execution.timeoutMs > 0 && execution.timeoutMs <= MAX_EXECUTION_TIMEOUT_MS &&
     isOptionalNonEmptyString(execution.model) &&
-    (execution.reasoningEffort === undefined || ['minimal', 'low', 'medium', 'high', 'xhigh'].includes(execution.reasoningEffort as string)) &&
+    (execution.reasoningEffort === undefined || (CANONICAL_REASONING_EFFORTS as readonly string[]).includes(execution.reasoningEffort as string)) &&
     (execution.sandboxMode === undefined || ['read-only', 'workspace-write', 'danger-full-access'].includes(execution.sandboxMode as string)) &&
     (execution.approvalPolicy === undefined || ['untrusted', 'on-request', 'never'].includes(execution.approvalPolicy as string));
 }

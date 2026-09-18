@@ -5,9 +5,115 @@
 export const EXECUTION_PROFILE_NAMES = ['routine', 'standard', 'complex', 'critical'] as const;
 
 export type ExecutionProfileName = (typeof EXECUTION_PROFILE_NAMES)[number];
-export type ExecutionReasoningEffort = 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+
+/**
+ * The canonical reasoning-effort vocabulary the Conductor may request.  It is a
+ * durable, provider-neutral control vocabulary: providers may report extra
+ * values through runtime discovery, but widening this set changes the durable
+ * execution snapshot and is therefore a deliberate, separate decision.
+ */
+export const CANONICAL_REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+
+export type ExecutionReasoningEffort = (typeof CANONICAL_REASONING_EFFORTS)[number];
 export type ExecutionSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type ExecutionApprovalPolicy = 'untrusted' | 'on-request' | 'never';
+
+/**
+ * Accepted operator aliases, normalized to one canonical runtime value.  Every
+ * entry maps to a level of the *same* strength: aliases never downgrade a
+ * request, and an ambiguous word (for example "highest") is deliberately absent
+ * so it fails closed instead of being guessed down a level.
+ */
+const REASONING_EFFORT_ALIASES: Readonly<Record<string, ExecutionReasoningEffort>> = {
+  minimal: 'minimal',
+  min: 'minimal',
+  low: 'low',
+  medium: 'medium',
+  med: 'medium',
+  moderate: 'medium',
+  high: 'high',
+  xhigh: 'xhigh',
+  'x-high': 'xhigh',
+  extrahigh: 'xhigh',
+  'extra-high': 'xhigh',
+  veryhigh: 'xhigh',
+  'very-high': 'xhigh',
+};
+
+/** Stable, countable codes so telemetry can separate configuration from execution. */
+export const EXECUTION_CONFIGURATION_ERROR_CODE = {
+  INVALID_REASONING_EFFORT: 'EXECUTION_CONFIG_INVALID_REASONING_EFFORT',
+  UNSUPPORTED_MODEL_EFFORT: 'EXECUTION_CONFIG_UNSUPPORTED_MODEL_EFFORT',
+} as const;
+
+export type ExecutionConfigurationErrorCode =
+  (typeof EXECUTION_CONFIGURATION_ERROR_CODE)[keyof typeof EXECUTION_CONFIGURATION_ERROR_CODE];
+
+/** Bounded, secret-free evidence describing a rejected pre-spawn configuration. */
+export interface ExecutionConfigurationEvidence {
+  readonly provider?: string;
+  readonly model?: string;
+  readonly requestedEffort: string;
+  readonly canonicalEffort?: ExecutionReasoningEffort;
+  readonly supportedEfforts?: readonly string[];
+  /** `runtime-discovery` is provider-authoritative; `fallback` is versioned local metadata. */
+  readonly capabilitySource?: 'runtime-discovery' | 'fallback';
+  readonly capabilityRevision?: string;
+  /** Provider-reported values the Conductor vocabulary cannot request. */
+  readonly unrequestableEfforts?: readonly string[];
+}
+
+/**
+ * A typed configuration rejection raised before any model spawn. It is
+ * deliberately distinct from runtime/model execution failures so orchestration
+ * and telemetry can attribute it to preflight validation.
+ */
+export class ExecutionConfigurationError extends Error {
+  readonly code: ExecutionConfigurationErrorCode;
+  readonly evidence: ExecutionConfigurationEvidence;
+
+  constructor(
+    code: ExecutionConfigurationErrorCode,
+    message: string,
+    evidence: ExecutionConfigurationEvidence,
+  ) {
+    super(message);
+    this.name = 'ExecutionConfigurationError';
+    this.code = code;
+    this.evidence = evidence;
+  }
+}
+
+export function isExecutionConfigurationError(error: unknown): error is ExecutionConfigurationError {
+  return error instanceof ExecutionConfigurationError;
+}
+
+/** Stable diagnostic line so configuration rejection is countable apart from runtime failure. */
+export function executionConfigurationDiagnostic(error: ExecutionConfigurationError): string {
+  return `${error.code}: ${error.message}`;
+}
+
+function aliasKey(value: string): string {
+  return value.trim().toLowerCase().replace(/[\s_]+/g, '-').replace(/-+/g, '-');
+}
+
+/**
+ * Normalize an operator/policy spelling (case, spacing, hyphenation, or an
+ * accepted alias) to exactly one canonical runtime value.  Throws a typed
+ * configuration error for anything it cannot map without guessing.
+ */
+export function normalizeReasoningEffort(
+  value: string,
+  context: { readonly provider?: string } = {},
+): ExecutionReasoningEffort {
+  const canonical = REASONING_EFFORT_ALIASES[aliasKey(value)];
+  if (canonical !== undefined) return canonical;
+  throw new ExecutionConfigurationError(
+    EXECUTION_CONFIGURATION_ERROR_CODE.INVALID_REASONING_EFFORT,
+    `Reasoning effort "${value}" is unsupported; expected one of ${CANONICAL_REASONING_EFFORTS.join(', ')}.`,
+    { ...(context.provider === undefined ? {} : { provider: context.provider }), requestedEffort: value },
+  );
+}
 
 /** Secret-free immutable settings retained with a run for reproducibility. */
 export interface ResolvedExecutionConfiguration {
@@ -26,7 +132,6 @@ export interface ExecutionProfileConfiguration {
   readonly profiles: Readonly<Record<ExecutionProfileName, Omit<ResolvedExecutionConfiguration, 'profile' | 'revision'>>>;
 }
 
-const REASONING_EFFORTS: readonly ExecutionReasoningEffort[] = ['minimal', 'low', 'medium', 'high', 'xhigh'];
 const SANDBOX_MODES: readonly ExecutionSandboxMode[] = ['read-only', 'workspace-write', 'danger-full-access'];
 const APPROVAL_POLICIES: readonly ExecutionApprovalPolicy[] = ['untrusted', 'on-request', 'never'];
 const PROFILE_KEYS = ['executor', 'timeoutMs', 'model', 'reasoningEffort', 'sandboxMode', 'approvalPolicy'] as const;
@@ -58,8 +163,8 @@ function parseProfile(name: ExecutionProfileName, value: unknown): Omit<Resolved
   if (value.model !== undefined && !nonEmptyString(value.model)) {
     throw new Error(`Execution profile "${name}".model must be a non-empty string when supplied.`);
   }
-  if (value.reasoningEffort !== undefined && !REASONING_EFFORTS.includes(value.reasoningEffort as ExecutionReasoningEffort)) {
-    throw new Error(`Execution profile "${name}".reasoningEffort is unsupported.`);
+  if (value.reasoningEffort !== undefined && typeof value.reasoningEffort !== 'string') {
+    throw new Error(`Execution profile "${name}".reasoningEffort must be a string when supplied.`);
   }
   if (value.sandboxMode !== undefined && !SANDBOX_MODES.includes(value.sandboxMode as ExecutionSandboxMode)) {
     throw new Error(`Execution profile "${name}".sandboxMode is invalid.`);
@@ -67,11 +172,17 @@ function parseProfile(name: ExecutionProfileName, value: unknown): Omit<Resolved
   if (value.approvalPolicy !== undefined && !APPROVAL_POLICIES.includes(value.approvalPolicy as ExecutionApprovalPolicy)) {
     throw new Error(`Execution profile "${name}".approvalPolicy is invalid.`);
   }
+  const executor = value.executor.trim();
+  // Normalize accepted aliases/case to one canonical value here, at resolution
+  // time, so no provider adapter ever receives an unnormalized spelling.
+  const reasoningEffort = value.reasoningEffort === undefined
+    ? undefined
+    : normalizeReasoningEffort(value.reasoningEffort, { provider: executor });
   return {
-    executor: value.executor.trim(),
+    executor,
     timeoutMs: value.timeoutMs as number,
     ...(value.model === undefined ? {} : { model: value.model.trim() }),
-    ...(value.reasoningEffort === undefined ? {} : { reasoningEffort: value.reasoningEffort as ExecutionReasoningEffort }),
+    ...(reasoningEffort === undefined ? {} : { reasoningEffort }),
     ...(value.sandboxMode === undefined ? {} : { sandboxMode: value.sandboxMode as ExecutionSandboxMode }),
     ...(value.approvalPolicy === undefined ? {} : { approvalPolicy: value.approvalPolicy as ExecutionApprovalPolicy }),
   };

@@ -179,6 +179,19 @@ describe('CLI command layer', () => {
       approvalPolicy: 'never',
       timeoutMs: 12_345,
     });
+    // Operator aliases/case resolve to the canonical runtime value before spawn.
+    assert.deepEqual(
+      resolveCodexExecutionConfig({ TACHIKO_CODEX_REASONING_EFFORT: 'High' }),
+      { reasoningEffort: 'high' },
+    );
+    assert.deepEqual(
+      resolveCodexExecutionConfig({ TACHIKO_CODEX_REASONING_EFFORT: 'XHigh' }),
+      { reasoningEffort: 'xhigh' },
+    );
+    assert.throws(
+      () => resolveCodexExecutionConfig({ TACHIKO_CODEX_REASONING_EFFORT: 'highest' }),
+      /Reasoning effort "highest" is unsupported/,
+    );
     assert.throws(
       () => resolveImplementationProvider({ TACHIKO_IMPLEMENTATION_AGENT: 'unknown' }),
       /TACHIKO_IMPLEMENTATION_AGENT/,
