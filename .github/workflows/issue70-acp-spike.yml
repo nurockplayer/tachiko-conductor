@@ -14,12 +14,14 @@ jobs:
     timeout-minutes: 20
     env:
       ISSUE70_BASE_SHA: 555523234732af4343426e819f7281e74d06a683
-      ISSUE70_RUNTIME_DIR: ${{ runner.temp }}/issue70-runtime
     steps:
       - name: Checkout spike branch
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Set spike runtime path
+        run: echo "ISSUE70_RUNTIME_DIR=$RUNNER_TEMP/issue70-runtime" >> "$GITHUB_ENV"
 
       - name: Set up Node 24
         uses: actions/setup-node@v4
