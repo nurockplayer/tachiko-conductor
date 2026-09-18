@@ -28,7 +28,7 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Set up pnpm
+      - name: Set up Tachiko pnpm
         uses: pnpm/action-setup@v4
         with:
           version: 10.34.5
@@ -39,13 +39,28 @@ jobs:
           pnpm install --frozen-lockfile
           pnpm build
 
-      - name: Install exact published Harness runtime
+      - name: Install exact published Harness runtime with upstream pnpm
         run: |
           mkdir -p "$ISSUE70_RUNTIME_DIR"
-          printf '%s\n' '{"private":true,"type":"module"}' > "$ISSUE70_RUNTIME_DIR/package.json"
-          pnpm --dir "$ISSUE70_RUNTIME_DIR" add --save-exact \
+          cat > "$ISSUE70_RUNTIME_DIR/package.json" <<'JSON'
+          {
+            "private": true,
+            "type": "module",
+            "packageManager": "pnpm@11.7.0",
+            "pnpm": {
+              "onlyBuiltDependencies": [
+                "@deepseek-ai/dsh-subprocess-local",
+                "node-pty",
+                "koffi"
+              ]
+            }
+          }
+          JSON
+          pnpm dlx pnpm@11.7.0 --dir "$ISSUE70_RUNTIME_DIR" add --save-exact \
             @deepseek-ai/dsh@0.1.6-alpha.2 \
             @agentclientprotocol/sdk@1.4.0
+          pnpm dlx pnpm@11.7.0 --dir "$ISSUE70_RUNTIME_DIR" rebuild \
+            @deepseek-ai/dsh-subprocess-local node-pty koffi
           node -e 'const p=require(process.env.ISSUE70_RUNTIME_DIR+"/node_modules/@deepseek-ai/dsh/package.json"); if(p.version!=="0.1.6-alpha.2") process.exit(2); console.log(p.name+"@"+p.version)'
 
       - name: Run bounded ACP cancellation ownership probe
