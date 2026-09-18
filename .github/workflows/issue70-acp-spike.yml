@@ -16,6 +16,7 @@ jobs:
       ISSUE70_BASE_SHA: 555523234732af4343426e819f7281e74d06a683
       ISSUE70_HARNESS_COMMIT: ddefc45fbc7f8e46dd73185e68295696d1297887
       ISSUE70_HARNESS_TAG: dsh-v0.1.6-alpha.2
+      ISSUE70_PERMISSION_MODE: danger-full-access
     steps:
       - name: Checkout spike branch
         uses: actions/checkout@v4
