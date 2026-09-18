@@ -166,6 +166,8 @@ function hasClosingReference(
   return pattern.test(pullRequest.body);
 }
 
+type PullRequestAssociation = 'associated' | 'not_associated' | 'unknown';
+
 interface OpenPullRequest {
   readonly number: number;
   readonly path: string;
@@ -202,15 +204,13 @@ export class LiveGitHubAdapter implements GitHubAdapter {
   }
 
   async readIssue(target: IssueTarget): Promise<IssueSnapshot> {
-    const live = await this.readLiveSnapshot(target);
+    const path = `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}`;
+    const issue = this.normalizeIssue(asRecordOrThrow(await this.transport.get(path), path), path);
     return {
       target,
-      title: live.issue.title,
-      body: live.issue.body,
-      state: live.issue.state,
-      ...(live.pullRequest === null
-        ? {}
-        : { headSha: live.pullRequest.headSha, pullRequestNumber: live.pullRequest.number }),
+      title: issue.title,
+      body: issue.body,
+      state: issue.state,
     };
   }
 
@@ -244,6 +244,11 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const record = asRecord(await this.transport.get(path));
       if (record === null) throw invalid(path, 'pull request is not an object');
+      const association = await this.classifyPullRequestAssociation(owner, repo, target.issueNumber, number, record);
+      if (association === 'not_associated') continue;
+      // Unknown is deliberately retained here: dispatch duplicate-writer
+      // protection must fail closed when a timeline candidate cannot be
+      // authoritatively disproven.
       result.push(this.normalizePullRequest(record, path));
     }
     return result;
@@ -261,32 +266,32 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const timeline = await this.transport.getPaginated(`${issuePath}/timeline`);
     const numbers = await this.discoverPullRequestNumbers(owner, repo, issueNumber, timeline);
 
-    const open: OpenPullRequest[] = [];
+    const associated: OpenPullRequest[] = [];
+    const unknownAssociationNumbers: number[] = [];
     for (const number of numbers) {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const raw = asRecordOrThrow(await this.transport.get(path), path);
       if (requirePositiveInt(raw, 'number', path) !== number) {
         throw invalid(path, `pull request number ${String(raw.number)} does not match the referenced ${number}`);
       }
-      if (raw.state === 'open') open.push({ number, path, raw });
-    }
-    let associated = open;
-    let authoritativeClosingMatches: number | null = null;
-    if (open.length > 1 && this.transport.graphql !== undefined) {
-      const closingMatches: OpenPullRequest[] = [];
-      for (const candidate of open) {
-        if (await this.pullRequestClosesIssue(owner, repo, candidate.number, issueNumber)) {
-          closingMatches.push(candidate);
-        }
+      if (raw.state !== 'open') continue;
+      const association = await this.classifyPullRequestAssociation(owner, repo, issueNumber, number, raw);
+      if (association === 'not_associated') continue;
+      if (association === 'unknown') {
+        unknownAssociationNumbers.push(number);
+        continue;
       }
-      authoritativeClosingMatches = closingMatches.length;
-      if (closingMatches.length > 0) associated = closingMatches;
+      associated.push({ number, path, raw });
     }
-    if (associated.length > 1 && (authoritativeClosingMatches === null || authoritativeClosingMatches === 0)) {
-      const bodyClosingMatches = associated.filter((candidate) =>
-        hasClosingReference(candidate.raw, owner, repo, issueNumber),
+    if (unknownAssociationNumbers.length > 0) {
+      throw new GitHubLiveStateError(
+        'GH_PR_ASSOCIATION_UNKNOWN',
+        `Issue ${owner}/${repo}#${issueNumber} has pull-request timeline candidates whose association cannot be proven; refusing to select or ignore them.`,
+        {
+          retryable: true,
+          details: { owner, repo, issueNumber, pullRequestNumbers: unknownAssociationNumbers },
+        },
       );
-      if (bodyClosingMatches.length === 1) associated = bodyClosingMatches;
     }
     if (associated.length > 1) {
       throw new GitHubLiveStateError(
@@ -551,6 +556,32 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     };
   }
 
+  /**
+   * One fail-closed rule for Issue <-> PR association. A timeline
+   * cross-reference only proves that a PR mentioned the Issue; it does not
+   * prove the PR implements or closes it. Prefer GitHub's first-party closing
+   * linkage. GitHub closing-keyword syntax remains a deterministic fallback
+   * for Conductor-created PRs and degraded first-party-linkage reads.
+   */
+  private async classifyPullRequestAssociation(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    pullRequestNumber: number,
+    raw: Record<string, unknown>,
+  ): Promise<PullRequestAssociation> {
+    if (this.transport.graphql !== undefined) {
+      try {
+        if (await this.pullRequestClosesIssue(owner, repo, pullRequestNumber, issueNumber)) return 'associated';
+        return hasClosingReference(raw, owner, repo, issueNumber) ? 'associated' : 'not_associated';
+      } catch {
+        return hasClosingReference(raw, owner, repo, issueNumber) ? 'associated' : 'unknown';
+      }
+    }
+    return hasClosingReference(raw, owner, repo, issueNumber) ? 'associated' : 'unknown';
+  }
+
+  /** Timeline cross-references are candidates, never proof of association. */
   private async discoverPullRequestNumbers(
     owner: string,
     repo: string,
