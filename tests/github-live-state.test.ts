@@ -302,6 +302,7 @@ PR: #7`;
 
   it('counts unresolved review threads across GraphQL pages', async () => {
     const transport = prTransport().queueGraphql(
+      closingIssues(42),
       {
         data: {
           repository: {
@@ -674,14 +675,18 @@ PR: #7`;
 
   it('fails closed on a prose cross-reference when no first-party closing channel exists', async () => {
     const route = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
       .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
-      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'See #42.' }));
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'See #42.' }), pull(7, HEAD, { body: 'See #42.' }));
     const transport: GitHubApiTransport = {
       get: (path) => route.get(path),
       getPaginated: (path) => route.getPaginated(path),
     };
     const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
 
-    assert.deepEqual(await adapter.listPullRequests(TARGET), []);
+    const candidates = await adapter.listPullRequests(TARGET);
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0]?.number, 7);
+    await expectError(adapter.readLiveSnapshot(TARGET), 'GH_PR_ASSOCIATION_UNKNOWN', true);
   });
 });
