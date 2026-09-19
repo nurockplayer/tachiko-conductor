@@ -232,11 +232,19 @@ function dedupeEvidence(evidence: readonly WaitEvidence[]): readonly WaitEvidenc
  * new transition, so duplicate or coalesced provider events produce exactly
  * one meaningful change.
  */
+export interface WaitNativeBoundary {
+  /** Completed-turn identity from the last genuine native read. */
+  readonly lastNativeIdentity: string | null;
+  /** Whether the immediately preceding recorded observation was a native read. */
+  readonly previousWasNative: boolean;
+}
+
 export function classifyWaitChange(
   previous: WaitObservation | null,
   next: WaitObservation,
   previousNative?: WaitObservation | null,
   previousIsNative = previous?.source === 'native',
+  nativeBoundary: WaitNativeBoundary = { lastNativeIdentity: previousNative?.lastCompletedTurnId ?? null, previousWasNative: previousIsNative },
 ): WaitChange {
   if (previous === null) {
     // The first observation establishes a baseline. A terminal baseline is
@@ -262,10 +270,11 @@ export function classifyWaitChange(
   const nativeBefore = previousNative === undefined
     ? (previous.source === 'native' ? previous : null)
     : previousNative;
-  // Compare against the last genuine native identity, not the immediately
-  // preceding record: an ambiguous read drops the identity and would otherwise
-  // look like a fresh completion.
-  const priorNativeIdentity = nativeBefore?.lastCompletedTurnId ?? null;
+  // Compare against the durable last genuine native identity, not the
+  // immediately preceding record: an ambiguous read drops the identity and
+  // would otherwise look like a fresh completion, and bounded history eviction
+  // must not lose the anchor either.
+  const priorNativeIdentity = nativeBoundary.lastNativeIdentity;
   const nextIdentity = next.lastCompletedTurnId ?? null;
   const turnIdentityAdvanced = nextIdentity !== null && nextIdentity !== priorNativeIdentity;
   // Completion boundary 1: an observed native active phase just ended.
@@ -283,7 +292,7 @@ export function classifyWaitChange(
   // read is what separates this from a plain idle -> idle advance, which is
   // progress-only. A native active anchor is excluded here because boundary 1
   // already covers it.
-  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && !previousIsNative && (nativeBefore === null || nativeBefore.status === 'idle')) {
+  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && !nativeBoundary.previousWasNative) {
     return {
       kind: 'completion',
       meaningful: true,
@@ -432,11 +441,21 @@ export interface WaitLedger {
   readonly waitStartedAt: string | null;
   /**
    * True once this subject has reached a terminal state and that transition has
-   * been surfaced. A timeout after that is never a new decision boundary, so a
-   * terminal Run can never be re-woken by the timeout policy even if later
-   * observations drift to a different digest.
+   * been surfaced. Sticky for the subject's lifetime: a timeout after that is
+   * never a new decision boundary, so a terminal Run can never be re-woken by
+   * the timeout policy even if later observations drift or repeat.
    */
   readonly terminalReached: boolean;
+  /**
+   * Completed-turn identity from the most recent genuine native read. Kept on
+   * the ledger (not derived from the bounded observation history) so the native
+   * completion boundary cannot be lost to eviction.
+   */
+  readonly lastNativeIdentity: string | null;
+  /** Whether the most recent recorded observation came from a genuine native read. */
+  readonly previousWasNative: boolean;
+  /** Bounded set of native completed-turn identities already surfaced. */
+  readonly nativeIdentities: readonly string[];
   /** Monotonic observation counter, independent of the bounded history length. */
   readonly observationSequence: number;
 }
@@ -459,6 +478,9 @@ export function createWaitLedger(input: {
     lastObservedAt: null,
     waitStartedAt: null,
     terminalReached: false,
+    lastNativeIdentity: null,
+    previousWasNative: false,
+    nativeIdentities: [],
     observationSequence: 0,
   };
 }
@@ -554,9 +576,13 @@ export function advanceWaitLedger(input: {
       };
   const previousNative = duplicate ? null : lastNativeObservation(ledger, observation.subjectId);
   const previousIsNative = previous !== null && previous.source === 'native';
+  const nativeBoundary: WaitNativeBoundary = {
+    lastNativeIdentity: ledger.lastNativeIdentity ?? null,
+    previousWasNative: ledger.previousWasNative ?? previousIsNative,
+  };
   const change = duplicate
     ? { kind: 'none' as const, meaningful: false, evidence: [] as readonly WaitEvidence[] }
-    : classifyWaitChange(previous, observation, previousNative, previousIsNative);
+    : classifyWaitChange(previous, observation, previousNative, previousIsNative, nativeBoundary);
   const observationSequence = ledger.observationSequence + 1;
   const observationEventId = `wait-observation:${ledger.ownerRunId}:${observation.subjectId}:${observationSequence}:${digest}`;
   const observations = duplicate
@@ -577,7 +603,11 @@ export function advanceWaitLedger(input: {
   // after the bounded wake list has evicted the original record. That includes
   // `timeout-policy`: an identical timeout must never become a periodic wake.
   const priorTerminalDigests = ledger.terminalDigests ?? [];
-  const duplicateWake = decision.shouldWake && ledger.wakes.some((wake) => wake.observationDigest === digest && wake.reason === decision.reason);
+  // A subject whose terminal transition was already surfaced never wakes again:
+  // later state is either a replay or post-terminal drift, neither of which is
+  // a new decision boundary.
+  const duplicateWake = decision.shouldWake && (ledger.terminalReached ||
+    ledger.wakes.some((wake) => wake.observationDigest === digest && wake.reason === decision.reason));
   const terminalDecision = decision.shouldWake &&
     (decision.reason === 'completion' || decision.reason === 'failure' || decision.reason === 'blocked' || decision.reason === 'terminal');
   const terminalAlreadyRecorded = terminalDecision && priorTerminalDigests.includes(digest);
@@ -604,7 +634,15 @@ export function advanceWaitLedger(input: {
     observations,
     wakes,
     terminalDigests,
-    terminalReached: !duplicate && isTerminalWaitObservation(observation),
+    // Sticky: once surfaced, a terminal transition stays surfaced.
+    terminalReached: ledger.terminalReached || (!duplicate && isTerminalWaitObservation(observation)),
+    lastNativeIdentity: observation.source === 'native'
+      ? observation.lastCompletedTurnId ?? ledger.lastNativeIdentity ?? null
+      : ledger.lastNativeIdentity ?? null,
+    previousWasNative: !duplicate && observation.source === 'native',
+    nativeIdentities: observation.source === 'native' && observation.lastCompletedTurnId !== undefined && !(ledger.nativeIdentities ?? []).includes(observation.lastCompletedTurnId)
+      ? [...(ledger.nativeIdentities ?? []), observation.lastCompletedTurnId].slice(-MAX_NATIVE_IDENTITIES)
+      : ledger.nativeIdentities ?? [],
     observationSequence,
     lastDigest: digest,
     lastObservedAt: input.at,
@@ -631,6 +669,7 @@ export interface WaitLedgerFile {
 const MAX_WAIT_OBSERVATIONS = 200;
 const MAX_WAIT_WAKES = 200;
 const MAX_TERMINAL_DIGESTS = 50;
+const MAX_NATIVE_IDENTITIES = 50;
 
 /**
  * Keep the durable ledger bounded; the latest records are the reconciliation
@@ -643,6 +682,7 @@ export function boundWaitLedger(ledger: WaitLedger): WaitLedger {
     observations: ledger.observations.slice(-MAX_WAIT_OBSERVATIONS),
     wakes: ledger.wakes.slice(-MAX_WAIT_WAKES),
     terminalDigests: (ledger.terminalDigests ?? []).slice(-MAX_TERMINAL_DIGESTS),
+    nativeIdentities: (ledger.nativeIdentities ?? []).slice(-MAX_NATIVE_IDENTITIES),
   };
 }
 
@@ -688,11 +728,25 @@ export function migrateWaitLedger(value: WaitLedger): WaitLedger {
   const terminalDigests = value.terminalDigests ?? value.wakes
     .filter((wake) => wake.reason === 'completion' || wake.reason === 'failure' || wake.reason === 'blocked' || wake.reason === 'terminal')
     .map((wake) => wake.observationDigest);
+  const nativeIdentities = value.nativeIdentities ?? value.observations
+    .filter((recorded) => recorded.source === 'native' && recorded.state.lastCompletedTurnId !== null)
+    .map((recorded) => recorded.state.lastCompletedTurnId as string);
+  const lastNative = [...value.observations].reverse().find((recorded) => recorded.source === 'native');
+  const lastObservation = value.observations[value.observations.length - 1];
+  const sequence = value.observationSequence ?? value.observations.reduce((highest, recorded) => {
+    const parsed = Number(recorded.id.split(':').at(-2));
+    return Number.isSafeInteger(parsed) && parsed > highest ? parsed : highest;
+  }, 0);
   return {
     ...value,
     terminalDigests,
+    // A terminal transition is only reached through a terminal *status*, never
+    // through a native completion wake whose observed status is `idle`.
     terminalReached: value.terminalReached ?? terminalDigests.length > 0,
-    observationSequence: value.observationSequence ?? value.observations.length,
+    lastNativeIdentity: value.lastNativeIdentity ?? lastNative?.state.lastCompletedTurnId ?? null,
+    previousWasNative: value.previousWasNative ?? lastObservation?.source === 'native',
+    nativeIdentities: [...new Set(nativeIdentities)].slice(-MAX_NATIVE_IDENTITIES),
+    observationSequence: sequence,
   };
 }
 

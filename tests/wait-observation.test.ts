@@ -203,45 +203,41 @@ describe('durable wait ledger', () => {
     assert.equal(second.ledger.wakes.length, 1);
   });
 
-  it('keeps the terminal dedup guarantee after bounded eviction of the wake record', () => {
-    // A terminal wake must never be re-emitted even after the bounded wake list
-    // has genuinely evicted the original record: the terminal-digest set is
-    // what carries the guarantee.
+  it('never re-wakes a terminal subject as the bounded history rolls over', () => {
+    // Once a terminal transition is surfaced, no amount of later drift, replay,
+    // or bounded eviction may wake the model again for that subject.
     let ledger = ledgerFor();
     const terminal = normalize('completed');
     const first = advanceWaitLedger({ ledger, observation: terminal, at: T0 });
     assert.equal(first.wokeNow, true);
     ledger = first.ledger;
-    // Push the terminal wake out of the bounded window with later, genuinely
-    // distinct timeout wakes (one per distinct observed state).
     const escalating: WaitWakePolicy = { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 0, onTimeout: 'policy-action' };
-    for (let index = 0; index < 250; index += 1) {
-      ledger = advanceWaitLedger({
-        ledger,
-        observation: normalize('active', { progress: { items: index + 1, turns: 0 } }),
-        at: T0,
-        timedOut: true,
-        policy: escalating,
-      }).ledger;
+    for (let index = 0; index < 400; index += 1) {
+      // Alternate drift and identical replays across the whole bounded history.
+      const next = index % 2 === 0
+        ? normalize('active', { progress: { items: index + 1, turns: 0 } })
+        : (index % 4 === 1 ? terminal : normalize('active', { progress: { items: index + 1, turns: 0 } }));
+      ledger = boundWaitLedger(advanceWaitLedger({ ledger, observation: next, at: T0, timedOut: true, policy: escalating }).ledger);
     }
-    assert.equal(ledger.wakes.length > 200, true);
-    const bounded = boundWaitLedger(ledger);
-    assert.equal(bounded.wakes.some((wake) => wake.observationDigest === waitObservationDigest(terminal)), false, 'terminal wake must be evicted');
-    assert.equal(bounded.terminalDigests?.includes(waitObservationDigest(terminal)), true);
-    const replayed = advanceWaitLedger({ ledger: bounded, observation: terminal, at: T0 });
-    assert.equal(replayed.wokeNow, false);
-    assert.equal(replayed.ledger.wakes.length, bounded.wakes.length);
+    assert.equal(ledger.terminalReached, true);
+    assert.equal(ledger.wakes.length, 1);
+    assert.equal(ledger.terminalDigests?.includes(waitObservationDigest(terminal)), true);
+    // The terminal record survives bounded observation eviction as durable state.
+    assert.equal(ledger.observations.length, 200);
+    const replay = advanceWaitLedger({ ledger, observation: terminal, at: T0 });
+    assert.equal(replay.wokeNow, false);
+    assert.equal(replay.ledger.wakes.length, 1);
   });
 
-  it('migrates a ledger written before terminal digests existed', () => {
-    const legacy = { ...ledgerFor() } as Record<string, unknown>;
-    delete legacy.terminalDigests;
+  it('suppresses a recorded terminal wake independently of terminalReached', () => {
+    // The terminal-digest set is the secondary guarantee: even if the sticky
+    // terminal flag were lost, the recorded digest must suppress the replay.
     const terminal = normalize('completed');
-    const advanced = advanceWaitLedger({ ledger: legacy as never, observation: terminal, at: T0 });
-    const migrated = migrateWaitLedger({ ...advanced.ledger, terminalDigests: undefined });
-    assert.deepEqual(migrated.terminalDigests, [waitObservationDigest(terminal)]);
-    const replayed = advanceWaitLedger({ ledger: migrated, observation: terminal, at: T0 });
+    const recorded = advanceWaitLedger({ ledger: ledgerFor(), observation: terminal, at: T0 }).ledger;
+    const withoutStickyFlag = { ...recorded, terminalReached: false };
+    const replayed = advanceWaitLedger({ ledger: withoutStickyFlag, observation: terminal, at: T0 });
     assert.equal(replayed.wokeNow, false);
+    assert.equal(replayed.ledger.wakes.length, recorded.wakes.length);
   });
 
   it('is digest-stable across evidence order and timestamps', () => {
@@ -647,6 +643,38 @@ describe('#35 native observation reuse', () => {
     assert.equal(sequences[0], 1);
     assert.equal(sequences.at(-1), 260);
     assert.equal(ledger.observations.length, 200);
+  });
+
+  it('keeps the native identity anchor through bounded observation eviction', () => {
+    // The anchor is durable ledger state, not a scan of the bounded history, so
+    // eviction cannot turn an unchanged identity into an apparent advance.
+    let ledger = ledgerFor();
+    ledger = advanceWaitLedger({ ledger, observation: normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' }), at: T0 }).ledger;
+    for (let index = 0; index < 260; index += 1) {
+      ledger = boundWaitLedger(advanceWaitLedger({
+        ledger,
+        observation: normalize('active', { progress: { items: index + 1, turns: 0 } }),
+        at: T0,
+      }).ledger);
+    }
+    assert.equal(ledger.observations.length, 200);
+    assert.equal(ledger.observations.some((recorded) => recorded.source === 'native'), false, 'native anchor must be evicted from history');
+    assert.equal(ledger.lastNativeIdentity, 'turn-1');
+    const replay = advanceWaitLedger({ ledger, observation: normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' }), at: T0 });
+    assert.equal(replay.change.kind, 'progress');
+    assert.equal(replay.wokeNow, false);
+    assert.equal(replay.ledger.wakes.length, 0);
+  });
+
+  it('keeps terminalReached sticky across duplicate terminal replays', () => {
+    const terminal = normalize('failed');
+    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: terminal, at: T0 }).ledger;
+    assert.equal(ledger.terminalReached, true);
+    ledger = advanceWaitLedger({ ledger, observation: terminal, at: T0 }).ledger;
+    assert.equal(ledger.terminalReached, true, 'a duplicate terminal read must not clear terminalReached');
+    const timeout = advanceWaitLedger({ ledger, observation: terminal, at: T0, timedOut: true, policy: { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 0, onTimeout: 'policy-action' } });
+    assert.equal(timeout.wake.shouldWake, false);
+    assert.equal(timeout.ledger.wakes.length, 1);
   });
 
   it('stays progress-only for an idle -> idle completed-turn identity advance', () => {
