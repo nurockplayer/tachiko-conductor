@@ -505,7 +505,7 @@ describe('wait CLI', () => {
       acknowledgeWaitDelivery({
         ok: true, mode: 'observe', runId: run.id, state: run.state, source: 'runtime', subjectId: run.id,
         status: 'failed', headSha: null, observationDigest: '', change: 'none',
-        wake: { shouldWake: false, reason: null, evidence: [] }, pendingWakes: [], modelTurns: 0,
+        wake: { shouldWake: false, reason: null, evidence: [] }, pendingWakes: [], carriedWakeIds: [], modelTurns: 0,
         timedOut: false, idle: true, observations: 1, duplicateObservations: 1, wakeCount: 1,
         waitStartedAt: null, observedDigest: '',
       }, ledgerStore);
@@ -540,7 +540,7 @@ describe('wait CLI', () => {
         ok: true, mode: 'observe', runId: run.id, state: run.state, source: 'runtime', subjectId: run.id,
         status: 'failed', headSha: null, observationDigest: '', change: 'failure',
         wake: { shouldWake: true, reason: 'failure', evidence: [] },
-        pendingWakes: [{ id: 'wake-a', reason: 'failure', subjectId: run.id, status: 'failed', evidence: [] }],
+        pendingWakes: [], carriedWakeIds: ['wake-a'],
         modelTurns: 0, timedOut: false, idle: false, observations: 1, duplicateObservations: 0,
         wakeCount: 2, waitStartedAt: null, observedDigest: '',
       }, ledgerStore);
@@ -623,6 +623,66 @@ describe('wait CLI', () => {
       assert.notEqual(timeout, undefined);
       assert.equal(timeout?.evidence.some((item) => item.detail.includes('expired')), true);
       assert.equal(pendingWaitWakes(ledgerStore.read()!).length, 0, 'both wakes were emitted and acknowledged');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('never overwrites a transition that lands between the telemetry read and write', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-telemetry-race'), { type: 'start' }, T0);
+      const real = new JsonFileStore({ dir: dataDir });
+      real.create(run);
+      let reads = 0;
+      // Inject the concurrent transition immediately after recordWake's first
+      // read, i.e. inside the read -> write window.
+      const store: typeof real = Object.create(real) as typeof real;
+      store.read = (id: string) => {
+        reads += 1;
+        const value = real.read(id);
+        if (reads === 2) real.update(applyTransition(real.read(id)!, { type: 'wait_dependency' }, T0));
+        return value;
+      };
+      const ledgerStore = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) });
+      const result = await waitObserveCommand({ id: run.id, mode: 'observe' }, { store, ledgerStore, now: () => T0 });
+      assert.equal(result.status, 'active');
+      const after = real.read(run.id);
+      assert.equal(after?.state, 'WAITING_DEPENDENCY', 'the concurrent transition must survive the telemetry write');
+      assert.equal(after?.history.length, 2);
+      assert.equal(after?.telemetry?.events.filter((event) => event.id.startsWith('wait-wake:')).length, 0);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('does not present a replayed wake twice', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-replay-dedupe'), { type: 'fail' }, T0);
+      seedRun(dataDir, run);
+      const filePath = resolveWaitLedgerFile(run.id, env);
+      const ledgerStore = new WaitLedgerFileStore({ filePath });
+      const base = createWaitLedger({ subjectId: run.id, ownerRunId: run.id, generation: run.id });
+      ledgerStore.write({
+        ...base,
+        wakes: [
+          { id: 'wake-failure', at: T0, reason: 'failure', source: 'runtime', subjectId: run.id, status: 'failed', observationDigest: 'b'.repeat(64), evidence: [] },
+          { id: 'wake-timeout', at: T0, reason: 'timeout-policy', source: 'runtime', subjectId: run.id, status: 'blocked', observationDigest: 'a'.repeat(64), evidence: [] },
+        ],
+        terminalDigests: ['b'.repeat(64)],
+        terminalReached: true,
+      });
+      const replayed = await runMain(env, ['wait', 'observe', run.id]);
+      const parsed = JSON.parse(replayed.stdout[0]!) as {
+        wake: { shouldWake: boolean; reason: string };
+        pendingWakes: readonly { id: string }[];
+        carriedWakeIds: readonly string[];
+      };
+      assert.equal(parsed.wake.reason, 'failure');
+      assert.equal(parsed.pendingWakes.some((wake) => wake.id === 'wake-failure'), false, 'the replayed wake must not also appear as pending');
+      assert.deepEqual(parsed.carriedWakeIds.slice().sort(), ['wake-failure', 'wake-timeout']);
+      assert.equal(pendingWaitWakes(ledgerStore.read()!).length, 0);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

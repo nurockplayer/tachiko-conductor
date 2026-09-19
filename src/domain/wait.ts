@@ -237,6 +237,8 @@ export interface WaitNativeBoundary {
   readonly lastNativeIdentity: string | null;
   /** Status from the last genuine native read. Durable, eviction-proof. */
   readonly lastNativeStatus: WaitSubjectStatus | null;
+  /** True once a genuine native baseline has been established. */
+  readonly nativeBaselineSeen: boolean;
   /** Whether the immediately preceding recorded observation was a native read. */
   readonly previousWasNative: boolean;
 }
@@ -246,7 +248,7 @@ export function classifyWaitChange(
   next: WaitObservation,
   previousNative?: WaitObservation | null,
   previousIsNative = previous?.source === 'native',
-  nativeBoundary: WaitNativeBoundary = { lastNativeIdentity: previousNative?.lastCompletedTurnId ?? null, lastNativeStatus: previousNative?.status ?? null, previousWasNative: previousIsNative },
+  nativeBoundary: WaitNativeBoundary = { lastNativeIdentity: previousNative?.lastCompletedTurnId ?? null, lastNativeStatus: previousNative?.status ?? null, nativeBaselineSeen: previousNative !== null, previousWasNative: previousIsNative },
 ): WaitChange {
   if (previous === null) {
     // The first observation establishes a baseline. A terminal baseline is
@@ -294,9 +296,11 @@ export function classifyWaitChange(
   // completion boundary and must wake. The prior identity must exist: the first
   // native read only establishes a baseline, because a turn that completed
   // before the wait started is indistinguishable from one that completed
-  // during it. A native active anchor is excluded here because boundary 1
-  // already covers it.
-  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && priorNativeIdentity !== null) {
+  // during it. `nativeBaselineSeen` (not a non-null identity) is what marks
+  // that baseline, so the first completion after a zero-turn thread still
+  // wakes. A native active anchor is excluded here because boundary 1 already
+  // covers it.
+  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && nativeBoundary.nativeBaselineSeen) {
     return {
       kind: 'completion',
       meaningful: true,
@@ -470,6 +474,12 @@ export interface WaitLedger {
    * active -> idle boundary never depends on the bounded observation history.
    */
   readonly lastNativeStatus: WaitSubjectStatus | null;
+  /**
+   * True once any genuine native read has established a baseline. A turn that
+   * completed after the baseline is a completion even when the provider reports
+   * no completed-turn identity at baseline time.
+   */
+  readonly nativeBaselineSeen: boolean;
   /** Whether the most recent recorded observation came from a genuine native read. */
   readonly previousWasNative: boolean;
   /**
@@ -508,6 +518,7 @@ export function createWaitLedger(input: {
     terminalReached: false,
     lastNativeIdentity: null,
     lastNativeStatus: null,
+    nativeBaselineSeen: false,
     previousWasNative: false,
     surfacedDigests: [],
     deliveredWakeIds: [],
@@ -609,6 +620,7 @@ export function advanceWaitLedger(input: {
   const nativeBoundary: WaitNativeBoundary = {
     lastNativeIdentity: ledger.lastNativeIdentity ?? null,
     lastNativeStatus: ledger.lastNativeStatus ?? null,
+    nativeBaselineSeen: ledger.nativeBaselineSeen ?? false,
     previousWasNative: ledger.previousWasNative ?? previousIsNative,
   };
   const change = duplicate
@@ -678,6 +690,7 @@ export function advanceWaitLedger(input: {
       ? observation.lastCompletedTurnId ?? ledger.lastNativeIdentity ?? null
       : ledger.lastNativeIdentity ?? null,
     lastNativeStatus: observation.source === 'native' ? observation.status : ledger.lastNativeStatus ?? null,
+    nativeBaselineSeen: (ledger.nativeBaselineSeen ?? false) || (!duplicate && observation.source === 'native'),
     previousWasNative: duplicate ? (ledger.previousWasNative ?? previousIsNative) : observation.source === 'native',
     observationSequence,
     lastDigest: digest,
@@ -754,6 +767,7 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
     (record.terminalReached === undefined || typeof record.terminalReached === 'boolean') &&
     (record.lastNativeIdentity === undefined || record.lastNativeIdentity === null || (typeof record.lastNativeIdentity === 'string' && record.lastNativeIdentity !== '')) &&
     (record.lastNativeStatus === undefined || record.lastNativeStatus === null || (WAIT_SUBJECT_STATUSES as readonly string[]).includes(record.lastNativeStatus as string)) &&
+    (record.nativeBaselineSeen === undefined || typeof record.nativeBaselineSeen === 'boolean') &&
     (record.previousWasNative === undefined || typeof record.previousWasNative === 'boolean') &&
     (record.surfacedDigests === undefined ||
       (Array.isArray(record.surfacedDigests) && record.surfacedDigests.every((item: unknown) => typeof item === 'string' && item !== ''))) &&
@@ -810,6 +824,7 @@ export function migrateWaitLedger(value: WaitLedger): WaitLedger {
     terminalReached: absorbingWakes,
     lastNativeIdentity: value.lastNativeIdentity ?? lastNative?.state.lastCompletedTurnId ?? null,
     lastNativeStatus: value.lastNativeStatus ?? lastNative?.status ?? null,
+    nativeBaselineSeen: value.nativeBaselineSeen ?? value.observations.some((recorded) => recorded.source === 'native'),
     previousWasNative: value.previousWasNative ?? lastObservation?.source === 'native',
     surfacedDigests: value.surfacedDigests ?? [...new Set(value.wakes.map((wake) => wake.observationDigest))].slice(-MAX_SURFACED_DIGESTS),
     // Legacy ledgers have no delivery record; treat their recorded wakes as

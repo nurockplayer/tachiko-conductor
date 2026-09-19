@@ -87,6 +87,8 @@ export interface WaitCommandResult {
     /** Bounded evidence for this decision, so a replay never loses it. */
     readonly evidence: readonly { readonly kind: string; readonly detail: string }[];
   }[];
+  /** Every wake id this result carried, so delivery acknowledgement is exact. */
+  readonly carriedWakeIds: readonly string[];
   /** Always zero: this path never starts a model turn. */
   readonly modelTurns: 0;
   readonly timedOut: boolean;
@@ -142,6 +144,9 @@ export class WaitLedgerOwnershipError extends Error {
 function runtimeObserver(run: Run, dependencies: WaitCommandDependencies): WaitObserver {
   return new RunRuntimeObserver(run, {
     now: dependencies.now,
+    // Re-read the durable Run on every poll so a transition during the wait is
+    // observed instead of serving the snapshot taken when the command started.
+    readRun: () => dependencies.store.read(run.id) ?? run,
     ...(dependencies.readHead === undefined ? {} : { readHead: dependencies.readHead }),
     ...(dependencies.nativeObserver === undefined ? {} : { nativeObserver: dependencies.nativeObserver }),
   });
@@ -205,7 +210,7 @@ function toResult(input: {
           evidence: evidenceViews(replayWake.evidence),
         },
     pendingWakes: pending
-      .filter((wake) => replay || wake.id !== replayWake?.id)
+      .filter((wake) => wake.id !== replayWake?.id)
       .map((wake) => ({
         id: wake.id,
         reason: wake.reason,
@@ -213,6 +218,7 @@ function toResult(input: {
         status: wake.status,
         evidence: evidenceViews(wake.evidence),
       })),
+    carriedWakeIds: pending.map((wake) => wake.id),
     modelTurns: 0,
     timedOut: input.outcome.timedOut,
     idle: input.outcome.idle,
@@ -309,7 +315,7 @@ export async function waitAwaitCommand(
  * delivery leaves the wake pending for the next process to replay.
  */
 export function acknowledgeWaitDelivery(result: WaitCommandResult, ledgerStore: WaitLedgerStore): void {
-  const carried = result.pendingWakes.map((wake) => wake.id);
+  const carried = result.carriedWakeIds;
   if (carried.length === 0) return;
   const ledger = ledgerStore.read();
   if (ledger === null) return;
@@ -343,16 +349,30 @@ function recordWake(input: {
   readonly reason: string;
   readonly store: RunStore;
 }): void {
-  const current = input.store.read(input.run.id);
-  if (current === null) return;
-  if (current.state !== input.run.state) return;
-  const next = recordWaitWakeTelemetry(current, {
-    at: input.at,
-    reason: input.reason,
-    source: input.observation.source,
-    subjectId: input.observation.subjectId,
-    status: input.observation.status,
-    observationDigest: waitObservationDigest(input.observation),
-  });
-  if (next !== current) input.store.update(next);
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    const current = input.store.read(input.run.id);
+    if (current === null) return;
+    // The wait path must never become a workflow writer. Skip the telemetry
+    // capture when the Run moved on from the state this wake was observed in.
+    if (current.state !== input.run.state) return;
+    const next = recordWaitWakeTelemetry(current, {
+      at: input.at,
+      reason: input.reason,
+      source: input.observation.source,
+      subjectId: input.observation.subjectId,
+      status: input.observation.status,
+      observationDigest: waitObservationDigest(input.observation),
+    });
+    if (next === current) return;
+    // Verify immediately before writing: a transition landing since the read
+    // must be re-based onto, never overwritten. There is no await between the
+    // verify and the write, so only a separate process can interleave.
+    const verified = input.store.read(input.run.id);
+    if (verified === null) return;
+    if (verified.state !== current.state || verified.updatedAt !== current.updatedAt || verified.history.length !== current.history.length) {
+      continue;
+    }
+    input.store.update(next);
+    return;
+  }
 }

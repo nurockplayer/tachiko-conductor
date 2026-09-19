@@ -229,6 +229,12 @@ export interface NativeWaitSnapshot {
 
 export interface RuntimeObservationDependencies {
   readonly now: () => string;
+  /**
+   * Re-read the authoritative durable Run. A bounded wait can outlive several
+   * transitions, so the observer must not serve one frozen snapshot for the
+   * whole episode.
+   */
+  readonly readRun?: () => Run | null;
   /** Read-only exact-HEAD probe for the prepared workspace. */
   readonly readHead?: (run: Run) => Promise<string | null>;
   /** Optional #35-native observation seam; absent means fallback-only. */
@@ -249,26 +255,29 @@ export class RunRuntimeObserver implements WaitObserver {
   }
 
   async observe(): Promise<WaitObservation> {
+    // Always observe the current durable Run; a transition during the wait is
+    // exactly the evidence the orchestrator must be woken for.
+    const run = this.dependencies.readRun?.() ?? this.run;
     const native = await this.observeNative();
     // Provenance is explicit: a native read that did not determine the status is
     // ambiguous evidence, reported as the deterministic runtime source, so it
     // can never masquerade as a genuine native turn boundary.
-    const merged = resolveRuntimeStatus(runWaitStatus(this.run.state), native);
+    const merged = resolveRuntimeStatus(runWaitStatus(run.state), native);
     const usedNativeStatus = merged.source === 'native';
     const nativeField = <T>(value: T): T | undefined => usedNativeStatus ? value : undefined;
-    const durableHead = this.run.headSha ?? null;
+    const durableHead = run.headSha ?? null;
     // A failed or unavailable exact-HEAD probe must not masquerade as a head
     // move; fall back to durable state and let the next read reconcile.
     const probedHead = this.dependencies.readHead === undefined
       ? durableHead
-      : await this.dependencies.readHead(this.run).catch(() => null);
+      : await this.dependencies.readHead(run).catch(() => null);
     const headSha = probedHead ?? durableHead;
     const evidence: WaitEvidence[] = [];
     if (headSha !== null && headSha !== durableHead) evidence.push({ kind: 'head-changed', detail: `workspace head ${shorten(headSha)}` });
     const snapshot: WaitSubjectSnapshot = {
       status: merged.status,
       ...(nativeField(native?.activeItemId) === undefined ? {} : { activeItemId: nativeField(native?.activeItemId)! }),
-      items: nativeField(native?.items) ?? this.run.history.length,
+      items: nativeField(native?.items) ?? run.history.length,
       ...(nativeField(native?.turns) === undefined ? {} : { turns: nativeField(native?.turns)! }),
       ...(nativeField(native?.lastCompletedTurnId) === undefined ? {} : { lastCompletedTurnId: nativeField(native?.lastCompletedTurnId)! }),
       ...(headSha === null ? {} : { headSha }),

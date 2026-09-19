@@ -899,6 +899,39 @@ describe('#35 native observation reuse', () => {
     assert.equal(repeat.ledger.wakes.length, 1);
   });
 
+  it('wakes for the first completion after a zero-turn native baseline', () => {
+    // A fresh thread reports idle with no completed-turn identity. A later idle
+    // carrying the first completed turn is a real completion, not a baseline.
+    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: normalize('idle', { source: 'native', progress: { items: 0, turns: 0 } }), at: T0 }).ledger;
+    assert.equal(ledger.nativeBaselineSeen, true);
+    assert.equal(ledger.wakes.length, 0);
+    const advance = advanceWaitLedger({ ledger, observation: normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1', progress: { items: 0, turns: 1 } }), at: T0 });
+    assert.equal(advance.change.kind, 'completion');
+    assert.equal(advance.wokeNow, true);
+    assert.equal(advance.ledger.wakes.length, 1);
+  });
+
+  it('observes a durable transition that happens during a bounded wait', async () => {
+    const run = applyTransition(newRun(SUBJECT), { type: 'start' }, T0);
+    let current = run;
+    let reads = 0;
+    const observer = new RunRuntimeObserver(run, {
+      now: () => T0,
+      readRun: () => { reads += 1; return reads >= 2 ? current : run; },
+    });
+    const first = await observer.observe();
+    assert.equal(first.status, 'active');
+    const ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: first, at: T0 }).ledger;
+    // The durable Run fails while the wait is still running.
+    current = applyTransition(run, { type: 'fail' }, T0);
+    const second = await observer.observe();
+    assert.equal(second.source, 'runtime');
+    assert.equal(second.status, 'failed', 'a transition during the wait must be observed');
+    const advance = advanceWaitLedger({ ledger, observation: second, at: T0 });
+    assert.equal(advance.change.kind, 'failure');
+    assert.equal(advance.wokeNow, true);
+  });
+
   it('treats the first native observation as a baseline, not a completion', () => {
     const first = advanceWaitLedger({ ledger: ledgerFor(), observation: normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' }), at: T0 });
     assert.equal(first.change.kind, 'none');
