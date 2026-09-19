@@ -541,6 +541,41 @@ describe('#35 native observation reuse', () => {
     }
   });
 
+  it('wakes for a durable terminal transition that arrives after a native observation', () => {
+    // Regression: a durable completed/failed/blocked state is always surfaced
+    // through runtime provenance, so the boundary previous=native ->
+    // next=runtime-terminal must still be a terminal wake, not progress.
+    const nativeActive = normalize('active', { source: 'native' });
+    for (const [status, expected] of [['failed', 'failure'], ['blocked', 'blocked'], ['completed', 'completion']] as const) {
+      const terminal = normalize(status, { source: 'runtime' });
+      let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: nativeActive, at: T0 }).ledger;
+      assert.equal(ledger.wakes.length, 0);
+      const advance = advanceWaitLedger({ ledger, observation: terminal, at: T0 });
+      assert.equal(advance.change.kind, expected, status);
+      assert.equal(advance.wokeNow, true, status);
+      assert.equal(advance.ledger.wakes.length, 1, status);
+      // The terminal digest is now recorded, so a replay stays silent.
+      const replay = advanceWaitLedger({ ledger: advance.ledger, observation: terminal, at: T0 });
+      assert.equal(replay.wokeNow, false, status);
+      assert.equal(replay.ledger.wakes.length, 1, status);
+    }
+  });
+
+  it('wakes for a completion whose active phase was never observed', () => {
+    // Every read during the turn was ambiguous, so the turn boundary is only
+    // visible as a completed-turn identity advance.
+    const active = normalize('active', { source: 'native', progress: { items: 0, turns: 1 } });
+    const ambiguous = normalize('active', { source: 'runtime', progress: { items: 0, turns: 1 } });
+    const completed = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-2', progress: { items: 0, turns: 2 } });
+    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: active, at: T0 }).ledger;
+    ledger = advanceWaitLedger({ ledger, observation: ambiguous, at: T0 }).ledger;
+    ledger = advanceWaitLedger({ ledger, observation: ambiguous, at: T0 }).ledger;
+    const advance = advanceWaitLedger({ ledger, observation: completed, at: T0 });
+    assert.equal(advance.change.kind, 'completion');
+    assert.equal(advance.wokeNow, true);
+    assert.equal(advance.ledger.wakes.length, 1);
+  });
+
   it('keeps successive completions distinct when only the completed-turn identity advances', () => {
     // turnCount held constant, so only lastCompletedTurnId can distinguish them.
     const idle = (turn: string) => normalize('idle', { lastCompletedTurnId: turn, progress: { items: 100, turns: 100 } });

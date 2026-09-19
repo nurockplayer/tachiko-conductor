@@ -156,7 +156,9 @@ export async function awaitMeaningfulChange(options: WaitAwaitOptions): Promise<
       ...(options.expectedGeneration === undefined ? {} : { expectedGeneration: options.expectedGeneration }),
     });
     if (advance.duplicate) duplicateObservations += 1;
-    ledger = advance.ledger;
+    // Bound the in-memory ledger exactly like the persisted store does, so a
+    // long bounded wait cannot grow without limit.
+    ledger = boundWaitLedger(advance.ledger);
     lastChange = advance.change;
     if (advance.change.kind !== 'none' && advance.change.kind !== 'progress') {
       return { observation, change: advance.change, wake: advance.wake, ledger, observationCount, duplicateObservations, timedOut: false, idle: false };

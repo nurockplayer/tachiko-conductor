@@ -12,6 +12,9 @@ import { createHash } from 'node:crypto';
 export const WAIT_OBSERVATION_REVISION = 'wait-observation-v1' as const;
 export const WAIT_WAKE_POLICY_REVISION = 'wait-wake-policy-v1' as const;
 
+const WAIT_SUBJECT_STATUSES: readonly WaitSubjectStatus[] = ['idle', 'active', 'completed', 'failed', 'blocked', 'unknown', 'unavailable'];
+const WAIT_CHANGE_KINDS: readonly WaitChangeKind[] = ['none', 'progress', 'completion', 'failure', 'blocked'];
+
 /** The provider family that produced one observation. Never a model identity. */
 export type WaitObservationSource = 'native' | 'runtime' | 'subprocess' | 'github';
 
@@ -260,16 +263,16 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
     };
   }
   if (next.status !== previous.status) {
-    // A status change observed through a different source is a provenance
-    // change, not a workflow transition; it stays progress-only.
-    const sameSource = previous.source === next.source;
-    if (next.status === 'completed') {
-      return sameSource
-        ? { kind: 'completion', meaningful: true, evidence: terminalEvidence(next, 'completion') }
-        : { kind: 'progress', meaningful: true, evidence: [{ kind: 'status-changed', detail: `subject ${next.subjectId} reported completed` }] };
-    }
-    if (next.status === 'failed' && sameSource) return { kind: 'failure', meaningful: true, evidence: terminalEvidence(next, 'failure') };
-    if (next.status === 'blocked' && sameSource) return { kind: 'blocked', meaningful: true, evidence: terminalEvidence(next, 'blocked') };
+    // Terminal statuses are authoritative no matter which source reported them.
+    // A durable terminal state is always surfaced through runtime provenance,
+    // so a native -> runtime-terminal boundary is exactly a workflow terminal
+    // transition; `sameSource` must not suppress it. Fabricated native terminal
+    // statuses are impossible by construction: an ambiguous native read
+    // degrades to `unknown`/`unavailable` with runtime provenance, never to
+    // `failed`/`blocked`/`completed`.
+    if (next.status === 'completed') return { kind: 'completion', meaningful: true, evidence: terminalEvidence(next, 'completion') };
+    if (next.status === 'failed') return { kind: 'failure', meaningful: true, evidence: terminalEvidence(next, 'failure') };
+    if (next.status === 'blocked') return { kind: 'blocked', meaningful: true, evidence: terminalEvidence(next, 'blocked') };
     if (next.status === 'unavailable') return { kind: 'progress', meaningful: true, evidence: transitionEvidence(previous, next, 'unavailable', `subject ${next.subjectId} became unavailable`) };
     return { kind: 'progress', meaningful: true, evidence: transitionEvidence(previous, next, 'status-changed', `subject ${next.subjectId} changed status`) };
   }
@@ -285,11 +288,16 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
   // an active-item change, or newly reported evidence counts as progress, and
   // progress never wakes a model.
   if ((previous.lastCompletedTurnId ?? null) !== (next.lastCompletedTurnId ?? null)) {
-    return {
-      kind: 'progress',
-      meaningful: true,
-      evidence: [{ kind: 'turn-completed', detail: `completed turn ${previous.lastCompletedTurnId ?? 'none'} -> ${next.lastCompletedTurnId ?? 'none'}` }],
-    };
+    // The completed-turn identity advanced. When the last genuine native read
+    // was not idle, the intervening turn was never observed as active (every
+    // read during it was ambiguous), so this is the completion boundary and it
+    // must wake. A pure idle -> idle identity advance is progress-only.
+    const observedIdleBefore = nativeBefore !== null && nativeBefore.status === 'idle';
+    const evidence = [{ kind: 'turn-completed' as const, detail: `completed turn ${previous.lastCompletedTurnId ?? 'none'} -> ${next.lastCompletedTurnId ?? 'none'}` }];
+    if (next.source === 'native' && next.status === 'idle' && !observedIdleBefore) {
+      return { kind: 'completion', meaningful: true, evidence };
+    }
+    return { kind: 'progress', meaningful: true, evidence };
   }
   if (next.progress.items > previous.progress.items || next.progress.turns > previous.progress.turns) {
     return {
@@ -426,8 +434,8 @@ export interface WaitLedgerAdvance {
   readonly wokeNow: boolean;
   /**
    * The genuine preceding native observation used for the native active -> idle
-   * boundary, when the ledger retained one. Exposed so a caller can persist and
-   * re-derive the same boundary without re-scanning the ledger.
+   * boundary, when the ledger retained one. Informational: the same boundary is
+   * re-derived from the durable ledger, so callers may ignore it.
    */
   readonly previousNative: WaitObservation | null;
   readonly observationEventId: string;
@@ -645,7 +653,7 @@ function isWaitObservationState(value: unknown): value is WaitObservationState {
   const state = value as Record<string, unknown>;
   return typeof state.source === 'string' &&
     typeof state.subjectId === 'string' && state.subjectId !== '' &&
-    typeof state.status === 'string' &&
+    typeof state.status === 'string' && (WAIT_SUBJECT_STATUSES as readonly string[]).includes(state.status) &&
     (state.activeItemId === null || typeof state.activeItemId === 'string') &&
     Number.isSafeInteger(state.items) && (state.items as number) >= 0 &&
     Number.isSafeInteger(state.turns) && (state.turns as number) >= 0 &&
@@ -662,7 +670,7 @@ function isWaitRecordedObservation(value: unknown): value is WaitRecordedObserva
     typeof record.subjectId === 'string' && record.subjectId !== '' &&
     typeof record.status === 'string' &&
     typeof record.observationDigest === 'string' && record.observationDigest !== '' &&
-    typeof record.change === 'string' &&
+    typeof record.change === 'string' && (WAIT_CHANGE_KINDS as readonly string[]).includes(record.change) &&
     isWaitObservationState(record.state);
 }
 
