@@ -61,6 +61,7 @@ describe('OracleReviewer', () => {
     const records: OracleReceipt[] = [];
     const reviewer = new OracleReviewer({ github: github([HEAD, HEAD]), transport: transport(response({ extra: 'secret' })), receipts: { record: (receipt) => records.push(receipt), list: () => records } });
     await assert.rejects(() => reviewer.review({ target, headSha: HEAD }), (error: unknown) => error instanceof OracleReviewerError && error.code === 'ORACLE_INVALID_OUTPUT');
-    assert.equal(records.length, 0);
+    assert.equal(records[0]?.outcome, 'failed');
+    assert.equal(records[0]?.failureCode, 'invalid_response');
   });
 });
