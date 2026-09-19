@@ -861,12 +861,76 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     }
 
     const latestByAuthor = new Map<string, GitHubReviewSnapshot>();
+    const byAuthor = new Map<string, GitHubReviewSnapshot[]>();
     for (const review of reviews) {
       const key = review.author ?? '';
-      const existing = latestByAuthor.get(key);
-      if (existing === undefined || (review.submittedAt ?? '') > (existing.submittedAt ?? '')) {
-        latestByAuthor.set(key, review);
+      const entries = byAuthor.get(key) ?? [];
+      entries.push(review);
+      byAuthor.set(key, entries);
+    }
+
+    const latestOf = (entries: readonly GitHubReviewSnapshot[]): GitHubReviewSnapshot | undefined =>
+      entries.reduce<GitHubReviewSnapshot | undefined>((latest, review) => {
+        if (latest === undefined) return review;
+        const reviewTime = review.submittedAt ?? '';
+        const latestTime = latest.submittedAt ?? '';
+        if (reviewTime > latestTime) return review;
+        if (reviewTime < latestTime) return latest;
+
+        // GitHub timestamps can tie at second precision. In that ambiguity,
+        // never let ordering alone erase an explicit negative review: prefer
+        // CHANGES_REQUESTED over any positive/neutral decisive state. For other
+        // ties, the later collection entry is descriptive only.
+        if (review.state === 'changes_requested' && latest.state !== 'changes_requested') return review;
+        if (latest.state === 'changes_requested' && review.state !== 'changes_requested') return latest;
+        return review;
+      }, undefined);
+    const isDecisive = (review: GitHubReviewSnapshot): boolean =>
+      review.state === 'approved' ||
+      review.state === 'changes_requested' ||
+      review.state === 'dismissed';
+
+    for (const [key, entries] of byAuthor) {
+      const current = entries.filter((review) => review.fresh);
+      const unknown = entries.filter((review) => !review.fresh && review.commitSha === null);
+      const stale = entries.filter((review) => !review.fresh && review.commitSha !== null);
+      const currentDecision = latestOf(current.filter(isDecisive));
+      const unknownDecision = latestOf(unknown.filter(isDecisive));
+      const currentObservation = latestOf(current);
+
+      let effective: GitHubReviewSnapshot | undefined;
+      if (currentDecision?.state === 'changes_requested') {
+        // A known-current negative review remains authoritative until a later
+        // known-current decisive review changes or dismisses that decision.
+        effective = currentDecision;
+      } else if (
+        unknownDecision?.state === 'changes_requested' &&
+        (
+          currentDecision === undefined ||
+          (unknownDecision.submittedAt ?? '') >= (currentDecision.submittedAt ?? '')
+        )
+      ) {
+        // Unknown provenance is not stale provenance. A later explicit negative
+        // review may describe the current candidate, so fail closed unless a
+        // later exact-HEAD decisive review explicitly clears it. COMMENTED
+        // observations never clear a decisive review.
+        effective = unknownDecision;
+      } else if (currentDecision !== undefined) {
+        effective = currentDecision;
+      } else if (unknownDecision?.state === 'changes_requested') {
+        effective = unknownDecision;
+      } else {
+        // With no active negative/decisive current state, prefer a current-HEAD
+        // observation for descriptive review state, then unknown provenance,
+        // and use proven-stale evidence only as a last historical observation.
+        effective =
+          currentObservation ??
+          unknownDecision ??
+          latestOf(unknown) ??
+          latestOf(stale);
       }
+
+      if (effective !== undefined) latestByAuthor.set(key, effective);
     }
     const latest = [...latestByAuthor.values()].sort((a, b) => (a.submittedAt ?? '').localeCompare(b.submittedAt ?? ''));
     const decision: GitHubReviewSummary['decision'] =
