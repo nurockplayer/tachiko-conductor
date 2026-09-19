@@ -487,6 +487,35 @@ PR: #7`;
     assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED']);
   });
 
+  it('fails closed on equal-timestamp approval/change-request ties regardless of collection order', async () => {
+    const approval = {
+      node_id: 'R_APPROVED_TIE',
+      user: { login: 'alice' },
+      state: 'APPROVED',
+      commit_id: HEAD,
+      submitted_at: '2026-08-14T02:00:00.000Z',
+      html_url: 'https://github.test/reviews/approved-tie',
+    };
+    const changes = {
+      node_id: 'R_CHANGES_TIE',
+      user: { login: 'alice' },
+      state: 'CHANGES_REQUESTED',
+      commit_id: HEAD,
+      submitted_at: '2026-08-14T02:00:00.000Z',
+      html_url: 'https://github.test/reviews/changes-tie',
+    };
+
+    for (const ordered of [[approval, changes], [changes, approval]]) {
+      const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', ordered);
+      const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+      const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+      assert.equal(snapshot.reviews.decision, 'changes_requested');
+      assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_CHANGES_TIE']);
+    }
+  });
+
   it('does not let a later-submitted stale approval supersede a current-HEAD change request', async () => {
     const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
       {

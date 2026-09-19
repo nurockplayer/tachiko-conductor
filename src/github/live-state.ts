@@ -870,13 +870,21 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     }
 
     const latestOf = (entries: readonly GitHubReviewSnapshot[]): GitHubReviewSnapshot | undefined =>
-      entries.reduce<GitHubReviewSnapshot | undefined>(
-        (latest, review) =>
-          latest === undefined || (review.submittedAt ?? '') > (latest.submittedAt ?? '')
-            ? review
-            : latest,
-        undefined,
-      );
+      entries.reduce<GitHubReviewSnapshot | undefined>((latest, review) => {
+        if (latest === undefined) return review;
+        const reviewTime = review.submittedAt ?? '';
+        const latestTime = latest.submittedAt ?? '';
+        if (reviewTime > latestTime) return review;
+        if (reviewTime < latestTime) return latest;
+
+        // GitHub timestamps can tie at second precision. In that ambiguity,
+        // never let ordering alone erase an explicit negative review: prefer
+        // CHANGES_REQUESTED over any positive/neutral decisive state. For other
+        // ties, the later collection entry is descriptive only.
+        if (review.state === 'changes_requested' && latest.state !== 'changes_requested') return review;
+        if (latest.state === 'changes_requested' && review.state !== 'changes_requested') return latest;
+        return review;
+      }, undefined);
     const isDecisive = (review: GitHubReviewSnapshot): boolean =>
       review.state === 'approved' ||
       review.state === 'changes_requested' ||
