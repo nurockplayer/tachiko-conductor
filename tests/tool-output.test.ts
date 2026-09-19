@@ -84,6 +84,19 @@ describe('bounded tool output contract', () => {
     assert.equal(matches[0]?.line, 3);
   });
 
+  it('bounds search matches even when a matching line is enormous', () => {
+    const store = new InMemoryToolOutputStore();
+    const output = boundToolOutput({
+      outcome: 'failed', exitCode: 1, stdout: `${'x'.repeat(500_000)}needle\n`, stderr: '', store,
+    });
+
+    const matches = searchToolOutput(output, store, { channel: 'stdout', query: 'needle', maxBytes: 64 });
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0]?.text.includes('needle'), true);
+    assert.equal(matches[0]?.truncated, true);
+    assert.ok(Buffer.byteLength(matches[0]?.text ?? '', 'utf8') <= 64);
+  });
+
   it('uses bounded defaults while allowing an explicit larger task budget', () => {
     const store = new InMemoryToolOutputStore();
     const text = 'x'.repeat(DEFAULT_TOOL_OUTPUT_POLICY.previewBytes + 1);

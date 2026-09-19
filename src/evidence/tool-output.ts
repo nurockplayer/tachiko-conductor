@@ -110,6 +110,8 @@ export interface ToolOutputSearchRequest {
   readonly channel?: 'stdout' | 'stderr';
   readonly query: string;
   readonly maxMatches?: number;
+  /** Maximum UTF-8 bytes returned for each matching line. */
+  readonly maxBytes?: number;
 }
 
 export interface ToolOutputMatch {
@@ -117,6 +119,7 @@ export interface ToolOutputMatch {
   readonly line: number;
   readonly offset: number;
   readonly text: string;
+  readonly truncated?: boolean;
 }
 
 export interface ToolOutputStore {
@@ -306,7 +309,10 @@ export function searchToolOutput(
   request: ToolOutputSearchRequest,
 ): readonly ToolOutputMatch[] {
   if (envelope.version !== TOOL_OUTPUT_CONTRACT_VERSION) throw new Error('Unsupported tool-output envelope version.');
-  return store.search(envelope.artifact, request);
+  return store.search(envelope.artifact, {
+    ...request,
+    maxBytes: request.maxBytes ?? envelope.overflow.diagnosticLimitBytes,
+  });
 }
 
 export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelope {
@@ -376,10 +382,22 @@ function readStringRange(value: string, offset: number, length: number): ToolOut
 
 export class InMemoryToolOutputStore implements ToolOutputStore {
   private readonly values = new Map<string, ToolOutputCapture>();
+  private readonly maxArtifacts: number;
+  private readonly order: string[] = [];
+
+  constructor(options: { readonly maxArtifacts?: number } = {}) {
+    this.maxArtifacts = options.maxArtifacts ?? Number.POSITIVE_INFINITY;
+    if (this.maxArtifacts !== Number.POSITIVE_INFINITY) assertPositiveInteger(this.maxArtifacts, 'maxArtifacts');
+  }
 
   save(capture: ToolOutputCapture): ToolOutputArtifactReference {
     const id = randomUUID();
     this.values.set(id, { stdout: capture.stdout, stderr: capture.stderr });
+    this.order.push(id);
+    while (this.order.length > this.maxArtifacts) {
+      const evicted = this.order.shift();
+      if (evicted !== undefined) this.values.delete(evicted);
+    }
     return reference(id, capture.stdout, capture.stderr);
   }
 
@@ -452,13 +470,13 @@ export class FileToolOutputStore implements ToolOutputStore {
   }
 
   search(referenceValue: ToolOutputArtifactReference, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
-    const maxMatches = validateSearchRequest(request);
+    const { maxMatches, maxBytes } = validateSearchRequest(request);
     const channels = request.channel === undefined ? (['stdout', 'stderr'] as const) : [request.channel];
     const results: ToolOutputMatch[] = [];
     for (const channel of channels) {
       const filePath = this.file(referenceValue.id, channel);
       if (!existsSync(filePath)) return this.fallback.search(referenceValue, request);
-      results.push(...searchFile(filePath, channel, request.query, maxMatches, results.length));
+      results.push(...searchFile(filePath, channel, request.query, maxMatches, maxBytes, results.length));
       if (results.length >= maxMatches) break;
     }
     return results.slice(0, maxMatches);
@@ -643,22 +661,24 @@ function reference(id: string, stdout: string, stderr: string): ToolOutputArtifa
 }
 
 function searchCapture(capture: ToolOutputCapture, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
-  const maxMatches = validateSearchRequest(request);
+  const { maxMatches, maxBytes } = validateSearchRequest(request);
   const channels = request.channel === undefined ? (['stdout', 'stderr'] as const) : [request.channel];
   const results: ToolOutputMatch[] = [];
   for (const channel of channels) {
     const value = channel === 'stdout' ? capture.stdout : capture.stderr;
-    scanText(channel, value, request.query, maxMatches, results);
+    scanText(channel, value, request.query, maxMatches, maxBytes, results);
     if (results.length >= maxMatches) return results;
   }
   return results;
 }
 
-function validateSearchRequest(request: ToolOutputSearchRequest): number {
+function validateSearchRequest(request: ToolOutputSearchRequest): { readonly maxMatches: number; readonly maxBytes: number } {
   if (request.query.trim() === '') throw new Error('Tool-output search query must not be empty.');
   const maxMatches = request.maxMatches ?? DEFAULT_TOOL_OUTPUT_POLICY.maxDiagnostics;
   assertPositiveInteger(maxMatches, 'maxMatches');
-  return maxMatches;
+  const maxBytes = request.maxBytes ?? DEFAULT_TOOL_OUTPUT_POLICY.diagnosticBytes;
+  assertPositiveInteger(maxBytes, 'maxBytes');
+  return { maxMatches, maxBytes };
 }
 
 function scanText(
@@ -666,9 +686,10 @@ function scanText(
   value: string,
   query: string,
   maxMatches: number,
+  maxBytes: number,
   results: ToolOutputMatch[],
 ): void {
-  scanDecodedChunks(channel, query, maxMatches, results, [value], { text: '', line: 1, offset: 0 }, true);
+  scanDecodedChunks(channel, query, maxMatches, maxBytes, results, [value], emptySearchState(), true);
 }
 
 function searchFile(
@@ -676,6 +697,7 @@ function searchFile(
   channel: 'stdout' | 'stderr',
   query: string,
   maxMatches: number,
+  maxBytes: number,
   existingMatches: number,
 ): readonly ToolOutputMatch[] {
   const results: ToolOutputMatch[] = [];
@@ -683,20 +705,20 @@ function searchFile(
   try {
     const buffer = Buffer.alloc(64 * 1024);
     const decoder = new StringDecoder('utf8');
-    let state: SearchScanState = { text: '', line: 1, offset: 0 };
+    let state = emptySearchState();
     let bytesRead: number;
     let chunks: string[] = [];
     do {
       bytesRead = readSync(handle, buffer, 0, buffer.length, null);
       if (bytesRead > 0) chunks.push(decoder.write(buffer.subarray(0, bytesRead)));
       if (chunks.length > 0) {
-        state = scanDecodedChunks(channel, query, maxMatches - existingMatches, results, chunks, state);
+        state = scanDecodedChunks(channel, query, maxMatches - existingMatches, maxBytes, results, chunks, state);
         chunks = [];
       }
     } while (bytesRead > 0 && results.length + existingMatches < maxMatches);
     chunks.push(decoder.end());
     if (results.length + existingMatches < maxMatches) {
-      scanDecodedChunks(channel, query, maxMatches - existingMatches, results, chunks, state, true);
+      scanDecodedChunks(channel, query, maxMatches - existingMatches, maxBytes, results, chunks, state, true);
     }
   } finally {
     closeSync(handle);
@@ -705,15 +727,22 @@ function searchFile(
 }
 
 interface SearchScanState {
-  text: string;
   line: number;
   offset: number;
+  lineBytes: number;
+  matchTail: string;
+  matchedText?: string;
+}
+
+function emptySearchState(): SearchScanState {
+  return { line: 1, offset: 0, lineBytes: 0, matchTail: '' };
 }
 
 function scanDecodedChunks(
   channel: 'stdout' | 'stderr',
   query: string,
   maxMatches: number,
+  maxBytes: number,
   results: ToolOutputMatch[],
   chunks: readonly string[],
   initialState: SearchScanState,
@@ -721,27 +750,65 @@ function scanDecodedChunks(
 ): SearchScanState {
   let pending = initialState;
   for (const chunk of chunks) {
-    pending.text += chunk;
-    let newline: RegExpMatchArray | null;
-    while ((newline = pending.text.match(/\r?\n/)) !== null) {
-      const newlineIndex = newline.index ?? 0;
-      const lineText = pending.text.slice(0, newlineIndex);
-      const delimiter = newline[0];
-      if (lineText.includes(query) && results.length < maxMatches) {
-        results.push({ channel, line: pending.line, offset: pending.offset, text: lineText });
+    let remainder = chunk;
+    while (remainder !== '') {
+      const newlineIndex = remainder.search(/\r?\n/);
+      if (newlineIndex < 0) {
+        pending = appendSearchSegment(pending, remainder, query, maxBytes);
+        break;
+      }
+      const delimiter = remainder.startsWith('\r\n', newlineIndex) ? '\r\n' : remainder.slice(newlineIndex, newlineIndex + 1);
+      pending = appendSearchSegment(pending, remainder.slice(0, newlineIndex), query, maxBytes);
+      if (pending.matchedText !== undefined && results.length < maxMatches) {
+        results.push({
+          channel,
+          line: pending.line,
+          offset: pending.offset,
+          text: pending.matchedText,
+          ...(pending.lineBytes > utf8Bytes(pending.matchedText) ? { truncated: true } : {}),
+        });
       }
       pending = {
-        text: pending.text.slice(newlineIndex + delimiter.length),
         line: pending.line + 1,
-        offset: pending.offset + utf8Bytes(lineText) + utf8Bytes(delimiter),
+        offset: pending.offset + pending.lineBytes + utf8Bytes(delimiter),
+        lineBytes: 0,
+        matchTail: '',
       };
+      remainder = remainder.slice(newlineIndex + delimiter.length);
       if (results.length >= maxMatches) break;
     }
     if (results.length >= maxMatches) break;
   }
-  if (final && results.length < maxMatches && pending.text !== '' && pending.text.includes(query)) {
-    results.push({ channel, line: pending.line, offset: pending.offset, text: pending.text });
-    pending = { text: '', line: pending.line, offset: pending.offset + utf8Bytes(pending.text) };
+  if (final && results.length < maxMatches && pending.matchedText !== undefined) {
+    results.push({
+      channel,
+      line: pending.line,
+      offset: pending.offset,
+      text: pending.matchedText,
+      ...(pending.lineBytes > utf8Bytes(pending.matchedText) ? { truncated: true } : {}),
+    });
   }
   return pending;
+}
+
+function appendSearchSegment(state: SearchScanState, segment: string, query: string, maxBytes: number): SearchScanState {
+  if (segment === '') return state;
+  const candidate = `${state.matchTail}${segment}`;
+  const matchIndex = state.matchedText === undefined ? candidate.indexOf(query) : -1;
+  return {
+    ...state,
+    lineBytes: state.lineBytes + utf8Bytes(segment),
+    matchTail: candidate.slice(-Math.max(0, query.length - 1)),
+    ...(matchIndex < 0 || state.matchedText !== undefined ? {} : { matchedText: boundedMatchText(candidate, matchIndex, query, maxBytes) }),
+  };
+}
+
+function boundedMatchText(line: string, matchIndex: number, query: string, maxBytes: number): string {
+  if (utf8Bytes(line) <= maxBytes) return line;
+  if (utf8Bytes(query) >= maxBytes) return head(query, maxBytes);
+  const queryBytes = utf8Bytes(query);
+  const contextBytes = maxBytes - queryBytes;
+  const beforeBytes = Math.floor(contextBytes / 2);
+  const afterBytes = contextBytes - beforeBytes;
+  return `${tail(line.slice(0, matchIndex), beforeBytes)}${query}${head(line.slice(matchIndex + query.length), afterBytes)}`;
 }

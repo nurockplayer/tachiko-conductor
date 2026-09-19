@@ -291,7 +291,7 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
       // Docker log/error transcripts are redacted at the container boundary
       // before they are persisted by ContainerWorkerBoundary. Keep the raw
       // process-cap partial in memory only here.
-      outputStore: options.outputStore ?? new InMemoryToolOutputStore(),
+      outputStore: options.outputStore ?? new InMemoryToolOutputStore({ maxArtifacts: 1 }),
     });
     this.docker = options.docker ?? 'docker';
     this.controlTimeoutMs = options.controlTimeoutMs ?? 30_000;
@@ -395,6 +395,8 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
       throw new WorkerRouterContainerError(
         WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
         'docker logs could not read the terminal container transcript.',
+        undefined,
+        result.output,
       );
     }
     return { stdout: result.stdout, stderr: result.stderr };
@@ -687,7 +689,10 @@ function firstLine(value: string): string {
 function redactContainerSecrets(value: string, env: Readonly<Record<string, string>>): string {
   let redacted = value;
   for (const [key, secret] of Object.entries(env)) {
-    if (secret !== '' && (key.includes('KEY') || key.includes('TOKEN') || key.includes('SECRET') || key.includes('PASSWORD'))) {
+    // HOME is a fixed container path, not a credential. Every other
+    // forwarded value may be a task-specific secret even when its key name is
+    // uninformative, so redact by value at the boundary.
+    if (key !== 'HOME' && secret !== '') {
       redacted = redacted.split(secret).join('[redacted]');
     }
   }

@@ -4,6 +4,7 @@ import {
   boundToolOutput,
   DEFAULT_TOOL_OUTPUT_POLICY,
   FileToolOutputStore,
+  InMemoryToolOutputStore,
   type ToolOutputEnvelope,
   type ToolOutputPolicy,
   type ToolOutputStore,
@@ -246,7 +247,10 @@ export class GhCliTransport implements GitHubApiTransport {
   private readonly outputStore: ToolOutputStore | undefined;
 
   constructor(options: GhCliTransportOptions = {}) {
-    this.runner = options.runner ?? new NodeProcessRunner();
+    // GitHub transport callers consume the parsed response, not a drill-down
+    // artifact. Keep one bounded ephemeral capture instead of orphaning every
+    // `gh` response on disk.
+    this.runner = options.runner ?? new NodeProcessRunner({ outputStore: new InMemoryToolOutputStore({ maxArtifacts: 1 }) });
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.outputPolicy = options.outputPolicy;
     this.outputStore = options.outputStore;
