@@ -59,6 +59,13 @@ export interface NativeThreadObservation {
   readonly threadId: string;
   readonly status: 'active' | 'idle' | 'not_loaded' | 'system_error';
   readonly activeTurnId?: string;
+  /**
+   * Total native turns reported by the runtime. Monotonic and uncapped, so it
+   * remains a usable progress counter after `history` saturates.
+   */
+  readonly turnCount?: number;
+  /** Identity of the most recent completed turn, when the runtime reports one. */
+  readonly lastCompletedTurnId?: string;
   /** Bounded native items for reconciliation. Raw transcripts are never persisted. */
   readonly history: readonly { readonly id: string; readonly type: string }[];
 }
@@ -634,12 +641,29 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
     const status = object(thread.status, 'thread status');
     const rawStatus = string(status.type, 'thread status type');
     const turns = array(thread.turns, 'thread turns');
-    const active = turns.map((turn) => object(turn, 'turn')).find((turn) => turn.status === 'inProgress');
+    const parsedTurns = turns.map((turn) => object(turn, 'turn'));
+    const active = parsedTurns.find((turn) => turn.status === 'inProgress');
+    // Newest completed turn with a usable identity; a blank id falls through to
+    // an earlier completed turn rather than losing the progress signal. This
+    // assumes `thread/read` returns turns oldest-first (the documented and
+    // fixture-verified order); the unobserved-completion signal degrades to
+    // progress-only evidence if a runtime ever windows or reorders them.
+    let lastCompletedTurnId: string | undefined;
+    for (let index = parsedTurns.length - 1; index >= 0; index -= 1) {
+      const turn = parsedTurns[index]!;
+      if (turn.status !== 'completed') continue;
+      const candidate = turn.id;
+      if (typeof candidate !== 'string' || candidate.trim() === '') continue;
+      lastCompletedTurnId = candidate;
+      break;
+    }
     return {
       threadId: string(thread.id, 'thread id'),
       status: rawStatus === 'active' ? 'active' : rawStatus === 'idle' ? 'idle' : rawStatus === 'notLoaded' ? 'not_loaded' : 'system_error',
       ...(active === undefined ? {} : { activeTurnId: string(active.id, 'active turn id') }),
-      history: turns.flatMap((turn) => array(object(turn, 'turn').items, 'turn items').slice(0, 20).map((item) => {
+      turnCount: parsedTurns.length,
+      ...(lastCompletedTurnId === undefined ? {} : { lastCompletedTurnId }),
+      history: parsedTurns.flatMap((turn) => array(turn.items, 'turn items').slice(0, 20).map((item) => {
         const value = object(item, 'thread item');
         return { id: string(value.id, 'thread item id'), type: string(value.type, 'thread item type') };
       })).slice(0, 100),

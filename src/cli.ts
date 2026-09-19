@@ -11,7 +11,7 @@ import {
   CodexCliAdapter,
   type CodexCliAdapterOptions,
 } from './agents/codex-cli.js';
-import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter } from './agents/codex-app-server.js';
+import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter, type NativeThreadObservation } from './agents/codex-app-server.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import { WORKER_ROUTER_PROVIDER, WorkerRouterAdapter } from './agents/worker-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
@@ -66,7 +66,7 @@ import {
 } from './domain/types.js';
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
-import { GhCliTransport } from './github/transport.js';
+import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
@@ -82,6 +82,16 @@ import {
   type WorkflowOptions,
   type WorkflowOutcome,
 } from './workflow/run.js';
+import { DEFAULT_WAIT_WAKE_POLICY, type WaitWakePolicy } from './domain/wait.js';
+import {
+  acknowledgeWaitDelivery,
+  waitAwaitCommand,
+  waitObserveCommand,
+  type WaitCommandResult,
+  type WaitCommandDependencies,
+} from './workflow/wait-command.js';
+import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
+import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -95,6 +105,8 @@ Usage:
   tachiko run list
   tachiko dispatch once
   tachiko dispatch launchd render --program <absolute-wrapper> --working-directory <absolute-path> [--minute <0-59>]
+  tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
+  tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
@@ -121,6 +133,12 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
 New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
 the selected --execution-profile is persisted with the run.
+wait observe/await are deterministic and model-free: they read native/runtime
+state, coalesce it into the durable wait ledger, and report whether the
+orchestrator must reconcile. They never start a model turn. One ledger is
+written per run at <wait ledger dir>/<runId>.wait.json, where the directory is
+$TACHIKO_WAIT_LEDGER_DIR (or the directory of $TACHIKO_WAIT_LEDGER_PATH) and
+defaults to <TACHIKO_DATA_DIR>/../wait.
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
 in the foreground; use status/stop from another terminal.
@@ -1023,6 +1041,114 @@ export async function waitForOwnedBrowser(
   }
 }
 
+/**
+ * Durable wait-ledger location. `TACHIKO_WAIT_LEDGER_PATH` names a path whose
+ * directory holds the per-run ledgers; its basename is conventional (the file
+ * actually written is `<dir>/<runId>.wait.json`). Prefer
+ * `resolveWaitLedgerDirectory`/`resolveWaitLedgerFile` in callers.
+ */
+export function resolveWaitLedgerPath(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.TACHIKO_WAIT_LEDGER_PATH !== undefined && env.TACHIKO_WAIT_LEDGER_PATH.trim() !== '') return env.TACHIKO_WAIT_LEDGER_PATH;
+  return path.join(path.dirname(resolveRunsDir(env)), 'wait', 'state.json');
+}
+
+/** Parse the bounded wait policy from CLI values; defaults stay revisioned. */
+export function resolveWaitWakePolicy(values: {
+  readonly 'timeout-ms'?: string;
+  readonly 'on-timeout'?: string;
+}): WaitWakePolicy {
+  const policy = DEFAULT_WAIT_WAKE_POLICY;
+  const timeoutMs = values['timeout-ms'] === undefined ? policy.timeoutMs : Number(values['timeout-ms']);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new Error('--timeout-ms must be a non-negative safe integer.');
+  const onTimeout = values['on-timeout'] ?? policy.onTimeout;
+  if (onTimeout !== 'continue' && onTimeout !== 'policy-action') throw new Error('--on-timeout must be continue or policy-action.');
+  return { ...policy, timeoutMs, onTimeout };
+}
+
+/**
+ * Single-owner fence for one run's wait path, beside that run's ledger. Two wait
+ * processes can never perform the ledger read-modify-write concurrently.
+ */
+export function waitLockPath(runId: string, env: NodeJS.ProcessEnv = process.env): string {
+  return `${resolveWaitLedgerFile(runId, env)}.lock`;
+}
+
+/**
+ * Per-run ledger file. `TACHIKO_WAIT_LEDGER_DIR` names the directory directly;
+ * otherwise the directory of `TACHIKO_WAIT_LEDGER_PATH` is used, so the
+ * configured path stays a single explicit override.
+ */
+export function resolveWaitLedgerDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  const directory = env.TACHIKO_WAIT_LEDGER_DIR;
+  if (directory !== undefined && directory.trim() !== '') return directory;
+  return path.dirname(resolveWaitLedgerPath(env));
+}
+
+/** One ledger per run at `<wait ledger directory>/<runId>.wait.json`. */
+export function resolveWaitLedgerFile(runId: string, env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(resolveWaitLedgerDirectory(env), `${runId}.wait.json`);
+}
+
+/**
+ * Build the deterministic wait dependencies for one run. A native #35 observer
+ * is only wired for App Server executors; otherwise the runtime fallback path
+ * is used. Nothing here starts or resumes a Codex turn.
+ */
+export interface CodexNativeObservationAdapter {
+  observeRuntime(executor: NonNullable<Run['executor']>): Promise<NativeThreadObservation>;
+}
+
+/**
+ * Build the deterministic wait dependencies for one run.
+ *
+ * A native #35 observer is wired only for App Server executors and only reads
+ * `thread/read`; it never starts, resumes, steers, or interrupts a turn.
+ *
+ * Exactly one observer instance is retained for the lifetime of these
+ * dependencies, so consecutive provider reads within one command observe a
+ * real transition. The active -> idle completion boundary is *also* classified
+ * from the durable previous observation in `classifyWaitChange`, so a separate
+ * CLI invocation or a runtime restart that has no observer memory preserves it.
+ */
+export function buildWaitCommandDependencies(options: {
+  readonly store: RunStore;
+  readonly run: Run;
+  readonly env?: NodeJS.ProcessEnv;
+  /** Injectable read-only App Server observation seam for deterministic wiring tests. */
+  readonly appServerAdapter?: CodexNativeObservationAdapter;
+  readonly now?: () => string;
+}): WaitCommandDependencies {
+  const env = options.env ?? process.env;
+  const run = options.run;
+  const now = options.now ?? (() => new Date().toISOString());
+  const workspace = run.bootstrap?.workspacePath;
+  const adapter = run.executor?.provider === CODEX_APP_SERVER_PROVIDER
+    ? options.appServerAdapter ?? new CodexAppServerAdapter({ cwd: workspace ?? process.cwd() })
+    : undefined;
+  const nativeObserver = adapter === undefined
+    ? undefined
+    : new NativeThreadWaitObserver({
+        client: { observeThread: () => adapter.observeRuntime(run.executor!) },
+        threadId: run.executor!.sessionId,
+        now,
+        subjectId: run.id,
+      });
+  return {
+    store: options.store,
+    ledgerStore: new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }),
+    now,
+    ...(workspace === undefined ? {} : { readHead: gitHeadReader(new NodeProcessRunner(), workspace) }),
+    ...(nativeObserver === undefined ? {} : { nativeObserver }),
+  };
+}
+
+/** Print the bounded, model-free wait result and its settled marker. */
+export function printWaitResult(result: WaitCommandResult): void {
+  console.log(JSON.stringify(result, null, 2));
+  if (result.wake.shouldWake) console.log('TACHIKO_WAIT_WAKE_V1');
+  else if (result.idle) console.log('TACHIKO_WAIT_IDLE_V1');
+}
+
 export async function main(argv: string[]): Promise<number> {
   const store = new JsonFileStore({ dir: resolveRunsDir() });
   const [command, subcommand, ...rest] = argv;
@@ -1168,6 +1294,61 @@ export async function main(argv: string[]): Promise<number> {
         resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
       });
       printDispatchResult(result);
+      return 0;
+    } finally {
+      lock.release();
+    }
+  }
+
+  if (command === 'wait') {
+    if (subcommand !== 'observe' && subcommand !== 'await') {
+      console.error(`Unknown command: wait ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: {
+        'timeout-ms': { type: 'string' },
+        'poll-interval-ms': { type: 'string' },
+        'on-timeout': { type: 'string' },
+      },
+    });
+    const [id, extra] = positionals;
+    if (id === undefined || extra !== undefined) throw new Error(`wait ${subcommand} requires exactly one run id.`);
+    const run = store.read(id);
+    if (run === null) throw new Error(`Run ${id} was not found.`);
+    const policy = resolveWaitWakePolicy(values);
+    const pollIntervalMs = values['poll-interval-ms'] === undefined
+      ? undefined
+      : Number(values['poll-interval-ms']);
+    if (pollIntervalMs !== undefined && (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 0)) {
+      throw new Error('--poll-interval-ms must be a non-negative safe integer.');
+    }
+    // The wait ledger is a per-run read-modify-write. Hold the same single-owner
+    // invocation fence `dispatch once` uses, scoped to this run, so two wait
+    // processes can never clobber each other's durable wake decisions.
+    let lock;
+    try {
+      lock = acquireDispatchInvocationLock({ lockPath: waitLockPath(id) });
+    } catch (error) {
+      if (error instanceof DispatchInvocationLockedError) {
+        console.log(JSON.stringify({ outcome: 'already_running', runId: id, reason: error.message }));
+        return 0;
+      }
+      throw error;
+    }
+    try {
+      const dependencies = buildWaitCommandDependencies({ store, run });
+      const result = subcommand === 'observe'
+        ? await waitObserveCommand({ id, mode: 'observe', policy }, dependencies)
+        : await waitAwaitCommand({ id, mode: 'wait', policy, ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }) }, dependencies);
+      printWaitResult(result);
+      // Only after the wake has been emitted is it safe to mark it delivered; a
+      // crash before this point makes the next process replay it.
+      acknowledgeWaitDelivery(result, dependencies.ledgerStore);
+      // A wake is a reconciliation signal, not a failure; the caller decides.
       return 0;
     } finally {
       lock.release();

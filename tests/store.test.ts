@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
@@ -9,6 +11,18 @@ import { JsonFileStore } from '../src/store/json-file-store.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
+const REPO_ROOT = path.resolve(import.meta.dirname, '..');
+const TSX_CLI = path.join(REPO_ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+
+function waitForFile(filePath: string, timeoutMs = 5_000): void {
+  const deadlineAt = Date.now() + timeoutMs;
+  const cell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  while (!existsSync(filePath)) {
+    if (Date.now() >= deadlineAt) throw new Error(`Timed out waiting for child-process marker ${filePath}`);
+    Atomics.wait(cell, 0, 0, 10);
+  }
+}
+
 
 function tempStore(): { store: JsonFileStore; dir: string } {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-'));
@@ -27,6 +41,66 @@ describe('JsonFileStore — persistence round-trips', () => {
     const { store } = tempStore();
     store.create(newRun('r1'));
     assert.deepEqual(store.read('r1'), newRun('r1'));
+  });
+
+  it('serializes a cross-process workflow update with CAS across the compare/write window', () => {
+    const { dir } = tempStore();
+    const initial = newRun('cas-race');
+    new JsonFileStore({ dir }).create(initial);
+
+    const readyPath = path.join(dir, 'workflow-writer-ready');
+    const donePath = path.join(dir, 'workflow-writer-done');
+    const childPath = path.join(dir, 'workflow-writer.mjs');
+    const storeUrl = pathToFileURL(path.join(REPO_ROOT, 'src', 'store', 'json-file-store.ts')).href;
+    writeFileSync(childPath, [
+      `import { writeFileSync } from 'node:fs';`,
+      `import { JsonFileStore } from ${JSON.stringify(storeUrl)};`,
+      `const [dir, readyPath, donePath] = process.argv.slice(2);`,
+      `const store = new JsonFileStore({ dir, mutationLockTimeoutMs: 5000 });`,
+      `const current = store.read('cas-race');`,
+      `if (current === null) throw new Error('missing run');`,
+      `const at = '2026-09-19T00:00:02.000Z';`,
+      `const transitioned = { ...current, state: 'IMPLEMENTING', updatedAt: at, history: [...current.history, { type: 'start', from: 'READY', to: 'IMPLEMENTING', at }] };`,
+      `writeFileSync(readyPath, 'ready');`,
+      `store.update(transitioned);`,
+      `writeFileSync(donePath, 'done');`,
+    ].join('\n'), 'utf8');
+
+    let childStarted = false;
+    const waitWriter = new JsonFileStore({
+      dir,
+      beforeConditionalWrite: () => {
+        const child = spawn(process.execPath, [TSX_CLI, childPath, dir, readyPath, donePath], {
+          cwd: REPO_ROOT,
+          stdio: ['ignore', 'inherit', 'inherit'],
+        });
+        child.unref();
+        waitForFile(readyPath);
+        // The child has read the same pre-CAS snapshot and is now about to
+        // enter ordinary update(). It cannot pass the shared mutation fence
+        // until this compare+write critical section ends.
+        childStarted = true;
+        assert.equal(existsSync(donePath), false);
+      },
+    });
+
+    const staleTelemetryLikeWrite = { ...initial, updatedAt: '2026-09-19T00:00:01.000Z' };
+    assert.equal(waitWriter.updateIfUnchanged(initial, staleTelemetryLikeWrite), true);
+    assert.equal(childStarted, true);
+
+    // Once CAS releases the fence, the already-started workflow process writes
+    // its transition. The final durable Run must retain that newer transition,
+    // never the stale READY snapshot from the wait writer.
+    waitForFile(donePath);
+    const finalRun = new JsonFileStore({ dir }).read(initial.id);
+    assert.equal(finalRun?.state, 'IMPLEMENTING');
+    assert.equal(finalRun?.history.at(-1)?.type, 'start');
+
+    // The inverse ordering is also safe: if a workflow transition lands before
+    // CAS acquires the fence, the stale expected fingerprint is rejected.
+    const expected = staleTelemetryLikeWrite;
+    assert.equal(waitWriter.updateIfUnchanged(expected, { ...expected, headSha: 'stale-head' }), false);
+    assert.equal(new JsonFileStore({ dir }).read(initial.id)?.state, 'IMPLEMENTING');
   });
 
   it('persists updates across store instances (simulated restart)', () => {

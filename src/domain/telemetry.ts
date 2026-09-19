@@ -144,6 +144,16 @@ export interface RunTelemetryWaitEvent {
   readonly kind: 'wait_status_wakeup';
   readonly state: string;
   readonly headSha: string | null;
+  /**
+   * Optional #47 wake evidence. Bounded categorical fields only: never raw
+   * provider payloads, transcripts, or tool output. Absent on legacy wait
+   * events recorded before the event-driven wake contract existed.
+   */
+  readonly reason?: string;
+  readonly observationSource?: string;
+  readonly subjectId?: string;
+  readonly observationStatus?: string;
+  readonly observationDigest?: string;
 }
 
 export type RunTelemetryEvent = RunTelemetrySpawnEvent | RunTelemetryCompletionEvent | RunTelemetryWaitEvent;
@@ -434,6 +444,40 @@ export function recordWaitTelemetry(run: Run, at: string): Run {
     kind: 'wait_status_wakeup',
     state: run.state,
     headSha: run.headSha ?? null,
+  };
+  return appendRunTelemetryEvents(run, [event]);
+}
+
+/** Bounded evidence for one #47 wait/status wake. Raw payloads are never stored. */
+export interface WaitWakeTelemetryInput {
+  readonly at: string;
+  readonly reason: string;
+  readonly source: string;
+  readonly subjectId: string;
+  readonly status: string;
+  readonly observationDigest: string;
+}
+
+/**
+ * Record one meaningful #47 wait/status wake. The event id is content-addressed
+ * by the normalized observation digest, so a restart that re-observes the same
+ * state cannot double-count the same wake in the run ledger.
+ */
+export function recordWaitWakeTelemetry(run: Run, input: WaitWakeTelemetryInput): Run {
+  const event: RunTelemetryWaitEvent = {
+    // Purely content-addressed by the normalized observation digest and reason,
+    // so the same wake is recorded once no matter how much run state changed
+    // around it before it was captured.
+    id: `wait-wake:${run.id}:${input.subjectId}:${input.observationDigest}:${input.reason}`,
+    at: input.at,
+    kind: 'wait_status_wakeup',
+    state: run.state,
+    headSha: run.headSha ?? null,
+    reason: input.reason,
+    observationSource: input.source,
+    subjectId: input.subjectId,
+    observationStatus: input.status,
+    observationDigest: input.observationDigest,
   };
   return appendRunTelemetryEvents(run, [event]);
 }
@@ -969,7 +1013,13 @@ function isRunTelemetryEvent(value: unknown): value is RunTelemetryEvent {
       (event.contextJustification === null || event.contextJustification === 'live-target-bounded' || event.contextJustification === 'operator-full-override');
   }
   if (event.kind === 'wait_status_wakeup') {
-    return nonEmpty(event.state) && (event.headSha === null || nonEmpty(event.headSha));
+    return nonEmpty(event.state) &&
+      (event.headSha === null || nonEmpty(event.headSha)) &&
+      (event.reason === undefined || nonEmpty(event.reason)) &&
+      (event.observationSource === undefined || nonEmpty(event.observationSource)) &&
+      (event.subjectId === undefined || nonEmpty(event.subjectId)) &&
+      (event.observationStatus === undefined || nonEmpty(event.observationStatus)) &&
+      (event.observationDigest === undefined || nonEmpty(event.observationDigest));
   }
   if (event.kind === 'completion') {
     if ((event.role !== 'worker' && event.role !== 'reviewer') || !nonEmpty(event.invocationId) ||
