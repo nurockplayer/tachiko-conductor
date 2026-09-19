@@ -5,7 +5,7 @@ import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
-import { JsonFileStore } from '../src/store/json-file-store.js';
+import { JsonFileStore, RunMutationLockedError } from '../src/store/json-file-store.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
@@ -27,6 +27,45 @@ describe('JsonFileStore — persistence round-trips', () => {
     const { store } = tempStore();
     store.create(newRun('r1'));
     assert.deepEqual(store.read('r1'), newRun('r1'));
+  });
+
+  it('serializes ordinary update with CAS across the compare/write window', () => {
+    const { dir } = tempStore();
+    const initial = newRun('cas-race');
+    const bootstrap = new JsonFileStore({ dir });
+    bootstrap.create(initial);
+
+    let competingWriteBlocked = false;
+    const waitWriter = new JsonFileStore({
+      dir,
+      beforeConditionalWrite: () => {
+        const workflowWriter = new JsonFileStore({ dir, mutationLockTimeoutMs: 0 });
+        const transitioned = applyTransition(workflowWriter.read(initial.id)!, { type: 'start' }, T0);
+        assert.throws(
+          () => workflowWriter.update(transitioned),
+          (error: unknown) => error instanceof RunMutationLockedError,
+        );
+        competingWriteBlocked = true;
+      },
+    });
+
+    const staleTelemetryLikeWrite = { ...initial, updatedAt: '2026-09-19T00:00:01.000Z' };
+    assert.equal(waitWriter.updateIfUnchanged(initial, staleTelemetryLikeWrite), true);
+    assert.equal(competingWriteBlocked, true);
+
+    // Once the CAS writer releases the shared fence, the workflow transition
+    // proceeds from the latest durable snapshot and remains authoritative.
+    const workflowWriter = new JsonFileStore({ dir });
+    const current = workflowWriter.read(initial.id)!;
+    const transitioned = applyTransition(current, { type: 'start' }, T0);
+    workflowWriter.update(transitioned);
+    assert.equal(workflowWriter.read(initial.id)?.state, 'IMPLEMENTING');
+
+    // Conversely, when the workflow transition wins before CAS acquires the
+    // fence, the stale writer observes the new fingerprint and refuses to write.
+    const expected = staleTelemetryLikeWrite;
+    assert.equal(waitWriter.updateIfUnchanged(expected, { ...expected, headSha: 'stale-head' }), false);
+    assert.equal(workflowWriter.read(initial.id)?.state, 'IMPLEMENTING');
   });
 
   it('persists updates across store instances (simulated restart)', () => {
