@@ -11,7 +11,7 @@ import {
   CodexCliAdapter,
   type CodexCliAdapterOptions,
 } from './agents/codex-cli.js';
-import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter } from './agents/codex-app-server.js';
+import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter, type NativeThreadObservation } from './agents/codex-app-server.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import { WORKER_ROUTER_PROVIDER, WorkerRouterAdapter } from './agents/worker-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
@@ -1080,34 +1080,49 @@ export function resolveWaitLedgerFile(runId: string, env: NodeJS.ProcessEnv = pr
  * is only wired for App Server executors; otherwise the runtime fallback path
  * is used. Nothing here starts or resumes a Codex turn.
  */
-function buildWaitCommandDependencies(options: {
+export interface CodexNativeObservationAdapter {
+  observeRuntime(executor: NonNullable<Run['executor']>): Promise<NativeThreadObservation>;
+}
+
+/**
+ * Build the deterministic wait dependencies for one run.
+ *
+ * A native #35 observer is wired only for App Server executors and only reads
+ * `thread/read`; it never starts, resumes, steers, or interrupts a turn. The
+ * normalized native status it returns is stateless, so the completion boundary
+ * is decided by the durable previous observation (never by in-process memory),
+ * which keeps the signal correct across a fresh process or a restart.
+ */
+export function buildWaitCommandDependencies(options: {
   readonly store: RunStore;
   readonly run: Run;
   readonly env?: NodeJS.ProcessEnv;
+  /** Test seam; production uses the real component-local App Server adapter. */
+  readonly nativeAdapter?: CodexNativeObservationAdapter;
+  readonly now?: () => string;
 }): WaitCommandDependencies {
   const env = options.env ?? process.env;
   const run = options.run;
   const workspace = run.bootstrap?.workspacePath;
-  const adapter = run.executor?.provider === CODEX_APP_SERVER_PROVIDER
+  const now = options.now ?? (() => new Date().toISOString());
+  const adapter = options.nativeAdapter ?? (run.executor?.provider === CODEX_APP_SERVER_PROVIDER
     ? new CodexAppServerAdapter({ cwd: workspace ?? process.cwd() })
-    : undefined;
+    : undefined);
   return {
     store: options.store,
     ledgerStore: new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }),
-    now: () => new Date().toISOString(),
+    now,
     ...(workspace === undefined ? {} : { readHead: gitHeadReader(new NodeProcessRunner(), workspace) }),
     ...(adapter === undefined ? {} : {
       nativeObserver: {
-        snapshot: async () => {
-          const observation = await adapter.observeRuntime(run.executor!);
-          const observer = new NativeThreadWaitObserver({
-            client: { observeThread: async () => observation },
-            threadId: run.executor!.sessionId,
-            now: () => new Date().toISOString(),
-            subjectId: run.id,
-          });
-          return observer.snapshot();
-        },
+        snapshot: () => new NativeThreadWaitObserver({
+          client: {
+            observeThread: async () => adapter.observeRuntime(run.executor!),
+          },
+          threadId: run.executor!.sessionId,
+          now,
+          subjectId: run.id,
+        }).snapshot(),
       },
     }),
   };

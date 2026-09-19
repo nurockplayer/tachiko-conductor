@@ -323,10 +323,18 @@ ledger fails closed instead of being adopted or overwritten.
 Native observation reuses the #35 App Server `thread/read` capability and
 starts no Codex turn. It is enrichment, never authority: the durable `Run`
 status wins whenever it is `completed`, `failed`, or `blocked`, so an idle or
-not-loaded native thread can never hide a terminal or blocked wake. A native
-turn that leaves its active state is reported as a completion boundary. When
-the native runtime is unavailable, the deterministic runtime fallback still
-produces the same normalized terminal wakes and the same no-wake coalescing.
+not-loaded native thread can never hide a terminal or blocked wake. A subject
+that stops being `active` is a completion boundary, derived from the durable
+previous observation rather than in-process memory, so it still holds when the
+observer is recreated per read or the runtime restarts. When the native runtime
+is unavailable, the deterministic runtime fallback still produces the same
+normalized terminal wakes and the same no-wake coalescing.
+
+The wait path is not a second writer of workflow state. Run-level wait
+telemetry is re-based onto the current durable `Run` immediately before it is
+appended and is skipped when that Run is gone or its workflow state changed
+while waiting, so a wake can never revert a concurrent transition or lose
+terminal evidence.
 
 ```bash
 pnpm exec tsx src/cli.ts wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]

@@ -62,6 +62,21 @@ describe('wait/status telemetry (#51 reuse)', () => {
     assert.deepEqual(projectRunEfficiency(again).metrics.waitStatusWakeups, { status: 'observed', value: 2 });
   });
 
+  it('is purely digest-addressed even when run history grows between captures', () => {
+    const run = waitingRun();
+    const first = recordWaitWakeTelemetry(run, {
+      at: T0, reason: 'blocked', source: 'runtime', subjectId: run.id, status: 'blocked', observationDigest: DIGEST,
+    });
+    // A later capture of the same normalized wake after unrelated history growth
+    // must not mint a second event.
+    const grown = { ...first, history: [...first.history, { type: 'start' as const, from: 'READY' as const, to: 'IMPLEMENTING' as const, at: T0 }] };
+    const second = recordWaitWakeTelemetry(grown, {
+      at: T0, reason: 'blocked', source: 'runtime', subjectId: run.id, status: 'blocked', observationDigest: DIGEST,
+    });
+    assert.equal(second.telemetry?.events.filter((event) => event.kind === 'wait_status_wakeup').length, 2);
+    assert.equal(second.telemetry?.events.filter((event) => event.id.startsWith('wait-wake:')).length, 1);
+  });
+
   it('keeps the persisted wait event structurally valid and secret-free', () => {
     const run = recordWaitWakeTelemetry(waitingRun(), {
       at: T0, reason: 'failure', source: 'runtime', subjectId: 'run-1', status: 'failed', observationDigest: DIGEST,
@@ -86,6 +101,11 @@ describe('wait ledger structural validation', () => {
     assert.equal(isWaitLedger(advanced), true);
     assert.equal(isWaitLedger({ ...advanced, generation: '' }), false);
     assert.equal(isWaitLedger(null), false);
+    // Structurally malformed entries must fail closed instead of being adopted
+    // and then throwing a raw TypeError deeper in the ledger logic.
+    assert.equal(isWaitLedger({ ...advanced, observations: [{ subjectId: 'run-1' }] }), false);
+    assert.equal(isWaitLedger({ ...advanced, wakes: [{ id: 'w1' }] }), false);
+    assert.equal(isWaitLedger({ ...advanced, observations: [{ ...advanced.observations[0], state: undefined }] }), false);
   });
 });
 

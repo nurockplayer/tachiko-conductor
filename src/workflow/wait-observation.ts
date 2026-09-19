@@ -190,12 +190,6 @@ export interface NativeWaitSnapshot {
   readonly items?: number;
   readonly turns?: number;
   readonly evidence?: readonly WaitEvidence[];
-  /**
-   * True when this read observed an active turn end (`active` -> `idle`). That
-   * is a native completion boundary worth a wake, unlike a thread that was
-   * merely idle before this observer started.
-   */
-  readonly leftActiveTurn?: boolean;
 }
 
 export interface RuntimeObservationDependencies {
@@ -279,7 +273,10 @@ export function mergeRuntimeStatus(durable: WaitSubjectStatus, native: NativeWai
   if (native.status === 'failed') return 'failed';
   if (native.status === 'blocked') return 'blocked';
   if (native.status === 'active') return 'active';
-  if (native.status === 'idle') return native.leftActiveTurn === true ? 'completed' : 'idle';
+  // An idle thread is non-terminal here. The durable previous state decides
+  // whether active -> idle is a completion boundary (classifyWaitChange), so
+  // the signal survives a runtime restart that has no in-process memory.
+  if (native.status === 'idle') return 'idle';
   return durable;
 }
 
@@ -318,8 +315,6 @@ export function gitHeadReader(
 export class NativeThreadWaitObserver {
   readonly source: WaitObservationSource = 'native';
   readonly subjectId: string;
-  /** Last normalized native status, so a finished turn is a completion event. */
-  private previousStatus: WaitSubjectStatus | undefined;
 
   constructor(
     private readonly options: {
@@ -349,18 +344,11 @@ export class NativeThreadWaitObserver {
       detail: `${item.type}:${item.id}`.slice(0, 120),
     }));
     if (observation.activeTurnId !== undefined) evidence.push({ kind: 'turn-started', detail: observation.activeTurnId.slice(0, 120) });
-    const status = nativeStatus(observation.status, observation.activeTurnId);
-    // Only an observed active turn that ends counts as a completion boundary;
-    // a thread that was already idle when this observer started is not one.
-    const leftActiveTurn = status === 'idle' && this.previousStatus === 'active';
-    if (leftActiveTurn) evidence.push({ kind: 'turn-completed', detail: `native thread ${this.options.threadId} left its active turn` });
-    this.previousStatus = status;
     return {
-      status,
+      status: nativeStatus(observation.status, observation.activeTurnId),
       ...(observation.activeTurnId === undefined ? {} : { activeItemId: observation.activeTurnId }),
       turns: observation.history.length,
       evidence,
-      ...(leftActiveTurn ? { leftActiveTurn: true } : {}),
     };
   }
 }

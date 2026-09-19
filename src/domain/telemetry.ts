@@ -465,7 +465,10 @@ export interface WaitWakeTelemetryInput {
  */
 export function recordWaitWakeTelemetry(run: Run, input: WaitWakeTelemetryInput): Run {
   const event: RunTelemetryWaitEvent = {
-    id: `wait-wake:${run.id}:${run.state}:${run.history.length}:${input.subjectId}:${input.observationDigest}:${input.reason}`,
+    // Purely content-addressed by the normalized observation digest and reason,
+    // so the same wake is recorded once no matter how much run state changed
+    // around it before it was captured.
+    id: `wait-wake:${run.id}:${input.subjectId}:${input.observationDigest}:${input.reason}`,
     at: input.at,
     kind: 'wait_status_wakeup',
     state: run.state,

@@ -1,5 +1,6 @@
 import {
   DEFAULT_WAIT_WAKE_POLICY,
+  wakeReasonForChange,
   waitObservationDigest,
   type WaitLedger,
   type WaitObservation,
@@ -177,7 +178,15 @@ export async function waitObserveCommand(
     expectedGeneration: run.dispatchClaimId ?? run.id,
   });
   dependencies.ledgerStore.write(advance.ledger);
-  if (advance.wokeNow) recordWake(run, observation, dependencies.now(), advance.wake.reason ?? 'terminal', dependencies.store);
+  if (advance.wokeNow) {
+    recordWake({
+      run,
+      observation,
+      at: dependencies.now(),
+      reason: wakeReasonForChange(advance.change) ?? (advance.wake.reason === 'timeout-policy' ? 'timeout-policy' : 'terminal'),
+      store: dependencies.store,
+    });
+  }
   return toResult({
     mode: 'observe',
     run,
@@ -218,7 +227,15 @@ export async function waitAwaitCommand(
     expectedGeneration: run.dispatchClaimId ?? run.id,
   });
   dependencies.ledgerStore.write(outcome.ledger);
-  if (outcome.wake.shouldWake) recordWake(run, outcome.observation, dependencies.now(), outcome.wake.reason ?? 'terminal', dependencies.store);
+  if (outcome.wake.shouldWake) {
+    recordWake({
+      run,
+      observation: outcome.observation,
+      at: dependencies.now(),
+      reason: outcome.wake.reason ?? 'terminal',
+      store: dependencies.store,
+    });
+  }
   return toResult({ mode: 'wait', run, outcome });
 }
 
@@ -228,15 +245,33 @@ function readRun(id: string, store: RunStore): Run {
   return run;
 }
 
-/** Append run-level wait/status telemetry for a real wake (never for polling). */
-function recordWake(run: Run, observation: WaitObservation, at: string, reason: string, store: RunStore): void {
-  const next = recordWaitWakeTelemetry(run, {
-    at,
-    reason,
-    source: observation.source,
-    subjectId: observation.subjectId,
-    status: observation.status,
-    observationDigest: waitObservationDigest(observation),
+/**
+ * Append run-level wait/status telemetry for a real wake (never for polling).
+ *
+ * The wait path must never become a second writer of workflow state. `run` may
+ * have been read up to a full bounded wait (default 15 minutes) earlier, so the
+ * append is re-based onto the *current* durable Run and skipped entirely if
+ * that Run is gone or its workflow state changed while waiting. Telemetry is
+ * captured; a concurrent terminal transition is never reverted, and no stale
+ * snapshot is written back.
+ */
+function recordWake(input: {
+  readonly run: Run;
+  readonly observation: WaitObservation;
+  readonly at: string;
+  readonly reason: string;
+  readonly store: RunStore;
+}): void {
+  const current = input.store.read(input.run.id);
+  if (current === null) return;
+  if (current.state !== input.run.state) return;
+  const next = recordWaitWakeTelemetry(current, {
+    at: input.at,
+    reason: input.reason,
+    source: input.observation.source,
+    subjectId: input.observation.subjectId,
+    status: input.observation.status,
+    observationDigest: waitObservationDigest(input.observation),
   });
-  if (next !== run) store.update(next);
+  if (next !== current) input.store.update(next);
 }

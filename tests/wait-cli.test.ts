@@ -8,6 +8,10 @@ import { main, resolveWaitLedgerDirectory, resolveWaitLedgerFile, resolveWaitLed
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { createWaitLedger } from '../src/domain/wait.js';
+import { waitObserveCommand } from '../src/workflow/wait-command.js';
+import type { WaitLedgerStore } from '../src/workflow/wait-ledger-store.js';
+import { buildWaitCommandDependencies } from '../src/cli.js';
+import { CODEX_APP_SERVER_PROVIDER } from '../src/agents/codex-app-server.js';
 import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { WaitLedgerFileStore } from '../src/workflow/wait-ledger-store.js';
@@ -196,6 +200,102 @@ describe('wait CLI', () => {
       assert.equal(untouched?.subjectId, 'other-run');
       assert.equal(untouched?.observations.length, 0);
       assert.equal(untouched?.wakes.length, 0);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('records a wake without ever overwriting a concurrent durable transition', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-concurrent'), { type: 'start' }, T0);
+      const store = new JsonFileStore({ dir: dataDir });
+      store.create(run);
+      const filePath = resolveWaitLedgerFile(run.id, env);
+      const ledgerStore = new WaitLedgerFileStore({ filePath });
+      // A concurrent writer reaches a human decision boundary while the wait
+      // path is between its read and its telemetry write.
+      const concurrent: WaitLedgerStore = {
+        read: () => ledgerStore.read(),
+        write: (ledger) => {
+          ledgerStore.write(ledger);
+          store.update(applyTransition(store.read(run.id)!, { type: 'wait_dependency' }, T0));
+        },
+      };
+      const result = await waitObserveCommand(
+        { id: run.id, mode: 'observe' },
+        { store, ledgerStore: concurrent, now: () => T0 },
+      );
+      assert.equal(result.status, 'active');
+      // The wait path must not write back its stale IMPLEMENTING snapshot.
+      const after = store.read(run.id);
+      assert.equal(after?.state, 'WAITING_DEPENDENCY');
+      assert.equal(after?.history.length, 2);
+      // No #47 wake evidence: the wait path captured nothing from its stale read.
+      assert.equal(after?.telemetry?.events.filter((event) => event.id.startsWith('wait-wake:')).length, 0);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('recovers a wake that was recorded before the runtime restarted', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = createRun(TARGET, T0, 'run-wait-restart');
+      seedRun(dataDir, run);
+      const first = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+      assert.equal((JSON.parse(first.stdout[0]!) as { wakeCount: number }).wakeCount, 1);
+      // A brand-new process reads the same durable ledger and must not re-wake.
+      const second = await runMain(env, ['wait', 'observe', run.id]);
+      const parsed = JSON.parse(second.stdout[0]!) as { wake: { shouldWake: boolean }; wakeCount: number; duplicateObservations: number };
+      assert.equal(parsed.wake.shouldWake, false);
+      assert.equal(parsed.wakeCount, 1);
+      assert.equal(parsed.duplicateObservations, 1);
+      const third = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+      assert.equal((JSON.parse(third.stdout[0]!) as { wake: { shouldWake: boolean } }).wake.shouldWake, false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('wakes on a native active-to-idle completion through the production dependency wrapper', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = {
+        ...applyTransition(createRun(TARGET, T0, 'run-wait-native'), { type: 'start' }, T0),
+        executor: { provider: CODEX_APP_SERVER_PROVIDER, sessionId: 'thread-1', generation: 'generation-1' },
+      };
+      const store = new JsonFileStore({ dir: dataDir });
+      store.create(run);
+      let threadStatus: 'active' | 'idle' = 'active';
+      // The wrapper creates a fresh observer for every snapshot, so this proves
+      // the completion boundary comes from durable state, not observer memory.
+      const dependencies = buildWaitCommandDependencies({
+        store,
+        run,
+        env,
+        now: () => T0,
+        nativeAdapter: {
+          observeRuntime: async () => ({
+            threadId: 'thread-1',
+            status: threadStatus,
+            ...(threadStatus === 'active' ? { activeTurnId: 'turn-1' } : {}),
+            history: [],
+          }),
+        },
+      });
+      const started = await waitObserveCommand({ id: run.id, mode: 'observe' }, dependencies);
+      assert.equal(started.status, 'active');
+      assert.equal(started.wake.shouldWake, false);
+
+      threadStatus = 'idle';
+      const finished = await waitObserveCommand({ id: run.id, mode: 'observe' }, dependencies);
+      assert.equal(finished.change, 'completion');
+      assert.equal(finished.wake.shouldWake, true);
+      assert.equal(finished.wake.reason, 'completion');
+      assert.equal(finished.modelTurns, 0);
+      const stored = store.read(run.id);
+      assert.equal(stored?.telemetry?.events.filter((event) => event.kind === 'wait_status_wakeup').length, 1);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

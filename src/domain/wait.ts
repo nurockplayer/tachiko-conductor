@@ -184,6 +184,14 @@ function terminalEvidence(observation: WaitObservation, kind: 'completion' | 'fa
   return dedupeEvidence([{ kind: evidenceKind, detail: `subject ${observation.subjectId} reported ${observation.status}` }, ...reportedEvidence(observation)]);
 }
 
+/** The wake reason a classified change implies; `none` never wakes. */
+export function wakeReasonForChange(change: WaitChange): WaitWakeReason | null {
+  if (change.kind === 'completion') return 'completion';
+  if (change.kind === 'failure') return 'failure';
+  if (change.kind === 'blocked') return 'blocked';
+  return null;
+}
+
 function reportedEvidence(observation: WaitObservation): readonly WaitEvidence[] {
   return observation.evidence.length === 0 ? statusEvidence(observation.status) : observation.evidence;
 }
@@ -229,6 +237,12 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
     if (next.status === 'completed') return { kind: 'completion', meaningful: true, evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} completed`) };
     if (next.status === 'failed') return { kind: 'failure', meaningful: true, evidence: transitionEvidence(previous, next, 'failure', `subject ${next.subjectId} failed`) };
     if (next.status === 'blocked') return { kind: 'blocked', meaningful: true, evidence: transitionEvidence(previous, next, 'blocked', `subject ${next.subjectId} is blocked`) };
+    // A subject that stops being active has reached a completion boundary. This
+    // is derived from the durable previous state, never from in-process
+    // observer memory, so it survives a runtime restart.
+    if (previous.status === 'active' && next.status === 'idle') {
+      return { kind: 'completion', meaningful: true, evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} left its active state`) };
+    }
     if (next.status === 'unavailable') return { kind: 'progress', meaningful: true, evidence: transitionEvidence(previous, next, 'unavailable', `subject ${next.subjectId} became unavailable`) };
     return { kind: 'progress', meaningful: true, evidence: transitionEvidence(previous, next, 'status-changed', `subject ${next.subjectId} changed status`) };
   }
@@ -441,15 +455,18 @@ export function advanceWaitLedger(input: {
         state: waitObservationState(observation),
       }];
   const decision = decideWaitWake({ change, observation, ...(input.timedOut === undefined ? {} : { timedOut: input.timedOut }), policy });
-  // A terminal wake for this exact digest is recorded at most once, even if a
-  // restart re-observes it before the orchestrator has reconciled, and even
-  // after the bounded wake list has evicted the original record.
+  // Any wake for this exact digest and reason is recorded at most once, even if
+  // a restart re-observes it before the orchestrator has reconciled and even
+  // after the bounded wake list has evicted the original record. That includes
+  // `timeout-policy`: an identical timeout must never become a periodic wake.
+  const priorTerminalDigests = ledger.terminalDigests ?? [];
+  const duplicateWake = decision.shouldWake && ledger.wakes.some((wake) => wake.observationDigest === digest && wake.reason === decision.reason);
   const terminalDecision = decision.shouldWake &&
     (decision.reason === 'completion' || decision.reason === 'failure' || decision.reason === 'blocked' || decision.reason === 'terminal');
-  const priorTerminalDigests = ledger.terminalDigests ?? [];
   const terminalAlreadyRecorded = terminalDecision && priorTerminalDigests.includes(digest);
+  const alreadyRecorded = duplicateWake || terminalAlreadyRecorded;
   const wakeId = `wait-wake:${ledger.ownerRunId}:${observation.subjectId}:${digest}:${decision.reason ?? 'none'}:${ledger.wakes.length}`;
-  const wokeNow = decision.shouldWake && !terminalAlreadyRecorded;
+  const wokeNow = decision.shouldWake && !alreadyRecorded;
   const wakes = wokeNow
     ? [...ledger.wakes, {
         id: wakeId,
@@ -522,8 +539,8 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
     typeof record.subjectId === 'string' && record.subjectId !== '' &&
     typeof record.ownerRunId === 'string' && record.ownerRunId !== '' &&
     typeof record.generation === 'string' && record.generation !== '' &&
-    Array.isArray(record.observations) &&
-    Array.isArray(record.wakes) &&
+    Array.isArray(record.observations) && record.observations.every(isWaitRecordedObservation) &&
+    Array.isArray(record.wakes) && record.wakes.every(isWaitRecordedWake) &&
     (record.terminalDigests === undefined ||
       (Array.isArray(record.terminalDigests) && record.terminalDigests.every((item) => typeof item === 'string'))) &&
     (record.lastDigest === null || typeof record.lastDigest === 'string') &&
@@ -543,6 +560,45 @@ export function migrateWaitLedger(value: WaitLedger): WaitLedger {
       .filter((wake) => wake.reason === 'completion' || wake.reason === 'failure' || wake.reason === 'blocked' || wake.reason === 'terminal')
       .map((wake) => wake.observationDigest),
   };
+}
+
+function isWaitObservationState(value: unknown): value is WaitObservationState {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const state = value as Record<string, unknown>;
+  return typeof state.source === 'string' &&
+    typeof state.subjectId === 'string' && state.subjectId !== '' &&
+    typeof state.status === 'string' &&
+    (state.activeItemId === null || typeof state.activeItemId === 'string') &&
+    Number.isSafeInteger(state.items) && (state.items as number) >= 0 &&
+    Number.isSafeInteger(state.turns) && (state.turns as number) >= 0 &&
+    (state.headSha === null || typeof state.headSha === 'string');
+}
+
+function isWaitRecordedObservation(value: unknown): value is WaitRecordedObservation {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.id === 'string' && record.id !== '' &&
+    typeof record.at === 'string' &&
+    typeof record.source === 'string' &&
+    typeof record.subjectId === 'string' && record.subjectId !== '' &&
+    typeof record.status === 'string' &&
+    typeof record.observationDigest === 'string' && record.observationDigest !== '' &&
+    typeof record.change === 'string' &&
+    isWaitObservationState(record.state);
+}
+
+function isWaitRecordedWake(value: unknown): value is WaitRecordedWake {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return typeof record.id === 'string' && record.id !== '' &&
+    typeof record.at === 'string' &&
+    typeof record.reason === 'string' &&
+    typeof record.source === 'string' &&
+    typeof record.subjectId === 'string' && record.subjectId !== '' &&
+    typeof record.status === 'string' &&
+    typeof record.observationDigest === 'string' && record.observationDigest !== '' &&
+    Array.isArray(record.evidence) && record.evidence.every((item) => typeof item === 'object' && item !== null &&
+      typeof (item as Record<string, unknown>).kind === 'string' && typeof (item as Record<string, unknown>).detail === 'string');
 }
 
 export function isWaitObservation(value: unknown): value is WaitObservation {

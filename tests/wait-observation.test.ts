@@ -190,18 +190,30 @@ describe('durable wait ledger', () => {
     assert.equal(second.ledger.wakes.length, 1);
   });
 
-  it('keeps the terminal dedup guarantee across bounded ledger eviction', () => {
-    // A terminal observation must never wake twice, even after the bounded
-    // warning-evidence history has evicted the original wake record.
+  it('keeps the terminal dedup guarantee after bounded eviction of the wake record', () => {
+    // A terminal wake must never be re-emitted even after the bounded wake list
+    // has genuinely evicted the original record: the terminal-digest set is
+    // what carries the guarantee.
     let ledger = ledgerFor();
-    for (let index = 0; index < 250; index += 1) {
-      ledger = advanceWaitLedger({ ledger, observation: normalize('active', { progress: { items: index, turns: 0 } }), at: T0 }).ledger;
-    }
     const terminal = normalize('completed');
     const first = advanceWaitLedger({ ledger, observation: terminal, at: T0 });
     assert.equal(first.wokeNow, true);
-    const bounded = boundWaitLedger(first.ledger);
-    assert.equal(bounded.wakes.length <= 200, true);
+    ledger = first.ledger;
+    // Push the terminal wake out of the bounded window with later, genuinely
+    // distinct timeout wakes (one per distinct observed state).
+    const escalating: WaitWakePolicy = { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 0, onTimeout: 'policy-action' };
+    for (let index = 0; index < 250; index += 1) {
+      ledger = advanceWaitLedger({
+        ledger,
+        observation: normalize('active', { progress: { items: index + 1, turns: 0 } }),
+        at: T0,
+        timedOut: true,
+        policy: escalating,
+      }).ledger;
+    }
+    assert.equal(ledger.wakes.length > 200, true);
+    const bounded = boundWaitLedger(ledger);
+    assert.equal(bounded.wakes.some((wake) => wake.observationDigest === waitObservationDigest(terminal)), false, 'terminal wake must be evicted');
     assert.equal(bounded.terminalDigests?.includes(waitObservationDigest(terminal)), true);
     const replayed = advanceWaitLedger({ ledger: bounded, observation: terminal, at: T0 });
     assert.equal(replayed.wokeNow, false);
@@ -343,35 +355,46 @@ describe('#35 native observation reuse', () => {
     }
   });
 
-  it('wakes on a native active-to-idle turn completion', async () => {
-    const native = new NativeThreadWaitObserver({
-      client: {
-        observeThread: async (threadId: string) => threadStatus === 'active'
-          ? { threadId, status: 'active' as const, activeTurnId: 'turn-1', history: [] }
-          : { threadId, status: 'idle' as const, history: [] },
-      },
-      threadId: 'thread-1',
-      now: () => T0,
-      subjectId: SUBJECT,
-    });
-    const run = applyTransition(newRun(SUBJECT), { type: 'start' }, T0);
-    const observer = new RunRuntimeObserver(
-      { ...run, executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } },
-      { now: () => T0, nativeObserver: { snapshot: () => native.snapshot() } },
-    );
+  it('wakes on a native active-to-idle turn completion across a fresh observer', async () => {
+    // The completion boundary must come from the durable previous state, never
+    // from in-process observer memory: a production wrapper creates a new
+    // observer per snapshot, and a restart has no memory at all.
+    const run = { ...applyTransition(newRun(SUBJECT), { type: 'start' }, T0), executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } };
     let threadStatus: 'active' | 'idle' = 'active';
-    const started = await observer.observe();
+    const freshObserver = (): RunRuntimeObserver => new RunRuntimeObserver(run, {
+      now: () => T0,
+      nativeObserver: {
+        snapshot: () => new NativeThreadWaitObserver({
+          client: {
+            observeThread: async (threadId: string) => threadStatus === 'active'
+              ? { threadId, status: 'active' as const, activeTurnId: 'turn-1', history: [] }
+              : { threadId, status: 'idle' as const, history: [] },
+          },
+          threadId: 'thread-1',
+          now: () => T0,
+          subjectId: SUBJECT,
+        }).snapshot(),
+      },
+    });
+
+    const started = await freshObserver().observe();
     assert.equal(started.status, 'active');
     let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: started, at: T0 }).ledger;
     assert.equal(ledger.wakes.length, 0);
 
     threadStatus = 'idle';
-    const finished = await observer.observe();
-    assert.equal(finished.status, 'completed');
+    // A brand-new observer instance proves no in-process state is required.
+    const finished = await freshObserver().observe();
+    assert.equal(finished.status, 'idle');
     const advance = advanceWaitLedger({ ledger, observation: finished, at: T0 });
     assert.equal(advance.change.kind, 'completion');
     assert.equal(advance.wokeNow, true);
     assert.equal(advance.ledger.wakes.length, 1);
+
+    // Replaying the same idle read after a restart does not wake again.
+    const replay = advanceWaitLedger({ ledger: advance.ledger, observation: finished, at: T0 });
+    assert.equal(replay.wokeNow, false);
+    assert.equal(replay.ledger.wakes.length, 1);
   });
 
   it('does not treat an already-idle native thread as a completion', async () => {
