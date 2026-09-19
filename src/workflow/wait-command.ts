@@ -187,6 +187,10 @@ function toResult(input: {
   // Replay the most significant pending decision, not merely the oldest, and
   // carry every pending wake with its own bounded evidence so nothing is lost.
   const replayWake = replay ? byReplayPriority(pending)[0]! : undefined;
+  // The wake presented as `wake` is that same decision either way; it must not
+  // also be listed as a separate pending wake.
+  const presentedWakeId = replayWake?.id
+    ?? pending.find((wake) => wake.observationDigest === ledger.lastDigest)?.id;
   return {
     ok: true,
     mode: input.mode,
@@ -210,7 +214,7 @@ function toResult(input: {
           evidence: evidenceViews(replayWake.evidence),
         },
     pendingWakes: pending
-      .filter((wake) => wake.id !== replayWake?.id)
+      .filter((wake) => wake.id !== presentedWakeId)
       .map((wake) => ({
         id: wake.id,
         reason: wake.reason,
@@ -349,30 +353,43 @@ function recordWake(input: {
   readonly reason: string;
   readonly store: RunStore;
 }): void {
-  for (let attempt = 0; attempt < 3; attempt += 1) {
-    const current = input.store.read(input.run.id);
-    if (current === null) return;
-    // The wait path must never become a workflow writer. Skip the telemetry
-    // capture when the Run moved on from the state this wake was observed in.
-    if (current.state !== input.run.state) return;
-    const next = recordWaitWakeTelemetry(current, {
-      at: input.at,
-      reason: input.reason,
-      source: input.observation.source,
-      subjectId: input.observation.subjectId,
-      status: input.observation.status,
-      observationDigest: waitObservationDigest(input.observation),
-    });
-    if (next === current) return;
-    // Verify immediately before writing: a transition landing since the read
-    // must be re-based onto, never overwritten. There is no await between the
-    // verify and the write, so only a separate process can interleave.
-    const verified = input.store.read(input.run.id);
-    if (verified === null) return;
-    if (verified.state !== current.state || verified.updatedAt !== current.updatedAt || verified.history.length !== current.history.length) {
-      continue;
-    }
-    input.store.update(next);
+  // Re-base onto the *current* durable Run: a wake for a transition observed
+  // during the wait legitimately belongs to that new state, so the append must
+  // not be skipped just because the Run moved on from the command-start read.
+  const current = input.store.read(input.run.id);
+  if (current === null) return;
+  const next = recordWaitWakeTelemetry(current, {
+    at: input.at,
+    reason: input.reason,
+    source: input.observation.source,
+    subjectId: input.observation.subjectId,
+    status: input.observation.status,
+    observationDigest: waitObservationDigest(input.observation),
+  });
+  if (next === current) return;
+  // Never clobber a concurrent writer: prefer a compare-and-swap when the
+  // store offers one, and otherwise verify the snapshot immediately before the
+  // write (there is no await between the verify and the write).
+  if (input.store.updateIfUnchanged !== undefined) {
+    input.store.updateIfUnchanged(current, next);
     return;
   }
+  const verified = input.store.read(input.run.id);
+  if (verified === null) return;
+  if (runSnapshotKey(verified) !== runSnapshotKey(current)) return;
+  input.store.update(next);
+}
+
+/** Durable identity of a Run snapshot, for the non-CAS fallback path. */
+function runSnapshotKey(run: Run): string {
+  return JSON.stringify([
+    run.state,
+    run.updatedAt,
+    run.headSha ?? null,
+    run.history.length,
+    run.agentResult ?? null,
+    run.reviewResult ?? null,
+    run.validationResult ?? null,
+    run.pullRequest ?? null,
+  ]);
 }

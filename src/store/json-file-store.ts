@@ -16,6 +16,12 @@ export interface RunStore {
   create(run: Run): void;
   read(id: string): Run | null;
   update(run: Run): void;
+  /**
+   * Optional compare-and-swap write: replace a Run only when its durable
+   * identity is still exactly `expected`, returning false when another writer
+   * changed it first. Callers must degrade safely when it is absent.
+   */
+  updateIfUnchanged?(expected: Run, next: Run): boolean;
   list(): Run[];
   delete(id: string): void;
 }
@@ -269,6 +275,27 @@ function readRun(filePath: string, id: string): Run {
  * committed run file, so a run survives a process restart intact: each write
  * goes to `<id>.json.tmp` and is renamed into place only after it is complete.
  */
+/**
+ * Identity of one durable Run snapshot for compare-and-swap writes. Any field a
+ * workflow transition can change participates, so a stale writer is refused
+ * rather than reverting a concurrent transition.
+ */
+function runFingerprint(run: Run | null): string {
+  if (run === null) return 'absent';
+  return JSON.stringify({
+    state: run.state,
+    updatedAt: run.updatedAt,
+    headSha: run.headSha ?? null,
+    history: run.history.length,
+    agentResult: run.agentResult ?? null,
+    reviewResult: run.reviewResult ?? null,
+    validationResult: run.validationResult ?? null,
+    pullRequest: run.pullRequest ?? null,
+    executor: run.executor ?? null,
+    interrupt: run.interrupt ?? null,
+  });
+}
+
 export class JsonFileStore implements RunStore {
   readonly name = 'json-file';
   private readonly dir: string;
@@ -299,6 +326,14 @@ export class JsonFileStore implements RunStore {
 
   update(run: Run): void {
     writeJsonAtomic(this.filePathFor(run.id), run);
+  }
+
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    const filePath = this.filePathFor(expected.id);
+    const current = readRun(filePath, expected.id);
+    if (runFingerprint(current) !== runFingerprint(expected)) return false;
+    writeJsonAtomic(filePath, next);
+    return true;
   }
 
   list(): Run[] {

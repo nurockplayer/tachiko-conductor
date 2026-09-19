@@ -688,6 +688,39 @@ describe('wait CLI', () => {
     }
   });
 
+  it('records run telemetry for a durable transition observed during the wait', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-transition-telemetry'), { type: 'start' }, T0);
+      const real = new JsonFileStore({ dir: dataDir });
+      real.create(run);
+      // The wait observes the run while it is still IMPLEMENTING, then the
+      // durable run fails before the next telemetry read.
+      let reads = 0;
+      const store: typeof real = Object.create(real) as typeof real;
+      store.read = (id: string) => {
+        reads += 1;
+        // The durable run fails between the command-start read and the
+        // observer's own re-read.
+        if (reads === 2) real.update(applyTransition(real.read(id)!, { type: 'fail' }, T0));
+        return real.read(id);
+      };
+      const ledgerStore = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) });
+      const result = await waitObserveCommand({ id: run.id, mode: 'observe' }, { store, ledgerStore, now: () => T0 });
+      // The observer re-read the durable run and saw the transition.
+      assert.equal(result.status, 'failed');
+      assert.equal(result.change, 'failure');
+      assert.equal(result.wake.shouldWake, true);
+      assert.equal(result.wake.reason, 'failure');
+      const after = real.read(run.id);
+      assert.equal(after?.state, 'FAILED');
+      // The transition wake is recorded for the state it was observed in.
+      assert.equal(after?.telemetry?.events.filter((event) => event.id.startsWith('wait-wake:')).length, 1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unknown run id and malformed schedule values', async () => {
     const { directory, dataDir, env } = tempWorkspace();
     try {
