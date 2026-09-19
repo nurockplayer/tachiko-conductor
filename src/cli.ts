@@ -1040,7 +1040,12 @@ export async function waitForOwnedBrowser(
   }
 }
 
-/** Durable wait-ledger location; explicit override first, no repository defaults. */
+/**
+ * Durable wait-ledger location. `TACHIKO_WAIT_LEDGER_PATH` names a path whose
+ * directory holds the per-run ledgers; its basename is conventional (the file
+ * actually written is `<dir>/<runId>.wait.json`). Prefer
+ * `resolveWaitLedgerDirectory`/`resolveWaitLedgerFile` in callers.
+ */
 export function resolveWaitLedgerPath(env: NodeJS.ProcessEnv = process.env): string {
   if (env.TACHIKO_WAIT_LEDGER_PATH !== undefined && env.TACHIKO_WAIT_LEDGER_PATH.trim() !== '') return env.TACHIKO_WAIT_LEDGER_PATH;
   return path.join(path.dirname(resolveRunsDir(env)), 'wait', 'state.json');

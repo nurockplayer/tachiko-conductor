@@ -666,6 +666,66 @@ describe('#35 native observation reuse', () => {
     assert.equal(replay.ledger.wakes.length, 0);
   });
 
+  it('still wakes when a resumable blocked subject later becomes terminal', () => {
+    // MERGE_READY / WAITING_DEPENDENCY are blocked but resumable, so a later
+    // failed/completed transition must still wake exactly once.
+    for (const [blocked, terminal, expected] of [
+      ['blocked', 'failed', 'failure'],
+      ['blocked', 'completed', 'completion'],
+    ] as const) {
+      let ledger = ledgerFor();
+      const first = advanceWaitLedger({ ledger, observation: normalize(blocked), at: T0 });
+      assert.equal(first.change.kind, 'blocked', blocked);
+      assert.equal(first.wokeNow, true, blocked);
+      assert.equal(first.ledger.terminalReached, false, `${blocked} must not be sticky-terminal`);
+      const later = advanceWaitLedger({ ledger: first.ledger, observation: normalize(terminal), at: T0 });
+      assert.equal(later.change.kind, expected, `${blocked} -> ${terminal}`);
+      assert.equal(later.wokeNow, true, `${blocked} -> ${terminal} must wake`);
+      assert.equal(later.ledger.wakes.length, 2, `${blocked} -> ${terminal}`);
+    }
+  });
+
+  it('keeps a blocked timeout re-wake bounded to genuinely distinct states', () => {
+    const policy: WaitWakePolicy = { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 0, onTimeout: 'policy-action' };
+    let ledger = ledgerFor();
+    ledger = advanceWaitLedger({ ledger, observation: normalize('blocked'), at: T0 }).ledger;
+    const repeat = advanceWaitLedger({ ledger, observation: normalize('blocked'), at: T0, timedOut: true, policy });
+    assert.equal(repeat.wake.shouldWake, false);
+    assert.equal(repeat.ledger.wakes.length, 1);
+  });
+
+  it('migrates a native completion wake without marking the subject terminal', () => {
+    const active = normalize('active', { source: 'native' });
+    const completed = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' });
+    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: active, at: T0 }).ledger;
+    ledger = advanceWaitLedger({ ledger, observation: completed, at: T0 }).ledger;
+    assert.equal(ledger.wakes[0]?.reason, 'completion');
+    assert.equal(ledger.wakes[0]?.status, 'idle');
+    assert.equal(ledger.terminalReached, false);
+    const legacy = { ...ledger, terminalReached: undefined, terminalDigests: undefined, lastNativeStatus: undefined } as never;
+    const migrated = migrateWaitLedger(legacy);
+    assert.equal(migrated.terminalReached, false, 'a native completion wake is not a terminal transition');
+    assert.equal(migrated.lastNativeStatus, 'idle');
+    // A later genuine terminal transition must still wake.
+    const failed = advanceWaitLedger({ ledger: migrated, observation: normalize('failed'), at: T0 });
+    assert.equal(failed.wokeNow, true);
+    assert.equal(failed.change.kind, 'failure');
+  });
+
+  it('keeps the active native anchor through eviction when the idle read has no turn id', () => {
+    // Boundary 1 is anchored on the durable native status, so it survives both
+    // history eviction and an interrupted turn with no completed-turn id.
+    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: normalize('active', { source: 'native' }), at: T0 }).ledger;
+    for (let index = 0; index < 260; index += 1) {
+      ledger = boundWaitLedger(advanceWaitLedger({ ledger, observation: normalize('active', { progress: { items: index + 1, turns: 0 } }), at: T0 }).ledger);
+    }
+    assert.equal(ledger.observations.some((recorded) => recorded.source === 'native'), false);
+    assert.equal(ledger.lastNativeStatus, 'active');
+    const finished = advanceWaitLedger({ ledger, observation: normalize('idle', { source: 'native' }), at: T0 });
+    assert.equal(finished.change.kind, 'completion');
+    assert.equal(finished.wokeNow, true);
+  });
+
   it('keeps terminalReached sticky across duplicate terminal replays', () => {
     const terminal = normalize('failed');
     let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: terminal, at: T0 }).ledger;

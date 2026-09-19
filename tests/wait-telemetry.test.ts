@@ -111,6 +111,13 @@ describe('wait ledger structural validation', () => {
     assert.equal(isWaitLedger({ ...advanced, wakes: [{ ...advanced.wakes[0], reason: 'nonsense' }] }), false);
     assert.equal(isWaitLedger({ ...advanced, observationSequence: -1 }), false);
     assert.equal(isWaitLedger({ ...advanced, terminalReached: 'yes' }), false);
+    assert.equal(isWaitLedger({ ...advanced, lastNativeStatus: 'NOT_A_STATUS' }), false);
+    assert.equal(isWaitLedger({ ...advanced, lastNativeStatus: 3 }), false);
+    assert.equal(isWaitLedger({ ...advanced, lastNativeIdentity: 123 }), false);
+    assert.equal(isWaitLedger({ ...advanced, lastNativeIdentity: '' }), false);
+    assert.equal(isWaitLedger({ ...advanced, previousWasNative: 'yes' }), false);
+    assert.equal(isWaitLedger({ ...advanced, nativeIdentities: 'nope' }), false);
+    assert.equal(isWaitLedger({ ...advanced, nativeIdentities: [3] }), false);
   });
 });
 
