@@ -4,16 +4,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { main, resolveWaitLedgerDirectory, resolveWaitLedgerFile, resolveWaitLedgerPath, resolveWaitWakePolicy } from '../src/cli.js';
+import { buildWaitCommandDependencies, main, resolveWaitLedgerDirectory, resolveWaitLedgerFile, resolveWaitLedgerPath, resolveWaitWakePolicy } from '../src/cli.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
-import { createWaitLedger } from '../src/domain/wait.js';
+import { DEFAULT_WAIT_WAKE_POLICY, createWaitLedger } from '../src/domain/wait.js';
 import { waitObserveCommand } from '../src/workflow/wait-command.js';
 import type { WaitLedgerStore } from '../src/workflow/wait-ledger-store.js';
-import { buildWaitCommandDependencies } from '../src/cli.js';
 import { CODEX_APP_SERVER_PROVIDER } from '../src/agents/codex-app-server.js';
 import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
+import { waitAwaitCommand } from '../src/workflow/wait-command.js';
 import { WaitLedgerFileStore } from '../src/workflow/wait-ledger-store.js';
 import { T0, TARGET } from './helpers.js';
 
@@ -92,6 +92,75 @@ describe('wait CLI', () => {
       assert.notEqual(ledger, null);
       assert.equal(ledger?.wakes.length, 1);
       assert.equal(ledger?.observations.length, 1);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('wakes exactly once on native active -> idle through the production dependency wrapper', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = {
+        ...createRun(TARGET, T0, 'run-wait-native-wiring'),
+        executor: { provider: 'codex-app-server', sessionId: 'thread-native-1', generation: 'generation-native-1' },
+      };
+      const store = new JsonFileStore({ dir: dataDir });
+      store.create(run);
+      const startup = await waitAwaitCommand(
+        { id: run.id, mode: 'wait', policy: { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 0, onTimeout: 'continue' }, pollIntervalMs: 0 },
+        {
+          ...buildWaitCommandDependencies({
+            store,
+            run,
+            env,
+            now: () => T0,
+            appServerAdapter: {
+              observeRuntime: async () => ({ threadId: 'thread-native-1', status: 'active' as const, activeTurnId: 'turn-1', history: [] }),
+            },
+          }),
+          monotonicNow: () => 0,
+          sleep: async () => undefined,
+        },
+      );
+      assert.equal(startup.source, 'native');
+      assert.equal(startup.status, 'active');
+      assert.equal(startup.wake.shouldWake, false);
+
+      // A brand-new dependency wrapper (as a separate CLI invocation creates)
+      // now sees the same native thread idle. The completion boundary must come
+      // from the durable previous observation, not observer memory.
+      let reads = 0;
+      const finished = await waitAwaitCommand(
+        { id: run.id, mode: 'wait', policy: { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 10, onTimeout: 'continue' }, pollIntervalMs: 1 },
+        {
+          ...buildWaitCommandDependencies({
+            store,
+            run,
+            env,
+            now: () => T0,
+            appServerAdapter: {
+              observeRuntime: async () => {
+                reads += 1;
+                return { threadId: 'thread-native-1', status: 'idle' as const, history: [] };
+              },
+            },
+          }),
+          monotonicNow: () => 0,
+          sleep: async () => undefined,
+        },
+      );
+
+      assert.equal(reads >= 1, true);
+      assert.equal(finished.source, 'native');
+      assert.equal(finished.change, 'completion');
+      assert.equal(finished.wake.shouldWake, true);
+      assert.equal(finished.wake.reason, 'completion');
+      assert.equal(finished.wakeCount, 1);
+      assert.equal(finished.modelTurns, 0);
+
+      const ledger = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }).read();
+      assert.equal(ledger?.wakes.length, 1);
+      assert.equal(ledger?.wakes[0]?.reason, 'completion');
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -275,7 +344,7 @@ describe('wait CLI', () => {
         run,
         env,
         now: () => T0,
-        nativeAdapter: {
+        appServerAdapter: {
           observeRuntime: async () => ({
             threadId: 'thread-1',
             status: threadStatus,

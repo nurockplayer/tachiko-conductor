@@ -1089,25 +1089,26 @@ export interface CodexNativeObservationAdapter {
  *
  * A native #35 observer is wired only for App Server executors and only reads
  * `thread/read`; it never starts, resumes, steers, or interrupts a turn. The
- * normalized native status it returns is stateless, so the completion boundary
- * is decided by the durable previous observation (never by in-process memory),
- * which keeps the signal correct across a fresh process or a restart.
+ * normalized native status it reports is stateless: the active -> idle
+ * completion boundary is classified from the durable previous observation in
+ * `classifyWaitChange`, so a fresh process, a re-created observer, or a restart
+ * preserves it.
  */
 export function buildWaitCommandDependencies(options: {
   readonly store: RunStore;
   readonly run: Run;
   readonly env?: NodeJS.ProcessEnv;
-  /** Test seam; production uses the real component-local App Server adapter. */
-  readonly nativeAdapter?: CodexNativeObservationAdapter;
+  /** Injectable read-only App Server observation seam for deterministic wiring tests. */
+  readonly appServerAdapter?: CodexNativeObservationAdapter;
   readonly now?: () => string;
 }): WaitCommandDependencies {
   const env = options.env ?? process.env;
   const run = options.run;
-  const workspace = run.bootstrap?.workspacePath;
   const now = options.now ?? (() => new Date().toISOString());
-  const adapter = options.nativeAdapter ?? (run.executor?.provider === CODEX_APP_SERVER_PROVIDER
-    ? new CodexAppServerAdapter({ cwd: workspace ?? process.cwd() })
-    : undefined);
+  const workspace = run.bootstrap?.workspacePath;
+  const adapter = run.executor?.provider === CODEX_APP_SERVER_PROVIDER
+    ? options.appServerAdapter ?? new CodexAppServerAdapter({ cwd: workspace ?? process.cwd() })
+    : undefined;
   return {
     store: options.store,
     ledgerStore: new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }),
@@ -1116,9 +1117,7 @@ export function buildWaitCommandDependencies(options: {
     ...(adapter === undefined ? {} : {
       nativeObserver: {
         snapshot: () => new NativeThreadWaitObserver({
-          client: {
-            observeThread: async () => adapter.observeRuntime(run.executor!),
-          },
+          client: { observeThread: () => adapter.observeRuntime(run.executor!) },
           threadId: run.executor!.sessionId,
           now,
           subjectId: run.id,
