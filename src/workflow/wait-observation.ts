@@ -105,7 +105,7 @@ function recordWake(ledger: WaitLedger, observation: WaitObservation, at: string
   // timeout on the same unchanged state is not a new decision boundary, it is a
   // timer. Never re-wake for it.
   const terminalDigest = (ledger.terminalDigests ?? []).includes(digest);
-  const alreadyRecorded = terminalDigest ||
+  const alreadyRecorded = ledger.terminalReached || terminalDigest ||
     ledger.wakes.some((wake) => wake.observationDigest === digest && wake.reason === decision.reason);
   const shouldWake = decision.shouldWake && !alreadyRecorded;
   const wakeId = `wait-wake:${ledger.ownerRunId}:${observation.subjectId}:${digest}:${decision.reason ?? 'none'}:${ledger.wakes.length}`;
@@ -173,7 +173,13 @@ export async function awaitMeaningfulChange(options: WaitAwaitOptions): Promise<
     }
     const remaining = deadlineAt - now();
     if (remaining <= 0) {
-      const decision = decideWaitWake({ change: { kind: 'none', meaningful: false, evidence: [] }, observation, timedOut: true, policy: options.policy });
+      const decision = decideWaitWake({
+        change: { kind: 'none', meaningful: false, evidence: [] },
+        observation,
+        timedOut: true,
+        policy: options.policy,
+        terminalReached: ledger.terminalReached,
+      });
       const recorded = recordWake(ledger, observation, observation.observedAt, decision);
       return {
         observation,

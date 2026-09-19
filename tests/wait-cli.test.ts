@@ -427,7 +427,8 @@ describe('wait CLI', () => {
     const { directory, dataDir, env } = tempWorkspace();
     try {
       const run = applyTransition(createRun(TARGET, T0, 'run-wait-terminal-timeout'), { type: 'fail' }, T0);
-      seedRun(dataDir, run);
+      const store = new JsonFileStore({ dir: dataDir });
+      store.create(run);
       const first = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
       const firstParsed = JSON.parse(first.stdout[0]!) as { change: string; wake: { shouldWake: boolean; reason: string }; wakeCount: number };
       assert.equal(firstParsed.change, 'failure');
@@ -445,6 +446,20 @@ describe('wait CLI', () => {
       assert.equal(second.stdout.includes('TACHIKO_WAIT_IDLE_V1'), true);
       const ledger = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }).read();
       assert.deepEqual(ledger?.wakes.map((wake) => wake.reason), ['failure']);
+
+      // Digest drift on an already-terminal run must not convert a progress-only
+      // observation into a model wake.
+      for (const headSha of ['a'.repeat(40), 'b'.repeat(40)]) {
+        const drifted = { ...store.read(run.id)!, headSha };
+        store.update(drifted);
+        const afterDrift = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+        const driftedParsed = JSON.parse(afterDrift.stdout[0]!) as { change: string; wake: { shouldWake: boolean }; wakeCount: number };
+        assert.equal(driftedParsed.wake.shouldWake, false);
+        assert.equal(driftedParsed.wakeCount, 1);
+        assert.equal(afterDrift.stdout.includes('TACHIKO_WAIT_WAKE_V1'), false);
+      }
+      const finalLedger = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }).read();
+      assert.deepEqual(finalLedger?.wakes.map((wake) => wake.reason), ['failure']);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

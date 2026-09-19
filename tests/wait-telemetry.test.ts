@@ -106,6 +106,11 @@ describe('wait ledger structural validation', () => {
     assert.equal(isWaitLedger({ ...advanced, observations: [{ subjectId: 'run-1' }] }), false);
     assert.equal(isWaitLedger({ ...advanced, wakes: [{ id: 'w1' }] }), false);
     assert.equal(isWaitLedger({ ...advanced, observations: [{ ...advanced.observations[0], state: undefined }] }), false);
+    assert.equal(isWaitLedger({ ...advanced, observations: [{ ...advanced.observations[0], source: 'martian' }] }), false);
+    assert.equal(isWaitLedger({ ...advanced, observations: [{ ...advanced.observations[0], status: 'NOT_A_STATUS' }] }), false);
+    assert.equal(isWaitLedger({ ...advanced, wakes: [{ ...advanced.wakes[0], reason: 'nonsense' }] }), false);
+    assert.equal(isWaitLedger({ ...advanced, observationSequence: -1 }), false);
+    assert.equal(isWaitLedger({ ...advanced, terminalReached: 'yes' }), false);
   });
 });
 

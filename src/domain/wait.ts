@@ -13,6 +13,7 @@ export const WAIT_OBSERVATION_REVISION = 'wait-observation-v1' as const;
 export const WAIT_WAKE_POLICY_REVISION = 'wait-wake-policy-v1' as const;
 
 const WAIT_SUBJECT_STATUSES: readonly WaitSubjectStatus[] = ['idle', 'active', 'completed', 'failed', 'blocked', 'unknown', 'unavailable'];
+const WAIT_OBSERVATION_SOURCES: readonly WaitObservationSource[] = ['native', 'runtime', 'subprocess', 'github'];
 const WAIT_CHANGE_KINDS: readonly WaitChangeKind[] = ['none', 'progress', 'completion', 'failure', 'blocked'];
 const WAIT_WAKE_REASONS: readonly WaitWakeReason[] = ['completion', 'failure', 'blocked', 'terminal', 'timeout-policy'];
 
@@ -261,7 +262,12 @@ export function classifyWaitChange(
   const nativeBefore = previousNative === undefined
     ? (previous.source === 'native' ? previous : null)
     : previousNative;
-  const turnIdentityAdvanced = (previous.lastCompletedTurnId ?? null) !== (next.lastCompletedTurnId ?? null);
+  // Compare against the last genuine native identity, not the immediately
+  // preceding record: an ambiguous read drops the identity and would otherwise
+  // look like a fresh completion.
+  const priorNativeIdentity = nativeBefore?.lastCompletedTurnId ?? null;
+  const nextIdentity = next.lastCompletedTurnId ?? null;
+  const turnIdentityAdvanced = nextIdentity !== null && nextIdentity !== priorNativeIdentity;
   // Completion boundary 1: an observed native active phase just ended.
   if (nativeBefore !== null && next.source === 'native' && nativeBefore.status === 'active' && next.status === 'idle') {
     return {
@@ -277,8 +283,7 @@ export function classifyWaitChange(
   // read is what separates this from a plain idle -> idle advance, which is
   // progress-only. A native active anchor is excluded here because boundary 1
   // already covers it.
-  const previousWasNative = previousIsNative;
-  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && !previousWasNative && (nativeBefore === null || nativeBefore.status === 'idle')) {
+  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && !previousIsNative && (nativeBefore === null || nativeBefore.status === 'idle')) {
     return {
       kind: 'completion',
       meaningful: true,
@@ -351,6 +356,8 @@ export interface WaitWakeInput {
   /** True once the bounded wait budget for this episode is exhausted. */
   readonly timedOut?: boolean;
   readonly policy?: WaitWakePolicy;
+  /** True when this subject's terminal transition has already been surfaced. */
+  readonly terminalReached?: boolean;
 }
 
 /**
@@ -360,10 +367,11 @@ export interface WaitWakeInput {
  */
 export function decideWaitWake(input: WaitWakeInput): WaitWakeDecision {
   const policy = input.policy ?? DEFAULT_WAIT_WAKE_POLICY;
+  const terminalReached = input.terminalReached === true;
   if (input.change.meaningful && (input.change.kind === 'completion' || input.change.kind === 'failure' || input.change.kind === 'blocked')) {
     return { shouldWake: true, reason: input.change.kind, evidence: input.change.evidence };
   }
-  if (input.timedOut === true && policy.onTimeout === 'policy-action') {
+  if (input.timedOut === true && policy.onTimeout === 'policy-action' && terminalReached !== true) {
     return {
       shouldWake: true,
       reason: 'timeout-policy',
@@ -422,6 +430,15 @@ export interface WaitLedger {
   readonly lastObservedAt: string | null;
   /** Start of the current bounded wait episode; reset by every meaningful change. */
   readonly waitStartedAt: string | null;
+  /**
+   * True once this subject has reached a terminal state and that transition has
+   * been surfaced. A timeout after that is never a new decision boundary, so a
+   * terminal Run can never be re-woken by the timeout policy even if later
+   * observations drift to a different digest.
+   */
+  readonly terminalReached: boolean;
+  /** Monotonic observation counter, independent of the bounded history length. */
+  readonly observationSequence: number;
 }
 
 export function createWaitLedger(input: {
@@ -441,6 +458,8 @@ export function createWaitLedger(input: {
     lastDigest: null,
     lastObservedAt: null,
     waitStartedAt: null,
+    terminalReached: false,
+    observationSequence: 0,
   };
 }
 
@@ -538,8 +557,8 @@ export function advanceWaitLedger(input: {
   const change = duplicate
     ? { kind: 'none' as const, meaningful: false, evidence: [] as readonly WaitEvidence[] }
     : classifyWaitChange(previous, observation, previousNative, previousIsNative);
-  const sequence = (ledger.observations[ledger.observations.length - 1]?.id.split(':').at(-2) ?? '0');
-  const observationEventId = `wait-observation:${ledger.ownerRunId}:${observation.subjectId}:${sequence}:${digest}`;
+  const observationSequence = ledger.observationSequence + 1;
+  const observationEventId = `wait-observation:${ledger.ownerRunId}:${observation.subjectId}:${observationSequence}:${digest}`;
   const observations = duplicate
     ? ledger.observations
     : [...ledger.observations, {
@@ -552,7 +571,7 @@ export function advanceWaitLedger(input: {
         change: change.kind,
         state: waitObservationState(observation),
       }];
-  const decision = decideWaitWake({ change, observation, ...(input.timedOut === undefined ? {} : { timedOut: input.timedOut }), policy });
+  const decision = decideWaitWake({ change, observation, ...(input.timedOut === undefined ? {} : { timedOut: input.timedOut }), policy, terminalReached: ledger.terminalReached });
   // Any wake for this exact digest and reason is recorded at most once, even if
   // a restart re-observes it before the orchestrator has reconciled and even
   // after the bounded wake list has evicted the original record. That includes
@@ -585,6 +604,8 @@ export function advanceWaitLedger(input: {
     observations,
     wakes,
     terminalDigests,
+    terminalReached: !duplicate && isTerminalWaitObservation(observation),
+    observationSequence,
     lastDigest: digest,
     lastObservedAt: input.at,
     waitStartedAt: !isTerminalWaitObservation(observation) && change.kind === 'none'
@@ -644,7 +665,9 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
       (Array.isArray(record.terminalDigests) && record.terminalDigests.every((item) => typeof item === 'string'))) &&
     (record.lastDigest === null || typeof record.lastDigest === 'string') &&
     (record.lastObservedAt === null || typeof record.lastObservedAt === 'string') &&
-    (record.waitStartedAt === null || typeof record.waitStartedAt === 'string');
+    (record.waitStartedAt === null || typeof record.waitStartedAt === 'string') &&
+    (record.terminalReached === undefined || typeof record.terminalReached === 'boolean') &&
+    (record.observationSequence === undefined || (Number.isSafeInteger(record.observationSequence) && (record.observationSequence as number) >= 0));
 }
 
 /**
@@ -662,18 +685,21 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
  * reconciliation prompt.
  */
 export function migrateWaitLedger(value: WaitLedger): WaitLedger {
+  const terminalDigests = value.terminalDigests ?? value.wakes
+    .filter((wake) => wake.reason === 'completion' || wake.reason === 'failure' || wake.reason === 'blocked' || wake.reason === 'terminal')
+    .map((wake) => wake.observationDigest);
   return {
     ...value,
-    terminalDigests: value.terminalDigests ?? value.wakes
-      .filter((wake) => wake.reason === 'completion' || wake.reason === 'failure' || wake.reason === 'blocked' || wake.reason === 'terminal')
-      .map((wake) => wake.observationDigest),
+    terminalDigests,
+    terminalReached: value.terminalReached ?? terminalDigests.length > 0,
+    observationSequence: value.observationSequence ?? value.observations.length,
   };
 }
 
 function isWaitObservationState(value: unknown): value is WaitObservationState {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const state = value as Record<string, unknown>;
-  return typeof state.source === 'string' &&
+  return typeof state.source === 'string' && (WAIT_OBSERVATION_SOURCES as readonly string[]).includes(state.source) &&
     typeof state.subjectId === 'string' && state.subjectId !== '' &&
     typeof state.status === 'string' && (WAIT_SUBJECT_STATUSES as readonly string[]).includes(state.status) &&
     (state.activeItemId === null || typeof state.activeItemId === 'string') &&
@@ -688,7 +714,7 @@ function isWaitRecordedObservation(value: unknown): value is WaitRecordedObserva
   const record = value as Record<string, unknown>;
   return typeof record.id === 'string' && record.id !== '' &&
     typeof record.at === 'string' &&
-    typeof record.source === 'string' &&
+    typeof record.source === 'string' && (WAIT_OBSERVATION_SOURCES as readonly string[]).includes(record.source) &&
     typeof record.subjectId === 'string' && record.subjectId !== '' &&
     typeof record.status === 'string' && (WAIT_SUBJECT_STATUSES as readonly string[]).includes(record.status) &&
     typeof record.observationDigest === 'string' && record.observationDigest !== '' &&
@@ -702,7 +728,7 @@ function isWaitRecordedWake(value: unknown): value is WaitRecordedWake {
   return typeof record.id === 'string' && record.id !== '' &&
     typeof record.at === 'string' &&
     typeof record.reason === 'string' && (WAIT_WAKE_REASONS as readonly string[]).includes(record.reason) &&
-    typeof record.source === 'string' &&
+    typeof record.source === 'string' && (WAIT_OBSERVATION_SOURCES as readonly string[]).includes(record.source) &&
     typeof record.subjectId === 'string' && record.subjectId !== '' &&
     typeof record.status === 'string' && (WAIT_SUBJECT_STATUSES as readonly string[]).includes(record.status) &&
     typeof record.observationDigest === 'string' && record.observationDigest !== '' &&

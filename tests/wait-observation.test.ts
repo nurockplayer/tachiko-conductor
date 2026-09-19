@@ -597,6 +597,58 @@ describe('#35 native observation reuse', () => {
     }
   });
 
+  it('never wakes when an ambiguous read hides an unchanged completed-turn identity', async () => {
+    // The immediately preceding record drops its identity (runtime provenance),
+    // so the boundary must compare against the last genuine native identity.
+    for (const ambiguity of ['throw', 'not_loaded'] as const) {
+      const run = { ...applyTransition(newRun(SUBJECT), { type: 'start' }, T0), executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } };
+      let step = 0;
+      const observer = (): RunRuntimeObserver => new RunRuntimeObserver(run, {
+        now: () => T0,
+        nativeObserver: {
+          snapshot: async () => {
+            step += 1;
+            if (step === 2) {
+              if (ambiguity === 'throw') throw new Error('transient native read failure');
+              return { status: 'unknown' };
+            }
+            return { status: 'idle', turns: 1, lastCompletedTurnId: 'turn-1' };
+          },
+        },
+      });
+      let ledger = ledgerFor();
+      const kinds: string[] = [];
+      for (let read = 0; read < 3; read += 1) {
+        const advance = advanceWaitLedger({ ledger, observation: await observer().observe(), at: T0 });
+        ledger = advance.ledger;
+        kinds.push(advance.change.kind);
+      }
+      assert.deepEqual(kinds, ['none', 'progress', 'progress'], ambiguity);
+      assert.equal(ledger.wakes.length, 0, ambiguity);
+      // The replayed unchanged identity must coalesce, not wake.
+      const replay = advanceWaitLedger({ ledger, observation: await observer().observe(), at: T0 });
+      assert.equal(replay.change.kind, 'none', ambiguity);
+      assert.equal(replay.wokeNow, false, ambiguity);
+      assert.equal(replay.ledger.wakes.length, 0, ambiguity);
+    }
+  });
+
+  it('keeps observation event ids unique and monotonic under bounded eviction', () => {
+    let ledger = ledgerFor();
+    const ids: string[] = [];
+    for (let index = 0; index < 260; index += 1) {
+      const advance = advanceWaitLedger({ ledger, observation: normalize('active', { progress: { items: index, turns: 0 } }), at: T0 });
+      ledger = boundWaitLedger(advance.ledger);
+      ids.push(advance.observationEventId);
+    }
+    assert.equal(new Set(ids).size, ids.length);
+    const sequences = ids.map((id) => Number(id.split(':').at(-2)));
+    assert.deepEqual(sequences, sequences.slice().sort((left, right) => left - right));
+    assert.equal(sequences[0], 1);
+    assert.equal(sequences.at(-1), 260);
+    assert.equal(ledger.observations.length, 200);
+  });
+
   it('stays progress-only for an idle -> idle completed-turn identity advance', () => {
     const idleOne = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' });
     const idleTwo = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-2' });
