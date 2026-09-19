@@ -1,6 +1,8 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '../dispatch/invocation-lock.js';
+
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetry.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
@@ -29,6 +31,12 @@ export interface RunStore {
 export interface JsonFileStoreOptions {
   /** Directory that will hold one `<id>.json` file per run. */
   readonly dir: string;
+  /** Bound for waiting on another same-host Run writer. */
+  readonly mutationLockTimeoutMs?: number;
+  /** Retry cadence while a live Run writer owns the mutation fence. */
+  readonly mutationLockRetryMs?: number;
+  /** Test seam: runs after CAS comparison succeeds while the mutation fence is still held. */
+  readonly beforeConditionalWrite?: () => void;
 }
 
 const ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -299,12 +307,40 @@ function runFingerprint(run: Run | null): string {
   });
 }
 
+export class RunMutationLockedError extends Error {
+  constructor(runId: string, lockPath: string) {
+    super(`Run "${runId}" is currently owned by another same-host mutation at ${lockPath}; refusing an unfenced write.`);
+    this.name = 'RunMutationLockedError';
+  }
+}
+
+const DEFAULT_RUN_MUTATION_LOCK_TIMEOUT_MS = 30_000;
+const DEFAULT_RUN_MUTATION_LOCK_RETRY_MS = 10;
+
+function sleepSync(milliseconds: number): void {
+  if (milliseconds <= 0) return;
+  const cell = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+  Atomics.wait(cell, 0, 0, milliseconds);
+}
+
 export class JsonFileStore implements RunStore {
   readonly name = 'json-file';
   private readonly dir: string;
+  private readonly mutationLockTimeoutMs: number;
+  private readonly mutationLockRetryMs: number;
+  private readonly beforeConditionalWrite: (() => void) | undefined;
 
   constructor(options: JsonFileStoreOptions) {
-    this.dir = options.dir;
+    this.dir = path.resolve(options.dir);
+    this.mutationLockTimeoutMs = options.mutationLockTimeoutMs ?? DEFAULT_RUN_MUTATION_LOCK_TIMEOUT_MS;
+    this.mutationLockRetryMs = options.mutationLockRetryMs ?? DEFAULT_RUN_MUTATION_LOCK_RETRY_MS;
+    this.beforeConditionalWrite = options.beforeConditionalWrite;
+    if (!Number.isSafeInteger(this.mutationLockTimeoutMs) || this.mutationLockTimeoutMs < 0) {
+      throw new Error('mutationLockTimeoutMs must be a non-negative safe integer.');
+    }
+    if (!Number.isSafeInteger(this.mutationLockRetryMs) || this.mutationLockRetryMs < 1) {
+      throw new Error('mutationLockRetryMs must be a positive safe integer.');
+    }
     mkdirSync(this.dir, { recursive: true });
   }
 
@@ -313,12 +349,43 @@ export class JsonFileStore implements RunStore {
     return path.join(this.dir, `${id}.json`);
   }
 
-  create(run: Run): void {
-    const filePath = this.filePathFor(run.id);
-    if (existsSync(filePath)) {
-      throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
+  private mutationLockPathFor(id: string): string {
+    return `${this.filePathFor(id)}.mutation.lock`;
+  }
+
+  /**
+   * Serialize every same-host Run mutation through one per-run process lock.
+   * The shared lock covers both the CAS comparison and its write; ordinary
+   * update/create/delete writers use the same fence, closing the TOCTOU window.
+   */
+  private withMutationLock<T>(id: string, operation: () => T): T {
+    const lockPath = this.mutationLockPathFor(id);
+    const deadlineAt = Date.now() + this.mutationLockTimeoutMs;
+    for (;;) {
+      try {
+        const lock = acquireDispatchInvocationLock({ lockPath });
+        try {
+          return operation();
+        } finally {
+          lock.release();
+        }
+      } catch (error) {
+        if (!(error instanceof DispatchInvocationLockedError)) throw error;
+        const remaining = deadlineAt - Date.now();
+        if (remaining <= 0) throw new RunMutationLockedError(id, lockPath);
+        sleepSync(Math.min(this.mutationLockRetryMs, remaining));
+      }
     }
-    writeJsonAtomic(filePath, run);
+  }
+
+  create(run: Run): void {
+    this.withMutationLock(run.id, () => {
+      const filePath = this.filePathFor(run.id);
+      if (existsSync(filePath)) {
+        throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
+      }
+      writeJsonAtomic(filePath, run);
+    });
   }
 
   read(id: string): Run | null {
@@ -328,15 +395,21 @@ export class JsonFileStore implements RunStore {
   }
 
   update(run: Run): void {
-    writeJsonAtomic(this.filePathFor(run.id), run);
+    this.withMutationLock(run.id, () => {
+      writeJsonAtomic(this.filePathFor(run.id), run);
+    });
   }
 
   updateIfUnchanged(expected: Run, next: Run): boolean {
-    const filePath = this.filePathFor(expected.id);
-    const current = readRun(filePath, expected.id);
-    if (runFingerprint(current) !== runFingerprint(expected)) return false;
-    writeJsonAtomic(filePath, next);
-    return true;
+    if (expected.id !== next.id) throw new Error('updateIfUnchanged requires expected and next to name the same Run id.');
+    return this.withMutationLock(expected.id, () => {
+      const filePath = this.filePathFor(expected.id);
+      const current = readRun(filePath, expected.id);
+      if (runFingerprint(current) !== runFingerprint(expected)) return false;
+      this.beforeConditionalWrite?.();
+      writeJsonAtomic(filePath, next);
+      return true;
+    });
   }
 
   list(): Run[] {
@@ -347,10 +420,12 @@ export class JsonFileStore implements RunStore {
   }
 
   delete(id: string): void {
-    const filePath = this.filePathFor(id);
-    if (!existsSync(filePath)) {
-      throw new Error(`No run with id "${id}" exists at ${filePath}; nothing to delete.`);
-    }
-    unlinkSync(filePath);
+    this.withMutationLock(id, () => {
+      const filePath = this.filePathFor(id);
+      if (!existsSync(filePath)) {
+        throw new Error(`No run with id "${id}" exists at ${filePath}; nothing to delete.`);
+      }
+      unlinkSync(filePath);
+    });
   }
 }
