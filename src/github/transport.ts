@@ -115,7 +115,21 @@ export class NodeProcessRunner implements ProcessRunner {
             finish(() => resolve(this.result(stdout, stderr, exitCode, options)));
             return;
           }
-          finish(() => reject(error));
+          // execFile aborts with ERR_CHILD_PROCESS_STDIO_MAXBUFFER once its
+          // safety cap is reached. Preserve the partial transcript as an
+          // explicit capture-truncated artifact instead of dropping the only
+          // failure evidence available to the caller.
+          const captureTruncated = error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+          finish(() => reject(Object.assign(error, {
+            output: this.output(
+              stdout,
+              stderr,
+              captureTruncated ? 'failed' : 'unknown',
+              null,
+              options,
+              captureTruncated,
+            ),
+          })));
         },
       );
       // A child may close its read end before stdin is ended (for example,
@@ -149,6 +163,7 @@ export class NodeProcessRunner implements ProcessRunner {
     outcome: ToolOutputEnvelope['outcome'],
     exitCode: number | null,
     options: ProcessRunOptions,
+    captureTruncated = false,
   ): ToolOutputEnvelope {
     return boundToolOutput({
       outcome,
@@ -157,6 +172,7 @@ export class NodeProcessRunner implements ProcessRunner {
       stderr,
       store: options.outputStore ?? this.outputStore,
       policy: options.outputPolicy ?? this.outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY,
+      captureTruncated,
     });
   }
 }

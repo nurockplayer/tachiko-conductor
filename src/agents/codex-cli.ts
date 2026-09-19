@@ -21,7 +21,6 @@ import {
   type ModelEffortPreflightResult,
 } from './model-capability.js';
 import {
-  attachToolOutputTelemetry,
   capabilityTelemetry,
   maximumBytes,
   mergeTokenUsage,
@@ -196,7 +195,10 @@ export class CodexCliAdapter implements ImplementationAgent {
       ...(capability === undefined ? {} : { capability }),
     });
     if (!parsed.ok) return failureAgentResult(parsed.code, parsed.detail, durationMs, executor, parsed.telemetry, result.output);
-    const telemetry = attachToolOutputTelemetry(parsed.outcome.telemetry, result.output);
+    // The parser's per-item measurement is the tool-result metric. The
+    // process envelope is the complete JSONL transcript and must not inflate
+    // largestToolResultBytes.
+    const telemetry = parsed.outcome.telemetry;
     if (executor !== undefined && parsed.outcome.executor.sessionId !== executor.sessionId) {
       return failureAgentResult(
         CODEX_ERROR_CODE.RESUME_IDENTITY_MISMATCH,

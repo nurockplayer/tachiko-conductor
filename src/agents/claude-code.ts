@@ -16,7 +16,6 @@ import {
   type ProcessRunOptions,
 } from '../github/transport.js';
 import {
-  attachToolOutputTelemetry,
   providerTelemetry,
   tokenUsageFromProviderValue,
   usageContextFromTokenUsage,
@@ -311,12 +310,12 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     }
     const usage = tokenUsageFromProviderValue(json.usage);
     const context = usageContextFromTokenUsage(usage);
-    const telemetry = attachToolOutputTelemetry(providerTelemetry({
+    const telemetry = providerTelemetry({
       provider: CLAUDE_CODE_PROVIDER,
       ...(this.model === undefined && json.model === undefined ? {} : { model: json.model ?? this.model }),
       ...(usage === undefined ? {} : { usage }),
       ...(context === undefined ? {} : { context }),
-    }), result.output);
+    });
     return {
       ok: true,
       summary: typeof json.result === 'string' && json.result !== '' ? json.result : 'Done.',

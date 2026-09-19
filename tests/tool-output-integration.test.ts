@@ -57,6 +57,24 @@ describe('bounded output integration', () => {
     );
   });
 
+  it('preserves explicit overflow evidence when execFile reaches its safety cap', async () => {
+    const store = new InMemoryToolOutputStore();
+    await assert.rejects(
+      new NodeProcessRunner({ outputStore: store }).run(
+        process.execPath,
+        ['-e', "process.stdout.write('x'.repeat(17 * 1024 * 1024))"],
+        { timeoutMs: 10_000 },
+      ),
+      (error: unknown) => {
+        const value = error as { readonly code?: unknown; readonly output?: { readonly overflow?: { readonly capture?: boolean }; readonly artifact?: { readonly totalBytes?: number } } };
+        assert.equal(value.code, 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER');
+        assert.equal(value.output?.overflow?.capture, true);
+        assert.ok((value.output?.artifact?.totalBytes ?? 0) > 0);
+        return true;
+      },
+    );
+  });
+
   it('searches a file-backed artifact in bounded chunks with byte offsets', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-file-output-'));
     try {

@@ -2,7 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
 import type { LocalValidationConfiguration, ValidationAdapter, ValidationRequest } from '../adapters/validation.js';
-import { boundToolOutput, FileToolOutputStore, type ToolOutputPolicy, type ToolOutputStore } from '../evidence/tool-output.js';
+import { boundToolOutputFromCapture, DEFAULT_TOOL_OUTPUT_POLICY, FileToolOutputStore, type ToolOutputPolicy, type ToolOutputStore } from '../evidence/tool-output.js';
 
 function malformed(commandIndex: number, executable = ''): LocalValidationCommandEvidence {
   return { commandIndex, executable, outcome: 'malformed', exitCode: null, durationMs: 0 };
@@ -120,24 +120,25 @@ async function execute(
 ): Promise<LocalValidationCommandEvidence> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
+  const capturePolicy = outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY;
+  const capture = outputStore.startCapture(capturePolicy);
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
     let timer: NodeJS.Timeout | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
     let settling = false;
-    let stdout = '';
-    let stderr = '';
     const finish = (outcome: LocalValidationCommandEvidence['outcome'], exitCode: number | null): void => {
       if (settled) return;
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       if (forceTimer !== undefined) clearTimeout(forceTimer);
+      const evidence = capture.finish();
       resolve({
         commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
-        output: boundToolOutput({
+        output: boundToolOutputFromCapture({
           outcome: outcome === 'passed' ? 'passed' : outcome === 'failed' ? 'failed' : outcome === 'timed_out' ? 'timed_out' : 'unknown',
-          exitCode, stdout, stderr, store: outputStore, policy: outputPolicy,
+          exitCode, capture: evidence, policy: capturePolicy,
         }),
       });
     };
@@ -166,8 +167,8 @@ async function execute(
     }
     child.stdout?.setEncoding('utf8');
     child.stderr?.setEncoding('utf8');
-    child.stdout?.on('data', (chunk: string) => { stdout += chunk; });
-    child.stderr?.on('data', (chunk: string) => { stderr += chunk; });
+    child.stdout?.on('data', (chunk: string) => { capture.write('stdout', chunk); });
+    child.stderr?.on('data', (chunk: string) => { capture.write('stderr', chunk); });
     timer = setTimeout(() => {
       timedOut = true;
       if (process.platform === 'win32') {

@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readSync, writeFileSync, writeSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -35,6 +35,7 @@ export interface ToolOutputStream {
 
 export interface ToolOutputOverflow {
   readonly truncated: boolean;
+  readonly capture: boolean;
   readonly summary: boolean;
   readonly diagnostics: boolean;
   readonly stdout: boolean;
@@ -77,6 +78,19 @@ export interface ToolOutputCapture {
   readonly stderr: string;
 }
 
+export interface ToolOutputCaptureSummary {
+  readonly artifact: ToolOutputArtifactReference;
+  readonly stdout: ToolOutputStream;
+  readonly stderr: ToolOutputStream;
+  readonly diagnostics: readonly string[];
+  readonly diagnosticsTruncated: boolean;
+}
+
+export interface ToolOutputCaptureWriter {
+  write(channel: 'stdout' | 'stderr', chunk: string): void;
+  finish(): ToolOutputCaptureSummary;
+}
+
 export interface ToolOutputReadRequest {
   readonly channel: 'stdout' | 'stderr';
   readonly offset?: number;
@@ -107,6 +121,7 @@ export interface ToolOutputMatch {
 
 export interface ToolOutputStore {
   save(capture: ToolOutputCapture): ToolOutputArtifactReference;
+  startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter;
   read(reference: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult;
   search(reference: ToolOutputArtifactReference, request: ToolOutputSearchRequest): readonly ToolOutputMatch[];
 }
@@ -131,12 +146,22 @@ function utf8Bytes(value: string): number {
 function tail(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, 'utf8');
   if (bytes.length <= maxBytes) return value;
-  return bytes.subarray(bytes.length - maxBytes).toString('utf8');
+  let start = bytes.length - maxBytes;
+  while (start < bytes.length && (bytes[start]! & 0xc0) === 0x80) start += 1;
+  return bytes.subarray(start).toString('utf8');
 }
 
 function head(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, 'utf8');
-  return bytes.length <= maxBytes ? value : bytes.subarray(0, maxBytes).toString('utf8');
+  if (bytes.length <= maxBytes) return value;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end - 1]! & 0xc0) === 0x80) end -= 1;
+  if (end > 0) {
+    const first = bytes[end - 1]!;
+    const expected = first >= 0xf0 ? 4 : first >= 0xe0 ? 3 : first >= 0xc0 ? 2 : 1;
+    if (expected > maxBytes - end + 1) end -= 1;
+  }
+  return bytes.subarray(0, Math.max(0, end)).toString('utf8');
 }
 
 function boundedDiagnostics(stdout: string, stderr: string, policy: ToolOutputPolicy): { readonly lines: string[]; readonly truncated: boolean } {
@@ -185,6 +210,7 @@ export function boundToolOutput(input: {
   readonly summary?: string;
   readonly store: ToolOutputStore;
   readonly policy?: ToolOutputPolicy;
+  readonly captureTruncated?: boolean;
 }): ToolOutputEnvelope {
   if (!Number.isInteger(input.exitCode) && input.exitCode !== null) throw new Error('exitCode must be an integer or null.');
   const policy = normalizePolicy(input.policy);
@@ -197,7 +223,8 @@ export function boundToolOutput(input: {
   const retainedBytes = stdout.previewBytes + stderr.previewBytes;
   const totalBytes = artifact.totalBytes;
   const overflow = {
-    truncated: stdout.truncated || stderr.truncated,
+    truncated: Boolean(input.captureTruncated) || stdout.truncated || stderr.truncated || diagnostics.truncated || utf8Bytes(summary) < utf8Bytes(rawSummary),
+    capture: Boolean(input.captureTruncated),
     summary: utf8Bytes(summary) < utf8Bytes(rawSummary),
     diagnostics: diagnostics.truncated,
     stdout: stdout.truncated,
@@ -219,6 +246,46 @@ export function boundToolOutput(input: {
     stderr,
     diagnostics: diagnostics.lines,
     artifact,
+    overflow,
+  };
+}
+
+export function boundToolOutputFromCapture(input: {
+  readonly outcome: ToolOutputOutcome;
+  readonly exitCode: number | null;
+  readonly capture: ToolOutputCaptureSummary;
+  readonly summary?: string;
+  readonly policy?: ToolOutputPolicy;
+  readonly captureTruncated?: boolean;
+}): ToolOutputEnvelope {
+  if (!Number.isInteger(input.exitCode) && input.exitCode !== null) throw new Error('exitCode must be an integer or null.');
+  const policy = normalizePolicy(input.policy);
+  const rawSummary = input.summary?.trim() || `${input.outcome}${input.exitCode === null ? '' : ` (exit ${input.exitCode})`}`;
+  const summary = head(rawSummary, policy.diagnosticBytes);
+  const overflow = {
+    truncated: Boolean(input.captureTruncated) || input.capture.stdout.truncated || input.capture.stderr.truncated || input.capture.diagnosticsTruncated || utf8Bytes(summary) < utf8Bytes(rawSummary),
+    capture: Boolean(input.captureTruncated),
+    summary: utf8Bytes(summary) < utf8Bytes(rawSummary),
+    diagnostics: input.capture.diagnosticsTruncated,
+    stdout: input.capture.stdout.truncated,
+    stderr: input.capture.stderr.truncated,
+    totalBytes: input.capture.artifact.totalBytes,
+    retainedBytes: input.capture.stdout.previewBytes + input.capture.stderr.previewBytes,
+    omittedBytes: Math.max(0, input.capture.artifact.totalBytes - input.capture.stdout.previewBytes - input.capture.stderr.previewBytes),
+    previewLimitBytes: policy.previewBytes,
+    diagnosticLimitBytes: policy.diagnosticBytes,
+    diagnosticLimitLines: policy.maxDiagnostics,
+  } satisfies ToolOutputOverflow;
+  return {
+    version: TOOL_OUTPUT_CONTRACT_VERSION,
+    outcome: input.outcome,
+    exitCode: input.exitCode,
+    readBytes: policy.readBytes,
+    summary,
+    stdout: input.capture.stdout,
+    stderr: input.capture.stderr,
+    diagnostics: input.capture.diagnostics,
+    artifact: input.capture.artifact,
     overflow,
   };
 }
@@ -255,7 +322,7 @@ export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelop
   const overflow = envelope.overflow;
   if (typeof overflow !== 'object' || overflow === null) return false;
   const overflowRecord = overflow as Record<string, unknown>;
-  return typeof overflowRecord.truncated === 'boolean' && typeof overflowRecord.summary === 'boolean' &&
+  return typeof overflowRecord.truncated === 'boolean' && typeof overflowRecord.capture === 'boolean' && typeof overflowRecord.summary === 'boolean' &&
     typeof overflowRecord.diagnostics === 'boolean' &&
     typeof overflowRecord.stdout === 'boolean' && typeof overflowRecord.stderr === 'boolean' &&
     [overflowRecord.totalBytes, overflowRecord.retainedBytes, overflowRecord.omittedBytes, overflowRecord.previewLimitBytes,
@@ -307,6 +374,10 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
     return reference(id, capture.stdout, capture.stderr);
   }
 
+  startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
+    return new BufferedToolOutputWriter(this, policy);
+  }
+
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
     const capture = this.values.get(referenceValue.id);
     if (capture === undefined) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable.`);
@@ -347,6 +418,14 @@ export class FileToolOutputStore implements ToolOutputStore {
     }
   }
 
+  startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
+    try {
+      return new FileToolOutputWriter(this.root, policy);
+    } catch {
+      return new BufferedToolOutputWriter(this.fallback, policy);
+    }
+  }
+
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
     const range = validateReadRequest(referenceValue, request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
     const filePath = this.file(referenceValue.id, request.channel);
@@ -379,6 +458,167 @@ export class FileToolOutputStore implements ToolOutputStore {
   private file(id: string, channel: 'stdout' | 'stderr'): string {
     if (!/^[0-9a-f-]{36}$/.test(id)) throw new Error('Invalid tool-output artifact id.');
     return path.join(this.root, `${id}.${channel}`);
+  }
+}
+
+class StreamCapture {
+  private total = 0;
+  private preview = '';
+
+  constructor(private readonly limit: number) {}
+
+  append(chunk: string): void {
+    this.total += utf8Bytes(chunk);
+    this.preview = tail(`${this.preview}${chunk}`, this.limit);
+  }
+
+  value(): ToolOutputStream {
+    return {
+      bytes: this.total,
+      preview: this.preview,
+      previewBytes: utf8Bytes(this.preview),
+      truncated: this.total > this.limit,
+    };
+  }
+}
+
+class DiagnosticCapture {
+  private pending = '';
+  private readonly highSignal: string[] = [];
+  private readonly fallback: string[] = [];
+  private dropped = false;
+  private readonly highSignalPattern = /\b(error|failed|failure|fatal|exception|assert|panic|timeout|timed[ -]?out|denied|invalid|cannot|could not)\b/i;
+
+  constructor(private readonly policy: ToolOutputPolicy) {}
+
+  append(chunk: string): void {
+    this.pending += chunk;
+    let match: RegExpMatchArray | null;
+    while ((match = this.pending.match(/\r?\n/)) !== null) {
+      const index = match.index ?? 0;
+      this.line(this.pending.slice(0, index));
+      this.pending = this.pending.slice(index + match[0].length);
+    }
+    if (utf8Bytes(this.pending) > this.policy.diagnosticBytes * 2) {
+      this.pending = tail(this.pending, this.policy.diagnosticBytes);
+      this.dropped = true;
+    }
+  }
+
+  finish(): { readonly lines: readonly string[]; readonly truncated: boolean } {
+    if (this.pending !== '') this.line(this.pending);
+    const selected = this.highSignal.length > 0 ? this.highSignal : this.fallback;
+    const bounded = boundedDiagnostics(selected.join('\n'), '', this.policy);
+    return { lines: bounded.lines, truncated: this.dropped || bounded.truncated };
+  }
+
+  private line(value: string): void {
+    const normalized = value.trim();
+    if (normalized === '') return;
+    this.fallback.push(normalized);
+    while (this.fallback.length > 2) this.fallback.shift();
+    if (!this.highSignalPattern.test(normalized)) return;
+    this.highSignal.push(normalized);
+    if (this.highSignal.length > this.policy.maxDiagnostics) {
+      this.highSignal.shift();
+      this.dropped = true;
+    }
+  }
+}
+
+class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
+  private stdout = '';
+  private stderr = '';
+
+  constructor(private readonly store: ToolOutputStore, private readonly policy: ToolOutputPolicy) {}
+
+  write(channel: 'stdout' | 'stderr', chunk: string): void {
+    if (channel === 'stdout') this.stdout += chunk;
+    else this.stderr += chunk;
+  }
+
+  finish(): ToolOutputCaptureSummary {
+    const artifact = this.store.save({ stdout: this.stdout, stderr: this.stderr });
+    const diagnostics = boundedDiagnostics(this.stdout, this.stderr, this.policy);
+    return {
+      artifact,
+      stdout: stream(this.stdout, this.policy.previewBytes),
+      stderr: stream(this.stderr, this.policy.previewBytes),
+      diagnostics: diagnostics.lines,
+      diagnosticsTruncated: diagnostics.truncated,
+    };
+  }
+}
+
+class FileToolOutputWriter implements ToolOutputCaptureWriter {
+  private readonly id = randomUUID();
+  private readonly stdoutHandle: number;
+  private readonly stderrHandle: number;
+  private readonly stdoutCapture: StreamCapture;
+  private readonly stderrCapture: StreamCapture;
+  private readonly stdoutDiagnostics: DiagnosticCapture;
+  private readonly stderrDiagnostics: DiagnosticCapture;
+  private readonly stdoutHash = createHash('sha256');
+  private readonly stderrHash = createHash('sha256');
+  private finished = false;
+
+  constructor(private readonly root: string, private readonly policy: ToolOutputPolicy) {
+    mkdirSync(root, { recursive: true, mode: 0o700 });
+    chmodSync(root, 0o700);
+    this.stdoutHandle = openSync(path.join(root, `${this.id}.stdout`), 'wx', 0o600);
+    this.stderrHandle = openSync(path.join(root, `${this.id}.stderr`), 'wx', 0o600);
+    this.stdoutCapture = new StreamCapture(policy.previewBytes);
+    this.stderrCapture = new StreamCapture(policy.previewBytes);
+    this.stdoutDiagnostics = new DiagnosticCapture(policy);
+    this.stderrDiagnostics = new DiagnosticCapture(policy);
+  }
+
+  write(channel: 'stdout' | 'stderr', chunk: string): void {
+    if (this.finished) throw new Error('Tool-output capture is already finished.');
+    const bytes = Buffer.from(chunk, 'utf8');
+    const handle = channel === 'stdout' ? this.stdoutHandle : this.stderrHandle;
+    writeSync(handle, bytes, 0, bytes.length);
+    if (channel === 'stdout') {
+      this.stdoutHash.update(bytes);
+      this.stdoutCapture.append(chunk);
+      this.stdoutDiagnostics.append(chunk);
+    } else {
+      this.stderrHash.update(bytes);
+      this.stderrCapture.append(chunk);
+      this.stderrDiagnostics.append(chunk);
+    }
+  }
+
+  finish(): ToolOutputCaptureSummary {
+    if (!this.finished) {
+      this.finished = true;
+      closeSync(this.stdoutHandle);
+      closeSync(this.stderrHandle);
+    }
+    const stdout = this.stdoutCapture.value();
+    const stderr = this.stderrCapture.value();
+    const stdoutBytes = stdout.bytes;
+    const stderrBytes = stderr.bytes;
+    const hash = createHash('sha256')
+      .update(this.stdoutHash.digest())
+      .update('\0', 'utf8')
+      .update(this.stderrHash.digest())
+      .digest('hex');
+    const artifact: ToolOutputArtifactReference = {
+      kind: 'tool-output', id: this.id, stdoutBytes, stderrBytes, totalBytes: stdoutBytes + stderrBytes, sha256: hash,
+    };
+    const stdoutDiagnostics = this.stdoutDiagnostics.finish();
+    const stderrDiagnostics = this.stderrDiagnostics.finish();
+    const diagnostics = boundedDiagnostics(
+      [...stdoutDiagnostics.lines, ...stderrDiagnostics.lines].join('\n'), '', this.policy,
+    );
+    return {
+      artifact,
+      stdout,
+      stderr,
+      diagnostics: diagnostics.lines,
+      diagnosticsTruncated: stdoutDiagnostics.truncated || stderrDiagnostics.truncated || diagnostics.truncated,
+    };
   }
 }
 
