@@ -740,6 +740,31 @@ describe('#35 native observation reuse', () => {
     assert.equal(advanceWaitLedger({ ledger: migratedNative, observation: normalize('failed'), at: T0 }).wokeNow, true);
   });
 
+  it('does not change wake eligibility when an equivalent read is coalesced', async () => {
+    // Regression: a duplicate read appends nothing, so it must not change any
+    // durable boundary state. Concretely, an idle -> idle completed-turn
+    // advance stays progress-only whether or not an inert duplicate poll
+    // happened in between.
+    const run = { ...applyTransition(newRun(SUBJECT), { type: 'start' }, T0), executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } };
+    const sequence = async (withDuplicate: boolean): Promise<{ readonly kind: string; readonly woke: boolean; readonly wakes: number }> => {
+      let turn = 'turn-1';
+      const observer = (): RunRuntimeObserver => new RunRuntimeObserver(run, {
+        now: () => T0,
+        nativeObserver: { snapshot: async () => ({ status: 'idle', turns: 1, lastCompletedTurnId: turn }) },
+      });
+      let ledger = ledgerFor();
+      ledger = advanceWaitLedger({ ledger, observation: await observer().observe(), at: T0 }).ledger;
+      if (withDuplicate) ledger = advanceWaitLedger({ ledger, observation: await observer().observe(), at: T0 }).ledger;
+      turn = 'turn-2';
+      const advance = advanceWaitLedger({ ledger, observation: await observer().observe(), at: T0 });
+      return { kind: advance.change.kind, woke: advance.wokeNow, wakes: advance.ledger.wakes.length };
+    };
+    const plain = await sequence(false);
+    const coalesced = await sequence(true);
+    assert.deepEqual(plain, { kind: 'progress', woke: false, wakes: 0 });
+    assert.deepEqual(coalesced, plain, 'a coalesced duplicate must not change wake eligibility');
+  });
+
   it('never re-wakes a surfaced digest after the bounded wake list rolls over', () => {
     const policy: WaitWakePolicy = { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 0, onTimeout: 'policy-action' };
     const decision = normalize('active');

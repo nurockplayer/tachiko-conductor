@@ -673,7 +673,7 @@ export function advanceWaitLedger(input: {
       ? observation.lastCompletedTurnId ?? ledger.lastNativeIdentity ?? null
       : ledger.lastNativeIdentity ?? null,
     lastNativeStatus: observation.source === 'native' ? observation.status : ledger.lastNativeStatus ?? null,
-    previousWasNative: !duplicate && observation.source === 'native',
+    previousWasNative: duplicate ? (ledger.previousWasNative ?? previousIsNative) : observation.source === 'native',
     nativeIdentities: observation.source === 'native' && observation.lastCompletedTurnId !== undefined && !(ledger.nativeIdentities ?? []).includes(observation.lastCompletedTurnId)
       ? [...(ledger.nativeIdentities ?? []), observation.lastCompletedTurnId].slice(-MAX_NATIVE_IDENTITIES)
       : ledger.nativeIdentities ?? [],
@@ -796,6 +796,11 @@ export function migrateWaitLedger(value: WaitLedger): WaitLedger {
     // Absorbing terminal is only reached through a real absorbing status, never
     // through a `blocked` subject or a native completion wake whose observed
     // status is `idle`.
+    // Absorbing terminal requires observable absorbing wake evidence. A legacy
+    // ledger whose absorbing wake was evicted is indistinguishable from one
+    // whose only boundary was a resumable `blocked` state, and inferring
+    // terminal there would silently drop a real later transition, so terminal
+    // is not inferred from an evicted digest.
     terminalReached: absorbingWakes,
     lastNativeIdentity: value.lastNativeIdentity ?? lastNative?.state.lastCompletedTurnId ?? null,
     lastNativeStatus: value.lastNativeStatus ?? lastNative?.status ?? null,

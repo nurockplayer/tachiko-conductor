@@ -76,6 +76,8 @@ export interface WaitAwaitOptions {
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
+/** Mirrors the domain ledger cap for the surfaced-digest set. */
+const MAX_SURFACED_DIGESTS = 500;
 
 function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
   if (milliseconds <= 0) return Promise.resolve();
@@ -127,7 +129,7 @@ function recordWake(ledger: WaitLedger, observation: WaitObservation, at: string
       ...ledger,
       wakes,
       surfacedDigests: shouldWake && !(ledger.surfacedDigests ?? []).includes(digest)
-        ? [...(ledger.surfacedDigests ?? []), digest].slice(-500)
+        ? [...(ledger.surfacedDigests ?? []), digest].slice(-MAX_SURFACED_DIGESTS)
         : ledger.surfacedDigests ?? [],
     },
     change: { kind: 'none', meaningful: false, evidence: [] },
