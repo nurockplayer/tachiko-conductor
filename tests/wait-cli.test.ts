@@ -423,6 +423,33 @@ describe('wait CLI', () => {
     }
   });
 
+  it('never re-wakes a terminal run through the timeout path', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-terminal-timeout'), { type: 'fail' }, T0);
+      seedRun(dataDir, run);
+      const first = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+      const firstParsed = JSON.parse(first.stdout[0]!) as { change: string; wake: { shouldWake: boolean; reason: string }; wakeCount: number };
+      assert.equal(firstParsed.change, 'failure');
+      assert.equal(firstParsed.wake.shouldWake, true);
+      assert.equal(firstParsed.wake.reason, 'failure');
+      assert.equal(firstParsed.wakeCount, 1);
+
+      // A second identical invocation must not turn the timeout policy into a
+      // timer wake for an already-reconciled terminal run.
+      const second = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+      const secondParsed = JSON.parse(second.stdout[0]!) as { change: string; wake: { shouldWake: boolean }; wakeCount: number };
+      assert.equal(secondParsed.wake.shouldWake, false);
+      assert.equal(secondParsed.wakeCount, 1);
+      assert.equal(second.stdout.includes('TACHIKO_WAIT_WAKE_V1'), false);
+      assert.equal(second.stdout.includes('TACHIKO_WAIT_IDLE_V1'), true);
+      const ledger = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }).read();
+      assert.deepEqual(ledger?.wakes.map((wake) => wake.reason), ['failure']);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unknown run id and malformed schedule values', async () => {
     const { directory, dataDir, env } = tempWorkspace();
     try {

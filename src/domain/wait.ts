@@ -14,6 +14,7 @@ export const WAIT_WAKE_POLICY_REVISION = 'wait-wake-policy-v1' as const;
 
 const WAIT_SUBJECT_STATUSES: readonly WaitSubjectStatus[] = ['idle', 'active', 'completed', 'failed', 'blocked', 'unknown', 'unavailable'];
 const WAIT_CHANGE_KINDS: readonly WaitChangeKind[] = ['none', 'progress', 'completion', 'failure', 'blocked'];
+const WAIT_WAKE_REASONS: readonly WaitWakeReason[] = ['completion', 'failure', 'blocked', 'terminal', 'timeout-policy'];
 
 /** The provider family that produced one observation. Never a model identity. */
 export type WaitObservationSource = 'native' | 'runtime' | 'subprocess' | 'github';
@@ -230,7 +231,12 @@ function dedupeEvidence(evidence: readonly WaitEvidence[]): readonly WaitEvidenc
  * new transition, so duplicate or coalesced provider events produce exactly
  * one meaningful change.
  */
-export function classifyWaitChange(previous: WaitObservation | null, next: WaitObservation, previousNative?: WaitObservation | null): WaitChange {
+export function classifyWaitChange(
+  previous: WaitObservation | null,
+  next: WaitObservation,
+  previousNative?: WaitObservation | null,
+  previousIsNative = previous?.source === 'native',
+): WaitChange {
   if (previous === null) {
     // The first observation establishes a baseline. A terminal baseline is
     // still meaningful (the orchestrator must reconcile it exactly once).
@@ -255,11 +261,28 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
   const nativeBefore = previousNative === undefined
     ? (previous.source === 'native' ? previous : null)
     : previousNative;
+  const turnIdentityAdvanced = (previous.lastCompletedTurnId ?? null) !== (next.lastCompletedTurnId ?? null);
+  // Completion boundary 1: an observed native active phase just ended.
   if (nativeBefore !== null && next.source === 'native' && nativeBefore.status === 'active' && next.status === 'idle') {
     return {
       kind: 'completion',
       meaningful: true,
       evidence: transitionEvidence(nativeBefore, next, 'turn-completed', `subject ${next.subjectId} native turn completed${next.lastCompletedTurnId === undefined ? '' : ` (${next.lastCompletedTurnId})`}`),
+    };
+  }
+  // Completion boundary 2: the completed-turn identity advanced after at least
+  // one non-native read, while the last genuine native read was idle or absent.
+  // The turn ran entirely inside ambiguous reads, so the identity advance is
+  // the only completion evidence there is. Requiring an intervening ambiguous
+  // read is what separates this from a plain idle -> idle advance, which is
+  // progress-only. A native active anchor is excluded here because boundary 1
+  // already covers it.
+  const previousWasNative = previousIsNative;
+  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && !previousWasNative && (nativeBefore === null || nativeBefore.status === 'idle')) {
+    return {
+      kind: 'completion',
+      meaningful: true,
+      evidence: [{ kind: 'turn-completed', detail: `completed turn ${previous.lastCompletedTurnId ?? 'none'} -> ${next.lastCompletedTurnId ?? 'none'} (active phase unobserved)` }],
     };
   }
   if (next.status !== previous.status) {
@@ -287,17 +310,14 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
   // Same status: a monotonic progress advance, a new completed-turn identity,
   // an active-item change, or newly reported evidence counts as progress, and
   // progress never wakes a model.
-  if ((previous.lastCompletedTurnId ?? null) !== (next.lastCompletedTurnId ?? null)) {
-    // The completed-turn identity advanced. When the last genuine native read
-    // was not idle, the intervening turn was never observed as active (every
-    // read during it was ambiguous), so this is the completion boundary and it
-    // must wake. A pure idle -> idle identity advance is progress-only.
-    const observedIdleBefore = nativeBefore !== null && nativeBefore.status === 'idle';
-    const evidence = [{ kind: 'turn-completed' as const, detail: `completed turn ${previous.lastCompletedTurnId ?? 'none'} -> ${next.lastCompletedTurnId ?? 'none'}` }];
-    if (next.source === 'native' && next.status === 'idle' && !observedIdleBefore) {
-      return { kind: 'completion', meaningful: true, evidence };
-    }
-    return { kind: 'progress', meaningful: true, evidence };
+  if (turnIdentityAdvanced) {
+    // An idle -> idle identity advance is progress-only: no boundary was
+    // crossed. Any genuinely unobserved completion was already handled above.
+    return {
+      kind: 'progress',
+      meaningful: true,
+      evidence: [{ kind: 'turn-completed', detail: `completed turn ${previous.lastCompletedTurnId ?? 'none'} -> ${next.lastCompletedTurnId ?? 'none'}` }],
+    };
   }
   if (next.progress.items > previous.progress.items || next.progress.turns > previous.progress.turns) {
     return {
@@ -514,10 +534,12 @@ export function advanceWaitLedger(input: {
         observedAt: last.at,
       };
   const previousNative = duplicate ? null : lastNativeObservation(ledger, observation.subjectId);
+  const previousIsNative = previous !== null && previous.source === 'native';
   const change = duplicate
     ? { kind: 'none' as const, meaningful: false, evidence: [] as readonly WaitEvidence[] }
-    : classifyWaitChange(previous, observation, previousNative);
-  const observationEventId = `wait-observation:${ledger.ownerRunId}:${observation.subjectId}:${ledger.observations.length}:${digest}`;
+    : classifyWaitChange(previous, observation, previousNative, previousIsNative);
+  const sequence = (ledger.observations[ledger.observations.length - 1]?.id.split(':').at(-2) ?? '0');
+  const observationEventId = `wait-observation:${ledger.ownerRunId}:${observation.subjectId}:${sequence}:${digest}`;
   const observations = duplicate
     ? ledger.observations
     : [...ledger.observations, {
@@ -668,7 +690,7 @@ function isWaitRecordedObservation(value: unknown): value is WaitRecordedObserva
     typeof record.at === 'string' &&
     typeof record.source === 'string' &&
     typeof record.subjectId === 'string' && record.subjectId !== '' &&
-    typeof record.status === 'string' &&
+    typeof record.status === 'string' && (WAIT_SUBJECT_STATUSES as readonly string[]).includes(record.status) &&
     typeof record.observationDigest === 'string' && record.observationDigest !== '' &&
     typeof record.change === 'string' && (WAIT_CHANGE_KINDS as readonly string[]).includes(record.change) &&
     isWaitObservationState(record.state);
@@ -679,10 +701,10 @@ function isWaitRecordedWake(value: unknown): value is WaitRecordedWake {
   const record = value as Record<string, unknown>;
   return typeof record.id === 'string' && record.id !== '' &&
     typeof record.at === 'string' &&
-    typeof record.reason === 'string' &&
+    typeof record.reason === 'string' && (WAIT_WAKE_REASONS as readonly string[]).includes(record.reason) &&
     typeof record.source === 'string' &&
     typeof record.subjectId === 'string' && record.subjectId !== '' &&
-    typeof record.status === 'string' &&
+    typeof record.status === 'string' && (WAIT_SUBJECT_STATUSES as readonly string[]).includes(record.status) &&
     typeof record.observationDigest === 'string' && record.observationDigest !== '' &&
     Array.isArray(record.evidence) && record.evidence.every((item) => typeof item === 'object' && item !== null &&
       typeof (item as Record<string, unknown>).kind === 'string' && typeof (item as Record<string, unknown>).detail === 'string');

@@ -101,7 +101,12 @@ function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void>
  */
 function recordWake(ledger: WaitLedger, observation: WaitObservation, at: string, decision: WaitWakeDecision): WaitLedgerAdvance {
   const digest = waitObservationDigest(observation);
-  const alreadyRecorded = ledger.wakes.some((wake) => wake.observationDigest === digest && wake.reason === decision.reason);
+  // A terminal observation has already been surfaced for this digest; a later
+  // timeout on the same unchanged state is not a new decision boundary, it is a
+  // timer. Never re-wake for it.
+  const terminalDigest = (ledger.terminalDigests ?? []).includes(digest);
+  const alreadyRecorded = terminalDigest ||
+    ledger.wakes.some((wake) => wake.observationDigest === digest && wake.reason === decision.reason);
   const shouldWake = decision.shouldWake && !alreadyRecorded;
   const wakeId = `wait-wake:${ledger.ownerRunId}:${observation.subjectId}:${digest}:${decision.reason ?? 'none'}:${ledger.wakes.length}`;
   const wakes = shouldWake

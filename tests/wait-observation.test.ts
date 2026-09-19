@@ -561,19 +561,50 @@ describe('#35 native observation reuse', () => {
     }
   });
 
-  it('wakes for a completion whose active phase was never observed', () => {
-    // Every read during the turn was ambiguous, so the turn boundary is only
-    // visible as a completed-turn identity advance.
-    const active = normalize('active', { source: 'native', progress: { items: 0, turns: 1 } });
-    const ambiguous = normalize('active', { source: 'runtime', progress: { items: 0, turns: 1 } });
-    const completed = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-2', progress: { items: 0, turns: 2 } });
-    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: active, at: T0 }).ledger;
-    ledger = advanceWaitLedger({ ledger, observation: ambiguous, at: T0 }).ledger;
-    ledger = advanceWaitLedger({ ledger, observation: ambiguous, at: T0 }).ledger;
-    const advance = advanceWaitLedger({ ledger, observation: completed, at: T0 });
-    assert.equal(advance.change.kind, 'completion');
-    assert.equal(advance.wokeNow, true);
-    assert.equal(advance.ledger.wakes.length, 1);
+  it('wakes for a completion whose active phase was never observed', async () => {
+    // Every read during the turn was ambiguous: the turn boundary is only
+    // visible as a completed-turn identity advance, never as native active.
+    for (const ambiguity of ['throw', 'not_loaded'] as const) {
+      const run = { ...applyTransition(newRun(SUBJECT), { type: 'start' }, T0), executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } };
+      const modes: Array<'idle1' | 'ambiguous' | 'idle2'> = ['idle1', 'ambiguous', 'ambiguous', 'idle2'];
+      let index = 0;
+      const observer = (): RunRuntimeObserver => new RunRuntimeObserver(run, {
+        now: () => T0,
+        nativeObserver: {
+          snapshot: async () => {
+            const mode = modes[Math.min(index++, modes.length - 1)]!;
+            if (mode === 'ambiguous') {
+              if (ambiguity === 'throw') throw new Error('transient native read failure');
+              return { status: 'unknown' };
+            }
+            return mode === 'idle1'
+              ? { status: 'idle', turns: 1, lastCompletedTurnId: 'turn-1' }
+              : { status: 'idle', turns: 2, lastCompletedTurnId: 'turn-2' };
+          },
+        },
+      });
+      let ledger = ledgerFor();
+      const baseline = await observer().observe();
+      ledger = advanceWaitLedger({ ledger, observation: baseline, at: T0 }).ledger;
+      for (let step = 0; step < 3; step += 1) {
+        const next = await observer().observe();
+        const advance = advanceWaitLedger({ ledger, observation: next, at: T0 });
+        ledger = advance.ledger;
+        if (step < 2) assert.equal(advance.wokeNow, false, `${ambiguity}: ambiguous reads stay silent`);
+      }
+      assert.equal(ledger.wakes.length, 1, `${ambiguity}: the unobserved completion wakes exactly once`);
+      assert.equal(ledger.wakes[0]?.reason, 'completion', ambiguity);
+    }
+  });
+
+  it('stays progress-only for an idle -> idle completed-turn identity advance', () => {
+    const idleOne = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' });
+    const idleTwo = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-2' });
+    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: idleOne, at: T0 }).ledger;
+    const advance = advanceWaitLedger({ ledger, observation: idleTwo, at: T0 });
+    assert.equal(advance.change.kind, 'progress');
+    assert.equal(advance.wokeNow, false);
+    assert.equal(advance.ledger.wakes.length, 0);
   });
 
   it('keeps successive completions distinct when only the completed-turn identity advances', () => {
