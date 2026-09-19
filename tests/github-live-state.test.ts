@@ -378,6 +378,60 @@ PR: #7`;
     assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED', 'R_CHANGES']);
   });
 
+  it('keeps a current-HEAD change request active across a later comment-only review from the same author', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/changes',
+      },
+      {
+        node_id: 'R_COMMENT',
+        user: { login: 'alice' },
+        state: 'COMMENTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/comment',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_CHANGES']);
+  });
+
+  it('does not let a later-submitted stale approval supersede a current-HEAD change request', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/changes',
+      },
+      {
+        node_id: 'R_STALE_APPROVAL',
+        user: { login: 'alice' },
+        state: 'APPROVED',
+        commit_id: BASE,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/stale-approval',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_CHANGES']);
+  });
+
   it('rejects more than one open associated pull request', async () => {
     const transport = new RouteTransport()
       .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })

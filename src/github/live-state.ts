@@ -864,7 +864,33 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     for (const review of reviews) {
       const key = review.author ?? '';
       const existing = latestByAuthor.get(key);
-      if (existing === undefined || (review.submittedAt ?? '') > (existing.submittedAt ?? '')) {
+      if (existing === undefined) {
+        latestByAuthor.set(key, review);
+        continue;
+      }
+
+      // Exact-HEAD evidence outranks stale submissions from the same author.
+      // This matters when a pending review started before a push and lands
+      // after a current-HEAD review: the later timestamp must not make stale
+      // evidence look authoritative for the current candidate.
+      if (existing.fresh !== review.fresh) {
+        if (review.fresh) latestByAuthor.set(key, review);
+        continue;
+      }
+      if ((review.submittedAt ?? '') <= (existing.submittedAt ?? '')) continue;
+
+      // COMMENTED/unknown reviews are additive observations, not explicit
+      // clearance. Once an author has APPROVED or CHANGES_REQUESTED, only a
+      // later decisive state (including DISMISSED, which clears a review) may
+      // supersede it. Otherwise a comment-only review could silently erase an
+      // outstanding change request and make an empty-thread set look clean.
+      const existingIsActiveDecision =
+        existing.state === 'approved' || existing.state === 'changes_requested';
+      const incomingCanSupersedeDecision =
+        review.state === 'approved' ||
+        review.state === 'changes_requested' ||
+        review.state === 'dismissed';
+      if (!existingIsActiveDecision || incomingCanSupersedeDecision) {
         latestByAuthor.set(key, review);
       }
     }
