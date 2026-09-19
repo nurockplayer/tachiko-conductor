@@ -79,7 +79,14 @@ export interface WaitCommandResult {
    * before it died. These are replayed so a crash cannot silently drop a wake;
    * they are marked delivered once printed.
    */
-  readonly pendingWakes: readonly { readonly id: string; readonly reason: string; readonly subjectId: string; readonly status: string }[];
+  readonly pendingWakes: readonly {
+    readonly id: string;
+    readonly reason: string;
+    readonly subjectId: string;
+    readonly status: string;
+    /** Bounded evidence for this decision, so a replay never loses it. */
+    readonly evidence: readonly { readonly kind: string; readonly detail: string }[];
+  }[];
   /** Always zero: this path never starts a model turn. */
   readonly modelTurns: 0;
   readonly timedOut: boolean;
@@ -144,6 +151,24 @@ function pendingWakeViews(ledger: WaitLedger): readonly WaitRecordedWake[] {
   return pendingWaitWakes(ledger);
 }
 
+/** Decision boundaries outrank a timer wake when replaying several at once. */
+const WAKE_REASON_PRIORITY: Readonly<Record<string, number>> = {
+  failure: 0,
+  blocked: 1,
+  completion: 2,
+  terminal: 3,
+  'timeout-policy': 4,
+};
+
+function byReplayPriority(wakes: readonly WaitRecordedWake[]): readonly WaitRecordedWake[] {
+  return wakes.slice().sort((left, right) =>
+    (WAKE_REASON_PRIORITY[left.reason] ?? 9) - (WAKE_REASON_PRIORITY[right.reason] ?? 9));
+}
+
+function evidenceViews(evidence: readonly { readonly kind: string; readonly detail: string }[]): readonly { readonly kind: string; readonly detail: string }[] {
+  return evidence.map((item) => ({ kind: item.kind, detail: item.detail }));
+}
+
 function toResult(input: {
   readonly mode: WaitCommandMode;
   readonly run: Run;
@@ -154,7 +179,9 @@ function toResult(input: {
   // A recorded-but-undelivered wake is a real decision boundary: surface it so
   // a restart always hands the caller the same wake it would have before.
   const replay = !input.outcome.wake.shouldWake && pending.length > 0;
-  const replayWake = replay ? pending[0]! : undefined;
+  // Replay the most significant pending decision, not merely the oldest, and
+  // carry every pending wake with its own bounded evidence so nothing is lost.
+  const replayWake = replay ? byReplayPriority(pending)[0]! : undefined;
   return {
     ok: true,
     mode: input.mode,
@@ -175,11 +202,17 @@ function toResult(input: {
       : {
           shouldWake: true,
           reason: replayWake.reason,
-          evidence: replayWake.evidence.map((item) => ({ kind: item.kind, detail: item.detail })),
+          evidence: evidenceViews(replayWake.evidence),
         },
     pendingWakes: pending
       .filter((wake) => replay || wake.id !== replayWake?.id)
-      .map((wake) => ({ id: wake.id, reason: wake.reason, subjectId: wake.subjectId, status: wake.status })),
+      .map((wake) => ({
+        id: wake.id,
+        reason: wake.reason,
+        subjectId: wake.subjectId,
+        status: wake.status,
+        evidence: evidenceViews(wake.evidence),
+      })),
     modelTurns: 0,
     timedOut: input.outcome.timedOut,
     idle: input.outcome.idle,

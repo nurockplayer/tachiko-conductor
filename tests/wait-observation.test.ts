@@ -826,8 +826,10 @@ describe('#35 native observation reuse', () => {
     };
     const plain = await sequence(false);
     const coalesced = await sequence(true);
-    assert.deepEqual(plain, { kind: 'progress', woke: false, wakes: 0 });
+    // Whatever the sequence decides, an inert duplicate must not change it.
     assert.deepEqual(coalesced, plain, 'a coalesced duplicate must not change wake eligibility');
+    assert.equal(plain.kind, 'completion');
+    assert.equal(plain.woke, true, 'a turn that completed between native reads must wake');
   });
 
   it('never re-wakes a surfaced digest after the bounded wake list rolls over', () => {
@@ -878,14 +880,31 @@ describe('#35 native observation reuse', () => {
     assert.equal(timeout.ledger.wakes.length, 1);
   });
 
-  it('stays progress-only for an idle -> idle completed-turn identity advance', () => {
+  it('wakes when a new completed-turn identity appears between native reads', () => {
+    // A turn that ran entirely between two native idle reads is a real
+    // completion boundary; the identity advance is the only evidence of it.
     const idleOne = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' });
     const idleTwo = normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-2' });
     let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: idleOne, at: T0 }).ledger;
+    // The first native read only establishes the baseline.
+    assert.equal(ledger.wakes.length, 0);
     const advance = advanceWaitLedger({ ledger, observation: idleTwo, at: T0 });
-    assert.equal(advance.change.kind, 'progress');
-    assert.equal(advance.wokeNow, false);
-    assert.equal(advance.ledger.wakes.length, 0);
+    assert.equal(advance.change.kind, 'completion');
+    assert.equal(advance.wokeNow, true);
+    assert.equal(advance.ledger.wakes.length, 1);
+    // The same identity again is not a new boundary.
+    const repeat = advanceWaitLedger({ ledger: advance.ledger, observation: idleTwo, at: T0 });
+    assert.equal(repeat.change.kind, 'none');
+    assert.equal(repeat.wokeNow, false);
+    assert.equal(repeat.ledger.wakes.length, 1);
+  });
+
+  it('treats the first native observation as a baseline, not a completion', () => {
+    const first = advanceWaitLedger({ ledger: ledgerFor(), observation: normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' }), at: T0 });
+    assert.equal(first.change.kind, 'none');
+    assert.equal(first.wokeNow, false);
+    assert.equal(first.ledger.wakes.length, 0);
+    assert.equal(first.ledger.lastNativeIdentity, 'turn-1');
   });
 
   it('keeps successive completions distinct when only the completed-turn identity advances', () => {

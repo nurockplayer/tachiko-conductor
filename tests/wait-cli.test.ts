@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { buildWaitCommandDependencies, main, resolveWaitLedgerDirectory, resolveWaitLedgerFile, resolveWaitLedgerPath, resolveWaitWakePolicy } from '../src/cli.js';
+import { buildWaitCommandDependencies, main, resolveWaitLedgerDirectory, resolveWaitLedgerFile, resolveWaitLedgerPath, resolveWaitWakePolicy, waitLockPath } from '../src/cli.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { DEFAULT_WAIT_WAKE_POLICY, createWaitLedger, markWaitWakesDelivered, pendingWaitWakes } from '../src/domain/wait.js';
@@ -15,6 +15,7 @@ import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { waitAwaitCommand } from '../src/workflow/wait-command.js';
 import { WaitLedgerFileStore } from '../src/workflow/wait-ledger-store.js';
+import { acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
 import { T0, TARGET } from './helpers.js';
 
 function tempWorkspace(): { readonly directory: string; readonly dataDir: string; readonly env: NodeJS.ProcessEnv } {
@@ -539,7 +540,7 @@ describe('wait CLI', () => {
         ok: true, mode: 'observe', runId: run.id, state: run.state, source: 'runtime', subjectId: run.id,
         status: 'failed', headSha: null, observationDigest: '', change: 'failure',
         wake: { shouldWake: true, reason: 'failure', evidence: [] },
-        pendingWakes: [{ id: 'wake-a', reason: 'failure', subjectId: run.id, status: 'failed' }],
+        pendingWakes: [{ id: 'wake-a', reason: 'failure', subjectId: run.id, status: 'failed', evidence: [] }],
         modelTurns: 0, timedOut: false, idle: false, observations: 1, duplicateObservations: 0,
         wakeCount: 2, waitStartedAt: null, observedDigest: '',
       }, ledgerStore);
@@ -550,6 +551,78 @@ describe('wait CLI', () => {
       const replayed = ledgerStore.read()!;
       assert.equal(replayed.deliveredWakeIds?.includes('wake-a'), true);
       assert.equal(replayed.deliveredWakeIds?.includes('wake-b'), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses to run two wait processes against one run ledger at once', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = createRun(TARGET, T0, 'run-wait-locked');
+      seedRun(dataDir, run);
+      const lock = acquireDispatchInvocationLock({ lockPath: waitLockPath(run.id, env) });
+      try {
+        // A concurrent waiter must not touch the ledger while the fence is held.
+        const blocked = await runMain(env, ['wait', 'observe', run.id]);
+        assert.equal(blocked.code, 0);
+        const parsed = JSON.parse(blocked.stdout[0]!) as { outcome: string; runId: string };
+        assert.equal(parsed.outcome, 'already_running');
+        assert.equal(parsed.runId, run.id);
+        assert.equal(blocked.stdout.includes('TACHIKO_WAIT_WAKE_V1'), false);
+        assert.equal(new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }).read(), null);
+      } finally {
+        lock.release();
+      }
+      // Once released the same command proceeds normally.
+      const proceeded = await runMain(env, ['wait', 'observe', run.id]);
+      assert.equal(JSON.parse(proceeded.stdout[0]!).ok, true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('replays the most significant pending wake and keeps every decision evidence', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-priority'), { type: 'fail' }, T0);
+      seedRun(dataDir, run);
+      const filePath = resolveWaitLedgerFile(run.id, env);
+      const ledgerStore = new WaitLedgerFileStore({ filePath });
+      const base = createWaitLedger({ subjectId: run.id, ownerRunId: run.id, generation: run.id });
+      ledgerStore.write({
+        ...base,
+        wakes: [
+          {
+            id: 'wake-timeout', at: T0, reason: 'timeout-policy', source: 'runtime', subjectId: run.id,
+            status: 'blocked', observationDigest: 'a'.repeat(64),
+            evidence: [{ kind: 'progress', detail: 'bounded wait expired' }],
+          },
+          {
+            id: 'wake-failure', at: T0, reason: 'failure', source: 'runtime', subjectId: run.id,
+            status: 'failed', observationDigest: 'b'.repeat(64),
+            evidence: [{ kind: 'failure', detail: 'subject reported failed' }],
+          },
+        ],
+        terminalDigests: ['b'.repeat(64)],
+        terminalReached: true,
+      });
+
+      const replayed = await runMain(env, ['wait', 'observe', run.id]);
+      const parsed = JSON.parse(replayed.stdout[0]!) as {
+        wake: { shouldWake: boolean; reason: string; evidence: readonly { detail: string }[] };
+        pendingWakes: readonly { reason: string; evidence: readonly { detail: string }[] }[];
+      };
+      // The real decision boundary is replayed ahead of the timer wake.
+      assert.equal(parsed.wake.shouldWake, true);
+      assert.equal(parsed.wake.reason, 'failure');
+      assert.equal(parsed.wake.evidence.some((item) => item.detail.includes('failed')), true);
+      // The timeout decision still carries its own evidence rather than being
+      // emitted as a bare summary and then acknowledged away.
+      const timeout = parsed.pendingWakes.find((wake) => wake.reason === 'timeout-policy');
+      assert.notEqual(timeout, undefined);
+      assert.equal(timeout?.evidence.some((item) => item.detail.includes('expired')), true);
+      assert.equal(pendingWaitWakes(ledgerStore.read()!).length, 0, 'both wakes were emitted and acknowledged');
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

@@ -288,14 +288,15 @@ export function classifyWaitChange(
       evidence: transitionEvidence({ ...next, status: 'active' as WaitSubjectStatus }, next, 'turn-completed', `subject ${next.subjectId} native turn completed${next.lastCompletedTurnId === undefined ? '' : ` (${next.lastCompletedTurnId})`}`),
     };
   }
-  // Completion boundary 2: the completed-turn identity advanced after at least
-  // one non-native read, while the last genuine native read was idle or absent.
-  // The turn ran entirely inside ambiguous reads, so the identity advance is
-  // the only completion evidence there is. Requiring an intervening ambiguous
-  // read is what separates this from a plain idle -> idle advance, which is
-  // progress-only. A native active anchor is excluded here because boundary 1
+  // Completion boundary 2: the completed-turn identity advanced past the last
+  // genuine native identity while this read is a native idle. However the
+  // active phase was or was not observed, a *new* completed turn is a
+  // completion boundary and must wake. The prior identity must exist: the first
+  // native read only establishes a baseline, because a turn that completed
+  // before the wait started is indistinguishable from one that completed
+  // during it. A native active anchor is excluded here because boundary 1
   // already covers it.
-  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && !nativeBoundary.previousWasNative) {
+  if (next.source === 'native' && next.status === 'idle' && turnIdentityAdvanced && priorNativeIdentity !== null) {
     return {
       kind: 'completion',
       meaningful: true,

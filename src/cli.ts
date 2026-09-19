@@ -1066,6 +1066,14 @@ export function resolveWaitWakePolicy(values: {
 }
 
 /**
+ * Single-owner fence for one run's wait path, beside that run's ledger. Two wait
+ * processes can never perform the ledger read-modify-write concurrently.
+ */
+export function waitLockPath(runId: string, env: NodeJS.ProcessEnv = process.env): string {
+  return `${resolveWaitLedgerFile(runId, env)}.lock`;
+}
+
+/**
  * Per-run ledger file. `TACHIKO_WAIT_LEDGER_DIR` names the directory directly;
  * otherwise the directory of `TACHIKO_WAIT_LEDGER_PATH` is used, so the
  * configured path stays a single explicit override.
@@ -1318,16 +1326,33 @@ export async function main(argv: string[]): Promise<number> {
     if (pollIntervalMs !== undefined && (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 0)) {
       throw new Error('--poll-interval-ms must be a non-negative safe integer.');
     }
-    const dependencies = buildWaitCommandDependencies({ store, run });
-    const result = subcommand === 'observe'
-      ? await waitObserveCommand({ id, mode: 'observe', policy }, dependencies)
-      : await waitAwaitCommand({ id, mode: 'wait', policy, ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }) }, dependencies);
-    printWaitResult(result);
-    // Only after the wake has been emitted is it safe to mark it delivered; a
-    // crash before this point makes the next process replay it.
-    acknowledgeWaitDelivery(result, dependencies.ledgerStore);
-    // A wake is a reconciliation signal, not a failure; the caller decides.
-    return 0;
+    // The wait ledger is a per-run read-modify-write. Hold the same single-owner
+    // invocation fence `dispatch once` uses, scoped to this run, so two wait
+    // processes can never clobber each other's durable wake decisions.
+    let lock;
+    try {
+      lock = acquireDispatchInvocationLock({ lockPath: waitLockPath(id) });
+    } catch (error) {
+      if (error instanceof DispatchInvocationLockedError) {
+        console.log(JSON.stringify({ outcome: 'already_running', runId: id, reason: error.message }));
+        return 0;
+      }
+      throw error;
+    }
+    try {
+      const dependencies = buildWaitCommandDependencies({ store, run });
+      const result = subcommand === 'observe'
+        ? await waitObserveCommand({ id, mode: 'observe', policy }, dependencies)
+        : await waitAwaitCommand({ id, mode: 'wait', policy, ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }) }, dependencies);
+      printWaitResult(result);
+      // Only after the wake has been emitted is it safe to mark it delivered; a
+      // crash before this point makes the next process replay it.
+      acknowledgeWaitDelivery(result, dependencies.ledgerStore);
+      // A wake is a reconciliation signal, not a failure; the caller decides.
+      return 0;
+    } finally {
+      lock.release();
+    }
   }
 
   if (command !== 'run') {
