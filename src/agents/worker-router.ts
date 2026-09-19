@@ -2,6 +2,7 @@ import path from 'node:path';
 
 import { assertWorkspaceGuard, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
+import type { ToolOutputEnvelope } from '../evidence/tool-output.js';
 import { NodeProcessRunner, type ProcessRunner, type ProcessRunOptions } from '../github/transport.js';
 import { providerTelemetry } from './provider-telemetry.js';
 import {
@@ -150,37 +151,58 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     const diagnostics = boundedDiagnostics(result.stderr, result.stdout, provenance);
     if (result.exitCode !== 0) {
       const durationMs = elapsed(startedAt);
-      return { ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics] };
+      return {
+        ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs),
+        diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics],
+        ...(result.output === undefined ? {} : { output: result.output }),
+      };
     }
-    if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
+    if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt), result.output);
     // The exact container is terminal before this point; only now may the
     // Tachiko-owned workspace guard, HEAD read, ancestry proof, and publication run.
     await assertWorkspaceGuard(request.workspaceGuard, 'after-execution');
     const head = await this.readHead(request.signal, cwd);
-    if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
+    if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt), result.output);
     if (head === null) {
       const durationMs = elapsed(startedAt);
-      return { ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics] };
+      return {
+        ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs),
+        diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics],
+        ...(result.output === undefined ? {} : { output: result.output }),
+      };
     }
     const ancestry = await this.verifyBaseAncestry(request.signal, cwd, request.baseSha, head);
     if (!ancestry.ok) {
       const durationMs = elapsed(startedAt);
-      if (ancestry.cancelled) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router ancestry verification was cancelled.', durationMs);
+      if (ancestry.cancelled) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router ancestry verification was cancelled.', durationMs, result.output);
       return {
         ...failure(WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED, `Worker router HEAD ${head} does not prove descent from the authorized base.`, durationMs),
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED}: ${ancestry.detail}`, ...diagnostics, ...ancestry.diagnostics],
+        ...(result.output === undefined ? {} : { output: result.output }),
       };
     }
     const published = await this.publishHead(request.signal, cwd, head, branch);
     if (!published.ok) {
       const durationMs = elapsed(startedAt);
-      if (published.cancelled) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router publication was cancelled.', durationMs);
+      if (published.cancelled) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router publication was cancelled.', durationMs, result.output);
       return {
         ...failure(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED, `Worker router committed ${head}, but Conductor could not publish it to origin/${branch}.`, durationMs),
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED}: ${published.detail}`, ...diagnostics, ...published.diagnostics],
+        ...(result.output === undefined ? {} : { output: result.output }),
       };
     }
-    return { exitStatus: 'success', summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.', headSha: head, telemetry: providerTelemetry({ provider: WORKER_ROUTER_PROVIDER }), ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
+    return {
+      exitStatus: 'success',
+      summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.',
+      headSha: head,
+      telemetry: providerTelemetry({
+        provider: WORKER_ROUTER_PROVIDER,
+        ...(result.output === undefined ? {} : { largestToolResultBytes: result.output.artifact.totalBytes }),
+      }),
+      ...(diagnostics.length === 0 ? {} : { diagnostics }),
+      ...(result.output === undefined ? {} : { output: result.output }),
+      durationMs: elapsed(startedAt),
+    };
   }
 
   private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined): WorkerContainerSpec {
@@ -211,14 +233,15 @@ export class WorkerRouterAdapter implements ImplementationAgent {
   private containerFailure(error: unknown, signal: AbortSignal | undefined, startedAt: number, env: Readonly<Record<string, string>>): AgentResult {
     const durationMs = elapsed(startedAt);
     const containerCode = isWorkerRouterContainerError(error) ? error.code : undefined;
+    const output = isWorkerRouterContainerError(error) ? error.output : undefined;
     if (isAborted(signal) || containerCode === WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED) {
-      return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', durationMs);
+      return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', durationMs, output);
     }
     if (containerCode === WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT) {
-      return failure(WORKER_ROUTER_ERROR_CODE.TIMEOUT, `Worker router container timed out after ${this.timeoutMs}ms.`, durationMs);
+      return failure(WORKER_ROUTER_ERROR_CODE.TIMEOUT, `Worker router container timed out after ${this.timeoutMs}ms.`, durationMs, output);
     }
     const message = redactWorkerEnvValues(boundedMessage(error), env);
-    return failure(adapterCodeFor(containerCode), `Worker router container failed closed: ${message}`, durationMs);
+    return failure(adapterCodeFor(containerCode), `Worker router container failed closed: ${message}`, durationMs, output);
   }
 
   private async verifyBaseAncestry(
@@ -337,7 +360,12 @@ function boundedDiagnostics(stderr: string, stdout: string, provenance: string |
   return provenance === undefined ? [] : [provenance];
 }
 
-function failure(code: string, summary: string, durationMs: number): AgentResult { return { exitStatus: 'failure', summary, diagnostics: [`${code}: ${summary}`], durationMs }; }
+function failure(code: string, summary: string, durationMs: number, output?: ToolOutputEnvelope): AgentResult {
+  return {
+    exitStatus: 'failure', summary, diagnostics: [`${code}: ${summary}`], durationMs,
+    ...(output === undefined ? {} : { output }),
+  };
+}
 function elapsed(startedAt: number): number { return Math.max(0, Date.now() - startedAt); }
 function errorCode(error: unknown): unknown { return typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

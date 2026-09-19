@@ -5,6 +5,7 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '..
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetry.js';
+import { isToolOutputEnvelope } from '../evidence/tool-output.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
 
@@ -135,6 +136,7 @@ function isAgentResult(value: unknown): boolean {
     (result.executor === undefined || isExecutorIdentity(result.executor)) &&
     isOptionalNonEmptyString(result.sessionId) &&
     isOptionalDuration(result.durationMs) &&
+    (result.output === undefined || isToolOutputEnvelope(result.output)) &&
     (result.telemetry === undefined || isProviderExecutionTelemetry(result.telemetry))
   );
 }

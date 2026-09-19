@@ -1,5 +1,14 @@
 import { execFile, type ExecFileException } from 'node:child_process';
 
+import {
+  boundToolOutput,
+  DEFAULT_TOOL_OUTPUT_POLICY,
+  FileToolOutputStore,
+  InMemoryToolOutputStore,
+  type ToolOutputEnvelope,
+  type ToolOutputPolicy,
+  type ToolOutputStore,
+} from '../evidence/tool-output.js';
 import { GitHubLiveStateError } from './errors.js';
 
 export interface GitHubApiTransport {
@@ -20,6 +29,8 @@ export interface ProcessResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number;
+  /** Bounded, explicitly drillable evidence for the command transcript. */
+  readonly output?: ToolOutputEnvelope;
 }
 
 export interface ProcessRunOptions {
@@ -28,18 +39,36 @@ export interface ProcessRunOptions {
   readonly signal?: AbortSignal;
   /** Optional UTF-8 payload for non-interactive commands that read stdin. */
   readonly stdin?: string;
+  /** Optional per-command preview budget; exact exit semantics are unaffected. */
+  readonly outputPolicy?: ToolOutputPolicy;
+  /** Optional evidence store for explicit full/range drill-down. */
+  readonly outputStore?: ToolOutputStore;
 }
 
 export interface ProcessRunner {
   run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult>;
 }
 
+export interface NodeProcessRunnerOptions {
+  readonly outputPolicy?: ToolOutputPolicy;
+  readonly outputStore?: ToolOutputStore;
+}
+
 interface ProcessError extends ExecFileException {
   readonly killed?: boolean;
+  readonly output?: ToolOutputEnvelope;
 }
 
 /** Production process boundary. Commands are always an executable plus args. */
 export class NodeProcessRunner implements ProcessRunner {
+  private readonly outputPolicy: ToolOutputPolicy | undefined;
+  private readonly outputStore: ToolOutputStore;
+
+  constructor(options: NodeProcessRunnerOptions = {}) {
+    this.outputPolicy = options.outputPolicy;
+    this.outputStore = options.outputStore ?? new FileToolOutputStore();
+  }
+
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     return await new Promise<ProcessResult>((resolve, reject) => {
       let settled = false;
@@ -65,23 +94,43 @@ export class NodeProcessRunner implements ProcessRunner {
               finish(() => reject(stdinError));
               return;
             }
-            finish(() => resolve({ stdout, stderr, exitCode: 0 }));
+            finish(() => resolve(this.result(stdout, stderr, 0, options)));
             return;
           }
           if (options.signal?.aborted === true) {
-            finish(() => reject(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' })));
+            finish(() => reject(Object.assign(new Error(`Command ${file} was cancelled.`), {
+              code: 'ABORT_ERR',
+              output: this.output(stdout, stderr, 'cancelled', null, options),
+            })));
             return;
           }
           if (error.killed) {
-            finish(() => reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT' })));
+            finish(() => reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), {
+              code: 'ETIMEDOUT',
+              output: this.output(stdout, stderr, 'timed_out', null, options),
+            })));
             return;
           }
           if (typeof error.code === 'number') {
             const exitCode = error.code;
-            finish(() => resolve({ stdout, stderr, exitCode }));
+            finish(() => resolve(this.result(stdout, stderr, exitCode, options)));
             return;
           }
-          finish(() => reject(error));
+          // execFile aborts with ERR_CHILD_PROCESS_STDIO_MAXBUFFER once its
+          // safety cap is reached. Preserve the partial transcript as an
+          // explicit capture-truncated artifact instead of dropping the only
+          // failure evidence available to the caller.
+          const captureTruncated = error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER';
+          finish(() => reject(Object.assign(error, {
+            output: this.output(
+              stdout,
+              stderr,
+              captureTruncated ? 'failed' : 'unknown',
+              null,
+              options,
+              captureTruncated,
+            ),
+          })));
         },
       );
       // A child may close its read end before stdin is ended (for example,
@@ -99,11 +148,41 @@ export class NodeProcessRunner implements ProcessRunner {
       }
     });
   }
+
+  private result(stdout: string, stderr: string, exitCode: number, options: ProcessRunOptions): ProcessResult {
+    return {
+      stdout,
+      stderr,
+      exitCode,
+      output: this.output(stdout, stderr, exitCode === 0 ? 'passed' : 'failed', exitCode, options),
+    };
+  }
+
+  private output(
+    stdout: string,
+    stderr: string,
+    outcome: ToolOutputEnvelope['outcome'],
+    exitCode: number | null,
+    options: ProcessRunOptions,
+    captureTruncated = false,
+  ): ToolOutputEnvelope {
+    return boundToolOutput({
+      outcome,
+      exitCode,
+      stdout,
+      stderr,
+      store: options.outputStore ?? this.outputStore,
+      policy: options.outputPolicy ?? this.outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY,
+      captureTruncated,
+    });
+  }
 }
 
 export interface GhCliTransportOptions {
   readonly runner?: ProcessRunner;
   readonly timeoutMs?: number;
+  readonly outputPolicy?: ToolOutputPolicy;
+  readonly outputStore?: ToolOutputStore;
 }
 
 function errorCode(error: unknown): unknown {
@@ -133,6 +212,8 @@ function mapThrownError(error: unknown, path: string): GitHubLiveStateError {
 }
 
 function mapCommandFailure(result: ProcessResult, path: string): GitHubLiveStateError {
+  // Classification remains based on the complete machine-readable transcript;
+  // the bounded envelope is supplemental evidence, never authority.
   const diagnostic = `${result.stderr}\n${result.stdout}`.trim();
   const lower = diagnostic.toLowerCase();
   if (lower.includes('rate limit') || lower.includes('secondary rate')) {
@@ -162,10 +243,17 @@ function mapCommandFailure(result: ProcessResult, path: string): GitHubLiveState
 export class GhCliTransport implements GitHubApiTransport {
   private readonly runner: ProcessRunner;
   private readonly timeoutMs: number;
+  private readonly outputPolicy: ToolOutputPolicy | undefined;
+  private readonly outputStore: ToolOutputStore | undefined;
 
   constructor(options: GhCliTransportOptions = {}) {
-    this.runner = options.runner ?? new NodeProcessRunner();
+    // GitHub transport callers consume the parsed response, not a drill-down
+    // artifact. Keep one bounded ephemeral capture instead of orphaning every
+    // `gh` response on disk.
+    this.runner = options.runner ?? new NodeProcessRunner({ outputStore: new InMemoryToolOutputStore({ maxArtifacts: 1 }) });
     this.timeoutMs = options.timeoutMs ?? 30_000;
+    this.outputPolicy = options.outputPolicy;
+    this.outputStore = options.outputStore;
   }
 
   private args(
@@ -192,7 +280,11 @@ export class GhCliTransport implements GitHubApiTransport {
   private async execute(path: string, args: readonly string[]): Promise<string> {
     let result: ProcessResult;
     try {
-      result = await this.runner.run('gh', args, { timeoutMs: this.timeoutMs });
+      result = await this.runner.run('gh', args, {
+        timeoutMs: this.timeoutMs,
+        ...(this.outputPolicy === undefined ? {} : { outputPolicy: this.outputPolicy }),
+        ...(this.outputStore === undefined ? {} : { outputStore: this.outputStore }),
+      });
     } catch (error) {
       throw mapThrownError(error, path);
     }

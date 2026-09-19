@@ -25,6 +25,14 @@ import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
+import {
+  boundToolOutput,
+  FileToolOutputStore,
+  InMemoryToolOutputStore,
+  type ToolOutputEnvelope,
+  type ToolOutputPolicy,
+  type ToolOutputStore,
+} from '../evidence/tool-output.js';
 
 export const WORKER_ROUTER_IMAGE_ENV = 'TACHIKO_WORKER_ROUTER_IMAGE';
 export const WORKER_ROUTER_NETWORK_ENV = 'TACHIKO_WORKER_ROUTER_NETWORK';
@@ -59,10 +67,12 @@ export type WorkerRouterContainerErrorCode =
 
 export class WorkerRouterContainerError extends Error {
   readonly code: WorkerRouterContainerErrorCode;
-  constructor(code: WorkerRouterContainerErrorCode, message: string, cause?: unknown) {
+  readonly output?: ToolOutputEnvelope;
+  constructor(code: WorkerRouterContainerErrorCode, message: string, cause?: unknown, output?: ToolOutputEnvelope) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = 'WorkerRouterContainerError';
     this.code = code;
+    this.output = output ?? errorOutput(cause);
   }
 }
 
@@ -105,6 +115,7 @@ export interface WorkerContainerInspection {
 export interface WorkerContainerLogs {
   readonly stdout: string;
   readonly stderr: string;
+  readonly output?: ToolOutputEnvelope;
 }
 
 /** Lifecycle surface. Every method after `create` receives the exact ID. */
@@ -126,6 +137,7 @@ export interface ContainerWorkerResult {
   readonly restartPolicy: string;
   readonly stdout: string;
   readonly stderr: string;
+  readonly output?: ToolOutputEnvelope;
 }
 
 /** Injectable seam so adapter tests never touch a real container runtime. */
@@ -263,6 +275,8 @@ export interface DockerWorkerContainerRuntimeOptions {
   readonly docker?: string;
   /** Bound for lifecycle control calls; never the worker run itself. */
   readonly controlTimeoutMs?: number;
+  readonly outputPolicy?: ToolOutputPolicy;
+  readonly outputStore?: ToolOutputStore;
 }
 
 /** Docker CLI implementation. Every lifecycle call carries the exact ID. */
@@ -272,7 +286,13 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
   private readonly controlTimeoutMs: number;
 
   constructor(options: DockerWorkerContainerRuntimeOptions = {}) {
-    this.runner = options.runner ?? new NodeProcessRunner();
+    this.runner = options.runner ?? new NodeProcessRunner({
+      outputPolicy: options.outputPolicy,
+      // Docker log/error transcripts are redacted at the container boundary
+      // before they are persisted by ContainerWorkerBoundary. Keep the raw
+      // process-cap partial in memory only here.
+      outputStore: options.outputStore ?? new InMemoryToolOutputStore({ maxArtifacts: 1 }),
+    });
     this.docker = options.docker ?? 'docker';
     this.controlTimeoutMs = options.controlTimeoutMs ?? 30_000;
   }
@@ -375,6 +395,8 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
       throw new WorkerRouterContainerError(
         WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
         'docker logs could not read the terminal container transcript.',
+        undefined,
+        result.output,
       );
     }
     return { stdout: result.stdout, stderr: result.stderr };
@@ -458,10 +480,19 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
 export class ContainerWorkerBoundary implements ContainerWorkerExecution {
   private readonly runtime: WorkerContainerRuntime;
   private readonly cleanupGraceSeconds: number;
+  private readonly outputPolicy: ToolOutputPolicy | undefined;
+  private readonly outputStore: ToolOutputStore;
 
-  constructor(options: { readonly runtime?: WorkerContainerRuntime; readonly cleanupGraceSeconds?: number } = {}) {
+  constructor(options: {
+    readonly runtime?: WorkerContainerRuntime;
+    readonly cleanupGraceSeconds?: number;
+    readonly outputPolicy?: ToolOutputPolicy;
+    readonly outputStore?: ToolOutputStore;
+  } = {}) {
     this.runtime = options.runtime ?? new DockerWorkerContainerRuntime();
     this.cleanupGraceSeconds = options.cleanupGraceSeconds ?? 5;
+    this.outputPolicy = options.outputPolicy;
+    this.outputStore = options.outputStore ?? new FileToolOutputStore();
   }
 
   async run(spec: WorkerContainerSpec): Promise<ContainerWorkerResult> {
@@ -478,6 +509,10 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
         );
       }
       const logs = await this.readLogs(id);
+      const safeLogs = {
+        stdout: redactContainerSecrets(logs.stdout, spec.env),
+        stderr: redactContainerSecrets(logs.stderr, spec.env),
+      };
       // Terminal state is already proven, so removal is opportunistic cleanup:
       // a failed rm does not leave unproven work behind.
       await this.removeQuietly(id);
@@ -486,25 +521,73 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
         exitCode,
         terminalState: state.status,
         restartPolicy: state.restartPolicy,
-        stdout: logs.stdout,
-        stderr: logs.stderr,
+        stdout: safeLogs.stdout,
+        stderr: safeLogs.stderr,
+        output: logs.output === undefined ? boundToolOutput({
+          outcome: exitCode === 0 ? 'passed' : 'failed',
+          exitCode,
+          stdout: safeLogs.stdout,
+          stderr: safeLogs.stderr,
+          store: this.outputStore,
+          policy: this.outputPolicy,
+          summary: exitCode === 0 ? 'Worker container completed.' : `Worker container exited with status ${exitCode}.`,
+        }) : boundToolOutput({
+          outcome: logs.output.outcome,
+          exitCode: logs.output.exitCode,
+          stdout: safeLogs.stdout,
+          stderr: safeLogs.stderr,
+          store: this.outputStore,
+          policy: this.outputPolicy,
+          summary: logs.output.summary,
+          captureTruncated: true,
+        }),
       };
     } catch (error) {
+      const safeError = this.redactErrorOutput(error, spec.env);
       const cleanup = await this.proveQuiescent(id);
       if (!cleanup.quiescent) {
         // Containment takes precedence over the ordinary worker failure: never
         // return while the exact container may still be alive and mutating.
         throw new WorkerRouterContainerError(
           WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
-          `Container ${id.slice(0, 12)} cleanup could not prove quiescence (${cleanup.detail}); refusing to report the worker failure as contained. Original failure: ${boundedMessage(error, 200)}`,
-          error,
+          `Container ${id.slice(0, 12)} cleanup could not prove quiescence (${cleanup.detail}); refusing to report the worker failure as contained. Original failure: ${boundedMessage(safeError, 200)}`,
+          safeError,
+          errorOutput(safeError),
         );
       }
       if (isAborted(spec.signal)) {
-        throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED, 'The worker container was cancelled.', error);
+        throw new WorkerRouterContainerError(
+          WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED,
+          'The worker container was cancelled.',
+          safeError,
+          errorOutput(safeError),
+        );
       }
-      throw error;
+      throw safeError;
     }
+  }
+
+  /** Rebuild error evidence from redacted previews before it can leave the boundary. */
+  private redactErrorOutput(error: unknown, env: Readonly<Record<string, string>>): unknown {
+    const output = errorOutput(error);
+    if (output === undefined) return error;
+    const safeOutput = boundToolOutput({
+      outcome: output.outcome,
+      exitCode: output.exitCode,
+      stdout: redactContainerSecrets(output.stdout.preview, env),
+      stderr: redactContainerSecrets(output.stderr.preview, env),
+      summary: redactContainerSecrets(output.summary, env),
+      store: this.outputStore,
+      policy: this.outputPolicy,
+      // The original artifact may have been captured before the boundary had
+      // a chance to redact it. The replacement artifact is intentionally only
+      // the bounded, redacted evidence visible to callers.
+      captureTruncated: true,
+    });
+    if (error instanceof WorkerRouterContainerError) {
+      return new WorkerRouterContainerError(error.code, error.message, error, safeOutput);
+    }
+    return Object.assign(new Error(error instanceof Error ? error.message : boundedMessage(error)), error, { output: safeOutput });
   }
 
   /**
@@ -552,10 +635,21 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
   private async readLogs(id: string): Promise<WorkerContainerLogs> {
     try {
       return await this.runtime.logs(id);
-    } catch {
-      return { stdout: '', stderr: '' };
+    } catch (error) {
+      const output = errorOutput(error);
+      return {
+        stdout: output?.stdout.preview ?? '',
+        stderr: output?.stderr.preview ?? '',
+        ...(output === undefined ? {} : { output }),
+      };
     }
   }
+}
+
+function errorOutput(value: unknown): ToolOutputEnvelope | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const output = (value as { output?: unknown }).output;
+  return typeof output === 'object' && output !== null ? output as ToolOutputEnvelope : undefined;
 }
 
 export function redactWorkerEnvValues(message: string, env: Readonly<Record<string, string>>): string {
@@ -590,6 +684,19 @@ function isBenignLifecycleFailure(stderr: string): boolean {
 function firstLine(value: string): string {
   const line = value.split('\n').map((part) => part.trim()).find((part) => part !== '');
   return line ?? 'no diagnostic';
+}
+
+function redactContainerSecrets(value: string, env: Readonly<Record<string, string>>): string {
+  let redacted = value;
+  for (const [key, secret] of Object.entries(env)) {
+    // HOME is a fixed container path, not a credential. Every other
+    // forwarded value may be a task-specific secret even when its key name is
+    // uninformative, so redact by value at the boundary.
+    if (key !== 'HOME' && secret !== '') {
+      redacted = redacted.split(secret).join('[redacted]');
+    }
+  }
+  return redacted;
 }
 
 function errorCode(error: unknown): unknown {

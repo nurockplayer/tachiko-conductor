@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { ClaudeCodeAdapter, NodeClaudeProcessRunner } from '../src/agents/claude-code.js';
+import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
 import type { ClaudeProcessRunner, ClaudeRunOptions } from '../src/agents/claude-code.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
@@ -106,6 +107,21 @@ describe('ClaudeCodeAdapter', () => {
     assert.match(agentResult.diagnostics?.join('\n') ?? '', /CLAUDE_EXIT_FAILURE/);
     assert.equal(agentResult.headSha, undefined);
     assert.equal(runner.calls.length, 1);
+  });
+
+  it('preserves bounded provider failure evidence on a non-zero exit', async () => {
+    const output = boundToolOutput({
+      outcome: 'failed', exitCode: 19, stdout: 'noise '.repeat(100), stderr: 'ERROR: claude crashed\n',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
+    });
+    const agentResult = await new ClaudeCodeAdapter({
+      runner: new FakeRunner([{ ...result('', 'ERROR: claude crashed\n', 19), output }]), cwd: '/tmp/repo',
+    }).run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.equal(agentResult.output?.exitCode, 19);
+    assert.equal(agentResult.output?.overflow.truncated, true);
   });
 
   it('maps is_error results, timeouts, missing executables, and invalid structured output deterministically', async () => {
@@ -395,6 +411,8 @@ describe('NodeClaudeProcessRunner', () => {
       { timeoutMs: 1_000, cwd: process.cwd() },
     );
 
-    assert.deepEqual(child, { stdout: 'closed', stderr: '', exitCode: 0 });
+    assert.deepEqual({ stdout: child.stdout, stderr: child.stderr, exitCode: child.exitCode }, { stdout: 'closed', stderr: '', exitCode: 0 });
+    assert.equal(child.output?.outcome, 'passed');
+    assert.equal(child.output?.exitCode, 0);
   });
 });

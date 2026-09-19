@@ -216,9 +216,14 @@ describe('CLI command layer', () => {
         TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
           revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr',
           commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }],
+          outputPolicy: { previewBytes: 8_192, diagnosticBytes: 16_384, maxDiagnostics: 32, readBytes: 65_536 },
         }),
       }),
-      { revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
+      {
+        revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr',
+        commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }],
+        outputPolicy: { previewBytes: 8_192, diagnosticBytes: 16_384, maxDiagnostics: 32, readBytes: 65_536 },
+      },
     );
     assert.throws(
       () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: '{bad json' }),

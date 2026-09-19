@@ -1,7 +1,17 @@
 import type { HostedValidationEvidence, LocalValidationEvidence, ValidationResult, ValidationStatus } from './types.js';
+import { isToolOutputEnvelope } from '../evidence/tool-output.js';
 
 function isCommandOutcome(value: unknown): value is 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed' {
   return value === 'passed' || value === 'failed' || value === 'timed_out' || value === 'unavailable' || value === 'malformed';
+}
+
+function isCommandOutputCoherent(command: Record<string, unknown>): boolean {
+  if (command.output === undefined) return true;
+  if (!isToolOutputEnvelope(command.output)) return false;
+  const expected = command.outcome === 'passed' ? 'passed'
+    : command.outcome === 'failed' ? 'failed'
+      : command.outcome === 'timed_out' ? 'timed_out' : 'unknown';
+  return command.output.outcome === expected && command.output.exitCode === command.exitCode;
 }
 
 function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
@@ -16,7 +26,8 @@ function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
     typeof command.executable === 'string' &&
     (command.executable.trim() !== '' || command.outcome === 'malformed') && isCommandOutcome(command.outcome) &&
     (command.exitCode === null || typeof command.exitCode === 'number') &&
-    typeof command.durationMs === 'number' && Number.isSafeInteger(command.durationMs) && command.durationMs >= 0,
+    typeof command.durationMs === 'number' && Number.isSafeInteger(command.durationMs) && command.durationMs >= 0 &&
+    isCommandOutputCoherent(command),
   )) return false;
   const final = commands.at(-1);
   if (evidence.status === 'passed') return commands.length > 0 && commands.every((command) => command.outcome === 'passed' && command.exitCode === 0);

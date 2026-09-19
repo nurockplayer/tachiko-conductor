@@ -18,6 +18,7 @@ import type { ImplementationCapabilityResolver, McpHttpCapability } from './adap
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
 import type { HostedCheckPolicyConfiguration, LocalValidationConfiguration } from './adapters/validation.js';
+import type { ToolOutputPolicy } from './evidence/tool-output.js';
 import {
   ConfiguredLocalValidationAdapter,
   MAX_LOCAL_VALIDATION_TIMEOUT_MS,
@@ -287,10 +288,31 @@ export function resolveLocalValidationConfiguration(
     (typeof record.workspacePath !== 'string' || record.workspacePath.trim() === '' || !path.isAbsolute(record.workspacePath))) {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.workspacePath must be an absolute non-empty path when supplied.');
   }
+  const outputPolicy = record.outputPolicy === undefined ? undefined : parseToolOutputPolicy(record.outputPolicy);
   return {
     revision: record.revision,
     commands,
     ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
+    ...(outputPolicy === undefined ? {} : { outputPolicy }),
+  };
+}
+
+function parseToolOutputPolicy(value: unknown): ToolOutputPolicy {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.outputPolicy must be an object.');
+  }
+  const policy = value as Record<string, unknown>;
+  const fields = ['previewBytes', 'diagnosticBytes', 'maxDiagnostics', 'readBytes'] as const;
+  for (const field of fields) {
+    if (!Number.isSafeInteger(policy[field]) || (policy[field] as number) < 1) {
+      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.outputPolicy.${field} must be a positive safe integer.`);
+    }
+  }
+  return {
+    previewBytes: policy.previewBytes as number,
+    diagnosticBytes: policy.diagnosticBytes as number,
+    maxDiagnostics: policy.maxDiagnostics as number,
+    readBytes: policy.readBytes as number,
   };
 }
 

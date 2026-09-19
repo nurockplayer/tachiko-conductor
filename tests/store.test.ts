@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
+import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
@@ -142,6 +143,29 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.agentResult?.sessionId, 'legacy-session-1');
     assert.deepEqual(loaded?.executor, { provider: 'codex-cli', sessionId: 'thread-1' });
     assert.equal(loaded?.agentResult?.durationMs, 125);
+  });
+
+  it('persists bounded output metadata without making it validation authority', () => {
+    const { dir } = tempStore();
+    const evidence = boundToolOutput({
+      outcome: 'failed',
+      exitCode: 7,
+      stdout: 'stdout '.repeat(100),
+      stderr: 'ERROR: test failed\n',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
+    });
+    let run = applyTransition(newRun('output-run'), { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'agent_failed',
+      agentResult: { exitStatus: 'failure', summary: 'failed', output: evidence },
+    }, T0);
+    new JsonFileStore({ dir }).create(run);
+
+    const loaded = new JsonFileStore({ dir }).read('output-run');
+    assert.equal(loaded?.agentResult?.output?.exitCode, 7);
+    assert.equal(loaded?.agentResult?.output?.overflow.truncated, true);
+    assert.equal(loaded?.state, 'FAILED');
   });
 
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {

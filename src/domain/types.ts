@@ -9,6 +9,7 @@
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
+import type { ToolOutputEnvelope } from '../evidence/tool-output.js';
 
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;
@@ -111,10 +112,12 @@ export interface AgentResult {
   readonly executor?: ExecutorIdentity;
   /** Opaque executor session token used to continue this logical run. */
   readonly sessionId?: string;
-  /** Wall-clock execution duration. Raw transcripts and hidden reasoning are never retained. */
+  /** Wall-clock execution duration. Raw transcripts and hidden reasoning are never retained; bounded evidence is supplemental. */
   readonly durationMs?: number;
   /** Structured provider usage/provenance only; never raw output or hidden reasoning. */
   readonly telemetry?: ProviderExecutionTelemetry;
+  /** Bounded command/provider evidence with an explicit artifact drill-down. */
+  readonly output?: ToolOutputEnvelope;
 }
 
 export type ReviewVerdict = 'approve' | 'request_changes';
@@ -138,16 +141,18 @@ export interface ReviewResult {
 /** A fail-closed validation outcome. `waiting` is reserved for a re-checkable external dependency. */
 export type ValidationStatus = 'passed' | 'failed' | 'waiting' | 'unknown';
 
-/** Compact, secret-free result for one explicitly configured local command. */
+/** Compact result for one explicitly configured local command; output evidence is bounded and supplemental. */
 export interface LocalValidationCommandEvidence {
   readonly commandIndex: number;
   readonly executable: string;
   readonly outcome: 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed';
   readonly exitCode: number | null;
   readonly durationMs: number;
+  /** Bounded stdout/stderr evidence; exitCode/outcome remain authoritative. */
+  readonly output?: ToolOutputEnvelope;
 }
 
-/** Durable provenance for deterministic local validation. It intentionally excludes command output. */
+/** Durable provenance for deterministic local validation; output evidence never becomes validation authority. */
 export interface LocalValidationEvidence {
   readonly status: Exclude<ValidationStatus, 'waiting'>;
   readonly configRevision: string | null;
