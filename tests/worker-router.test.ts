@@ -19,6 +19,7 @@ import {
   type WorkerContainerSpec,
 } from '../src/agents/worker-router-container.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
+import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
 import { TARGET } from './helpers.js';
 
 class FakeRunner implements ProcessRunner {
@@ -294,6 +295,22 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.TIMEOUT));
     assert.equal(after, 0);
     assert.equal(runner.calls.length, 0);
+  });
+
+  it('retains container timeout evidence on the provider-neutral failure result', async () => {
+    const ws = preparedWorkspace();
+    const output = boundToolOutput({
+      outcome: 'timed_out', exitCode: null, stdout: '', stderr: 'ERROR: worker timeout\n',
+      store: new InMemoryToolOutputStore(),
+    });
+    const container = new FakeContainer([new WorkerRouterContainerError(
+      WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT, 'timed out', undefined, output,
+    )]);
+    const response = await new WorkerRouterAdapter({ runner: new FakeRunner([]), container, image: IMAGE }).run(requestFor(ws.workspacePath));
+
+    assert.equal(response.exitStatus, 'failure');
+    assert.equal(response.output?.outcome, 'timed_out');
+    assert.equal(response.output?.artifact.totalBytes, output.artifact.totalBytes);
   });
 
   it('never reads HEAD, proves ancestry, or publishes after a container failure', async () => {

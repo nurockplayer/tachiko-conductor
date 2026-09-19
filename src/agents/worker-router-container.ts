@@ -66,10 +66,12 @@ export type WorkerRouterContainerErrorCode =
 
 export class WorkerRouterContainerError extends Error {
   readonly code: WorkerRouterContainerErrorCode;
-  constructor(code: WorkerRouterContainerErrorCode, message: string, cause?: unknown) {
+  readonly output?: ToolOutputEnvelope;
+  constructor(code: WorkerRouterContainerErrorCode, message: string, cause?: unknown, output?: ToolOutputEnvelope) {
     super(message, cause === undefined ? undefined : { cause });
     this.name = 'WorkerRouterContainerError';
     this.code = code;
+    this.output = output ?? errorOutput(cause);
   }
 }
 
@@ -112,6 +114,7 @@ export interface WorkerContainerInspection {
 export interface WorkerContainerLogs {
   readonly stdout: string;
   readonly stderr: string;
+  readonly output?: ToolOutputEnvelope;
 }
 
 /** Lifecycle surface. Every method after `create` receives the exact ID. */
@@ -509,7 +512,7 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
         restartPolicy: state.restartPolicy,
         stdout: safeLogs.stdout,
         stderr: safeLogs.stderr,
-        output: boundToolOutput({
+        output: logs.output ?? boundToolOutput({
           outcome: exitCode === 0 ? 'passed' : 'failed',
           exitCode,
           stdout: safeLogs.stdout,
@@ -582,10 +585,21 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
   private async readLogs(id: string): Promise<WorkerContainerLogs> {
     try {
       return await this.runtime.logs(id);
-    } catch {
-      return { stdout: '', stderr: '' };
+    } catch (error) {
+      const output = errorOutput(error);
+      return {
+        stdout: output?.stdout.preview ?? '',
+        stderr: output?.stderr.preview ?? '',
+        ...(output === undefined ? {} : { output }),
+      };
     }
   }
+}
+
+function errorOutput(value: unknown): ToolOutputEnvelope | undefined {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const output = (value as { output?: unknown }).output;
+  return typeof output === 'object' && output !== null ? output as ToolOutputEnvelope : undefined;
 }
 
 export function redactWorkerEnvValues(message: string, env: Readonly<Record<string, string>>): string {

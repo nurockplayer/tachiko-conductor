@@ -155,11 +155,12 @@ function head(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, 'utf8');
   if (bytes.length <= maxBytes) return value;
   let end = maxBytes;
-  while (end > 0 && (bytes[end - 1]! & 0xc0) === 0x80) end -= 1;
-  if (end > 0) {
-    const first = bytes[end - 1]!;
+  let start = end - 1;
+  while (start > 0 && (bytes[start]! & 0xc0) === 0x80) start -= 1;
+  if (start >= 0) {
+    const first = bytes[start]!;
     const expected = first >= 0xf0 ? 4 : first >= 0xe0 ? 3 : first >= 0xc0 ? 2 : 1;
-    if (expected > maxBytes - end + 1) end -= 1;
+    if (expected > end - start) end = start;
   }
   return bytes.subarray(0, Math.max(0, end)).toString('utf8');
 }
@@ -322,12 +323,20 @@ export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelop
   const overflow = envelope.overflow;
   if (typeof overflow !== 'object' || overflow === null) return false;
   const overflowRecord = overflow as Record<string, unknown>;
-  return typeof overflowRecord.truncated === 'boolean' && typeof overflowRecord.capture === 'boolean' && typeof overflowRecord.summary === 'boolean' &&
-    typeof overflowRecord.diagnostics === 'boolean' &&
-    typeof overflowRecord.stdout === 'boolean' && typeof overflowRecord.stderr === 'boolean' &&
-    [overflowRecord.totalBytes, overflowRecord.retainedBytes, overflowRecord.omittedBytes, overflowRecord.previewLimitBytes,
+  if (typeof overflowRecord.truncated !== 'boolean' || typeof overflowRecord.capture !== 'boolean' || typeof overflowRecord.summary !== 'boolean' ||
+    typeof overflowRecord.diagnostics !== 'boolean' || typeof overflowRecord.stdout !== 'boolean' || typeof overflowRecord.stderr !== 'boolean' ||
+    ![overflowRecord.totalBytes, overflowRecord.retainedBytes, overflowRecord.omittedBytes, overflowRecord.previewLimitBytes,
       overflowRecord.diagnosticLimitBytes, overflowRecord.diagnosticLimitLines]
-      .every((item) => typeof item === 'number' && Number.isSafeInteger(item) && item >= 0);
+      .every((item) => typeof item === 'number' && Number.isSafeInteger(item) && item >= 0)) return false;
+  const expectedTruncated = overflowRecord.capture || overflowRecord.summary || overflowRecord.diagnostics || overflowRecord.stdout || overflowRecord.stderr;
+  return envelope.stdout.previewBytes === utf8Bytes(envelope.stdout.preview) &&
+    envelope.stderr.previewBytes === utf8Bytes(envelope.stderr.preview) &&
+    envelope.artifact.totalBytes === envelope.artifact.stdoutBytes + envelope.artifact.stderrBytes &&
+    overflowRecord.totalBytes === envelope.artifact.totalBytes &&
+    overflowRecord.retainedBytes === envelope.stdout.previewBytes + envelope.stderr.previewBytes &&
+    overflowRecord.omittedBytes === Math.max(0, overflowRecord.totalBytes - overflowRecord.retainedBytes) &&
+    overflowRecord.stdout === envelope.stdout.truncated && overflowRecord.stderr === envelope.stderr.truncated &&
+    overflowRecord.truncated === expectedTruncated;
 }
 
 function isToolOutputStream(value: unknown): value is ToolOutputStream {
