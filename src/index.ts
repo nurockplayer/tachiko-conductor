@@ -38,3 +38,6 @@ export * from './dispatch/command.js';
 export * from './browser/playwright-mcp-runtime.js';
 export * from './browser/agent-config.js';
 export * from './browser/mcp-client.js';
+export * from './oracle/types.js';
+export * from './oracle/reviewer.js';
+export * from './oracle/receipt-store.js';
