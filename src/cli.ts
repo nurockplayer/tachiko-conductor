@@ -84,6 +84,7 @@ import {
 } from './workflow/run.js';
 import { DEFAULT_WAIT_WAKE_POLICY, type WaitWakePolicy } from './domain/wait.js';
 import {
+  acknowledgeWaitDelivery,
   waitAwaitCommand,
   waitObserveCommand,
   type WaitCommandResult,
@@ -1317,10 +1318,14 @@ export async function main(argv: string[]): Promise<number> {
     if (pollIntervalMs !== undefined && (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 0)) {
       throw new Error('--poll-interval-ms must be a non-negative safe integer.');
     }
+    const dependencies = buildWaitCommandDependencies({ store, run });
     const result = subcommand === 'observe'
-      ? await waitObserveCommand({ id, mode: 'observe', policy }, buildWaitCommandDependencies({ store, run }))
-      : await waitAwaitCommand({ id, mode: 'wait', policy, ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }) }, buildWaitCommandDependencies({ store, run }));
+      ? await waitObserveCommand({ id, mode: 'observe', policy }, dependencies)
+      : await waitAwaitCommand({ id, mode: 'wait', policy, ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }) }, dependencies);
     printWaitResult(result);
+    // Only after the wake has been emitted is it safe to mark it delivered; a
+    // crash before this point makes the next process replay it.
+    acknowledgeWaitDelivery(result, dependencies.ledgerStore);
     // A wake is a reconciliation signal, not a failure; the caller decides.
     return 0;
   }

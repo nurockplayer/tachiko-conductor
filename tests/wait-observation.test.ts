@@ -757,35 +757,42 @@ describe('#35 native observation reuse', () => {
             index += 1;
             return index === 1
               ? { status: 'active', activeItemId: 'turn-1', turns: 1 }
-              : { status: 'idle', turns: index, lastCompletedTurnId: 'turn-2' };
+              : { status: 'idle', turns: index, lastCompletedTurnId: 'turn-3' };
           },
         },
       });
       const persistedNativeStatuses: Array<string | null> = [];
-      const outcome = await awaitMeaningfulChange({
-        observer,
-        ledger: createWaitLedger({ subjectId: SUBJECT, ownerRunId: SUBJECT, generation: 'generation-1' }),
-        policy: { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 100, onTimeout: 'continue' },
-        now: () => 0,
-        sleep: async () => undefined,
-        pollIntervalMs: 1,
-        persist: (ledger) => {
-          store.write(ledger);
-          persistedNativeStatuses.push(store.read()?.lastNativeStatus ?? null);
-        },
-      });
-      assert.equal(outcome.change.kind, 'completion');
-      assert.equal(outcome.wake.shouldWake, true);
-      // The genuine native active phase reached durable storage mid-wait.
+      let crash = false;
+      await assert.rejects(
+        () => awaitMeaningfulChange({
+          observer,
+          ledger: createWaitLedger({ subjectId: SUBJECT, ownerRunId: SUBJECT, generation: 'generation-1' }),
+          policy: { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 100_000, onTimeout: 'continue' },
+          now: () => 0,
+          // Simulate a crash on the poll after the native active anchor is
+          // persisted, before any completion is observed.
+          sleep: async () => { if (crash) throw new Error('simulated crash'); },
+          pollIntervalMs: 1,
+          persist: (ledger) => {
+            store.write(ledger);
+            persistedNativeStatuses.push(store.read()?.lastNativeStatus ?? null);
+            if (ledger.lastNativeStatus === 'active') crash = true;
+          },
+        }),
+        /simulated crash/,
+      );
       assert.equal(persistedNativeStatuses.includes('active'), true, 'the native active anchor must be persisted during the wait');
 
-      // A restarted process reading only the persisted ledger anchors on that
-      // durable active state and still wakes for the completion.
-      const onDisk = { ...store.read()!, lastNativeIdentity: 'turn-1', previousWasNative: false };
+      // A restarted process reads ONLY the ledger the crashed wait wrote. No
+      // hand-editing: the durable anchor itself must carry the boundary.
+      const reloaded = store.read();
+      assert.notEqual(reloaded, null);
+      assert.equal(reloaded?.lastNativeStatus, 'active');
+      assert.equal(reloaded?.lastNativeIdentity, null);
       index = 99;
       const restarted = await observeWaitState({
         observer,
-        ledger: onDisk,
+        ledger: reloaded,
         at: T0,
         policy: DEFAULT_WAIT_WAKE_POLICY,
         expectedOwnerRunId: SUBJECT,

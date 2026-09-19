@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -88,16 +88,4 @@ export class WaitLedgerFileStore implements WaitLedgerStore {
     renameSync(temporary, this.filePath);
   }
 
-  exists(): boolean {
-    try {
-      return statSync(this.filePath).isFile();
-    } catch {
-      return false;
-    }
-  }
-
-  /** Remove a rejected ledger; only used by explicit operator repair paths. */
-  remove(): void {
-    rmSync(this.filePath, { force: true });
-  }
 }

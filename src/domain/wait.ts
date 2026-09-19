@@ -479,6 +479,12 @@ export interface WaitLedger {
    * can never resurrect a periodic timeout wake for an already-decided state.
    */
   readonly surfacedDigests: readonly string[];
+  /**
+   * Wake ids whose decision the caller has already been handed. A wake that is
+   * recorded but not yet delivered must be replayed after a restart, otherwise
+   * a crash between persisting the decision and emitting it loses the wake.
+   */
+  readonly deliveredWakeIds: readonly string[];
   /** Monotonic observation counter, independent of the bounded history length. */
   readonly observationSequence: number;
 }
@@ -506,6 +512,7 @@ export function createWaitLedger(input: {
     previousWasNative: false,
     nativeIdentities: [],
     surfacedDigests: [],
+    deliveredWakeIds: [],
     observationSequence: 0,
   };
 }
@@ -705,6 +712,7 @@ const MAX_WAIT_WAKES = 200;
 const MAX_TERMINAL_DIGESTS = 50;
 const MAX_NATIVE_IDENTITIES = 50;
 const MAX_SURFACED_DIGESTS = 500;
+const MAX_DELIVERED_WAKE_IDS = 500;
 
 /**
  * Keep the durable ledger bounded; the latest records are the reconciliation
@@ -719,12 +727,20 @@ export function boundWaitLedger(ledger: WaitLedger): WaitLedger {
     terminalDigests: (ledger.terminalDigests ?? []).slice(-MAX_TERMINAL_DIGESTS),
     nativeIdentities: (ledger.nativeIdentities ?? []).slice(-MAX_NATIVE_IDENTITIES),
     surfacedDigests: (ledger.surfacedDigests ?? []).slice(-MAX_SURFACED_DIGESTS),
+    deliveredWakeIds: (ledger.deliveredWakeIds ?? []).slice(-MAX_DELIVERED_WAKE_IDS),
   };
 }
 
 /** Wakes that still require an orchestrator reconciliation pass. */
 export function pendingWaitWakes(ledger: WaitLedger): readonly WaitRecordedWake[] {
-  return ledger.wakes;
+  const delivered = new Set(ledger.deliveredWakeIds ?? []);
+  return ledger.wakes.filter((wake) => !delivered.has(wake.id));
+}
+
+/** Mark recorded wakes as delivered so a restart does not replay them. */
+export function markWaitWakesDelivered(ledger: WaitLedger, ids: readonly string[]): WaitLedger {
+  const delivered = new Set([...(ledger.deliveredWakeIds ?? []), ...ids]);
+  return { ...ledger, deliveredWakeIds: [...delivered].slice(-MAX_DELIVERED_WAKE_IDS) };
 }
 
 export function isWaitLedger(value: unknown): value is WaitLedger {
@@ -750,6 +766,8 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
       (Array.isArray(record.nativeIdentities) && record.nativeIdentities.every((item: unknown) => typeof item === 'string' && item !== ''))) &&
     (record.surfacedDigests === undefined ||
       (Array.isArray(record.surfacedDigests) && record.surfacedDigests.every((item: unknown) => typeof item === 'string' && item !== ''))) &&
+    (record.deliveredWakeIds === undefined ||
+      (Array.isArray(record.deliveredWakeIds) && record.deliveredWakeIds.every((item: unknown) => typeof item === 'string' && item !== ''))) &&
     (record.observationSequence === undefined || (Number.isSafeInteger(record.observationSequence) && (record.observationSequence as number) >= 0));
 }
 
@@ -807,6 +825,9 @@ export function migrateWaitLedger(value: WaitLedger): WaitLedger {
     previousWasNative: value.previousWasNative ?? lastObservation?.source === 'native',
     nativeIdentities: [...new Set(nativeIdentities)].slice(-MAX_NATIVE_IDENTITIES),
     surfacedDigests: value.surfacedDigests ?? [...new Set(value.wakes.map((wake) => wake.observationDigest))].slice(-MAX_SURFACED_DIGESTS),
+    // Legacy ledgers have no delivery record; treat their recorded wakes as
+    // delivered so an upgrade does not replay historical decisions.
+    deliveredWakeIds: value.deliveredWakeIds ?? value.wakes.map((wake) => wake.id),
     observationSequence: sequence,
   };
 }

@@ -7,8 +7,8 @@ import { describe, it } from 'node:test';
 import { buildWaitCommandDependencies, main, resolveWaitLedgerDirectory, resolveWaitLedgerFile, resolveWaitLedgerPath, resolveWaitWakePolicy } from '../src/cli.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
-import { DEFAULT_WAIT_WAKE_POLICY, createWaitLedger } from '../src/domain/wait.js';
-import { waitObserveCommand } from '../src/workflow/wait-command.js';
+import { DEFAULT_WAIT_WAKE_POLICY, createWaitLedger, markWaitWakesDelivered, pendingWaitWakes } from '../src/domain/wait.js';
+import { acknowledgeWaitDelivery, waitObserveCommand } from '../src/workflow/wait-command.js';
 import type { WaitLedgerStore } from '../src/workflow/wait-ledger-store.js';
 import { CODEX_APP_SERVER_PROVIDER } from '../src/agents/codex-app-server.js';
 import { projectRunEfficiency } from '../src/domain/telemetry.js';
@@ -460,6 +460,55 @@ describe('wait CLI', () => {
       }
       const finalLedger = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }).read();
       assert.deepEqual(finalLedger?.wakes.map((wake) => wake.reason), ['failure']);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('replays a wake that was recorded but never delivered before a crash', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-crash-replay'), { type: 'fail' }, T0);
+      seedRun(dataDir, run);
+      const filePath = resolveWaitLedgerFile(run.id, env);
+      const ledgerStore = new WaitLedgerFileStore({ filePath });
+
+      const first = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+      assert.equal((JSON.parse(first.stdout[0]!) as { wake: { shouldWake: boolean } }).wake.shouldWake, true);
+
+      // Simulate a crash after the ledger write but before the wake was handed
+      // to the caller: clear the delivery record.
+      const recorded = ledgerStore.read()!;
+      assert.equal(pendingWaitWakes(recorded).length, 0, 'a delivered wake is not pending');
+      ledgerStore.write(markWaitWakesDelivered({ ...recorded, deliveredWakeIds: [] }, []));
+      assert.equal(pendingWaitWakes(ledgerStore.read()!).length, 1);
+
+      // A restarted process must replay the undelivered wake exactly once.
+      const replayed = await runMain(env, ['wait', 'observe', run.id]);
+      const replayedParsed = JSON.parse(replayed.stdout[0]!) as { wake: { shouldWake: boolean; reason: string }; wakeCount: number };
+      assert.equal(replayedParsed.wake.shouldWake, true);
+      assert.equal(replayedParsed.wake.reason, 'failure');
+      assert.equal(replayedParsed.wakeCount, 1);
+      assert.equal(replayed.stdout.includes('TACHIKO_WAIT_WAKE_V1'), true);
+
+      // Once delivered, later processes stay idle.
+      const settled = await runMain(env, ['wait', 'observe', run.id]);
+      const settledParsed = JSON.parse(settled.stdout[0]!) as { wake: { shouldWake: boolean }; pendingWakes: readonly unknown[] };
+      assert.equal(settledParsed.wake.shouldWake, false);
+      assert.deepEqual(settledParsed.pendingWakes, []);
+      assert.equal(settled.stdout.includes('TACHIKO_WAIT_WAKE_V1'), false);
+      assert.equal(pendingWaitWakes(ledgerStore.read()!).length, 0);
+
+      // The helper is idempotent once everything is delivered.
+      const current = ledgerStore.read()!;
+      acknowledgeWaitDelivery({
+        ok: true, mode: 'observe', runId: run.id, state: run.state, source: 'runtime', subjectId: run.id,
+        status: 'failed', headSha: null, observationDigest: '', change: 'none',
+        wake: { shouldWake: false, reason: null, evidence: [] }, pendingWakes: [], modelTurns: 0,
+        timedOut: false, idle: true, observations: 1, duplicateObservations: 1, wakeCount: 1,
+        waitStartedAt: null, observedDigest: '',
+      }, ledgerStore);
+      assert.deepEqual(ledgerStore.read()?.deliveredWakeIds?.length, current.deliveredWakeIds?.length);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

@@ -644,7 +644,10 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
     const parsedTurns = turns.map((turn) => object(turn, 'turn'));
     const active = parsedTurns.find((turn) => turn.status === 'inProgress');
     // Newest completed turn with a usable identity; a blank id falls through to
-    // an earlier completed turn rather than losing the progress signal.
+    // an earlier completed turn rather than losing the progress signal. This
+    // assumes `thread/read` returns turns oldest-first (the documented and
+    // fixture-verified order); the unobserved-completion signal degrades to
+    // progress-only evidence if a runtime ever windows or reorders them.
     let lastCompletedTurnId: string | undefined;
     for (let index = parsedTurns.length - 1; index >= 0; index -= 1) {
       const turn = parsedTurns[index]!;

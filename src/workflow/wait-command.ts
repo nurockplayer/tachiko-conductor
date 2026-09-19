@@ -1,9 +1,12 @@
 import {
   DEFAULT_WAIT_WAKE_POLICY,
+  markWaitWakesDelivered,
+  pendingWaitWakes,
   wakeReasonForChange,
   waitObservationDigest,
   type WaitLedger,
   type WaitObservation,
+  type WaitRecordedWake,
   type WaitWakePolicy,
 } from '../domain/wait.js';
 import { recordWaitWakeTelemetry } from '../domain/telemetry.js';
@@ -71,6 +74,12 @@ export interface WaitCommandResult {
     readonly reason: string | null;
     readonly evidence: readonly { readonly kind: string; readonly detail: string }[];
   };
+  /**
+   * Wakes recorded by an earlier process that had not been handed to a caller
+   * before it died. These are replayed so a crash cannot silently drop a wake;
+   * they are marked delivered once printed.
+   */
+  readonly pendingWakes: readonly { readonly id: string; readonly reason: string; readonly subjectId: string; readonly status: string }[];
   /** Always zero: this path never starts a model turn. */
   readonly modelTurns: 0;
   readonly timedOut: boolean;
@@ -79,6 +88,8 @@ export interface WaitCommandResult {
   readonly duplicateObservations: number;
   readonly wakeCount: number;
   readonly waitStartedAt: string | null;
+  /** Ledger mutation kind for this call, so the caller can persist delivery. */
+  readonly observedDigest: string;
 }
 
 export function emptyWaitLedger(run: Run): WaitLedger {
@@ -129,12 +140,21 @@ function runtimeObserver(run: Run, dependencies: WaitCommandDependencies): WaitO
   });
 }
 
+function pendingWakeViews(ledger: WaitLedger): readonly WaitRecordedWake[] {
+  return pendingWaitWakes(ledger);
+}
+
 function toResult(input: {
   readonly mode: WaitCommandMode;
   readonly run: Run;
   readonly outcome: Pick<WaitAwaitOutcome, 'observation' | 'change' | 'wake' | 'ledger' | 'observationCount' | 'duplicateObservations' | 'timedOut' | 'idle'>;
 }): WaitCommandResult {
   const { observation, ledger } = input.outcome;
+  const pending = pendingWakeViews(ledger);
+  // A recorded-but-undelivered wake is a real decision boundary: surface it so
+  // a restart always hands the caller the same wake it would have before.
+  const replay = !input.outcome.wake.shouldWake && pending.length > 0;
+  const replayWake = replay ? pending[0]! : undefined;
   return {
     ok: true,
     mode: input.mode,
@@ -146,11 +166,20 @@ function toResult(input: {
     headSha: observation.headSha,
     observationDigest: ledger.lastDigest ?? '',
     change: input.outcome.change.kind,
-    wake: {
-      shouldWake: input.outcome.wake.shouldWake,
-      reason: input.outcome.wake.reason,
-      evidence: input.outcome.wake.evidence.map((item) => ({ kind: item.kind, detail: item.detail })),
-    },
+    wake: replayWake === undefined
+      ? {
+          shouldWake: input.outcome.wake.shouldWake,
+          reason: input.outcome.wake.reason,
+          evidence: input.outcome.wake.evidence.map((item) => ({ kind: item.kind, detail: item.detail })),
+        }
+      : {
+          shouldWake: true,
+          reason: replayWake.reason,
+          evidence: replayWake.evidence.map((item) => ({ kind: item.kind, detail: item.detail })),
+        },
+    pendingWakes: pending
+      .filter((wake) => replay || wake.id !== replayWake?.id)
+      .map((wake) => ({ id: wake.id, reason: wake.reason, subjectId: wake.subjectId, status: wake.status })),
     modelTurns: 0,
     timedOut: input.outcome.timedOut,
     idle: input.outcome.idle,
@@ -158,6 +187,7 @@ function toResult(input: {
     duplicateObservations: input.outcome.duplicateObservations,
     wakeCount: ledger.wakes.length,
     waitStartedAt: ledger.waitStartedAt,
+    observedDigest: ledger.lastDigest ?? '',
   };
 }
 
@@ -238,6 +268,19 @@ export async function waitAwaitCommand(
     });
   }
   return toResult({ mode: 'wait', run, outcome });
+}
+
+/**
+ * Mark every wake this result carried (new or replayed) as delivered. Called by
+ * the caller only after the result has actually been emitted, so a crash before
+ * delivery leaves the wake pending for the next process to replay.
+ */
+export function acknowledgeWaitDelivery(result: WaitCommandResult, ledgerStore: WaitLedgerStore): void {
+  if (result.wake.shouldWake !== true && result.pendingWakes.length === 0) return;
+  const ledger = ledgerStore.read();
+  if (ledger === null) return;
+  const pending = pendingWakeViews(ledger);
+  ledgerStore.write(markWaitWakesDelivered(ledger, pending.map((wake) => wake.id)));
 }
 
 function readRun(id: string, store: RunStore): Run {

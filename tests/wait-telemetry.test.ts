@@ -118,6 +118,9 @@ describe('wait ledger structural validation', () => {
     assert.equal(isWaitLedger({ ...advanced, previousWasNative: 'yes' }), false);
     assert.equal(isWaitLedger({ ...advanced, nativeIdentities: 'nope' }), false);
     assert.equal(isWaitLedger({ ...advanced, nativeIdentities: [3] }), false);
+    assert.equal(isWaitLedger({ ...advanced, deliveredWakeIds: 'nope' }), false);
+    assert.equal(isWaitLedger({ ...advanced, deliveredWakeIds: [''] }), false);
+    assert.equal(isWaitLedger({ ...advanced, surfacedDigests: [''] }), false);
   });
 });
 
