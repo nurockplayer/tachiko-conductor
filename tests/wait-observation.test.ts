@@ -77,6 +77,18 @@ describe('wait observation contract', () => {
     assert.equal(decision.shouldWake, false);
   });
 
+  it('treats persisted native active -> idle as completion across restart/re-entry', () => {
+    const active = normalize('active', { source: 'native' });
+    const idle = normalize('idle', { source: 'native' });
+    const reloadedPrevious: WaitObservation = JSON.parse(JSON.stringify(active));
+    const change = classifyWaitChange(reloadedPrevious, idle);
+    assert.equal(change.kind, 'completion');
+    assert.equal(change.meaningful, true);
+    const decision = decideWaitWake({ change, observation: idle });
+    assert.equal(decision.shouldWake, true);
+    assert.equal(decision.reason, 'completion');
+  });
+
   it('treats completion, failure, and blocked transitions as exactly one meaningful change', () => {
     for (const status of ['completed', 'failed', 'blocked'] as const) {
       const previous = normalize('active');
