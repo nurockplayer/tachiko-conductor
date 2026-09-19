@@ -437,13 +437,102 @@ describe('#35 native observation reuse', () => {
     }).observe();
     assert.equal(idle.status, 'idle');
 
-    const failed = await new NativeThreadWaitObserver({
+    // A native system error is ambiguous, not an authoritative failure. It must
+    // never fabricate a failure wake on its own.
+    const errored = await new NativeThreadWaitObserver({
       client: { observeThread: async (threadId: string) => ({ threadId, status: 'system_error', history: [] }) },
       threadId: 'thread-1',
       now: () => T0,
       subjectId: SUBJECT,
     }).observe();
-    assert.equal(failed.status, 'failed');
+    assert.equal(errored.status, 'unavailable');
+    assert.equal(classifyWaitChange(null, errored).meaningful, false);
+  });
+
+  it('distinguishes successive native turn completions after a saturated history', async () => {
+    // A provider whose bounded history has saturated (100 items) must still let
+    // two distinct turn completions produce two distinct, waking transitions.
+    const run = { ...applyTransition(newRun(SUBJECT), { type: 'start' }, T0), executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } };
+    const saturated = Array.from({ length: 100 }, (_, index) => ({ id: `item-${index}`, type: 'agentMessage' }));
+    let turnCount = 1;
+    let lastCompletedTurnId = 'turn-1';
+    let status: 'active' | 'idle' = 'active';
+    const observer = (): RunRuntimeObserver => new RunRuntimeObserver(run, {
+      now: () => T0,
+      nativeObserver: {
+        snapshot: async () => ({
+          status,
+          ...(status === 'active' ? { activeItemId: `turn-${turnCount}` } : {}),
+          turns: turnCount,
+          lastCompletedTurnId,
+          ...({} as Record<string, never>),
+          evidence: [],
+        }),
+      },
+    });
+    void saturated;
+
+    const activeOne = await observer().observe();
+    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: activeOne, at: T0 }).ledger;
+    status = 'idle';
+    const doneOne = await observer().observe();
+    const first = advanceWaitLedger({ ledger, observation: doneOne, at: T0 });
+    assert.equal(first.change.kind, 'completion');
+    assert.equal(first.wokeNow, true);
+    ledger = first.ledger;
+
+    // Second turn: active again, then a different completed turn id.
+    turnCount = 2;
+    lastCompletedTurnId = 'turn-2';
+    status = 'active';
+    const activeTwo = await observer().observe();
+    ledger = advanceWaitLedger({ ledger, observation: activeTwo, at: T0 }).ledger;
+    status = 'idle';
+    const doneTwo = await observer().observe();
+    assert.notEqual(waitObservationDigest(doneOne), waitObservationDigest(doneTwo));
+    const second = advanceWaitLedger({ ledger, observation: doneTwo, at: T0 });
+    assert.equal(second.change.kind, 'completion');
+    assert.equal(second.wokeNow, true);
+    assert.equal(second.ledger.wakes.length, 2);
+  });
+
+  it('never fabricates a completion wake from an ambiguous native read', async () => {
+    const run = { ...applyTransition(newRun(SUBJECT), { type: 'start' }, T0), executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } };
+    let mode: 'throw' | 'not_loaded' | 'idle' = 'throw';
+    const observer = (): RunRuntimeObserver => new RunRuntimeObserver(run, {
+      now: () => T0,
+      nativeObserver: {
+        snapshot: async () => {
+          if (mode === 'throw') throw new Error('transient native read failure');
+          if (mode === 'not_loaded') return { status: 'unknown' };
+          return { status: 'idle' };
+        },
+      },
+    });
+    // A transient read failure degrades to the durable runtime observation.
+    const degraded = await observer().observe();
+    assert.equal(degraded.source, 'runtime');
+    assert.equal(degraded.status, 'active');
+    // Recovery to idle must be progress, not a fabricated completion.
+    mode = 'idle';
+    const recovered = await observer().observe();
+    assert.equal(recovered.status, 'idle');
+    assert.equal(classifyWaitChange(degraded, recovered).kind, 'progress');
+    const advance = advanceWaitLedger({ ledger: advanceWaitLedger({ ledger: ledgerFor(), observation: degraded, at: T0 }).ledger, observation: recovered, at: T0 });
+    assert.equal(advance.wokeNow, false);
+
+    // A not-loaded thread is equally ambiguous.
+    let ledger = ledgerFor();
+    mode = 'not_loaded';
+    const notLoaded = await observer().observe();
+    assert.equal(notLoaded.source, 'runtime');
+    assert.equal(notLoaded.status, 'active');
+    ledger = advanceWaitLedger({ ledger, observation: notLoaded, at: T0 }).ledger;
+    mode = 'idle';
+    const afterLoad = await observer().observe();
+    const ambiguous = advanceWaitLedger({ ledger, observation: afterLoad, at: T0 });
+    assert.equal(ambiguous.change.kind, 'progress');
+    assert.equal(ambiguous.wokeNow, false);
   });
 
   it('presents the same normalized baseline wake semantics as the fallback path', async () => {

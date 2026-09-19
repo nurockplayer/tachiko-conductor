@@ -189,6 +189,8 @@ export interface NativeWaitSnapshot {
   readonly activeItemId?: string;
   readonly items?: number;
   readonly turns?: number;
+  /** Most recent completed native turn identity, when the provider reports one. */
+  readonly lastCompletedTurnId?: string;
   readonly evidence?: readonly WaitEvidence[];
 }
 
@@ -215,6 +217,12 @@ export class RunRuntimeObserver implements WaitObserver {
 
   async observe(): Promise<WaitObservation> {
     const native = await this.observeNative();
+    // Provenance is explicit: a native read that did not determine the status is
+    // ambiguous evidence, reported as the deterministic runtime source, so it
+    // can never masquerade as a genuine native turn boundary.
+    const merged = resolveRuntimeStatus(runWaitStatus(this.run.state), native);
+    const usedNativeStatus = merged.source === 'native';
+    const nativeField = <T>(value: T): T | undefined => usedNativeStatus ? value : undefined;
     const durableHead = this.run.headSha ?? null;
     // A failed or unavailable exact-HEAD probe must not masquerade as a head
     // move; fall back to durable state and let the next read reconcile.
@@ -225,15 +233,16 @@ export class RunRuntimeObserver implements WaitObserver {
     const evidence: WaitEvidence[] = [];
     if (headSha !== null && headSha !== durableHead) evidence.push({ kind: 'head-changed', detail: `workspace head ${shorten(headSha)}` });
     const snapshot: WaitSubjectSnapshot = {
-      status: mergeRuntimeStatus(runWaitStatus(this.run.state), native),
-      ...(native?.activeItemId === undefined ? {} : { activeItemId: native.activeItemId }),
-      items: native?.items ?? this.run.history.length,
-      ...(native?.turns === undefined ? {} : { turns: native.turns }),
+      status: merged.status,
+      ...(nativeField(native?.activeItemId) === undefined ? {} : { activeItemId: nativeField(native?.activeItemId)! }),
+      items: nativeField(native?.items) ?? this.run.history.length,
+      ...(nativeField(native?.turns) === undefined ? {} : { turns: nativeField(native?.turns)! }),
+      ...(nativeField(native?.lastCompletedTurnId) === undefined ? {} : { lastCompletedTurnId: nativeField(native?.lastCompletedTurnId)! }),
       ...(headSha === null ? {} : { headSha }),
-      evidence: [...(native?.evidence ?? []), ...evidence],
+      evidence: [...(usedNativeStatus ? native?.evidence ?? [] : []), ...evidence],
     };
     return normalizeWaitObservation({
-      source: native === undefined ? this.source : 'native',
+      source: usedNativeStatus ? 'native' : this.source,
       subjectId: this.subjectId,
       observedAt: this.dependencies.now(),
       snapshot,
@@ -260,24 +269,25 @@ export class RunRuntimeObserver implements WaitObserver {
 /**
  * Combine the authoritative durable Run status with optional native evidence.
  *
- * Native observation is enrichment: it can only refine a non-terminal durable
- * state, never mask it. A durable `failed`/`blocked`/`completed` Run always
- * wins, so a finished or not-loaded native thread cannot hide a terminal wake.
- * Conversely an actively running native thread is `active` even when the
- * durable Run is parked, which is a real decision boundary.
+ * Native observation is enrichment, never authority. A durable
+ * `failed`/`blocked`/`completed` Run always wins, so a finished or not-loaded
+ * native thread cannot hide a terminal or blocked wake. A genuinely active
+ * native thread is real in-flight work even when the durable Run is parked, so
+ * it refines a non-terminal durable state. `unknown` and `unavailable` native
+ * reads never override durable state and are not reported as native provenance.
  */
+export function resolveRuntimeStatus(durable: WaitSubjectStatus, native: NativeWaitSnapshot | undefined): { readonly status: WaitSubjectStatus; readonly source: 'native' | 'runtime' } {
+  if (durable === 'completed' || durable === 'failed' || durable === 'blocked') return { status: durable, source: 'runtime' };
+  if (native === undefined) return { status: durable, source: 'runtime' };
+  if (native.status === 'completed' || native.status === 'failed' || native.status === 'blocked' || native.status === 'active' || native.status === 'idle') {
+    return { status: native.status, source: 'native' };
+  }
+  return { status: durable, source: 'runtime' };
+}
+
+/** Status-only view of {@link resolveRuntimeStatus}. */
 export function mergeRuntimeStatus(durable: WaitSubjectStatus, native: NativeWaitSnapshot | undefined): WaitSubjectStatus {
-  if (durable === 'completed' || durable === 'failed' || durable === 'blocked') return durable;
-  if (native === undefined) return durable;
-  if (native.status === 'completed') return 'completed';
-  if (native.status === 'failed') return 'failed';
-  if (native.status === 'blocked') return 'blocked';
-  if (native.status === 'active') return 'active';
-  // An idle thread is non-terminal here. The durable previous state decides
-  // whether active -> idle is a completion boundary (classifyWaitChange), so
-  // the signal survives a runtime restart that has no in-process memory.
-  if (native.status === 'idle') return 'idle';
-  return durable;
+  return resolveRuntimeStatus(durable, native).status;
 }
 
 function runWaitStatus(state: WorkflowState): WaitSubjectStatus {
@@ -344,10 +354,15 @@ export class NativeThreadWaitObserver {
       detail: `${item.type}:${item.id}`.slice(0, 120),
     }));
     if (observation.activeTurnId !== undefined) evidence.push({ kind: 'turn-started', detail: observation.activeTurnId.slice(0, 120) });
+    if (observation.lastCompletedTurnId !== undefined) {
+      evidence.push({ kind: 'turn-completed', detail: `completed turn ${observation.lastCompletedTurnId}`.slice(0, 120) });
+    }
     return {
       status: nativeStatus(observation.status, observation.activeTurnId),
       ...(observation.activeTurnId === undefined ? {} : { activeItemId: observation.activeTurnId }),
-      turns: observation.history.length,
+      // Use the uncapped runtime turn count, never the bounded item history.
+      turns: observation.turnCount ?? observation.history.length,
+      ...(observation.lastCompletedTurnId === undefined ? {} : { lastCompletedTurnId: observation.lastCompletedTurnId }),
       evidence,
     };
   }
@@ -356,8 +371,11 @@ export class NativeThreadWaitObserver {
 function nativeStatus(status: NativeThreadObservation['status'], activeTurnId: string | undefined): WaitSubjectStatus {
   if (status === 'active' || activeTurnId !== undefined) return 'active';
   if (status === 'idle') return 'idle';
+  // `not_loaded` and `system_error` are ambiguous/transient native states, never
+  // an authoritative terminal signal. They degrade to the durable Run status
+  // and are reported as `unavailable` so they cannot fabricate a wake.
   if (status === 'not_loaded') return 'unknown';
-  return 'failed';
+  return 'unavailable';
 }
 
 /**

@@ -52,6 +52,8 @@ export interface WaitObservation {
     readonly items: number;
     readonly turns: number;
   };
+  /** Most recent completed native turn identity, when the provider reports one. */
+  readonly lastCompletedTurnId?: string;
   readonly headSha: string | null;
   /** Bounded, normalized evidence. Never raw output. */
   readonly evidence: readonly WaitEvidence[];
@@ -65,6 +67,12 @@ export interface WaitObservationState {
   readonly activeItemId: string | null;
   readonly items: number;
   readonly turns: number;
+  /**
+   * Identity of the most recent completed native turn. Monotonic and uncapped,
+   * so two distinct turn completions can never normalize to one digest once a
+   * provider's bounded history has saturated.
+   */
+  readonly lastCompletedTurnId: string | null;
   readonly headSha: string | null;
 }
 
@@ -113,6 +121,7 @@ export interface WaitSubjectSnapshot {
   readonly activeItemId?: string;
   readonly items?: number;
   readonly turns?: number;
+  readonly lastCompletedTurnId?: string;
   readonly headSha?: string | null;
   readonly evidence?: readonly WaitEvidence[];
 }
@@ -133,6 +142,7 @@ export function normalizeWaitObservation(input: WaitObservationInput): WaitObser
     status: input.snapshot.status,
     ...(input.snapshot.activeItemId === undefined ? {} : { activeItemId: input.snapshot.activeItemId }),
     progress: { items: input.snapshot.items ?? 0, turns: input.snapshot.turns ?? 0 },
+    ...(input.snapshot.lastCompletedTurnId === undefined ? {} : { lastCompletedTurnId: input.snapshot.lastCompletedTurnId }),
     headSha: input.snapshot.headSha ?? null,
     evidence: input.snapshot.evidence ?? [],
     observedAt: input.observedAt,
@@ -147,6 +157,7 @@ export function waitObservationState(observation: WaitObservation): WaitObservat
     activeItemId: observation.activeItemId ?? null,
     items: observation.progress.items,
     turns: observation.progress.turns,
+    lastCompletedTurnId: observation.lastCompletedTurnId ?? null,
     headSha: observation.headSha,
   };
 }
@@ -233,27 +244,29 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
     // Identical normalized state: coalesced, zero wakeups.
     return { kind: 'none', meaningful: false, evidence: [] };
   }
-  // A native App Server turn is complete when the same durable subject moves
-  // from active to idle. This transition is classified from durable normalized
-  // observations rather than only in-memory observer state, so a process
-  // restart or separate `wait observe` invocation cannot lose the completion.
+  // A native App Server turn is complete when the same subject genuinely moves
+  // from active to idle. Both sides must be real native reads: an ambiguous
+  // native status degrades to a durable-derived status whose `source` is
+  // `runtime`, so a transient native read failure or a not-loaded thread can
+  // never masquerade as a completed turn.
   if (previous.source === 'native' && next.source === 'native' && previous.status === 'active' && next.status === 'idle') {
     return {
       kind: 'completion',
       meaningful: true,
-      evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} native turn completed`),
+      evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} native turn completed${next.lastCompletedTurnId === undefined ? '' : ` (${next.lastCompletedTurnId})`}`),
     };
   }
   if (next.status !== previous.status) {
-    if (next.status === 'completed') return { kind: 'completion', meaningful: true, evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} completed`) };
-    if (next.status === 'failed') return { kind: 'failure', meaningful: true, evidence: transitionEvidence(previous, next, 'failure', `subject ${next.subjectId} failed`) };
-    if (next.status === 'blocked') return { kind: 'blocked', meaningful: true, evidence: transitionEvidence(previous, next, 'blocked', `subject ${next.subjectId} is blocked`) };
-    // A subject that stops being active has reached a completion boundary. This
-    // is derived from the durable previous state, never from in-process
-    // observer memory, so it survives a runtime restart.
-    if (previous.status === 'active' && next.status === 'idle') {
-      return { kind: 'completion', meaningful: true, evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} left its active state`) };
+    // A status change observed through a different source is a provenance
+    // change, not a workflow transition; it stays progress-only.
+    const sameSource = previous.source === next.source;
+    if (next.status === 'completed') {
+      return sameSource
+        ? { kind: 'completion', meaningful: true, evidence: terminalEvidence(next, 'completion') }
+        : { kind: 'progress', meaningful: true, evidence: [{ kind: 'status-changed', detail: `subject ${next.subjectId} reported completed` }] };
     }
+    if (next.status === 'failed' && sameSource) return { kind: 'failure', meaningful: true, evidence: terminalEvidence(next, 'failure') };
+    if (next.status === 'blocked' && sameSource) return { kind: 'blocked', meaningful: true, evidence: terminalEvidence(next, 'blocked') };
     if (next.status === 'unavailable') return { kind: 'progress', meaningful: true, evidence: transitionEvidence(previous, next, 'unavailable', `subject ${next.subjectId} became unavailable`) };
     return { kind: 'progress', meaningful: true, evidence: transitionEvidence(previous, next, 'status-changed', `subject ${next.subjectId} changed status`) };
   }
@@ -265,8 +278,16 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
       evidence: [{ kind: 'head-changed', detail: `head ${shortSha(previous.headSha)} -> ${shortSha(next.headSha)}` }, ...(next.evidence.length === 0 ? [] : next.evidence)],
     };
   }
-  // Same status: a monotonic progress advance, an active-item change, or newly
-  // reported evidence counts as progress, and progress never wakes a model.
+  // Same status: a monotonic progress advance, a new completed-turn identity,
+  // an active-item change, or newly reported evidence counts as progress, and
+  // progress never wakes a model.
+  if ((previous.lastCompletedTurnId ?? null) !== (next.lastCompletedTurnId ?? null)) {
+    return {
+      kind: 'progress',
+      meaningful: true,
+      evidence: [{ kind: 'turn-completed', detail: `completed turn ${previous.lastCompletedTurnId ?? 'none'} -> ${next.lastCompletedTurnId ?? 'none'}` }],
+    };
+  }
   if (next.progress.items > previous.progress.items || next.progress.turns > previous.progress.turns) {
     return {
       kind: 'progress',
@@ -445,6 +466,7 @@ export function advanceWaitLedger(input: {
         status: last.status,
         ...(last.state.activeItemId === null ? {} : { activeItemId: last.state.activeItemId }),
         progress: { items: last.state.items, turns: last.state.turns },
+        ...(last.state.lastCompletedTurnId === null ? {} : { lastCompletedTurnId: last.state.lastCompletedTurnId }),
         headSha: last.state.headSha,
         evidence: [],
         observedAt: last.at,
@@ -582,6 +604,7 @@ function isWaitObservationState(value: unknown): value is WaitObservationState {
     (state.activeItemId === null || typeof state.activeItemId === 'string') &&
     Number.isSafeInteger(state.items) && (state.items as number) >= 0 &&
     Number.isSafeInteger(state.turns) && (state.turns as number) >= 0 &&
+    (state.lastCompletedTurnId === null || state.lastCompletedTurnId === undefined || typeof state.lastCompletedTurnId === 'string') &&
     (state.headSha === null || typeof state.headSha === 'string');
 }
 
