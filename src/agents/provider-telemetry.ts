@@ -24,24 +24,51 @@ function firstNumber(source: Record<string, unknown>, keys: readonly string[]): 
   return undefined;
 }
 
+/** Read a non-negative number from the first present nested details object. */
+function nestedNumber(
+  source: Record<string, unknown>,
+  parentKeys: readonly string[],
+  childKeys: readonly string[],
+): number | undefined {
+  for (const parentKey of parentKeys) {
+    const parent = record(source[parentKey]);
+    if (parent === undefined) continue;
+    const value = firstNumber(parent, childKeys);
+    if (value !== undefined) return value;
+  }
+  return undefined;
+}
+
 /** Parse provider-reported usage without retaining any raw provider payload. */
 export function tokenUsageFromProviderValue(value: unknown): ProviderTokenUsage | undefined {
   const usage = record(value);
   if (usage === undefined) return undefined;
   const inputTokens = firstNumber(usage, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']);
-  const cachedInputTokens = firstNumber(usage, [
-    'cached_input_tokens',
-    'cachedInputTokens',
-    'cache_read_input_tokens',
-    'cacheReadInputTokens',
-  ]);
+  // DeepSeek chat completions reports cache hits at the top level and under prompt_tokens_details.
+  const cachedInputTokens =
+    firstNumber(usage, [
+      'cached_input_tokens',
+      'cachedInputTokens',
+      'cache_read_input_tokens',
+      'cacheReadInputTokens',
+      'prompt_cache_hit_tokens',
+      'promptCacheHitTokens',
+    ]) ??
+    nestedNumber(usage, ['prompt_tokens_details', 'promptTokensDetails'], ['cached_tokens', 'cachedTokens']);
   const outputTokens = firstNumber(usage, ['output_tokens', 'outputTokens', 'completion_tokens', 'completionTokens']);
-  const reasoningTokens = firstNumber(usage, [
-    'reasoning_output_tokens',
-    'reasoningOutputTokens',
-    'reasoning_tokens',
-    'reasoningTokens',
-  ]);
+  // DeepSeek reports reasoning tokens under completion_tokens_details.
+  const reasoningTokens =
+    firstNumber(usage, [
+      'reasoning_output_tokens',
+      'reasoningOutputTokens',
+      'reasoning_tokens',
+      'reasoningTokens',
+    ]) ??
+    nestedNumber(
+      usage,
+      ['completion_tokens_details', 'completionTokensDetails'],
+      ['reasoning_tokens', 'reasoningTokens'],
+    );
   if ([inputTokens, cachedInputTokens, outputTokens, reasoningTokens].every((item) => item === undefined)) {
     return undefined;
   }

@@ -427,6 +427,8 @@ export class DeepSeekApiClient implements ReviewApiClient {
       telemetry: providerTelemetry({
         provider: 'deepseek',
         ...(typeof data.model === 'string' && data.model.trim() !== '' ? { model: data.model } : { model: options.model }),
+        // A successful chat-completions call is exactly one model invocation.
+        turns: 1,
         ...(usage === undefined ? {} : { usage }),
         ...(context === undefined ? {} : { context }),
       }),
