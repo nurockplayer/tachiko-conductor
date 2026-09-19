@@ -541,21 +541,51 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
         }),
       };
     } catch (error) {
+      const safeError = this.redactErrorOutput(error, spec.env);
       const cleanup = await this.proveQuiescent(id);
       if (!cleanup.quiescent) {
         // Containment takes precedence over the ordinary worker failure: never
         // return while the exact container may still be alive and mutating.
         throw new WorkerRouterContainerError(
           WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
-          `Container ${id.slice(0, 12)} cleanup could not prove quiescence (${cleanup.detail}); refusing to report the worker failure as contained. Original failure: ${boundedMessage(error, 200)}`,
-          error,
+          `Container ${id.slice(0, 12)} cleanup could not prove quiescence (${cleanup.detail}); refusing to report the worker failure as contained. Original failure: ${boundedMessage(safeError, 200)}`,
+          safeError,
+          errorOutput(safeError),
         );
       }
       if (isAborted(spec.signal)) {
-        throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED, 'The worker container was cancelled.', error);
+        throw new WorkerRouterContainerError(
+          WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED,
+          'The worker container was cancelled.',
+          safeError,
+          errorOutput(safeError),
+        );
       }
-      throw error;
+      throw safeError;
     }
+  }
+
+  /** Rebuild error evidence from redacted previews before it can leave the boundary. */
+  private redactErrorOutput(error: unknown, env: Readonly<Record<string, string>>): unknown {
+    const output = errorOutput(error);
+    if (output === undefined) return error;
+    const safeOutput = boundToolOutput({
+      outcome: output.outcome,
+      exitCode: output.exitCode,
+      stdout: redactContainerSecrets(output.stdout.preview, env),
+      stderr: redactContainerSecrets(output.stderr.preview, env),
+      summary: redactContainerSecrets(output.summary, env),
+      store: this.outputStore,
+      policy: this.outputPolicy,
+      // The original artifact may have been captured before the boundary had
+      // a chance to redact it. The replacement artifact is intentionally only
+      // the bounded, redacted evidence visible to callers.
+      captureTruncated: true,
+    });
+    if (error instanceof WorkerRouterContainerError) {
+      return new WorkerRouterContainerError(error.code, error.message, error, safeOutput);
+    }
+    return Object.assign(new Error(error instanceof Error ? error.message : boundedMessage(error)), error, { output: safeOutput });
   }
 
   /**

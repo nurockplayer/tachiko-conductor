@@ -169,6 +169,40 @@ describe('ContainerWorkerBoundary', () => {
     assert.equal(runtime.calls.filter((call) => call === 'create').length, 1);
   });
 
+  it('redacts timeout evidence before returning it from the container boundary', async () => {
+    const runtime = new FakeRuntime();
+    const store = new InMemoryToolOutputStore();
+    const secret = 'sk-timeout-secret';
+    runtime.startError = new WorkerRouterContainerError(
+      WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT,
+      'worker timed out',
+      undefined,
+      boundToolOutput({
+        outcome: 'timed_out',
+        exitCode: null,
+        stdout: `worker stdout ${secret}`,
+        stderr: `worker stderr ${secret}`,
+        store: new InMemoryToolOutputStore(),
+      }),
+    );
+
+    let thrown: unknown;
+    try {
+      await new ContainerWorkerBoundary({ runtime, outputStore: store }).run(
+        spec({ env: { HOME: '/root', DEEPSEEK_API_KEY: secret } }),
+      );
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof WorkerRouterContainerError);
+    assert.equal(thrown.code, WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT);
+    assert.ok(thrown.output);
+    assert.equal(thrown.output.stdout.preview.includes(secret), false);
+    assert.equal(thrown.output.stderr.preview.includes(secret), false);
+    assert.equal(thrown.output.diagnostics.some((line) => line.includes(secret)), false);
+    assert.equal(searchToolOutput(thrown.output, store, { query: secret }).length, 0);
+  });
+
   it('cleans up by exact ID on cancellation and reports a single bounded cleanup', async () => {
     const controller = new AbortController();
     const runtime = new FakeRuntime();
