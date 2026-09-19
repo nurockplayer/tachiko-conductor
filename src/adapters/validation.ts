@@ -1,5 +1,6 @@
 import type { LocalValidationEvidence } from '../domain/types.js';
 import type { IssueTarget } from '../domain/types.js';
+import type { ToolOutputPolicy, ToolOutputStore } from '../evidence/tool-output.js';
 import type { HostedCheckPolicy } from '../validation/hosted-policy.js';
 
 /** One explicitly configured executable and its bounded wall-clock limit. */
@@ -18,6 +19,9 @@ export interface LocalValidationConfiguration {
    * identity before commands execute.
    */
   readonly workspacePath?: string;
+  /** Optional task-specific preview budget and evidence destination. */
+  readonly outputPolicy?: ToolOutputPolicy;
+  readonly outputStore?: ToolOutputStore;
 }
 
 /** Explicit repository/run policy used to interpret the live hosted check list. */

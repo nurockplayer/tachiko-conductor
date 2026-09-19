@@ -150,7 +150,11 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     const diagnostics = boundedDiagnostics(result.stderr, result.stdout, provenance);
     if (result.exitCode !== 0) {
       const durationMs = elapsed(startedAt);
-      return { ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics] };
+      return {
+        ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs),
+        diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics],
+        ...(result.output === undefined ? {} : { output: result.output }),
+      };
     }
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
     // The exact container is terminal before this point; only now may the
@@ -160,7 +164,11 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
     if (head === null) {
       const durationMs = elapsed(startedAt);
-      return { ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics] };
+      return {
+        ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs),
+        diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics],
+        ...(result.output === undefined ? {} : { output: result.output }),
+      };
     }
     const ancestry = await this.verifyBaseAncestry(request.signal, cwd, request.baseSha, head);
     if (!ancestry.ok) {
@@ -169,6 +177,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       return {
         ...failure(WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED, `Worker router HEAD ${head} does not prove descent from the authorized base.`, durationMs),
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED}: ${ancestry.detail}`, ...diagnostics, ...ancestry.diagnostics],
+        ...(result.output === undefined ? {} : { output: result.output }),
       };
     }
     const published = await this.publishHead(request.signal, cwd, head, branch);
@@ -178,9 +187,21 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       return {
         ...failure(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED, `Worker router committed ${head}, but Conductor could not publish it to origin/${branch}.`, durationMs),
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED}: ${published.detail}`, ...diagnostics, ...published.diagnostics],
+        ...(result.output === undefined ? {} : { output: result.output }),
       };
     }
-    return { exitStatus: 'success', summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.', headSha: head, telemetry: providerTelemetry({ provider: WORKER_ROUTER_PROVIDER }), ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
+    return {
+      exitStatus: 'success',
+      summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.',
+      headSha: head,
+      telemetry: providerTelemetry({
+        provider: WORKER_ROUTER_PROVIDER,
+        ...(result.output === undefined ? {} : { largestToolResultBytes: result.output.artifact.totalBytes }),
+      }),
+      ...(diagnostics.length === 0 ? {} : { diagnostics }),
+      ...(result.output === undefined ? {} : { output: result.output }),
+      durationMs: elapsed(startedAt),
+    };
   }
 
   private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined): WorkerContainerSpec {

@@ -2,6 +2,7 @@ import { spawn, spawnSync } from 'node:child_process';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
 import type { LocalValidationConfiguration, ValidationAdapter, ValidationRequest } from '../adapters/validation.js';
+import { boundToolOutput, FileToolOutputStore, type ToolOutputPolicy, type ToolOutputStore } from '../evidence/tool-output.js';
 
 function malformed(commandIndex: number, executable = ''): LocalValidationCommandEvidence {
   return { commandIndex, executable, outcome: 'malformed', exitCode: null, durationMs: 0 };
@@ -114,6 +115,8 @@ async function execute(
   commandIndex: number,
   command: { readonly argv: readonly string[]; readonly timeoutMs: number },
   workspacePath: string,
+  outputStore: ToolOutputStore,
+  outputPolicy: ToolOutputPolicy | undefined,
 ): Promise<LocalValidationCommandEvidence> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
@@ -123,12 +126,20 @@ async function execute(
     let timer: NodeJS.Timeout | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
     let settling = false;
+    let stdout = '';
+    let stderr = '';
     const finish = (outcome: LocalValidationCommandEvidence['outcome'], exitCode: number | null): void => {
       if (settled) return;
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       if (forceTimer !== undefined) clearTimeout(forceTimer);
-      resolve({ commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt });
+      resolve({
+        commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
+        output: boundToolOutput({
+          outcome: outcome === 'passed' ? 'passed' : outcome === 'failed' ? 'failed' : outcome === 'timed_out' ? 'timed_out' : 'unknown',
+          exitCode, stdout, stderr, store: outputStore, policy: outputPolicy,
+        }),
+      });
     };
     const settleTimedOutProcess = async (child: ReturnType<typeof spawn>): Promise<void> => {
       if (settling || settled) return;
@@ -147,12 +158,16 @@ async function execute(
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(executable, command.argv.slice(1), {
-        shell: false, stdio: 'ignore', cwd: workspacePath, detached: process.platform !== 'win32',
+        shell: false, stdio: ['ignore', 'pipe', 'pipe'], cwd: workspacePath, detached: process.platform !== 'win32',
       });
     } catch {
       finish('unavailable', null);
       return;
     }
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', (chunk: string) => { stdout += chunk; });
+    child.stderr?.on('data', (chunk: string) => { stderr += chunk; });
     timer = setTimeout(() => {
       timedOut = true;
       if (process.platform === 'win32') {
@@ -179,10 +194,12 @@ async function execute(
 export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
   readonly kind = 'validation' as const;
   readonly configRevision: string;
+  private readonly outputStore: ToolOutputStore;
   readonly requiresOwnedWorkspace = true;
 
   constructor(private readonly configuration: LocalValidationConfiguration) {
     this.configRevision = configuration.revision;
+    this.outputStore = configuration.outputStore ?? new FileToolOutputStore();
   }
 
   async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
@@ -206,7 +223,13 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      const result = await execute(index, command, workspacePath);
+      const result = await execute(
+        index,
+        command,
+        workspacePath,
+        this.outputStore,
+        this.configuration.outputPolicy,
+      );
       evidence.push(result);
       if (result.outcome === 'failed' || result.outcome === 'timed_out') {
         return { status: 'failed', configRevision: revision, commands: evidence };

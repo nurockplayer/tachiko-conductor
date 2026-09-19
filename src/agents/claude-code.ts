@@ -16,6 +16,7 @@ import {
   type ProcessRunOptions,
 } from '../github/transport.js';
 import {
+  attachToolOutputTelemetry,
   providerTelemetry,
   tokenUsageFromProviderValue,
   usageContextFromTokenUsage,
@@ -48,6 +49,9 @@ export interface ClaudeCodeAdapterOptions {
   readonly allowedTools?: readonly string[];
   readonly github?: GitHubAdapter;
   readonly sessionId?: string;
+  /** Optional larger per-execution bounded-output budget and evidence store. */
+  readonly outputPolicy?: ProcessRunOptions['outputPolicy'];
+  readonly outputStore?: ProcessRunOptions['outputStore'];
 }
 
 const DEFAULT_TOOLS: readonly string[] = ['Read', 'Edit', 'Write', 'Bash'];
@@ -63,6 +67,7 @@ type ClaudeOutcome =
       readonly sessionId: string | undefined;
       readonly durationMs: number;
       readonly telemetry: ProviderExecutionTelemetry;
+      readonly output?: ProcessResult['output'];
     }
   | { readonly ok: false; readonly agentResult: AgentResult };
 
@@ -90,6 +95,8 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
   private readonly allowedTools: readonly string[];
   private readonly github: GitHubAdapter | undefined;
   private readonly initialSessionId: string | undefined;
+  private readonly outputPolicy: ProcessRunOptions['outputPolicy'];
+  private readonly outputStore: ProcessRunOptions['outputStore'];
 
   constructor(options: ClaudeCodeAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeClaudeProcessRunner();
@@ -99,6 +106,8 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     this.allowedTools = options.allowedTools ?? DEFAULT_TOOLS;
     this.github = options.github;
     this.initialSessionId = options.sessionId;
+    this.outputPolicy = options.outputPolicy;
+    this.outputStore = options.outputStore;
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -146,6 +155,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         ...(executor === undefined ? {} : { executor }),
         telemetry: outcome.telemetry,
         durationMs: outcome.durationMs,
+        ...(outcome.output === undefined ? {} : { output: outcome.output }),
       };
     }
     await assertWorkspaceGuard(request.workspaceGuard, 'after-execution', executor);
@@ -162,6 +172,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         ...(executor === undefined ? {} : { executor }),
         telemetry: outcome.telemetry,
         durationMs: outcome.durationMs,
+        ...(outcome.output === undefined ? {} : { output: outcome.output }),
       };
     }
     return {
@@ -171,6 +182,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       sessionId: outcome.sessionId,
       ...(executor === undefined ? {} : { executor }),
       telemetry: outcome.telemetry,
+      ...(outcome.output === undefined ? {} : { output: outcome.output }),
       durationMs: outcome.durationMs,
     };
   }
@@ -234,12 +246,13 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
-      result = await this.runner.run('claude', args, processOptions(this.timeoutMs, cwd, signal));
+      result = await this.runner.run('claude', args, processOptions(this.timeoutMs, cwd, signal, this.outputPolicy, this.outputStore));
     } catch (error) {
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
+      const output = processOutput(error);
       if (signal?.aborted === true || code === 'ABORT_ERR') {
-        return { ok: false, agentResult: cancelledAgentResult(durationMs, resumeSessionId) };
+        return { ok: false, agentResult: cancelledAgentResult(durationMs, resumeSessionId, output) };
       }
       if (code === 'ETIMEDOUT') {
         return failureAgentResult(
@@ -247,6 +260,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
           `Claude Code timed out after ${this.timeoutMs}ms.`,
           durationMs,
           resumeSessionId,
+          output,
         );
       }
       if (code === 'ENOENT') {
@@ -255,6 +269,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
           'Claude Code executable "claude" was not found.',
           durationMs,
           resumeSessionId,
+          output,
         );
       }
       return failureAgentResult(
@@ -262,6 +277,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         `Failed to run Claude Code: ${message(error)}`,
         durationMs,
         resumeSessionId,
+        output,
       );
     }
     const durationMs = elapsedMs(startedAt);
@@ -271,6 +287,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         `Claude Code exited with status ${result.exitCode}.`,
         durationMs,
         resumeSessionId,
+        result.output,
       );
     }
     const json = parseResultJson(result.stdout);
@@ -280,6 +297,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         'Claude Code returned invalid structured output.',
         durationMs,
         resumeSessionId,
+        result.output,
       );
     }
     if (json.is_error === true) {
@@ -288,27 +306,30 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         `Claude Code reported an error: ${json.result}`,
         durationMs,
         json.session_id ?? resumeSessionId,
+        result.output,
       );
     }
     const usage = tokenUsageFromProviderValue(json.usage);
     const context = usageContextFromTokenUsage(usage);
+    const telemetry = attachToolOutputTelemetry(providerTelemetry({
+      provider: CLAUDE_CODE_PROVIDER,
+      ...(this.model === undefined && json.model === undefined ? {} : { model: json.model ?? this.model }),
+      ...(usage === undefined ? {} : { usage }),
+      ...(context === undefined ? {} : { context }),
+    }), result.output);
     return {
       ok: true,
       summary: typeof json.result === 'string' && json.result !== '' ? json.result : 'Done.',
       sessionId: json.session_id ?? resumeSessionId,
-      telemetry: providerTelemetry({
-        provider: CLAUDE_CODE_PROVIDER,
-        ...(this.model === undefined && json.model === undefined ? {} : { model: json.model ?? this.model }),
-        ...(usage === undefined ? {} : { usage }),
-        ...(context === undefined ? {} : { context }),
-      }),
+      telemetry,
+      ...(result.output === undefined ? {} : { output: result.output }),
       durationMs,
     };
   }
 
   private async readHead(signal: AbortSignal | undefined, cwd: string): Promise<{ ok: true; sha: string } | { ok: false }> {
     try {
-      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], processOptions(this.timeoutMs, cwd, signal));
+      const result = await this.runner.run('git', ['rev-parse', 'HEAD'], processOptions(this.timeoutMs, cwd, signal, this.outputPolicy, this.outputStore));
       const sha = result.stdout.trim();
       if (result.exitCode === 0 && FULL_SHA.test(sha)) return { ok: true, sha };
       return { ok: false };
@@ -337,6 +358,7 @@ function failureAgentResult(
   detail: string,
   durationMs: number,
   sessionId?: string,
+  output?: ProcessResult['output'],
 ): { ok: false; agentResult: AgentResult } {
   return {
     ok: false,
@@ -347,6 +369,7 @@ function failureAgentResult(
       durationMs,
       sessionId,
       ...(executorIdentity(sessionId) === undefined ? {} : { executor: executorIdentity(sessionId) }),
+      ...(output === undefined ? {} : { output }),
     },
   };
 }
@@ -386,11 +409,23 @@ function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
 
-function processOptions(timeoutMs: number, cwd: string, signal: AbortSignal | undefined): ProcessRunOptions {
-  return signal === undefined ? { timeoutMs, cwd } : { timeoutMs, cwd, signal };
+function processOptions(
+  timeoutMs: number,
+  cwd: string,
+  signal: AbortSignal | undefined,
+  outputPolicy: ProcessRunOptions['outputPolicy'],
+  outputStore: ProcessRunOptions['outputStore'],
+): ProcessRunOptions {
+  return {
+    timeoutMs,
+    cwd,
+    ...(signal === undefined ? {} : { signal }),
+    ...(outputPolicy === undefined ? {} : { outputPolicy }),
+    ...(outputStore === undefined ? {} : { outputStore }),
+  };
 }
 
-function cancelledAgentResult(durationMs: number, sessionId?: string): AgentResult {
+function cancelledAgentResult(durationMs: number, sessionId?: string, output?: ProcessResult['output']): AgentResult {
   const detail = 'Claude Code execution was cancelled.';
   return {
     exitStatus: 'failure',
@@ -398,6 +433,7 @@ function cancelledAgentResult(durationMs: number, sessionId?: string): AgentResu
     diagnostics: [`${CLAUDE_ERROR_CODE.CANCELLED}: ${detail}`],
     sessionId,
     ...(executorIdentity(sessionId) === undefined ? {} : { executor: executorIdentity(sessionId) }),
+    ...(output === undefined ? {} : { output }),
     durationMs,
   };
 }
@@ -412,6 +448,12 @@ function executorIdentity(sessionId: string | undefined): ExecutorIdentity | und
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function processOutput(error: unknown): ProcessResult['output'] {
+  return typeof error === 'object' && error !== null && 'output' in error
+    ? (error as { output?: ProcessResult['output'] }).output
+    : undefined;
 }
 
 function formatTarget(target: Target): string {

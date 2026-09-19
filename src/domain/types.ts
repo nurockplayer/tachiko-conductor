@@ -9,6 +9,7 @@
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
+import type { ToolOutputEnvelope } from '../evidence/tool-output.js';
 
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;
@@ -115,6 +116,8 @@ export interface AgentResult {
   readonly durationMs?: number;
   /** Structured provider usage/provenance only; never raw output or hidden reasoning. */
   readonly telemetry?: ProviderExecutionTelemetry;
+  /** Bounded command/provider evidence with an explicit artifact drill-down. */
+  readonly output?: ToolOutputEnvelope;
 }
 
 export type ReviewVerdict = 'approve' | 'request_changes';
@@ -145,6 +148,8 @@ export interface LocalValidationCommandEvidence {
   readonly outcome: 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed';
   readonly exitCode: number | null;
   readonly durationMs: number;
+  /** Bounded stdout/stderr evidence; exitCode/outcome remain authoritative. */
+  readonly output?: ToolOutputEnvelope;
 }
 
 /** Durable provenance for deterministic local validation. It intentionally excludes command output. */

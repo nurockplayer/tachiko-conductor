@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
+import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
 import {
   CODEX_CAPABILITY_FALLBACK_REVISION,
   runtimeCapabilityCatalog,
@@ -197,6 +198,21 @@ describe('CodexCliAdapter', () => {
       assert.match(agentResult.diagnostics?.join('\n') ?? '', new RegExp(code));
       assert.equal(runner.calls.length, 1);
     }
+  });
+
+  it('preserves bounded provider failure evidence without weakening exact-HEAD handling', async () => {
+    const output = boundToolOutput({
+      outcome: 'failed', exitCode: 17, stdout: 'noise '.repeat(100), stderr: 'ERROR: provider failed\n',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
+    });
+    const runner = new FakeRunner([{ ...result('', 'ERROR: provider failed\n', 17), output }]);
+    const agentResult = await new CodexCliAdapter({ runner, cwd: '/tmp/repo' }).run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.equal(agentResult.output?.exitCode, 17);
+    assert.equal(agentResult.output?.overflow.truncated, true);
+    assert.equal(runner.calls.length, 1);
   });
 
   it('rejects stale or unusable resume identity before executing Codex', async () => {

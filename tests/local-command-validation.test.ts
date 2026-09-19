@@ -41,10 +41,11 @@ describe('ConfiguredLocalValidationAdapter', () => {
     ).validate(request());
 
     assert.equal(result.status, 'passed');
-    assert.deepEqual(result.commands, [{
-      commandIndex: 0, executable: process.execPath, outcome: 'passed', exitCode: 0,
-      durationMs: result.commands[0]?.durationMs,
-    }]);
+    assert.equal(result.commands[0]?.commandIndex, 0);
+    assert.equal(result.commands[0]?.executable, process.execPath);
+    assert.equal(result.commands[0]?.outcome, 'passed');
+    assert.equal(result.commands[0]?.exitCode, 0);
+    assert.equal(result.commands[0]?.output?.outcome, 'passed');
     assert.equal(Object.hasOwn(result.commands[0]!, 'argv'), false);
   });
 

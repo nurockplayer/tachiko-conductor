@@ -21,6 +21,7 @@ import {
   type ModelEffortPreflightResult,
 } from './model-capability.js';
 import {
+  attachToolOutputTelemetry,
   capabilityTelemetry,
   maximumBytes,
   mergeTokenUsage,
@@ -61,6 +62,9 @@ export interface CodexCliAdapterOptions {
   readonly reasoningEffort?: ExecutionReasoningEffort;
   readonly sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   readonly approvalPolicy?: 'untrusted' | 'on-request' | 'never';
+  /** Optional larger per-execution bounded-output budget and evidence store. */
+  readonly outputPolicy?: ProcessRunOptions['outputPolicy'];
+  readonly outputStore?: ProcessRunOptions['outputStore'];
   /** Provider-boundary capability source; defaults to the versioned Codex fallback. */
   readonly capabilityCatalog?: ModelCapabilityCatalog;
 }
@@ -92,6 +96,8 @@ export class CodexCliAdapter implements ImplementationAgent {
   private readonly sandboxMode: CodexCliAdapterOptions['sandboxMode'];
   private readonly approvalPolicy: CodexCliAdapterOptions['approvalPolicy'];
   private readonly capabilityCatalog: ModelCapabilityCatalog;
+  private readonly outputPolicy: ProcessRunOptions['outputPolicy'];
+  private readonly outputStore: ProcessRunOptions['outputStore'];
 
   constructor(options: CodexCliAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
@@ -102,6 +108,8 @@ export class CodexCliAdapter implements ImplementationAgent {
     this.sandboxMode = options.sandboxMode;
     this.approvalPolicy = options.approvalPolicy;
     this.capabilityCatalog = options.capabilityCatalog ?? codexFallbackCapabilityCatalog();
+    this.outputPolicy = options.outputPolicy;
+    this.outputStore = options.outputStore;
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -142,13 +150,16 @@ export class CodexCliAdapter implements ImplementationAgent {
     } catch (error) {
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
-      if (isAborted(request.signal) || code === 'ABORT_ERR') return cancelledAgentResult(durationMs, executor);
+      const output = processOutput(error);
+      if (isAborted(request.signal) || code === 'ABORT_ERR') return cancelledAgentResult(durationMs, executor, output);
       if (code === 'ETIMEDOUT') {
         return failureAgentResult(
           CODEX_ERROR_CODE.TIMEOUT,
           `Codex CLI timed out after ${this.timeoutMs}ms.`,
           durationMs,
           executor,
+          undefined,
+          output,
         );
       }
       if (code === 'ENOENT') {
@@ -157,6 +168,8 @@ export class CodexCliAdapter implements ImplementationAgent {
           'Codex CLI executable "codex" was not found.',
           durationMs,
           executor,
+          undefined,
+          output,
         );
       }
       return failureAgentResult(
@@ -164,6 +177,8 @@ export class CodexCliAdapter implements ImplementationAgent {
         `Failed to run Codex CLI: ${errorMessage(error)}`,
         durationMs,
         executor,
+        undefined,
+        output,
       );
     }
 
@@ -171,7 +186,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     if (result.exitCode !== 0) {
       const code = executor === undefined ? CODEX_ERROR_CODE.EXIT_FAILURE : CODEX_ERROR_CODE.RESUME_FAILED;
       const action = executor === undefined ? 'execution' : 'resume';
-      return failureAgentResult(code, `Codex ${action} exited with status ${result.exitCode}.`, durationMs, executor);
+      return failureAgentResult(code, `Codex ${action} exited with status ${result.exitCode}.`, durationMs, executor, undefined, result.output);
     }
 
     const parsed = parseCodexJsonl(result.stdout, {
@@ -180,13 +195,16 @@ export class CodexCliAdapter implements ImplementationAgent {
       ...(preflight.reasoningEffort === undefined ? {} : { reasoningEffort: preflight.reasoningEffort }),
       ...(capability === undefined ? {} : { capability }),
     });
-    if (!parsed.ok) return failureAgentResult(parsed.code, parsed.detail, durationMs, executor, parsed.telemetry);
+    if (!parsed.ok) return failureAgentResult(parsed.code, parsed.detail, durationMs, executor, parsed.telemetry, result.output);
+    const telemetry = attachToolOutputTelemetry(parsed.outcome.telemetry, result.output);
     if (executor !== undefined && parsed.outcome.executor.sessionId !== executor.sessionId) {
       return failureAgentResult(
         CODEX_ERROR_CODE.RESUME_IDENTITY_MISMATCH,
         `Codex resume returned thread ${parsed.outcome.executor.sessionId}, expected ${executor.sessionId}.`,
         durationMs,
         executor,
+        undefined,
+        result.output,
       );
     }
     const takeoverReason = parseHumanTakeover(parsed.outcome.summary);
@@ -196,7 +214,8 @@ export class CodexCliAdapter implements ImplementationAgent {
         summary: takeoverReason,
         diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
         executor: parsed.outcome.executor,
-        telemetry: parsed.outcome.telemetry,
+        telemetry,
+        ...(result.output === undefined ? {} : { output: result.output }),
         durationMs,
       };
     }
@@ -211,7 +230,8 @@ export class CodexCliAdapter implements ImplementationAgent {
         `Codex completed, but an exact 40-hex HEAD could not be read from ${this.cwd}.`,
         durationMs,
         parsed.outcome.executor,
-        parsed.outcome.telemetry,
+        telemetry,
+        result.output,
       );
     }
     return {
@@ -219,7 +239,8 @@ export class CodexCliAdapter implements ImplementationAgent {
       summary: parsed.outcome.summary,
       headSha: sha,
       executor: parsed.outcome.executor,
-      telemetry: parsed.outcome.telemetry,
+      telemetry,
+      ...(result.output === undefined ? {} : { output: result.output }),
       durationMs,
     };
   }
@@ -251,9 +272,13 @@ export class CodexCliAdapter implements ImplementationAgent {
   }
 
   private processOptions(signal: AbortSignal | undefined, cwd = this.cwd): ProcessRunOptions {
-    return signal === undefined
-      ? { timeoutMs: this.timeoutMs, cwd }
-      : { timeoutMs: this.timeoutMs, cwd, signal };
+    return {
+      timeoutMs: this.timeoutMs,
+      cwd,
+      ...(signal === undefined ? {} : { signal }),
+      ...(this.outputPolicy === undefined ? {} : { outputPolicy: this.outputPolicy }),
+      ...(this.outputStore === undefined ? {} : { outputStore: this.outputStore }),
+    };
   }
 
   /**
@@ -451,6 +476,7 @@ function failureAgentResult(
   durationMs: number,
   executor?: ExecutorIdentity,
   telemetry?: ProviderExecutionTelemetry,
+  output?: ProcessResult['output'],
 ): AgentResult {
   return {
     exitStatus: 'failure',
@@ -459,11 +485,12 @@ function failureAgentResult(
     durationMs,
     ...(executor === undefined ? {} : { executor }),
     ...(telemetry === undefined ? {} : { telemetry }),
+    ...(output === undefined ? {} : { output }),
   };
 }
 
-function cancelledAgentResult(durationMs: number, executor?: ExecutorIdentity): AgentResult {
-  return failureAgentResult(CODEX_ERROR_CODE.CANCELLED, 'Codex CLI execution was cancelled.', durationMs, executor);
+function cancelledAgentResult(durationMs: number, executor?: ExecutorIdentity, output?: ProcessResult['output']): AgentResult {
+  return failureAgentResult(CODEX_ERROR_CODE.CANCELLED, 'Codex CLI execution was cancelled.', durationMs, executor, undefined, output);
 }
 
 function isAborted(signal: AbortSignal | undefined): boolean {
@@ -480,4 +507,10 @@ function errorCode(error: unknown): unknown {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function processOutput(error: unknown): ProcessResult['output'] {
+  return typeof error === 'object' && error !== null && 'output' in error
+    ? (error as { output?: ProcessResult['output'] }).output
+    : undefined;
 }

@@ -25,6 +25,13 @@ import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
 import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
+import {
+  boundToolOutput,
+  FileToolOutputStore,
+  type ToolOutputEnvelope,
+  type ToolOutputPolicy,
+  type ToolOutputStore,
+} from '../evidence/tool-output.js';
 
 export const WORKER_ROUTER_IMAGE_ENV = 'TACHIKO_WORKER_ROUTER_IMAGE';
 export const WORKER_ROUTER_NETWORK_ENV = 'TACHIKO_WORKER_ROUTER_NETWORK';
@@ -126,6 +133,7 @@ export interface ContainerWorkerResult {
   readonly restartPolicy: string;
   readonly stdout: string;
   readonly stderr: string;
+  readonly output?: ToolOutputEnvelope;
 }
 
 /** Injectable seam so adapter tests never touch a real container runtime. */
@@ -458,10 +466,19 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
 export class ContainerWorkerBoundary implements ContainerWorkerExecution {
   private readonly runtime: WorkerContainerRuntime;
   private readonly cleanupGraceSeconds: number;
+  private readonly outputPolicy: ToolOutputPolicy | undefined;
+  private readonly outputStore: ToolOutputStore;
 
-  constructor(options: { readonly runtime?: WorkerContainerRuntime; readonly cleanupGraceSeconds?: number } = {}) {
+  constructor(options: {
+    readonly runtime?: WorkerContainerRuntime;
+    readonly cleanupGraceSeconds?: number;
+    readonly outputPolicy?: ToolOutputPolicy;
+    readonly outputStore?: ToolOutputStore;
+  } = {}) {
     this.runtime = options.runtime ?? new DockerWorkerContainerRuntime();
     this.cleanupGraceSeconds = options.cleanupGraceSeconds ?? 5;
+    this.outputPolicy = options.outputPolicy;
+    this.outputStore = options.outputStore ?? new FileToolOutputStore();
   }
 
   async run(spec: WorkerContainerSpec): Promise<ContainerWorkerResult> {
@@ -478,6 +495,10 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
         );
       }
       const logs = await this.readLogs(id);
+      const safeLogs = {
+        stdout: redactContainerSecrets(logs.stdout, spec.env),
+        stderr: redactContainerSecrets(logs.stderr, spec.env),
+      };
       // Terminal state is already proven, so removal is opportunistic cleanup:
       // a failed rm does not leave unproven work behind.
       await this.removeQuietly(id);
@@ -486,8 +507,17 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
         exitCode,
         terminalState: state.status,
         restartPolicy: state.restartPolicy,
-        stdout: logs.stdout,
-        stderr: logs.stderr,
+        stdout: safeLogs.stdout,
+        stderr: safeLogs.stderr,
+        output: boundToolOutput({
+          outcome: exitCode === 0 ? 'passed' : 'failed',
+          exitCode,
+          stdout: safeLogs.stdout,
+          stderr: safeLogs.stderr,
+          store: this.outputStore,
+          policy: this.outputPolicy,
+          summary: exitCode === 0 ? 'Worker container completed.' : `Worker container exited with status ${exitCode}.`,
+        }),
       };
     } catch (error) {
       const cleanup = await this.proveQuiescent(id);
@@ -590,6 +620,16 @@ function isBenignLifecycleFailure(stderr: string): boolean {
 function firstLine(value: string): string {
   const line = value.split('\n').map((part) => part.trim()).find((part) => part !== '');
   return line ?? 'no diagnostic';
+}
+
+function redactContainerSecrets(value: string, env: Readonly<Record<string, string>>): string {
+  let redacted = value;
+  for (const [key, secret] of Object.entries(env)) {
+    if (secret !== '' && (key.includes('KEY') || key.includes('TOKEN') || key.includes('SECRET') || key.includes('PASSWORD'))) {
+      redacted = redacted.split(secret).join('[redacted]');
+    }
+  }
+  return redacted;
 }
 
 function errorCode(error: unknown): unknown {

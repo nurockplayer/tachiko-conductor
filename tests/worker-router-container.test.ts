@@ -102,6 +102,8 @@ describe('ContainerWorkerBoundary', () => {
     assert.equal(result.restartPolicy, 'no');
     assert.equal(result.stdout, 'out');
     assert.equal(result.stderr, 'err');
+    assert.equal(result.output?.outcome, 'passed');
+    assert.equal(result.output?.exitCode, 0);
     assert.deepEqual(runtime.calls, [
       'create',
       `start:${ID}`,
