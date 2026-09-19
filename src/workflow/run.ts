@@ -857,6 +857,14 @@ export async function runWorkflow(
         const mergeState = pullRequest?.mergeStateStatus?.toUpperCase() ?? null;
         const contradictory = snapshot.problems.find((problem) => problem.code === 'CONTRADICTORY_STATE');
         const currentHosted = hostedValidation(snapshot, deps.hostedCheckPolicy);
+        // An explicit negative review on the exact current HEAD is blocking
+        // authority even when it created no inline thread. Do not infer a pass
+        // from the absence of unresolved threads; only the latest review per
+        // author is retained by the normalized GitHub snapshot, and stale
+        // reviews are deliberately ignored here.
+        const currentHeadChangeRequest = snapshot.reviews.latestByAuthor.find(
+          (review) => review.fresh && review.state === 'changes_requested',
+        );
         if (currentHosted.status === 'waiting') {
           const reason = `Final GitHub readiness gate is waiting for required hosted checks at ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
@@ -885,6 +893,9 @@ export async function runWorkflow(
             : snapshot.reviews.unresolvedThreads > 0
               ? `${snapshot.reviews.unresolvedThreads} review thread(s) remain unresolved`
               : null,
+          currentHeadChangeRequest === undefined
+            ? null
+            : `GitHub review ${currentHeadChangeRequest.id} on the current HEAD explicitly requests changes`,
           contradictory?.message ?? null,
         ].filter((problem): problem is string => problem !== null);
 

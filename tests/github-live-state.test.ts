@@ -336,6 +336,21 @@ PR: #7`;
     assert.equal(transport.calls.filter((call) => call.kind === 'graphql').length, 3);
   });
 
+  it('fails closed when review evidence collections cannot be read instead of treating them as empty', async () => {
+    for (const path of [
+      'repos/acme/widgets/pulls/7/reviews',
+      'repos/acme/widgets/pulls/7/comments',
+    ]) {
+      const transport = prTransport().fault(
+        path,
+        new GitHubLiveStateError('GH_RATE_LIMITED', 'rate limited', { retryable: true }),
+      );
+      const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+      await expectError(adapter.readLiveSnapshot(TARGET), 'GH_RATE_LIMITED', true);
+    }
+  });
+
   it('gives a latest change request precedence over another author approval', async () => {
     const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
       {

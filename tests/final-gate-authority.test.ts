@@ -339,6 +339,83 @@ describe('final-gate authority', () => {
     assert.equal(result.run.history.filter((entry) => entry.type === 'revalidate').length, 1);
   });
 
+  it('fails closed on a current-HEAD GitHub change request even when no review thread is unresolved', async () => {
+    const store = new MemoryStore();
+    store.create(finalGateRun('current-head-change-request'));
+    const ready = readySnapshot(HEAD);
+    const blocked: GitHubLiveSnapshot = {
+      ...ready,
+      reviews: {
+        decision: 'changes_requested',
+        latestByAuthor: [{
+          id: 'R_BLOCK',
+          author: 'review-bot',
+          state: 'changes_requested',
+          commitSha: HEAD,
+          submittedAt: T0,
+          url: 'https://github.test/reviews/block',
+          fresh: true,
+        }],
+        unresolvedThreads: 0,
+      },
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubReturning(blocked),
+        implementation: unusedImplementation,
+        reviewer: unusedReviewer,
+        validation: existingValidation,
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
+      'current-head-change-request',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.notEqual(result.run.state, 'MERGE_READY');
+    assert.match(result.reason, /current HEAD explicitly requests changes/i);
+  });
+
+  it('does not let a stale GitHub change request on an older HEAD block a valid current candidate', async () => {
+    const store = new MemoryStore();
+    store.create(finalGateRun('stale-change-request'));
+    const ready = readySnapshot(HEAD);
+    const stale: GitHubLiveSnapshot = {
+      ...ready,
+      reviews: {
+        decision: 'changes_requested',
+        latestByAuthor: [{
+          id: 'R_STALE',
+          author: 'review-bot',
+          state: 'changes_requested',
+          commitSha: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+          submittedAt: T0,
+          url: 'https://github.test/reviews/stale',
+          fresh: false,
+        }],
+        unresolvedThreads: 0,
+      },
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubReturning(stale),
+        implementation: unusedImplementation,
+        reviewer: unusedReviewer,
+        validation: existingValidation,
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
+      'stale-change-request',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(result.run.state, 'MERGE_READY');
+  });
+
   it('does not infer a hosted policy from a non-empty passing observation', () => {
     assert.equal(
       evaluateHostedCheckPolicy({
