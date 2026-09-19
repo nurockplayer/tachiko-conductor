@@ -134,8 +134,10 @@ New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
 the selected --execution-profile is persisted with the run.
 wait observe/await are deterministic and model-free: they read native/runtime
 state, coalesce it into the durable wait ledger, and report whether the
-orchestrator must reconcile. They never start a model turn. The ledger path is
-$TACHIKO_WAIT_LEDGER_PATH (default <TACHIKO_DATA_DIR>/../wait/state.json).
+orchestrator must reconcile. They never start a model turn. One ledger is
+written per run at <wait ledger dir>/<runId>.wait.json, where the directory is
+$TACHIKO_WAIT_LEDGER_DIR (or the directory of $TACHIKO_WAIT_LEDGER_PATH) and
+defaults to <TACHIKO_DATA_DIR>/../wait.
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
 in the foreground; use status/stop from another terminal.
@@ -1057,10 +1059,20 @@ export function resolveWaitWakePolicy(values: {
   return { ...policy, timeoutMs, onTimeout };
 }
 
-/** Per-run ledger file beside the configured wait ledger root. */
+/**
+ * Per-run ledger file. `TACHIKO_WAIT_LEDGER_DIR` names the directory directly;
+ * otherwise the directory of `TACHIKO_WAIT_LEDGER_PATH` is used, so the
+ * configured path stays a single explicit override.
+ */
+export function resolveWaitLedgerDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  const directory = env.TACHIKO_WAIT_LEDGER_DIR;
+  if (directory !== undefined && directory.trim() !== '') return directory;
+  return path.dirname(resolveWaitLedgerPath(env));
+}
+
+/** One ledger per run at `<wait ledger directory>/<runId>.wait.json`. */
 export function resolveWaitLedgerFile(runId: string, env: NodeJS.ProcessEnv = process.env): string {
-  const base = resolveWaitLedgerPath(env);
-  return path.join(path.dirname(base), `${runId}.wait.json`);
+  return path.join(resolveWaitLedgerDirectory(env), `${runId}.wait.json`);
 }
 
 /**

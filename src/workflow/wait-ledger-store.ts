@@ -5,6 +5,7 @@ import {
   WAIT_OBSERVATION_REVISION,
   boundWaitLedger,
   isWaitLedger,
+  migrateWaitLedger,
   type WaitLedger,
 } from '../domain/wait.js';
 
@@ -72,7 +73,7 @@ export class WaitLedgerFileStore implements WaitLedgerStore {
       ? (parsed as Record<string, unknown>).ledger
       : undefined;
     if (!isWaitLedger(value)) throw new WaitLedgerCorruptionError(this.filePath);
-    return value;
+    return migrateWaitLedger(value);
   }
 
   /** Atomic replace; a crash leaves the previous ledger intact. */

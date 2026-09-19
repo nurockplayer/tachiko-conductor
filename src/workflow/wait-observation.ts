@@ -91,12 +91,17 @@ function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void>
   });
 }
 
-/** Record only a wake decision (never a model turn) into the durable ledger. */
+/**
+ * Record only a wake decision (never a model turn) into the durable ledger.
+ *
+ * Every wake reason is deduplicated by the normalized observation digest. That
+ * matters most for `timeout-policy`: an identical timeout for unchanged state
+ * must not become a periodic model wake (a poll/timer by another name). A new
+ * timeout can only wake again after the observed state actually changed.
+ */
 function recordWake(ledger: WaitLedger, observation: WaitObservation, at: string, decision: WaitWakeDecision): WaitLedgerAdvance {
   const digest = waitObservationDigest(observation);
-  const terminal = decision.reason === 'completion' || decision.reason === 'failure' || decision.reason === 'blocked' || decision.reason === 'terminal';
-  const alreadyRecorded = terminal && ledger.wakes.some((wake) => wake.observationDigest === digest &&
-    (wake.reason === 'completion' || wake.reason === 'failure' || wake.reason === 'blocked' || wake.reason === 'terminal'));
+  const alreadyRecorded = ledger.wakes.some((wake) => wake.observationDigest === digest && wake.reason === decision.reason);
   const shouldWake = decision.shouldWake && !alreadyRecorded;
   const wakeId = `wait-wake:${ledger.ownerRunId}:${observation.subjectId}:${digest}:${decision.reason ?? 'none'}:${ledger.wakes.length}`;
   const wakes = shouldWake
@@ -185,6 +190,12 @@ export interface NativeWaitSnapshot {
   readonly items?: number;
   readonly turns?: number;
   readonly evidence?: readonly WaitEvidence[];
+  /**
+   * True when this read observed an active turn end (`active` -> `idle`). That
+   * is a native completion boundary worth a wake, unlike a thread that was
+   * merely idle before this observer started.
+   */
+  readonly leftActiveTurn?: boolean;
 }
 
 export interface RuntimeObservationDependencies {
@@ -210,13 +221,17 @@ export class RunRuntimeObserver implements WaitObserver {
 
   async observe(): Promise<WaitObservation> {
     const native = await this.observeNative();
-    const headSha = this.dependencies.readHead === undefined
-      ? this.run.headSha ?? null
+    const durableHead = this.run.headSha ?? null;
+    // A failed or unavailable exact-HEAD probe must not masquerade as a head
+    // move; fall back to durable state and let the next read reconcile.
+    const probedHead = this.dependencies.readHead === undefined
+      ? durableHead
       : await this.dependencies.readHead(this.run).catch(() => null);
+    const headSha = probedHead ?? durableHead;
     const evidence: WaitEvidence[] = [];
-    if (headSha !== null && headSha !== (this.run.headSha ?? null)) evidence.push({ kind: 'head-changed', detail: `workspace head ${shorten(headSha)}` });
+    if (headSha !== null && headSha !== durableHead) evidence.push({ kind: 'head-changed', detail: `workspace head ${shorten(headSha)}` });
     const snapshot: WaitSubjectSnapshot = {
-      status: native?.status ?? runWaitStatus(this.run.state),
+      status: mergeRuntimeStatus(runWaitStatus(this.run.state), native),
       ...(native?.activeItemId === undefined ? {} : { activeItemId: native.activeItemId }),
       items: native?.items ?? this.run.history.length,
       ...(native?.turns === undefined ? {} : { turns: native.turns }),
@@ -246,6 +261,26 @@ export class RunRuntimeObserver implements WaitObserver {
       return undefined;
     }
   }
+}
+
+/**
+ * Combine the authoritative durable Run status with optional native evidence.
+ *
+ * Native observation is enrichment: it can only refine a non-terminal durable
+ * state, never mask it. A durable `failed`/`blocked`/`completed` Run always
+ * wins, so a finished or not-loaded native thread cannot hide a terminal wake.
+ * Conversely an actively running native thread is `active` even when the
+ * durable Run is parked, which is a real decision boundary.
+ */
+export function mergeRuntimeStatus(durable: WaitSubjectStatus, native: NativeWaitSnapshot | undefined): WaitSubjectStatus {
+  if (durable === 'completed' || durable === 'failed' || durable === 'blocked') return durable;
+  if (native === undefined) return durable;
+  if (native.status === 'completed') return 'completed';
+  if (native.status === 'failed') return 'failed';
+  if (native.status === 'blocked') return 'blocked';
+  if (native.status === 'active') return 'active';
+  if (native.status === 'idle') return native.leftActiveTurn === true ? 'completed' : 'idle';
+  return durable;
 }
 
 function runWaitStatus(state: WorkflowState): WaitSubjectStatus {
@@ -283,6 +318,8 @@ export function gitHeadReader(
 export class NativeThreadWaitObserver {
   readonly source: WaitObservationSource = 'native';
   readonly subjectId: string;
+  /** Last normalized native status, so a finished turn is a completion event. */
+  private previousStatus: WaitSubjectStatus | undefined;
 
   constructor(
     private readonly options: {
@@ -312,11 +349,18 @@ export class NativeThreadWaitObserver {
       detail: `${item.type}:${item.id}`.slice(0, 120),
     }));
     if (observation.activeTurnId !== undefined) evidence.push({ kind: 'turn-started', detail: observation.activeTurnId.slice(0, 120) });
+    const status = nativeStatus(observation.status, observation.activeTurnId);
+    // Only an observed active turn that ends counts as a completion boundary;
+    // a thread that was already idle when this observer started is not one.
+    const leftActiveTurn = status === 'idle' && this.previousStatus === 'active';
+    if (leftActiveTurn) evidence.push({ kind: 'turn-completed', detail: `native thread ${this.options.threadId} left its active turn` });
+    this.previousStatus = status;
     return {
-      status: nativeStatus(observation.status, observation.activeTurnId),
+      status,
       ...(observation.activeTurnId === undefined ? {} : { activeItemId: observation.activeTurnId }),
       turns: observation.history.length,
       evidence,
+      ...(leftActiveTurn ? { leftActiveTurn: true } : {}),
     };
   }
 }

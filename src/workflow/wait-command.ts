@@ -78,7 +78,6 @@ export interface WaitCommandResult {
   readonly duplicateObservations: number;
   readonly wakeCount: number;
   readonly waitStartedAt: string | null;
-  readonly ledgerRejected: boolean;
 }
 
 export function emptyWaitLedger(run: Run): WaitLedger {
@@ -91,22 +90,34 @@ export function emptyWaitLedger(run: Run): WaitLedger {
 
 /**
  * Load the durable wait ledger for this exact run identity. A ledger that does
- * not belong to the run (foreign subject/owner/generation) is rejected rather
- * than adopted, so a restart or a second dispatcher cannot duplicate a writer.
+ * not belong to the run (foreign subject/owner/generation) fails closed: the
+ * wait path refuses to adopt or overwrite another identity's durable
+ * reconciliation state, so a second dispatcher can never become a duplicate
+ * writer by clobbering it.
  */
 export function loadWaitLedger(input: {
   readonly run: Run;
   readonly ledgerStore: WaitLedgerStore;
-}): { readonly ledger: WaitLedger; readonly rejected: boolean } {
+}): WaitLedger {
   const stored = input.ledgerStore.read();
-  if (stored === null) return { ledger: emptyWaitLedger(input.run), rejected: false };
+  if (stored === null) return emptyWaitLedger(input.run);
   const identity = {
     subjectId: input.run.id,
     ownerRunId: input.run.id,
     generation: input.run.dispatchClaimId ?? input.run.id,
   };
-  if (!waitLedgerBelongsTo(stored, identity)) return { ledger: emptyWaitLedger(input.run), rejected: true };
-  return { ledger: stored, rejected: false };
+  if (!waitLedgerBelongsTo(stored, identity)) {
+    throw new WaitLedgerOwnershipError(input.run.id);
+  }
+  return stored;
+}
+
+/** Raised instead of adopting or overwriting a foreign durable wait ledger. */
+export class WaitLedgerOwnershipError extends Error {
+  constructor(runId: string) {
+    super(`Wait ledger for run ${runId} belongs to a different subject/owner/generation; refusing to adopt or overwrite it.`);
+    this.name = 'WaitLedgerOwnershipError';
+  }
 }
 
 function runtimeObserver(run: Run, dependencies: WaitCommandDependencies): WaitObserver {
@@ -121,7 +132,6 @@ function toResult(input: {
   readonly mode: WaitCommandMode;
   readonly run: Run;
   readonly outcome: Pick<WaitAwaitOutcome, 'observation' | 'change' | 'wake' | 'ledger' | 'observationCount' | 'duplicateObservations' | 'timedOut' | 'idle'>;
-  readonly rejected: boolean;
 }): WaitCommandResult {
   const { observation, ledger } = input.outcome;
   return {
@@ -147,7 +157,6 @@ function toResult(input: {
     duplicateObservations: input.outcome.duplicateObservations,
     wakeCount: ledger.wakes.length,
     waitStartedAt: ledger.waitStartedAt,
-    ledgerRejected: input.rejected,
   };
 }
 
@@ -158,10 +167,10 @@ export async function waitObserveCommand(
 ): Promise<WaitCommandResult> {
   const run = readRun(options.id, dependencies.store);
   const policy = options.policy ?? DEFAULT_WAIT_WAKE_POLICY;
-  const loaded = loadWaitLedger({ run, ledgerStore: dependencies.ledgerStore });
+  const ledger = loadWaitLedger({ run, ledgerStore: dependencies.ledgerStore });
   const { observation, advance } = await observeWaitState({
     observer: runtimeObserver(run, dependencies),
-    ledger: loaded.ledger,
+    ledger,
     at: dependencies.now(),
     policy,
     expectedOwnerRunId: run.id,
@@ -172,7 +181,6 @@ export async function waitObserveCommand(
   return toResult({
     mode: 'observe',
     run,
-    rejected: loaded.rejected,
     outcome: {
       observation,
       change: advance.change,
@@ -197,10 +205,10 @@ export async function waitAwaitCommand(
 ): Promise<WaitCommandResult> {
   const run = readRun(options.id, dependencies.store);
   const policy = options.policy ?? DEFAULT_WAIT_WAKE_POLICY;
-  const loaded = loadWaitLedger({ run, ledgerStore: dependencies.ledgerStore });
+  const ledger = loadWaitLedger({ run, ledgerStore: dependencies.ledgerStore });
   const outcome = await awaitMeaningfulChange({
     observer: runtimeObserver(run, dependencies),
-    ledger: loaded.ledger,
+    ledger,
     policy,
     now: dependencies.monotonicNow ?? (() => Date.now()),
     ...(dependencies.sleep === undefined ? {} : { sleep: dependencies.sleep }),
@@ -211,7 +219,7 @@ export async function waitAwaitCommand(
   });
   dependencies.ledgerStore.write(outcome.ledger);
   if (outcome.wake.shouldWake) recordWake(run, outcome.observation, dependencies.now(), outcome.wake.reason ?? 'terminal', dependencies.store);
-  return toResult({ mode: 'wait', run, rejected: loaded.rejected, outcome });
+  return toResult({ mode: 'wait', run, outcome });
 }
 
 function readRun(id: string, store: RunStore): Run {

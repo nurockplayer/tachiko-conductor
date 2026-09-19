@@ -24,7 +24,9 @@ import {
   type WaitObserver,
 } from '../src/workflow/wait-observation.js';
 import { WaitLedgerFileStore, waitLedgerBelongsTo } from '../src/workflow/wait-ledger-store.js';
+import { boundWaitLedger, migrateWaitLedger } from '../src/domain/wait.js';
 import { newRun, T0 } from './helpers.js';
+import { applyTransition } from '../src/domain/state-machine.js';
 import { WORKFLOW_STATES } from '../src/domain/types.js';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -188,6 +190,35 @@ describe('durable wait ledger', () => {
     assert.equal(second.ledger.wakes.length, 1);
   });
 
+  it('keeps the terminal dedup guarantee across bounded ledger eviction', () => {
+    // A terminal observation must never wake twice, even after the bounded
+    // warning-evidence history has evicted the original wake record.
+    let ledger = ledgerFor();
+    for (let index = 0; index < 250; index += 1) {
+      ledger = advanceWaitLedger({ ledger, observation: normalize('active', { progress: { items: index, turns: 0 } }), at: T0 }).ledger;
+    }
+    const terminal = normalize('completed');
+    const first = advanceWaitLedger({ ledger, observation: terminal, at: T0 });
+    assert.equal(first.wokeNow, true);
+    const bounded = boundWaitLedger(first.ledger);
+    assert.equal(bounded.wakes.length <= 200, true);
+    assert.equal(bounded.terminalDigests?.includes(waitObservationDigest(terminal)), true);
+    const replayed = advanceWaitLedger({ ledger: bounded, observation: terminal, at: T0 });
+    assert.equal(replayed.wokeNow, false);
+    assert.equal(replayed.ledger.wakes.length, bounded.wakes.length);
+  });
+
+  it('migrates a ledger written before terminal digests existed', () => {
+    const legacy = { ...ledgerFor() } as Record<string, unknown>;
+    delete legacy.terminalDigests;
+    const terminal = normalize('completed');
+    const advanced = advanceWaitLedger({ ledger: legacy as never, observation: terminal, at: T0 });
+    const migrated = migrateWaitLedger({ ...advanced.ledger, terminalDigests: undefined });
+    assert.deepEqual(migrated.terminalDigests, [waitObservationDigest(terminal)]);
+    const replayed = advanceWaitLedger({ ledger: migrated, observation: terminal, at: T0 });
+    assert.equal(replayed.wokeNow, false);
+  });
+
   it('is digest-stable across evidence order and timestamps', () => {
     const left = normalize('active', { evidence: [{ kind: 'progress', detail: 'a' }, { kind: 'item-completed', detail: 'b' }], observedAt: '2026-09-19T00:00:00.000Z' });
     const right = normalize('active', { evidence: [{ kind: 'item-completed', detail: 'b' }, { kind: 'progress', detail: 'a' }], observedAt: '2026-09-19T01:00:00.000Z' });
@@ -290,6 +321,78 @@ describe('#35 native observation reuse', () => {
     assert.equal(value.activeItemId, 'turn-1');
   });
 
+  it('never lets native observation mask an authoritative terminal durable state', async () => {
+    // #47 blocking-finding regression: a finished/not-loaded native thread must
+    // not hide a FAILED / NEEDS_HUMAN / MERGED durable Run.
+    const terminalRuns = [
+      { run: applyTransition(newRun(SUBJECT), { type: 'fail' }, T0), expected: 'failed' },
+      { run: applyTransition(newRun(SUBJECT), { type: 'escalate', reason: 'human' }, T0), expected: 'blocked' },
+    ] as const;
+    for (const { run, expected } of terminalRuns) {
+      for (const nativeStatus of ['idle', 'unknown', 'active'] as const) {
+        const observer = new RunRuntimeObserver(
+          { ...run, executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } },
+          { now: () => T0, nativeObserver: { snapshot: async () => ({ status: nativeStatus }) } },
+        );
+        const value = await observer.observe();
+        assert.equal(value.status, expected, `${run.state}/${nativeStatus}`);
+        const advance = advanceWaitLedger({ ledger: ledgerFor(), observation: value, at: T0 });
+        assert.equal(advance.wokeNow, true, `${run.state}/${nativeStatus}`);
+        assert.equal(advance.change.kind, expected === 'failed' ? 'failure' : 'blocked', `${run.state}/${nativeStatus}`);
+      }
+    }
+  });
+
+  it('wakes on a native active-to-idle turn completion', async () => {
+    const native = new NativeThreadWaitObserver({
+      client: {
+        observeThread: async (threadId: string) => threadStatus === 'active'
+          ? { threadId, status: 'active' as const, activeTurnId: 'turn-1', history: [] }
+          : { threadId, status: 'idle' as const, history: [] },
+      },
+      threadId: 'thread-1',
+      now: () => T0,
+      subjectId: SUBJECT,
+    });
+    const run = applyTransition(newRun(SUBJECT), { type: 'start' }, T0);
+    const observer = new RunRuntimeObserver(
+      { ...run, executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } },
+      { now: () => T0, nativeObserver: { snapshot: () => native.snapshot() } },
+    );
+    let threadStatus: 'active' | 'idle' = 'active';
+    const started = await observer.observe();
+    assert.equal(started.status, 'active');
+    let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: started, at: T0 }).ledger;
+    assert.equal(ledger.wakes.length, 0);
+
+    threadStatus = 'idle';
+    const finished = await observer.observe();
+    assert.equal(finished.status, 'completed');
+    const advance = advanceWaitLedger({ ledger, observation: finished, at: T0 });
+    assert.equal(advance.change.kind, 'completion');
+    assert.equal(advance.wokeNow, true);
+    assert.equal(advance.ledger.wakes.length, 1);
+  });
+
+  it('does not treat an already-idle native thread as a completion', async () => {
+    const native = new NativeThreadWaitObserver({
+      client: { observeThread: async (threadId: string) => ({ threadId, status: 'idle' as const, history: [] }) },
+      threadId: 'thread-1',
+      now: () => T0,
+      subjectId: SUBJECT,
+    });
+    const run = applyTransition(newRun(SUBJECT), { type: 'start' }, T0);
+    const observer = new RunRuntimeObserver(
+      { ...run, executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } },
+      { now: () => T0, nativeObserver: { snapshot: () => native.snapshot() } },
+    );
+    const value = await observer.observe();
+    assert.equal(value.status, 'idle');
+    const advance = advanceWaitLedger({ ledger: ledgerFor(), observation: value, at: T0 });
+    assert.equal(advance.change.kind, 'none');
+    assert.equal(advance.wokeNow, false);
+  });
+
   it('maps native idle and system_error states onto the neutral contract', async () => {
     const idle = await new NativeThreadWaitObserver({
       client: { observeThread: async (threadId: string) => ({ threadId, status: 'idle', history: [] }) },
@@ -308,7 +411,7 @@ describe('#35 native observation reuse', () => {
     assert.equal(failed.status, 'failed');
   });
 
-  it('presents the same normalized wake semantics as the fallback path', async () => {
+  it('presents the same normalized baseline wake semantics as the fallback path', async () => {
     const nativeObserver = new NativeThreadWaitObserver({
       client: {
         observeThread: async (threadId: string) => ({ threadId, status: 'active', activeTurnId: 'turn-1', history: nativeHistory }),
@@ -373,6 +476,18 @@ describe('runtime fallback observation', () => {
     assert.equal(value.source, 'native');
     assert.equal(value.status, 'idle');
     assert.equal(value.progress.turns, 7);
+  });
+
+  it('does not report a head move when the exact-HEAD probe fails transiently', async () => {
+    const run = { ...newRun(SUBJECT), headSha: HEAD };
+    const observer = new RunRuntimeObserver(run, { now: () => T0, readHead: async () => null });
+    const value = await observer.observe();
+    assert.equal(value.headSha, HEAD);
+    assert.equal(value.evidence.some((item) => item.kind === 'head-changed'), false);
+    assert.equal(classifyWaitChange(
+      normalizeWaitObservation({ source: 'runtime', subjectId: SUBJECT, observedAt: T0, snapshot: { status: 'active', headSha: HEAD } }),
+      value,
+    ).kind, 'none');
   });
 
   it('reads exact HEAD read-only through the injected runner', async () => {

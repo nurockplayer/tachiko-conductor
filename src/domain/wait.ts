@@ -176,14 +176,28 @@ function statusEvidence(status: WaitSubjectStatus): readonly WaitEvidence[] {
 }
 
 function transitionEvidence(previous: WaitObservation, next: WaitObservation, kind: WaitEvidenceKind, detail: string): readonly WaitEvidence[] {
-  const reported = next.evidence.length === 0 ? statusEvidence(next.status) : next.evidence;
-  return [{ kind, detail: `${detail} (${previous.status} -> ${next.status})` }, ...reported];
+  return dedupeEvidence([{ kind, detail: `${detail} (${previous.status} -> ${next.status})` }, ...reportedEvidence(next)]);
 }
 
 function terminalEvidence(observation: WaitObservation, kind: 'completion' | 'failure' | 'blocked'): readonly WaitEvidence[] {
-  const reported = observation.evidence.length === 0 ? statusEvidence(observation.status) : observation.evidence;
   const evidenceKind: WaitEvidenceKind = kind === 'completion' ? 'turn-completed' : kind === 'failure' ? 'failure' : 'blocked';
-  return [{ kind: evidenceKind, detail: `subject ${observation.subjectId} reported ${observation.status}` }, ...reported];
+  return dedupeEvidence([{ kind: evidenceKind, detail: `subject ${observation.subjectId} reported ${observation.status}` }, ...reportedEvidence(observation)]);
+}
+
+function reportedEvidence(observation: WaitObservation): readonly WaitEvidence[] {
+  return observation.evidence.length === 0 ? statusEvidence(observation.status) : observation.evidence;
+}
+
+/** Keep bounded evidence readable: one entry per kind, first (most specific) wins. */
+function dedupeEvidence(evidence: readonly WaitEvidence[]): readonly WaitEvidence[] {
+  const seen = new Set<WaitEvidenceKind>();
+  const result: WaitEvidence[] = [];
+  for (const item of evidence) {
+    if (seen.has(item.kind)) continue;
+    seen.add(item.kind);
+    result.push(item);
+  }
+  return result;
 }
 
 /**
@@ -319,6 +333,13 @@ export interface WaitLedger {
   readonly generation: string;
   readonly observations: readonly WaitRecordedObservation[];
   readonly wakes: readonly WaitRecordedWake[];
+  /**
+   * Terminal observation digests already surfaced. Kept separate from the
+   * bounded wake list so evicting old warning evidence can never cause a
+   * terminal transition to wake a second time. Absent on ledgers written
+   * before this field existed; `migrateWaitLedger` reconstructs it.
+   */
+  readonly terminalDigests?: readonly string[];
   /** Last normalized observation digest, so restart can reconstruct without re-waking. */
   readonly lastDigest: string | null;
   readonly lastObservedAt: string | null;
@@ -339,6 +360,7 @@ export function createWaitLedger(input: {
     generation: input.generation,
     observations: [],
     wakes: [],
+    terminalDigests: [],
     lastDigest: null,
     lastObservedAt: null,
     waitStartedAt: null,
@@ -420,10 +442,12 @@ export function advanceWaitLedger(input: {
       }];
   const decision = decideWaitWake({ change, observation, ...(input.timedOut === undefined ? {} : { timedOut: input.timedOut }), policy });
   // A terminal wake for this exact digest is recorded at most once, even if a
-  // restart re-observes it before the orchestrator has reconciled.
-  const terminalAlreadyRecorded = decision.shouldWake &&
-    (decision.reason === 'completion' || decision.reason === 'failure' || decision.reason === 'blocked' || decision.reason === 'terminal') &&
-    ledger.wakes.some((recorded) => recorded.observationDigest === digest && terminalWakeReasons.has(recorded.reason));
+  // restart re-observes it before the orchestrator has reconciled, and even
+  // after the bounded wake list has evicted the original record.
+  const terminalDecision = decision.shouldWake &&
+    (decision.reason === 'completion' || decision.reason === 'failure' || decision.reason === 'blocked' || decision.reason === 'terminal');
+  const priorTerminalDigests = ledger.terminalDigests ?? [];
+  const terminalAlreadyRecorded = terminalDecision && priorTerminalDigests.includes(digest);
   const wakeId = `wait-wake:${ledger.ownerRunId}:${observation.subjectId}:${digest}:${decision.reason ?? 'none'}:${ledger.wakes.length}`;
   const wokeNow = decision.shouldWake && !terminalAlreadyRecorded;
   const wakes = wokeNow
@@ -438,10 +462,14 @@ export function advanceWaitLedger(input: {
         evidence: decision.evidence,
       }]
     : ledger.wakes;
+  const terminalDigests = terminalDecision && !priorTerminalDigests.includes(digest)
+    ? [...priorTerminalDigests, digest]
+    : priorTerminalDigests;
   const nextLedger: WaitLedger = {
     ...ledger,
     observations,
     wakes,
+    terminalDigests,
     lastDigest: digest,
     lastObservedAt: input.at,
     waitStartedAt: !isTerminalWaitObservation(observation) && change.kind === 'none'
@@ -458,8 +486,6 @@ export function advanceWaitLedger(input: {
   };
 }
 
-const terminalWakeReasons: ReadonlySet<WaitWakeReason> = new Set(['completion', 'failure', 'blocked', 'terminal']);
-
 export interface WaitLedgerFile {
   readonly revision: typeof WAIT_OBSERVATION_REVISION;
   readonly ledger: WaitLedger;
@@ -467,13 +493,19 @@ export interface WaitLedgerFile {
 
 const MAX_WAIT_OBSERVATIONS = 200;
 const MAX_WAIT_WAKES = 200;
+const MAX_TERMINAL_DIGESTS = 50;
 
-/** Keep the durable ledger bounded; the latest records are the reconciliation input. */
+/**
+ * Keep the durable ledger bounded; the latest records are the reconciliation
+ * input. Terminal digests are kept separately so bounded warning evidence can
+ * never resurrect a terminal wake.
+ */
 export function boundWaitLedger(ledger: WaitLedger): WaitLedger {
   return {
     ...ledger,
     observations: ledger.observations.slice(-MAX_WAIT_OBSERVATIONS),
     wakes: ledger.wakes.slice(-MAX_WAIT_WAKES),
+    terminalDigests: (ledger.terminalDigests ?? []).slice(-MAX_TERMINAL_DIGESTS),
   };
 }
 
@@ -492,9 +524,25 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
     typeof record.generation === 'string' && record.generation !== '' &&
     Array.isArray(record.observations) &&
     Array.isArray(record.wakes) &&
+    (record.terminalDigests === undefined ||
+      (Array.isArray(record.terminalDigests) && record.terminalDigests.every((item) => typeof item === 'string'))) &&
     (record.lastDigest === null || typeof record.lastDigest === 'string') &&
     (record.lastObservedAt === null || typeof record.lastObservedAt === 'string') &&
     (record.waitStartedAt === null || typeof record.waitStartedAt === 'string');
+}
+
+/**
+ * Adopt a persisted ledger, filling in fields added after the ledger was
+ * written. Older wait ledgers predate terminal-digest tracking; reconstructing
+ * it from recorded terminal wakes preserves the duplicate-wake guarantee.
+ */
+export function migrateWaitLedger(value: WaitLedger): WaitLedger {
+  return {
+    ...value,
+    terminalDigests: value.terminalDigests ?? value.wakes
+      .filter((wake) => wake.reason === 'completion' || wake.reason === 'failure' || wake.reason === 'blocked' || wake.reason === 'terminal')
+      .map((wake) => wake.observationDigest),
+  };
 }
 
 export function isWaitObservation(value: unknown): value is WaitObservation {

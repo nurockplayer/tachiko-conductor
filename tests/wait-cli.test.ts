@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { main, resolveWaitLedgerFile, resolveWaitLedgerPath, resolveWaitWakePolicy } from '../src/cli.js';
+import { main, resolveWaitLedgerDirectory, resolveWaitLedgerFile, resolveWaitLedgerPath, resolveWaitWakePolicy } from '../src/cli.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { createWaitLedger } from '../src/domain/wait.js';
@@ -50,6 +50,17 @@ describe('wait CLI', () => {
     assert.equal(policy.onTimeout, 'policy-action');
     assert.throws(() => resolveWaitWakePolicy({ 'timeout-ms': '-1' }), /non-negative/);
     assert.throws(() => resolveWaitWakePolicy({ 'on-timeout': 'sometimes' }), /continue or policy-action/);
+  });
+
+  it('resolves one per-run ledger under an explicit wait ledger directory', () => {
+    const directory = path.join(os.tmpdir(), 'tachiko-wait-dir');
+    assert.equal(resolveWaitLedgerDirectory({ TACHIKO_WAIT_LEDGER_DIR: directory }), directory);
+    assert.equal(resolveWaitLedgerFile('run-9', { TACHIKO_WAIT_LEDGER_DIR: directory }), path.join(directory, 'run-9.wait.json'));
+    // A path-style override still selects the containing directory.
+    assert.equal(
+      resolveWaitLedgerDirectory({ TACHIKO_WAIT_LEDGER_DIR: '', TACHIKO_WAIT_LEDGER_PATH: '/tmp/other/state.json' }),
+      '/tmp/other',
+    );
   });
 
   it('observes a waiting run without a model turn and coalesces a repeat', async () => {
@@ -121,18 +132,54 @@ describe('wait CLI', () => {
       const projection = projectRunEfficiency(stored!);
       assert.deepEqual(projection.metrics.waitStatusWakeups, { status: 'observed', value: 1 });
 
-      // A repeated timeout wake must be idempotent for the same normalized state.
-      const repeated = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
-      const repeatedParsed = JSON.parse(repeated.stdout[0]!) as { wake: { shouldWake: boolean } };
-      assert.equal(repeatedParsed.wake.shouldWake, true);
+      // An identical timeout for unchanged state must not become a periodic
+      // model wake: the second and third invocations stay model-free.
+      let wakeMarkers = 1;
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        const repeated = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+        const repeatedParsed = JSON.parse(repeated.stdout[0]!) as { wake: { shouldWake: boolean }; wakeCount: number };
+        assert.equal(repeatedParsed.wake.shouldWake, false);
+        assert.equal(repeatedParsed.wakeCount, 1);
+        assert.equal(repeated.stdout.includes('TACHIKO_WAIT_WAKE_V1'), false);
+        assert.equal(repeated.stdout.includes('TACHIKO_WAIT_IDLE_V1'), true);
+        wakeMarkers += repeated.stdout.includes('TACHIKO_WAIT_WAKE_V1') ? 1 : 0;
+      }
+      assert.equal(wakeMarkers, 1);
       const afterRepeat = new JsonFileStore({ dir: dataDir }).read(run.id);
       assert.equal(afterRepeat?.telemetry?.events.filter((event) => event.kind === 'wait_status_wakeup').length, 1);
+      const ledgerAfterRepeat = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }).read();
+      assert.equal(ledgerAfterRepeat?.wakes.length, 1);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
   });
 
-  it('rejects a foreign durable ledger instead of adopting another run writer', async () => {
+  it('keeps a distinct timeout wake after the observed state actually changes', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = createRun(TARGET, T0, 'run-wait-timeout-change');
+      seedRun(dataDir, run);
+      const first = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+      assert.equal((JSON.parse(first.stdout[0]!) as { wake: { shouldWake: boolean } }).wake.shouldWake, true);
+      // A real state change (HEAD moves) re-arms the bounded wait episode.
+      const moved = { ...run, headSha: 'a'.repeat(40) };
+      new JsonFileStore({ dir: dataDir }).update(moved);
+      const second = await runMain(env, ['wait', 'observe', run.id]);
+      const parsed = JSON.parse(second.stdout[0]!) as { change: string; wake: { shouldWake: boolean }; wakeCount: number };
+      assert.equal(parsed.change, 'progress');
+      assert.equal(parsed.wake.shouldWake, false);
+      assert.equal(parsed.wakeCount, 1);
+      const third = await runMain(env, ['wait', 'await', run.id, '--timeout-ms', '0', '--poll-interval-ms', '0', '--on-timeout', 'policy-action']);
+      const thirdParsed = JSON.parse(third.stdout[0]!) as { wake: { shouldWake: boolean; reason: string }; wakeCount: number };
+      assert.equal(thirdParsed.wake.shouldWake, true);
+      assert.equal(thirdParsed.wake.reason, 'timeout-policy');
+      assert.equal(thirdParsed.wakeCount, 2);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed on a foreign durable ledger without overwriting another writer', async () => {
     const { directory, dataDir, env } = tempWorkspace();
     try {
       const run = createRun(TARGET, T0, 'run-wait-foreign');
@@ -142,12 +189,13 @@ describe('wait CLI', () => {
       const foreign = createWaitLedger({ subjectId: 'other-run', ownerRunId: 'other-run', generation: 'generation-x' });
       writeFileSync(filePath, `${JSON.stringify({ revision: foreign.revision, ledger: foreign }, null, 2)}\n`);
 
-      const result = await runMain(env, ['wait', 'observe', run.id]);
-      const parsed = JSON.parse(result.stdout[0]!) as { ledgerRejected: boolean; wake: { shouldWake: boolean } };
-      assert.equal(parsed.ledgerRejected, true);
-      // The replacement ledger is still written under this run's identity.
-      const replacement = new WaitLedgerFileStore({ filePath }).read();
-      assert.equal(replacement?.ownerRunId, run.id);
+      await assert.rejects(() => runMain(env, ['wait', 'observe', run.id]), /different subject\/owner\/generation/);
+      // The foreign ledger is left byte-for-byte intact: no adoption, no clobber.
+      const untouched = new WaitLedgerFileStore({ filePath }).read();
+      assert.equal(untouched?.ownerRunId, 'other-run');
+      assert.equal(untouched?.subjectId, 'other-run');
+      assert.equal(untouched?.observations.length, 0);
+      assert.equal(untouched?.wakes.length, 0);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

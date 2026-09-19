@@ -306,19 +306,27 @@ observation runtime compares each report with the last durable one:
 - a `completed`, `failed`, or `blocked` transition wakes the orchestrator
   exactly once with bounded evidence;
 - a bounded timeout wakes only when the wait policy requires policy/recovery
-  reasoning (`--on-timeout policy-action`); `continue` keeps waiting model-free.
+  reasoning (`--on-timeout policy-action`); `continue` keeps waiting model-free,
+  and an identical repeated timeout for unchanged state does not wake again.
 
 A wake is a signal to reconcile live GitHub plus the durable `Run`; it is never
 workflow authority by itself, and one completion notification never substitutes
 for re-reading complete authoritative state.
 
-The durable per-run wait ledger (`<data>/wait/<runId>.wait.json`, overridable
-with `TACHIKO_WAIT_LEDGER_PATH`) revalidates subject/owner/generation before
-adoption. A restart therefore reconstructs the same coalesced state instead of
-duplicating a wake or a writer, and a foreign ledger is rejected rather than
-adopted. Native observation reuses the #35 App Server `thread/read` capability
-and starts no Codex turn; when the native runtime is unavailable, the same
-normalized wake semantics are preserved by the deterministic runtime fallback.
+The durable per-run wait ledger (`<wait dir>/<runId>.wait.json`, where the
+directory is `TACHIKO_WAIT_LEDGER_DIR`, else the directory of
+`TACHIKO_WAIT_LEDGER_PATH`, else `<data>/wait`) revalidates
+subject/owner/generation before adoption. A restart therefore reconstructs the
+same coalesced state instead of duplicating a wake or a writer, and a foreign
+ledger fails closed instead of being adopted or overwritten.
+
+Native observation reuses the #35 App Server `thread/read` capability and
+starts no Codex turn. It is enrichment, never authority: the durable `Run`
+status wins whenever it is `completed`, `failed`, or `blocked`, so an idle or
+not-loaded native thread can never hide a terminal or blocked wake. A native
+turn that leaves its active state is reported as a completion boundary. When
+the native runtime is unavailable, the deterministic runtime fallback still
+produces the same normalized terminal wakes and the same no-wake coalescing.
 
 ```bash
 pnpm exec tsx src/cli.ts wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
