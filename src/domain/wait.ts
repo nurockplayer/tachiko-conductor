@@ -225,6 +225,17 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
     // Identical normalized state: coalesced, zero wakeups.
     return { kind: 'none', meaningful: false, evidence: [] };
   }
+  // A native App Server turn is complete when the same durable subject moves
+  // from active to idle. This transition is classified from durable normalized
+  // observations rather than only in-memory observer state, so a process
+  // restart or separate `wait observe` invocation cannot lose the completion.
+  if (previous.source === 'native' && next.source === 'native' && previous.status === 'active' && next.status === 'idle') {
+    return {
+      kind: 'completion',
+      meaningful: true,
+      evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} native turn completed`),
+    };
+  }
   if (next.status !== previous.status) {
     if (next.status === 'completed') return { kind: 'completion', meaningful: true, evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} completed`) };
     if (next.status === 'failed') return { kind: 'failure', meaningful: true, evidence: transitionEvidence(previous, next, 'failure', `subject ${next.subjectId} failed`) };
