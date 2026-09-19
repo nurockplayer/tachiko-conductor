@@ -461,6 +461,54 @@ describe('CodexAppServerAdapter', () => {
     await client.close();
   });
 
+  it('reports an uncapped turn count and the newest usable completed turn', async () => {
+    const child = new FakeAppServerProcess();
+    const client = new StdioCodexAppServerClient(child as never);
+    const turns = [
+      { id: 'turn-1', status: 'completed', items: [{ id: 'i1', type: 'agentMessage' }] },
+      { id: 'turn-2', status: 'interrupted', items: [] },
+      { id: '', status: 'completed', items: [] },
+      { id: 'turn-4', status: 'completed', items: [] },
+      ...Array.from({ length: 6 }, (_, index) => ({ id: `turn-${index + 5}`, status: 'completed', items: [] })),
+      { id: 'turn-11', status: 'inProgress', items: [] },
+    ];
+    const pending = client.observeThread('thread-1');
+    await new Promise((resolve) => setImmediate(resolve));
+    child.stdout.write(`${JSON.stringify({
+      id: (child.writes[0] as { id: number }).id,
+      result: { thread: { id: 'thread-1', status: { type: 'active' }, turns } },
+    })}\n`);
+    const observation = await pending;
+    assert.equal(observation.status, 'active');
+    assert.equal(observation.turnCount, turns.length);
+    assert.equal(observation.activeTurnId, 'turn-11');
+    // The blank-id completed turn is skipped in favour of an earlier usable id.
+    assert.equal(observation.lastCompletedTurnId, 'turn-10');
+    assert.equal(observation.history.length, 1);
+    await client.close();
+  });
+
+  it('caps history independently of the uncapped turn counter', async () => {
+    const child = new FakeAppServerProcess();
+    const client = new StdioCodexAppServerClient(child as never);
+    const turns = Array.from({ length: 8 }, (_, index) => ({
+      id: `turn-${index + 1}`,
+      status: 'completed',
+      items: Array.from({ length: 25 }, (_, item) => ({ id: `t${index}-i${item}`, type: 'agentMessage' })),
+    }));
+    const pending = client.observeThread('thread-2');
+    await new Promise((resolve) => setImmediate(resolve));
+    child.stdout.write(`${JSON.stringify({
+      id: (child.writes[0] as { id: number }).id,
+      result: { thread: { id: 'thread-2', status: { type: 'idle' }, turns } },
+    })}\n`);
+    const observation = await pending;
+    assert.equal(observation.history.length, 100);
+    assert.equal(observation.turnCount, 8);
+    assert.equal(observation.lastCompletedTurnId, 'turn-8');
+    await client.close();
+  });
+
   it('opens the signed-in local App Server without starting a model turn when explicitly opted in', {
     skip: process.env.TACHIKO_CODEX_APP_SERVER_SMOKE !== '1',
   }, async () => {

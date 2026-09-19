@@ -643,12 +643,15 @@ export class StdioCodexAppServerClient implements CodexAppServerClient {
     const turns = array(thread.turns, 'thread turns');
     const parsedTurns = turns.map((turn) => object(turn, 'turn'));
     const active = parsedTurns.find((turn) => turn.status === 'inProgress');
+    // Newest completed turn with a usable identity; a blank id falls through to
+    // an earlier completed turn rather than losing the progress signal.
     let lastCompletedTurnId: string | undefined;
     for (let index = parsedTurns.length - 1; index >= 0; index -= 1) {
       const turn = parsedTurns[index]!;
       if (turn.status !== 'completed') continue;
       const candidate = turn.id;
-      if (typeof candidate === 'string' && candidate.trim() !== '') lastCompletedTurnId = candidate;
+      if (typeof candidate !== 'string' || candidate.trim() === '') continue;
+      lastCompletedTurnId = candidate;
       break;
     }
     return {

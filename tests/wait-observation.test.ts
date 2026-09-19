@@ -46,6 +46,7 @@ function normalize(status: WaitSubjectStatus, overrides: Partial<WaitObservation
       ...(overrides.activeItemId === undefined ? {} : { activeItemId: overrides.activeItemId }),
       items: overrides.progress?.items ?? 0,
       turns: overrides.progress?.turns ?? 0,
+      ...(overrides.lastCompletedTurnId === undefined ? {} : { lastCompletedTurnId: overrides.lastCompletedTurnId }),
       ...(overrides.headSha === undefined ? {} : { headSha: overrides.headSha }),
       evidence: overrides.evidence ?? [],
     },
@@ -494,6 +495,62 @@ describe('#35 native observation reuse', () => {
     assert.equal(second.change.kind, 'completion');
     assert.equal(second.wokeNow, true);
     assert.equal(second.ledger.wakes.length, 2);
+  });
+
+  it('wakes for a real native completion even when one ambiguous read interleaves', async () => {
+    // Regression: an ambiguous native read between a genuine active and idle
+    // read must neither fabricate a completion nor hide the real one.
+    for (const ambiguous of ['throw', 'not_loaded', 'system_error'] as const) {
+      const run = { ...applyTransition(newRun(SUBJECT), { type: 'start' }, T0), executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } };
+      const modes: Array<'active' | 'ambiguous' | 'idle'> = ['active', 'ambiguous', 'idle'];
+      let index = 0;
+      const observer = (): RunRuntimeObserver => new RunRuntimeObserver(run, {
+        now: () => T0,
+        nativeObserver: {
+          snapshot: async () => {
+            const mode = modes[Math.min(index++, modes.length - 1)]!;
+            if (mode === 'ambiguous') {
+              if (ambiguous === 'throw') throw new Error('transient native read failure');
+              if (ambiguous === 'not_loaded') return { status: 'unknown' };
+              return { status: 'unavailable' };
+            }
+            return mode === 'active'
+              ? { status: 'active', activeItemId: 'turn-1', turns: 1 }
+              : { status: 'idle', turns: 1, lastCompletedTurnId: 'turn-1' };
+          },
+        },
+      });
+
+      const started = await observer().observe();
+      assert.equal(started.source, 'native');
+      assert.equal(started.status, 'active');
+      let ledger = advanceWaitLedger({ ledger: ledgerFor(), observation: started, at: T0 }).ledger;
+
+      const ambiguousRead = await observer().observe();
+      const afterAmbiguous = advanceWaitLedger({ ledger, observation: ambiguousRead, at: T0 });
+      ledger = afterAmbiguous.ledger;
+      assert.equal(afterAmbiguous.wokeNow, false, `${ambiguous}: ambiguous read must not wake`);
+
+      const finished = await observer().observe();
+      assert.equal(finished.source, 'native');
+      assert.equal(finished.status, 'idle');
+      const completion = advanceWaitLedger({ ledger, observation: finished, at: T0 });
+      assert.equal(completion.change.kind, 'completion', `${ambiguous}: real completion must survive`);
+      assert.equal(completion.wokeNow, true, `${ambiguous}: real completion must wake exactly once`);
+      assert.equal(completion.ledger.wakes.length, 1, `${ambiguous}: exactly one wake`);
+    }
+  });
+
+  it('keeps successive completions distinct when only the completed-turn identity advances', () => {
+    // turnCount held constant, so only lastCompletedTurnId can distinguish them.
+    const idle = (turn: string) => normalize('idle', { lastCompletedTurnId: turn, progress: { items: 100, turns: 100 } });
+    assert.notEqual(waitObservationDigest(idle('turn-1')), waitObservationDigest(idle('turn-2')));
+    const transition = classifyWaitChange(idle('turn-1'), idle('turn-2'));
+    assert.equal(transition.kind, 'progress');
+    assert.equal(decideWaitWake({ change: transition, observation: idle('turn-2') }).shouldWake, false);
+    // A genuine native boundary is still a completion.
+    const boundary = classifyWaitChange(normalize('active', { source: 'native' }), normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-2' }));
+    assert.equal(boundary.kind, 'completion');
   });
 
   it('never fabricates a completion wake from an ambiguous native read', async () => {

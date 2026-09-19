@@ -227,7 +227,7 @@ function dedupeEvidence(evidence: readonly WaitEvidence[]): readonly WaitEvidenc
  * new transition, so duplicate or coalesced provider events produce exactly
  * one meaningful change.
  */
-export function classifyWaitChange(previous: WaitObservation | null, next: WaitObservation): WaitChange {
+export function classifyWaitChange(previous: WaitObservation | null, next: WaitObservation, previousNative?: WaitObservation | null): WaitChange {
   if (previous === null) {
     // The first observation establishes a baseline. A terminal baseline is
     // still meaningful (the orchestrator must reconcile it exactly once).
@@ -245,15 +245,18 @@ export function classifyWaitChange(previous: WaitObservation | null, next: WaitO
     return { kind: 'none', meaningful: false, evidence: [] };
   }
   // A native App Server turn is complete when the same subject genuinely moves
-  // from active to idle. Both sides must be real native reads: an ambiguous
-  // native status degrades to a durable-derived status whose `source` is
-  // `runtime`, so a transient native read failure or a not-loaded thread can
-  // never masquerade as a completed turn.
-  if (previous.source === 'native' && next.source === 'native' && previous.status === 'active' && next.status === 'idle') {
+  // from active to idle. The boundary is anchored on the closest preceding
+  // *genuine native* read, so an ambiguous read in between (a transient native
+  // failure, or a not-loaded thread reported as runtime provenance) neither
+  // fabricates a completion nor hides a real one.
+  const nativeBefore = previousNative === undefined
+    ? (previous.source === 'native' ? previous : null)
+    : previousNative;
+  if (nativeBefore !== null && next.source === 'native' && nativeBefore.status === 'active' && next.status === 'idle') {
     return {
       kind: 'completion',
       meaningful: true,
-      evidence: transitionEvidence(previous, next, 'turn-completed', `subject ${next.subjectId} native turn completed${next.lastCompletedTurnId === undefined ? '' : ` (${next.lastCompletedTurnId})`}`),
+      evidence: transitionEvidence(nativeBefore, next, 'turn-completed', `subject ${next.subjectId} native turn completed${next.lastCompletedTurnId === undefined ? '' : ` (${next.lastCompletedTurnId})`}`),
     };
   }
   if (next.status !== previous.status) {
@@ -421,7 +424,38 @@ export interface WaitLedgerAdvance {
   readonly duplicate: boolean;
   /** True when the advance appended a new wake record. */
   readonly wokeNow: boolean;
+  /**
+   * The genuine preceding native observation used for the native active -> idle
+   * boundary, when the ledger retained one. Exposed so a caller can persist and
+   * re-derive the same boundary without re-scanning the ledger.
+   */
+  readonly previousNative: WaitObservation | null;
   readonly observationEventId: string;
+}
+
+/**
+ * Closest preceding genuine native read for this subject. Ambiguous native
+ * reads are recorded with `runtime` provenance, so they are skipped here and
+ * the real native boundary survives an interleaved ambiguous read.
+ */
+function lastNativeObservation(ledger: WaitLedger, subjectId: string): WaitObservation | null {
+  for (let index = ledger.observations.length - 1; index >= 0; index -= 1) {
+    const recorded = ledger.observations[index]!;
+    if (recorded.subjectId !== subjectId || recorded.source !== 'native') continue;
+    return {
+      revision: WAIT_OBSERVATION_REVISION,
+      source: 'native',
+      subjectId: recorded.subjectId,
+      status: recorded.status,
+      ...(recorded.state.activeItemId === null ? {} : { activeItemId: recorded.state.activeItemId }),
+      progress: { items: recorded.state.items, turns: recorded.state.turns },
+      ...(recorded.state.lastCompletedTurnId === null ? {} : { lastCompletedTurnId: recorded.state.lastCompletedTurnId }),
+      headSha: recorded.state.headSha,
+      evidence: [],
+      observedAt: recorded.at,
+    };
+  }
+  return null;
 }
 
 /**
@@ -453,7 +487,7 @@ export function advanceWaitLedger(input: {
     throw new Error('Wait ledger subject does not match the observed subject identity.');
   }
   const digest = waitObservationDigest(observation);
-  const duplicate = ledger.lastDigest === digest && ledger.observations.some((recorded) => recorded.observationDigest === digest);
+  const duplicate = ledger.lastDigest === digest;
   // Reconstruct the previous normalized state from the last durable record.
   // Only state (never evidence detail) is needed to detect a real transition.
   const last = ledger.observations[ledger.observations.length - 1];
@@ -471,10 +505,11 @@ export function advanceWaitLedger(input: {
         evidence: [],
         observedAt: last.at,
       };
+  const previousNative = duplicate ? null : lastNativeObservation(ledger, observation.subjectId);
   const change = duplicate
     ? { kind: 'none' as const, meaningful: false, evidence: [] as readonly WaitEvidence[] }
-    : classifyWaitChange(previous, observation);
-  const observationEventId = `wait-observation:${ledger.ownerRunId}:${observation.subjectId}:${digest}`;
+    : classifyWaitChange(previous, observation, previousNative);
+  const observationEventId = `wait-observation:${ledger.ownerRunId}:${observation.subjectId}:${ledger.observations.length}:${digest}`;
   const observations = duplicate
     ? ledger.observations
     : [...ledger.observations, {
@@ -532,6 +567,7 @@ export function advanceWaitLedger(input: {
     wake: wokeNow ? decision : { shouldWake: false, reason: null, evidence: [] },
     duplicate,
     wokeNow,
+    previousNative: previousNative ?? (observation.source === 'native' ? observation : null),
     observationEventId,
   };
 }
@@ -583,8 +619,17 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
 
 /**
  * Adopt a persisted ledger, filling in fields added after the ledger was
- * written. Older wait ledgers predate terminal-digest tracking; reconstructing
- * it from recorded terminal wakes preserves the duplicate-wake guarantee.
+ * written. Older wait ledgers predate terminal-digest tracking; the set is
+ * reconstructed from terminal wakes that are still inside the bounded history,
+ * which preserves the duplicate-wake guarantee for every realistic upgrade.
+ *
+ * Known, accepted limit: if a legacy ledger both lacks the field and has
+ * already evicted the terminal wake, the evicted digest is unrecoverable, and a
+ * later non-monotonic re-observation of that same terminal state can wake once
+ * more. Legacy ledgers only ever existed transiently on this unmerged branch,
+ * so refusing to adopt them would be the larger risk (a cold-start re-wake for
+ * every in-flight wait); the extra wake is a bounded, non-safety-relevant
+ * reconciliation prompt.
  */
 export function migrateWaitLedger(value: WaitLedger): WaitLedger {
   return {

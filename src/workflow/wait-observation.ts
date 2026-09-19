@@ -122,6 +122,7 @@ function recordWake(ledger: WaitLedger, observation: WaitObservation, at: string
     wake: shouldWake ? decision : { shouldWake: false, reason: null, evidence: [] },
     duplicate: false,
     wokeNow: shouldWake,
+    previousNative: null,
     observationEventId: wakeId,
   };
 }
