@@ -91,6 +91,28 @@ describe('bounded output integration', () => {
     }
   });
 
+  it('uses the same content digest for buffered and file-backed artifacts', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-file-output-hash-'));
+    try {
+      const fileStore = new FileToolOutputStore(directory);
+      const bufferedStore = new InMemoryToolOutputStore();
+      const fileResult = await new NodeProcessRunner({ outputStore: fileStore }).run(
+        process.execPath,
+        ['-e', "process.stdout.write('hash stdout'); process.stderr.write('hash stderr')"],
+        { timeoutMs: 5_000 },
+      );
+      const bufferedResult = await new NodeProcessRunner({ outputStore: bufferedStore }).run(
+        process.execPath,
+        ['-e', "process.stdout.write('hash stdout'); process.stderr.write('hash stderr')"],
+        { timeoutMs: 5_000 },
+      );
+
+      assert.equal(fileResult.output?.artifact.sha256, bufferedResult.output?.artifact.sha256);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('records validation output without changing exact-HEAD acceptance', async () => {
     const owned = workspace();
     try {

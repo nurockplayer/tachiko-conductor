@@ -585,8 +585,6 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
   private readonly stderrCapture: StreamCapture;
   private readonly stdoutDiagnostics: DiagnosticCapture;
   private readonly stderrDiagnostics: DiagnosticCapture;
-  private readonly stdoutHash = createHash('sha256');
-  private readonly stderrHash = createHash('sha256');
   private finished = false;
 
   constructor(private readonly root: string, private readonly policy: ToolOutputPolicy) {
@@ -606,11 +604,9 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
     const handle = channel === 'stdout' ? this.stdoutHandle : this.stderrHandle;
     writeSync(handle, bytes, 0, bytes.length);
     if (channel === 'stdout') {
-      this.stdoutHash.update(bytes);
       this.stdoutCapture.append(chunk);
       this.stdoutDiagnostics.append(chunk);
     } else {
-      this.stderrHash.update(bytes);
       this.stderrCapture.append(chunk);
       this.stderrDiagnostics.append(chunk);
     }
@@ -626,11 +622,10 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
     const stderr = this.stderrCapture.value();
     const stdoutBytes = stdout.bytes;
     const stderrBytes = stderr.bytes;
-    const hash = createHash('sha256')
-      .update(this.stdoutHash.digest())
-      .update('\0', 'utf8')
-      .update(this.stderrHash.digest())
-      .digest('hex');
+    const hash = hashFiles(
+      path.join(this.root, `${this.id}.stdout`),
+      path.join(this.root, `${this.id}.stderr`),
+    );
     const artifact: ToolOutputArtifactReference = {
       kind: 'tool-output', id: this.id, stdoutBytes, stderrBytes, totalBytes: stdoutBytes + stderrBytes, sha256: hash,
     };
@@ -658,6 +653,28 @@ function reference(id: string, stdout: string, stderr: string): ToolOutputArtifa
     totalBytes: utf8Bytes(stdout) + utf8Bytes(stderr),
     sha256: artifactHash(stdout, stderr),
   };
+}
+
+function hashFiles(stdoutPath: string, stderrPath: string): string {
+  const hash = createHash('sha256');
+  hashFile(stdoutPath, hash);
+  hash.update('\0', 'utf8');
+  hashFile(stderrPath, hash);
+  return hash.digest('hex');
+}
+
+function hashFile(filePath: string, hash: ReturnType<typeof createHash>): void {
+  const handle = openSync(filePath, 'r');
+  const buffer = Buffer.alloc(64 * 1024);
+  try {
+    let bytesRead: number;
+    do {
+      bytesRead = readSync(handle, buffer, 0, buffer.length, null);
+      if (bytesRead > 0) hash.update(buffer.subarray(0, bytesRead));
+    } while (bytesRead > 0);
+  } finally {
+    closeSync(handle);
+  }
 }
 
 function searchCapture(capture: ToolOutputCapture, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
@@ -798,7 +815,7 @@ function appendSearchSegment(state: SearchScanState, segment: string, query: str
   return {
     ...state,
     lineBytes: state.lineBytes + utf8Bytes(segment),
-    matchTail: candidate.slice(-Math.max(0, query.length - 1)),
+    matchTail: query.length <= 1 ? '' : candidate.slice(-(query.length - 1)),
     ...(matchIndex < 0 || state.matchedText !== undefined ? {} : { matchedText: boundedMatchText(candidate, matchIndex, query, maxBytes) }),
   };
 }
