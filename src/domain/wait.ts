@@ -471,8 +471,6 @@ export interface WaitLedger {
   readonly lastNativeStatus: WaitSubjectStatus | null;
   /** Whether the most recent recorded observation came from a genuine native read. */
   readonly previousWasNative: boolean;
-  /** Bounded set of native completed-turn identities already surfaced. */
-  readonly nativeIdentities: readonly string[];
   /**
    * Bounded set of observation digests that have already surfaced a wake.
    * Independent of the bounded `wakes` evidence list, so rolling that list over
@@ -510,7 +508,6 @@ export function createWaitLedger(input: {
     lastNativeIdentity: null,
     lastNativeStatus: null,
     previousWasNative: false,
-    nativeIdentities: [],
     surfacedDigests: [],
     deliveredWakeIds: [],
     observationSequence: 0,
@@ -681,9 +678,6 @@ export function advanceWaitLedger(input: {
       : ledger.lastNativeIdentity ?? null,
     lastNativeStatus: observation.source === 'native' ? observation.status : ledger.lastNativeStatus ?? null,
     previousWasNative: duplicate ? (ledger.previousWasNative ?? previousIsNative) : observation.source === 'native',
-    nativeIdentities: observation.source === 'native' && observation.lastCompletedTurnId !== undefined && !(ledger.nativeIdentities ?? []).includes(observation.lastCompletedTurnId)
-      ? [...(ledger.nativeIdentities ?? []), observation.lastCompletedTurnId].slice(-MAX_NATIVE_IDENTITIES)
-      : ledger.nativeIdentities ?? [],
     observationSequence,
     lastDigest: digest,
     lastObservedAt: input.at,
@@ -710,7 +704,6 @@ export interface WaitLedgerFile {
 const MAX_WAIT_OBSERVATIONS = 200;
 const MAX_WAIT_WAKES = 200;
 const MAX_TERMINAL_DIGESTS = 50;
-const MAX_NATIVE_IDENTITIES = 50;
 const MAX_SURFACED_DIGESTS = 500;
 const MAX_DELIVERED_WAKE_IDS = 500;
 
@@ -725,7 +718,6 @@ export function boundWaitLedger(ledger: WaitLedger): WaitLedger {
     observations: ledger.observations.slice(-MAX_WAIT_OBSERVATIONS),
     wakes: ledger.wakes.slice(-MAX_WAIT_WAKES),
     terminalDigests: (ledger.terminalDigests ?? []).slice(-MAX_TERMINAL_DIGESTS),
-    nativeIdentities: (ledger.nativeIdentities ?? []).slice(-MAX_NATIVE_IDENTITIES),
     surfacedDigests: (ledger.surfacedDigests ?? []).slice(-MAX_SURFACED_DIGESTS),
     deliveredWakeIds: (ledger.deliveredWakeIds ?? []).slice(-MAX_DELIVERED_WAKE_IDS),
   };
@@ -762,8 +754,6 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
     (record.lastNativeIdentity === undefined || record.lastNativeIdentity === null || (typeof record.lastNativeIdentity === 'string' && record.lastNativeIdentity !== '')) &&
     (record.lastNativeStatus === undefined || record.lastNativeStatus === null || (WAIT_SUBJECT_STATUSES as readonly string[]).includes(record.lastNativeStatus as string)) &&
     (record.previousWasNative === undefined || typeof record.previousWasNative === 'boolean') &&
-    (record.nativeIdentities === undefined ||
-      (Array.isArray(record.nativeIdentities) && record.nativeIdentities.every((item: unknown) => typeof item === 'string' && item !== ''))) &&
     (record.surfacedDigests === undefined ||
       (Array.isArray(record.surfacedDigests) && record.surfacedDigests.every((item: unknown) => typeof item === 'string' && item !== ''))) &&
     (record.deliveredWakeIds === undefined ||
@@ -799,9 +789,6 @@ export function migrateWaitLedger(value: WaitLedger): WaitLedger {
     ...terminalWakes.map((wake) => wake.observationDigest),
   ])];
   const absorbingWakes = terminalWakes.filter((wake) => isAbsorbingWaitStatus(wake.status)).length > 0;
-  const nativeIdentities = value.nativeIdentities ?? value.observations
-    .filter((recorded) => recorded.source === 'native' && recorded.state.lastCompletedTurnId !== null)
-    .map((recorded) => recorded.state.lastCompletedTurnId as string);
   const lastNative = [...value.observations].reverse().find((recorded) => recorded.source === 'native');
   const lastObservation = value.observations[value.observations.length - 1];
   const sequence = value.observationSequence ?? value.observations.reduce((highest, recorded) => {
@@ -823,7 +810,6 @@ export function migrateWaitLedger(value: WaitLedger): WaitLedger {
     lastNativeIdentity: value.lastNativeIdentity ?? lastNative?.state.lastCompletedTurnId ?? null,
     lastNativeStatus: value.lastNativeStatus ?? lastNative?.status ?? null,
     previousWasNative: value.previousWasNative ?? lastObservation?.source === 'native',
-    nativeIdentities: [...new Set(nativeIdentities)].slice(-MAX_NATIVE_IDENTITIES),
     surfacedDigests: value.surfacedDigests ?? [...new Set(value.wakes.map((wake) => wake.observationDigest))].slice(-MAX_SURFACED_DIGESTS),
     // Legacy ledgers have no delivery record; treat their recorded wakes as
     // delivered so an upgrade does not replay historical decisions.

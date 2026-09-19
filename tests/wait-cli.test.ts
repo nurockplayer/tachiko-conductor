@@ -514,6 +514,47 @@ describe('wait CLI', () => {
     }
   });
 
+  it('acknowledges only the wakes the result actually carried', () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-ack-scope'), { type: 'fail' }, T0);
+      seedRun(dataDir, run);
+      const filePath = resolveWaitLedgerFile(run.id, env);
+      const ledgerStore = new WaitLedgerFileStore({ filePath });
+      const base = createWaitLedger({ subjectId: run.id, ownerRunId: run.id, generation: run.id });
+      const wakeOf = (id: string, reason: 'failure' | 'completion') => ({
+        id, at: T0, reason, source: 'runtime' as const, subjectId: run.id, status: 'failed' as const,
+        observationDigest: id.padEnd(64, 'a'), evidence: [],
+      });
+      ledgerStore.write({
+        ...base,
+        // Two distinct recorded wakes; only the first is carried by the result.
+        wakes: [wakeOf('wake-a', 'failure'), wakeOf('wake-b', 'completion')],
+        terminalDigests: ['wake-a'.padEnd(64, 'a'), 'wake-b'.padEnd(64, 'a')],
+        terminalReached: true,
+      });
+      assert.equal(pendingWaitWakes(ledgerStore.read()!).length, 2);
+
+      acknowledgeWaitDelivery({
+        ok: true, mode: 'observe', runId: run.id, state: run.state, source: 'runtime', subjectId: run.id,
+        status: 'failed', headSha: null, observationDigest: '', change: 'failure',
+        wake: { shouldWake: true, reason: 'failure', evidence: [] },
+        pendingWakes: [{ id: 'wake-a', reason: 'failure', subjectId: run.id, status: 'failed' }],
+        modelTurns: 0, timedOut: false, idle: false, observations: 1, duplicateObservations: 0,
+        wakeCount: 2, waitStartedAt: null, observedDigest: '',
+      }, ledgerStore);
+
+      const after = pendingWaitWakes(ledgerStore.read()!);
+      assert.deepEqual(after.map((wake) => wake.id), ['wake-b'], 'a wake the result never carried must stay pending');
+      // A later process replays the wake that was never delivered.
+      const replayed = ledgerStore.read()!;
+      assert.equal(replayed.deliveredWakeIds?.includes('wake-a'), true);
+      assert.equal(replayed.deliveredWakeIds?.includes('wake-b'), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an unknown run id and malformed schedule values', async () => {
     const { directory, dataDir, env } = tempWorkspace();
     try {

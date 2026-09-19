@@ -276,11 +276,15 @@ export async function waitAwaitCommand(
  * delivery leaves the wake pending for the next process to replay.
  */
 export function acknowledgeWaitDelivery(result: WaitCommandResult, ledgerStore: WaitLedgerStore): void {
-  if (result.wake.shouldWake !== true && result.pendingWakes.length === 0) return;
+  const carried = result.pendingWakes.map((wake) => wake.id);
+  if (carried.length === 0) return;
   const ledger = ledgerStore.read();
   if (ledger === null) return;
-  const pending = pendingWakeViews(ledger);
-  ledgerStore.write(markWaitWakesDelivered(ledger, pending.map((wake) => wake.id)));
+  // Only the exact wakes this result carried may be acknowledged. Marking every
+  // currently-pending id would silently suppress a wake another writer recorded
+  // after this result was built but before it was emitted.
+  const known = new Set(ledger.wakes.map((wake) => wake.id));
+  ledgerStore.write(markWaitWakesDelivered(ledger, carried.filter((id) => known.has(id))));
 }
 
 function readRun(id: string, store: RunStore): Run {
