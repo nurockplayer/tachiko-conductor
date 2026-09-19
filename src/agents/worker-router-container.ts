@@ -28,6 +28,7 @@ import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
 import {
   boundToolOutput,
   FileToolOutputStore,
+  InMemoryToolOutputStore,
   type ToolOutputEnvelope,
   type ToolOutputPolicy,
   type ToolOutputStore,
@@ -274,6 +275,8 @@ export interface DockerWorkerContainerRuntimeOptions {
   readonly docker?: string;
   /** Bound for lifecycle control calls; never the worker run itself. */
   readonly controlTimeoutMs?: number;
+  readonly outputPolicy?: ToolOutputPolicy;
+  readonly outputStore?: ToolOutputStore;
 }
 
 /** Docker CLI implementation. Every lifecycle call carries the exact ID. */
@@ -283,7 +286,13 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
   private readonly controlTimeoutMs: number;
 
   constructor(options: DockerWorkerContainerRuntimeOptions = {}) {
-    this.runner = options.runner ?? new NodeProcessRunner();
+    this.runner = options.runner ?? new NodeProcessRunner({
+      outputPolicy: options.outputPolicy,
+      // Docker log/error transcripts are redacted at the container boundary
+      // before they are persisted by ContainerWorkerBoundary. Keep the raw
+      // process-cap partial in memory only here.
+      outputStore: options.outputStore ?? new InMemoryToolOutputStore(),
+    });
     this.docker = options.docker ?? 'docker';
     this.controlTimeoutMs = options.controlTimeoutMs ?? 30_000;
   }
@@ -512,7 +521,7 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
         restartPolicy: state.restartPolicy,
         stdout: safeLogs.stdout,
         stderr: safeLogs.stderr,
-        output: logs.output ?? boundToolOutput({
+        output: logs.output === undefined ? boundToolOutput({
           outcome: exitCode === 0 ? 'passed' : 'failed',
           exitCode,
           stdout: safeLogs.stdout,
@@ -520,6 +529,15 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
           store: this.outputStore,
           policy: this.outputPolicy,
           summary: exitCode === 0 ? 'Worker container completed.' : `Worker container exited with status ${exitCode}.`,
+        }) : boundToolOutput({
+          outcome: logs.output.outcome,
+          exitCode: logs.output.exitCode,
+          stdout: safeLogs.stdout,
+          stderr: safeLogs.stderr,
+          store: this.outputStore,
+          policy: this.outputPolicy,
+          summary: logs.output.summary,
+          captureTruncated: true,
         }),
       };
     } catch (error) {

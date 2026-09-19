@@ -18,7 +18,7 @@ import {
   type WorkerContainerSpec,
 } from '../src/agents/worker-router-container.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
-import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
+import { InMemoryToolOutputStore, boundToolOutput, searchToolOutput } from '../src/evidence/tool-output.js';
 
 const ID = 'ab'.repeat(32);
 const IMAGE = `tachiko/worker-router@sha256:${'c'.repeat(64)}`;
@@ -128,8 +128,10 @@ describe('ContainerWorkerBoundary', () => {
 
   it('retains bounded log-retrieval overflow evidence after the container is terminal', async () => {
     const runtime = new FakeRuntime();
+    const store = new InMemoryToolOutputStore();
+    const secret = 'sk-live-secret';
     const output = boundToolOutput({
-      outcome: 'failed', exitCode: null, stdout: 'partial worker log', stderr: '',
+      outcome: 'failed', exitCode: null, stdout: `partial worker log ${secret}`, stderr: '',
       store: new InMemoryToolOutputStore(), captureTruncated: true,
     });
     runtime.logsResult = new WorkerRouterContainerError(
@@ -139,11 +141,12 @@ describe('ContainerWorkerBoundary', () => {
       output,
     );
 
-    const result = await new ContainerWorkerBoundary({ runtime }).run(spec());
+    const result = await new ContainerWorkerBoundary({ runtime, outputStore: store }).run(spec({ env: { HOME: '/root', DEEPSEEK_API_KEY: secret } }));
 
     assert.equal(result.output?.overflow.capture, true);
-    assert.equal(result.output?.artifact.totalBytes, output.artifact.totalBytes);
-    assert.equal(result.stdout, output.stdout.preview);
+    assert.ok((result.output?.artifact.totalBytes ?? 0) > 0);
+    assert.equal(result.stdout.includes(secret), false);
+    assert.equal(searchToolOutput(result.output!, store, { query: secret }).length, 0);
     assert.equal(runtime.calls.includes(`remove:${ID}`), true);
   });
 
