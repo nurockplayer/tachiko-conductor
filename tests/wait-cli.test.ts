@@ -166,6 +166,59 @@ describe('wait CLI', () => {
     }
   });
 
+  it('retains one native observer for the dependency lifetime and wakes once on active -> idle', async () => {
+    const { directory, dataDir, env } = tempWorkspace();
+    try {
+      const run = {
+        ...createRun(TARGET, T0, 'run-wait-native-lifetime'),
+        executor: { provider: CODEX_APP_SERVER_PROVIDER, sessionId: 'thread-lifetime', generation: 'generation-1' },
+      };
+      const store = new JsonFileStore({ dir: dataDir });
+      store.create(run);
+      const observedStatuses: string[] = [];
+      // The provider reports active once and then idle.
+      const dependencies = buildWaitCommandDependencies({
+        store,
+        run,
+        env,
+        now: () => T0,
+        appServerAdapter: {
+          observeRuntime: async () => {
+            const status = observedStatuses.length === 0 ? 'active' as const : 'idle' as const;
+            observedStatuses.push(status);
+            return {
+              threadId: 'thread-lifetime',
+              status,
+              ...(status === 'active' ? { activeTurnId: 'turn-1' } : {}),
+              history: [],
+            };
+          },
+        },
+      });
+      // One dependency object must expose exactly one retained observer.
+      const observer = dependencies.nativeObserver;
+      assert.notEqual(observer, undefined);
+      assert.equal(dependencies.nativeObserver, observer);
+      let clock = 0;
+      const result = await waitAwaitCommand(
+        { id: run.id, mode: 'wait', policy: { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 10, onTimeout: 'continue' }, pollIntervalMs: 1 },
+        { ...dependencies, monotonicNow: () => clock, sleep: async (milliseconds) => { clock += milliseconds; } },
+      );
+      assert.deepEqual(observedStatuses.slice(0, 2), ['active', 'idle']);
+      assert.equal(result.source, 'native');
+      assert.equal(result.change, 'completion');
+      assert.equal(result.wake.shouldWake, true);
+      assert.equal(result.wake.reason, 'completion');
+      assert.equal(result.wakeCount, 1);
+      assert.equal(result.modelTurns, 0);
+      const ledger = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }).read();
+      assert.equal(ledger?.wakes.length, 1);
+      assert.equal(ledger?.wakes[0]?.reason, 'completion');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('keeps an idle bounded wait model-free and records no run telemetry wake', async () => {
     const { directory, dataDir, env } = tempWorkspace();
     try {
