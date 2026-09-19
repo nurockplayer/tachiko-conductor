@@ -1,12 +1,34 @@
-import { homedir } from 'node:os';
 import path from 'node:path';
 
 import { assertWorkspaceGuard, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
-import { NodeProcessRunner, type ProcessRunner, type ProcessResult, type ProcessRunOptions } from '../github/transport.js';
+import { NodeProcessRunner, type ProcessRunner, type ProcessRunOptions } from '../github/transport.js';
+import {
+  ContainerWorkerBoundary,
+  WORKER_ROUTER_CONTAINER_ENV_ALLOWLIST,
+  WORKER_ROUTER_CONTAINER_ERROR_CODE,
+  WORKER_ROUTER_CONTAINER_HOME,
+  WORKER_ROUTER_IMAGE_ENV,
+  WORKER_ROUTER_NETWORK_ENV,
+  assertDigestPinnedImage,
+  boundedMessage,
+  isWorkerRouterContainerError,
+  planCommitOnlyMounts,
+  redactWorkerEnvValues,
+  resolveWorkerNetworkMode,
+  type ContainerWorkerExecution,
+  type ContainerWorkerResult,
+  type WorkerContainerSpec,
+  type WorkerNetworkMode,
+  type WorkerRouterContainerErrorCode,
+} from './worker-router-container.js';
 
 export const WORKER_ROUTER_PROVIDER = 'worker-router';
-export const WORKER_ROUTER_DEFAULT_EXECUTABLE = `${homedir()}/.local/bin/worker-router`;
+/**
+ * Absolute *in-container* entrypoint. The host worker path is never executed;
+ * the digest-pinned image owns the worker runtime.
+ */
+export const WORKER_ROUTER_DEFAULT_EXECUTABLE = `${WORKER_ROUTER_CONTAINER_HOME}/.local/bin/worker-router`;
 export const WORKER_ROUTER_EXECUTABLE_ENV = 'TACHIKO_WORKER_ROUTER_PATH';
 
 export const WORKER_ROUTER_ERROR_CODE = {
@@ -20,29 +42,49 @@ export const WORKER_ROUTER_ERROR_CODE = {
   HEAD_READ_FAILED: 'WORKER_ROUTER_HEAD_READ_FAILED',
   BASE_ANCESTRY_FAILED: 'WORKER_ROUTER_BASE_ANCESTRY_FAILED',
   PUBLISH_FAILED: 'WORKER_ROUTER_PUBLISH_FAILED',
+  IMAGE_REQUIRED: WORKER_ROUTER_CONTAINER_ERROR_CODE.IMAGE_REQUIRED,
+  IMAGE_UNPINNED: WORKER_ROUTER_CONTAINER_ERROR_CODE.IMAGE_UNPINNED,
+  MOUNTS_INVALID: WORKER_ROUTER_CONTAINER_ERROR_CODE.MOUNTS_INVALID,
+  CONTAINER_FAILURE: 'WORKER_ROUTER_CONTAINER_FAILURE',
+  CONTAINMENT_UNPROVEN: 'WORKER_ROUTER_CONTAINMENT_UNPROVEN',
 } as const;
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
 export interface WorkerRouterAdapterOptions {
+  /** Host process runner for Conductor-owned Git authority operations only. */
   readonly runner?: ProcessRunner;
+  /** Absolute in-container worker entrypoint (defaults to the image's worker-router). */
   readonly executable?: string;
   readonly cwd?: string;
   readonly timeoutMs?: number;
   readonly env?: NodeJS.ProcessEnv;
+  /** Digest-pinned container image. */
+  readonly image?: string;
+  readonly network?: WorkerNetworkMode;
+  /** Exact host environment variable names forwarded into the container. */
+  readonly containerEnv?: readonly string[];
+  /** Injectable container boundary; production always uses the real runtime. */
+  readonly container?: ContainerWorkerExecution;
 }
 
-/** Stateless implementation adapter for the local worker-router executable. */
+/** Stateless implementation adapter for the container-owned worker-router path. */
 export class WorkerRouterAdapter implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
   private readonly runner: ProcessRunner;
   private readonly executable: string;
   private readonly cwd: string;
   private readonly timeoutMs: number;
+  private readonly hostEnv: NodeJS.ProcessEnv;
+  private readonly container: ContainerWorkerExecution;
+  private readonly image: string | undefined;
+  private readonly network: WorkerNetworkMode;
+  private readonly containerEnvKeys: readonly string[];
 
   constructor(options: WorkerRouterAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
     const env = options.env ?? process.env;
+    this.hostEnv = env;
     const executable = options.executable ?? env[WORKER_ROUTER_EXECUTABLE_ENV] ?? WORKER_ROUTER_DEFAULT_EXECUTABLE;
     if (executable.trim() === '' || !path.isAbsolute(executable)) {
       throw new Error(`${WORKER_ROUTER_EXECUTABLE_ENV} / worker-router executable must be an absolute non-empty path.`);
@@ -50,6 +92,13 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     this.executable = executable;
     this.cwd = options.cwd ?? process.cwd();
     this.timeoutMs = options.timeoutMs ?? 10 * 60_000;
+    const image = options.image ?? env[WORKER_ROUTER_IMAGE_ENV];
+    if (image !== undefined && image.trim() !== '') assertDigestPinnedImage(image);
+    this.image = image === undefined || image.trim() === '' ? undefined : image;
+    this.network = resolveWorkerNetworkMode(options.network ?? env[WORKER_ROUTER_NETWORK_ENV]);
+    this.containerEnvKeys = options.containerEnv ?? WORKER_ROUTER_CONTAINER_ENV_ALLOWLIST;
+    // The real boundary is the only production path; there is no host fallback.
+    this.container = options.container ?? new ContainerWorkerBoundary();
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -73,16 +122,28 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     const task = buildTask(request);
     await assertWorkspaceGuard(request.workspaceGuard);
     const startedAt = Date.now();
-    let result: ProcessResult;
+    if (this.image === undefined) {
+      return failure(
+        WORKER_ROUTER_ERROR_CODE.IMAGE_REQUIRED,
+        `Worker router requires a digest-pinned container image via ${WORKER_ROUTER_IMAGE_ENV}; host execution is not a fallback.`,
+        elapsed(startedAt),
+      );
+    }
+    let spec: WorkerContainerSpec;
     try {
-      result = await this.runner.run(this.executable, [], this.options(request.signal, cwd, task));
+      spec = this.containerSpec(this.image, cwd, task, request.signal);
     } catch (error) {
-      const durationMs = elapsed(startedAt);
-      const code = errorCode(error);
-      if (isAborted(request.signal) || code === 'ABORT_ERR') return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', durationMs);
-      if (code === 'ETIMEDOUT') return failure(WORKER_ROUTER_ERROR_CODE.TIMEOUT, `Worker router timed out after ${this.timeoutMs}ms.`, durationMs);
-      if (code === 'ENOENT') return failure(WORKER_ROUTER_ERROR_CODE.NOT_FOUND, `Worker router executable "${this.executable}" was not found.`, durationMs);
-      return failure(WORKER_ROUTER_ERROR_CODE.EXEC_FAILURE, `Failed to run worker router: ${errorMessage(error)}`, durationMs);
+      return failure(
+        WORKER_ROUTER_ERROR_CODE.MOUNTS_INVALID,
+        `Worker router could not plan its commit-only container mounts: ${boundedMessage(error)}`,
+        elapsed(startedAt),
+      );
+    }
+    let result: ContainerWorkerResult;
+    try {
+      result = await this.container.run(spec);
+    } catch (error) {
+      return this.containerFailure(error, request.signal, startedAt, spec.env);
     }
     const provenance = workerProvenance(result.stderr);
     const diagnostics = boundedDiagnostics(result.stderr, result.stdout, provenance);
@@ -91,6 +152,8 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       return { ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics] };
     }
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
+    // The exact container is terminal before this point; only now may the
+    // Tachiko-owned workspace guard, HEAD read, ancestry proof, and publication run.
     await assertWorkspaceGuard(request.workspaceGuard, 'after-execution');
     const head = await this.readHead(request.signal, cwd);
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
@@ -116,7 +179,45 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED}: ${published.detail}`, ...diagnostics, ...published.diagnostics],
       };
     }
-    return { exitStatus: 'success', summary: 'Worker router completed implementation and Conductor published the exact committed HEAD.', headSha: head, ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
+    return { exitStatus: 'success', summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.', headSha: head, ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
+  }
+
+  private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined): WorkerContainerSpec {
+    return {
+      image,
+      entrypoint: this.executable,
+      args: [],
+      mounts: planCommitOnlyMounts(cwd),
+      env: this.containerEnvironment(),
+      network: this.network,
+      workdir: cwd,
+      stdin: task,
+      timeoutMs: this.timeoutMs,
+      ...(signal === undefined ? {} : { signal }),
+    };
+  }
+
+  /** Forward only the named worker inputs; never a broad host environment. */
+  private containerEnvironment(): Readonly<Record<string, string>> {
+    const forwarded: Record<string, string> = { HOME: WORKER_ROUTER_CONTAINER_HOME };
+    for (const key of this.containerEnvKeys) {
+      const value = this.hostEnv[key];
+      if (typeof value === 'string' && value !== '') forwarded[key] = value;
+    }
+    return forwarded;
+  }
+
+  private containerFailure(error: unknown, signal: AbortSignal | undefined, startedAt: number, env: Readonly<Record<string, string>>): AgentResult {
+    const durationMs = elapsed(startedAt);
+    const containerCode = isWorkerRouterContainerError(error) ? error.code : undefined;
+    if (isAborted(signal) || containerCode === WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED) {
+      return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', durationMs);
+    }
+    if (containerCode === WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT) {
+      return failure(WORKER_ROUTER_ERROR_CODE.TIMEOUT, `Worker router container timed out after ${this.timeoutMs}ms.`, durationMs);
+    }
+    const message = redactWorkerEnvValues(boundedMessage(error), env);
+    return failure(adapterCodeFor(containerCode), `Worker router container failed closed: ${message}`, durationMs);
   }
 
   private async verifyBaseAncestry(
@@ -189,6 +290,17 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: [],
       };
     }
+  }
+}
+
+function adapterCodeFor(code: WorkerRouterContainerErrorCode | undefined): string {
+  switch (code) {
+    case WORKER_ROUTER_CONTAINER_ERROR_CODE.IMAGE_REQUIRED: return WORKER_ROUTER_ERROR_CODE.IMAGE_REQUIRED;
+    case WORKER_ROUTER_CONTAINER_ERROR_CODE.IMAGE_UNPINNED: return WORKER_ROUTER_ERROR_CODE.IMAGE_UNPINNED;
+    case WORKER_ROUTER_CONTAINER_ERROR_CODE.MOUNTS_INVALID: return WORKER_ROUTER_ERROR_CODE.MOUNTS_INVALID;
+    case WORKER_ROUTER_CONTAINER_ERROR_CODE.RUNTIME_NOT_FOUND: return WORKER_ROUTER_ERROR_CODE.NOT_FOUND;
+    case WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN: return WORKER_ROUTER_ERROR_CODE.CONTAINMENT_UNPROVEN;
+    default: return WORKER_ROUTER_ERROR_CODE.CONTAINER_FAILURE;
   }
 }
 
