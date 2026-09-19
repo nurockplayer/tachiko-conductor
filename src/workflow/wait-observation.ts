@@ -106,7 +106,8 @@ function recordWake(ledger: WaitLedger, observation: WaitObservation, at: string
   // timer. Never re-wake for it.
   const terminalDigest = (ledger.terminalDigests ?? []).includes(digest);
   const alreadyRecorded = ledger.terminalReached || terminalDigest ||
-    ledger.wakes.some((wake) => wake.observationDigest === digest && wake.reason === decision.reason);
+    (ledger.surfacedDigests ?? []).includes(digest) ||
+    ledger.wakes.some((wake) => wake.observationDigest === digest);
   const shouldWake = decision.shouldWake && !alreadyRecorded;
   const wakeId = `wait-wake:${ledger.ownerRunId}:${observation.subjectId}:${digest}:${decision.reason ?? 'none'}:${ledger.wakes.length}`;
   const wakes = shouldWake
@@ -122,7 +123,13 @@ function recordWake(ledger: WaitLedger, observation: WaitObservation, at: string
       }]
     : ledger.wakes;
   return {
-    ledger: { ...ledger, wakes },
+    ledger: {
+      ...ledger,
+      wakes,
+      surfacedDigests: shouldWake && !(ledger.surfacedDigests ?? []).includes(digest)
+        ? [...(ledger.surfacedDigests ?? []), digest].slice(-500)
+        : ledger.surfacedDigests ?? [],
+    },
     change: { kind: 'none', meaningful: false, evidence: [] },
     wake: shouldWake ? decision : { shouldWake: false, reason: null, evidence: [] },
     duplicate: false,

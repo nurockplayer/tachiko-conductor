@@ -473,6 +473,12 @@ export interface WaitLedger {
   readonly previousWasNative: boolean;
   /** Bounded set of native completed-turn identities already surfaced. */
   readonly nativeIdentities: readonly string[];
+  /**
+   * Bounded set of observation digests that have already surfaced a wake.
+   * Independent of the bounded `wakes` evidence list, so rolling that list over
+   * can never resurrect a periodic timeout wake for an already-decided state.
+   */
+  readonly surfacedDigests: readonly string[];
   /** Monotonic observation counter, independent of the bounded history length. */
   readonly observationSequence: number;
 }
@@ -499,6 +505,7 @@ export function createWaitLedger(input: {
     lastNativeStatus: null,
     previousWasNative: false,
     nativeIdentities: [],
+    surfacedDigests: [],
     observationSequence: 0,
   };
 }
@@ -627,6 +634,8 @@ export function advanceWaitLedger(input: {
   // would attach to the same unchanged state. A terminal subject never wakes
   // again at all, so post-terminal drift cannot recycle the timeout policy.
   const duplicateWake = decision.shouldWake && (ledger.terminalReached ||
+    (ledger.terminalDigests ?? []).includes(digest) ||
+    (ledger.surfacedDigests ?? []).includes(digest) ||
     ledger.wakes.some((wake) => wake.observationDigest === digest));
   const terminalDecision = decision.shouldWake &&
     (decision.reason === 'completion' || decision.reason === 'failure' || decision.reason === 'blocked' || decision.reason === 'terminal');
@@ -654,6 +663,9 @@ export function advanceWaitLedger(input: {
     observations,
     wakes,
     terminalDigests,
+    surfacedDigests: wokeNow && !(ledger.surfacedDigests ?? []).includes(digest)
+      ? [...(ledger.surfacedDigests ?? []), digest].slice(-MAX_SURFACED_DIGESTS)
+      : ledger.surfacedDigests ?? [],
     // Sticky for absorbing states only: a resumable `blocked` subject must not
     // suppress a later genuine terminal wake.
     terminalReached: ledger.terminalReached || (!duplicate && isAbsorbingWaitStatus(observation.status)),
@@ -692,6 +704,7 @@ const MAX_WAIT_OBSERVATIONS = 200;
 const MAX_WAIT_WAKES = 200;
 const MAX_TERMINAL_DIGESTS = 50;
 const MAX_NATIVE_IDENTITIES = 50;
+const MAX_SURFACED_DIGESTS = 500;
 
 /**
  * Keep the durable ledger bounded; the latest records are the reconciliation
@@ -705,6 +718,7 @@ export function boundWaitLedger(ledger: WaitLedger): WaitLedger {
     wakes: ledger.wakes.slice(-MAX_WAIT_WAKES),
     terminalDigests: (ledger.terminalDigests ?? []).slice(-MAX_TERMINAL_DIGESTS),
     nativeIdentities: (ledger.nativeIdentities ?? []).slice(-MAX_NATIVE_IDENTITIES),
+    surfacedDigests: (ledger.surfacedDigests ?? []).slice(-MAX_SURFACED_DIGESTS),
   };
 }
 
@@ -734,6 +748,8 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
     (record.previousWasNative === undefined || typeof record.previousWasNative === 'boolean') &&
     (record.nativeIdentities === undefined ||
       (Array.isArray(record.nativeIdentities) && record.nativeIdentities.every((item: unknown) => typeof item === 'string' && item !== ''))) &&
+    (record.surfacedDigests === undefined ||
+      (Array.isArray(record.surfacedDigests) && record.surfacedDigests.every((item: unknown) => typeof item === 'string' && item !== ''))) &&
     (record.observationSequence === undefined || (Number.isSafeInteger(record.observationSequence) && (record.observationSequence as number) >= 0));
 }
 
@@ -752,10 +768,19 @@ export function isWaitLedger(value: unknown): value is WaitLedger {
  * reconciliation prompt.
  */
 export function migrateWaitLedger(value: WaitLedger): WaitLedger {
-  const terminalDigests = value.terminalDigests ?? value.wakes
-    .filter((wake) => (wake.reason === 'completion' || wake.reason === 'failure' || wake.reason === 'blocked' || wake.reason === 'terminal') &&
-      isAbsorbingWaitStatus(wake.status))
-    .map((wake) => wake.observationDigest);
+  // A recorded decision boundary is anything surfaced for a terminal or blocked
+  // status; only absorbing statuses make the subject permanently terminal. This
+  // is derived from the recorded wake evidence rather than trusting persisted
+  // gate fields written by earlier revisions, which could mark a resumable
+  // `blocked` subject terminal and silently drop its later real transition.
+  const terminalWakes = value.wakes.filter((wake) =>
+    (wake.reason === 'completion' || wake.reason === 'failure' || wake.reason === 'blocked' || wake.reason === 'terminal') &&
+    (isAbsorbingWaitStatus(wake.status) || wake.status === 'blocked'));
+  const terminalDigests = [...new Set([
+    ...(value.terminalDigests ?? []),
+    ...terminalWakes.map((wake) => wake.observationDigest),
+  ])];
+  const absorbingWakes = terminalWakes.filter((wake) => isAbsorbingWaitStatus(wake.status)).length > 0;
   const nativeIdentities = value.nativeIdentities ?? value.observations
     .filter((recorded) => recorded.source === 'native' && recorded.state.lastCompletedTurnId !== null)
     .map((recorded) => recorded.state.lastCompletedTurnId as string);
@@ -768,13 +793,15 @@ export function migrateWaitLedger(value: WaitLedger): WaitLedger {
   return {
     ...value,
     terminalDigests,
-    // A terminal transition is only reached through a terminal *status*, never
-    // through a native completion wake whose observed status is `idle`.
-    terminalReached: value.terminalReached ?? terminalDigests.length > 0,
+    // Absorbing terminal is only reached through a real absorbing status, never
+    // through a `blocked` subject or a native completion wake whose observed
+    // status is `idle`.
+    terminalReached: absorbingWakes,
     lastNativeIdentity: value.lastNativeIdentity ?? lastNative?.state.lastCompletedTurnId ?? null,
     lastNativeStatus: value.lastNativeStatus ?? lastNative?.status ?? null,
     previousWasNative: value.previousWasNative ?? lastObservation?.source === 'native',
     nativeIdentities: [...new Set(nativeIdentities)].slice(-MAX_NATIVE_IDENTITIES),
+    surfacedDigests: value.surfacedDigests ?? [...new Set(value.wakes.map((wake) => wake.observationDigest))].slice(-MAX_SURFACED_DIGESTS),
     observationSequence: sequence,
   };
 }

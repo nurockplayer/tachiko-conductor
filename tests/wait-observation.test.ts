@@ -712,6 +712,57 @@ describe('#35 native observation reuse', () => {
     assert.equal(failed.change.kind, 'failure');
   });
 
+  it('re-derives terminal gates from recorded status during migration', () => {
+    // A ledger written by an earlier revision could persist terminalReached=true
+    // for a resumable blocked subject, and could persist a blocked or native
+    // completion digest in terminalDigests. Migration must trust the recorded
+    // status evidence, not those fields.
+    const blocked = normalize('blocked');
+    const bounded = advanceWaitLedger({ ledger: ledgerFor(), observation: blocked, at: T0 }).ledger;
+    const legacy = {
+      ...bounded,
+      terminalReached: true,
+      terminalDigests: [waitObservationDigest(blocked)],
+    } as never;
+    const migrated = migrateWaitLedger(legacy);
+    assert.equal(migrated.terminalReached, false, 'a blocked subject is not absorbing-terminal');
+    assert.equal(migrated.terminalDigests?.includes(waitObservationDigest(blocked)), true, 'the blocked decision boundary stays recorded');
+    const failed = advanceWaitLedger({ ledger: migrated, observation: normalize('failed'), at: T0 });
+    assert.equal(failed.change.kind, 'failure');
+    assert.equal(failed.wokeNow, true, 'a later genuine terminal transition must wake');
+    assert.equal(failed.ledger.wakes.length, 2);
+
+    // A native completion wake (observed status idle) must never be absorbing.
+    let nativeLedger = advanceWaitLedger({ ledger: ledgerFor(), observation: normalize('active', { source: 'native' }), at: T0 }).ledger;
+    nativeLedger = advanceWaitLedger({ ledger: nativeLedger, observation: normalize('idle', { source: 'native', lastCompletedTurnId: 'turn-1' }), at: T0 }).ledger;
+    const migratedNative = migrateWaitLedger({ ...nativeLedger, terminalReached: true, lastNativeStatus: undefined } as never);
+    assert.equal(migratedNative.terminalReached, false);
+    assert.equal(advanceWaitLedger({ ledger: migratedNative, observation: normalize('failed'), at: T0 }).wokeNow, true);
+  });
+
+  it('never re-wakes a surfaced digest after the bounded wake list rolls over', () => {
+    const policy: WaitWakePolicy = { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 0, onTimeout: 'policy-action' };
+    const decision = normalize('active');
+    let ledger = ledgerFor();
+    const first = advanceWaitLedger({ ledger, observation: decision, at: T0, timedOut: true, policy });
+    assert.equal(first.wokeNow, true);
+    ledger = first.ledger;
+    assert.equal(ledger.surfacedDigests?.includes(waitObservationDigest(decision)), true);
+    // Roll the bounded wake list far enough that the original record is gone.
+    for (let index = 0; index < 260; index += 1) {
+      ledger = boundWaitLedger(advanceWaitLedger({
+        ledger,
+        observation: normalize('active', { progress: { items: index + 1, turns: 0 } }),
+        at: T0,
+        timedOut: true,
+        policy,
+      }).ledger);
+    }
+    assert.equal(ledger.wakes.some((wake) => wake.observationDigest === waitObservationDigest(decision)), false, 'surfaced wake must be evicted');
+    const replay = advanceWaitLedger({ ledger, observation: decision, at: T0, timedOut: true, policy });
+    assert.equal(replay.wokeNow, false, 'an already-surfaced digest must not re-wake after rollover');
+  });
+
   it('keeps the active native anchor through eviction when the idle read has no turn id', () => {
     // Boundary 1 is anchored on the durable native status, so it survives both
     // history eviction and an interrupted turn with no completed-turn id.
