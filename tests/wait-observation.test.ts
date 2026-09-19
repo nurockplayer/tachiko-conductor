@@ -740,6 +740,64 @@ describe('#35 native observation reuse', () => {
     assert.equal(advanceWaitLedger({ ledger: migratedNative, observation: normalize('failed'), at: T0 }).wokeNow, true);
   });
 
+  it('persists the native boundary during a bounded wait so a crash cannot lose it', async () => {
+    // A bounded wait can run for many minutes. The genuine native active phase
+    // must reach durable storage during the wait, not only when it returns.
+    const TARGET_LOCAL = { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 7 } as const;
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-wait-durable-'));
+    try {
+      const filePath = path.join(directory, 'state.json');
+      const store = new WaitLedgerFileStore({ filePath });
+      const run = { ...newRun(SUBJECT, TARGET_LOCAL), executor: { provider: 'codex-app-server', sessionId: 'thread-1', generation: 'generation-1' } };
+      let index = 0;
+      const observer = new RunRuntimeObserver(run, {
+        now: () => T0,
+        nativeObserver: {
+          snapshot: async () => {
+            index += 1;
+            return index === 1
+              ? { status: 'active', activeItemId: 'turn-1', turns: 1 }
+              : { status: 'idle', turns: index, lastCompletedTurnId: 'turn-2' };
+          },
+        },
+      });
+      const persistedNativeStatuses: Array<string | null> = [];
+      const outcome = await awaitMeaningfulChange({
+        observer,
+        ledger: createWaitLedger({ subjectId: SUBJECT, ownerRunId: SUBJECT, generation: 'generation-1' }),
+        policy: { ...DEFAULT_WAIT_WAKE_POLICY, timeoutMs: 100, onTimeout: 'continue' },
+        now: () => 0,
+        sleep: async () => undefined,
+        pollIntervalMs: 1,
+        persist: (ledger) => {
+          store.write(ledger);
+          persistedNativeStatuses.push(store.read()?.lastNativeStatus ?? null);
+        },
+      });
+      assert.equal(outcome.change.kind, 'completion');
+      assert.equal(outcome.wake.shouldWake, true);
+      // The genuine native active phase reached durable storage mid-wait.
+      assert.equal(persistedNativeStatuses.includes('active'), true, 'the native active anchor must be persisted during the wait');
+
+      // A restarted process reading only the persisted ledger anchors on that
+      // durable active state and still wakes for the completion.
+      const onDisk = { ...store.read()!, lastNativeIdentity: 'turn-1', previousWasNative: false };
+      index = 99;
+      const restarted = await observeWaitState({
+        observer,
+        ledger: onDisk,
+        at: T0,
+        policy: DEFAULT_WAIT_WAKE_POLICY,
+        expectedOwnerRunId: SUBJECT,
+        expectedGeneration: 'generation-1',
+      });
+      assert.equal(restarted.advance.change.kind, 'completion');
+      assert.equal(restarted.advance.wokeNow, true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('does not change wake eligibility when an equivalent read is coalesced', async () => {
     // Regression: a duplicate read appends nothing, so it must not change any
     // durable boundary state. Concretely, an idle -> idle completed-turn
@@ -977,6 +1035,21 @@ describe('wait ledger persistence', () => {
       assert.equal(read?.ownerRunId, SUBJECT);
       assert.ok(waitLedgerBelongsTo(read!, { subjectId: SUBJECT, ownerRunId: SUBJECT, generation: 'generation-1' }));
       assert.equal(waitLedgerBelongsTo(read!, { subjectId: 'other', ownerRunId: SUBJECT, generation: 'generation-1' }), false);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed when an existing ledger cannot be read', () => {
+    // Only a missing file means "no ledger". Any other read failure must not be
+    // treated as absent, or the next write would clobber durable evidence.
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-wait-unreadable-'));
+    try {
+      // Reading a directory always fails with a non-ENOENT error.
+      const store = new WaitLedgerFileStore({ filePath: directory });
+      assert.throws(() => store.read(), /not a valid/);
+      // A genuinely missing file is still an empty starting point.
+      assert.equal(new WaitLedgerFileStore({ filePath: path.join(directory, 'absent.json') }).read(), null);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

@@ -225,6 +225,7 @@ export async function waitAwaitCommand(
     ...(options.pollIntervalMs === undefined ? {} : { pollIntervalMs: options.pollIntervalMs }),
     expectedOwnerRunId: run.id,
     expectedGeneration: run.dispatchClaimId ?? run.id,
+    persist: (ledger) => dependencies.ledgerStore.write(ledger),
   });
   dependencies.ledgerStore.write(outcome.ledger);
   if (outcome.wake.shouldWake) {

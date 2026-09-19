@@ -60,8 +60,12 @@ export class WaitLedgerFileStore implements WaitLedgerStore {
     let raw: string;
     try {
       raw = readFileSync(this.filePath, 'utf8');
-    } catch {
-      return null;
+    } catch (error) {
+      // Only a missing file means "no ledger". Any other read failure leaves an
+      // existing durable ledger unreadable, and treating that as absent would
+      // let the next write clobber terminal evidence; fail closed instead.
+      if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'ENOENT') return null;
+      throw new WaitLedgerCorruptionError(this.filePath);
     }
     let parsed: unknown;
     try {

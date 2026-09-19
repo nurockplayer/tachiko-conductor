@@ -73,6 +73,13 @@ export interface WaitAwaitOptions {
   readonly pollIntervalMs?: number;
   readonly expectedOwnerRunId?: string;
   readonly expectedGeneration?: string;
+  /**
+   * Persist the durable ledger as the wait progresses. A bounded wait can run
+   * for many minutes, so the native boundary evidence must survive a crash
+   * rather than only being written after the wait returns. Called only when a
+   * new distinct observation is actually recorded.
+   */
+  readonly persist?: (ledger: WaitLedger) => void;
 }
 
 const DEFAULT_POLL_INTERVAL_MS = 1_000;
@@ -173,6 +180,9 @@ export async function awaitMeaningfulChange(options: WaitAwaitOptions): Promise<
     // Bound the in-memory ledger exactly like the persisted store does, so a
     // long bounded wait cannot grow without limit.
     ledger = boundWaitLedger(advance.ledger);
+    // Persist each newly recorded observation so the native boundary evidence
+    // survives a crash mid-wait; coalesced duplicates write nothing.
+    if (!advance.duplicate) options.persist?.(ledger);
     lastChange = advance.change;
     if (advance.change.kind !== 'none' && advance.change.kind !== 'progress') {
       return { observation, change: advance.change, wake: advance.wake, ledger, observationCount, duplicateObservations, timedOut: false, idle: false };
