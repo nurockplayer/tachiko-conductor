@@ -1,0 +1,234 @@
+import {
+  DEFAULT_WAIT_WAKE_POLICY,
+  waitObservationDigest,
+  type WaitLedger,
+  type WaitObservation,
+  type WaitWakePolicy,
+} from '../domain/wait.js';
+import { recordWaitWakeTelemetry } from '../domain/telemetry.js';
+import type { Run } from '../domain/types.js';
+import type { RunStore } from '../store/json-file-store.js';
+import {
+  RunRuntimeObserver,
+  awaitMeaningfulChange,
+  createWaitLedger,
+  observeWaitState,
+  type NativeWaitSnapshot,
+  type WaitAwaitOutcome,
+  type WaitObserver,
+} from './wait-observation.js';
+import { waitLedgerBelongsTo, type WaitLedgerStore } from './wait-ledger-store.js';
+
+/**
+ * The `wait` command surface for issue #47: deterministic status/observation
+ * that is model-free by construction.
+ *
+ * `observe` performs one side-effect-free read, coalesces it into the durable
+ * wait ledger, and reports whether the orchestrator must reconcile. `wait`
+ * deterministically waits for exactly one meaningful normalized change (or a
+ * bounded timeout) without starting a model turn. Neither command invokes a
+ * model; the caller decides what to do with a `wake`.
+ */
+
+export type WaitCommandMode = 'observe' | 'wait';
+
+export interface WaitCommandDependencies {
+  readonly store: RunStore;
+  readonly ledgerStore: WaitLedgerStore;
+  /** Clock for observation timestamps. */
+  readonly now: () => string;
+  /** Monotonic clock for the bounded wait budget. */
+  readonly monotonicNow?: () => number;
+  readonly sleep?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+  readonly signal?: AbortSignal;
+  /** Read-only exact-HEAD probe for the prepared workspace. */
+  readonly readHead?: (run: Run) => Promise<string | null>;
+  /** Optional #35-native observation seam; absent means deterministic fallback. */
+  readonly nativeObserver?: { snapshot(): Promise<NativeWaitSnapshot> };
+}
+
+export interface WaitCommandOptions {
+  readonly id: string;
+  readonly mode: WaitCommandMode;
+  readonly policy?: WaitWakePolicy;
+  readonly pollIntervalMs?: number;
+}
+
+export interface WaitCommandResult {
+  readonly ok: true;
+  readonly mode: WaitCommandMode;
+  readonly runId: string;
+  readonly state: Run['state'];
+  readonly source: WaitObservation['source'];
+  readonly subjectId: string;
+  readonly status: WaitObservation['status'];
+  readonly headSha: string | null;
+  readonly observationDigest: string;
+  readonly change: WaitLedger['observations'][number]['change'];
+  readonly wake: {
+    readonly shouldWake: boolean;
+    readonly reason: string | null;
+    readonly evidence: readonly { readonly kind: string; readonly detail: string }[];
+  };
+  /** Always zero: this path never starts a model turn. */
+  readonly modelTurns: 0;
+  readonly timedOut: boolean;
+  readonly idle: boolean;
+  readonly observations: number;
+  readonly duplicateObservations: number;
+  readonly wakeCount: number;
+  readonly waitStartedAt: string | null;
+  readonly ledgerRejected: boolean;
+}
+
+export function emptyWaitLedger(run: Run): WaitLedger {
+  return createWaitLedger({
+    subjectId: run.id,
+    ownerRunId: run.id,
+    generation: run.dispatchClaimId ?? run.id,
+  });
+}
+
+/**
+ * Load the durable wait ledger for this exact run identity. A ledger that does
+ * not belong to the run (foreign subject/owner/generation) is rejected rather
+ * than adopted, so a restart or a second dispatcher cannot duplicate a writer.
+ */
+export function loadWaitLedger(input: {
+  readonly run: Run;
+  readonly ledgerStore: WaitLedgerStore;
+}): { readonly ledger: WaitLedger; readonly rejected: boolean } {
+  const stored = input.ledgerStore.read();
+  if (stored === null) return { ledger: emptyWaitLedger(input.run), rejected: false };
+  const identity = {
+    subjectId: input.run.id,
+    ownerRunId: input.run.id,
+    generation: input.run.dispatchClaimId ?? input.run.id,
+  };
+  if (!waitLedgerBelongsTo(stored, identity)) return { ledger: emptyWaitLedger(input.run), rejected: true };
+  return { ledger: stored, rejected: false };
+}
+
+function runtimeObserver(run: Run, dependencies: WaitCommandDependencies): WaitObserver {
+  return new RunRuntimeObserver(run, {
+    now: dependencies.now,
+    ...(dependencies.readHead === undefined ? {} : { readHead: dependencies.readHead }),
+    ...(dependencies.nativeObserver === undefined ? {} : { nativeObserver: dependencies.nativeObserver }),
+  });
+}
+
+function toResult(input: {
+  readonly mode: WaitCommandMode;
+  readonly run: Run;
+  readonly outcome: Pick<WaitAwaitOutcome, 'observation' | 'change' | 'wake' | 'ledger' | 'observationCount' | 'duplicateObservations' | 'timedOut' | 'idle'>;
+  readonly rejected: boolean;
+}): WaitCommandResult {
+  const { observation, ledger } = input.outcome;
+  return {
+    ok: true,
+    mode: input.mode,
+    runId: input.run.id,
+    state: input.run.state,
+    source: observation.source,
+    subjectId: observation.subjectId,
+    status: observation.status,
+    headSha: observation.headSha,
+    observationDigest: ledger.lastDigest ?? '',
+    change: input.outcome.change.kind,
+    wake: {
+      shouldWake: input.outcome.wake.shouldWake,
+      reason: input.outcome.wake.reason,
+      evidence: input.outcome.wake.evidence.map((item) => ({ kind: item.kind, detail: item.detail })),
+    },
+    modelTurns: 0,
+    timedOut: input.outcome.timedOut,
+    idle: input.outcome.idle,
+    observations: input.outcome.observationCount,
+    duplicateObservations: input.outcome.duplicateObservations,
+    wakeCount: ledger.wakes.length,
+    waitStartedAt: ledger.waitStartedAt,
+    ledgerRejected: input.rejected,
+  };
+}
+
+/** One model-free observation, coalesced and persisted to the durable ledger. */
+export async function waitObserveCommand(
+  options: WaitCommandOptions,
+  dependencies: WaitCommandDependencies,
+): Promise<WaitCommandResult> {
+  const run = readRun(options.id, dependencies.store);
+  const policy = options.policy ?? DEFAULT_WAIT_WAKE_POLICY;
+  const loaded = loadWaitLedger({ run, ledgerStore: dependencies.ledgerStore });
+  const { observation, advance } = await observeWaitState({
+    observer: runtimeObserver(run, dependencies),
+    ledger: loaded.ledger,
+    at: dependencies.now(),
+    policy,
+    expectedOwnerRunId: run.id,
+    expectedGeneration: run.dispatchClaimId ?? run.id,
+  });
+  dependencies.ledgerStore.write(advance.ledger);
+  if (advance.wokeNow) recordWake(run, observation, dependencies.now(), advance.wake.reason ?? 'terminal', dependencies.store);
+  return toResult({
+    mode: 'observe',
+    run,
+    rejected: loaded.rejected,
+    outcome: {
+      observation,
+      change: advance.change,
+      wake: advance.wake,
+      ledger: advance.ledger,
+      observationCount: 1,
+      duplicateObservations: advance.duplicate ? 1 : 0,
+      timedOut: false,
+      idle: !advance.wokeNow,
+    },
+  });
+}
+
+/**
+ * Wait deterministically for exactly one meaningful normalized change. Polling
+ * is bounded and coalesced, and progress-only change keeps waiting without a
+ * model turn.
+ */
+export async function waitAwaitCommand(
+  options: WaitCommandOptions,
+  dependencies: WaitCommandDependencies,
+): Promise<WaitCommandResult> {
+  const run = readRun(options.id, dependencies.store);
+  const policy = options.policy ?? DEFAULT_WAIT_WAKE_POLICY;
+  const loaded = loadWaitLedger({ run, ledgerStore: dependencies.ledgerStore });
+  const outcome = await awaitMeaningfulChange({
+    observer: runtimeObserver(run, dependencies),
+    ledger: loaded.ledger,
+    policy,
+    now: dependencies.monotonicNow ?? (() => Date.now()),
+    ...(dependencies.sleep === undefined ? {} : { sleep: dependencies.sleep }),
+    ...(dependencies.signal === undefined ? {} : { signal: dependencies.signal }),
+    ...(options.pollIntervalMs === undefined ? {} : { pollIntervalMs: options.pollIntervalMs }),
+    expectedOwnerRunId: run.id,
+    expectedGeneration: run.dispatchClaimId ?? run.id,
+  });
+  dependencies.ledgerStore.write(outcome.ledger);
+  if (outcome.wake.shouldWake) recordWake(run, outcome.observation, dependencies.now(), outcome.wake.reason ?? 'terminal', dependencies.store);
+  return toResult({ mode: 'wait', run, rejected: loaded.rejected, outcome });
+}
+
+function readRun(id: string, store: RunStore): Run {
+  const run = store.read(id);
+  if (run === null) throw new Error(`Run ${id} was not found.`);
+  return run;
+}
+
+/** Append run-level wait/status telemetry for a real wake (never for polling). */
+function recordWake(run: Run, observation: WaitObservation, at: string, reason: string, store: RunStore): void {
+  const next = recordWaitWakeTelemetry(run, {
+    at,
+    reason,
+    source: observation.source,
+    subjectId: observation.subjectId,
+    status: observation.status,
+    observationDigest: waitObservationDigest(observation),
+  });
+  if (next !== run) store.update(next);
+}

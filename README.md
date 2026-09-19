@@ -115,6 +115,8 @@ pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
 pnpm exec tsx src/cli.ts dispatch once
+pnpm exec tsx src/cli.ts wait observe <id>
+pnpm exec tsx src/cli.ts wait await <id> --timeout-ms 60000 --on-timeout continue
 pnpm exec tsx src/cli.ts github snapshot nurockplayer/tachiko-conductor#42
 pnpm exec tsx src/cli.ts browser bootstrap github-work
 pnpm exec tsx src/cli.ts browser start github-work --headless
@@ -284,6 +286,44 @@ default threshold set is versioned as `run-efficiency-thresholds-v1` and can be
 overridden per workflow invocation; audit-specific numbers are not embedded as
 universal limits. Event IDs make telemetry merges idempotent across workflow
 restart/re-entry, so already-persisted events are not counted twice.
+
+A `wait_status_wakeup` event may carry optional, bounded #47 wake evidence
+(`reason`, `observationSource`, `subjectId`, `observationStatus`,
+`observationDigest`). It never carries provider prose, transcripts, or tool
+output, and its content-addressed id makes a replayed wake idempotent.
+
+### Event-driven wait/status wakeups
+
+Waiting and status inspection never start a model turn. Conductor observes
+worker/subprocess/native state through one provider-neutral contract
+(`wait-observation-v1`) with normalized status, active item, monotonic
+progress counters, exact HEAD, and bounded categorical evidence. The
+observation runtime compares each report with the last durable one:
+
+- an unchanged or repeated equivalent report is coalesced and wakes nothing;
+- a progress-only change (turn/item/HEAD movement) is recorded and keeps
+  waiting without a model turn;
+- a `completed`, `failed`, or `blocked` transition wakes the orchestrator
+  exactly once with bounded evidence;
+- a bounded timeout wakes only when the wait policy requires policy/recovery
+  reasoning (`--on-timeout policy-action`); `continue` keeps waiting model-free.
+
+A wake is a signal to reconcile live GitHub plus the durable `Run`; it is never
+workflow authority by itself, and one completion notification never substitutes
+for re-reading complete authoritative state.
+
+The durable per-run wait ledger (`<data>/wait/<runId>.wait.json`, overridable
+with `TACHIKO_WAIT_LEDGER_PATH`) revalidates subject/owner/generation before
+adoption. A restart therefore reconstructs the same coalesced state instead of
+duplicating a wake or a writer, and a foreign ledger is rejected rather than
+adopted. Native observation reuses the #35 App Server `thread/read` capability
+and starts no Codex turn; when the native runtime is unavailable, the same
+normalized wake semantics are preserved by the deterministic runtime fallback.
+
+```bash
+pnpm exec tsx src/cli.ts wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
+pnpm exec tsx src/cli.ts wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
+```
 
 ### Codex App Server runtime observation
 

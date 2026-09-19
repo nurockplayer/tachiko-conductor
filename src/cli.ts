@@ -66,7 +66,7 @@ import {
 } from './domain/types.js';
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
-import { GhCliTransport } from './github/transport.js';
+import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
@@ -82,6 +82,15 @@ import {
   type WorkflowOptions,
   type WorkflowOutcome,
 } from './workflow/run.js';
+import { DEFAULT_WAIT_WAKE_POLICY, type WaitWakePolicy } from './domain/wait.js';
+import {
+  waitAwaitCommand,
+  waitObserveCommand,
+  type WaitCommandResult,
+  type WaitCommandDependencies,
+} from './workflow/wait-command.js';
+import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
+import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -95,6 +104,8 @@ Usage:
   tachiko run list
   tachiko dispatch once
   tachiko dispatch launchd render --program <absolute-wrapper> --working-directory <absolute-path> [--minute <0-59>]
+  tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
+  tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
@@ -121,6 +132,10 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
 New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
 the selected --execution-profile is persisted with the run.
+wait observe/await are deterministic and model-free: they read native/runtime
+state, coalesce it into the durable wait ledger, and report whether the
+orchestrator must reconcile. They never start a model turn. The ledger path is
+$TACHIKO_WAIT_LEDGER_PATH (default <TACHIKO_DATA_DIR>/../wait/state.json).
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
 in the foreground; use status/stop from another terminal.
@@ -1023,6 +1038,76 @@ export async function waitForOwnedBrowser(
   }
 }
 
+/** Durable wait-ledger location; explicit override first, no repository defaults. */
+export function resolveWaitLedgerPath(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.TACHIKO_WAIT_LEDGER_PATH !== undefined && env.TACHIKO_WAIT_LEDGER_PATH.trim() !== '') return env.TACHIKO_WAIT_LEDGER_PATH;
+  return path.join(path.dirname(resolveRunsDir(env)), 'wait', 'state.json');
+}
+
+/** Parse the bounded wait policy from CLI values; defaults stay revisioned. */
+export function resolveWaitWakePolicy(values: {
+  readonly 'timeout-ms'?: string;
+  readonly 'on-timeout'?: string;
+}): WaitWakePolicy {
+  const policy = DEFAULT_WAIT_WAKE_POLICY;
+  const timeoutMs = values['timeout-ms'] === undefined ? policy.timeoutMs : Number(values['timeout-ms']);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new Error('--timeout-ms must be a non-negative safe integer.');
+  const onTimeout = values['on-timeout'] ?? policy.onTimeout;
+  if (onTimeout !== 'continue' && onTimeout !== 'policy-action') throw new Error('--on-timeout must be continue or policy-action.');
+  return { ...policy, timeoutMs, onTimeout };
+}
+
+/** Per-run ledger file beside the configured wait ledger root. */
+export function resolveWaitLedgerFile(runId: string, env: NodeJS.ProcessEnv = process.env): string {
+  const base = resolveWaitLedgerPath(env);
+  return path.join(path.dirname(base), `${runId}.wait.json`);
+}
+
+/**
+ * Build the deterministic wait dependencies for one run. A native #35 observer
+ * is only wired for App Server executors; otherwise the runtime fallback path
+ * is used. Nothing here starts or resumes a Codex turn.
+ */
+function buildWaitCommandDependencies(options: {
+  readonly store: RunStore;
+  readonly run: Run;
+  readonly env?: NodeJS.ProcessEnv;
+}): WaitCommandDependencies {
+  const env = options.env ?? process.env;
+  const run = options.run;
+  const workspace = run.bootstrap?.workspacePath;
+  const adapter = run.executor?.provider === CODEX_APP_SERVER_PROVIDER
+    ? new CodexAppServerAdapter({ cwd: workspace ?? process.cwd() })
+    : undefined;
+  return {
+    store: options.store,
+    ledgerStore: new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }),
+    now: () => new Date().toISOString(),
+    ...(workspace === undefined ? {} : { readHead: gitHeadReader(new NodeProcessRunner(), workspace) }),
+    ...(adapter === undefined ? {} : {
+      nativeObserver: {
+        snapshot: async () => {
+          const observation = await adapter.observeRuntime(run.executor!);
+          const observer = new NativeThreadWaitObserver({
+            client: { observeThread: async () => observation },
+            threadId: run.executor!.sessionId,
+            now: () => new Date().toISOString(),
+            subjectId: run.id,
+          });
+          return observer.snapshot();
+        },
+      },
+    }),
+  };
+}
+
+/** Print the bounded, model-free wait result and its settled marker. */
+export function printWaitResult(result: WaitCommandResult): void {
+  console.log(JSON.stringify(result, null, 2));
+  if (result.wake.shouldWake) console.log('TACHIKO_WAIT_WAKE_V1');
+  else if (result.idle) console.log('TACHIKO_WAIT_IDLE_V1');
+}
+
 export async function main(argv: string[]): Promise<number> {
   const store = new JsonFileStore({ dir: resolveRunsDir() });
   const [command, subcommand, ...rest] = argv;
@@ -1172,6 +1257,40 @@ export async function main(argv: string[]): Promise<number> {
     } finally {
       lock.release();
     }
+  }
+
+  if (command === 'wait') {
+    if (subcommand !== 'observe' && subcommand !== 'await') {
+      console.error(`Unknown command: wait ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: {
+        'timeout-ms': { type: 'string' },
+        'poll-interval-ms': { type: 'string' },
+        'on-timeout': { type: 'string' },
+      },
+    });
+    const [id, extra] = positionals;
+    if (id === undefined || extra !== undefined) throw new Error(`wait ${subcommand} requires exactly one run id.`);
+    const run = store.read(id);
+    if (run === null) throw new Error(`Run ${id} was not found.`);
+    const policy = resolveWaitWakePolicy(values);
+    const pollIntervalMs = values['poll-interval-ms'] === undefined
+      ? undefined
+      : Number(values['poll-interval-ms']);
+    if (pollIntervalMs !== undefined && (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 0)) {
+      throw new Error('--poll-interval-ms must be a non-negative safe integer.');
+    }
+    const result = subcommand === 'observe'
+      ? await waitObserveCommand({ id, mode: 'observe', policy }, buildWaitCommandDependencies({ store, run }))
+      : await waitAwaitCommand({ id, mode: 'wait', policy, ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }) }, buildWaitCommandDependencies({ store, run }));
+    printWaitResult(result);
+    // A wake is a reconciliation signal, not a failure; the caller decides.
+    return 0;
   }
 
   if (command !== 'run') {

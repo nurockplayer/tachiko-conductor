@@ -135,6 +135,26 @@ describe('dispatch scheduler boundary', () => {
     assert.doesNotMatch(plist, /TACHIKO_DISPATCH_CONFIG/);
   });
 
+  it('keeps the configured calendar minute across reinstall and never wakes at load', () => {
+    // #47 configuration requirement: the minute is configuration-owned, not a
+    // hard-coded product default, and reinstalling reproduces the selection.
+    const options = {
+      program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
+      workingDirectory: '/Users/example/Developer/tachiko-conductor',
+      label: 'io.tachiko.conductor.dispatch-once',
+    } as const;
+    const configured = renderDispatchLaunchdPlist({ ...options, minute: 40 });
+    const reinstalled = renderDispatchLaunchdPlist({ ...options, minute: 40 });
+    assert.equal(reinstalled, configured);
+    assert.match(configured, /<key>StartCalendarInterval<\/key><dict><key>Minute<\/key><integer>40<\/integer><\/dict>/);
+    // launchd is a supervisor, not the workflow clock: no load-time model wake.
+    assert.doesNotMatch(configured, /RunAtLoad/);
+    assert.doesNotMatch(configured, /StartInterval/);
+    // A different explicit minute is honored rather than clamped to a default.
+    assert.match(renderDispatchLaunchdPlist({ ...options, minute: 5 }), /<key>Minute<\/key><integer>5<\/integer>/);
+    assert.throws(() => renderDispatchLaunchdPlist({ ...options, minute: 60 }), /0 through 59/);
+  });
+
   it('leaves a concurrent dispatch at a safe re-entry boundary without reading configuration or GitHub', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-main-lock-'));
     const lockPath = path.join(directory, 'once.lock');
