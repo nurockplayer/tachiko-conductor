@@ -433,6 +433,60 @@ PR: #7`;
     assert.equal(snapshot.reviews.latestByAuthor[0]?.commitSha, null);
   });
 
+  it('lets a later unknown-provenance change request override an earlier current-HEAD comment', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_COMMENT',
+        user: { login: 'alice' },
+        state: 'COMMENTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/comment',
+      },
+      {
+        node_id: 'R_UNKNOWN_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: null,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/unknown-changes',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_UNKNOWN_CHANGES']);
+  });
+
+  it('lets a later current-HEAD approval clear an earlier unknown-provenance change request', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_UNKNOWN_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: null,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/unknown-changes',
+      },
+      {
+        node_id: 'R_APPROVED',
+        user: { login: 'alice' },
+        state: 'APPROVED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/approved',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'approved');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED']);
+  });
+
   it('does not let a later-submitted stale approval supersede a current-HEAD change request', async () => {
     const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
       {

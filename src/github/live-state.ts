@@ -861,48 +861,68 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     }
 
     const latestByAuthor = new Map<string, GitHubReviewSnapshot>();
-    const provenanceRank = (review: GitHubReviewSnapshot): number =>
-      review.fresh ? 2 : review.commitSha === null ? 1 : 0;
+    const byAuthor = new Map<string, GitHubReviewSnapshot[]>();
     for (const review of reviews) {
       const key = review.author ?? '';
-      const existing = latestByAuthor.get(key);
-      if (existing === undefined) {
-        latestByAuthor.set(key, review);
-        continue;
+      const entries = byAuthor.get(key) ?? [];
+      entries.push(review);
+      byAuthor.set(key, entries);
+    }
+
+    const latestOf = (entries: readonly GitHubReviewSnapshot[]): GitHubReviewSnapshot | undefined =>
+      entries.reduce<GitHubReviewSnapshot | undefined>(
+        (latest, review) =>
+          latest === undefined || (review.submittedAt ?? '') > (latest.submittedAt ?? '')
+            ? review
+            : latest,
+        undefined,
+      );
+    const isDecisive = (review: GitHubReviewSnapshot): boolean =>
+      review.state === 'approved' ||
+      review.state === 'changes_requested' ||
+      review.state === 'dismissed';
+
+    for (const [key, entries] of byAuthor) {
+      const current = entries.filter((review) => review.fresh);
+      const unknown = entries.filter((review) => !review.fresh && review.commitSha === null);
+      const stale = entries.filter((review) => !review.fresh && review.commitSha !== null);
+      const currentDecision = latestOf(current.filter(isDecisive));
+      const unknownDecision = latestOf(unknown.filter(isDecisive));
+      const currentObservation = latestOf(current);
+
+      let effective: GitHubReviewSnapshot | undefined;
+      if (currentDecision?.state === 'changes_requested') {
+        // A known-current negative review remains authoritative until a later
+        // known-current decisive review changes or dismisses that decision.
+        effective = currentDecision;
+      } else if (
+        unknownDecision?.state === 'changes_requested' &&
+        (
+          currentDecision === undefined ||
+          (unknownDecision.submittedAt ?? '') > (currentDecision.submittedAt ?? '')
+        )
+      ) {
+        // Unknown provenance is not stale provenance. A later explicit negative
+        // review may describe the current candidate, so fail closed unless a
+        // later exact-HEAD decisive review explicitly clears it. COMMENTED
+        // observations never clear a decisive review.
+        effective = unknownDecision;
+      } else if (currentDecision !== undefined) {
+        effective = currentDecision;
+      } else if (unknownDecision?.state === 'changes_requested') {
+        effective = unknownDecision;
+      } else {
+        // With no active negative/decisive current state, prefer a current-HEAD
+        // observation for descriptive review state, then unknown provenance,
+        // and use proven-stale evidence only as a last historical observation.
+        effective =
+          currentObservation ??
+          unknownDecision ??
+          latestOf(unknown) ??
+          latestOf(stale);
       }
 
-      const existingIsActiveDecision =
-        existing.state === 'approved' || existing.state === 'changes_requested';
-      const incomingCanSupersedeDecision =
-        review.state === 'approved' ||
-        review.state === 'changes_requested' ||
-        review.state === 'dismissed';
-
-      // COMMENTED/unknown reviews are additive observations, not explicit
-      // clearance. A current-HEAD comment may replace a *known-stale* decision,
-      // but it must not erase a current decision or one whose commit provenance
-      // is unavailable: neither absence nor unknown provenance proves that a
-      // negative review was cleared.
-      if (existingIsActiveDecision && !incomingCanSupersedeDecision) {
-        if (!existing.fresh && existing.commitSha !== null && review.fresh) {
-          latestByAuthor.set(key, review);
-        }
-        continue;
-      }
-
-      // Prefer exact-HEAD evidence, then evidence with unknown provenance, then
-      // evidence proven stale. This prevents a late old-HEAD review from
-      // superseding current authority, while keeping unknown provenance visible
-      // so the final gate can fail closed rather than misclassify it as stale.
-      const existingRank = provenanceRank(existing);
-      const incomingRank = provenanceRank(review);
-      if (existingRank !== incomingRank) {
-        if (incomingRank > existingRank) latestByAuthor.set(key, review);
-        continue;
-      }
-      if ((review.submittedAt ?? '') > (existing.submittedAt ?? '')) {
-        latestByAuthor.set(key, review);
-      }
+      if (effective !== undefined) latestByAuthor.set(key, effective);
     }
     const latest = [...latestByAuthor.values()].sort((a, b) => (a.submittedAt ?? '').localeCompare(b.submittedAt ?? ''));
     const decision: GitHubReviewSummary['decision'] =
