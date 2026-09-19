@@ -403,9 +403,19 @@ Configuration:
 Only `HOME=/root` plus the exact worker inputs `DEEPSEEK_API_KEY` and
 `WORKER_FORCE` are forwarded. The container receives the narrow commit-only
 mounts reused from #73 -- the linked worktree, its per-worktree gitdir,
-`objects`, `refs`, a read-only `config`, and `packed-refs` when present. The
-bare remote, source checkout, `$HOME`, SSH agent, Docker socket, hooks, and
+`objects`, `refs`, and a read-only `config`. `packed-refs` is deliberately not
+mounted: the prepared branch is loose, and an opt-in smoke proof packs the
+source refs to show the commit path does not need it. Only the prepared
+linked-worktree layout is accepted; plain `.git/` repositories are rejected
+because the writable worktree mount would expose their whole common Git tree.
+The bare remote, source checkout, `$HOME`, SSH agent, Docker socket, hooks, and
 other worktrees are never mounted.
+
+Failure, cancel, and timeout cleanup must end with proof that the exact
+container is absent or terminal. When `stop`/`kill`/`rm` and a final exact-ID
+inspect cannot prove that, the adapter surfaces
+`WORKER_ROUTER_CONTAINMENT_UNPROVEN` instead of the ordinary worker error, which
+is retained only as the cause/diagnostic.
 
 The container image owns the worker runtime, so a production image must bundle
 Git plus the worker entrypoint (and any provider runtime it needs). The built-in

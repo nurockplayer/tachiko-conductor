@@ -87,6 +87,14 @@ describe('worker-router container smoke', () => {
         baseSha: fixture.baseSha,
       } as const;
       const identity = await bootstrap.plan(request);
+      // Pack the source refs first so the prepared branch is created loose
+      // afterwards. This proves the commit-only mount set needs no
+      // `packed-refs` mount: the container commits on a loose ref while the
+      // host repository still has a real packed-refs file.
+      out('git', ['pack-refs', '--all'], fixture.source);
+      if (!existsSync(path.join(fixture.source, '.git', 'packed-refs'))) {
+        throw new Error('smoke fixture failed to create a packed-refs file for the mount-necessity proof');
+      }
       await bootstrap.prepare({ ...request, existing: identity });
       const guard = bootstrap.guard(identity);
       await guard.assertValid('before-execution');

@@ -28,6 +28,8 @@ class FakeRuntime implements WorkerContainerRuntime {
   startError: Error | undefined;
   waitResult: number | Error = 0;
   inspectResult: WorkerContainerInspection | Error = { id: ID, status: 'exited', running: false, exitCode: 0, restartPolicy: 'no' };
+  /** Per-call overrides consumed before `inspectResult`. */
+  readonly inspectQueue: Array<WorkerContainerInspection | Error> = [];
   logsResult: WorkerContainerLogs | Error = { stdout: 'out', stderr: 'err' };
   stopError: Error | undefined;
   killError: Error | undefined;
@@ -49,8 +51,9 @@ class FakeRuntime implements WorkerContainerRuntime {
   }
   async inspect(id: string): Promise<WorkerContainerInspection> {
     this.calls.push(`inspect:${id}`);
-    if (this.inspectResult instanceof Error) throw this.inspectResult;
-    return this.inspectResult;
+    const queued = this.inspectQueue.shift() ?? this.inspectResult;
+    if (queued instanceof Error) throw queued;
+    return queued;
   }
   async logs(id: string): Promise<WorkerContainerLogs> {
     this.calls.push(`logs:${id}`);
@@ -192,16 +195,56 @@ describe('ContainerWorkerBoundary', () => {
     assert.ok(runtime.calls.includes(`remove:${ID}`));
   });
 
-  it('cleans up boundedly even when stop/kill/remove fail, preserving the original failure', async () => {
+  it('surfaces a containment failure instead of preserving the worker failure when stop/kill/remove cannot prove quiescence', async () => {
+    const original = containerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT, 'worker timed out');
     const runtime = new FakeRuntime();
-    runtime.waitResult = 0;
-    runtime.inspectResult = containerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN, 'unreadable');
+    runtime.startError = original;
+    runtime.inspectResult = new Error('docker inspect failed: cannot connect to the Docker daemon');
     runtime.stopError = new Error('stop failed');
     runtime.killError = new Error('kill failed');
     runtime.removeError = new Error('remove failed');
+    let thrown: unknown;
+    try {
+      await new ContainerWorkerBoundary({ runtime }).run(spec());
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof WorkerRouterContainerError, 'cleanup must surface a typed containment failure');
+    assert.equal(thrown.code, WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN);
+    assert.match(thrown.message, /could not prove quiescence/);
+    assert.match(thrown.message, /refusing to report the worker failure as contained/);
+    assert.equal(thrown.cause, original, 'the original worker failure is preserved only as cause');
+    assert.deepEqual(runtime.calls, [
+      'create',
+      `start:${ID}`,
+      `stop:${ID}:5`,
+      `wait:${ID}`,
+      `kill:${ID}`,
+      `wait:${ID}`,
+      `remove:${ID}`,
+      `inspect:${ID}`,
+    ]);
+  });
+
+  it('preserves the worker failure when removal fails but a final inspect still proves a terminal container', async () => {
+    const original = containerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT, 'worker timed out');
+    const runtime = new FakeRuntime();
+    runtime.startError = original;
+    runtime.removeError = new Error('remove failed');
     await assert.rejects(
       () => new ContainerWorkerBoundary({ runtime }).run(spec()),
-      (error: unknown) => error instanceof WorkerRouterContainerError && error.code === WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
+      (error: unknown) => error === original,
+    );
+    assert.equal(runtime.calls.includes(`inspect:${ID}`), true);
+    assert.equal(runtime.calls.filter((call) => call === `inspect:${ID}`).length, 1);
+  });
+
+  it('treats an unreadable first inspect as quiescent only after a final terminal proof', async () => {
+    const runtime = new FakeRuntime();
+    runtime.inspectQueue.push(new Error('transient inspect failure'));
+    await assert.rejects(
+      () => new ContainerWorkerBoundary({ runtime }).run(spec()),
+      (error: unknown) => error instanceof Error && error.message === 'transient inspect failure',
     );
     assert.deepEqual(runtime.calls, [
       'create',
@@ -214,6 +257,23 @@ describe('ContainerWorkerBoundary', () => {
       `wait:${ID}`,
       `remove:${ID}`,
     ]);
+  });
+
+  it('refuses to claim cleanup success when a running container survives stop/kill/remove', async () => {
+    const runtime = new FakeRuntime();
+    runtime.inspectResult = { id: ID, status: 'running', running: true, exitCode: -1, restartPolicy: 'no' };
+    runtime.removeError = new Error('remove failed');
+    let thrown: unknown;
+    try {
+      await new ContainerWorkerBoundary({ runtime }).run(spec());
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof WorkerRouterContainerError);
+    assert.equal(thrown.code, WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN);
+    assert.match(thrown.message, /still running/);
+    assert.equal(runtime.calls.filter((call) => call === `remove:${ID}`).length, 1);
+    assert.equal(runtime.calls.filter((call) => call === `inspect:${ID}`).length, 2);
   });
 
   it('does not attempt any lifecycle call when create fails', async () => {
@@ -369,7 +429,7 @@ describe('commit-only mount plan', () => {
   }
   process.on('exit', () => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
 
-  it('mounts only the linked worktree, gitdir, objects, refs, packed-refs, and a read-only config', () => {
+  it('mounts only the linked worktree, gitdir, objects, refs, and a read-only config', () => {
     const f = fixture();
     assert.deepEqual(
       planCommitOnlyMounts(f.workspacePath).map((mount) => `${mount.container}:${mount.mode}`),
@@ -379,11 +439,11 @@ describe('commit-only mount plan', () => {
         `${path.join(f.commonDir, 'objects')}:rw`,
         `${path.join(f.commonDir, 'refs')}:rw`,
         `${path.join(f.commonDir, 'config')}:ro`,
-        `${path.join(f.commonDir, 'packed-refs')}:rw`,
       ],
     );
     const destinations = planCommitOnlyMounts(f.workspacePath).map((mount) => mount.container);
     assert.equal(destinations.some((value) => value.includes('remote.git')), false);
+    assert.equal(destinations.some((value) => value.includes('packed-refs')), false);
     assert.equal(destinations.some((value) => value.includes(`${path.sep}hooks`)), false);
     assert.equal(destinations.some((value) => value.includes('docker.sock')), false);
     assert.equal(destinations.some((value) => value.startsWith(os.homedir())), false);
@@ -399,21 +459,31 @@ describe('commit-only mount plan', () => {
     assert.throws(() => planCommitOnlyMounts(f.workspacePath), /missing its common Git objects directory/);
   });
 
-  it('supports a plain .git directory without double-mounting it', () => {
+  it('rejects a plain .git/ repository instead of exposing its whole common Git tree', () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'worker-router-plain-'));
     roots.push(root);
     mkdirSync(path.join(root, '.git', 'objects'), { recursive: true });
     mkdirSync(path.join(root, '.git', 'refs'), { recursive: true });
+    mkdirSync(path.join(root, '.git', 'hooks'), { recursive: true });
     writeFileSync(path.join(root, '.git', 'config'), '[core]\n');
-    assert.deepEqual(
-      planCommitOnlyMounts(root).map((mount) => `${mount.container}:${mount.mode}`),
-      [
-        `${root}:rw`,
-        `${path.join(root, '.git', 'objects')}:rw`,
-        `${path.join(root, '.git', 'refs')}:rw`,
-        `${path.join(root, '.git', 'config')}:ro`,
-      ],
-    );
+    assert.throws(() => planCommitOnlyMounts(root), /plain Git repositories are never containerized/);
+  });
+
+  it('rejects a .git file that is not a registered linked-worktree gitdir', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'worker-router-orphan-'));
+    roots.push(root);
+    const workspacePath = path.join(root, 'worktree');
+    const commonDir = path.join(root, 'common', '.git');
+    const gitdir = path.join(root, 'gitdirs', 'run');
+    mkdirSync(workspacePath, { recursive: true });
+    mkdirSync(gitdir, { recursive: true });
+    mkdirSync(path.join(commonDir, 'objects'), { recursive: true });
+    mkdirSync(path.join(commonDir, 'refs'), { recursive: true });
+    writeFileSync(path.join(workspacePath, '.git'), `gitdir: ${gitdir}\n`);
+    assert.throws(() => planCommitOnlyMounts(workspacePath), /no commondir pointer/);
+
+    writeFileSync(path.join(gitdir, 'commondir'), '../../common/.git\n');
+    assert.throws(() => planCommitOnlyMounts(workspacePath), /not registered under the common Git worktrees/);
   });
 });
 

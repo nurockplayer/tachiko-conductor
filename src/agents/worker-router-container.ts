@@ -10,10 +10,16 @@
  * The proven boundary from #73 is reused unchanged:
  *   create -> start -> wait -> inspect -> stop|kill -> rm -f (by exact ID)
  *
- * The container gets the narrow commit-only Git mounts proven in #73 (linked
- * worktree, per-worktree gitdir, `objects`, `refs`, read-only `config`,
- * `packed-refs`). The bare remote is intentionally *not* mounted: the worker
- * commits only and Tachiko publishes the exact HEAD from the host.
+ * The container gets only the narrow commit-only Git mounts reused from #73
+ * (linked worktree, per-worktree gitdir, `objects`, `refs`, read-only
+ * `config`). The bare remote is intentionally *not* mounted: the worker
+ * commits only and Tachiko publishes the exact HEAD from the host. Plain
+ * `.git/` repositories are rejected so the writable worktree mount cannot
+ * expose an entire common Git tree.
+ *
+ * Failure/cancel/timeout cleanup must prove the exact container is absent or
+ * terminal before returning; when that proof is unavailable the boundary fails
+ * closed with a containment error instead of the ordinary worker failure.
  */
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
@@ -153,8 +159,15 @@ export function resolveWorkerNetworkMode(value: string | undefined): WorkerNetwo
 }
 
 /**
- * The exact #73 minimum commit-only mount set. No bare remote, no hooks, no
- * source checkout, no `$HOME`, no SSH agent, no Docker socket.
+ * The narrow commit-only mount set reused from #73. Only the prepared linked
+ * worktree shape is accepted: a `.git` *file* indirection to a per-worktree
+ * gitdir registered under the common `worktrees/` directory, with the common
+ * Git directory outside the worktree. Plain `.git/` repositories are rejected
+ * because the writable worktree mount would otherwise expose their whole
+ * common Git tree, including `hooks` and unrelated worktree state.
+ *
+ * No bare remote, no `packed-refs`, no hooks, no source checkout, no `$HOME`,
+ * no SSH agent, no Docker socket.
  */
 export function planCommitOnlyMounts(workspacePath: string): readonly ContainerMount[] {
   if (!path.isAbsolute(workspacePath)) {
@@ -163,11 +176,11 @@ export function planCommitOnlyMounts(workspacePath: string): readonly ContainerM
       'The prepared workspace path must be absolute before container mounts can be planned.',
     );
   }
-  const dotGit = path.join(workspacePath, '.git');
-  const gitdir = dotGitDirectory(dotGit);
-  const commonDir = commonGitDirectory(gitdir);
-  const mounts: ContainerMount[] = [{ host: workspacePath, container: workspacePath, mode: 'rw' }];
-  if (!isInside(workspacePath, gitdir)) mounts.push({ host: gitdir, container: gitdir, mode: 'rw' });
+  const { gitdir, commonDir } = linkedWorktreeLayout(workspacePath);
+  const mounts: ContainerMount[] = [
+    { host: workspacePath, container: workspacePath, mode: 'rw' },
+    { host: gitdir, container: gitdir, mode: 'rw' },
+  ];
   for (const required of ['objects', 'refs'] as const) {
     const directory = path.join(commonDir, required);
     if (!existsSync(directory)) {
@@ -180,55 +193,64 @@ export function planCommitOnlyMounts(workspacePath: string): readonly ContainerM
   }
   const config = path.join(commonDir, 'config');
   if (existsSync(config)) mounts.push({ host: config, container: config, mode: 'ro' });
-  const packedRefs = path.join(commonDir, 'packed-refs');
-  if (existsSync(packedRefs)) mounts.push({ host: packedRefs, container: packedRefs, mode: 'rw' });
   return mounts;
 }
 
-function dotGitDirectory(dotGit: string): string {
+interface LinkedWorktreeLayout {
+  readonly gitdir: string;
+  readonly commonDir: string;
+}
+
+function invalidMounts(message: string): never {
+  throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.MOUNTS_INVALID, message);
+}
+
+/** Fail closed unless the workspace is the prepared linked-worktree layout. */
+function linkedWorktreeLayout(workspacePath: string): LinkedWorktreeLayout {
+  const dotGit = path.join(workspacePath, '.git');
   let stat;
   try {
     stat = lstatSync(dotGit);
   } catch {
-    throw new WorkerRouterContainerError(
-      WORKER_ROUTER_CONTAINER_ERROR_CODE.MOUNTS_INVALID,
-      'The prepared workspace has no readable .git indirection; refusing to containerize it.',
-    );
+    invalidMounts('The prepared workspace has no readable .git indirection; refusing to containerize it.');
   }
-  if (stat.isDirectory()) return dotGit;
+  if (!stat.isFile()) {
+    invalidMounts('The prepared workspace must be a linked worktree with a .git file indirection; plain Git repositories are never containerized.');
+  }
   let raw: string;
   try {
     raw = readFileSync(dotGit, 'utf8').trim();
   } catch {
-    throw new WorkerRouterContainerError(
-      WORKER_ROUTER_CONTAINER_ERROR_CODE.MOUNTS_INVALID,
-      'The prepared workspace .git indirection could not be read.',
-    );
+    invalidMounts('The prepared workspace .git indirection could not be read.');
   }
-  const match = /^gitdir:\s*(.+)$/.exec(raw);
-  const target = match?.[1]?.trim();
-  if (target === undefined || target === '') {
-    throw new WorkerRouterContainerError(
-      WORKER_ROUTER_CONTAINER_ERROR_CODE.MOUNTS_INVALID,
-      'The prepared workspace .git indirection is not a linked-worktree pointer.',
-    );
+  const target = /^gitdir:\s*(.+)$/.exec(raw)?.[1]?.trim();
+  if (target === undefined || target === '' || !path.isAbsolute(target)) {
+    invalidMounts('The prepared workspace .git indirection is not an absolute linked-worktree pointer.');
   }
-  return path.isAbsolute(target) ? target : path.resolve(path.dirname(dotGit), target);
-}
-
-function commonGitDirectory(gitdir: string): string {
-  const commondir = path.join(gitdir, 'commondir');
-  if (!existsSync(commondir)) return gitdir;
-  let raw: string;
+  const gitdir = target;
+  const commondirFile = path.join(gitdir, 'commondir');
+  if (!existsSync(commondirFile)) {
+    invalidMounts('The prepared workspace is not a linked worktree: its gitdir has no commondir pointer.');
+  }
+  let rawCommon: string;
   try {
-    raw = readFileSync(commondir, 'utf8').trim();
+    rawCommon = readFileSync(commondirFile, 'utf8').trim();
   } catch {
-    throw new WorkerRouterContainerError(
-      WORKER_ROUTER_CONTAINER_ERROR_CODE.MOUNTS_INVALID,
-      'The prepared workspace commondir pointer could not be read.',
-    );
+    invalidMounts('The prepared workspace commondir pointer could not be read.');
   }
-  return raw === '' ? gitdir : path.resolve(gitdir, raw);
+  if (rawCommon === '') invalidMounts('The prepared workspace commondir pointer is empty.');
+  const commonDir = path.resolve(gitdir, rawCommon);
+  if (
+    commonDir === workspacePath || gitdir === workspacePath ||
+    isInside(workspacePath, gitdir) || isInside(workspacePath, commonDir) ||
+    isInside(gitdir, workspacePath) || isInside(commonDir, workspacePath)
+  ) {
+    invalidMounts('The linked-worktree git directory must live outside the prepared worktree; refusing an overlapping Git layout.');
+  }
+  if (!isInside(path.join(commonDir, 'worktrees'), gitdir)) {
+    invalidMounts('The prepared gitdir is not registered under the common Git worktrees/ directory; refusing an unproven worktree layout.');
+  }
+  return { gitdir, commonDir };
 }
 
 function isInside(parent: string, candidate: string): boolean {
@@ -321,7 +343,7 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
     if (result.exitCode !== 0) {
       throw new WorkerRouterContainerError(
         WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
-        `docker inspect failed (exit ${result.exitCode}).`,
+        `docker inspect failed (exit ${result.exitCode}): ${firstLine(result.stderr)}`,
       );
     }
     let raw: {
@@ -360,17 +382,35 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
 
   async stop(id: string, graceSeconds: number): Promise<void> {
     assertExactContainerId(id);
-    await this.control(['stop', '--time', String(Math.max(0, Math.trunc(graceSeconds))), id]);
+    const result = await this.control(['stop', '--time', String(Math.max(0, Math.trunc(graceSeconds))), id]);
+    if (result.exitCode !== 0 && !isBenignLifecycleFailure(result.stderr)) {
+      throw new WorkerRouterContainerError(
+        WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
+        `docker stop failed (exit ${result.exitCode}): ${firstLine(result.stderr)}`,
+      );
+    }
   }
 
   async kill(id: string): Promise<void> {
     assertExactContainerId(id);
-    await this.control(['kill', id]);
+    const result = await this.control(['kill', id]);
+    if (result.exitCode !== 0 && !isBenignLifecycleFailure(result.stderr)) {
+      throw new WorkerRouterContainerError(
+        WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
+        `docker kill failed (exit ${result.exitCode}): ${firstLine(result.stderr)}`,
+      );
+    }
   }
 
+  /** Removal is idempotent: an already-absent container is quiescent success. */
   async remove(id: string): Promise<void> {
     assertExactContainerId(id);
-    await this.control(['rm', '--force', id]);
+    const result = await this.control(['rm', '--force', id]);
+    if (result.exitCode === 0 || isBenignLifecycleFailure(result.stderr)) return;
+    throw new WorkerRouterContainerError(
+      WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
+      `docker rm failed (exit ${result.exitCode}): ${firstLine(result.stderr)}`,
+    );
   }
 
   private async control(args: readonly string[], signal?: AbortSignal) {
@@ -427,17 +467,6 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
   async run(spec: WorkerContainerSpec): Promise<ContainerWorkerResult> {
     assertDigestPinnedImage(spec.image);
     const id = await this.runtime.create(spec);
-    let cleaned = false;
-    let terminalConfirmed = false;
-    const cleanup = async (): Promise<void> => {
-      if (cleaned) return;
-      cleaned = true;
-      if (terminalConfirmed) {
-        await swallow(() => this.runtime.remove(id));
-        return;
-      }
-      await this.terminate(id);
-    };
     try {
       await this.runtime.start(id, spec);
       const exitCode = await this.runtime.wait(id);
@@ -448,9 +477,10 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
           `Container ${id.slice(0, 12)} was not observed in a terminal state (status=${state.status === '' ? 'unknown' : state.status}).`,
         );
       }
-      terminalConfirmed = true;
       const logs = await this.readLogs(id);
-      await cleanup();
+      // Terminal state is already proven, so removal is opportunistic cleanup:
+      // a failed rm does not leave unproven work behind.
+      await this.removeQuietly(id);
       return {
         containerId: id,
         exitCode,
@@ -460,7 +490,16 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
         stderr: logs.stderr,
       };
     } catch (error) {
-      await cleanup();
+      const cleanup = await this.proveQuiescent(id);
+      if (!cleanup.quiescent) {
+        // Containment takes precedence over the ordinary worker failure: never
+        // return while the exact container may still be alive and mutating.
+        throw new WorkerRouterContainerError(
+          WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
+          `Container ${id.slice(0, 12)} cleanup could not prove quiescence (${cleanup.detail}); refusing to report the worker failure as contained. Original failure: ${boundedMessage(error, 200)}`,
+          error,
+        );
+      }
       if (isAborted(spec.signal)) {
         throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED, 'The worker container was cancelled.', error);
       }
@@ -468,13 +507,46 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
     }
   }
 
-  /** stop -> await terminal -> kill -> await terminal -> rm, all by exact ID. */
-  private async terminate(id: string): Promise<void> {
-    await swallow(() => this.runtime.stop(id, this.cleanupGraceSeconds));
-    await swallow(() => this.runtime.wait(id));
-    await swallow(() => this.runtime.kill(id));
-    await swallow(() => this.runtime.wait(id));
-    await swallow(() => this.runtime.remove(id));
+  /**
+   * Failure/cancel/timeout cleanup. It must end with proof that the exact
+   * container is absent or terminal; a failed `rm` is only acceptable when a
+   * final inspect proves the exact container is no longer running.
+   */
+  private async proveQuiescent(id: string): Promise<{ readonly quiescent: boolean; readonly detail: string }> {
+    const failures: string[] = [];
+    const attempt = async (label: string, action: () => Promise<unknown>): Promise<boolean> => {
+      try {
+        await action();
+        return true;
+      } catch (error) {
+        failures.push(`${label}: ${boundedMessage(error, 160)}`);
+        return false;
+      }
+    };
+    await attempt('stop', () => this.runtime.stop(id, this.cleanupGraceSeconds));
+    await attempt('wait', () => this.runtime.wait(id));
+    await attempt('kill', () => this.runtime.kill(id));
+    await attempt('wait', () => this.runtime.wait(id));
+    if (await attempt('remove', () => this.runtime.remove(id))) return { quiescent: true, detail: '' };
+    try {
+      const state = await this.runtime.inspect(id);
+      if (!state.running && TERMINAL_STATES.has(state.status)) return { quiescent: true, detail: '' };
+      return { quiescent: false, detail: `exact container is still ${state.status === '' ? 'unreadable' : state.status}` };
+    } catch (error) {
+      return {
+        quiescent: false,
+        detail: `terminal state could not be proven (${failures.join('; ')}; inspect: ${boundedMessage(error, 160)})`,
+      };
+    }
+  }
+
+  private async removeQuietly(id: string): Promise<void> {
+    try {
+      await this.runtime.remove(id);
+    } catch {
+      // Terminal state was already proven; a residual terminal container is
+      // never unproven work. Bounded, idempotent, and not reported as success.
+    }
   }
 
   private async readLogs(id: string): Promise<WorkerContainerLogs> {
@@ -510,13 +582,9 @@ function assertExactContainerId(id: string): void {
   }
 }
 
-async function swallow(action: () => Promise<unknown>): Promise<void> {
-  try {
-    await action();
-  } catch {
-    // Cleanup is bounded and idempotent: an already-terminal/absent container
-    // is success, never a reason to extend or repeat the run.
-  }
+/** Docker already-terminal/absent lifecycle outcomes are benign, not failures. */
+function isBenignLifecycleFailure(stderr: string): boolean {
+  return /is not running|no such container|not running|no such object/i.test(stderr);
 }
 
 function firstLine(value: string): string {

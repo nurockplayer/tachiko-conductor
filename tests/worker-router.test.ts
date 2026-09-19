@@ -235,6 +235,22 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(runner.calls.length, 0);
   });
 
+  it('refuses a plain Git repository workspace instead of exposing its whole .git tree', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'worker-router-plain-'));
+    cleanupPaths.push(root);
+    mkdirSync(path.join(root, '.git', 'objects'), { recursive: true });
+    mkdirSync(path.join(root, '.git', 'refs'), { recursive: true });
+    mkdirSync(path.join(root, '.git', 'hooks'), { recursive: true });
+    writeFileSync(path.join(root, '.git', 'config'), '[core]\n');
+    const runner = new FakeRunner([]);
+    const container = new FakeContainer([]);
+    const response = await new WorkerRouterAdapter({ runner, container, image: IMAGE }).run(requestFor(root));
+    assert.equal(response.exitStatus, 'failure');
+    assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.MOUNTS_INVALID));
+    assert.equal(container.specs.length, 0);
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('keeps only recognized provenance and never persists worker output', async () => {
     const ws = workspace();
     const container = new FakeContainer([containerResult({ exitCode: 7, stderr: `[worker-router] -> deepseek-worker\n${'x'.repeat(5000)}` })]);
@@ -291,6 +307,24 @@ describe('WorkerRouterAdapter container boundary', () => {
     });
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE));
+    assert.equal(after, 0);
+    assert.equal(runner.calls.length, 0);
+  });
+
+  it('surfaces a distinct containment failure and never publishes when container quiescence is unproven', async () => {
+    const ws = workspace();
+    const runner = new FakeRunner([]);
+    const container = new FakeContainer([new WorkerRouterContainerError(
+      WORKER_ROUTER_CONTAINER_ERROR_CODE.TERMINAL_UNPROVEN,
+      'Container abc cleanup could not prove quiescence; refusing to report the worker failure as contained.',
+    )]);
+    let after = 0;
+    const response = await new WorkerRouterAdapter({ runner, container, image: IMAGE }).run({
+      ...requestFor(ws.workspacePath),
+      workspaceGuard: { assertValid: (phase) => { if (phase === 'after-execution') after++; } },
+    });
+    assert.equal(response.exitStatus, 'failure');
+    assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.CONTAINMENT_UNPROVEN));
     assert.equal(after, 0);
     assert.equal(runner.calls.length, 0);
   });
