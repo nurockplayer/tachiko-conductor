@@ -15,6 +15,7 @@ export * from './agents/codex-app-server.js';
 export * from './agents/model-capability.js';
 export * from './agents/implementation-router.js';
 export * from './agents/worker-router.js';
+export * from './agents/worker-router-container.js';
 export * from './reviewers/deepseek.js';
 export * from './reviewers/loop.js';
 export * from './workflow/run.js';

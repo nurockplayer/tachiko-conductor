@@ -370,7 +370,60 @@ non-zero exit code.
 require result payloads supplied by adapters; `run transition` rejects them
 explicitly. Drive those through the domain API (`applyTransition`).
 
+## Container-owned worker-router execution
+
+`WorkerRouterAdapter` is the one executor placed behind the container boundary
+proven in issue #73. The untrusted worker runs only inside a digest-pinned
+container; the host worker path is never executed and there is no fallback.
+
+The adapter keeps the authority split unchanged. It runs `guard(before)`, then
+creates and starts the container, forwards the task on stdin, waits for the
+exact container terminal state, and only then runs `guard(after)`, reads the
+exact HEAD, proves base ancestry, and publishes that exact HEAD from the host.
+The worker/container commits only and never pushes.
+
+Container lifecycle is driven exclusively by the exact 64-hex ID returned by
+`docker create` (`create -> start -> wait -> inspect -> stop|kill -> rm -f`).
+There is no `ps`, PGID/orphan, or name-based discovery. The container is created
+with restart policy `no`, without privileged mode or the Docker socket.
+Timeout, cancel, and failure stop/kill the exact ID, await terminal state,
+remove it by that same ID, and never replay or fall back to host execution.
+
+Configuration:
+
+- `TACHIKO_WORKER_ROUTER_IMAGE` (required): the worker image reference, pinned
+  by digest (`name@sha256:<64-hex>` or an immutable `sha256:<64-hex>`). Tags
+  are rejected and a missing image is a typed fail-closed error.
+- `TACHIKO_WORKER_ROUTER_PATH` (optional): absolute in-container entrypoint,
+  default `/root/.local/bin/worker-router`.
+- `TACHIKO_WORKER_ROUTER_NETWORK` (optional): `none` (default) or `bridge`.
+  Provider-backed workers need an explicit `bridge` opt-in; network is never
+  enabled implicitly.
+
+Only `HOME=/root` plus the exact worker inputs `DEEPSEEK_API_KEY` and
+`WORKER_FORCE` are forwarded. The container receives the narrow commit-only
+mounts reused from #73 -- the linked worktree, its per-worktree gitdir,
+`objects`, `refs`, a read-only `config`, and `packed-refs` when present. The
+bare remote, source checkout, `$HOME`, SSH agent, Docker socket, hooks, and
+other worktrees are never mounted.
+
+The container image owns the worker runtime, so a production image must bundle
+Git plus the worker entrypoint (and any provider runtime it needs). The built-in
+`worker-router` script selects `deepseek-worker` from `DEEPSEEK_API_KEY`, but
+`luna-worker` additionally needs the ChatGPT auth file under `$HOME`; that
+credential cannot be provided inside the container without weakening the mount
+boundary, so `luna` remains a documented blocker rather than a mounted secret.
+
 ## Smoke paths
+
+The opt-in worker-router acceptance path builds a disposable digest-pinned
+worker image and drives the real authority sequence end to end
+(`guard -> container -> exact terminal -> guard -> HEAD -> ancestry ->
+publication -> verifyDurable`). It is skipped unless explicitly enabled:
+
+```bash
+pnpm test:smoke:worker-router
+```
 
 The opt-in Claude Code smoke test invokes the installed `claude` CLI
 non-interactively once and is never part of CI:
