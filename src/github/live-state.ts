@@ -861,6 +861,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     }
 
     const latestByAuthor = new Map<string, GitHubReviewSnapshot>();
+    const provenanceRank = (review: GitHubReviewSnapshot): number =>
+      review.fresh ? 2 : review.commitSha === null ? 1 : 0;
     for (const review of reviews) {
       const key = review.author ?? '';
       const existing = latestByAuthor.get(key);
@@ -869,28 +871,36 @@ export class LiveGitHubAdapter implements GitHubAdapter {
         continue;
       }
 
-      // Exact-HEAD evidence outranks stale submissions from the same author.
-      // This matters when a pending review started before a push and lands
-      // after a current-HEAD review: the later timestamp must not make stale
-      // evidence look authoritative for the current candidate.
-      if (existing.fresh !== review.fresh) {
-        if (review.fresh) latestByAuthor.set(key, review);
-        continue;
-      }
-      if ((review.submittedAt ?? '') <= (existing.submittedAt ?? '')) continue;
-
-      // COMMENTED/unknown reviews are additive observations, not explicit
-      // clearance. Once an author has APPROVED or CHANGES_REQUESTED, only a
-      // later decisive state (including DISMISSED, which clears a review) may
-      // supersede it. Otherwise a comment-only review could silently erase an
-      // outstanding change request and make an empty-thread set look clean.
       const existingIsActiveDecision =
         existing.state === 'approved' || existing.state === 'changes_requested';
       const incomingCanSupersedeDecision =
         review.state === 'approved' ||
         review.state === 'changes_requested' ||
         review.state === 'dismissed';
-      if (!existingIsActiveDecision || incomingCanSupersedeDecision) {
+
+      // COMMENTED/unknown reviews are additive observations, not explicit
+      // clearance. A current-HEAD comment may replace a *known-stale* decision,
+      // but it must not erase a current decision or one whose commit provenance
+      // is unavailable: neither absence nor unknown provenance proves that a
+      // negative review was cleared.
+      if (existingIsActiveDecision && !incomingCanSupersedeDecision) {
+        if (!existing.fresh && existing.commitSha !== null && review.fresh) {
+          latestByAuthor.set(key, review);
+        }
+        continue;
+      }
+
+      // Prefer exact-HEAD evidence, then evidence with unknown provenance, then
+      // evidence proven stale. This prevents a late old-HEAD review from
+      // superseding current authority, while keeping unknown provenance visible
+      // so the final gate can fail closed rather than misclassify it as stale.
+      const existingRank = provenanceRank(existing);
+      const incomingRank = provenanceRank(review);
+      if (existingRank !== incomingRank) {
+        if (incomingRank > existingRank) latestByAuthor.set(key, review);
+        continue;
+      }
+      if ((review.submittedAt ?? '') > (existing.submittedAt ?? '')) {
         latestByAuthor.set(key, review);
       }
     }

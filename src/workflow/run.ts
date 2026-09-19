@@ -862,8 +862,10 @@ export async function runWorkflow(
         // from the absence of unresolved threads; only the latest review per
         // author is retained by the normalized GitHub snapshot, and stale
         // reviews are deliberately ignored here.
-        const currentHeadChangeRequest = snapshot.reviews.latestByAuthor.find(
-          (review) => review.fresh && review.state === 'changes_requested',
+        const blockingChangeRequest = snapshot.reviews.latestByAuthor.find(
+          (review) =>
+            review.state === 'changes_requested' &&
+            (review.fresh || review.commitSha === null),
         );
         if (currentHosted.status === 'waiting') {
           const reason = `Final GitHub readiness gate is waiting for required hosted checks at ${run.headSha ?? '(none)'}.`;
@@ -893,9 +895,11 @@ export async function runWorkflow(
             : snapshot.reviews.unresolvedThreads > 0
               ? `${snapshot.reviews.unresolvedThreads} review thread(s) remain unresolved`
               : null,
-          currentHeadChangeRequest === undefined
+          blockingChangeRequest === undefined
             ? null
-            : `GitHub review ${currentHeadChangeRequest.id} on the current HEAD explicitly requests changes`,
+            : blockingChangeRequest.commitSha === null
+              ? `GitHub review ${blockingChangeRequest.id} explicitly requests changes but its commit provenance is unavailable`
+              : `GitHub review ${blockingChangeRequest.id} on the current HEAD explicitly requests changes`,
           contradictory?.message ?? null,
         ].filter((problem): problem is string => problem !== null);
 

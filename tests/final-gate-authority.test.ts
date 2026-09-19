@@ -378,6 +378,45 @@ describe('final-gate authority', () => {
     assert.match(result.reason, /current HEAD explicitly requests changes/i);
   });
 
+  it('fails closed when a GitHub change request has unknown commit provenance', async () => {
+    const store = new MemoryStore();
+    store.create(finalGateRun('unknown-provenance-change-request'));
+    const ready = readySnapshot(HEAD);
+    const blocked: GitHubLiveSnapshot = {
+      ...ready,
+      reviews: {
+        decision: 'changes_requested',
+        latestByAuthor: [{
+          id: 'R_UNKNOWN',
+          author: 'review-bot',
+          state: 'changes_requested',
+          commitSha: null,
+          submittedAt: T0,
+          url: 'https://github.test/reviews/unknown',
+          fresh: false,
+        }],
+        unresolvedThreads: 0,
+      },
+    };
+
+    const result = await runWorkflow(
+      {
+        store,
+        github: githubReturning(blocked),
+        implementation: unusedImplementation,
+        reviewer: unusedReviewer,
+        validation: existingValidation,
+        hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+      },
+      'unknown-provenance-change-request',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.notEqual(result.run.state, 'MERGE_READY');
+    assert.match(result.reason, /commit provenance is unavailable/i);
+  });
+
   it('does not let a stale GitHub change request on an older HEAD block a valid current candidate', async () => {
     const store = new MemoryStore();
     store.create(finalGateRun('stale-change-request'));
