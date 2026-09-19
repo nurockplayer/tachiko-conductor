@@ -293,6 +293,9 @@ function runFingerprint(run: Run | null): string {
     pullRequest: run.pullRequest ?? null,
     executor: run.executor ?? null,
     interrupt: run.interrupt ?? null,
+    // Telemetry can change on its own without touching `updatedAt`, so a
+    // concurrent telemetry append must invalidate the comparison too.
+    telemetry: run.telemetry ?? null,
   });
 }
 

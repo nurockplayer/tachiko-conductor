@@ -628,29 +628,27 @@ describe('wait CLI', () => {
     }
   });
 
-  it('never overwrites a transition that lands between the telemetry read and write', async () => {
-    const { directory, dataDir, env } = tempWorkspace();
+  it('refuses a compare-and-swap write when a concurrent telemetry append landed', () => {
+    const { directory, dataDir } = tempWorkspace();
     try {
-      const run = applyTransition(createRun(TARGET, T0, 'run-wait-telemetry-race'), { type: 'start' }, T0);
-      const real = new JsonFileStore({ dir: dataDir });
-      real.create(run);
-      let reads = 0;
-      // Inject the concurrent transition immediately after recordWake's first
-      // read, i.e. inside the read -> write window.
-      const store: typeof real = Object.create(real) as typeof real;
-      store.read = (id: string) => {
-        reads += 1;
-        const value = real.read(id);
-        if (reads === 2) real.update(applyTransition(real.read(id)!, { type: 'wait_dependency' }, T0));
-        return value;
+      const run = applyTransition(createRun(TARGET, T0, 'run-wait-cas-telemetry'), { type: 'start' }, T0);
+      const store = new JsonFileStore({ dir: dataDir });
+      store.create(run);
+      const expected = store.read(run.id)!;
+      // A concurrent writer appends only telemetry; nothing else changes.
+      const withTelemetry = {
+        ...expected,
+        telemetry: { ...expected.telemetry!, events: [...(expected.telemetry?.events ?? []), { id: 'other', at: T0, kind: 'wait_status_wakeup' as const, state: 'IMPLEMENTING', headSha: null }] },
       };
-      const ledgerStore = new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) });
-      const result = await waitObserveCommand({ id: run.id, mode: 'observe' }, { store, ledgerStore, now: () => T0 });
-      assert.equal(result.status, 'active');
-      const after = real.read(run.id);
-      assert.equal(after?.state, 'WAITING_DEPENDENCY', 'the concurrent transition must survive the telemetry write');
-      assert.equal(after?.history.length, 2);
-      assert.equal(after?.telemetry?.events.filter((event) => event.id.startsWith('wait-wake:')).length, 0);
+      store.update(withTelemetry);
+      // The stale writer must be refused rather than reverting the append.
+      assert.equal(store.updateIfUnchanged(expected, { ...expected, state: 'FAILED' }), false);
+      assert.equal(store.read(run.id)?.telemetry?.events.length, 1);
+      assert.equal(store.read(run.id)?.state, 'IMPLEMENTING');
+      // An unchanged snapshot still succeeds.
+      const current = store.read(run.id)!;
+      assert.equal(store.updateIfUnchanged(current, { ...current, state: 'FAILED' }), true);
+      assert.equal(store.read(run.id)?.state, 'FAILED');
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -709,6 +707,7 @@ describe('wait CLI', () => {
       const result = await waitObserveCommand({ id: run.id, mode: 'observe' }, { store, ledgerStore, now: () => T0 });
       // The observer re-read the durable run and saw the transition.
       assert.equal(result.status, 'failed');
+      assert.equal(result.state, 'FAILED', 'the emitted state must reflect the observed transition');
       assert.equal(result.change, 'failure');
       assert.equal(result.wake.shouldWake, true);
       assert.equal(result.wake.reason, 'failure');

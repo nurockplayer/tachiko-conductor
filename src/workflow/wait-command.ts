@@ -152,6 +152,13 @@ function runtimeObserver(run: Run, dependencies: WaitCommandDependencies): WaitO
   });
 }
 
+/** The durable workflow state this observation was taken in. */
+function observedRunState(run: Run, observation: WaitObservation): Run['state'] {
+  if (observation.status === 'completed') return 'MERGED';
+  if (observation.status === 'failed') return 'FAILED';
+  return run.state;
+}
+
 function pendingWakeViews(ledger: WaitLedger): readonly WaitRecordedWake[] {
   return pendingWaitWakes(ledger);
 }
@@ -195,7 +202,9 @@ function toResult(input: {
     ok: true,
     mode: input.mode,
     runId: input.run.id,
-    state: input.run.state,
+    // The wake is about the state actually observed, which may have changed
+    // during the wait.
+    state: observedRunState(input.run, observation),
     source: observation.source,
     subjectId: observation.subjectId,
     status: observation.status,
@@ -391,5 +400,7 @@ function runSnapshotKey(run: Run): string {
     run.reviewResult ?? null,
     run.validationResult ?? null,
     run.pullRequest ?? null,
+    // Include telemetry: a concurrent telemetry-only append must count as drift.
+    run.telemetry ?? null,
   ]);
 }
