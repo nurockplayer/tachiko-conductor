@@ -7,6 +7,7 @@ import {
   type McpHttpCapability,
 } from '../adapters/agent.js';
 import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
+import type { ProviderExecutionTelemetry, ProviderTokenUsage } from '../domain/telemetry.js';
 import {
   isExecutionConfigurationError,
   normalizeReasoningEffort,
@@ -19,6 +20,14 @@ import {
   type ModelCapabilityCatalog,
   type ModelEffortPreflightResult,
 } from './model-capability.js';
+import {
+  capabilityTelemetry,
+  maximumBytes,
+  mergeTokenUsage,
+  providerTelemetry,
+  tokenUsageFromProviderValue,
+  toolResultBytesFromItem,
+} from './provider-telemetry.js';
 import {
   NodeProcessRunner,
   type ProcessResult,
@@ -61,11 +70,12 @@ const FULL_SHA = /^[0-9a-f]{40}$/;
 interface CodexOutcome {
   readonly summary: string;
   readonly executor: ExecutorIdentity;
+  readonly telemetry: ProviderExecutionTelemetry;
 }
 
 type ParsedCodexOutput =
   | { readonly ok: true; readonly outcome: CodexOutcome }
-  | { readonly ok: false; readonly code: CodexErrorCode; readonly detail: string };
+  | { readonly ok: false; readonly code: CodexErrorCode; readonly detail: string; readonly telemetry?: ProviderExecutionTelemetry };
 
 /**
  * Non-interactive Codex CLI implementation agent. Fresh runs use
@@ -116,6 +126,7 @@ export class CodexCliAdapter implements ImplementationAgent {
       throw error;
     }
     if (isAborted(request.signal)) return cancelledAgentResult(0, executor);
+    const capability = capabilityTelemetry(preflight);
 
     const prompt = buildPrompt(request);
     await assertWorkspaceGuard(request.workspaceGuard);
@@ -163,8 +174,13 @@ export class CodexCliAdapter implements ImplementationAgent {
       return failureAgentResult(code, `Codex ${action} exited with status ${result.exitCode}.`, durationMs, executor);
     }
 
-    const parsed = parseCodexJsonl(result.stdout);
-    if (!parsed.ok) return failureAgentResult(parsed.code, parsed.detail, durationMs, executor);
+    const parsed = parseCodexJsonl(result.stdout, {
+      provider: CODEX_CLI_PROVIDER,
+      ...(this.model === undefined ? {} : { model: this.model }),
+      ...(preflight.reasoningEffort === undefined ? {} : { reasoningEffort: preflight.reasoningEffort }),
+      ...(capability === undefined ? {} : { capability }),
+    });
+    if (!parsed.ok) return failureAgentResult(parsed.code, parsed.detail, durationMs, executor, parsed.telemetry);
     if (executor !== undefined && parsed.outcome.executor.sessionId !== executor.sessionId) {
       return failureAgentResult(
         CODEX_ERROR_CODE.RESUME_IDENTITY_MISMATCH,
@@ -180,6 +196,7 @@ export class CodexCliAdapter implements ImplementationAgent {
         summary: takeoverReason,
         diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
         executor: parsed.outcome.executor,
+        telemetry: parsed.outcome.telemetry,
         durationMs,
       };
     }
@@ -194,6 +211,7 @@ export class CodexCliAdapter implements ImplementationAgent {
         `Codex completed, but an exact 40-hex HEAD could not be read from ${this.cwd}.`,
         durationMs,
         parsed.outcome.executor,
+        parsed.outcome.telemetry,
       );
     }
     return {
@@ -201,6 +219,7 @@ export class CodexCliAdapter implements ImplementationAgent {
       summary: parsed.outcome.summary,
       headSha: sha,
       executor: parsed.outcome.executor,
+      telemetry: parsed.outcome.telemetry,
       durationMs,
     };
   }
@@ -294,10 +313,23 @@ function formatTarget(target: Target): string {
     : `${target.owner}/${target.repo}@${target.branch}`;
 }
 
-function parseCodexJsonl(stdout: string): ParsedCodexOutput {
+interface CodexParseContext {
+  readonly provider: string;
+  readonly model?: string;
+  readonly reasoningEffort?: string;
+  readonly capability?: ReturnType<typeof capabilityTelemetry>;
+}
+
+function parseCodexJsonl(stdout: string, context: CodexParseContext): ParsedCodexOutput {
   let threadId: string | undefined;
   let summary: string | undefined;
   let completed = false;
+  let turnStarts = 0;
+  let turnCompletions = 0;
+  let usage: ProviderTokenUsage | undefined;
+  let firstInputTokens: number | undefined;
+  let peakInputTokens: number | undefined;
+  let largestToolResultBytes: number | undefined;
   const lines = stdout.split(/\r?\n/).filter((value) => value.trim() !== '');
   for (const line of lines) {
     let event: Record<string, unknown>;
@@ -317,23 +349,63 @@ function parseCodexJsonl(stdout: string): ParsedCodexOutput {
       }
       threadId = event.thread_id;
     }
+    if (event.type === 'turn.started') turnStarts += 1;
     if (event.type === 'error' || event.type === 'turn.failed') {
+      const turns = Math.max(turnStarts, turnCompletions);
       return {
         ok: false,
         code: CODEX_ERROR_CODE.ERROR,
         detail: 'Codex CLI reported a structured execution error.',
+        telemetry: providerTelemetry({
+          provider: context.provider,
+          ...(context.model === undefined ? {} : { model: context.model }),
+          ...(context.reasoningEffort === undefined ? {} : { reasoningEffort: context.reasoningEffort }),
+          ...(turns === 0 ? {} : { turns }),
+          ...(usage === undefined ? {} : { usage }),
+          ...(context.capability === undefined ? {} : { capability: context.capability }),
+          failure: { category: 'executed-runtime', code: CODEX_ERROR_CODE.ERROR },
+        }),
       };
     }
-    if (event.type === 'turn.completed') completed = true;
+    if (event.type === 'turn.completed') {
+      completed = true;
+      turnCompletions += 1;
+      const turnUsage = tokenUsageFromProviderValue(event.usage);
+      usage = mergeTokenUsage(usage, turnUsage);
+      if (turnUsage?.inputTokens !== undefined) {
+        firstInputTokens ??= turnUsage.inputTokens;
+        peakInputTokens = peakInputTokens === undefined ? turnUsage.inputTokens : Math.max(peakInputTokens, turnUsage.inputTokens);
+      }
+    }
     if (event.type === 'item.completed' && typeof event.item === 'object' && event.item !== null) {
       const item = event.item as Record<string, unknown>;
       if (item.type === 'agent_message' && typeof item.text === 'string' && item.text !== '') summary = item.text;
+      largestToolResultBytes = maximumBytes(largestToolResultBytes, toolResultBytesFromItem(item));
     }
   }
   if (lines.length === 0 || threadId === undefined || summary === undefined || !completed) {
     return invalidOutput('Codex CLI returned incomplete structured output.');
   }
-  return { ok: true, outcome: { summary, executor: { provider: CODEX_CLI_PROVIDER, sessionId: threadId } } };
+  const turns = Math.max(turnStarts, turnCompletions, 1);
+  return {
+    ok: true,
+    outcome: {
+      summary,
+      executor: { provider: CODEX_CLI_PROVIDER, sessionId: threadId },
+      telemetry: providerTelemetry({
+        provider: context.provider,
+        ...(context.model === undefined ? {} : { model: context.model }),
+        ...(context.reasoningEffort === undefined ? {} : { reasoningEffort: context.reasoningEffort }),
+        turns,
+        ...(usage === undefined ? {} : { usage }),
+        ...(context.capability === undefined ? {} : { capability: context.capability }),
+        ...(firstInputTokens === undefined || peakInputTokens === undefined
+          ? {}
+          : { context: { initialTokens: firstInputTokens, peakTokens: peakInputTokens } }),
+        largestToolResultBytes: largestToolResultBytes ?? 0,
+      }),
+    },
+  };
 }
 
 function invalidOutput(detail: string): ParsedCodexOutput {
@@ -359,7 +431,18 @@ function isUsableCodexExecutor(executor: ExecutorIdentity): boolean {
 
 /** Typed preflight rejection: counted apart from any executed runtime failure. */
 function executionConfigurationFailure(error: ExecutionConfigurationError, executor?: ExecutorIdentity): AgentResult {
-  return failureAgentResult(error.code, error.message, 0, executor);
+  return failureAgentResult(error.code, error.message, 0, executor, providerTelemetry({
+    provider: error.evidence.provider ?? 'unknown',
+    ...(error.evidence.model === undefined ? {} : { model: error.evidence.model }),
+    ...(error.evidence.canonicalEffort === undefined ? {} : { reasoningEffort: error.evidence.canonicalEffort }),
+    turns: 0,
+    ...(error.evidence.capabilitySource === undefined ? {} : { capability: {
+      source: error.evidence.capabilitySource,
+      ...(error.evidence.capabilityRevision === undefined ? {} : { revision: error.evidence.capabilityRevision }),
+      verified: false,
+    } }),
+    failure: { category: 'configuration-preflight', code: error.code },
+  }));
 }
 
 function failureAgentResult(
@@ -367,6 +450,7 @@ function failureAgentResult(
   detail: string,
   durationMs: number,
   executor?: ExecutorIdentity,
+  telemetry?: ProviderExecutionTelemetry,
 ): AgentResult {
   return {
     exitStatus: 'failure',
@@ -374,6 +458,7 @@ function failureAgentResult(
     diagnostics: [`${code}: ${detail}`],
     durationMs,
     ...(executor === undefined ? {} : { executor }),
+    ...(telemetry === undefined ? {} : { telemetry }),
   };
 }
 

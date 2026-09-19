@@ -298,6 +298,8 @@ describe('JsonFileStore — persistence round-trips', () => {
       { ...newRun('bad'), executor: { provider: 'codex-cli', sessionId: '   ' } },
       { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', durationMs: -1 } },
       { ...newRun('bad'), agentResult: { exitStatus: 'failure', summary: 'failed', durationMs: 'slow' } },
+      { ...newRun('bad'), telemetry: null },
+      { ...newRun('bad'), telemetry: { revision: 'run-efficiency-v1', thresholds: {}, events: [null] } },
       { ...newRun('bad'), interrupt: null },
       { ...newRun('bad'), interrupt: { kind: 'unknown', reason: 'pause', createdAt: T0 } },
       { ...newRun('bad'), history: [null] },

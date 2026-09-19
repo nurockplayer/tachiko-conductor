@@ -11,7 +11,14 @@ import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
 import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
-import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
+import type { AgentResult, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
+import {
+  createCompletionInputFromResult,
+  recordCompletionTelemetry,
+  recordSpawnTelemetry,
+  withRunTelemetryThresholds,
+  type EfficiencyThresholds,
+} from '../domain/telemetry.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { RunStore } from '../store/json-file-store.js';
@@ -39,6 +46,8 @@ export interface WorkflowOptions {
   /** Bounded review attempts before the loop escalates to NEEDS_HUMAN. */
   readonly maxReviewAttempts: number;
   readonly now?: () => string;
+  /** Optional run-scoped thresholds for deterministic efficiency warnings. */
+  readonly telemetryThresholds?: Partial<Omit<EfficiencyThresholds, 'revision'>> & { readonly revision?: string };
 }
 
 export type WorkflowOutcome =
@@ -237,6 +246,8 @@ export async function runWorkflow(
 
   let run = store.read(runId);
   if (run === null) throw new Error(`No run with id "${runId}" found.`);
+  run = withRunTelemetryThresholds(run, options.telemetryThresholds ?? {});
+  store.update(run);
   if (run.target.kind !== 'issue') {
     throw new Error('runWorkflow currently supports issue-target runs only.');
   }
@@ -405,7 +416,25 @@ export async function runWorkflow(
         if (run.execution?.executor === 'worker-router' && snapshot.pullRequest !== null && bootstrap === undefined) {
           return park(run, 'Worker-router requires a verified prepared workspace and branch for an existing implementation pull request.', store, now);
         }
-        let result;
+        const workerAttemptKind = pendingRepair
+          ? 'repair'
+          : run.agentResult === undefined && run.executor === undefined
+            ? 'initial'
+            : 'resume';
+        const workerSpawn = recordSpawnTelemetry(run, {
+          role: 'worker',
+          attemptKind: workerAttemptKind,
+          ...(run.headSha === undefined ? {} : { headSha: run.headSha }),
+          ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
+          ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
+          ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+          ...(run.execution?.profile === undefined ? {} : { profile: run.execution.profile }),
+          contextMode: 'bounded',
+          contextJustification: 'live-target-bounded',
+        }, now());
+        run = workerSpawn.run;
+        store.update(run);
+        let result: AgentResult;
         try {
           result = await implementation.run({
             target, baseSha, authority: 'live-target', instructions,
@@ -423,8 +452,25 @@ export async function runWorkflow(
           });
         } catch (error) {
           if (isWorkspaceGuardFailure(error)) return bootstrapFailureOutcome(run, error, store, now);
+          const detail = error instanceof Error ? error.message : String(error);
+          run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+            exitStatus: 'failure',
+            summary: detail,
+            diagnostics: ['AGENT_RUNTIME_INVOCATION_FAILED: provider invocation threw before returning an AgentResult'],
+          }, {
+            ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
+            ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
+            ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+          }, 'worker', workerSpawn.invocationId), now());
+          store.update(run);
           throw error;
         }
+        run = recordCompletionTelemetry(run, createCompletionInputFromResult(result, {
+          ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
+          ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
+          ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+        }, 'worker', workerSpawn.invocationId), now());
+        store.update(run);
         if (result.exitStatus === 'failure') {
           const takeoverReason = humanTakeoverReason(result);
           if (takeoverReason !== undefined) {

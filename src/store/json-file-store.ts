@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSyn
 import path from 'node:path';
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
+import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetry.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
 
@@ -119,7 +120,8 @@ function isAgentResult(value: unknown): boolean {
     isOptionalStringArray(result.diagnostics) &&
     (result.executor === undefined || isExecutorIdentity(result.executor)) &&
     isOptionalNonEmptyString(result.sessionId) &&
-    isOptionalDuration(result.durationMs)
+    isOptionalDuration(result.durationMs) &&
+    (result.telemetry === undefined || isProviderExecutionTelemetry(result.telemetry))
   );
 }
 
@@ -141,7 +143,8 @@ function isReviewResult(value: unknown): boolean {
     typeof result.reviewerName === 'string' &&
     typeof result.headSha === 'string' &&
     Array.isArray(result.findings) &&
-    result.findings.every(isReviewFinding)
+    result.findings.every(isReviewFinding) &&
+    (result.telemetry === undefined || isProviderExecutionTelemetry(result.telemetry))
   );
 }
 
@@ -222,6 +225,7 @@ function isRun(value: unknown): value is Run {
     (v.pullRequest === undefined || v.headSha === undefined || (v.pullRequest as { headSha: unknown }).headSha === v.headSha) &&
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
     (v.validationResult === undefined || isValidationResultCoherent(v.validationResult)) &&
+    (v.telemetry === undefined || isRunTelemetry(v.telemetry)) &&
     (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );

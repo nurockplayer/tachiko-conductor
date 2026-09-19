@@ -3,6 +3,7 @@ import path from 'node:path';
 import { assertWorkspaceGuard, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessRunner, type ProcessRunOptions } from '../github/transport.js';
+import { providerTelemetry } from './provider-telemetry.js';
 import {
   ContainerWorkerBoundary,
   WORKER_ROUTER_CONTAINER_ENV_ALLOWLIST,
@@ -179,7 +180,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED}: ${published.detail}`, ...diagnostics, ...published.diagnostics],
       };
     }
-    return { exitStatus: 'success', summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.', headSha: head, ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
+    return { exitStatus: 'success', summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.', headSha: head, telemetry: providerTelemetry({ provider: WORKER_ROUTER_PROVIDER }), ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
   }
 
   private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined): WorkerContainerSpec {

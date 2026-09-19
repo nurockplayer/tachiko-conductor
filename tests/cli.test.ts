@@ -81,7 +81,11 @@ describe('CLI command layer', () => {
       assert.equal(created.state, 'READY');
       assert.deepEqual(created.target, TARGET);
 
-      assert.equal(runShowCommand(store, created.id).state, 'READY');
+      const view = runShowView(runShowCommand(store, created.id));
+      assert.equal(view.state, 'READY');
+      assert.equal(view.telemetry.recorded, true);
+      assert.equal(view.telemetry.metrics.inputTokens.status, 'unknown');
+      assert.ok(view.telemetry.summary.some((line) => line.startsWith('model turns')));
 
       const next = runTransitionCommand(store, created.id, 'start');
       assert.equal(next.state, 'IMPLEMENTING');

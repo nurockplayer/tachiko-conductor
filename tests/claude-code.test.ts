@@ -68,6 +68,32 @@ describe('ClaudeCodeAdapter', () => {
     assert.deepEqual(runner.calls[1]?.args, ['rev-parse', 'HEAD']);
   });
 
+  it('captures structured Claude usage when the provider reports it', async () => {
+    const runner = new FakeRunner([
+      result(claudeJson('implemented', {
+        model: 'claude-configured',
+        usage: {
+          input_tokens: 500,
+          cache_read_input_tokens: 400,
+          output_tokens: 25,
+        },
+      })),
+      result(HEAD),
+    ]);
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'success');
+    assert.equal(agentResult.telemetry?.provider, 'claude-code');
+    assert.equal(agentResult.telemetry?.model, 'claude-configured');
+    assert.deepEqual(agentResult.telemetry?.usage, {
+      inputTokens: 500,
+      cachedInputTokens: 400,
+      outputTokens: 25,
+    });
+  });
+
   it('maps a non-zero claude exit to a deterministic failure without reading git', async () => {
     const runner = new FakeRunner([result('', 'claude crashed', 1)]);
     const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
@@ -103,7 +129,7 @@ describe('ClaudeCodeAdapter', () => {
 
   it('never reports success when the post-run git HEAD cannot be read', async () => {
     const runner = new FakeRunner([
-      result(claudeJson('implemented')),
+      result(claudeJson('implemented', { usage: { input_tokens: 10, output_tokens: 2 } })),
       Object.assign(new Error('not a git repo'), { code: 'ENOENT' }),
     ]);
     const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
@@ -113,6 +139,7 @@ describe('ClaudeCodeAdapter', () => {
     assert.equal(agentResult.exitStatus, 'failure');
     assert.equal(agentResult.headSha, undefined);
     assert.match(agentResult.diagnostics?.join('\n') ?? '', /HEAD_READ_FAILED/);
+    assert.deepEqual(agentResult.telemetry?.usage, { inputTokens: 10, outputTokens: 2 });
   });
 
   it('returns a session id that a new adapter can resume after process restart', async () => {

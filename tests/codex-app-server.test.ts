@@ -70,6 +70,19 @@ class DiscoveringClient extends FakeClient {
   }
 }
 
+class UsageClient extends FakeClient {
+  override async startTurn(threadId: string, prompt: string): Promise<string> {
+    const turnId = await super.startTurn(threadId, prompt);
+    this.emitEvent({ type: 'turn_started', threadId, turnId });
+    this.emitEvent({ type: 'item_completed', threadId, itemId: 'tool-1', toolResultBytes: 321 });
+    this.emitEvent({
+      type: 'turn_completed', threadId, turnId, status: 'completed',
+      usage: { inputTokens: 2_000, cachedInputTokens: 1_500, outputTokens: 80, reasoningTokens: 20 },
+    });
+    return turnId;
+  }
+}
+
 class HangingClient extends FakeClient {
   override async waitForTurn(): Promise<{ status: 'completed'; summary: string }> {
     this.calls.push('wait');
@@ -368,6 +381,10 @@ describe('CodexAppServerAdapter', () => {
     assert.ok(!client.calls.includes('thread/start'), 'preflight rejection must not create a thread');
     assert.deepEqual(client.modelTurnCalls, [], 'preflight rejection must start zero model turns');
     assert.ok(client.calls.includes('close'), 'the App Server component is still closed');
+    assert.equal(result.telemetry?.turns, 0);
+    assert.equal(result.telemetry?.failure?.category, 'configuration-preflight');
+    assert.equal(result.telemetry?.capability?.source, 'runtime-discovery');
+    assert.equal(result.telemetry?.capability?.revision, 'codex-app-server:model/list');
   });
 
   it('proceeds on authoritative discovery when the pair is supported', async () => {
@@ -384,6 +401,28 @@ describe('CodexAppServerAdapter', () => {
     assert.ok(client.modelTurnCalls.includes('turn/start:thread-new'));
     // The canonical value reaches the provider unchanged and undowngraded.
     assert.equal(client.threadOptions[0]?.reasoningEffort, 'high');
+  });
+
+  it('captures App Server usage, turn, context, and tool-result telemetry', async () => {
+    const client = new UsageClient();
+    const adapter = new CodexAppServerAdapter({
+      clientFactory: new Factory(client), runner: new HeadRunner(),
+      model: 'configured-model', reasoningEffort: 'high',
+    });
+
+    const result = await adapter.run(request());
+
+    assert.equal(result.exitStatus, 'success');
+    assert.equal(result.telemetry?.provider, 'codex-app-server');
+    assert.equal(result.telemetry?.turns, 1);
+    assert.deepEqual(result.telemetry?.usage, {
+      inputTokens: 2_000,
+      cachedInputTokens: 1_500,
+      outputTokens: 80,
+      reasoningTokens: 20,
+    });
+    assert.deepEqual(result.telemetry?.context, { initialTokens: 2_000, peakTokens: 2_000 });
+    assert.equal(result.telemetry?.largestToolResultBytes, 321);
   });
 
   it('degrades to the versioned fallback when capability discovery is unavailable', async () => {

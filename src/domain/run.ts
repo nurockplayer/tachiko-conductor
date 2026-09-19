@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import { createRunTelemetry } from './telemetry.js';
 import type { Run, Target } from './types.js';
 
 /**
@@ -21,6 +22,7 @@ export function createRun(
     createdAt: now,
     updatedAt: now,
     history: [],
+    telemetry: createRunTelemetry(),
     ...(execution === undefined ? {} : { execution }),
     ...(dispatchClaimId === undefined ? {} : { dispatchClaimId }),
   };

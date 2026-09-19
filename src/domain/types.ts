@@ -8,6 +8,7 @@
  */
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
 
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;
@@ -110,8 +111,10 @@ export interface AgentResult {
   readonly executor?: ExecutorIdentity;
   /** Opaque executor session token used to continue this logical run. */
   readonly sessionId?: string;
-  /** Wall-clock execution duration. Raw transcripts and model usage are not retained. */
+  /** Wall-clock execution duration. Raw transcripts and hidden reasoning are never retained. */
   readonly durationMs?: number;
+  /** Structured provider usage/provenance only; never raw output or hidden reasoning. */
+  readonly telemetry?: ProviderExecutionTelemetry;
 }
 
 export type ReviewVerdict = 'approve' | 'request_changes';
@@ -128,6 +131,8 @@ export interface ReviewResult {
   /** Exact HEAD SHA this review was performed against. Never inferred. */
   readonly headSha: string;
   readonly findings: readonly ReviewFinding[];
+  /** Structured reviewer usage/provenance only; never raw output or hidden reasoning. */
+  readonly telemetry?: ProviderExecutionTelemetry;
 }
 
 /** A fail-closed validation outcome. `waiting` is reserved for a re-checkable external dependency. */
@@ -258,4 +263,6 @@ export interface Run {
   readonly validationResult?: ValidationResult;
   /** Current HEAD SHA of the implementation, when known. */
   readonly headSha?: string;
+  /** Append-only structured run-efficiency events; absent means telemetry was not recorded. */
+  readonly telemetry?: RunTelemetry;
 }

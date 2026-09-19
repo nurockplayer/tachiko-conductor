@@ -259,6 +259,32 @@ turns**. These configuration codes are emitted before any process/turn is
 created, so telemetry can count preflight rejections separately from executed
 model/runtime failures.
 
+### Per-run efficiency telemetry
+
+Each run carries an append-only `telemetry` ledger (`run-efficiency-v1`). The
+ledger stores only bounded structured events: provider/model/profile/reasoning
+identity, spawn and restart counts, provider-reported turn/token usage, context
+size/peak, largest tool-result payload size, configuration-preflight failures,
+executed failures/retries, and capability source/revision from the #50
+provider-boundary preflight. It never stores hidden reasoning, model prose,
+raw transcripts, tool output, or credentials.
+
+Provider fields are optional by design. When a provider does not report usage,
+the run projection returns `unknown` with a reason; it never substitutes zero.
+Partial coverage is reported as `partial` with observed/total sample counts.
+`run show <id>` exposes the structured `telemetry` projection and compact
+`telemetry.summary` lines. `run inspect <id>` prints only the compact summary
+plus deterministic warning signals.
+
+Signals are warnings by default and never block a run. They cover repeated
+unchanged-state wakeups, repeated review starts/restarts against one candidate
+HEAD, unjustified full-context spawns, unusually large tool results, repeated
+configuration-preflight failures, and abnormal reviewer restart counts. The
+default threshold set is versioned as `run-efficiency-thresholds-v1` and can be
+overridden per workflow invocation; audit-specific numbers are not embedded as
+universal limits. Event IDs make telemetry merges idempotent across workflow
+restart/re-entry, so already-persisted events are not counted twice.
+
 ### Codex App Server runtime observation
 
 For a `codex-cli` execution profile, Conductor first probes a component-local
@@ -447,7 +473,8 @@ pnpm test:smoke:claude
 `ImplementationRequest.sessionId` to resume after a Conductor process restart.
 An optional `AbortSignal` cancels the active process as a deterministic
 `CLAUDE_CANCELLED` failure. Results retain bounded wall-clock `durationMs`, but
-never raw stdout/stderr transcripts or model-usage details. The execution
+never raw stdout/stderr transcripts or hidden reasoning. Structured token/turn
+usage is retained when the provider reports it. The execution
 prompt requires repository validation and tests to pass before success is
 reported.
 

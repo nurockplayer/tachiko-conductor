@@ -53,6 +53,7 @@ import {
   canSynchronizeInterruptedHead,
 } from './domain/decisions.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
+import { projectRunEfficiency, type RunEfficiencyProjection } from './domain/telemetry.js';
 import {
   TRANSITION_TYPES,
   type InterruptKind,
@@ -78,6 +79,7 @@ import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js
 import {
   runWorkflow,
   type WorkflowDependencies,
+  type WorkflowOptions,
   type WorkflowOutcome,
 } from './workflow/run.js';
 
@@ -88,6 +90,7 @@ Usage:
   tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
   tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical>
   tachiko run show <id>
+  tachiko run inspect <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
   tachiko dispatch once
@@ -590,6 +593,8 @@ export interface WorkflowCommandOptions {
   readonly execution?: ResolvedExecutionConfiguration;
   /** Immutable queue-claim identity when this run is created by dispatch once. */
   readonly dispatchClaimId?: string;
+  /** Optional run-scoped efficiency-signal thresholds. */
+  readonly telemetryThresholds?: WorkflowOptions['telemetryThresholds'];
 }
 
 /**
@@ -618,6 +623,7 @@ export async function runIssueCommand(
   return runWorkflow(deps, run.id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
     now: options.now,
+    ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
   });
 }
 
@@ -705,6 +711,7 @@ export async function resumeCommand(
   return runWorkflow(deps, id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
     now: options.now,
+    ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
   });
 }
 
@@ -918,6 +925,8 @@ export interface RunView {
   interrupt: { kind: InterruptKind; reason: string } | null;
   transitions: number;
   updatedAt: string;
+  /** Structured per-run efficiency projection; absent telemetry is explicitly unknown. */
+  telemetry: RunEfficiencyProjection;
 }
 
 /** Project a run for display; a resolved interrupt is historical, not active. */
@@ -935,11 +944,22 @@ export function runShowView(run: Run): RunView {
     interrupt: activeInterrupt,
     transitions: run.history.length,
     updatedAt: run.updatedAt,
+    telemetry: projectRunEfficiency(run),
   };
 }
 
 function printRun(run: Run): void {
   console.log(JSON.stringify(runShowView(run), null, 2));
+}
+
+function printRunInspection(run: Run): void {
+  const telemetry = projectRunEfficiency(run);
+  const lines = [...telemetry.summary];
+  if (telemetry.signals.length > 0) {
+    lines.push('', 'warnings');
+    for (const signal of telemetry.signals) lines.push(`  ${signal.code}: ${signal.message}`);
+  }
+  console.log(lines.join('\n'));
 }
 
 function buildBrowserRuntime(): ManagedPlaywrightMcpRuntime {
@@ -1190,6 +1210,13 @@ export async function main(argv: string[]): Promise<number> {
     const id = rest[0];
     if (id === undefined) throw new Error('run show requires a run id.');
     printRun(runShowCommand(store, id));
+    return 0;
+  }
+
+  if (subcommand === 'inspect') {
+    const id = rest[0];
+    if (id === undefined) throw new Error('run inspect requires a run id.');
+    printRunInspection(runShowCommand(store, id));
     return 0;
   }
 
