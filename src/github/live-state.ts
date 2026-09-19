@@ -907,7 +907,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
         unknownDecision?.state === 'changes_requested' &&
         (
           currentDecision === undefined ||
-          (unknownDecision.submittedAt ?? '') > (currentDecision.submittedAt ?? '')
+          (unknownDecision.submittedAt ?? '') >= (currentDecision.submittedAt ?? '')
         )
       ) {
         // Unknown provenance is not stale provenance. A later explicit negative

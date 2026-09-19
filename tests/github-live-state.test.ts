@@ -487,6 +487,33 @@ PR: #7`;
     assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED']);
   });
 
+  it('fails closed when a current approval ties an unknown-provenance change request', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_CURRENT_APPROVED_TIE',
+        user: { login: 'alice' },
+        state: 'APPROVED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/current-approved-tie',
+      },
+      {
+        node_id: 'R_UNKNOWN_CHANGES_TIE',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: null,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/unknown-changes-tie',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_UNKNOWN_CHANGES_TIE']);
+  });
+
   it('fails closed on equal-timestamp approval/change-request ties regardless of collection order', async () => {
     const approval = {
       node_id: 'R_APPROVED_TIE',
