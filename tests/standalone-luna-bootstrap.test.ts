@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
@@ -99,5 +99,18 @@ describe('standalone Luna bootstrap', () => {
       await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); }, /Git (config|attributes) request/);
       assert.equal(existsSync(marker), false, location);
     }
+  });
+
+  it('skips an ordinary repository symlink but rejects a symlinked attribute authority', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-symlink-authority', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    symlinkSync('README.md', `${identity.workspacePath}/ordinary-link`);
+    fixture.git(identity.workspacePath, ['add', 'ordinary-link']);
+    fixture.git(identity.workspacePath, ['-c', 'user.name=Luna', '-c', 'user.email=luna@example.invalid', 'commit', '-m', 'ordinary symlink']);
+    await assert.doesNotReject(async () => await bootstrap.guard(identity).assertValid('after-execution'));
+    symlinkSync('README.md', `${identity.workspacePath}/.gitattributes`);
+    await assert.rejects(async () => await bootstrap.guard(identity).assertValid('after-execution'), /attribute authority/);
   });
 });
