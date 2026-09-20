@@ -639,8 +639,15 @@ export async function runIssueCommand(
   if (run === null) {
     run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId, options.repairTaskShapeAuthority);
     deps.store.create(run);
-  } else if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
-    throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
+  } else {
+    if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
+      throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
+    }
+    if (options.repairTaskShapeAuthority !== undefined &&
+      (run.repairTaskShapeAuthority?.revision !== options.repairTaskShapeAuthority.revision ||
+        run.repairTaskShapeAuthority?.shape !== options.repairTaskShapeAuthority.shape)) {
+      throw new Error(`Run "${run.id}" already has an immutable repair task-shape authority; refusing to replace it.`);
+    }
   }
   return runWorkflow(deps, run.id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,

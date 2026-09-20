@@ -589,6 +589,56 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.run.id, 'run-1');
   });
 
+  it('refuses a supplied repair authority that differs from an active durable run', async () => {
+    const store = new MemoryStore();
+    const run = createRun(TARGET, T0, 'run-1', undefined, undefined, REPAIR_AUTHORITY);
+    store.create(run);
+
+    await assert.rejects(
+      runIssueCommand(
+        deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])),
+        'acme/widgets#42',
+        { repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'interacting' } },
+      ),
+      /immutable repair task-shape authority/,
+    );
+    assert.deepEqual(store.read('run-1'), run);
+  });
+
+  it('refuses a supplied repair authority for an active legacy run', async () => {
+    const store = new MemoryStore();
+    const run = createRun(TARGET, T0, 'legacy-run');
+    store.create(run);
+
+    await assert.rejects(
+      runIssueCommand(
+        deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])),
+        'acme/widgets#42',
+        { repairTaskShapeAuthority: REPAIR_AUTHORITY },
+      ),
+      /immutable repair task-shape authority/,
+    );
+    assert.deepEqual(store.read('legacy-run'), run);
+  });
+
+  it('accepts a supplied repair authority that exactly matches an active durable run', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'run-1', undefined, undefined, REPAIR_AUTHORITY);
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+    store.create(run);
+
+    const outcome = await runIssueCommand(
+      deps(store, githubAdapter([HEAD, HEAD, HEAD]), new FakeImplementation([]), new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }])),
+      'acme/widgets#42',
+      { repairTaskShapeAuthority: REPAIR_AUTHORITY, now: () => T0 },
+    );
+
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.equal(outcome.run.id, 'run-1');
+  });
+
   it('creates fresh durable work without replacing terminal history for an explicitly re-dispatched Issue', async () => {
     const store = new MemoryStore();
     store.create({ ...createRun(TARGET, T0, 'old-terminal'), state: 'FAILED' });
