@@ -331,7 +331,7 @@ export async function runWorkflow(
         }
         let bootstrap = run.bootstrap;
         let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
-        let initialRecoveryCandidate: { number: number; headSha: string } | undefined;
+        let initialRecoveryCandidate: { number: number; baseSha: string; headSha: string } | undefined;
         let workspaceGuard: WorkspaceGuard | undefined;
 
         // A fresh isolated-Luna run may begin against an already-open PR. Bind
@@ -340,7 +340,7 @@ export async function runWorkflow(
         if (bootstrap === undefined && run.headSha === undefined &&
           effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null && snapshot.headSha !== null) {
           recoveryAuthority = { expectedHeadSha: snapshot.headSha };
-          initialRecoveryCandidate = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
+          initialRecoveryCandidate = { number: snapshot.pullRequest.number, baseSha: snapshot.pullRequest.baseSha, headSha: snapshot.headSha };
         }
 
         if (bootstrap !== undefined && (snapshot.pullRequest !== null || run.headSha !== undefined || run.pullRequest !== undefined)) {
@@ -356,7 +356,7 @@ export async function runWorkflow(
           // durable verification below must succeed before anything is adopted.
           recoveryAuthority = { expectedHeadSha: run.headSha ?? snapshot.headSha! };
           if (run.headSha === undefined) {
-            initialRecoveryCandidate = { number: snapshot.pullRequest!.number, headSha: snapshot.headSha! };
+            initialRecoveryCandidate = { number: snapshot.pullRequest!.number, baseSha: snapshot.pullRequest!.baseSha, headSha: snapshot.headSha! };
           }
         }
         if (pendingRepair && snapshot.headSha !== run.headSha) {
@@ -419,7 +419,9 @@ export async function runWorkflow(
             if (conflict !== null) return park(run, conflict, store, now);
             if (run.headSha === undefined) {
               if (initialRecoveryCandidate !== undefined &&
-                  (snapshot.pullRequest.number !== initialRecoveryCandidate.number || snapshot.headSha !== initialRecoveryCandidate.headSha)) {
+                  (snapshot.pullRequest.number !== initialRecoveryCandidate.number ||
+                    snapshot.pullRequest.baseSha !== initialRecoveryCandidate.baseSha ||
+                    snapshot.headSha !== initialRecoveryCandidate.headSha)) {
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
               }
               try {

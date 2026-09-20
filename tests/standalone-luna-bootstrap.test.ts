@@ -86,6 +86,30 @@ describe('standalone Luna bootstrap', () => {
     );
   });
 
+  it('retains a distinct existing PR publication branch through implementation, validation, and repair preparation', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const adoptedHead = fixture.commit(fixture.source, 'pr.txt', 'authoritative PR change\n');
+    fixture.git(fixture.source, ['push', 'origin', `HEAD:refs/heads/tachiko/existing-pr`]);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-99-reprepare', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha, publicationBranch: 'tachiko/existing-pr' };
+    const identity = await bootstrap.plan(request);
+
+    // Initial existing-PR adoption (implementation), then the exact-head
+    // validation reconstruction must retain the host publication target.
+    await bootstrap.prepare({ ...request, existing: identity, recoveryAuthority: { expectedHeadSha: adoptedHead } });
+    const validationIdentity = await bootstrap.prepare({ ...request, existing: identity, recoveryAuthority: { expectedHeadSha: adoptedHead } });
+    assert.equal(validationIdentity.publicationBranch, 'tachiko/existing-pr');
+    assert.notEqual(validationIdentity.branch, validationIdentity.publicationBranch);
+
+    // A review repair reconstructs from H and publication still targets the
+    // existing PR branch rather than this standalone workspace branch.
+    const repaired = fixture.commit(identity.workspacePath, 'repair.txt', 'repair\n');
+    const repairIdentity = await bootstrap.prepare({ ...request, existing: validationIdentity, recoveryAuthority: { expectedHeadSha: repaired } });
+    assert.equal(repairIdentity.publicationBranch, 'tachiko/existing-pr');
+    await bootstrap.verifyDurable({ identity: repairIdentity, expectedHeadSha: repaired, progressBaseSha: adoptedHead });
+    assert.equal(fixture.git(fixture.remote, ['rev-parse', 'refs/heads/tachiko/existing-pr']).trim(), repaired);
+  });
+
   it('rejects canonical filters and every attributes location before marker commands can execute', async () => {
     for (const location of ['config', '.gitattributes', 'nested/.gitattributes', '.git/info/attributes'] as const) {
       const fixture = createBootstrapGitFixture(); fixtures.push(fixture);

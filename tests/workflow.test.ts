@@ -932,6 +932,38 @@ describe('runWorkflow', () => {
     assert.equal(implementation.requests.length, 0);
   });
 
+  it('parks an existing Luna run when only its authoritative PR base SHA drifts after prepare', async () => {
+    class RecordingBootstrap extends FakeBootstrap {
+      override async prepare(request: unknown) { return this.identity; }
+    }
+    const stable = snapshot(HEAD);
+    const drifted: GitHubLiveSnapshot = {
+      ...snapshot(HEAD),
+      pullRequest: { ...snapshot(HEAD).pullRequest!, baseSha: 'c'.repeat(40) },
+    };
+    let reads = 0;
+    const github: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() { throw new Error('unused'); },
+      async readBranch() { throw new Error('unused'); },
+      async listPullRequests() { throw new Error('unused'); },
+      async readLiveSnapshot() { return reads++ === 0 ? stable : drifted; },
+    };
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'existing-luna-base-sha-drift', execution));
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => new RecordingBootstrap() },
+      'existing-luna-base-sha-drift', { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /Initial recovery PR or HEAD changed/);
+    assert.equal(implementation.requests.length, 0);
+  });
+
   it('parks a provider-neutral workspace guard failure instead of terminal agent failure', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-guard'));
