@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { parseTrustedLunaConfig } from '../src/agents/luna-isolated.js';
+import { isolatedLunaEnvironment, parseTrustedLunaConfig } from '../src/agents/luna-isolated.js';
 
 describe('qualified Luna runtime configuration', () => {
   it('pins all capability-denying overrides after repository configuration', () => {
@@ -9,5 +9,12 @@ describe('qualified Luna runtime configuration', () => {
   });
   it('rejects an incomplete trusted configuration before any model spawn', () => {
     assert.throws(() => parseTrustedLunaConfig('tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\n'), /explicitly disable/);
+  });
+  it('supplies a trusted commit identity without ambient user Git configuration', () => {
+    const env = isolatedLunaEnvironment('/tmp/qualified-luna', '/usr/bin');
+    assert.equal(env.HOME, '/tmp/qualified-luna');
+    assert.equal(env.GIT_CONFIG_GLOBAL, '/dev/null');
+    assert.equal(env.GIT_AUTHOR_EMAIL, 'tachiko-luna@localhost');
+    assert.equal(env.GIT_COMMITTER_NAME, 'Tachiko Isolated Luna');
   });
 });

@@ -56,20 +56,21 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     if ((request.capabilities?.length ?? 0) !== 0) return failure(LUNA_ISOLATED_ERROR_CODE.CAPABILITIES_FORBIDDEN, 'Isolated Luna forbids MCP/browser capabilities.');
     if (request.executor !== undefined || request.sessionId !== undefined) return failure(LUNA_ISOLATED_ERROR_CODE.CONTINUATION_FORBIDDEN, 'Isolated Luna repair/restart uses a fresh bounded worker; session continuation is forbidden.');
     if (request.workspacePath === undefined || request.branch === undefined) return failure(LUNA_ISOLATED_ERROR_CODE.RUNTIME_UNQUALIFIED, 'Isolated Luna requires a host-prepared standalone workspace and branch.');
-    const env: NodeJS.ProcessEnv = {
-      CODEX_HOME: this.home,
-      HOME: this.home,
-      PATH: this.executablePath ?? process.env.PATH ?? '',
-      NO_PROXY: '*',
-      GIT_AUTHOR_NAME: 'Tachiko Isolated Luna', GIT_AUTHOR_EMAIL: 'tachiko-luna@localhost',
-      GIT_COMMITTER_NAME: 'Tachiko Isolated Luna', GIT_COMMITTER_EMAIL: 'tachiko-luna@localhost',
-    };
+    const env = isolatedLunaEnvironment(this.home, this.executablePath);
     return await new CodexCliAdapter({
       cwd: request.workspacePath, model: LUNA_ISOLATED_MODEL,
       reasoningEffort: request.execution.reasoningEffort, sandboxMode: 'workspace-write', approvalPolicy: 'never',
       timeoutMs: this.timeoutMs, env, requiredConfig: this.runtimeConfig,
     }).run(request);
   }
+}
+
+/** Minimal fresh-worker environment; deliberately independent of user HOME. */
+export function isolatedLunaEnvironment(home: string, executablePath?: string): NodeJS.ProcessEnv {
+  return { CODEX_HOME: home, HOME: home, PATH: executablePath ?? process.env.PATH ?? '', NO_PROXY: '*',
+    GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_AUTHOR_NAME: 'Tachiko Isolated Luna', GIT_AUTHOR_EMAIL: 'tachiko-luna@localhost',
+    GIT_COMMITTER_NAME: 'Tachiko Isolated Luna', GIT_COMMITTER_EMAIL: 'tachiko-luna@localhost' };
 }
 
 /** Closed capability contract, then reapplied after repository configuration. */
