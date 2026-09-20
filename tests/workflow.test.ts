@@ -892,6 +892,46 @@ describe('runWorkflow', () => {
     assert.deepEqual((bootstrap.prepareRequest as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
   });
 
+  it('parks an existing Luna run when its authoritative PR tuple drifts after prepare', async () => {
+    class RecordingBootstrap extends FakeBootstrap {
+      prepareRequest: unknown;
+      override async prepare(request: unknown) { this.prepareRequest = request; return this.identity; }
+    }
+    const stable = snapshot(HEAD);
+    const drifted: GitHubLiveSnapshot = {
+      ...snapshot(HEAD),
+      pullRequest: {
+        ...snapshot(HEAD).pullRequest!,
+        number: 8,
+        baseRef: 'release',
+        headRef: 'tachiko/unexpected-branch',
+      },
+    };
+    let reads = 0;
+    const github: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() { throw new Error('unused'); },
+      async readBranch() { throw new Error('unused'); },
+      async listPullRequests() { throw new Error('unused'); },
+      async readLiveSnapshot() { return reads++ === 0 ? stable : drifted; },
+    };
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'existing-luna-drift', execution));
+    const bootstrap = new RecordingBootstrap();
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap },
+      'existing-luna-drift', { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.deepEqual((bootstrap.prepareRequest as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /does not match the persisted branch and repository identity|Initial recovery PR or HEAD changed/);
+    assert.equal(implementation.requests.length, 0);
+  });
+
   it('parks a provider-neutral workspace guard failure instead of terminal agent failure', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-guard'));
