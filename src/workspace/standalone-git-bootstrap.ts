@@ -132,7 +132,8 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private async tree(cwd: string, ref: string): Promise<string> { return (await this.git(cwd, ['rev-parse', `${ref}^{tree}`])).stdout.trim(); }
   private async assertPublicationRemote(request: Pick<ImplementationBootstrapIdentity, 'owner' | 'repo'>): Promise<void> {
     const urls = [...(await this.git(this.source, ['remote', 'get-url', '--all', 'origin'])).stdout.trim().split(/\r?\n/), ...(await this.git(this.source, ['remote', 'get-url', '--all', '--push', 'origin'])).stdout.trim().split(/\r?\n/)];
-    if (!urls.every((url) => githubIdentity(url) === `${request.owner}/${request.repo}`)) this.fail('REPOSITORY_MISMATCH', 'Trusted host publication remote does not exactly match the target GitHub repository.');
+    const expected = `${request.owner}/${request.repo}`.toLowerCase();
+    if (!urls.every((url) => githubIdentity(url)?.toLowerCase() === expected)) this.fail('REPOSITORY_MISMATCH', 'Trusted host publication remote does not exactly match the target GitHub repository.');
   }
   private assertWorkerGitSurface(workspace: string): void {
     const gitDir = path.join(workspace, '.git');

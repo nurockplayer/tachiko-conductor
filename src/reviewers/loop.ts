@@ -470,7 +470,7 @@ export async function runReviewLoop(
           target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: blockingFindings,
           ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
-          capabilities: await deps.resolveImplementationCapabilities?.(),
+          ...(isolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
           ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
