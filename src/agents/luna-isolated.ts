@@ -72,6 +72,9 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
 
 /** Closed capability contract, then reapplied after repository configuration. */
 export function parseTrustedLunaConfig(raw: string): readonly string[] {
+  if (!new RegExp(`^\\s*tachiko_luna_runtime_revision\\s*=\\s*"${LUNA_TRUSTED_RUNTIME_REVISION}"\\s*$`, 'm').test(raw)) {
+    throw new Error(`Qualified Luna config.toml must pin ${LUNA_TRUSTED_RUNTIME_REVISION}.`);
+  }
   const required = [/^\s*plugins\s*=\s*false\s*$/m, /^\s*apps\s*=\s*false\s*$/m,
     /^\s*mcp_servers\s*=\s*\{\s*\}\s*$/m, /^\s*web_search\s*=\s*(false|"disabled")\s*$/m,
     /^\s*network_access\s*=\s*false\s*$/m];

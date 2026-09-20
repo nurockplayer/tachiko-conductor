@@ -28,6 +28,7 @@ export interface ReviewLoopDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly bootstrap?: ImplementationBootstrapAdapter;
+  readonly bootstrapForExecution?: (execution: ResolvedExecutionConfiguration | undefined) => ImplementationBootstrapAdapter | undefined;
   readonly reviewer: ReviewerAdapter;
   /**
    * Resolves the active validation-policy identity at each reviewer effect
@@ -412,17 +413,19 @@ export async function runReviewLoop(
         ? 'Exact-HEAD validation failed. Repair the implementation and its required validation before returning a new exact HEAD.'
         : renderBlockingFindings(pendingReview!);
       const progressBaseSha = run.headSha;
+      const repairBootstrap = deps.bootstrapForExecution?.(repairExecution) ?? deps.bootstrap;
+      const isolatedLuna = repairExecution?.executor === 'luna-isolated';
       let workspaceGuard: WorkspaceGuard | undefined;
       if (run.bootstrap !== undefined) {
-        if (deps.bootstrap === undefined || progressBaseSha === undefined) {
+        if (repairBootstrap === undefined || progressBaseSha === undefined) {
           return parkBootstrap(run, new Error('Review fix cannot prove its persisted implementation workspace.'), store, now);
         }
         try {
-          await deps.bootstrap.prepare({
+          await repairBootstrap.prepare({
             runId: run.id, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
             existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: progressBaseSha },
           });
-          workspaceGuard = deps.bootstrap.guard(run.bootstrap);
+          workspaceGuard = repairBootstrap.guard(run.bootstrap);
         } catch (error) {
           return parkBootstrap(run, error, store, now);
         }
@@ -455,11 +458,11 @@ export async function runReviewLoop(
       let fixResult;
       try {
         fixResult = await implementation.run({
-          target, baseSha: progressBaseSha ?? '', authority: 'live-target', instructions: blockingFindings,
-          supplementalInstructions: blockingFindings,
+          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: blockingFindings,
+          ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           capabilities: await deps.resolveImplementationCapabilities?.(),
-          ...(repairStartsWithFreshExecutor ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
+          ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
       } catch (error) {
@@ -525,11 +528,11 @@ export async function runReviewLoop(
       }
 
       if (run.bootstrap !== undefined) {
-        if (deps.bootstrap === undefined || progressBaseSha === undefined) {
+        if (repairBootstrap === undefined || progressBaseSha === undefined) {
           return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now);
         }
         try {
-          await deps.bootstrap.verifyDurable({
+          await repairBootstrap.verifyDurable({
             identity: run.bootstrap, expectedHeadSha: fixResult.headSha, progressBaseSha, workspaceGuard,
           });
         } catch (error) {

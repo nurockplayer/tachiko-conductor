@@ -362,7 +362,7 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
-        if (!pendingRepair && snapshot.pullRequest === null && bootstrap === undefined) {
+        if (!pendingRepair && (snapshot.pullRequest === null || effectiveExecution?.executor === 'luna-isolated') && bootstrap === undefined) {
           if (bootstrapAdapter === undefined || snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null) {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
@@ -390,7 +390,7 @@ export async function runWorkflow(
           if (snapshot.pullRequest !== null) {
             const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
             if (conflict !== null) return park(run, conflict, store, now);
-            if (run.headSha === undefined) {
+            if (run.headSha === undefined && effectiveExecution?.executor !== 'luna-isolated') {
               if (initialRecoveryCandidate !== undefined &&
                   (snapshot.pullRequest.number !== initialRecoveryCandidate.number || snapshot.headSha !== initialRecoveryCandidate.headSha)) {
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
@@ -801,6 +801,7 @@ export async function runWorkflow(
             implementation,
             reviewer,
             bootstrap: deps.bootstrapForExecution?.(run.execution) ?? deps.bootstrap,
+            bootstrapForExecution: deps.bootstrapForExecution,
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
             resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,
