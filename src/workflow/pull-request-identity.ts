@@ -23,7 +23,7 @@ export function pullRequestIdentityConflict(run: Run, snapshot: GitHubLiveSnapsh
   }
   if (actual.headRepository.owner.toLowerCase() !== expected.owner.toLowerCase() ||
     actual.headRepository.repo.toLowerCase() !== expected.repo.toLowerCase() ||
-    actual.headRef !== expected.branch || actual.baseRef !== expected.baseBranch ||
+    actual.headRef !== (expected.publicationBranch ?? expected.branch) || actual.baseRef !== expected.baseBranch ||
     snapshot.repository.owner.toLowerCase() !== expected.owner.toLowerCase() ||
     snapshot.repository.repo.toLowerCase() !== expected.repo.toLowerCase() ||
     snapshot.issue.number !== expected.issueNumber) {
