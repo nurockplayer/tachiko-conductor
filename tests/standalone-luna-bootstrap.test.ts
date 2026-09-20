@@ -96,7 +96,7 @@ describe('standalone Luna bootstrap', () => {
         mkdirSync(path.dirname(file), { recursive: true });
         writeFileSync(file, '*.txt filter=marker\n');
       }
-      await assert.rejects(() => bootstrap.guard(identity).assertValid(), /Git (config|attributes) request/);
+      await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); }, /Git (config|attributes) request/);
       assert.equal(existsSync(marker), false, location);
     }
   });
