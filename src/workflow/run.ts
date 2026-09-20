@@ -476,15 +476,17 @@ export async function runWorkflow(
             : snapshot.issue.body
         );
         const boundedInstructions = isIsolatedLuna && snapshot.pullRequest === null
-          ? `Isolated Luna contract: implement only the host-bounded task and its tests; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
+          ? `Task requirements:\n${snapshot.issue.body}\n\nIsolated Luna contract: implement only the host-bounded task and its tests; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
           : isIsolatedLuna
             ? `${instructions}\n\nIsolated Luna contract: implement only this bounded task and its tests; run the required tests; commit one clean exact HEAD. The trusted host, not this worker, owns every push and pull-request action.`
           : instructions;
-        const supplementalInstructions = pendingFixInstructions ?? (
+        const supplementalInstructions = isIsolatedLuna && snapshot.pullRequest === null
+          ? undefined
+          : pendingFixInstructions ?? (
           snapshot.pullRequest === null
             ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : undefined
-        );
+          );
         if (effectiveExecution?.executor === 'worker-router' && snapshot.pullRequest !== null && bootstrap === undefined) {
           return park(run, 'Worker-router requires a verified prepared workspace and branch for an existing implementation pull request.', store, now);
         }
