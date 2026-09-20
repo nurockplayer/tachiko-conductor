@@ -37,6 +37,16 @@ afterEach(() => {
 });
 
 describe('JsonFileStore — persistence round-trips', () => {
+  it('normalizes a legacy persisted bootstrap to linked-worktree after restart', () => {
+    const { dir } = tempStore();
+    const legacy = { ...newRun('legacy-bootstrap'), bootstrap: {
+      owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+      baseBranch: 'main', baseSha: 'a'.repeat(40), branch: 'legacy', workspacePath: '/tmp/legacy-workspace',
+    } };
+    writeFileSync(path.join(dir, 'legacy-bootstrap.json'), JSON.stringify(legacy), 'utf8');
+    const restarted = new JsonFileStore({ dir }).read('legacy-bootstrap');
+    assert.equal(restarted?.bootstrap?.bootstrapKind, 'linked-worktree');
+  });
   it('persists a created run and reads it back intact', () => {
     const { store } = tempStore();
     store.create(newRun('r1'));
