@@ -413,7 +413,12 @@ export async function runReviewLoop(
         ? 'Exact-HEAD validation failed. Repair the implementation and its required validation before returning a new exact HEAD.'
         : renderBlockingFindings(pendingReview!);
       const progressBaseSha = run.headSha;
-      const repairBootstrap = deps.bootstrapForExecution?.(repairExecution) ?? deps.bootstrap;
+      // Workspace identity is durable authority across a promoted repair: a
+      // Luna checkout cannot be silently reinterpreted as a linked worktree.
+      const bootstrapExecution = run.bootstrap?.workspacePath.includes('/luna-') === true
+        ? { ...repairExecution!, executor: 'luna-isolated' }
+        : repairExecution;
+      const repairBootstrap = deps.bootstrapForExecution?.(bootstrapExecution) ?? deps.bootstrap;
       const isolatedLuna = repairExecution?.executor === 'luna-isolated';
       let workspaceGuard: WorkspaceGuard | undefined;
       if (run.bootstrap !== undefined) {

@@ -367,7 +367,8 @@ export async function runWorkflow(
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
           try {
-            bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: snapshot.repository.defaultBranch, baseSha: snapshot.repository.defaultBranchHeadSha });
+            bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: snapshot.repository.defaultBranch,
+              baseSha: effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null ? snapshot.headSha! : snapshot.repository.defaultBranchHeadSha });
             run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
             store.update(run);
           } catch (error) {
@@ -390,7 +391,7 @@ export async function runWorkflow(
           if (snapshot.pullRequest !== null) {
             const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
             if (conflict !== null) return park(run, conflict, store, now);
-            if (run.headSha === undefined && effectiveExecution?.executor !== 'luna-isolated') {
+            if (run.headSha === undefined) {
               if (initialRecoveryCandidate !== undefined &&
                   (snapshot.pullRequest.number !== initialRecoveryCandidate.number || snapshot.headSha !== initialRecoveryCandidate.headSha)) {
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
