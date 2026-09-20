@@ -334,6 +334,15 @@ export async function runWorkflow(
         let initialRecoveryCandidate: { number: number; headSha: string } | undefined;
         let workspaceGuard: WorkspaceGuard | undefined;
 
+        // A fresh isolated-Luna run may begin against an already-open PR. Bind
+        // its exact tuple before planning so prepare cannot seed from a stale
+        // base and later attempt to adopt a different head.
+        if (bootstrap === undefined && run.headSha === undefined &&
+          effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null && snapshot.headSha !== null) {
+          recoveryAuthority = { expectedHeadSha: snapshot.headSha };
+          initialRecoveryCandidate = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
+        }
+
         if (bootstrap !== undefined && (snapshot.pullRequest !== null || run.headSha !== undefined || run.pullRequest !== undefined)) {
           const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
           if (conflict !== null) return park(run, conflict, store, now);
