@@ -881,7 +881,7 @@ describe('CLI end-to-end across processes', () => {
       assert.match(create.stdout, /"profile": "standard"/);
 
       // Supplying both --issue and --branch is rejected.
-      const both = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--branch', 'main', '--execution-profile', 'standard']);
+      const both = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--branch', 'main', '--execution-profile', 'standard', '--repair-task-shape-authority', '{"revision":"task-shape-v1","shape":"bounded"}']);
       assert.equal(both.status, 1);
       assert.match(both.stderr, /error: run create requires exactly one of/);
 
