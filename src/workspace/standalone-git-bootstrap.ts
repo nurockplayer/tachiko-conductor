@@ -84,7 +84,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private identity(r: BootstrapPlanRequest): ImplementationBootstrapIdentity {
     const branch = `tachiko/${r.runId}`;
     const suffix = createHash('sha256').update(`${r.target.owner}/${r.target.repo}#${r.target.issueNumber}:${r.runId}`).digest('hex').slice(0, 16);
-    return { owner: r.target.owner, repo: r.target.repo, issueNumber: r.target.issueNumber, baseBranch: r.baseBranch, baseSha: r.baseSha, branch, workspacePath: path.join(this.root, `luna-${suffix}`) };
+    return { bootstrapKind: 'standalone-isolated', owner: r.target.owner, repo: r.target.repo, issueNumber: r.target.issueNumber, baseBranch: r.baseBranch, baseSha: r.baseSha, branch, workspacePath: path.join(this.root, `luna-${suffix}`) };
   }
   private async assert(i: ImplementationBootstrapIdentity, recovery?: string, initialBase?: string): Promise<void> {
     if (!existsSync(i.workspacePath)) this.fail('STALE_IDENTITY', 'Standalone workspace disappeared.');

@@ -415,7 +415,7 @@ export async function runReviewLoop(
       const progressBaseSha = run.headSha;
       // Workspace identity is durable authority across a promoted repair: a
       // Luna checkout cannot be silently reinterpreted as a linked worktree.
-      const bootstrapExecution = run.bootstrap?.workspacePath.includes('/luna-') === true
+      const bootstrapExecution = run.bootstrap?.bootstrapKind === 'standalone-isolated'
         ? { ...repairExecution!, executor: 'luna-isolated' }
         : repairExecution;
       const repairBootstrap = deps.bootstrapForExecution?.(bootstrapExecution) ?? deps.bootstrap;
