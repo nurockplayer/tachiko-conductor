@@ -187,6 +187,7 @@ class FakeImplementation implements ImplementationAgent {
     sessionId: string | undefined;
     executor: ImplementationRequest['executor'];
     execution: ImplementationRequest['execution'];
+    capabilities: ImplementationRequest['capabilities'];
   }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
@@ -198,6 +199,7 @@ class FakeImplementation implements ImplementationAgent {
       sessionId: request.sessionId,
       executor: request.executor,
       execution: request.execution,
+      capabilities: request.capabilities,
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
@@ -392,7 +394,7 @@ describe('runReviewLoop', () => {
       'run-1',
       { maxAttempts: 3, now: () => T0 },
     );
-    assert.equal(result.outcome, 'revalidating');
+    assert.equal(result.outcome, 'revalidating', result.outcome === 'needs_human' ? result.reason : '');
     assert.equal(result.run.state, 'VALIDATING');
     assert.equal(result.run.reviewResult, undefined);
     assert.equal(reviewer.requests.length, 1);
@@ -481,6 +483,28 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.match(result.reason, /cannot transition/);
     assert.equal(implementation.requests.length, 0);
+  });
+
+  it('does not resolve browser or MCP capabilities for an isolated Luna review repair', async () => {
+    const luna: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' };
+    const identity: ImplementationBootstrapIdentity = { bootstrapKind: 'standalone-isolated', owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base', branch: 'tachiko/luna', workspacePath: '/tmp/luna-review' };
+    const store = new MemoryStore();
+    let run = reviewingRun(HEAD, 'luna-capabilities', undefined, luna);
+    run = { ...run, bootstrap: identity };
+    store.create(run);
+    const bootstrap: ImplementationBootstrapAdapter = { kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated', async plan() { return identity; }, async prepare() { return identity; }, guard() { return { assertValid: () => undefined }; }, async verifyDurable(request) { return { headSha: request.expectedHeadSha, branch: identity.branch }; } };
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+    let resolved = 0;
+    const github = githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, pullRequest: { ...live.pullRequest!, headRef: identity.branch, baseRef: identity.baseBranch, headRepository: { owner: identity.owner, repo: identity.repo } } };
+    };
+    const result = await runReviewLoop({ store, github, implementation, reviewer: new FakeReviewer([requestChanges(HEAD)]), resolveValidationAuthority: reviewAuthority, bootstrapForExecution: () => bootstrap, resolveImplementationCapabilities: async () => { resolved += 1; return [{ kind: 'mcp-http', name: 'browser', endpoint: 'http://127.0.0.1:1/mcp' }]; } }, run.id, { maxAttempts: 3, now: () => T0 });
+    assert.equal(result.outcome, 'revalidating');
+    assert.equal(resolved, 0);
+    assert.equal(implementation.requests[0]?.capabilities, undefined);
   });
 
   it('routes only blocking findings to implementation', async () => {
