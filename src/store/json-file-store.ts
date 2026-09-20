@@ -278,7 +278,13 @@ function readRun(filePath: string, id: string): Run {
       `Run file ${filePath} is corrupt or incompatible: persisted run id "${parsed.id}" does not match its file name "${id}".`,
     );
   }
-  return parsed;
+  const run = parsed as Run;
+  // All historical bootstrap records predate explicit boundary kinds and were
+  // linked worktrees. Normalize once at the durable read boundary; never infer
+  // from a caller-controlled path.
+  return run.bootstrap?.bootstrapKind === undefined
+    ? { ...run, ...(run.bootstrap === undefined ? {} : { bootstrap: { ...run.bootstrap, bootstrapKind: 'linked-worktree' as const } }) }
+    : run;
 }
 
 /**
