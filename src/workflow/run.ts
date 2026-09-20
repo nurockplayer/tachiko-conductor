@@ -372,13 +372,18 @@ export async function runWorkflow(
           const existingLuna = effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null;
           const authoritativeBaseBranch = existingLuna ? snapshot.pullRequest?.baseRef : snapshot.repository.defaultBranch;
           const authoritativeBaseSha = existingLuna ? snapshot.pullRequest?.baseSha : snapshot.repository.defaultBranchHeadSha;
+          const publicationBranch = existingLuna ? snapshot.pullRequest?.headRef : undefined;
+          const sameRepository = existingLuna && snapshot.pullRequest?.headRepository?.owner === target.owner && snapshot.pullRequest?.headRepository?.repo === target.repo;
           if (bootstrapAdapter === undefined || authoritativeBaseBranch === undefined || authoritativeBaseBranch === null || authoritativeBaseBranch === '' ||
             authoritativeBaseSha === undefined || authoritativeBaseSha === null || authoritativeBaseSha === '') {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
+          if (existingLuna && (!sameRepository || publicationBranch === undefined || publicationBranch.trim() === '')) {
+            return bootstrapFailureOutcome(run, new Error('Existing Luna PR has no safe same-repository publication branch.'), store, now);
+          }
           try {
             bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: authoritativeBaseBranch,
-              baseSha: authoritativeBaseSha });
+              baseSha: authoritativeBaseSha, ...(publicationBranch === undefined ? {} : { publicationBranch }) });
             assertBootstrapBoundary(bootstrap, bootstrapAdapter);
             run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
             store.update(run);
