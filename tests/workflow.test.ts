@@ -12,7 +12,7 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
-import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
+import { EXECUTION_CONFIGURATION_ERROR_CODE, type ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
@@ -138,7 +138,9 @@ class FakeValidation implements ValidationAdapter {
 
 class FakeBootstrap implements ImplementationBootstrapAdapter {
   readonly kind = 'implementation-bootstrap' as const;
+  readonly bootstrapKind = 'linked-worktree' as const;
   readonly identity = {
+    bootstrapKind: 'linked-worktree' as const,
     owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base',
     branch: 'tachiko/issue-42-test', workspacePath: '/tmp/tachiko-workspace',
   };
@@ -185,6 +187,45 @@ function reviewingRun(store: RunStore, id = 'run-1', headSha = HEAD): Run {
 }
 
 describe('runWorkflow', () => {
+  it('adopts an existing Luna PR from its authoritative base and head when default-branch fields are unavailable', async () => {
+    const store = new MemoryStore();
+    const execution: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'profiles-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+      sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const,
+    };
+    const planned: Array<{ baseBranch: string; baseSha: string }> = [];
+    const verified: Array<Record<string, unknown>> = [];
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+      async plan(request) {
+        planned.push({ baseBranch: request.baseBranch, baseSha: request.baseSha });
+        return { bootstrapKind: 'standalone-isolated', owner: 'acme', repo: 'widgets', issueNumber: 42,
+          baseBranch: request.baseBranch, baseSha: request.baseSha, branch: 'tachiko/issue-42-test', workspacePath: '/tmp/luna-existing' };
+      },
+      async prepare(request) { return request.existing; },
+      guard() { return { assertValid: () => undefined }; },
+      async verifyDurable(request) { verified.push(request as unknown as Record<string, unknown>); return { headSha: request.expectedHeadSha, branch: 'tachiko/issue-42-test' }; },
+    };
+    const github: GitHubAdapter = githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]);
+    const originalRead = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await originalRead(target);
+      return { ...live, repository: { ...live.repository, defaultBranch: null, defaultBranchHeadSha: null } };
+    };
+    const run = createRun(TARGET, T0, 'luna-existing-pr', execution);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const outcome = await runWorkflow(
+      { store, github, implementation, bootstrapForExecution: () => bootstrap, reviewer: new FakeReviewer([approve(HEAD)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.deepEqual(planned, [{ baseBranch: 'main', baseSha: 'base' }]);
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(verified[0]?.adoptExistingHead, true);
+    assert.equal(verified[0]?.progressBaseSha, 'base');
+  });
+
   it('fails closed in VALIDATING when no explicit local validation adapter is configured', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'validation-missing');

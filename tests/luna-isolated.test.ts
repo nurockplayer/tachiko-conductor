@@ -1,4 +1,8 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 import { isolatedLunaEnvironment, parseTrustedLunaConfig } from '../src/agents/luna-isolated.js';
 
@@ -16,5 +20,21 @@ describe('qualified Luna runtime configuration', () => {
     assert.equal(env.GIT_CONFIG_GLOBAL, '/dev/null');
     assert.equal(env.GIT_AUTHOR_EMAIL, 'tachiko-luna@localhost');
     assert.equal(env.GIT_COMMITTER_NAME, 'Tachiko Isolated Luna');
+  });
+  it('creates a fresh isolated commit using only the supplied identity', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-luna-identity-'));
+    try {
+      const home = path.join(root, 'qualified-home');
+      const repository = path.join(root, 'repository');
+      mkdirSync(home); mkdirSync(repository);
+      const env = isolatedLunaEnvironment(home, process.env.PATH);
+      execFileSync('git', ['init', '-b', 'main'], { cwd: repository, env, stdio: 'ignore' });
+      writeFileSync(path.join(repository, 'fresh.txt'), 'isolated\n');
+      execFileSync('git', ['add', 'fresh.txt'], { cwd: repository, env, stdio: 'ignore' });
+      execFileSync('git', ['commit', '-m', 'fresh isolated identity'], { cwd: repository, env, stdio: 'ignore' });
+      assert.equal(execFileSync('git', ['show', '-s', '--format=%an <%ae>'], { cwd: repository, env, encoding: 'utf8' }).trim(), 'Tachiko Isolated Luna <tachiko-luna@localhost>');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

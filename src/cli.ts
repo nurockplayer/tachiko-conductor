@@ -806,6 +806,7 @@ function buildWorkflowDeps(
   let lunaBootstrap: ImplementationBootstrapAdapter | undefined;
   const lazyBootstrap: ImplementationBootstrapAdapter = {
     kind: 'implementation-bootstrap',
+    bootstrapKind: 'linked-worktree',
     plan: async (request) => {
       bootstrap ??= new GitWorktreeBootstrap({
         repositoryRoot: resolveRepositoryRoot(),

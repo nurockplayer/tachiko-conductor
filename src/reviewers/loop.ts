@@ -413,17 +413,21 @@ export async function runReviewLoop(
         ? 'Exact-HEAD validation failed. Repair the implementation and its required validation before returning a new exact HEAD.'
         : renderBlockingFindings(pendingReview!);
       const progressBaseSha = run.headSha;
-      // Workspace identity is durable authority across a promoted repair: a
-      // Luna checkout cannot be silently reinterpreted as a linked worktree.
-      const bootstrapExecution = run.bootstrap?.bootstrapKind === 'standalone-isolated'
-        ? { ...repairExecution!, executor: 'luna-isolated' }
-        : repairExecution;
-      const repairBootstrap = deps.bootstrapForExecution?.(bootstrapExecution) ?? deps.bootstrap;
+      // Workspace identity is durable authority across a promoted repair. A
+      // profile change may not reinterpret a standalone Luna checkout as a
+      // linked worktree (or the reverse) merely because its path looks alike.
       const isolatedLuna = repairExecution?.executor === 'luna-isolated';
+      if (run.bootstrap?.bootstrapKind === 'standalone-isolated' && !isolatedLuna) {
+        return parkBootstrap(run, new Error('A standalone Luna workspace cannot transition to a non-Luna repair transport.'), store, now);
+      }
+      const repairBootstrap = deps.bootstrapForExecution?.(repairExecution) ?? deps.bootstrap;
       let workspaceGuard: WorkspaceGuard | undefined;
       if (run.bootstrap !== undefined) {
         if (repairBootstrap === undefined || progressBaseSha === undefined) {
           return parkBootstrap(run, new Error('Review fix cannot prove its persisted implementation workspace.'), store, now);
+        }
+        if (repairBootstrap.bootstrapKind !== run.bootstrap.bootstrapKind) {
+          return parkBootstrap(run, new Error('Repair transport is incompatible with the persisted workspace boundary.'), store, now);
         }
         try {
           await repairBootstrap.prepare({

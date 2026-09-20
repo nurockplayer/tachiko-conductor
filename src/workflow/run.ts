@@ -68,6 +68,12 @@ function formatTarget(target: Target): string {
   return `${target.owner}/${target.repo}@${target.branch}`;
 }
 
+function assertBootstrapBoundary(bootstrap: NonNullable<Run['bootstrap']>, adapter: ImplementationBootstrapAdapter): void {
+  if (bootstrap.bootstrapKind !== adapter.bootstrapKind) {
+    throw new Error(`Persisted ${bootstrap.bootstrapKind} workspace cannot be used by ${adapter.bootstrapKind} bootstrap transport.`);
+  }
+}
+
 function renderBlockingFindings(run: Run): string | null {
   if (run.reviewResult?.verdict !== 'request_changes') return null;
   const findings = run.reviewResult.findings
@@ -364,12 +370,16 @@ export async function runWorkflow(
 
         if (!pendingRepair && (snapshot.pullRequest === null || effectiveExecution?.executor === 'luna-isolated') && bootstrap === undefined) {
           const existingLuna = effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null;
-          if (bootstrapAdapter === undefined || (!existingLuna && (snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null))) {
+          const authoritativeBaseBranch = existingLuna ? snapshot.pullRequest?.baseRef : snapshot.repository.defaultBranch;
+          const authoritativeBaseSha = existingLuna ? snapshot.pullRequest?.baseSha : snapshot.repository.defaultBranchHeadSha;
+          if (bootstrapAdapter === undefined || authoritativeBaseBranch === undefined || authoritativeBaseBranch === null || authoritativeBaseBranch === '' ||
+            authoritativeBaseSha === undefined || authoritativeBaseSha === null || authoritativeBaseSha === '') {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
           try {
-            bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: existingLuna ? snapshot.pullRequest!.baseRef! : snapshot.repository.defaultBranch!,
-              baseSha: existingLuna ? snapshot.headSha! : snapshot.repository.defaultBranchHeadSha! });
+            bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: authoritativeBaseBranch,
+              baseSha: authoritativeBaseSha });
+            assertBootstrapBoundary(bootstrap, bootstrapAdapter);
             run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
             store.update(run);
           } catch (error) {
@@ -379,6 +389,7 @@ export async function runWorkflow(
         if (bootstrap !== undefined) {
           if (bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
           try {
+            assertBootstrapBoundary(bootstrap, bootstrapAdapter);
             bootstrap = await bootstrapAdapter.prepare({
               runId: run.id, target, baseBranch: bootstrap.baseBranch, baseSha: bootstrap.baseSha,
               existing: bootstrap, ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
@@ -398,7 +409,8 @@ export async function runWorkflow(
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
               }
               try {
-                await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard, adoptExistingHead: bootstrap.bootstrapKind === 'standalone-isolated' });
+                await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard,
+                  ...(bootstrap.bootstrapKind === 'standalone-isolated' ? { adoptExistingHead: true, progressBaseSha: bootstrap.baseSha } : {}) });
               } catch (error) {
                 return bootstrapFailureOutcome(run, error, store, now);
               }
@@ -636,6 +648,7 @@ export async function runWorkflow(
             return bootstrapFailureOutcome(run, new Error('Exact-HEAD validation requires the owned workspace bootstrap.'), store, now);
           }
           try {
+            assertBootstrapBoundary(run.bootstrap, bootstrapAdapter);
             const identity = await bootstrapAdapter.prepare({
               runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
               existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },

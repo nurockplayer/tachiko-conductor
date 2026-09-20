@@ -5,12 +5,13 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
+import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition, type ActiveValidationConfiguration } from '../src/domain/state-machine.js';
 import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
-import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
+import type { AgentResult, ImplementationBootstrapIdentity, ReviewResult, Run } from '../src/domain/types.js';
 import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
@@ -414,6 +415,72 @@ describe('runReviewLoop', () => {
     assert.equal(result.run.headSha, HEAD2);
     assert.deepEqual(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
     assert.deepEqual(reviewer.requests.map((request) => request.headSha), [HEAD]);
+  });
+
+  it('keeps an ordinary linked worktree on its linked transport even when its path contains /luna-', async () => {
+    const store = new MemoryStore();
+    const execution = ROUTINE_REPAIR_EXECUTION;
+    const identity: ImplementationBootstrapIdentity = {
+      bootstrapKind: 'linked-worktree', owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base',
+      branch: 'tachiko/ordinary', workspacePath: '/tmp/luna-looking/ordinary-worktree',
+    };
+    let run = createRun(TARGET, T0, 'linked-luna-looking', execution);
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD, pullRequest: { number: 7, headSha: HEAD } }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    store.create(run);
+    const selected: Array<string | undefined> = [];
+    const linked: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree',
+      async plan() { return identity; }, async prepare() { return identity; }, guard() { return { assertValid: () => undefined }; },
+      async verifyDurable(request) { return { headSha: request.expectedHeadSha, branch: identity.branch }; },
+    };
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+    const github = githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD2]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, pullRequest: { ...live.pullRequest!, headRef: identity.branch, baseRef: identity.baseBranch,
+        headRepository: { owner: identity.owner, repo: identity.repo } } };
+    };
+    const result = await runReviewLoop(
+      { store, github, implementation, reviewer: new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]),
+        resolveValidationAuthority: reviewAuthority, bootstrapForExecution: (candidate) => { selected.push(candidate?.executor); return linked; } },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+    assert.equal(result.outcome, 'revalidating');
+    assert.deepEqual(selected, ['codex-cli']);
+    assert.equal(implementation.requests[0]?.execution?.executor, 'codex-cli');
+  });
+
+  it('fails closed when a standalone Luna workspace is assigned a non-Luna repair transport', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'standalone-transition', ROUTINE_REPAIR_EXECUTION);
+    const identity: ImplementationBootstrapIdentity = {
+      bootstrapKind: 'standalone-isolated', owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base',
+      branch: 'tachiko/luna', workspacePath: '/tmp/not-a-signal',
+    };
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD, pullRequest: { number: 7, headSha: HEAD } }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const github = githubAdapter([HEAD, HEAD]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, pullRequest: { ...live.pullRequest!, headRef: identity.branch, baseRef: identity.baseBranch,
+        headRepository: { owner: identity.owner, repo: identity.repo } } };
+    };
+    const result = await runReviewLoop(
+      { store, github, implementation, reviewer: new FakeReviewer([requestChanges(HEAD)]), resolveValidationAuthority: reviewAuthority },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /cannot transition/);
+    assert.equal(implementation.requests.length, 0);
   });
 
   it('routes only blocking findings to implementation', async () => {

@@ -68,6 +68,7 @@ function sameIdentity(a: ImplementationBootstrapIdentity, b: ImplementationBoots
  */
 export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   readonly kind = 'implementation-bootstrap' as const;
+  readonly bootstrapKind = 'linked-worktree' as const;
   private readonly repositoryRoot: string;
   private readonly workspaceRoot: string;
   private readonly remote: string;
