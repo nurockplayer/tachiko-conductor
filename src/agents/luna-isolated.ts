@@ -8,6 +8,7 @@ import { CodexCliAdapter } from './codex-cli.js';
 /** The sole production name for the #92-qualified subscription transport. */
 export const LUNA_ISOLATED_PROVIDER = 'luna-isolated';
 export const LUNA_ISOLATED_MODEL = 'gpt-5.6-luna';
+export const LUNA_TRUSTED_RUNTIME_REVISION = 'luna-qualified-runtime-v1';
 
 export const LUNA_ISOLATED_ERROR_CODE = {
   TRANSPORT_MISMATCH: 'LUNA_TRANSPORT_MISMATCH',
@@ -32,6 +33,7 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
   private readonly home: string;
   private readonly timeoutMs: number;
   private readonly executablePath: string | undefined;
+  private readonly runtimeConfig: readonly string[];
 
   constructor(options: IsolatedLunaAdapterOptions) {
     if (!path.isAbsolute(options.codexHome) || !existsSync(options.codexHome)) throw new Error('Qualified Luna CODEX_HOME must be an existing absolute directory.');
@@ -39,11 +41,7 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     if (existsSync(path.join(this.home, 'auth.json'))) throw new Error('Qualified Luna CODEX_HOME must use keyring-only authentication; auth.json is forbidden.');
     const configPath = path.join(this.home, 'config.toml');
     if (!existsSync(configPath)) throw new Error('Qualified Luna CODEX_HOME is missing its trusted config.toml.');
-    const config = readFileSync(configPath, 'utf8');
-    if (!/\bplugins\s*=\s*false\b/.test(config) || !/\bapps\s*=\s*false\b/.test(config) ||
-      !/\bnetwork_access\s*=\s*false\b/.test(config)) {
-      throw new Error('Qualified Luna config.toml must disable plugins, apps, and command network access.');
-    }
+    this.runtimeConfig = parseTrustedLunaConfig(readFileSync(configPath, 'utf8'));
     this.timeoutMs = options.timeoutMs;
     this.executablePath = options.path;
   }
@@ -67,9 +65,18 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     return await new CodexCliAdapter({
       cwd: request.workspacePath, model: LUNA_ISOLATED_MODEL,
       reasoningEffort: request.execution.reasoningEffort, sandboxMode: 'workspace-write', approvalPolicy: 'never',
-      timeoutMs: this.timeoutMs, env,
+      timeoutMs: this.timeoutMs, env, requiredConfig: this.runtimeConfig,
     }).run(request);
   }
+}
+
+/** Closed capability contract, then reapplied after repository configuration. */
+export function parseTrustedLunaConfig(raw: string): readonly string[] {
+  const required = [/^\s*plugins\s*=\s*false\s*$/m, /^\s*apps\s*=\s*false\s*$/m,
+    /^\s*mcp_servers\s*=\s*\{\s*\}\s*$/m, /^\s*web_search\s*=\s*(false|"disabled")\s*$/m,
+    /^\s*network_access\s*=\s*false\s*$/m];
+  if (!required.every((pattern) => pattern.test(raw))) throw new Error('Qualified Luna config.toml must explicitly disable plugins, apps, MCP, web search, and command network access.');
+  return ['features.plugins=false', 'features.apps=false', 'mcp_servers={}', 'web_search=false', 'sandbox_workspace_write.network_access=false'];
 }
 
 function failure(code: string, summary: string): AgentResult {

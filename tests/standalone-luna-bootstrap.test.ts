@@ -23,6 +23,14 @@ describe('standalone Luna bootstrap', () => {
     const head = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim();
     const durable = await bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha });
     assert.equal(durable.headSha, head);
-    assert.equal(fixture.git(fixture.source, ['rev-parse', `refs/heads/${identity.branch}`]).trim(), head);
+    assert.equal(fixture.git(fixture.remote, ['rev-parse', `refs/heads/${identity.branch}`]).trim(), head);
+  });
+
+  it('rejects an initial no-progress result before host publication', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-99-empty', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: fixture.baseSha }), /did not advance/);
   });
 });

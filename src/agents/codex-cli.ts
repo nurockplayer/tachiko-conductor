@@ -65,6 +65,7 @@ export interface CodexCliAdapterOptions {
   readonly capabilityCatalog?: ModelCapabilityCatalog;
   /** Optional explicit runtime environment; never merge this with ambient env. */
   readonly env?: NodeJS.ProcessEnv;
+  readonly requiredConfig?: readonly string[];
 }
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -95,6 +96,7 @@ export class CodexCliAdapter implements ImplementationAgent {
   private readonly approvalPolicy: CodexCliAdapterOptions['approvalPolicy'];
   private readonly capabilityCatalog: ModelCapabilityCatalog;
   private readonly env: NodeJS.ProcessEnv | undefined;
+  private readonly requiredConfig: readonly string[];
 
   constructor(options: CodexCliAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
@@ -106,6 +108,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     this.approvalPolicy = options.approvalPolicy;
     this.capabilityCatalog = options.capabilityCatalog ?? codexFallbackCapabilityCatalog();
     this.env = options.env;
+    this.requiredConfig = options.requiredConfig ?? [];
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -249,6 +252,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     if (this.approvalPolicy !== undefined) {
       args.push('-c', `approval_policy=${JSON.stringify(this.approvalPolicy)}`);
     }
+    for (const config of this.requiredConfig) args.push('-c', config);
     if (executor !== undefined) args.push(executor.sessionId);
     args.push(prompt);
     return args;

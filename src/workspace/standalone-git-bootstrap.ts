@@ -30,6 +30,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     const identity = this.identity(request);
     if (existsSync(identity.workspacePath)) this.fail('COLLISION', 'Standalone workspace path already exists.');
     await this.git(this.source, ['cat-file', '-e', `${request.baseSha}^{commit}`]);
+    await this.assertPublicationRemote(request);
     return identity;
   }
   async prepare(request: BootstrapPrepareRequest): Promise<ImplementationBootstrapIdentity> {
@@ -45,20 +46,25 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
       const remotes = (await this.git(identity.workspacePath, ['remote'])).stdout.trim();
       if (remotes !== '') this.fail('INVALID_REQUEST', 'Standalone worker checkout unexpectedly retained a remote.');
     }
-    await this.assert(identity, request.recoveryAuthority?.expectedHeadSha);
+    await this.assert(identity, request.recoveryAuthority?.expectedHeadSha, request.existing.baseSha);
     return identity;
   }
-  guard(identity: ImplementationBootstrapIdentity): WorkspaceGuard { return { assertValid: () => this.assert(identity) }; }
+  guard(identity: ImplementationBootstrapIdentity): WorkspaceGuard { return { assertValid: (phase) => this.assert(identity, undefined, phase === 'after-execution' ? undefined : identity.baseSha) }; }
   async verifyDurable(request: VerifyDurableRequest): Promise<DurableImplementationSnapshot> {
     await this.assert(request.identity);
     const head = (await this.git(request.identity.workspacePath, ['rev-parse', 'HEAD'])).stdout.trim();
     if (head !== request.expectedHeadSha) this.fail('HEAD_MISMATCH', 'Standalone worker HEAD differs from the reported exact HEAD.');
-    if (request.progressBaseSha !== undefined) await this.ancestor(request.identity.workspacePath, request.progressBaseSha, head);
-    else await this.ancestor(request.identity.workspacePath, request.identity.baseSha, head);
+    const progressBase = request.progressBaseSha ?? request.identity.baseSha;
+    if (head === progressBase) this.fail('HEAD_MISMATCH', 'Worker result did not advance the authorized HEAD.');
+    await this.ancestor(request.identity.workspacePath, progressBase, head);
+    if (await this.tree(request.identity.workspacePath, progressBase) === await this.tree(request.identity.workspacePath, head)) this.fail('HEAD_MISMATCH', 'Worker result has no tree progress from the authorized base.');
     // This command is host-owned.  The worker has no remote, credentials, or
     // source checkout authority, so it cannot publish the branch itself.
-    await this.git(request.identity.workspacePath, ['push', this.source, `${head}:refs/heads/${request.identity.branch}`]);
-    const published = (await this.git(this.source, ['rev-parse', `refs/heads/${request.identity.branch}`])).stdout.trim();
+    // Import through trusted host Git state; never run a worker checkout's
+    // hooks/config for publication.  Hooks are disabled on every host action.
+    await this.git(this.source, ['fetch', '--no-tags', '--no-recurse-submodules', request.identity.workspacePath, head]);
+    await this.git(this.source, ['push', '--no-verify', 'origin', `${head}:refs/heads/${request.identity.branch}`]);
+    const published = (await this.git(this.source, ['ls-remote', '--heads', 'origin', `refs/heads/${request.identity.branch}`])).stdout.trim().split(/\s+/)[0];
     if (published !== head) this.fail('UNPUSHED_HEAD', 'Host publication did not retain the exact standalone worker HEAD.');
     return { headSha: head, branch: request.identity.branch };
   }
@@ -67,7 +73,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     const suffix = createHash('sha256').update(`${r.target.owner}/${r.target.repo}#${r.target.issueNumber}:${r.runId}`).digest('hex').slice(0, 16);
     return { owner: r.target.owner, repo: r.target.repo, issueNumber: r.target.issueNumber, baseBranch: r.baseBranch, baseSha: r.baseSha, branch, workspacePath: path.join(this.root, `luna-${suffix}`) };
   }
-  private async assert(i: ImplementationBootstrapIdentity, recovery?: string): Promise<void> {
+  private async assert(i: ImplementationBootstrapIdentity, recovery?: string, initialBase?: string): Promise<void> {
     if (!existsSync(i.workspacePath)) this.fail('STALE_IDENTITY', 'Standalone workspace disappeared.');
     const branch = (await this.git(i.workspacePath, ['branch', '--show-current'])).stdout.trim();
     if (branch !== i.branch) this.fail('STALE_IDENTITY', 'Standalone worker branch changed.');
@@ -76,9 +82,24 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     const head = (await this.git(i.workspacePath, ['rev-parse', 'HEAD'])).stdout.trim();
     if (!SHA.test(head)) this.fail('HEAD_MISMATCH', 'Standalone worker HEAD is malformed.');
     if (recovery !== undefined && head !== recovery) this.fail('STALE_IDENTITY', 'Standalone restart cannot adopt a different worker HEAD.');
+    if (recovery === undefined && initialBase !== undefined && head !== initialBase) this.fail('STALE_IDENTITY', 'Unrecorded pre-PR worker progress cannot be adopted after restart.');
   }
   private async ancestor(cwd: string, base: string, head: string): Promise<void> { if ((await this.git(cwd, ['merge-base', '--is-ancestor', base, head], [0, 1])).exitCode !== 0) this.fail('HEAD_MISMATCH', 'Worker HEAD does not descend from its authorized base.'); }
-  private async git(cwd: string, args: string[], allowed: number[] = [0]) { const result = await this.runner.run('git', args, { cwd, timeoutMs: this.timeoutMs }); if (!allowed.includes(result.exitCode)) this.fail('COMMAND_FAILED', `git ${args[0]} failed.`); return result; }
+  private async tree(cwd: string, ref: string): Promise<string> { return (await this.git(cwd, ['rev-parse', `${ref}^{tree}`])).stdout.trim(); }
+  private async assertPublicationRemote(request: BootstrapPlanRequest): Promise<void> {
+    const urls = [
+      (await this.git(this.source, ['remote', 'get-url', 'origin'])).stdout.trim(),
+      (await this.git(this.source, ['remote', 'get-url', '--push', 'origin'])).stdout.trim(),
+    ];
+    if (!urls.every((url) => githubIdentity(url) === `${request.target.owner}/${request.target.repo}`)) this.fail('REPOSITORY_MISMATCH', 'Trusted host publication remote does not exactly match the target GitHub repository.');
+  }
+  private async git(cwd: string, args: string[], allowed: number[] = [0]) {
+    const env = { ...process.env } as NodeJS.ProcessEnv;
+    for (const key of Object.keys(env)) if (key.startsWith('GIT_CONFIG_') || ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'].includes(key)) delete env[key];
+    const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd, timeoutMs: this.timeoutMs, env });
+    if (!allowed.includes(result.exitCode)) this.fail('COMMAND_FAILED', `git ${args[0]} failed.`); return result;
+  }
   private fail(code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, message: string): never { throw new ImplementationBootstrapError(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE[code], message); }
 }
 function same(a: ImplementationBootstrapIdentity, b: ImplementationBootstrapIdentity): boolean { return a.owner === b.owner && a.repo === b.repo && a.issueNumber === b.issueNumber && a.baseBranch === b.baseBranch && a.baseSha === b.baseSha && a.branch === b.branch && path.resolve(a.workspacePath) === path.resolve(b.workspacePath); }
+function githubIdentity(url: string): string | null { const match = /(?:github\.com[:/])([^/\s]+)\/([^/\s]+?)(?:\.git)?$/.exec(url.trim()); return match === null ? null : `${match[1]}/${match[2]}`; }

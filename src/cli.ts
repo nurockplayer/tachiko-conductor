@@ -803,20 +803,21 @@ function buildWorkflowDeps(
   const localValidation = resolveLocalValidationConfiguration(env);
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
   let bootstrap: ImplementationBootstrapAdapter | undefined;
+  let lunaBootstrap: ImplementationBootstrapAdapter | undefined;
   const lazyBootstrap: ImplementationBootstrapAdapter = {
     kind: 'implementation-bootstrap',
     plan: async (request) => {
-      bootstrap ??= (env.TACHIKO_LUNA_CODEX_HOME === undefined ? new GitWorktreeBootstrap({
+      bootstrap ??= new GitWorktreeBootstrap({
         repositoryRoot: resolveRepositoryRoot(),
         workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
-      }) : new StandaloneGitBootstrap({ repositoryRoot: resolveRepositoryRoot(), workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces') }));
+      });
       return bootstrap.plan(request);
     },
     prepare: async (request) => {
-      bootstrap ??= (env.TACHIKO_LUNA_CODEX_HOME === undefined ? new GitWorktreeBootstrap({
+      bootstrap ??= new GitWorktreeBootstrap({
         repositoryRoot: resolveRepositoryRoot(),
         workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
-      }) : new StandaloneGitBootstrap({ repositoryRoot: resolveRepositoryRoot(), workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces') }));
+      });
       return bootstrap.prepare(request);
     },
     guard: (identity) => {
@@ -899,6 +900,14 @@ function buildWorkflowDeps(
       client: new DeepSeekApiClient(),
     }),
     bootstrap: lazyBootstrap,
+    bootstrapForExecution: (execution) => {
+      if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;
+      lunaBootstrap ??= new StandaloneGitBootstrap({
+        repositoryRoot: resolveRepositoryRoot(),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+      });
+      return lunaBootstrap;
+    },
     ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
     ...(hostedCheckPolicy === undefined ? {} : { hostedCheckPolicy }),
     resolveImplementationCapabilities,

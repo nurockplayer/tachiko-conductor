@@ -36,6 +36,8 @@ export interface WorkflowDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly bootstrap?: ImplementationBootstrapAdapter;
+  /** Selects an immutable bootstrap boundary from the persisted execution snapshot. */
+  readonly bootstrapForExecution?: (execution: ResolvedExecutionConfiguration | undefined) => ImplementationBootstrapAdapter | undefined;
   readonly reviewer: ReviewerAdapter;
   /** Explicit repository/run validation adapter; absence is recorded as unknown and fails closed. */
   readonly validation?: ValidationAdapter;
@@ -298,6 +300,7 @@ export async function runWorkflow(
         const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
           ? admittedRepairExecution(run, deps)
           : run.execution;
+        const bootstrapAdapter = deps.bootstrapForExecution?.(effectiveExecution ?? undefined) ?? deps.bootstrap;
         if (pendingRepair && run.repairTaskShapeAuthority !== undefined && effectiveExecution === null) {
           return park(
             run,
@@ -360,11 +363,11 @@ export async function runWorkflow(
         }
 
         if (!pendingRepair && snapshot.pullRequest === null && bootstrap === undefined) {
-          if (deps.bootstrap === undefined || snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null) {
+          if (bootstrapAdapter === undefined || snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null) {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
           try {
-            bootstrap = await deps.bootstrap.plan({ runId: run.id, target, baseBranch: snapshot.repository.defaultBranch, baseSha: snapshot.repository.defaultBranchHeadSha });
+            bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: snapshot.repository.defaultBranch, baseSha: snapshot.repository.defaultBranchHeadSha });
             run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
             store.update(run);
           } catch (error) {
@@ -372,13 +375,13 @@ export async function runWorkflow(
           }
         }
         if (bootstrap !== undefined) {
-          if (deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
+          if (bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
           try {
-            bootstrap = await deps.bootstrap.prepare({
+            bootstrap = await bootstrapAdapter.prepare({
               runId: run.id, target, baseBranch: bootstrap.baseBranch, baseSha: bootstrap.baseSha,
               existing: bootstrap, ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
             });
-            workspaceGuard = deps.bootstrap.guard(bootstrap);
+            workspaceGuard = bootstrapAdapter.guard(bootstrap);
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -393,7 +396,7 @@ export async function runWorkflow(
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
               }
               try {
-                await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard });
+                await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard });
               } catch (error) {
                 return bootstrapFailureOutcome(run, error, store, now);
               }
@@ -531,9 +534,9 @@ export async function runWorkflow(
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
         }
         if (bootstrap !== undefined) {
-          if (result.headSha === undefined || deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
+          if (result.headSha === undefined || bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
           try {
-            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
+            await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
             if ((run.execution?.executor === 'worker-router' || run.execution?.executor === 'luna-isolated') && snapshot.pullRequest === null) {
               if (deps.github.createImplementationPullRequest === undefined) {
                 return bootstrapFailureOutcome(run, new Error('Isolated implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
@@ -579,6 +582,7 @@ export async function runWorkflow(
       }
 
       case 'VALIDATING': {
+        const bootstrapAdapter = deps.bootstrapForExecution?.(run.execution) ?? deps.bootstrap;
         const activeValidation = activeValidationConfiguration(deps);
         const invalidAuthority = invalidValidationAuthority(activeValidation);
         if (invalidAuthority !== null) {
@@ -626,15 +630,15 @@ export async function runWorkflow(
         // the local worktree is fast-forwarded, so prepare and prove it again
         // immediately before the local process boundary.
         if (run.bootstrap !== undefined && deps.validation?.requiresOwnedWorkspace === true) {
-          if (deps.bootstrap === undefined || run.headSha === undefined) {
+          if (bootstrapAdapter === undefined || run.headSha === undefined) {
             return bootstrapFailureOutcome(run, new Error('Exact-HEAD validation requires the owned workspace bootstrap.'), store, now);
           }
           try {
-            const identity = await deps.bootstrap.prepare({
+            const identity = await bootstrapAdapter.prepare({
               runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
               existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },
             });
-            await deps.bootstrap.verifyDurable({ identity, expectedHeadSha: run.headSha });
+            await bootstrapAdapter.verifyDurable({ identity, expectedHeadSha: run.headSha });
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
           }
@@ -796,7 +800,7 @@ export async function runWorkflow(
             github,
             implementation,
             reviewer,
-            bootstrap: deps.bootstrap,
+            bootstrap: deps.bootstrapForExecution?.(run.execution) ?? deps.bootstrap,
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
             resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,
