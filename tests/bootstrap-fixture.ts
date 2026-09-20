@@ -25,7 +25,7 @@ export interface BootstrapGitFixture {
  * reads are presented as the expected GitHub repository.  This keeps Git
  * ancestry, refs, worktrees, and pushes real without contacting GitHub.
  */
-export function createBootstrapGitFixture(options: { readonly branch?: string } = {}): BootstrapGitFixture {
+export function createBootstrapGitFixture(options: { readonly branch?: string; readonly githubUrl?: string } = {}): BootstrapGitFixture {
   const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-fixture-'));
   const remote = path.join(root, 'remote.git');
   const source = path.join(root, 'source');
@@ -40,7 +40,7 @@ export function createBootstrapGitFixture(options: { readonly branch?: string } 
   git(source, ['remote', 'add', 'origin', `file://${remote}`]);
   git(source, ['push', '-u', 'origin', branch]);
   const baseSha = git(source, ['rev-parse', 'HEAD']);
-  const runner = new GitHubIdentityRunner(new NodeProcessRunner());
+  const runner = new GitHubIdentityRunner(new NodeProcessRunner(), options.githubUrl);
   return {
     root,
     remote,
@@ -64,16 +64,16 @@ export function createBootstrapGitFixture(options: { readonly branch?: string } 
 /** URL identity double only; every Git graph/ref/worktree operation is real. */
 export class GitHubIdentityRunner implements ProcessRunner {
   readonly commands: { file: string; args: readonly string[]; cwd?: string }[] = [];
-  constructor(private readonly delegate: ProcessRunner = new NodeProcessRunner()) {}
+  constructor(private readonly delegate: ProcessRunner = new NodeProcessRunner(), private readonly githubUrl = 'git@github.com:acme/widgets.git') {}
 
   async run(file: string, args: readonly string[], options: Parameters<ProcessRunner['run']>[2]) {
     this.commands.push({ file, args: [...args], cwd: options.cwd });
     const command = args.filter((value) => value !== '-c' && value !== 'core.hooksPath=/dev/null' && value !== 'core.fsmonitor=false' && value !== 'core.attributesFile=/dev/null' && value !== 'core.useReplaceRefs=false').join(' ');
     if (file === 'git' && (command === 'remote get-url origin' || command === 'remote get-url --all origin')) {
-      return { stdout: 'git@github.com:acme/widgets.git\n', stderr: '', exitCode: 0 };
+      return { stdout: `${this.githubUrl}\n`, stderr: '', exitCode: 0 };
     }
     if (file === 'git' && (command === 'remote get-url --all --push origin' || command === 'remote get-url --push origin')) {
-      return { stdout: 'git@github.com:acme/widgets.git\n', stderr: '', exitCode: 0 };
+      return { stdout: `${this.githubUrl}\n`, stderr: '', exitCode: 0 };
     }
     return this.delegate.run(file, args, options);
   }

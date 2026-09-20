@@ -11,6 +11,16 @@ const fixtures: BootstrapGitFixture[] = [];
 afterEach(() => { for (const fixture of fixtures.splice(0)) fixture.cleanup(); });
 
 describe('standalone Luna bootstrap', () => {
+  it('accepts canonical HTTPS and SCP GitHub remote identity casing at the real bootstrap boundary', async () => {
+    for (const githubUrl of ['https://github.com/AcMe/WiDgEtS.git', 'git@github.com:ACME/WIDGETS.git']) {
+      const fixture = createBootstrapGitFixture({ githubUrl }); fixtures.push(fixture);
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const request = { runId: `luna-case-${githubUrl.startsWith('https') ? 'https' : 'scp'}`, target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+      const identity = await bootstrap.plan(request);
+      await assert.doesNotReject(() => bootstrap.prepare({ ...request, existing: identity }));
+    }
+  });
+
   it('gives the worker a remote-free standalone checkout and host-publishes only its exact clean descendant', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
