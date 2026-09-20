@@ -36,7 +36,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     return identity;
   }
   async prepare(request: BootstrapPrepareRequest): Promise<ImplementationBootstrapIdentity> {
-    const identity = this.identity(request);
+    const identity = { ...this.identity(request), ...(request.existing.publicationBranch === undefined ? {} : { publicationBranch: request.existing.publicationBranch }) };
     if (!same(identity, request.existing)) this.fail('STALE_IDENTITY', 'Persisted standalone bootstrap identity changed.');
     const authorized = request.recoveryAuthority?.expectedHeadSha ?? request.existing.baseSha;
     if (!SHA.test(authorized)) this.fail('INVALID_REQUEST', 'Standalone recovery requires an exact authorized HEAD.');
