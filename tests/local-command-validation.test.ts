@@ -81,6 +81,21 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(wrongHead.status, 'unknown');
   });
 
+  it('fails closed before validation when ignored worker state could supply absent committed bytes', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), '.env\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore env'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    writeFileSync(path.join(owned.workspacePath, '.env'), 'worker-created=true\n');
+    const marker = path.join(owned.workspacePath, 'validation-ran');
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+    ).validate({ ...owned, headSha });
+    assert.equal(result.status, 'unknown');
+    assert.equal(existsSync(marker), false);
+  });
+
   it('runs a configured real command for an explicit verified pre-existing-PR workspace, never the ambient cwd', async () => {
     const existing = preExistingPullRequestRequest();
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));

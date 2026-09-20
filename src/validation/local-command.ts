@@ -39,7 +39,9 @@ function workspaceMatches(request: ValidationRequest, workspacePath: string, req
     encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: 512,
   });
   const head = invoke(['rev-parse', 'HEAD']);
-  const status = invoke(['status', '--porcelain']);
+  const status = invoke(['status', '--porcelain', '--untracked-files=all', '--ignored']);
+  // Authoritative validation may not consume worker-created ignored bytes:
+  // they are not represented by the committed exact HEAD.
   if (head.status !== 0 || status.status !== 0 || head.stdout.trim() !== request.headSha || status.stdout.trim() !== '') return false;
   if (!requireRepositoryIdentity) return true;
   const remote = invoke(['remote', 'get-url', 'origin']);
