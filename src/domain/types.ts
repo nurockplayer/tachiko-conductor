@@ -28,6 +28,8 @@ export interface RepositoryTarget {
   readonly owner: string;
   readonly repo: string;
   readonly branch: string;
+  /** Existing same-repository PR branch that host publication must advance. */
+  readonly publicationBranch?: string;
 }
 
 /** Explicit workflow states (issue #2). */
@@ -80,6 +82,7 @@ export interface ImplementationBootstrapIdentity {
   readonly baseBranch: string;
   readonly baseSha: string;
   readonly branch: string;
+  readonly publicationBranch?: string;
   readonly workspacePath: string;
 }
 

@@ -87,7 +87,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     // hooks/config for publication.  Hooks are disabled on every host action.
     await this.git(this.source, ['fetch', '--no-tags', '--no-recurse-submodules', request.identity.workspacePath, head]);
     await this.assertPublicationRemote(request.identity);
-    const ref = `refs/heads/${request.identity.branch}`;
+    const ref = `refs/heads/${request.identity.publicationBranch ?? request.identity.branch}`;
     const before = await this.remoteHead(ref);
     if (before !== null) {
       await this.git(this.source, ['fetch', '--no-tags', 'origin', ref]);
@@ -104,7 +104,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private identity(r: BootstrapPlanRequest): ImplementationBootstrapIdentity {
     const branch = `tachiko/${r.runId}`;
     const suffix = createHash('sha256').update(`${r.target.owner}/${r.target.repo}#${r.target.issueNumber}:${r.runId}`).digest('hex').slice(0, 16);
-    return { bootstrapKind: 'standalone-isolated', owner: r.target.owner, repo: r.target.repo, issueNumber: r.target.issueNumber, baseBranch: r.baseBranch, baseSha: r.baseSha, branch, workspacePath: path.join(this.root, `luna-${suffix}`) };
+    return { bootstrapKind: 'standalone-isolated', owner: r.target.owner, repo: r.target.repo, issueNumber: r.target.issueNumber, baseBranch: r.baseBranch, baseSha: r.baseSha, branch, ...(r.publicationBranch === undefined ? {} : { publicationBranch: r.publicationBranch }), workspacePath: path.join(this.root, `luna-${suffix}`) };
   }
   private async assert(i: ImplementationBootstrapIdentity, recovery?: string, initialBase?: string): Promise<void> {
     if (!existsSync(i.workspacePath)) this.fail('STALE_IDENTITY', 'Standalone workspace disappeared.');
@@ -151,7 +151,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   }
   private fail(code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, message: string): never { throw new ImplementationBootstrapError(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE[code], message); }
 }
-function same(a: ImplementationBootstrapIdentity, b: ImplementationBootstrapIdentity): boolean { return a.bootstrapKind === b.bootstrapKind && a.owner === b.owner && a.repo === b.repo && a.issueNumber === b.issueNumber && a.baseBranch === b.baseBranch && a.baseSha === b.baseSha && a.branch === b.branch && path.resolve(a.workspacePath) === path.resolve(b.workspacePath); }
+function same(a: ImplementationBootstrapIdentity, b: ImplementationBootstrapIdentity): boolean { return a.bootstrapKind === b.bootstrapKind && a.owner === b.owner && a.repo === b.repo && a.issueNumber === b.issueNumber && a.baseBranch === b.baseBranch && a.baseSha === b.baseSha && a.branch === b.branch && a.publicationBranch === b.publicationBranch && path.resolve(a.workspacePath) === path.resolve(b.workspacePath); }
 function githubIdentity(value: string): string | null {
   const url = value.trim(); let owner: string | undefined; let repo: string | undefined;
   try { const parsed = new URL(url); if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'github.com' || parsed.username || parsed.password) return null; [owner, repo] = parsed.pathname.replace(/^\/+|\/+$/g, '').split('/'); }

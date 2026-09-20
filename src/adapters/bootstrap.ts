@@ -11,6 +11,7 @@ export interface BootstrapPlanRequest {
   readonly target: IssueTarget;
   readonly baseBranch: string;
   readonly baseSha: string;
+  readonly publicationBranch?: string;
 }
 
 export interface BootstrapPrepareRequest extends BootstrapPlanRequest {
