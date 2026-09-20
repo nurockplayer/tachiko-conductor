@@ -63,6 +63,8 @@ export interface CodexCliAdapterOptions {
   readonly approvalPolicy?: 'untrusted' | 'on-request' | 'never';
   /** Provider-boundary capability source; defaults to the versioned Codex fallback. */
   readonly capabilityCatalog?: ModelCapabilityCatalog;
+  /** Optional explicit runtime environment; never merge this with ambient env. */
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -92,6 +94,7 @@ export class CodexCliAdapter implements ImplementationAgent {
   private readonly sandboxMode: CodexCliAdapterOptions['sandboxMode'];
   private readonly approvalPolicy: CodexCliAdapterOptions['approvalPolicy'];
   private readonly capabilityCatalog: ModelCapabilityCatalog;
+  private readonly env: NodeJS.ProcessEnv | undefined;
 
   constructor(options: CodexCliAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
@@ -102,6 +105,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     this.sandboxMode = options.sandboxMode;
     this.approvalPolicy = options.approvalPolicy;
     this.capabilityCatalog = options.capabilityCatalog ?? codexFallbackCapabilityCatalog();
+    this.env = options.env;
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -252,8 +256,8 @@ export class CodexCliAdapter implements ImplementationAgent {
 
   private processOptions(signal: AbortSignal | undefined, cwd = this.cwd): ProcessRunOptions {
     return signal === undefined
-      ? { timeoutMs: this.timeoutMs, cwd }
-      : { timeoutMs: this.timeoutMs, cwd, signal };
+      ? { timeoutMs: this.timeoutMs, cwd, ...(this.env === undefined ? {} : { env: this.env }) }
+      : { timeoutMs: this.timeoutMs, cwd, signal, ...(this.env === undefined ? {} : { env: this.env }) };
   }
 
   /**
@@ -290,7 +294,9 @@ function buildPrompt(request: ImplementationRequest): string {
     : request.instructions;
   const lines = [
     `Implement ${formatTarget(request.target)} from base ${request.baseSha}.`,
-    'Read the live target and repository-local instructions as authority.',
+    request.authority === 'live-target'
+      ? 'Read the live target and repository-local instructions as authority.'
+      : 'Treat the supplied bounded task packet as the only target authority; do not use network or MCP to rediscover it.',
     'Run repository-required validation before reporting success.',
     instructions,
   ].filter((line): line is string => line !== undefined && line !== '');

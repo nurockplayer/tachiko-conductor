@@ -230,7 +230,8 @@ export function assertExecutionSupportedByProvider(execution: ResolvedExecutionC
   const codexOnlySettings = execution.reasoningEffort !== undefined ||
     execution.sandboxMode !== undefined || execution.approvalPolicy !== undefined;
   const unsupported = (execution.executor === 'claude-code' && codexOnlySettings) ||
-    (execution.executor === 'worker-router' && (execution.model !== undefined || codexOnlySettings));
+    (execution.executor === 'worker-router' && (execution.model !== undefined || codexOnlySettings)) ||
+    (execution.executor === 'luna-isolated' && (execution.model !== 'gpt-5.6-luna' || execution.sandboxMode !== 'workspace-write' || execution.approvalPolicy !== 'never'));
   if (unsupported) {
     throw new Error(`Execution profile "${execution.profile}" requests settings unsupported by executor "${execution.executor}".`);
   }

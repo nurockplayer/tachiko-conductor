@@ -434,6 +434,7 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
+        const isIsolatedLuna = effectiveExecution?.executor === 'luna-isolated';
         const instructions = pendingFixInstructions ?? (
           snapshot.pullRequest === null
             ? `${snapshot.issue.body}\n\nConductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
@@ -468,12 +469,16 @@ export async function runWorkflow(
         let result: AgentResult;
         try {
           result = await implementation.run({
-            target, baseSha, authority: 'live-target', instructions,
+            target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target', instructions,
             ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
             capabilities: await deps.resolveImplementationCapabilities?.(),
-            ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-            ...(run.executor === undefined ? {} : { executor: run.executor }),
+            // #92 deliberately qualifies fresh bounded Luna workers.  A
+            // repair/re-entry therefore cannot pretend its prior CLI thread
+            // is a durable continuation; its explicit exact-HEAD bootstrap
+            // and newly copied bounded packet are the continuity authority.
+            ...(isIsolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(isIsolatedLuna || run.executor === undefined ? {} : { executor: run.executor }),
             runtimeOwnership: {
               runId: run.id,
               generation: run.executor?.generation ?? run.id,
@@ -529,9 +534,9 @@ export async function runWorkflow(
           if (result.headSha === undefined || deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
           try {
             await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
-            if (run.execution?.executor === 'worker-router' && snapshot.pullRequest === null) {
+            if ((run.execution?.executor === 'worker-router' || run.execution?.executor === 'luna-isolated') && snapshot.pullRequest === null) {
               if (deps.github.createImplementationPullRequest === undefined) {
-                return bootstrapFailureOutcome(run, new Error('Worker-router implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
+                return bootstrapFailureOutcome(run, new Error('Isolated implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
               }
               await deps.github.createImplementationPullRequest({
                 target,
