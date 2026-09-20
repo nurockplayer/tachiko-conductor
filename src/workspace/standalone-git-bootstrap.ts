@@ -118,6 +118,8 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private async git(cwd: string, args: string[], allowed: number[] = [0]) {
     const env = { ...process.env } as NodeJS.ProcessEnv;
     for (const key of Object.keys(env)) if (key.startsWith('GIT_CONFIG_') || ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'].includes(key)) delete env[key];
+    env.GIT_CONFIG_NOSYSTEM = '1';
+    env.GIT_CONFIG_GLOBAL = '/dev/null';
     const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', ...args], { cwd, timeoutMs: this.timeoutMs, env });
     if (!allowed.includes(result.exitCode)) this.fail('COMMAND_FAILED', `git ${args[0]} failed.`); return result;
   }
