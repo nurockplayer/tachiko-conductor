@@ -21,6 +21,7 @@ import {
 } from '../domain/telemetry.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
+import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { parkBootstrapFailure } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
@@ -40,6 +41,8 @@ export interface WorkflowDependencies {
   /** Explicit repository/run policy for interpreting the exact-HEAD hosted check list. */
   readonly hostedCheckPolicy?: HostedCheckPolicyConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
+  /** Optional because pre-authority Runs retain their historical repair path. */
+  readonly resolveRepairExecutionProfile?: (profile: 'routine' | 'complex') => ResolvedExecutionConfiguration | undefined;
 }
 
 export interface WorkflowOptions {
@@ -763,6 +766,7 @@ export async function runWorkflow(
             bootstrap: deps.bootstrap,
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
+            resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,
           },
           run.id,
           {

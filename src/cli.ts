@@ -874,6 +874,16 @@ function buildWorkflowDeps(
     ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
     ...(hostedCheckPolicy === undefined ? {} : { hostedCheckPolicy }),
     resolveImplementationCapabilities,
+    // A run carrying explicit repair authority is admitted only against this
+    // same revisioned execution-profile configuration. Missing or invalid
+    // configuration is intentionally surfaced as an unavailable profile.
+    resolveRepairExecutionProfile: (profile) => {
+      try {
+        return resolveSelectedExecutionProfile(profile, env);
+      } catch {
+        return undefined;
+      }
+    },
   };
 }
 

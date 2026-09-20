@@ -12,6 +12,12 @@ import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
+import {
+  createRepairAdmissionSnapshot,
+  decideRepairAdmission,
+  type RepairFindingKind,
+} from '../domain/repair-admission.js';
+import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUEST_DECISION } from '../domain/decisions.js';
 import { parkBootstrapFailure } from '../workflow/bootstrap-failure.js';
@@ -30,6 +36,12 @@ export interface ReviewLoopDependencies {
    */
   readonly resolveValidationAuthority: () => ActiveValidationConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
+  /**
+   * Resolves only the provider-neutral profile selected by explicit repair
+   * authority. It is intentionally absent for legacy runs, which have no
+   * retroactive task-shape classification.
+   */
+  readonly resolveRepairExecutionProfile?: (profile: 'routine' | 'complex') => ResolvedExecutionConfiguration | undefined;
 }
 
 export interface ReviewLoopOptions {
@@ -171,6 +183,15 @@ function parkAdmission(run: Run, reason: string, store: RunStore, now: () => str
   return { outcome: 'needs_human', run: parked, reason };
 }
 
+function parkRepairAuthority(run: Run, reason: string, store: RunStore, now: () => string): ReviewLoopResult {
+  const parked = applyTransition(run, {
+    type: 'escalate', reason,
+    interrupt: { evidence: reason, choices: ['Provide explicit repair authority or resolve execution availability', CANCEL_RUN_DECISION] },
+  }, now());
+  store.update(parked);
+  return { outcome: 'needs_human', run: parked, reason };
+}
+
 /**
  * Drive the review → fix → re-review loop for one issue-target run through the
  * core state machine. GitHub live state wins: the loop re-reads the live PR
@@ -303,6 +324,47 @@ export async function runReviewLoop(
       };
       const preflight = await checkOwnedFix();
       if (preflight !== null) return preflight;
+
+      // New runs may carry explicit, revisioned task-shape authority. Its
+      // closed mapping is the sole authority for choosing a repair profile;
+      // reviewer and Issue prose remains only worker context. Old JSON has no
+      // such field and intentionally follows the pre-existing generic path.
+      let repairExecution = run.execution;
+      const authority = run.repairTaskShapeAuthority;
+      if (authority !== undefined) {
+        const decision = decideRepairAdmission(authority);
+        if (decision.kind === 'park') {
+          return parkRepairAuthority(run, `Repair admission parked: ${decision.escalation}.`, store, now);
+        }
+        if (deps.resolveRepairExecutionProfile === undefined) {
+          return parkRepairAuthority(run, `Repair admission parked: ${decision.executionProfile} execution profile is unavailable.`, store, now);
+        }
+        try {
+          repairExecution = deps.resolveRepairExecutionProfile(decision.executionProfile);
+        } catch {
+          repairExecution = undefined;
+        }
+        if (repairExecution === undefined || repairExecution.profile !== decision.executionProfile) {
+          return parkRepairAuthority(run, `Repair admission parked: ${decision.executionProfile} execution profile is unavailable.`, store, now);
+        }
+        const finding: RepairFindingKind = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
+          ? 'validation_failed'
+          : 'review_blocking';
+        const admission = createRepairAdmissionSnapshot(
+          authority, finding, run.headSha, run.pullRequest.number, decision.executionProfile, now(),
+        );
+        const admittedRun: Run = { ...run, repairAdmissions: [...(run.repairAdmissions ?? []), admission] };
+        // An authority snapshot is useful only if it was appended against the
+        // exact durable Run that was preflighted. Never invoke a worker after a
+        // stale CAS, because another writer may have replaced its HEAD or PR.
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, admittedRun)) {
+          const current = store.read(run.id) ?? run;
+          return { outcome: 'needs_human', run: current, reason: 'Repair admission parked: admission_stale.' };
+        }
+        run = admittedRun;
+        const admissionPreflight = await checkOwnedFix();
+        if (admissionPreflight !== null) return admissionPreflight;
+      }
       run = applyTransition(run, { type: 'start_fix' }, now());
       store.update(run);
 
@@ -347,7 +409,7 @@ export async function runReviewLoop(
           supplementalInstructions: blockingFindings,
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           capabilities: await deps.resolveImplementationCapabilities?.(), sessionId: run.agentResult?.sessionId, executor: run.executor,
-          ...(run.execution === undefined ? {} : { execution: run.execution }),
+          ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
       } catch (error) {
         if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now);
