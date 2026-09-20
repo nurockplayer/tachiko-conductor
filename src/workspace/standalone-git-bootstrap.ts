@@ -170,7 +170,12 @@ function findAttributeFiles(root: string): string[] {
     for (const entry of readdirSync(directory, { withFileTypes: true })) {
       if (entry.name === '.git') continue;
       const candidate = path.join(directory, entry.name);
-      if (entry.isSymbolicLink()) throw new Error('Standalone worker attributes must not be symbolic links.');
+      // Ordinary repository symlinks are inert to this scan. A symlink named
+      // .gitattributes is rejected below only when it is attribute authority.
+      if (entry.isSymbolicLink()) {
+        if (entry.name === '.gitattributes') throw new Error('Standalone worker attribute authority must not be symbolic links.');
+        continue;
+      }
       if (entry.isDirectory()) visit(candidate);
       else if (entry.isFile() && entry.name === '.gitattributes') found.push(candidate);
     }
