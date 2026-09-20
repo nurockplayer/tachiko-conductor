@@ -73,9 +73,11 @@ import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
 import { resolveDispatchConfiguration } from './dispatch/config.js';
 import { dispatchOnceCommand } from './dispatch/command.js';
+import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/continuous.js';
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
+import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -105,7 +107,9 @@ Usage:
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
   tachiko dispatch once
-  tachiko dispatch launchd render --program <absolute-wrapper> --working-directory <absolute-path> [--minute <0-59>]
+  tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
+  tachiko dispatch wake
+  tachiko dispatch launchd render --program <absolute-driver-wrapper> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
@@ -1264,13 +1268,16 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
+    if (subcommand === 'wake' && rest.length === 0) {
+      console.log(JSON.stringify({ outcome: 'wake_signaled', token: signalDispatchWake(dispatchWakePath()) }));
+      return 0;
+    }
     if (subcommand === 'launchd' && rest[0] === 'render') {
       const { values, positionals } = parseArgs({
         args: rest.slice(1),
         options: {
           program: { type: 'string' },
           'working-directory': { type: 'string' },
-          minute: { type: 'string' },
           label: { type: 'string' },
           'stdout-path': { type: 'string' },
           'stderr-path': { type: 'string' },
@@ -1279,18 +1286,28 @@ export async function main(argv: string[]): Promise<number> {
       if (positionals.length > 0 || values.program === undefined || values['working-directory'] === undefined) {
         throw new Error('dispatch launchd render requires --program and --working-directory.');
       }
-      const minute = values.minute === undefined ? undefined : Number(values.minute);
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
         workingDirectory: values['working-directory'],
-        ...(minute === undefined ? {} : { minute }),
         ...(values.label === undefined ? {} : { label: values.label }),
         ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
         ...(values['stderr-path'] === undefined ? {} : { standardErrorPath: values['stderr-path'] }),
       }));
       return 0;
     }
-    if (subcommand !== 'once' || rest.length > 0) {
+    if (subcommand !== 'once' && subcommand !== 'serve') {
+      console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const { values, positionals } = parseArgs({
+      args: rest,
+      options: {
+        'idle-poll-ms': { type: 'string' },
+        'max-cycles': { type: 'string' },
+      },
+    });
+    if (positionals.length > 0 || (subcommand === 'once' && (values['idle-poll-ms'] !== undefined || values['max-cycles'] !== undefined))) {
       console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
       console.error(USAGE);
       return 1;
@@ -1310,7 +1327,7 @@ export async function main(argv: string[]): Promise<number> {
       const transport = new GhCliTransport();
       const runtime = new GitHubDispatchRuntime(transport, config);
       const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
-      const result = await dispatchOnceCommand(config, {
+      const reconcile = async () => await dispatchOnceCommand(config, {
         workflow,
         runtime,
         resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
@@ -1319,7 +1336,17 @@ export async function main(argv: string[]): Promise<number> {
         }),
         resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
       });
-      printDispatchResult(result);
+      if (subcommand === 'once') {
+        printDispatchResult(await reconcile());
+        return 0;
+      }
+      const result = await dispatchContinuously({
+        dispatchOnce: reconcile,
+        sleep: createDispatchWakeWaiter(dispatchWakePath()),
+        idlePollMs: values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']),
+        ...(values['max-cycles'] === undefined ? {} : { maxCycles: Number(values['max-cycles']) }),
+      });
+      console.log(JSON.stringify(result, null, 2));
       return 0;
     } finally {
       lock.release();
