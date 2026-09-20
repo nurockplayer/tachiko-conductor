@@ -6,4 +6,4 @@ if [ "${TACHIKO_DISPATCH_SMOKE:-}" != "1" ]; then
   exit 2
 fi
 
-exec pnpm exec tsx src/cli.ts dispatch once
+exec pnpm exec tsx src/cli.ts dispatch serve

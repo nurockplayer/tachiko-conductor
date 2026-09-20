@@ -37,6 +37,6 @@ export function parseDispatchConfiguration(raw: string): DispatchConfiguration {
 }
 
 export function resolveDispatchConfiguration(env: NodeJS.ProcessEnv = process.env): DispatchConfiguration {
-  if (env.TACHIKO_DISPATCH_CONFIG === undefined) throw new Error('TACHIKO_DISPATCH_CONFIG is required for dispatch once.');
+  if (env.TACHIKO_DISPATCH_CONFIG === undefined) throw new Error('TACHIKO_DISPATCH_CONFIG is required for dispatch commands.');
   return parseDispatchConfiguration(env.TACHIKO_DISPATCH_CONFIG);
 }

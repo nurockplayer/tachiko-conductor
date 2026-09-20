@@ -115,6 +115,7 @@ pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
 pnpm exec tsx src/cli.ts dispatch once
+pnpm exec tsx src/cli.ts dispatch serve
 pnpm exec tsx src/cli.ts wait observe <id>
 pnpm exec tsx src/cli.ts wait await <id> --timeout-ms 60000 --on-timeout continue
 pnpm exec tsx src/cli.ts github snapshot nurockplayer/tachiko-conductor#42
@@ -167,10 +168,15 @@ Before a claim, the dispatcher rereads the target Issue, associated PRs, and
 local durable runs. A closed Issue, open PR, non-terminal Run, ambiguous claim,
 or missing/mismatched claimed Run is not eligible. On restart it resumes the
 same claimed Run; an expired lease is never permission to create a second one.
-This Issue deliberately does not provide a recurring scheduler or same-host
-process lock; those remain #19's boundary.
+`tachiko dispatch serve` is the Phase-1 continuous serial driver. It holds the
+same-host lock for its lifetime, reconciles a terminal/merged run immediately,
+and then moves to the next executable queue row when the authoritative queue
+and durable Run permit it. At an active, parked, or empty boundary it only
+sleeps and rereads authoritative state; that idle path starts zero model turns.
+`--max-cycles` is an explicit bounded operational/test mode, and
+`--idle-poll-ms` controls the deterministic model-free safety poll.
 
-## Scheduled dispatch (macOS v0)
+## Supervised dispatch driver (macOS)
 
 `tachiko dispatch once` now takes a small local lock before reading GitHub. It
 complements (but never replaces) the GitHub claim lease: a concurrent same-host
@@ -180,30 +186,31 @@ or starting a second executor. The default lock lives outside the repository at
 `TACHIKO_DISPATCH_LOCK_PATH`. A malformed or live lock fails closed; a lock for
 a provably absent PID is retried once.
 
-For macOS, use `launchd` as the external hourly scheduler. First create a
+For macOS, use `launchd` to supervise the continuous driver. First create a
 private, absolute-path wrapper that supplies the explicitly selected dispatch,
 execution, validation, and hosted-check configurations, then ends with:
 
 ```sh
-exec /absolute/path/to/tachiko dispatch once
+exec /absolute/path/to/tachiko dispatch serve
 ```
 
-Do not put credentials in the generated plist. Render an hourly `HH:25`
-example (or choose a different minute) from the checked-in CLI:
+Do not put credentials in the generated plist. The generated supervisor starts
+the wrapper on load and restarts it if it exits; it contains no queue,
+execution, or provider credentials and is not a calendar wake:
 
 ```bash
 pnpm exec tsx src/cli.ts dispatch launchd render \
-  --program '/absolute/path/to/run-dispatch-once.sh' \
-  --working-directory "$PWD" --minute 25 \
-  > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-once.plist"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-once.plist"
+  --program '/absolute/path/to/run-dispatch-driver.sh' \
+  --working-directory "$PWD" \
+  > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
 ```
 
 Remove it with `launchctl bootout "gui/$(id -u)" <plist-path>` before deleting
-the plist. The generated schedule is deliberately only a wake-up cadence: a
-late wake remains correct, and an active durable claim is resumed before new
-queue work. No launchd installation or real GitHub/Codex invocation occurs in
-CI. An opt-in local smoke requires a disposable control Issue and all normal
+the plist. Restart/re-entry remains correct because each reconciliation first
+adopts the exact durable claim/run or fails closed. No launchd installation or
+real GitHub/Codex invocation occurs in CI. An opt-in local smoke requires a
+disposable control Issue and all normal
 explicit configuration, then uses:
 
 ```bash

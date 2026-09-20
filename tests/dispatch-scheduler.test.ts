@@ -124,35 +124,31 @@ describe('dispatch scheduler boundary', () => {
     }
   });
 
-  it('renders a configurable hourly launchd schedule without configuration values', () => {
+  it('renders a provider-neutral launchd supervisor without configuration values', () => {
     const plist = renderDispatchLaunchdPlist({
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
-      minute: 25,
     });
-    assert.match(plist, /<key>Minute<\/key><integer>25<\/integer>/);
     assert.match(plist, /<key>ProgramArguments<\/key><array><string>\/Users\/example\/Library/);
     assert.doesNotMatch(plist, /TACHIKO_DISPATCH_CONFIG/);
+    assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
+    assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
+    assert.doesNotMatch(plist, /StartCalendarInterval/);
   });
 
-  it('keeps the configured calendar minute across reinstall and never wakes at load', () => {
-    // #47 configuration requirement: the minute is configuration-owned, not a
-    // hard-coded product default, and reinstalling reproduces the selection.
+  it('renders the same supervisor across reinstall without creating a timer wake', () => {
     const options = {
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
-      label: 'io.tachiko.conductor.dispatch-once',
+      label: 'io.tachiko.conductor.dispatch-driver',
     } as const;
-    const configured = renderDispatchLaunchdPlist({ ...options, minute: 40 });
-    const reinstalled = renderDispatchLaunchdPlist({ ...options, minute: 40 });
+    const configured = renderDispatchLaunchdPlist(options);
+    const reinstalled = renderDispatchLaunchdPlist(options);
     assert.equal(reinstalled, configured);
-    assert.match(configured, /<key>StartCalendarInterval<\/key><dict><key>Minute<\/key><integer>40<\/integer><\/dict>/);
-    // launchd is a supervisor, not the workflow clock: no load-time model wake.
-    assert.doesNotMatch(configured, /RunAtLoad/);
+    assert.match(configured, /<key>RunAtLoad<\/key><true\/>/);
+    assert.match(configured, /<key>KeepAlive<\/key><true\/>/);
     assert.doesNotMatch(configured, /StartInterval/);
-    // A different explicit minute is honored rather than clamped to a default.
-    assert.match(renderDispatchLaunchdPlist({ ...options, minute: 5 }), /<key>Minute<\/key><integer>5<\/integer>/);
-    assert.throws(() => renderDispatchLaunchdPlist({ ...options, minute: 60 }), /0 through 59/);
+    assert.doesNotMatch(configured, /StartCalendarInterval/);
   });
 
   it('leaves a concurrent dispatch at a safe re-entry boundary without reading configuration or GitHub', async () => {
