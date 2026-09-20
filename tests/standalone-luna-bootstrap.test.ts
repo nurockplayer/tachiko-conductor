@@ -172,4 +172,17 @@ describe('standalone Luna bootstrap', () => {
     await assert.doesNotReject(() => bootstrap.prepare({ ...request, existing: identity }));
     assert.equal(fixture.commands.some(({ args }) => args.includes('core.useReplaceRefs=false')), true);
   });
+
+  it('rejects executable worktree config before its fsmonitor payload can run', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-worktree-config', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    const marker = path.join(fixture.root, 'worktree-config-ran');
+    const command = path.join(fixture.root, 'worktree-fsmonitor.sh');
+    writeFileSync(command, `#!/bin/sh\ntouch '${marker}'\n`); chmodSync(command, 0o755);
+    writeFileSync(path.join(identity.workspacePath, '.git', 'config.worktree'), `[core]\nfsmonitor = ${command}\n`);
+    await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /config requests executable/);
+    assert.equal(existsSync(marker), false);
+  });
 });

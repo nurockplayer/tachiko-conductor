@@ -140,8 +140,13 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     if (!existsSync(gitDir) || !lstatSync(gitDir).isDirectory()) this.fail('STALE_IDENTITY', 'Standalone worker Git directory changed.');
     const config = path.join(gitDir, 'config');
     if (!existsSync(config) || !lstatSync(config).isFile()) this.fail('STALE_IDENTITY', 'Standalone worker Git config changed.');
-    if (hasExecutableGitConfig(readFileSync(config, 'utf8'))) {
-      this.fail('STALE_IDENTITY', 'Worker Git config requests executable behavior.');
+    // extensions.worktreeConfig activates this additional worktree-local
+    // source. Inspect it as inert text before any host Git invocation.
+    for (const candidate of [config, path.join(gitDir, 'config.worktree')]) {
+      if (!existsSync(candidate)) continue;
+      if (!lstatSync(candidate).isFile() || hasExecutableGitConfig(readFileSync(candidate, 'utf8'))) {
+        this.fail('STALE_IDENTITY', 'Worker Git config requests executable behavior.');
+      }
     }
     const attributeFiles = [...findAttributeFiles(workspace), path.join(gitDir, 'info', 'attributes')];
     for (const file of attributeFiles) {
