@@ -57,6 +57,7 @@ export function isRepairAdmissionSnapshot(value: unknown): value is RepairAdmiss
     typeof snapshot.headSha === 'string' && snapshot.headSha.trim() !== '' &&
     Number.isSafeInteger(snapshot.pullRequestNumber) && (snapshot.pullRequestNumber as number) > 0 &&
     (snapshot.executionProfile === 'routine' || snapshot.executionProfile === 'complex') &&
+    snapshotProfileMatchesTaskShape(snapshot.taskShape as TaskShape, snapshot.executionProfile as 'routine' | 'complex') &&
     typeof snapshot.executionRevision === 'string' && snapshot.executionRevision.trim() !== '' &&
     isResolvedExecution(snapshot.execution) && snapshot.execution.profile === snapshot.executionProfile &&
     snapshot.execution.revision === snapshot.executionRevision &&
@@ -96,8 +97,17 @@ export function createRepairAdmissionSnapshot(
   if ((execution.profile !== 'routine' && execution.profile !== 'complex') || !isResolvedExecution(execution)) {
     throw new Error('Repair admission requires a resolved routine or complex execution profile.');
   }
+  if (!snapshotProfileMatchesTaskShape(authority.shape, execution.profile)) {
+    throw new Error('Repair admission execution profile does not match the explicit task-shape authority.');
+  }
   return { authorityRevision: authority.revision, taskShape: authority.shape, taxonomyRevision: REPAIR_FINDING_TAXONOMY_REVISION,
     finding, headSha, pullRequestNumber, executionProfile: execution.profile, executionRevision: execution.revision, execution, admittedAt };
+}
+
+/** Receipts must replay the same closed mapping used at admission. */
+function snapshotProfileMatchesTaskShape(shape: TaskShape, profile: 'routine' | 'complex'): boolean {
+  return (shape === 'bounded' && profile === 'routine') ||
+    (shape === 'interacting' && profile === 'complex');
 }
 
 /** Strict JSON boundary for unattended CLI creation; prose is never classified. */

@@ -183,10 +183,13 @@ function parkAdmission(run: Run, reason: string, store: RunStore, now: () => str
   return { outcome: 'needs_human', run: parked, reason };
 }
 
-function parkRepairAuthority(run: Run, reason: string, store: RunStore, now: () => string): ReviewLoopResult {
+function parkRepairAuthority(
+  run: Run, reason: string, store: RunStore, now: () => string,
+  choices: readonly string[] = ['Provide explicit repair authority or resolve execution availability', CANCEL_RUN_DECISION],
+): ReviewLoopResult {
   const parked = applyTransition(run, {
     type: 'escalate', reason,
-    interrupt: { evidence: reason, choices: ['Provide explicit repair authority or resolve execution availability', CANCEL_RUN_DECISION] },
+    interrupt: { evidence: reason, choices },
   }, now());
   store.update(parked);
   return { outcome: 'needs_human', run: parked, reason };
@@ -357,11 +360,15 @@ export async function runReviewLoop(
       // reviewer and Issue prose remains only worker context. Old JSON has no
       // such field and intentionally follows the pre-existing generic path.
       let repairExecution = run.execution;
+      let repairStartsWithFreshExecutor = false;
       const authority = run.repairTaskShapeAuthority;
       if (authority !== undefined) {
         const decision = decideRepairAdmission(authority);
         if (decision.kind === 'park') {
-          return parkRepairAuthority(run, `Repair admission parked: ${decision.escalation}.`, store, now);
+          // The immutable decision-shaped authority cannot be made executable
+          // by a generic resume. Do not advertise a retry that only parks it
+          // again; Oracle/Steward must issue a new run/authority separately.
+          return parkRepairAuthority(run, `Repair admission parked: ${decision.escalation}.`, store, now, [CANCEL_RUN_DECISION]);
         }
         if (deps.resolveRepairExecutionProfile === undefined) {
           return parkRepairAuthority(run, `Repair admission parked: ${decision.executionProfile} execution profile is unavailable.`, store, now);
@@ -374,6 +381,10 @@ export async function runReviewLoop(
         if (repairExecution === undefined || repairExecution.profile !== decision.executionProfile) {
           return parkRepairAuthority(run, `Repair admission parked: ${decision.executionProfile} execution profile is unavailable.`, store, now);
         }
+        // A promoted repair may be assigned to another provider. Continuing a
+        // prior provider's session across that boundary is not valid executor
+        // continuity; intentionally start the selected profile fresh.
+        repairStartsWithFreshExecutor = run.executor !== undefined && run.executor.provider !== repairExecution.executor;
         const finding: RepairFindingKind = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
           ? 'validation_failed'
           : 'review_blocking';
@@ -381,18 +392,21 @@ export async function runReviewLoop(
           authority, finding, run.headSha, run.pullRequest.number, repairExecution, now(),
         );
         const admittedRun: Run = { ...run, repairAdmissions: [...(run.repairAdmissions ?? []), admission] };
+        const startedFix = applyTransition(admittedRun, { type: 'start_fix' }, now());
         // An authority snapshot is useful only if it was appended against the
         // exact durable Run that was preflighted. Never invoke a worker after a
         // stale CAS, because another writer may have replaced its HEAD or PR.
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, admittedRun)) {
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, startedFix)) {
           return parkStaleRepairAdmission(run.id, run, store, now);
         }
-        run = admittedRun;
+        run = startedFix;
         const admissionPreflight = await checkOwnedFix();
         if (admissionPreflight !== null) return admissionPreflight;
       }
-      run = applyTransition(run, { type: 'start_fix' }, now());
-      store.update(run);
+      if (authority === undefined) {
+        run = applyTransition(run, { type: 'start_fix' }, now());
+        store.update(run);
+      }
 
       const blockingFindings = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
         ? 'Exact-HEAD validation failed. Repair the implementation and its required validation before returning a new exact HEAD.'
@@ -426,15 +440,26 @@ export async function runReviewLoop(
         contextMode: 'bounded',
         contextJustification: 'live-target-bounded',
       }, now());
+      const beforeSpawn = run;
       run = workerSpawn.run;
-      store.update(run);
+      // Admission's CAS also fenced IMPLEMENTING, but telemetry is another
+      // durable transition before the side effect. Re-fence it so a later
+      // cancellation/park cannot be overwritten or followed by a worker.
+      if (authority !== undefined) {
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(beforeSpawn, run)) {
+          return parkStaleRepairAdmission(run.id, beforeSpawn, store, now);
+        }
+      } else {
+        store.update(run);
+      }
       let fixResult;
       try {
         fixResult = await implementation.run({
           target, baseSha: progressBaseSha ?? '', authority: 'live-target', instructions: blockingFindings,
           supplementalInstructions: blockingFindings,
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
-          capabilities: await deps.resolveImplementationCapabilities?.(), sessionId: run.agentResult?.sessionId, executor: run.executor,
+          capabilities: await deps.resolveImplementationCapabilities?.(),
+          ...(repairStartsWithFreshExecutor ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
       } catch (error) {

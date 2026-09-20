@@ -1,5 +1,6 @@
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { Run } from '../domain/types.js';
+import type { RepairTaskShapeAuthority } from '../domain/repair-admission.js';
 import type { WorkflowDependencies, WorkflowOutcome } from '../workflow/run.js';
 import type { DispatchConfiguration } from './config.js';
 import { dispatchOnce, type DispatchOnceResult, type DispatchRuntimeApi } from './runner.js';
@@ -12,7 +13,7 @@ export interface DispatchCommandDependencies {
   readonly workflow: WorkflowDependencies;
   readonly runtime: DispatchCommandRuntime;
   readonly resolveExecutionProfile: (profile: string) => ResolvedExecutionConfiguration;
-  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string) => Promise<WorkflowOutcome>;
+  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string, repairTaskShapeAuthority: RepairTaskShapeAuthority) => Promise<WorkflowOutcome>;
   /** Resume the Run bound by the retained runtime claim, never a target lookup. */
   readonly resumeClaimedRun: (run: Run) => Promise<WorkflowOutcome>;
   readonly now?: () => string;
@@ -49,7 +50,10 @@ export async function dispatchOnceCommand(
         return { runId: outcome.run.id, state: outcomeState(outcome) };
       }
       const selected = deps.resolveExecutionProfile(entry.profile);
-      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId);
+      if (entry.repairTaskShapeAuthority === undefined) {
+        throw new Error(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
+      }
+      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority);
       return { runId: outcome.run.id, state: outcomeState(outcome) };
     },
   });

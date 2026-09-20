@@ -1307,7 +1307,9 @@ export async function main(argv: string[]): Promise<number> {
         workflow,
         runtime,
         resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-        runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
+        runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority) => await runIssueCommand(workflow, ref, {
+          ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority,
+        }),
         resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
       });
       printDispatchResult(result);

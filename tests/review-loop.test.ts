@@ -93,6 +93,29 @@ class ConcurrentAdmissionStore extends MemoryStore {
   }
 }
 
+class CasMemoryStore extends MemoryStore {
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    const current = this.read(expected.id);
+    if (current === null || JSON.stringify(current) !== JSON.stringify(expected)) return false;
+    this.update(next);
+    return true;
+  }
+}
+
+class SpawnRaceStore extends CasMemoryStore {
+  private attempts = 0;
+  constructor(private readonly concurrent: Run) { super(); }
+
+  override updateIfUnchanged(expected: Run, next: Run): boolean {
+    this.attempts += 1;
+    if (this.attempts === 2) {
+      this.update(this.concurrent);
+      return false;
+    }
+    return super.updateIfUnchanged(expected, next);
+  }
+}
+
 function snapshot(headSha: string | null): GitHubLiveSnapshot {
   return {
     repository: { owner: 'acme', repo: 'widgets', defaultBranch: null, defaultBranchHeadSha: null },
@@ -455,6 +478,66 @@ describe('runReviewLoop', () => {
       provider: 'codex-cli',
       sessionId: 'thread-42',
     });
+  });
+
+  it('starts an authority-promoted repair with a fresh executor when providers differ', async () => {
+    const store = new CasMemoryStore();
+    let run = repairChangesRun('fresh-promoted-executor');
+    run = {
+      ...run,
+      repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'interacting' },
+      executor: { provider: 'worker-router', sessionId: 'legacy-session' },
+      agentResult: { ...run.agentResult!, sessionId: 'legacy-session', executor: { provider: 'worker-router', sessionId: 'legacy-session' } },
+    };
+    store.create(run);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+    const complex = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD, HEAD, HEAD2]), implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+        resolveRepairExecutionProfile: () => complex },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'revalidating');
+    assert.equal(implementation.requests[0]?.executor, undefined);
+    assert.equal(implementation.requests[0]?.sessionId, undefined);
+    assert.deepEqual(implementation.requests[0]?.execution, complex);
+  });
+
+  it('does not spawn after a concurrent transition wins the post-admission telemetry fence', async () => {
+    const initial = repairChangesRun('post-admission-race');
+    const started = applyTransition(initial, { type: 'start_fix' }, T0);
+    const concurrent = applyTransition(started, { type: 'escalate', reason: 'concurrent cancellation' }, T0);
+    const store = new SpawnRaceStore(concurrent);
+    store.create(initial);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+        resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
+      initial.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(store.read(initial.id)?.state, 'NEEDS_HUMAN');
+    assert.equal(implementation.requests.length, 0);
+  });
+
+  it('parks decision-shaped authority with only a terminal choice', async () => {
+    const store = new MemoryStore();
+    const run = { ...repairChangesRun('decision-authority'), repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'decision' as const } };
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.deepEqual(result.run.interrupt?.choices, ['Cancel the run']);
+    assert.equal(implementation.requests.length, 0);
   });
 
   it('returns the fixed HEAD to VALIDATING before a second review can consume the attempt budget', async () => {

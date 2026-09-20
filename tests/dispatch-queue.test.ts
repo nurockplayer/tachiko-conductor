@@ -564,10 +564,16 @@ describe('dispatch queue protocol', () => {
   });
 
   it('passes the immutable claim id when creating a new dispatched run', async () => {
-    const runtime = new CommandRuntime(QUEUE);
+    const runtime = new CommandRuntime(`${DISPATCH_QUEUE_MARKER}
+ready:
+  - issue: 18
+    route: codex
+    profile: complex
+    task-shape-revision: task-shape-v1
+    task-shape: interacting`);
     const store = new MemoryStore();
     const selected = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
-    const received: Array<{ ref: string; profile: string; claimId: string }> = [];
+    const received: Array<{ ref: string; profile: string; claimId: string; authority: unknown }> = [];
     await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
       workflow: { store, github: new GitHub() } as unknown as WorkflowDependencies,
       runtime,
@@ -575,8 +581,8 @@ describe('dispatch queue protocol', () => {
         assert.equal(profile, 'complex');
         return selected;
       },
-      runIssue: async (ref, execution, claimId) => {
-        received.push({ ref, profile: execution?.profile ?? '', claimId });
+      runIssue: async (ref, execution, claimId, authority) => {
+        received.push({ ref, profile: execution?.profile ?? '', claimId, authority });
         return { outcome: 'needs_human', run: { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'new-run', selected, claimId), state: 'NEEDS_HUMAN' as const }, reason: 'parked for test' };
       },
       resumeClaimedRun: async () => { throw new Error('must create, not resume'); },
@@ -586,6 +592,7 @@ describe('dispatch queue protocol', () => {
     assert.equal(received[0]?.ref, 'acme/widgets#18');
     assert.equal(received[0]?.profile, 'complex');
     assert.equal(received[0]?.claimId, parseDispatchRuntime(runtime.comments[0]!.body)?.claimId);
+    assert.deepEqual(received[0]?.authority, { revision: 'task-shape-v1', shape: 'interacting' });
   });
 
   it('rejects recovery when the durable profile and retained claim disagree', async () => {

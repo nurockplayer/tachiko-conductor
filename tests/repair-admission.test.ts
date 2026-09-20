@@ -35,6 +35,11 @@ describe('revisioned repair admission authority', () => {
     assert.equal(snapshot.execution.revision, 'execution-v1');
     assert.equal(isRepairAdmissionSnapshot(snapshot), true);
     assert.equal(isRepairAdmissionSnapshot({ ...snapshot, headSha: '' }), false);
+    assert.equal(isRepairAdmissionSnapshot({ ...snapshot, taskShape: 'interacting' }), false);
+    assert.throws(
+      () => createRepairAdmissionSnapshot({ revision: 'task-shape-v1', shape: 'interacting' }, 'review_blocking', HEAD, 7, routineExecution, '2026-09-20T00:00:00.000Z'),
+      /does not match/,
+    );
   });
 
   it('survives restart, participates in CAS, and cannot be retroactively removed', () => {
