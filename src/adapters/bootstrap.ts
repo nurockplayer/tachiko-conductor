@@ -23,6 +23,8 @@ export interface VerifyDurableRequest {
   readonly expectedHeadSha: string;
   readonly progressBaseSha?: string;
   readonly workspaceGuard?: WorkspaceGuard;
+  /** Existing authoritative PR recovery, not a newly produced worker result. */
+  readonly adoptExistingHead?: boolean;
 }
 
 export interface DurableImplementationSnapshot {

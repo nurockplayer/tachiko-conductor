@@ -57,6 +57,10 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     await this.assert(request.identity);
     const head = (await this.git(request.identity.workspacePath, ['rev-parse', 'HEAD'])).stdout.trim();
     if (head !== request.expectedHeadSha) this.fail('HEAD_MISMATCH', 'Standalone worker HEAD differs from the reported exact HEAD.');
+    if (request.adoptExistingHead === true) {
+      await this.ancestor(request.identity.workspacePath, request.identity.baseSha, head);
+      return { headSha: head, branch: request.identity.branch };
+    }
     const progressBase = request.progressBaseSha ?? request.identity.baseSha;
     if (head === progressBase) this.fail('HEAD_MISMATCH', 'Worker result did not advance the authorized HEAD.');
     await this.ancestor(request.identity.workspacePath, progressBase, head);
@@ -107,7 +111,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private assertWorkerGitSurface(workspace: string): void {
     const gitDir = path.join(workspace, '.git');
     const config = readFileSync(path.join(gitDir, 'config'), 'utf8');
-    const attrs = existsSync(path.join(workspace, '.gitattributes')) ? readFileSync(path.join(workspace, '.gitattributes'), 'utf8') : '';
+    const attrs = [path.join(workspace, '.gitattributes'), path.join(gitDir, 'info', 'attributes')].filter(existsSync).map((file) => readFileSync(file, 'utf8')).join('\n');
     if (/\b(filter\.|fsmonitor|hooksPath|include\.path|core\.sshCommand)/i.test(config) || /\bfilter=[^\s-]|\bfilter\.[A-Za-z]/i.test(attrs)) this.fail('STALE_IDENTITY', 'Worker Git config or attributes request executable behavior.');
   }
   private async remoteHead(ref: string): Promise<string | null> { const raw = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim(); return raw === '' ? null : raw.split(/\s+/)[0] ?? null; }

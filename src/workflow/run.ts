@@ -363,12 +363,13 @@ export async function runWorkflow(
         }
 
         if (!pendingRepair && (snapshot.pullRequest === null || effectiveExecution?.executor === 'luna-isolated') && bootstrap === undefined) {
-          if (bootstrapAdapter === undefined || snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null) {
+          const existingLuna = effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null;
+          if (bootstrapAdapter === undefined || (!existingLuna && (snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null))) {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
           try {
-            bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: snapshot.repository.defaultBranch,
-              baseSha: effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null ? snapshot.headSha! : snapshot.repository.defaultBranchHeadSha });
+            bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: existingLuna ? snapshot.pullRequest!.baseRef! : snapshot.repository.defaultBranch!,
+              baseSha: existingLuna ? snapshot.headSha! : snapshot.repository.defaultBranchHeadSha! });
             run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
             store.update(run);
           } catch (error) {
@@ -397,7 +398,7 @@ export async function runWorkflow(
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
               }
               try {
-                await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard });
+                await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard, adoptExistingHead: bootstrap.bootstrapKind === 'standalone-isolated' });
               } catch (error) {
                 return bootstrapFailureOutcome(run, error, store, now);
               }
