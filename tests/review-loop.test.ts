@@ -467,7 +467,7 @@ describe('runReviewLoop', () => {
     run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
     store.create(run);
     const implementation = new FakeImplementation([]);
-    const github = githubAdapter([HEAD, HEAD]);
+    const github = githubAdapter([HEAD, HEAD, HEAD, HEAD]);
     const readLive = github.readLiveSnapshot.bind(github);
     github.readLiveSnapshot = async (target) => {
       const live = await readLive(target);
