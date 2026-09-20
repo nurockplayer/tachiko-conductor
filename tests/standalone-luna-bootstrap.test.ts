@@ -151,8 +151,15 @@ describe('standalone Luna bootstrap', () => {
     fixture.git(identity.workspacePath, ['update-index', '--assume-unchanged', 'README.md']);
     await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /hidden-worktree flags/);
     fixture.git(identity.workspacePath, ['update-index', '--no-assume-unchanged', 'README.md']);
-    mkdirSync(path.join(identity.workspacePath, 'nested', '.git'), { recursive: true });
+    const nestedGit = path.join(identity.workspacePath, 'nested', '.git');
+    const marker = path.join(fixture.root, 'nested-filter-ran');
+    const command = path.join(fixture.root, 'nested-filter.sh');
+    writeFileSync(command, `#!/bin/sh\ntouch '${marker}'\n`); chmodSync(command, 0o755);
+    mkdirSync(path.join(nestedGit, 'info'), { recursive: true });
+    writeFileSync(path.join(nestedGit, 'config'), `[filter "marker"]\n\tclean = ${command}\n`);
+    writeFileSync(path.join(nestedGit, 'info', 'attributes'), '*.txt filter=marker\n');
     await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /nested Git repositories/);
+    assert.equal(existsSync(marker), false, 'nested worker Git config/attributes payload must never execute');
   });
 
   it('disables replacement refs for every host-side standalone inspection', async () => {
