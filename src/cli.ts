@@ -132,7 +132,8 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 {"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
-New unattended runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value and strict revisioned repair-task-shape authority JSON;
+New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value.
+New unattended runs also require strict revisioned repair-task-shape authority JSON.
 the selected --execution-profile is persisted with the run.
 wait observe/await are deterministic and model-free: they read native/runtime
 state, coalesce it into the durable wait ledger, and report whether the

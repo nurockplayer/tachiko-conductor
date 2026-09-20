@@ -874,7 +874,7 @@ describe('CLI end-to-end across processes', () => {
       );
       assert.match(help.stdout, /New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value/);
 
-      const create = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--execution-profile', 'standard']);
+      const create = runCli(['run', 'create', '--owner', 'acme', '--repo', 'widgets', '--issue', '42', '--execution-profile', 'standard', '--repair-task-shape-authority', '{"revision":"task-shape-v1","shape":"bounded"}']);
       const id = /Created run ([a-f0-9-]+)/.exec(create.stdout)?.[1];
       assert.ok(id, `expected a run id in output: ${create.stdout}`);
       assert.match(create.stdout, /"state": "READY"/);
