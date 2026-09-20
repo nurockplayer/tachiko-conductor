@@ -145,7 +145,7 @@ class FakeBootstrap implements ImplementationBootstrapAdapter {
     branch: 'tachiko/issue-42-test', workspacePath: '/tmp/tachiko-workspace',
   };
   async plan() { return this.identity; }
-  async prepare() { return this.identity; }
+  async prepare(..._args: unknown[]) { return this.identity; }
   guard() { return { assertValid: () => undefined }; }
   async verifyDurable(request: { expectedHeadSha: string }) { return { headSha: request.expectedHeadSha, branch: this.identity.branch }; }
 }
@@ -877,6 +877,19 @@ describe('runWorkflow', () => {
     assert.equal(implementation.requests[0]?.baseSha, 'base');
     assert.match(implementation.requests[0]?.instructions ?? '', /start from main@base/);
     assert.match(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
+  });
+
+  it('binds an existing Luna PR head as recovery authority before standalone prepare', async () => {
+    class RecordingBootstrap extends FakeBootstrap {
+      prepareRequest: unknown;
+      override async prepare(request: unknown) { this.prepareRequest = request; return this.identity; }
+    }
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'existing-luna', execution));
+    const bootstrap = new RecordingBootstrap();
+    await runWorkflow({ store, github: githubAdapter([HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap }, 'existing-luna', { maxReviewAttempts: 1, now: () => T0 });
+    assert.deepEqual((bootstrap.prepareRequest as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
   });
 
   it('parks a provider-neutral workspace guard failure instead of terminal agent failure', async () => {
