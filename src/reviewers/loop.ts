@@ -9,7 +9,7 @@ import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import { createCompletionInputFromResult, recordCompletionTelemetry, recordSpawnTelemetry } from '../domain/telemetry.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
-import { applyTransition, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
+import { applyTransition, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
 import type { ReviewResult, Run, Target } from '../domain/types.js';
 import {
@@ -196,18 +196,26 @@ function parkRepairAuthority(run: Run, reason: string, store: RunStore, now: () 
 function parkStaleRepairAdmission(runId: string, fallback: Run, store: RunStore, now: () => string): ReviewLoopResult {
   const reason = 'Repair admission parked: admission_stale.';
   let current = store.read(runId) ?? fallback;
-  // A concurrent writer may win between read and escalation. Retry only while
-  // the repair is still pending; never overwrite a progressed/terminal run.
+  // A concurrent writer may win between read and escalation. Keep fencing the
+  // freshest active snapshot; only an already parked or terminal snapshot is
+  // preserved without an overwrite.
   for (;;) {
-    if (current.state !== 'CHANGES_REQUESTED') return { outcome: 'needs_human', run: current, reason };
+    if (current.state === 'NEEDS_HUMAN') return { outcome: 'needs_human', run: current, reason };
+    if (isTerminal(current.state)) return { outcome: 'failed', run: current, reason };
     const parked = applyTransition(current, {
       type: 'escalate', reason,
       interrupt: { evidence: reason, choices: ['Re-admit the exact repair authority and execution profile', CANCEL_RUN_DECISION] },
     }, now());
-    if (store.updateIfUnchanged !== undefined && store.updateIfUnchanged(current, parked)) {
-      return { outcome: 'needs_human', run: parked, reason };
+    if (store.updateIfUnchanged === undefined) {
+      store.update(parked);
+    } else if (!store.updateIfUnchanged(current, parked)) {
+      current = store.read(runId) ?? current;
+      continue;
     }
-    current = store.read(runId) ?? current;
+    const persisted = store.read(runId) ?? parked;
+    if (persisted.state === 'NEEDS_HUMAN') return { outcome: 'needs_human', run: persisted, reason };
+    if (isTerminal(persisted.state)) return { outcome: 'failed', run: persisted, reason };
+    current = persisted;
   }
 }
 
