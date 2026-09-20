@@ -7,6 +7,7 @@ import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from 
 import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetry.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
+import { isRepairAdmissionSnapshot, isRepairTaskShapeAuthority } from '../domain/repair-admission.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -230,6 +231,8 @@ function isRun(value: unknown): value is Run {
     Array.isArray(v.history) &&
     v.history.every(isTransitionRecord) &&
     (v.execution === undefined || isExecutionConfiguration(v.execution)) &&
+    (v.repairTaskShapeAuthority === undefined || isRepairTaskShapeAuthority(v.repairTaskShapeAuthority)) &&
+    (v.repairAdmissions === undefined || (Array.isArray(v.repairAdmissions) && v.repairAdmissions.every(isRepairAdmissionSnapshot))) &&
     isOptionalString(v.headSha) &&
     (v.interrupt === undefined || isInterrupt(v.interrupt)) &&
     (v.agentResult === undefined || isAgentResult(v.agentResult)) &&
@@ -304,7 +307,18 @@ function runFingerprint(run: Run | null): string {
     // Telemetry can change on its own without touching `updatedAt`, so a
     // concurrent telemetry append must invalidate the comparison too.
     telemetry: run.telemetry ?? null,
+    repairTaskShapeAuthority: run.repairTaskShapeAuthority ?? null,
+    repairAdmissions: run.repairAdmissions ?? null,
   });
+}
+
+/** Repair admissions are an audit ledger, never mutable workflow scratch data. */
+function assertRepairAdmissionsAppendOnly(previous: Run | null, next: Run): void {
+  const prior = previous?.repairAdmissions ?? [];
+  const proposed = next.repairAdmissions ?? [];
+  if (proposed.length < prior.length || prior.some((entry, index) => JSON.stringify(entry) !== JSON.stringify(proposed[index]))) {
+    throw new Error('Repair admission snapshots are append-only; existing entries cannot be changed or removed.');
+  }
 }
 
 export class RunMutationLockedError extends Error {
@@ -396,7 +410,10 @@ export class JsonFileStore implements RunStore {
 
   update(run: Run): void {
     this.withMutationLock(run.id, () => {
-      writeJsonAtomic(this.filePathFor(run.id), run);
+      const filePath = this.filePathFor(run.id);
+      const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
+      assertRepairAdmissionsAppendOnly(current, run);
+      writeJsonAtomic(filePath, run);
     });
   }
 
@@ -406,6 +423,7 @@ export class JsonFileStore implements RunStore {
       const filePath = this.filePathFor(expected.id);
       const current = readRun(filePath, expected.id);
       if (runFingerprint(current) !== runFingerprint(expected)) return false;
+      assertRepairAdmissionsAppendOnly(current, next);
       this.beforeConditionalWrite?.();
       writeJsonAtomic(filePath, next);
       return true;

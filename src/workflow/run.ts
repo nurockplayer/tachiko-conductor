@@ -21,6 +21,8 @@ import {
 } from '../domain/telemetry.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
+import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import type { RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { parkBootstrapFailure } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
@@ -40,6 +42,8 @@ export interface WorkflowDependencies {
   /** Explicit repository/run policy for interpreting the exact-HEAD hosted check list. */
   readonly hostedCheckPolicy?: HostedCheckPolicyConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
+  /** Optional because pre-authority Runs retain their historical repair path. */
+  readonly resolveRepairExecutionProfile?: (profile: 'routine' | 'complex') => ResolvedExecutionConfiguration | undefined;
 }
 
 export interface WorkflowOptions {
@@ -100,6 +104,19 @@ function park(run: Run, reason: string, store: RunStore, now: () => string, choi
   const next = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices } }, now());
   store.update(next);
   return { outcome: 'needs_human', run: next, reason };
+}
+
+function admittedRepairExecution(run: Run, deps: WorkflowDependencies): ResolvedExecutionConfiguration | null {
+  const authority = run.repairTaskShapeAuthority;
+  if (authority === undefined || run.headSha === undefined || run.pullRequest === undefined) return null;
+  const receipt = [...(run.repairAdmissions ?? [])].reverse().find((candidate): candidate is RepairAdmissionSnapshot =>
+    candidate.authorityRevision === authority.revision && candidate.taskShape === authority.shape &&
+    candidate.headSha === run.headSha && candidate.pullRequestNumber === run.pullRequest!.number,
+  );
+  if (receipt === undefined || deps.resolveRepairExecutionProfile === undefined) return null;
+  let resolved: ResolvedExecutionConfiguration | undefined;
+  try { resolved = deps.resolveRepairExecutionProfile(receipt.executionProfile); } catch { return null; }
+  return resolved !== undefined && JSON.stringify(resolved) === JSON.stringify(receipt.execution) ? resolved : null;
 }
 
 function hostedValidation(
@@ -276,6 +293,20 @@ export async function runWorkflow(
           run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
           run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
         const pendingRepair = pendingReviewFix || pendingValidationRepair;
+        // A restarted repair may execute only from its append-only admission
+        // receipt. It must not inherit the initial run profile as a fallback.
+        const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
+          ? admittedRepairExecution(run, deps)
+          : run.execution;
+        if (pendingRepair && run.repairTaskShapeAuthority !== undefined && effectiveExecution === null) {
+          return park(
+            run,
+            'Repair admission is missing, stale, or its exact execution profile can no longer be resolved.',
+            store,
+            now,
+            ['Re-admit the exact repair authority and execution profile', CANCEL_RUN_DECISION],
+          );
+        }
         if (pendingRepair) {
           const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
           if (conflict !== null) return park(run, conflict, store, now);
@@ -413,7 +444,7 @@ export async function runWorkflow(
             ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : undefined
         );
-        if (run.execution?.executor === 'worker-router' && snapshot.pullRequest !== null && bootstrap === undefined) {
+        if (effectiveExecution?.executor === 'worker-router' && snapshot.pullRequest !== null && bootstrap === undefined) {
           return park(run, 'Worker-router requires a verified prepared workspace and branch for an existing implementation pull request.', store, now);
         }
         const workerAttemptKind = pendingRepair
@@ -425,10 +456,10 @@ export async function runWorkflow(
           role: 'worker',
           attemptKind: workerAttemptKind,
           ...(run.headSha === undefined ? {} : { headSha: run.headSha }),
-          ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
-          ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
-          ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
-          ...(run.execution?.profile === undefined ? {} : { profile: run.execution.profile }),
+          ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
+          ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
+          ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
+          ...(effectiveExecution?.profile === undefined ? {} : { profile: effectiveExecution.profile }),
           contextMode: 'bounded',
           contextJustification: 'live-target-bounded',
         }, now());
@@ -448,7 +479,7 @@ export async function runWorkflow(
               generation: run.executor?.generation ?? run.id,
               ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
             },
-            ...(run.execution === undefined ? {} : { execution: run.execution }),
+            ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
           });
         } catch (error) {
           if (isWorkspaceGuardFailure(error)) return bootstrapFailureOutcome(run, error, store, now);
@@ -458,17 +489,17 @@ export async function runWorkflow(
             summary: detail,
             diagnostics: ['AGENT_RUNTIME_INVOCATION_FAILED: provider invocation threw before returning an AgentResult'],
           }, {
-            ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
-            ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
-            ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+            ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
+            ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
+            ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
           }, 'worker', workerSpawn.invocationId), now());
           store.update(run);
           throw error;
         }
         run = recordCompletionTelemetry(run, createCompletionInputFromResult(result, {
-          ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
-          ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
-          ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+          ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
+          ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
+          ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
         }, 'worker', workerSpawn.invocationId), now());
         store.update(run);
         if (result.exitStatus === 'failure') {
@@ -763,6 +794,7 @@ export async function runWorkflow(
             bootstrap: deps.bootstrap,
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
+            resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,
           },
           run.id,
           {

@@ -9,6 +9,7 @@
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
+import type { RepairAdmissionSnapshot, RepairTaskShapeAuthority } from './repair-admission.js';
 
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;
@@ -247,6 +248,10 @@ export interface Run {
   readonly history: readonly TransitionRecord[];
   /** Steward-selected, immutable secret-free executor snapshot for this run. */
   readonly execution?: ResolvedExecutionConfiguration;
+  /** Optional for legacy JSON; when present it is the only repair shape authority. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
+  /** Append-only, exact-HEAD/PR-bound repair authorizations. */
+  readonly repairAdmissions?: readonly RepairAdmissionSnapshot[];
   /** While paused in WAITING_DEPENDENCY / NEEDS_HUMAN, the state to resume to. */
   readonly interruptedFrom?: WorkflowState;
   readonly interrupt?: Interrupt;

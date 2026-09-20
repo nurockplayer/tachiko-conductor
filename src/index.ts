@@ -4,6 +4,7 @@ export * from './domain/state-machine.js';
 export * from './domain/validation.js';
 export * from './domain/wait.js';
 export * from './domain/telemetry.js';
+export * from './domain/repair-admission.js';
 export * from './store/json-file-store.js';
 export * from './adapters/github.js';
 export * from './adapters/agent.js';

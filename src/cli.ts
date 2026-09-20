@@ -36,6 +36,7 @@ import {
   type StartBrowserRuntimeOptions,
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
+import { parseRepairTaskShapeAuthority, type RepairTaskShapeAuthority } from './domain/repair-admission.js';
 import {
   assertExecutionSupportedByProvider,
   normalizeReasoningEffort,
@@ -96,9 +97,9 @@ import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observa
 const USAGE = `Tachiko Conductor — local orchestration core.
 
 Usage:
-  tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> [--browser-profile <profile>]
+  tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> --repair-task-shape-authority <json> [--browser-profile <profile>]
   tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
-  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical>
+  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical> --repair-task-shape-authority <json>
   tachiko run show <id>
   tachiko run inspect <id>
   tachiko run transition <id> <transition> [--reason <text>]
@@ -131,7 +132,8 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 {"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
-New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
+New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value.
+New unattended runs also require strict revisioned repair-task-shape authority JSON.
 the selected --execution-profile is persisted with the run.
 wait observe/await are deterministic and model-free: they read native/runtime
 state, coalesce it into the durable wait ledger, and report whether the
@@ -611,6 +613,8 @@ export interface WorkflowCommandOptions {
   readonly execution?: ResolvedExecutionConfiguration;
   /** Immutable queue-claim identity when this run is created by dispatch once. */
   readonly dispatchClaimId?: string;
+  /** Explicit revisioned task-shape authority for a newly created unattended run. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
   /** Optional run-scoped efficiency-signal thresholds. */
   readonly telemetryThresholds?: WorkflowOptions['telemetryThresholds'];
 }
@@ -633,10 +637,17 @@ export async function runIssueCommand(
     throw new Error(`Active durable run "${run.id}" is not bound to dispatch claim "${options.dispatchClaimId}"; refusing ambiguous recovery.`);
   }
   if (run === null) {
-    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId);
+    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId, options.repairTaskShapeAuthority);
     deps.store.create(run);
-  } else if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
-    throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
+  } else {
+    if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
+      throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
+    }
+    if (options.repairTaskShapeAuthority !== undefined &&
+      (run.repairTaskShapeAuthority?.revision !== options.repairTaskShapeAuthority.revision ||
+        run.repairTaskShapeAuthority?.shape !== options.repairTaskShapeAuthority.shape)) {
+      throw new Error(`Run "${run.id}" already has an immutable repair task-shape authority; refusing to replace it.`);
+    }
   }
   return runWorkflow(deps, run.id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
@@ -874,6 +885,16 @@ function buildWorkflowDeps(
     ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
     ...(hostedCheckPolicy === undefined ? {} : { hostedCheckPolicy }),
     resolveImplementationCapabilities,
+    // A run carrying explicit repair authority is admitted only against this
+    // same revisioned execution-profile configuration. Missing or invalid
+    // configuration is intentionally surfaced as an unavailable profile.
+    resolveRepairExecutionProfile: (profile) => {
+      try {
+        return resolveSelectedExecutionProfile(profile, env);
+      } catch {
+        return undefined;
+      }
+    },
   };
 }
 
@@ -883,8 +904,11 @@ export function runCreateCommand(
   store: RunStore,
   owner: string,
   repo: string,
-  opts: { issue?: number; branch?: string; execution?: ResolvedExecutionConfiguration },
+  opts: { issue?: number; branch?: string; execution?: ResolvedExecutionConfiguration; repairTaskShapeAuthority?: RepairTaskShapeAuthority },
 ): Run {
+  if (opts.repairTaskShapeAuthority === undefined) {
+    throw new Error('run create requires explicit revisioned repair task-shape authority.');
+  }
   const hasIssue = opts.issue !== undefined;
   const hasBranch = opts.branch !== undefined;
   if (hasIssue && hasBranch) {
@@ -899,7 +923,7 @@ export function runCreateCommand(
   } else {
     target = { kind: 'repository', owner, repo, branch: opts.branch ?? 'main' };
   }
-  const run = createRun(target, undefined, undefined, opts.execution);
+  const run = createRun(target, undefined, undefined, opts.execution, undefined, opts.repairTaskShapeAuthority);
   store.create(run);
   return run;
 }
@@ -1290,7 +1314,9 @@ export async function main(argv: string[]): Promise<number> {
         workflow,
         runtime,
         resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-        runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
+        runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority) => await runIssueCommand(workflow, ref, {
+          ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority,
+        }),
         resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
       });
       printDispatchResult(result);
@@ -1370,6 +1396,7 @@ export async function main(argv: string[]): Promise<number> {
         issue: { type: 'string' },
         branch: { type: 'string' },
         'execution-profile': { type: 'string' },
+        'repair-task-shape-authority': { type: 'string' },
       },
     });
     const { owner, repo } = values;
@@ -1380,8 +1407,12 @@ export async function main(argv: string[]): Promise<number> {
     if (values['execution-profile'] === undefined) {
       throw new Error('run create requires --execution-profile <routine|standard|complex|critical>.');
     }
+    if (values['repair-task-shape-authority'] === undefined) {
+      throw new Error('run create requires --repair-task-shape-authority <strict-json>.');
+    }
     const execution = resolveSelectedExecutionProfile(values['execution-profile']);
-    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch, execution });
+    const repairTaskShapeAuthority = parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
+    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch, execution, repairTaskShapeAuthority });
     console.log(`Created run ${run.id} (${run.state}).`);
     printRun(run);
     return 0;
@@ -1459,7 +1490,7 @@ export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: [subcommand, ...rest],
     allowPositionals: true,
-    options: { 'browser-profile': { type: 'string' }, 'execution-profile': { type: 'string' } },
+    options: { 'browser-profile': { type: 'string' }, 'execution-profile': { type: 'string' }, 'repair-task-shape-authority': { type: 'string' } },
   });
   const [ref, extra] = positionals;
   if (ref === undefined || extra !== undefined) {
@@ -1471,10 +1502,16 @@ export async function main(argv: string[]): Promise<number> {
   if (existing === null && values['execution-profile'] === undefined) {
     throw new Error('run owner/repo#123 requires --execution-profile <routine|standard|complex|critical> for a new run.');
   }
+  if (existing === null && values['repair-task-shape-authority'] === undefined) {
+    throw new Error('run owner/repo#123 requires --repair-task-shape-authority <strict-json> for a new run.');
+  }
   const execution = values['execution-profile'] === undefined
     ? undefined
     : resolveSelectedExecutionProfile(values['execution-profile']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution });
+  const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
+    ? undefined
+    : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
+  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution, repairTaskShapeAuthority });
   printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }

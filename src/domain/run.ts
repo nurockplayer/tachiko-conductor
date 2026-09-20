@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import type { RepairTaskShapeAuthority } from './repair-admission.js';
 import { createRunTelemetry } from './telemetry.js';
 import type { Run, Target } from './types.js';
 
@@ -14,6 +15,7 @@ export function createRun(
   id: string = randomUUID(),
   execution?: ResolvedExecutionConfiguration,
   dispatchClaimId?: string,
+  repairTaskShapeAuthority?: RepairTaskShapeAuthority,
 ): Run {
   return {
     id,
@@ -25,5 +27,6 @@ export function createRun(
     telemetry: createRunTelemetry(),
     ...(execution === undefined ? {} : { execution }),
     ...(dispatchClaimId === undefined ? {} : { dispatchClaimId }),
+    ...(repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority }),
   };
 }
