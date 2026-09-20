@@ -174,7 +174,11 @@ and then moves to the next executable queue row when the authoritative queue
 and durable Run permit it. At an active, parked, or empty boundary it only
 sleeps and rereads authoritative state; that idle path starts zero model turns.
 `--max-cycles` is an explicit bounded operational/test mode, and
-`--idle-poll-ms` controls the deterministic model-free safety poll.
+`--idle-poll-ms` controls the deterministic model-free safety poll. A local
+`tachiko dispatch wake` is a coalescing, provider-neutral nudge for a running
+driver; it changes no queue, Run, or provider state. The driver immediately
+reconciles on that wake, and a missing/unchanged wake always falls back to the
+bounded model-free safety poll.
 
 ## Supervised dispatch driver (macOS)
 

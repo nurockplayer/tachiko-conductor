@@ -77,6 +77,7 @@ import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
+import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -107,6 +108,7 @@ Usage:
   tachiko run list
   tachiko dispatch once
   tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
+  tachiko dispatch wake
   tachiko dispatch launchd render --program <absolute-driver-wrapper> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
@@ -1266,6 +1268,10 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
+    if (subcommand === 'wake' && rest.length === 0) {
+      console.log(JSON.stringify({ outcome: 'wake_signaled', token: signalDispatchWake(dispatchWakePath()) }));
+      return 0;
+    }
     if (subcommand === 'launchd' && rest[0] === 'render') {
       const { values, positionals } = parseArgs({
         args: rest.slice(1),
@@ -1336,7 +1342,7 @@ export async function main(argv: string[]): Promise<number> {
       }
       const result = await dispatchContinuously({
         dispatchOnce: reconcile,
-        sleep: async (milliseconds) => await new Promise<void>((resolve) => setTimeout(resolve, milliseconds)),
+        sleep: createDispatchWakeWaiter(dispatchWakePath()),
         idlePollMs: values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']),
         ...(values['max-cycles'] === undefined ? {} : { maxCycles: Number(values['max-cycles']) }),
       });
