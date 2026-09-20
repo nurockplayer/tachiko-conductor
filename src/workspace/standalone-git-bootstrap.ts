@@ -97,7 +97,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     // therefore remains untouched even if it changes after the re-read.
     await this.git(this.source, ['push', '--no-verify', 'origin', `${head}:${ref}`]);
     await this.assertPublicationRemote(request.identity);
-    const published = (await this.git(this.source, ['ls-remote', '--heads', 'origin', `refs/heads/${request.identity.branch}`])).stdout.trim().split(/\s+/)[0];
+    const published = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim().split(/\s+/)[0];
     if (published !== head) this.fail('UNPUSHED_HEAD', 'Host publication did not retain the exact standalone worker HEAD.');
     return { headSha: head, branch: request.identity.branch };
   }

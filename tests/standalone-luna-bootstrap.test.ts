@@ -69,11 +69,16 @@ describe('standalone Luna bootstrap', () => {
     const adoptedHead = fixture.commit(fixture.source, 'pr.txt', 'authoritative PR change\n');
     fixture.git(fixture.source, ['push', 'origin', `HEAD:refs/heads/tachiko/existing-pr`]);
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
-    const request = { runId: 'luna-99-adopt', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const request = { runId: 'luna-99-adopt', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha, publicationBranch: 'tachiko/existing-pr' };
     const identity = await bootstrap.plan(request);
     await bootstrap.prepare({ ...request, existing: identity, recoveryAuthority: { expectedHeadSha: adoptedHead } });
     assert.equal(fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim(), adoptedHead);
     await assert.doesNotReject(() => bootstrap.verifyDurable({ identity, expectedHeadSha: adoptedHead, progressBaseSha: fixture.baseSha, adoptExistingHead: true }));
+    assert.notEqual(identity.branch, identity.publicationBranch);
+    fixture.commit(identity.workspacePath, 'repair.txt', 'repair\n');
+    const repaired = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim();
+    await bootstrap.verifyDurable({ identity, expectedHeadSha: repaired, progressBaseSha: adoptedHead });
+    assert.equal(fixture.git(fixture.remote, ['rev-parse', 'refs/heads/tachiko/existing-pr']).trim(), repaired);
     fixture.git(identity.workspacePath, ['reset', '--hard', fixture.baseSha]);
     await assert.rejects(
       () => bootstrap.verifyDurable({ identity, expectedHeadSha: adoptedHead, progressBaseSha: fixture.baseSha, adoptExistingHead: true }),
