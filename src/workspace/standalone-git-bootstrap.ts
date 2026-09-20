@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, realpathSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, ImplementationBootstrapError, type BootstrapPlanRequest, type BootstrapPrepareRequest, type DurableImplementationSnapshot, type ImplementationBootstrapAdapter, type VerifyDurableRequest } from '../adapters/bootstrap.js';
@@ -88,6 +88,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   }
   private async assert(i: ImplementationBootstrapIdentity, recovery?: string, initialBase?: string): Promise<void> {
     if (!existsSync(i.workspacePath)) this.fail('STALE_IDENTITY', 'Standalone workspace disappeared.');
+    this.assertWorkerGitSurface(i.workspacePath);
     const branch = (await this.git(i.workspacePath, ['branch', '--show-current'])).stdout.trim();
     if (branch !== i.branch) this.fail('STALE_IDENTITY', 'Standalone worker branch changed.');
     if ((await this.git(i.workspacePath, ['remote'])).stdout.trim() !== '') this.fail('STALE_IDENTITY', 'Standalone worker checkout has a remote.');
@@ -100,11 +101,14 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private async ancestor(cwd: string, base: string, head: string): Promise<void> { if ((await this.git(cwd, ['merge-base', '--is-ancestor', base, head], [0, 1])).exitCode !== 0) this.fail('HEAD_MISMATCH', 'Worker HEAD does not descend from its authorized base.'); }
   private async tree(cwd: string, ref: string): Promise<string> { return (await this.git(cwd, ['rev-parse', `${ref}^{tree}`])).stdout.trim(); }
   private async assertPublicationRemote(request: Pick<ImplementationBootstrapIdentity, 'owner' | 'repo'>): Promise<void> {
-    const urls = [
-      (await this.git(this.source, ['remote', 'get-url', 'origin'])).stdout.trim(),
-      (await this.git(this.source, ['remote', 'get-url', '--push', 'origin'])).stdout.trim(),
-    ];
+    const urls = [...(await this.git(this.source, ['remote', 'get-url', '--all', 'origin'])).stdout.trim().split(/\r?\n/), ...(await this.git(this.source, ['remote', 'get-url', '--all', '--push', 'origin'])).stdout.trim().split(/\r?\n/)];
     if (!urls.every((url) => githubIdentity(url) === `${request.owner}/${request.repo}`)) this.fail('REPOSITORY_MISMATCH', 'Trusted host publication remote does not exactly match the target GitHub repository.');
+  }
+  private assertWorkerGitSurface(workspace: string): void {
+    const gitDir = path.join(workspace, '.git');
+    const config = readFileSync(path.join(gitDir, 'config'), 'utf8');
+    const attrs = existsSync(path.join(workspace, '.gitattributes')) ? readFileSync(path.join(workspace, '.gitattributes'), 'utf8') : '';
+    if (/\b(filter\.|fsmonitor|hooksPath|include\.path|core\.sshCommand)/i.test(config) || /\bfilter=[^\s-]|\bfilter\.[A-Za-z]/i.test(attrs)) this.fail('STALE_IDENTITY', 'Worker Git config or attributes request executable behavior.');
   }
   private async remoteHead(ref: string): Promise<string | null> { const raw = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim(); return raw === '' ? null : raw.split(/\s+/)[0] ?? null; }
   private async git(cwd: string, args: string[], allowed: number[] = [0]) {

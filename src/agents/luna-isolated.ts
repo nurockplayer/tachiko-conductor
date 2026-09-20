@@ -61,6 +61,8 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
       HOME: this.home,
       PATH: this.executablePath ?? process.env.PATH ?? '',
       NO_PROXY: '*',
+      GIT_AUTHOR_NAME: 'Tachiko Isolated Luna', GIT_AUTHOR_EMAIL: 'tachiko-luna@localhost',
+      GIT_COMMITTER_NAME: 'Tachiko Isolated Luna', GIT_COMMITTER_EMAIL: 'tachiko-luna@localhost',
     };
     return await new CodexCliAdapter({
       cwd: request.workspacePath, model: LUNA_ISOLATED_MODEL,
