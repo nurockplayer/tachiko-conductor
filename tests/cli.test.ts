@@ -39,6 +39,7 @@ import type { WorkflowDependencies } from '../src/workflow/run.js';
 import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const REPAIR_AUTHORITY = { revision: 'task-shape-v1', shape: 'bounded' as const };
 
 function tempStore(): { store: JsonFileStore; dir: string } {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-'));
@@ -77,7 +78,7 @@ describe('CLI command layer', () => {
   it('creates, shows, and transitions a run through the command functions', () => {
     const { store, dir } = tempStore();
     try {
-      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42, repairTaskShapeAuthority: REPAIR_AUTHORITY });
       assert.equal(created.state, 'READY');
       assert.deepEqual(created.target, TARGET);
 
@@ -122,7 +123,7 @@ describe('CLI command layer', () => {
     try {
       assert.throws(() => runShowCommand(store, 'missing'), /No run with id "missing"/);
 
-      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 1 });
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 1, repairTaskShapeAuthority: REPAIR_AUTHORITY });
       assert.throws(() => runTransitionCommand(store, created.id, 'merged'), /Invalid transition "merged" from state READY/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -133,13 +134,25 @@ describe('CLI command layer', () => {
     const { store, dir } = tempStore();
     try {
       assert.throws(
-        () => runCreateCommand(store, 'acme', 'widgets', { issue: 42, branch: 'main' }),
+        () => runCreateCommand(store, 'acme', 'widgets', { issue: 42, branch: 'main', repairTaskShapeAuthority: REPAIR_AUTHORITY }),
         /exactly one of --issue <n> or --branch <branch>/,
       );
-      assert.throws(() => runCreateCommand(store, 'acme', 'widgets', {}), /exactly one of/);
+      assert.throws(() => runCreateCommand(store, 'acme', 'widgets', { repairTaskShapeAuthority: REPAIR_AUTHORITY }), /exactly one of/);
       // the valid branch path is preserved
-      const branchRun = runCreateCommand(store, 'acme', 'widgets', { branch: 'main' });
+      const branchRun = runCreateCommand(store, 'acme', 'widgets', { branch: 'main', repairTaskShapeAuthority: REPAIR_AUTHORITY });
       assert.deepEqual(branchRun.target, { kind: 'repository', owner: 'acme', repo: 'widgets', branch: 'main' });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('requires explicit revisioned repair authority for unattended run creation', () => {
+    const { store, dir } = tempStore();
+    try {
+      assert.throws(
+        () => runCreateCommand(store, 'acme', 'widgets', { issue: 42 }),
+        /explicit revisioned repair task-shape authority/,
+      );
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
@@ -148,7 +161,7 @@ describe('CLI command layer', () => {
   it('refuses payload-requiring transitions with an explicit message and leaves the run unchanged', () => {
     const { store, dir } = tempStore();
     try {
-      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42, repairTaskShapeAuthority: REPAIR_AUTHORITY });
       for (const type of ['bootstrap_prepared', 'agent_succeeded', 'agent_failed', 'review_approved', 'changes_requested'] as const) {
         assert.throws(
           () => runTransitionCommand(store, created.id, type as TransitionType),
@@ -290,7 +303,7 @@ describe('CLI command layer', () => {
   it('shows an unresolved interrupt and hides a resolved one in run show', () => {
     const { store, dir } = tempStore();
     try {
-      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42, repairTaskShapeAuthority: REPAIR_AUTHORITY });
 
       // unresolved interrupt displays normally
       runTransitionCommand(store, created.id, 'escalate', 'product decision needed');
@@ -311,7 +324,7 @@ describe('CLI command layer', () => {
   it('hides a resolved dependency interrupt from run show', () => {
     const { store, dir } = tempStore();
     try {
-      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42 });
+      const created = runCreateCommand(store, 'acme', 'widgets', { issue: 42, repairTaskShapeAuthority: REPAIR_AUTHORITY });
       runTransitionCommand(store, created.id, 'wait_dependency', 'upstream API');
       runTransitionCommand(store, created.id, 'dependency_satisfied');
       const run = runShowCommand(store, created.id);

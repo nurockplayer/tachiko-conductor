@@ -192,6 +192,25 @@ function parkRepairAuthority(run: Run, reason: string, store: RunStore, now: () 
   return { outcome: 'needs_human', run: parked, reason };
 }
 
+/** A failed admission CAS is itself durable safety evidence, never a silent return. */
+function parkStaleRepairAdmission(runId: string, fallback: Run, store: RunStore, now: () => string): ReviewLoopResult {
+  const reason = 'Repair admission parked: admission_stale.';
+  let current = store.read(runId) ?? fallback;
+  // A concurrent writer may win between read and escalation. Retry only while
+  // the repair is still pending; never overwrite a progressed/terminal run.
+  for (;;) {
+    if (current.state !== 'CHANGES_REQUESTED') return { outcome: 'needs_human', run: current, reason };
+    const parked = applyTransition(current, {
+      type: 'escalate', reason,
+      interrupt: { evidence: reason, choices: ['Re-admit the exact repair authority and execution profile', CANCEL_RUN_DECISION] },
+    }, now());
+    if (store.updateIfUnchanged !== undefined && store.updateIfUnchanged(current, parked)) {
+      return { outcome: 'needs_human', run: parked, reason };
+    }
+    current = store.read(runId) ?? current;
+  }
+}
+
 /**
  * Drive the review → fix → re-review loop for one issue-target run through the
  * core state machine. GitHub live state wins: the loop re-reads the live PR
@@ -351,15 +370,14 @@ export async function runReviewLoop(
           ? 'validation_failed'
           : 'review_blocking';
         const admission = createRepairAdmissionSnapshot(
-          authority, finding, run.headSha, run.pullRequest.number, decision.executionProfile, now(),
+          authority, finding, run.headSha, run.pullRequest.number, repairExecution, now(),
         );
         const admittedRun: Run = { ...run, repairAdmissions: [...(run.repairAdmissions ?? []), admission] };
         // An authority snapshot is useful only if it was appended against the
         // exact durable Run that was preflighted. Never invoke a worker after a
         // stale CAS, because another writer may have replaced its HEAD or PR.
         if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, admittedRun)) {
-          const current = store.read(run.id) ?? run;
-          return { outcome: 'needs_human', run: current, reason: 'Repair admission parked: admission_stale.' };
+          return parkStaleRepairAdmission(run.id, run, store, now);
         }
         run = admittedRun;
         const admissionPreflight = await checkOwnedFix();
@@ -393,10 +411,10 @@ export async function runReviewLoop(
         role: 'worker',
         attemptKind: 'repair',
         ...(run.headSha === undefined ? {} : { headSha: run.headSha }),
-        ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
-        ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
-        ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
-        ...(run.execution?.profile === undefined ? {} : { profile: run.execution.profile }),
+        ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
+        ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
+        ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
+        ...(repairExecution?.profile === undefined ? {} : { profile: repairExecution.profile }),
         contextMode: 'bounded',
         contextJustification: 'live-target-bounded',
       }, now());
@@ -419,17 +437,17 @@ export async function runReviewLoop(
           summary: detail,
           diagnostics: ['AGENT_RUNTIME_INVOCATION_FAILED: provider invocation threw before returning an AgentResult'],
         }, {
-          ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
-          ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
-          ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+          ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
+          ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
+          ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
         }, 'worker', workerSpawn.invocationId), now());
         store.update(run);
         throw error;
       }
       run = recordCompletionTelemetry(run, createCompletionInputFromResult(fixResult, {
-        ...(run.execution?.executor === undefined ? {} : { provider: run.execution.executor }),
-        ...(run.execution?.model === undefined ? {} : { model: run.execution.model }),
-        ...(run.execution?.reasoningEffort === undefined ? {} : { reasoningEffort: run.execution.reasoningEffort }),
+        ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
+        ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
+        ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
       }, 'worker', workerSpawn.invocationId), now());
       store.update(run);
       if (fixResult.exitStatus === 'failure') {

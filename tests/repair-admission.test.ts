@@ -8,6 +8,7 @@ import {
   createRepairAdmissionSnapshot,
   decideRepairAdmission,
   isRepairAdmissionSnapshot,
+  parseRepairTaskShapeAuthority,
   REPAIR_FINDING_TAXONOMY_REVISION,
 } from '../src/domain/repair-admission.js';
 import { createRun } from '../src/domain/run.js';
@@ -16,6 +17,7 @@ import { TARGET } from './helpers.js';
 
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const authority = { revision: 'task-shape-v1', shape: 'bounded' as const };
+const routineExecution = { profile: 'routine' as const, revision: 'execution-v1', executor: 'codex-cli', timeoutMs: 1_000 };
 
 describe('revisioned repair admission authority', () => {
   it('maps only explicit bounded/interacting/decision authority and accepts no prose input', () => {
@@ -25,10 +27,12 @@ describe('revisioned repair admission authority', () => {
   });
 
   it('creates bounded, versioned exact-HEAD/PR admission evidence', () => {
-    const snapshot = createRepairAdmissionSnapshot(authority, 'review_blocking', HEAD, 7, 'routine', '2026-09-20T00:00:00.000Z');
+    const snapshot = createRepairAdmissionSnapshot(authority, 'review_blocking', HEAD, 7, routineExecution, '2026-09-20T00:00:00.000Z');
     assert.equal(snapshot.taxonomyRevision, REPAIR_FINDING_TAXONOMY_REVISION);
     assert.equal(snapshot.headSha, HEAD);
     assert.equal(snapshot.pullRequestNumber, 7);
+    assert.equal(snapshot.executionRevision, 'execution-v1');
+    assert.equal(snapshot.execution.revision, 'execution-v1');
     assert.equal(isRepairAdmissionSnapshot(snapshot), true);
     assert.equal(isRepairAdmissionSnapshot({ ...snapshot, headSha: '' }), false);
   });
@@ -39,7 +43,7 @@ describe('revisioned repair admission authority', () => {
       const store = new JsonFileStore({ dir });
       const initial = createRun(TARGET, '2026-09-20T00:00:00.000Z', 'repair-admission', undefined, undefined, authority);
       store.create(initial);
-      const snapshot = createRepairAdmissionSnapshot(authority, 'review_blocking', HEAD, 7, 'routine', '2026-09-20T00:00:01.000Z');
+      const snapshot = createRepairAdmissionSnapshot(authority, 'review_blocking', HEAD, 7, routineExecution, '2026-09-20T00:00:01.000Z');
       const admitted = { ...initial, repairAdmissions: [snapshot] };
       assert.equal(store.updateIfUnchanged(initial, admitted), true);
       assert.deepEqual(new JsonFileStore({ dir }).read(initial.id)?.repairAdmissions, [snapshot]);
@@ -61,5 +65,11 @@ describe('revisioned repair admission authority', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('accepts only strict revisioned JSON authority at the unattended boundary', () => {
+    assert.deepEqual(parseRepairTaskShapeAuthority('{"revision":"task-shape-v1","shape":"bounded"}'), authority);
+    assert.throws(() => parseRepairTaskShapeAuthority('{"revision":"task-shape-v1","shape":"bounded","prose":"small fix"}'), /strict JSON/);
+    assert.throws(() => parseRepairTaskShapeAuthority('small fix'), /valid JSON/);
   });
 });
