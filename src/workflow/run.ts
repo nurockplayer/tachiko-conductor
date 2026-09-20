@@ -382,7 +382,9 @@ export async function runWorkflow(
           const authoritativeBaseBranch = existingLuna ? snapshot.pullRequest?.baseRef : snapshot.repository.defaultBranch;
           const authoritativeBaseSha = existingLuna ? snapshot.pullRequest?.baseSha : snapshot.repository.defaultBranchHeadSha;
           const publicationBranch = existingLuna ? snapshot.pullRequest?.headRef : undefined;
-          const sameRepository = existingLuna && snapshot.pullRequest?.headRepository?.owner === target.owner && snapshot.pullRequest?.headRepository?.repo === target.repo;
+          const sameRepository = existingLuna &&
+            snapshot.pullRequest?.headRepository?.owner.toLowerCase() === target.owner.toLowerCase() &&
+            snapshot.pullRequest?.headRepository?.repo.toLowerCase() === target.repo.toLowerCase();
           if (bootstrapAdapter === undefined || authoritativeBaseBranch === undefined || authoritativeBaseBranch === null || authoritativeBaseBranch === '' ||
             authoritativeBaseSha === undefined || authoritativeBaseSha === null || authoritativeBaseSha === '') {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
@@ -473,6 +475,9 @@ export async function runWorkflow(
             ? `${snapshot.issue.body}\n\nConductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : snapshot.issue.body
         );
+        const boundedInstructions = isIsolatedLuna
+          ? `${instructions}\n\nIsolated Luna contract: implement only this bounded task and its tests; run the required tests; commit one clean exact HEAD. The trusted host, not this worker, owns every push and pull-request action.`
+          : instructions;
         const supplementalInstructions = pendingFixInstructions ?? (
           snapshot.pullRequest === null
             ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
@@ -502,10 +507,10 @@ export async function runWorkflow(
         let result: AgentResult;
         try {
           result = await implementation.run({
-            target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target', instructions,
+            target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target', instructions: boundedInstructions,
             ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
-            capabilities: await deps.resolveImplementationCapabilities?.(),
+            ...(isIsolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
             // #92 deliberately qualifies fresh bounded Luna workers.  A
             // repair/re-entry therefore cannot pretend its prior CLI thread
             // is a durable continuation; its explicit exact-HEAD bootstrap

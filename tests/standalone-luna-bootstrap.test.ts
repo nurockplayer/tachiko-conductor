@@ -142,4 +142,27 @@ describe('standalone Luna bootstrap', () => {
     symlinkSync('README.md', `${identity.workspacePath}/.gitattributes`);
     await assert.rejects(async () => await bootstrap.guard(identity).assertValid('after-execution'), /attribute authority/);
   });
+
+  it('rejects nested Git metadata and hidden index flags before host verification can inspect them', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-hidden-index', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    fixture.git(identity.workspacePath, ['update-index', '--assume-unchanged', 'README.md']);
+    await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /hidden-worktree flags/);
+    fixture.git(identity.workspacePath, ['update-index', '--no-assume-unchanged', 'README.md']);
+    mkdirSync(path.join(identity.workspacePath, 'nested', '.git'), { recursive: true });
+    await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /nested Git repositories/);
+  });
+
+  it('disables replacement refs for every host-side standalone inspection', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-replace-ref', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const replacement = fixture.commit(fixture.source, 'replacement.txt', 'replacement\n');
+    fixture.git(fixture.source, ['replace', fixture.baseSha, replacement]);
+    const identity = await bootstrap.plan(request);
+    await assert.doesNotReject(() => bootstrap.prepare({ ...request, existing: identity }));
+    assert.equal(fixture.commands.some(({ args }) => args.includes('core.useReplaceRefs=false')), true);
+  });
 });

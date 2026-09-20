@@ -892,6 +892,41 @@ describe('runWorkflow', () => {
     assert.deepEqual((bootstrap.prepareRequest as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
   });
 
+  it('keeps Luna packets host-bounded and never resolves browser or MCP capabilities', async () => {
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'luna-no-capabilities', execution));
+    const implementation = new FakeImplementation([failureResult('bounded failure')]);
+    let resolved = 0;
+    await runWorkflow(
+      { store, github: githubAdapter([null, null]), implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => new FakeBootstrap(),
+        resolveImplementationCapabilities: async () => { resolved += 1; return [{ kind: 'mcp-http', name: 'tachiko_browser', endpoint: 'http://127.0.0.1:1/mcp' }]; } },
+      'luna-no-capabilities', { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(resolved, 0);
+    assert.equal(implementation.requests[0]?.capabilities, undefined);
+    assert.match(implementation.requests[0]?.instructions ?? '', /host, not this worker, owns every push and pull-request action/);
+  });
+
+  it('accepts case-only same-repository identity for an existing Luna PR', async () => {
+    class RecordingBootstrap extends FakeBootstrap {
+      prepareRequest: unknown;
+      override async prepare(request: unknown) { this.prepareRequest = request; return this.identity; }
+    }
+    const github = githubAdapter([HEAD, HEAD]);
+    const original = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await original(target);
+      return { ...live, pullRequest: { ...live.pullRequest!, headRepository: { owner: 'ACME', repo: 'WIDGETS' } } };
+    };
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'luna-case-repository', execution));
+    const bootstrap = new RecordingBootstrap();
+    await runWorkflow({ store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap }, 'luna-case-repository', { maxReviewAttempts: 1, now: () => T0 });
+    assert.deepEqual((bootstrap.prepareRequest as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
+  });
+
   it('parks an existing Luna run when its authoritative PR tuple drifts after prepare', async () => {
     class RecordingBootstrap extends FakeBootstrap {
       prepareRequest: unknown;

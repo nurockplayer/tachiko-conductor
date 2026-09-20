@@ -68,7 +68,7 @@ export class GitHubIdentityRunner implements ProcessRunner {
 
   async run(file: string, args: readonly string[], options: Parameters<ProcessRunner['run']>[2]) {
     this.commands.push({ file, args: [...args], cwd: options.cwd });
-    const command = args.filter((value) => value !== '-c' && value !== 'core.hooksPath=/dev/null' && value !== 'core.fsmonitor=false' && value !== 'core.attributesFile=/dev/null').join(' ');
+    const command = args.filter((value) => value !== '-c' && value !== 'core.hooksPath=/dev/null' && value !== 'core.fsmonitor=false' && value !== 'core.attributesFile=/dev/null' && value !== 'core.useReplaceRefs=false').join(' ');
     if (file === 'git' && (command === 'remote get-url origin' || command === 'remote get-url --all origin')) {
       return { stdout: 'git@github.com:acme/widgets.git\n', stderr: '', exitCode: 0 };
     }

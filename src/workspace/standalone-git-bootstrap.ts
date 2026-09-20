@@ -109,6 +109,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private async assert(i: ImplementationBootstrapIdentity, recovery?: string, initialBase?: string): Promise<void> {
     if (!existsSync(i.workspacePath)) this.fail('STALE_IDENTITY', 'Standalone workspace disappeared.');
     this.assertWorkerGitSurface(i.workspacePath);
+    await this.assertNoWorkerIndexFlags(i.workspacePath);
     const branch = (await this.git(i.workspacePath, ['branch', '--show-current'])).stdout.trim();
     if (branch !== i.branch) this.fail('STALE_IDENTITY', 'Standalone worker branch changed.');
     if ((await this.git(i.workspacePath, ['remote'])).stdout.trim() !== '') this.fail('STALE_IDENTITY', 'Standalone worker checkout has a remote.');
@@ -117,6 +118,15 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     if (!SHA.test(head)) this.fail('HEAD_MISMATCH', 'Standalone worker HEAD is malformed.');
     if (recovery !== undefined && head !== recovery) this.fail('STALE_IDENTITY', 'Standalone restart cannot adopt a different worker HEAD.');
     if (recovery === undefined && initialBase !== undefined && head !== initialBase) this.fail('STALE_IDENTITY', 'Unrecorded pre-PR worker progress cannot be adopted after restart.');
+  }
+  /** Index flags can hide worker edits from porcelain cleanliness checks. */
+  private async assertNoWorkerIndexFlags(workspace: string): Promise<void> {
+    const entries = (await this.git(workspace, ['ls-files', '-v', '-z'])).stdout.split('\0');
+    for (const entry of entries) {
+      if (entry === '') continue;
+      // Lowercase tags are assume-unchanged; uppercase S is skip-worktree.
+      if (/^[a-zS] /.test(entry)) this.fail('DIRTY_WORKSPACE', 'Standalone worker index contains hidden-worktree flags.');
+    }
   }
   private async ancestor(cwd: string, base: string, head: string): Promise<void> { if ((await this.git(cwd, ['merge-base', '--is-ancestor', base, head], [0, 1])).exitCode !== 0) this.fail('HEAD_MISMATCH', 'Worker HEAD does not descend from its authorized base.'); }
   private async tree(cwd: string, ref: string): Promise<string> { return (await this.git(cwd, ['rev-parse', `${ref}^{tree}`])).stdout.trim(); }
@@ -146,7 +156,8 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     for (const key of Object.keys(env)) if (key.startsWith('GIT_CONFIG_') || ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'].includes(key)) delete env[key];
     env.GIT_CONFIG_NOSYSTEM = '1';
     env.GIT_CONFIG_GLOBAL = '/dev/null';
-    const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', ...args], { cwd, timeoutMs: this.timeoutMs, env });
+    env.GIT_NO_REPLACE_OBJECTS = '1';
+    const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.useReplaceRefs=false', ...args], { cwd, timeoutMs: this.timeoutMs, env });
     if (!allowed.includes(result.exitCode)) this.fail('COMMAND_FAILED', `git ${args[0]} failed.`); return result;
   }
   private fail(code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, message: string): never { throw new ImplementationBootstrapError(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE[code], message); }
@@ -176,7 +187,13 @@ function findAttributeFiles(root: string): string[] {
         if (entry.name === '.gitattributes') throw new Error('Standalone worker attribute authority must not be symbolic links.');
         continue;
       }
-      if (entry.isDirectory()) visit(candidate);
+      if (entry.isDirectory()) {
+        // A nested Git directory/worktree can carry its own config, hooks,
+        // filters and replacement refs. Host verification never recurses into
+        // worker-controlled Git repositories or submodules.
+        if (existsSync(path.join(candidate, '.git'))) throw new Error('Standalone worker checkout must not contain nested Git repositories.');
+        visit(candidate);
+      }
       else if (entry.isFile() && entry.name === '.gitattributes') found.push(candidate);
     }
   };
