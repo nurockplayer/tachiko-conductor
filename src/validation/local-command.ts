@@ -597,7 +597,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
       }
       if (this.configuration.pnpmProgram !== undefined && !hasPinnedPnpmAuthority(commandWorkspace.path, this.configuration.pnpmProgram, environment)) {
-        return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+        return { status: 'unknown', configRevision: revision, commands: [malformed(0, this.configuration.pnpmProgram)] };
       }
       // The production lane is meaningful only with a real macOS kernel
       // boundary. Do not silently degrade to environment scrubbing.
