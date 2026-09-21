@@ -15,6 +15,7 @@ export interface OperationalRuntimeProjectionV1 {
   readonly ownership: 'none' | 'active' | 'ambiguous';
   readonly checkpoint: 'durable' | 'in_progress' | 'unknown';
   readonly activeWriter?: { readonly issue?: number; readonly runId: string; readonly worker?: string; readonly worktree: string };
+  readonly manualLane?: { readonly repository: string; readonly worktree: string; readonly branch: string; readonly checkpointSha: string; readonly clean: boolean; readonly state: 'active' | 'parked'; readonly recoverable: boolean };
 }
 
 export function operationalRuntimeProjectionPath(runsDir: string): string {
@@ -55,4 +56,11 @@ export function restartVerdict(projection: OperationalRuntimeProjectionV1 | null
   if (projection.ownership !== 'none' || projection.checkpoint !== 'durable') return { verdict: 'UNKNOWN — CANNOT PROVE SAFE', reason: 'Writer ownership or durable restart checkpoint is ambiguous.' };
   if (!projection.maintenanceHold.active) return { verdict: 'SAFE NOW · WINDOW NOT GUARANTEED', reason: 'No writer is active, but new dispatch admission is not held.' };
   return { verdict: 'SAFE TO RESTART', reason: 'No writer is active, durable re-entry is proven, and maintenance hold prevents admission.' };
+}
+
+export function registerManualLane(runsDir: string, lane: NonNullable<OperationalRuntimeProjectionV1['manualLane']>, now: string): OperationalRuntimeProjectionV1 {
+  const prior = readOperationalRuntimeProjection(runsDir);
+  const active = lane.state === 'active';
+  const next: OperationalRuntimeProjectionV1 = { schemaVersion: 1, updatedAt: now, supervisor: prior?.supervisor ?? 'parked', stage: active ? 'manual_implementation' : 'manual_parked', eventWakeEligible: false, maintenanceHold: prior?.maintenanceHold ?? { active: false }, ownership: active ? 'active' : lane.recoverable && lane.clean ? 'none' : 'ambiguous', checkpoint: lane.recoverable && lane.clean ? 'durable' : 'unknown', manualLane: lane, ...(prior?.nextPollAt === undefined ? {} : { nextPollAt: prior.nextPollAt }) };
+  writeOperationalRuntimeProjection(runsDir, next); return next;
 }

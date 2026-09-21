@@ -95,7 +95,7 @@ import {
 } from './workflow/wait-command.js';
 import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
 import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
-import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, readOperationalRuntimeProjection, setMaintenanceHold, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
+import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, readOperationalRuntimeProjection, registerManualLane, setMaintenanceHold, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -1272,6 +1272,15 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
+    if (subcommand === 'manual' && (rest[0] === 'register' || rest[0] === 'park') && rest.length === 1) {
+      const worktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+      const branch = execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
+      const checkpointSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const clean = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim() === '';
+      const repository = execFileSync('git', ['config', '--get', 'remote.origin.url'], { encoding: 'utf8' }).trim();
+      console.log(JSON.stringify(registerManualLane(resolveRunsDir(), { repository, worktree, branch, checkpointSha, clean, state: rest[0] === 'register' ? 'active' : 'parked', recoverable: clean }, new Date().toISOString())));
+      return 0;
+    }
     if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
       console.log(JSON.stringify(setMaintenanceHold(resolveRunsDir(), rest[0] === 'hold', new Date().toISOString())));
       return 0;
