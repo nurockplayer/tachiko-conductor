@@ -15,9 +15,13 @@ import {
 } from '../src/production-policy.js';
 
 function environment(home: string): NodeJS.ProcessEnv {
+  const artifact = path.join(path.dirname(home), 'dependency-artifact');
+  mkdirSync(path.join(artifact, 'store'), { recursive: true });
+  writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), '0'.repeat(64));
   return {
     TACHIKO_NODE_PROGRAM: process.execPath,
     TACHIKO_PNPM_PROGRAM: process.execPath,
+    TACHIKO_PNPM_DEPENDENCY_ARTIFACT: artifact,
     TACHIKO_LUNA_CODEX_HOME: home,
     TACHIKO_PLAYWRIGHT_BROWSERS_PATH: path.dirname(home),
     TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify(PRODUCTION_EXECUTION_PROFILE_CONFIG),
@@ -41,7 +45,7 @@ describe('#104 production policy', () => {
       writeFileSync(path.join(root, 'luna', 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
       assert.deepEqual(preflightProductionPolicy(environment(path.join(root, 'luna'))), {
         revision: PRODUCTION_POLICY_REVISION, lunaCodexHome: path.join(root, 'luna'),
-        checks: ['execution-profile', 'luna-home', 'playwright-browsers', 'local-validation', 'hosted-check-policy'],
+        checks: ['execution-profile', 'luna-home', 'playwright-browsers', 'dependency-artifact', 'local-validation', 'hosted-check-policy'],
       });
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -77,7 +81,7 @@ describe('#104 production policy', () => {
     assert.match(script, /"mode":"not_required"/);
     assert.doesNotMatch(script, /requiredCheckNames/);
     const sourced = spawnSync('sh', ['-c', '. "$1"; printf "%s\\n%s\\n%s" "$TACHIKO_EXECUTION_PROFILE_CONFIG" "$TACHIKO_LOCAL_VALIDATION_CONFIG" "$TACHIKO_HOSTED_CHECK_POLICY_CONFIG"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], {
-      encoding: 'utf8', env: { ...process.env, TACHIKO_LUNA_CODEX_HOME: '/tmp/qualified-luna', TACHIKO_PLAYWRIGHT_BROWSERS_PATH: '/tmp/qualified-playwright', TACHIKO_NODE_PROGRAM: '/bin/sh', TACHIKO_PNPM_PROGRAM: '/bin/sh' },
+      encoding: 'utf8', env: { ...process.env, TACHIKO_LUNA_CODEX_HOME: '/tmp/qualified-luna', TACHIKO_PLAYWRIGHT_BROWSERS_PATH: '/tmp/qualified-playwright', TACHIKO_NODE_PROGRAM: '/bin/sh', TACHIKO_PNPM_PROGRAM: '/bin/sh', TACHIKO_PNPM_DEPENDENCY_ARTIFACT: '/tmp/qualified-dependency-artifact' },
     });
     assert.equal(sourced.status, 0, sourced.stderr);
     const [execution, local, hosted] = sourced.stdout.split('\n');

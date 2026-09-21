@@ -3,6 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
 import { ConfiguredLocalValidationAdapter } from '../src/validation/local-command.js';
@@ -34,6 +35,16 @@ function configuration(argv: readonly string[], timeoutMs = 1_000): LocalValidat
 }
 
 describe('ConfiguredLocalValidationAdapter', () => {
+  it('runs configured absolute Node and repository-pinned absolute pnpm under the macOS seatbelt', { skip: process.platform !== 'darwin' || !existsSync(path.resolve('node_modules/.bin/pnpm')) }, async () => {
+    const owned = request();
+    const pnpm = path.resolve('node_modules/.bin/pnpm');
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'darwin-real-toolchain-v1', nodeProgram: process.execPath, pnpmProgram: pnpm,
+      commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+  });
+
   it('runs explicit argument-array commands at the real process boundary and retains no output or arguments', async () => {
     const result = await new ConfiguredLocalValidationAdapter(
       configuration([process.execPath, '-e', 'process.exit(0)']),
@@ -148,6 +159,53 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const clean = request();
     const wrongHead = await adapter.validate({ ...clean, headSha: '0'.repeat(40) });
     assert.equal(wrongHead.status, 'unknown');
+  });
+
+  it('fails closed when a command creates an untracked source byte before a later command can consume it', async () => {
+    const owned = request();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'second-command-ran');
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'untracked-command-v1',
+      commands: [
+        { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('worker-created-source.js', 'unexpected')"], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 },
+      ],
+    }).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.commands.length, 2);
+    assert.equal(result.commands[1]?.outcome, 'unavailable');
+    assert.equal(existsSync(marker), false);
+  });
+
+  it('uses only a matching host lockfile-bound store for cold offline hydration and freezes its node_modules manifest', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'node_modules/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'pnpm-lock.yaml', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'lock dependency graph'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const artifact = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dependency-artifact-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-offline-pnpm-'));
+    dirs.push(artifact, tools);
+    mkdirSync(path.join(artifact, 'store'));
+    writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
+    const pnpm = path.join(tools, 'pnpm');
+    const marker = path.join(tools, 'validated');
+    writeFileSync(pnpm, `#!/bin/sh\n[ \"$npm_config_offline\" = true ] && [ \"$npm_config_store_dir\" = ${JSON.stringify(path.join(artifact, 'store'))} ] || exit 91\nmkdir -p node_modules/fixture\nprintf fixture > node_modules/fixture/index.js\n`);
+    chmodSync(pnpm, 0o755);
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'cold-offline-fixture-v1', dependencyArtifactPath: artifact,
+      commands: [
+        { argv: [pnpm], timeoutMs: 1_000 },
+        { argv: ['/bin/sh', '-c', `[ -f node_modules/fixture/index.js ] && : > ${JSON.stringify(marker)}`], timeoutMs: 1_000 },
+      ],
+    }).validate({ ...owned, headSha });
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(marker), true);
+    writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), '0'.repeat(64));
+    assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 1_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
   });
 
   it('uses a dedicated reconstruction budget rather than a short validation-command timeout', async () => {

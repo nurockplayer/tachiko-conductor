@@ -18,6 +18,8 @@ export interface LocalValidationConfiguration {
   readonly nodeProgram?: string;
   /** Absolute host-provisioned pnpm executable; never resolved from PATH. */
   readonly pnpmProgram?: string;
+  /** Read-only host artifact containing a lockfile-bound pnpm store. */
+  readonly dependencyArtifactPath?: string;
   /**
    * Explicit clean checkout for a supported pre-existing-PR run. It is never
    * inferred from the conductor process cwd and must prove target repository

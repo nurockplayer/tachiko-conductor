@@ -134,14 +134,40 @@ function workspaceMatches(
 
 /** The reconstructed checkout has no remote by design.  Bind command evidence
  * to its immutable exact commit and reject any tracked/index mutation. */
-function commandWorkspaceMatches(workspacePath: string, headSha: string): boolean {
+function commandWorkspaceManifest(workspacePath: string, headSha: string): string[] | null {
   const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, ...args], {
     encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
   const tracked = invoke(['diff', '--quiet', '--exit-code', 'HEAD', '--']);
   const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
-  return head.status === 0 && head.stdout.trim() === headSha && tracked.status === 0 && hiddenIndexFlags === false;
+  if (head.status !== 0 || head.stdout.trim() !== headSha || tracked.status !== 0 || hiddenIndexFlags !== false) return null;
+  return ignoredManifest(workspacePath, invoke);
+}
+
+function commandWorkspaceMatches(workspacePath: string, headSha: string, expectedIgnored: readonly string[] = []): boolean {
+  const manifest = commandWorkspaceManifest(workspacePath, headSha);
+  return manifest !== null && manifest.join('\n') === expectedIgnored.join('\n');
+}
+
+function lockfileBoundDependencyArtifact(workspacePath: string, artifactPath: string | undefined): string | null {
+  if (artifactPath === undefined || !path.isAbsolute(artifactPath)) return null;
+  try {
+    const artifact = realpathSync(artifactPath);
+    const stat = lstatSync(artifact);
+    const store = path.join(artifact, 'store');
+    const metadata = path.join(artifact, 'pnpm-lock.yaml.sha256');
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o022) !== 0 ||
+      !lstatSync(store).isDirectory() || lstatSync(store).isSymbolicLink() ||
+      !lstatSync(metadata).isFile() || lstatSync(metadata).isSymbolicLink() || (lstatSync(metadata).mode & 0o022) !== 0) return null;
+    const expected = readFileSync(metadata, 'utf8').trim();
+    const actual = createHash('sha256').update(readFileSync(path.join(workspacePath, 'pnpm-lock.yaml'))).digest('hex');
+    return /^[a-f0-9]{64}$/i.test(expected) && expected === actual ? store : null;
+  } catch { return null; }
+}
+
+function isHydratedDependencyManifest(manifest: readonly string[]): boolean {
+  return manifest.length === 1 && /^directory node_modules\/?\s/.test(manifest[0]!);
 }
 
 function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvidence {
@@ -393,6 +419,7 @@ function macosValidationSandboxProfile(
   workspacePath: string,
   runtimeRoot: string,
   browserArtifacts: string | undefined,
+  dependencyArtifactPath: string | undefined,
   nodeProgram: string,
   pnpmProgram: string,
 ): string | null {
@@ -403,13 +430,19 @@ function macosValidationSandboxProfile(
   } catch { return null; }
   if (!path.isAbsolute(node) || !path.isAbsolute(pnpm) || !existsSync(node) || !existsSync(pnpm)) return null;
   const reads = [
-    workspace, runtimeRoot, node, pnpm, path.dirname(node), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
+    workspace, runtimeRoot, node, pnpm, pnpmProgram, path.dirname(node), path.dirname(path.dirname(node)), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
     // pnpm launchers commonly use env/sh before entering the pinned Node
     // runtime. These are fixed macOS executables, not PATH-discovered tools.
-    '/usr/bin/env', '/bin/sh', '/usr/lib', '/System/Library',
+    '/usr/bin/env', '/bin/sh', '/usr/lib', '/System/Library', '/usr/share',
+    // Small fixed OS metadata/device set required by real Node startup. These
+    // are not user homes, caches, credentials, or configuration directories.
+    '/dev/null', '/dev/urandom', '/var/db/timezone', '/private/var/db/timezone',
   ];
   if (browserArtifacts !== undefined) {
     try { reads.push(realpathSync(browserArtifacts)); } catch { return null; }
+  }
+  if (dependencyArtifactPath !== undefined) {
+    try { reads.push(realpathSync(dependencyArtifactPath)); } catch { return null; }
   }
   const clauses = reads.map((entry) => `(allow file-read* (subpath ${sandboxLiteral(entry)}))`).join('\n');
   return `(version 1)\n(deny default)\n(deny network*)\n(allow process*)\n${clauses}\n(allow file-write* (subpath ${sandboxLiteral(workspace)}))\n(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))`;
@@ -421,7 +454,7 @@ function macosValidationSandboxProfile(
  * host-created home/cache root; notably no GitHub, SSH, ChatGPT/Codex/Luna,
  * npm, Git, or generic inherited secret variables cross this boundary.
  */
-function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string, nodeProgram?: string, pnpmProgram?: string): NodeJS.ProcessEnv {
+function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string, nodeProgram?: string, pnpmProgram?: string, dependencyStore?: string): NodeJS.ProcessEnv {
   const home = path.join(runtimeRoot, 'home');
   const cache = path.join(runtimeRoot, 'cache');
   const config = path.join(runtimeRoot, 'config');
@@ -447,6 +480,10 @@ function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrow
     if (process.env.PATHEXT !== undefined) environment.PATHEXT = process.env.PATHEXT;
   }
   if (playwrightBrowsersPath !== undefined) environment.PLAYWRIGHT_BROWSERS_PATH = playwrightBrowsersPath;
+  if (dependencyStore !== undefined) {
+    environment.npm_config_store_dir = dependencyStore;
+    environment.npm_config_offline = 'true';
+  }
   return environment;
 }
 
@@ -503,11 +540,16 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     if (!validHostBrowserArtifacts(this.configuration.playwrightBrowsersPath)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
+    const dependencyStore = lockfileBoundDependencyArtifact(commandWorkspace.path, this.configuration.dependencyArtifactPath);
+    if (this.configuration.dependencyArtifactPath !== undefined && dependencyStore === null) {
+      commandWorkspace.dispose();
+      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+    }
     const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
-    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram);
+    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, dependencyStore ?? undefined);
     const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
     const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
-      ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram) ?? undefined
+      ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram) ?? undefined
       : undefined;
     try {
       // The production lane is meaningful only with a real macOS kernel
@@ -517,6 +559,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
       }
       if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      let hydratedManifest: readonly string[] = [];
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
         if (!isCommand(command)) {
@@ -529,12 +572,16 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
           return { status: 'failed', configRevision: revision, commands: evidence };
         }
         if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
-        if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha)) {
+        const manifest = commandWorkspaceManifest(commandWorkspace.path, request.headSha);
+        if (manifest === null || (index === 0 && this.configuration.dependencyArtifactPath !== undefined
+          ? !isHydratedDependencyManifest(manifest)
+          : manifest.join('\n') !== hydratedManifest.join('\n'))) {
           evidence.push(workspaceUnavailable(evidence.length));
           return { status: 'unknown', configRevision: revision, commands: evidence };
         }
+        if (index === 0 && this.configuration.dependencyArtifactPath !== undefined) hydratedManifest = manifest;
       }
-      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha)) {
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, hydratedManifest)) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }

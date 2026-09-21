@@ -115,7 +115,7 @@ Usage:
   tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
   tachiko dispatch wake
   tachiko production preflight
-  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
+  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --pnpm-program <absolute-pnpm> --dependency-artifact-path <absolute-lockfile-bound-store> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
@@ -347,11 +347,14 @@ export function resolveLocalValidationConfiguration(
   }
   if (record.nodeProgramEnvironment !== undefined && record.nodeProgramEnvironment !== 'TACHIKO_NODE_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.nodeProgramEnvironment must be TACHIKO_NODE_PROGRAM when supplied.');
   if (record.pnpmProgramEnvironment !== undefined && record.pnpmProgramEnvironment !== 'TACHIKO_PNPM_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.pnpmProgramEnvironment must be TACHIKO_PNPM_PROGRAM when supplied.');
+  if (record.dependencyArtifactPathEnvironment !== undefined && record.dependencyArtifactPathEnvironment !== 'TACHIKO_PNPM_DEPENDENCY_ARTIFACT') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.dependencyArtifactPathEnvironment must be TACHIKO_PNPM_DEPENDENCY_ARTIFACT when supplied.');
   if ((record.nodeProgramEnvironment === undefined) !== (record.pnpmProgramEnvironment === undefined)) throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG must configure both Node and pnpm toolchain paths together.');
   const nodeProgram = record.nodeProgramEnvironment === undefined ? undefined : env.TACHIKO_NODE_PROGRAM;
   const pnpmProgram = record.pnpmProgramEnvironment === undefined ? undefined : env.TACHIKO_PNPM_PROGRAM;
+  const dependencyArtifactPath = record.dependencyArtifactPathEnvironment === undefined ? undefined : env.TACHIKO_PNPM_DEPENDENCY_ARTIFACT;
   if (record.nodeProgramEnvironment !== undefined && (typeof nodeProgram !== 'string' || nodeProgram.trim() === '' || !path.isAbsolute(nodeProgram))) throw new Error('TACHIKO_NODE_PROGRAM must be an absolute host-provisioned runtime.');
   if (record.pnpmProgramEnvironment !== undefined && (typeof pnpmProgram !== 'string' || pnpmProgram.trim() === '' || !path.isAbsolute(pnpmProgram))) throw new Error('TACHIKO_PNPM_PROGRAM must be an absolute host-provisioned pnpm executable.');
+  if (record.dependencyArtifactPathEnvironment !== undefined && (typeof dependencyArtifactPath !== 'string' || dependencyArtifactPath.trim() === '' || !path.isAbsolute(dependencyArtifactPath))) throw new Error('TACHIKO_PNPM_DEPENDENCY_ARTIFACT must be an absolute host-provisioned dependency artifact.');
   const playwrightBrowsersPath = record.playwrightBrowsersPathEnvironment === undefined ? undefined : env.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
   if (record.playwrightBrowsersPathEnvironment !== undefined &&
     (typeof playwrightBrowsersPath !== 'string' || playwrightBrowsersPath.trim() === '' || !path.isAbsolute(playwrightBrowsersPath))) {
@@ -365,6 +368,7 @@ export function resolveLocalValidationConfiguration(
     ...(playwrightBrowsersPath === undefined ? {} : { playwrightBrowsersPath }),
     ...(nodeProgram === undefined ? {} : { nodeProgram }),
     ...(pnpmProgram === undefined ? {} : { pnpmProgram }),
+    ...(dependencyArtifactPath === undefined ? {} : { dependencyArtifactPath }),
   };
 }
 
@@ -1382,6 +1386,7 @@ export async function main(argv: string[]): Promise<number> {
           program: { type: 'string' },
           'node-program': { type: 'string' },
           'pnpm-program': { type: 'string' },
+          'dependency-artifact-path': { type: 'string' },
           'luna-codex-home': { type: 'string' },
           'playwright-browsers-path': { type: 'string' },
           'working-directory': { type: 'string' },
@@ -1390,13 +1395,14 @@ export async function main(argv: string[]): Promise<number> {
           'stderr-path': { type: 'string' },
         },
       });
-      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['pnpm-program'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program, --node-program, --pnpm-program, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['pnpm-program'] === undefined || values['dependency-artifact-path'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, --pnpm-program, --dependency-artifact-path, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
       }
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
         nodeProgram: values['node-program'],
         pnpmProgram: values['pnpm-program'],
+        dependencyArtifactPath: values['dependency-artifact-path'],
         lunaCodexHome: values['luna-codex-home'],
         playwrightBrowsersPath: values['playwright-browsers-path'],
         workingDirectory: values['working-directory'],

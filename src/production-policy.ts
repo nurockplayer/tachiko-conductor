@@ -13,7 +13,7 @@ import { parseTrustedLunaConfig } from './agents/luna-isolated.js';
  * reboot-safe transport used by launchd/deployment; these values make its
  * contract testable without sourcing a user shell.
  */
-export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v3';
+export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v4';
 export const PRODUCTION_EXECUTION_PROFILE_CONFIG = {
   revision: PRODUCTION_POLICY_REVISION,
   profiles: {
@@ -32,10 +32,11 @@ export const PRODUCTION_LOCAL_VALIDATION_CONFIG = {
   playwrightBrowsersPathEnvironment: 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH',
   nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM',
   pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM',
+  dependencyArtifactPathEnvironment: 'TACHIKO_PNPM_DEPENDENCY_ARTIFACT',
   commands: [
     // This always happens in a newly reconstructed exact-HEAD checkout.  It
     // hydrates from the lockfile, never mutates it, and has no model boundary.
-    { argv: ['pnpm', 'install', '--frozen-lockfile'], timeoutMs: 300_000 },
+    { argv: ['pnpm', 'install', '--frozen-lockfile', '--offline', '--ignore-scripts'], timeoutMs: 300_000 },
     { argv: ['pnpm', 'test'], timeoutMs: 300_000 },
     { argv: ['pnpm', 'typecheck'], timeoutMs: 120_000 },
     { argv: ['pnpm', 'build'], timeoutMs: 120_000 },
@@ -53,7 +54,7 @@ export const PRODUCTION_HOSTED_CHECK_POLICY_CONFIG = {
 export interface ProductionPolicyPreflight {
   readonly revision: string;
   readonly lunaCodexHome: string;
-  readonly checks: readonly ['execution-profile', 'luna-home', 'playwright-browsers', 'local-validation', 'hosted-check-policy'];
+  readonly checks: readonly ['execution-profile', 'luna-home', 'playwright-browsers', 'dependency-artifact', 'local-validation', 'hosted-check-policy'];
 }
 
 function sameJson(left: unknown, right: unknown): boolean {
@@ -69,6 +70,13 @@ function isPrivateBrowserArtifactDirectory(directory: string): boolean {
   }
 }
 
+function isPrivateRegularFile(file: string): boolean {
+  try {
+    const stat = lstatSync(file);
+    return stat.isFile() && !stat.isSymbolicLink() && (stat.mode & 0o022) === 0;
+  } catch { return false; }
+}
+
 /**
  * Validate the complete deployed policy before dispatch/restart.  It is pure
  * configuration and local filesystem work: it neither reads GitHub nor
@@ -82,6 +90,7 @@ export function preflightProductionPolicy(env: NodeJS.ProcessEnv = process.env):
   const playwrightBrowsersPath = env.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
   const nodeProgram = env.TACHIKO_NODE_PROGRAM;
   const pnpmProgram = env.TACHIKO_PNPM_PROGRAM;
+  const dependencyArtifact = env.TACHIKO_PNPM_DEPENDENCY_ARTIFACT;
   if (executionRaw === undefined || localRaw === undefined || hostedRaw === undefined) {
     throw new Error('Issue #104 production preflight requires execution, local-validation, and hosted-check policy configuration.');
   }
@@ -96,6 +105,10 @@ export function preflightProductionPolicy(env: NodeJS.ProcessEnv = process.env):
   }
   if (pnpmProgram === undefined || !path.isAbsolute(pnpmProgram) || !existsSync(pnpmProgram)) {
     throw new Error('Issue #104 production preflight requires an existing absolute TACHIKO_PNPM_PROGRAM.');
+  }
+  if (dependencyArtifact === undefined || !path.isAbsolute(dependencyArtifact) || !isPrivateBrowserArtifactDirectory(dependencyArtifact) ||
+    !isPrivateBrowserArtifactDirectory(path.join(dependencyArtifact, 'store')) || !isPrivateRegularFile(path.join(dependencyArtifact, 'pnpm-lock.yaml.sha256'))) {
+    throw new Error('Issue #104 production preflight requires a private absolute TACHIKO_PNPM_DEPENDENCY_ARTIFACT with store and pnpm-lock.yaml.sha256.');
   }
   let suppliedExecution: unknown;
   let suppliedLocal: unknown;
@@ -134,5 +147,5 @@ export function preflightProductionPolicy(env: NodeJS.ProcessEnv = process.env):
     throw new Error('Issue #104 production Playwright browser artifact directory must be an existing private non-symlink host path; hydrate it host-side before validation.');
   }
   parseTrustedLunaConfig(readFileSync(path.join(lunaHome, 'config.toml'), 'utf8'));
-  return { revision: PRODUCTION_POLICY_REVISION, lunaCodexHome: lunaHome, checks: ['execution-profile', 'luna-home', 'playwright-browsers', 'local-validation', 'hosted-check-policy'] };
+  return { revision: PRODUCTION_POLICY_REVISION, lunaCodexHome: lunaHome, checks: ['execution-profile', 'luna-home', 'playwright-browsers', 'dependency-artifact', 'local-validation', 'hosted-check-policy'] };
 }

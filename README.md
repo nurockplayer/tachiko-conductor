@@ -436,10 +436,15 @@ fallback routes.
 
 From a stable merged checkout, set `TACHIKO_NODE_PROGRAM` and
 `TACHIKO_PNPM_PROGRAM` to the host-provisioned absolute Node and pnpm paths,
+and `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` to a private host-created directory
+containing `store/` and `pnpm-lock.yaml.sha256` (the SHA-256 of the candidate
+lockfile),
 then run `scripts/issue-104-deploy.sh preflight`. This reads only local policy
 and the qualified Luna config—no GitHub, pnpm install, or model turn. The
 production validator executes pnpm only by that explicit path, under macOS
-`sandbox-exec` with network and default filesystem access denied. `scripts/issue-104-deploy.sh restart` first persists the existing
+`sandbox-exec` with network and default filesystem access denied. The store is
+read-only to candidate code and hydration is offline; a missing, dirty, or
+lockfile-mismatched artifact makes validation unknown. `scripts/issue-104-deploy.sh restart` first persists the existing
 maintenance hold, preflights, and then restarts launchd; leave the hold in
 place until an operator explicitly verifies and releases it.
 
