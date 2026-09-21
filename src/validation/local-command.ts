@@ -86,11 +86,10 @@ function workspaceMatches(
   const head = invoke(['rev-parse', 'HEAD']);
   const manifest = ignoredManifest(workspacePath, invoke);
   if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null) return false;
-  if (manifest.length > 0) {
-    // Never globally ignore ignored paths.  They are admissible only when a
-    // separate host-owned clean checkout at this exact HEAD proves identical
-    // bytes existed before the worker could have written its workspace.
-    if (trustedIgnoredBaselinePath === undefined) return false;
+  if (trustedIgnoredBaselinePath !== undefined) {
+    // A configured baseline becomes the command cwd, even when both ignored
+    // manifests are empty.  Prove it is a separate, clean checkout of this
+    // exact implementation before it gains any execution authority.
     let baselinePath: string;
     let workerPath: string;
     try {
@@ -104,7 +103,16 @@ function workspaceMatches(
     const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
     const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
     if (baselineHead.status !== 0 || baselineHead.stdout.trim() !== request.headSha || baselineManifest === null ||
-      baselineManifest.length === 0 || baselineManifest.join('\n') !== manifest.join('\n')) return false;
+      baselineManifest.join('\n') !== manifest.join('\n')) return false;
+    if (requireRepositoryIdentity) {
+      const baselineRemote = baselineInvoke(['remote', 'get-url', 'origin']);
+      if (baselineRemote.status !== 0 || !remoteMatchesTarget(baselineRemote.stdout, request)) return false;
+    }
+  } else if (manifest.length > 0) {
+    // Never globally ignore ignored paths. They are admissible only when a
+    // separate host-owned clean checkout at this exact HEAD proves identical
+    // bytes existed before the worker could have written its workspace.
+    return false;
   }
   if (!requireRepositoryIdentity) return true;
   const remote = invoke(['remote', 'get-url', 'origin']);
@@ -128,10 +136,10 @@ interface ValidationWorkspace {
  * newly-created Git directory containing only host-created clone metadata and
  * the cryptographically addressed exact commit.
  */
-function reconstructedWorkspace(sourcePath: string, headSha: string): ValidationWorkspace | null {
+function reconstructedWorkspace(sourcePath: string, headSha: string, timeoutMs: number): ValidationWorkspace | null {
   const snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-'));
   const invoke = (args: readonly string[]) => spawnSync('git', args, {
-    encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
   });
   try {
     const cloned = invoke(['clone', '--no-local', '--no-checkout', sourcePath, snapshot]);
@@ -296,6 +304,10 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
     const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
+    const reconstructionTimeoutMs = configured.reduce(
+      (maximum, command) => isCommand(command) ? Math.max(maximum, command.timeoutMs) : maximum,
+      TERMINATION_GRACE_MS,
+    );
     if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
@@ -305,7 +317,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     // input so worker-controlled .git bytes have no validation authority.
     const baseline = this.configuration.trustedIgnoredBaselinePath;
     const commandWorkspace = baseline === undefined
-      ? reconstructedWorkspace(workspacePath, request.headSha)
+      ? reconstructedWorkspace(workspacePath, request.headSha, reconstructionTimeoutMs)
       : { path: baseline, dispose: () => {} };
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
