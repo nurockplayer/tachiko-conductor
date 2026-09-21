@@ -476,9 +476,9 @@ export async function runWorkflow(
             : snapshot.issue.body
         );
         const boundedInstructions = isIsolatedLuna && snapshot.pullRequest === null
-          ? `Task requirements:\n${snapshot.issue.body}\n\nIsolated Luna contract: implement only the host-bounded task and its tests; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
+          ? `Task title: ${snapshot.issue.title}\n\nTask requirements:\n${snapshot.issue.body}\n\nIsolated Luna contract: implement only the host-bounded task and its tests; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
           : isIsolatedLuna
-            ? `${instructions}\n\nIsolated Luna contract: implement only this bounded task and its tests; run the required tests; commit one clean exact HEAD. The trusted host, not this worker, owns every push and pull-request action.`
+            ? `Task title: ${snapshot.issue.title}\n\n${instructions}\n\nIsolated Luna contract: implement only this bounded task and its tests; run the required tests; commit one clean exact HEAD. The trusted host, not this worker, owns every push and pull-request action.`
           : instructions;
         const supplementalInstructions = isIsolatedLuna && snapshot.pullRequest === null
           ? undefined

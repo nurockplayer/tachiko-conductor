@@ -18,6 +18,12 @@ export interface LocalValidationConfiguration {
    * identity before commands execute.
    */
   readonly workspacePath?: string;
+  /**
+   * Host-owned clean checkout used to prove that ignored dependencies in an
+   * owned worker workspace pre-date the worker.  Its ignored-state manifest
+   * must exactly match before local commands may consume those bytes.
+   */
+  readonly trustedIgnoredBaselinePath?: string;
 }
 
 /** Explicit repository/run policy used to interpret the live hosted check list. */

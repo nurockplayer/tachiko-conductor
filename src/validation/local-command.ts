@@ -1,4 +1,7 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
+import path from 'node:path';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
 import type { LocalValidationConfiguration, ValidationAdapter, ValidationRequest } from '../adapters/validation.js';
@@ -33,16 +36,71 @@ function remoteMatchesTarget(remote: string, request: ValidationRequest): boolea
     repo?.replace(/\.git$/i, '').toLowerCase() === request.target.repo.toLowerCase();
 }
 
-function workspaceMatches(request: ValidationRequest, workspacePath: string, requireRepositoryIdentity: boolean): boolean {
+type GitInvoke = (args: readonly string[]) => SpawnSyncReturns<string>;
+
+function ignoredManifest(workspacePath: string, invoke: GitInvoke): string[] | null {
+  const status = invoke(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored']);
+  if (status.status !== 0) return null;
+  const ignored = status.stdout.split('\0').filter((entry) => entry.startsWith('!! ')).map((entry) => entry.slice(3));
+  const visible = status.stdout.split('\0').filter((entry) => entry !== '' && !entry.startsWith('!! '));
+  if (visible.length > 0) return null;
+  const root = path.resolve(workspacePath);
+  const fingerprint = (relative: string): string | null => {
+    const target = path.resolve(root, relative);
+    if (target !== root && !target.startsWith(`${root}${path.sep}`)) return null;
+    let stat;
+    try { stat = lstatSync(target); } catch { return null; }
+    const mode = stat.mode.toString(8);
+    if (stat.isSymbolicLink()) {
+      try { return `link ${relative} ${mode} ${createHash('sha256').update(readlinkSync(target)).digest('hex')}`; } catch { return null; }
+    }
+    if (stat.isFile()) {
+      try { return `file ${relative} ${mode} ${createHash('sha256').update(readFileSync(target)).digest('hex')}`; } catch { return null; }
+    }
+    if (!stat.isDirectory()) return null;
+    let children: readonly string[];
+    try { children = readdirSync(target).sort(); } catch { return null; }
+    const nested = children.map((name) => fingerprint(path.join(relative, name)));
+    if (nested.some((entry) => entry === null)) return null;
+    return `directory ${relative} ${mode} ${createHash('sha256').update(nested.join('\n')).digest('hex')}`;
+  };
+  const entries = ignored.map(fingerprint);
+  return entries.some((entry) => entry === null) ? null : entries.filter((entry): entry is string => entry !== null).sort();
+}
+
+function workspaceMatches(
+  request: ValidationRequest,
+  workspacePath: string,
+  requireRepositoryIdentity: boolean,
+  trustedIgnoredBaselinePath?: string,
+): boolean {
   if (workspacePath.trim() === '') return false;
-  const invoke = (args: readonly string[]) => spawnSync('git', ['-C', workspacePath, ...args], {
+  const invoke: GitInvoke = (args) => spawnSync('git', ['-C', workspacePath, ...args], {
     encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: 512,
-  });
+  }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
-  const status = invoke(['status', '--porcelain', '--untracked-files=all', '--ignored']);
-  // Authoritative validation may not consume worker-created ignored bytes:
-  // they are not represented by the committed exact HEAD.
-  if (head.status !== 0 || status.status !== 0 || head.stdout.trim() !== request.headSha || status.stdout.trim() !== '') return false;
+  const manifest = ignoredManifest(workspacePath, invoke);
+  if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null) return false;
+  if (manifest.length > 0) {
+    // Never globally ignore ignored paths.  They are admissible only when a
+    // separate host-owned clean checkout at this exact HEAD proves identical
+    // bytes existed before the worker could have written its workspace.
+    if (trustedIgnoredBaselinePath === undefined) return false;
+    let baselinePath: string;
+    let workerPath: string;
+    try {
+      baselinePath = realpathSync(trustedIgnoredBaselinePath);
+      workerPath = realpathSync(workspacePath);
+    } catch { return false; }
+    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return false;
+    const baselineInvoke: GitInvoke = (args) => spawnSync('git', ['-C', baselinePath, ...args], {
+      encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: 512,
+    }) as SpawnSyncReturns<string>;
+    const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
+    const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
+    if (baselineHead.status !== 0 || baselineHead.stdout.trim() !== request.headSha || baselineManifest === null ||
+      baselineManifest.length === 0 || baselineManifest.join('\n') !== manifest.join('\n')) return false;
+  }
   if (!requireRepositoryIdentity) return true;
   const remote = invoke(['remote', 'get-url', 'origin']);
   return remote.status === 0 && remoteMatchesTarget(remote.stdout, request);
@@ -199,7 +257,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
     const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
-    if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity)) {
+    if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
     for (let index = 0; index < configured.length; index += 1) {
@@ -215,7 +273,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       }
       if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
     }
-    if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity)) {
+    if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
       evidence.push(workspaceUnavailable(evidence.length));
       return { status: 'unknown', configRevision: revision, commands: evidence };
     }

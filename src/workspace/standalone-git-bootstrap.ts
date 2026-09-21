@@ -260,7 +260,7 @@ function hasExecutableGitConfig(raw: string): boolean {
     if (assignment === null) return true;
     const key = assignment[1]!.toLowerCase();
     if (section === 'filter' || key === 'filter' || key.startsWith('filter.') ||
-      (section === 'core' && ['hookspath', 'fsmonitor', 'sshcommand', 'attributesfile', 'worktree'].includes(key)) ||
+      (section === 'core' && ['hookspath', 'fsmonitor', 'sshcommand', 'attributesfile', 'worktree', 'trustctime', 'checkstat'].includes(key)) ||
       (section === 'include' && key === 'path') || section === 'includeif') return true;
   }
   return false;

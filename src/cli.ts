@@ -303,10 +303,15 @@ export function resolveLocalValidationConfiguration(
     (typeof record.workspacePath !== 'string' || record.workspacePath.trim() === '' || !path.isAbsolute(record.workspacePath))) {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.workspacePath must be an absolute non-empty path when supplied.');
   }
+  if (record.trustedIgnoredBaselinePath !== undefined &&
+    (typeof record.trustedIgnoredBaselinePath !== 'string' || record.trustedIgnoredBaselinePath.trim() === '' || !path.isAbsolute(record.trustedIgnoredBaselinePath))) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.trustedIgnoredBaselinePath must be an absolute non-empty path when supplied.');
+  }
   return {
     revision: record.revision,
     commands,
     ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
+    ...(record.trustedIgnoredBaselinePath === undefined ? {} : { trustedIgnoredBaselinePath: record.trustedIgnoredBaselinePath }),
   };
 }
 

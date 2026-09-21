@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -88,12 +88,41 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore env'], { encoding: 'utf8' }).status, 0);
     const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
     writeFileSync(path.join(owned.workspacePath, '.env'), 'worker-created=true\n');
-    const marker = path.join(owned.workspacePath, 'validation-ran');
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'validation-ran');
     const result = await new ConfiguredLocalValidationAdapter(
       configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
     ).validate({ ...owned, headSha });
     assert.equal(result.status, 'unknown');
     assert.equal(existsSync(marker), false);
+  });
+
+  it('permits only an identical ignored dependency baseline, never new worker ignored state', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'node_modules/\n.env\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore dependencies'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const baseline = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-'));
+    dirs.push(baseline);
+    assert.equal(spawnSync('git', ['clone', owned.workspacePath, baseline], { encoding: 'utf8' }).status, 0);
+    for (const workspace of [baseline, owned.workspacePath]) {
+      mkdirSync(path.join(workspace, 'node_modules', 'trusted'), { recursive: true });
+      writeFileSync(path.join(workspace, 'node_modules', 'trusted', 'index.js'), 'module.exports = true\n');
+    }
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'validation-ran');
+    const adapter = new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+      trustedIgnoredBaselinePath: baseline,
+    });
+    assert.equal((await adapter.validate({ ...owned, headSha })).status, 'passed');
+    assert.equal(existsSync(marker), true);
+
+    writeFileSync(path.join(owned.workspacePath, '.env'), 'worker-created=true\n');
+    assert.equal((await adapter.validate({ ...owned, headSha })).status, 'unknown');
   });
 
   it('runs a configured real command for an explicit verified pre-existing-PR workspace, never the ambient cwd', async () => {

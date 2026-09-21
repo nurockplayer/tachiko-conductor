@@ -425,7 +425,7 @@ export async function runReviewLoop(
         return parkBootstrap(run, new Error('Isolated Luna repair requires a fresh bounded Issue packet.'), store, now);
       }
       const repairInstructions = isolatedLuna
-        ? `Task requirements:\n${repairSnapshot!.issue.body}\n\nRepair requirements:\n${blockingFindings}\n\nIsolated Luna contract: implement only the host-bounded task and repair; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
+        ? `Task title: ${repairSnapshot!.issue.title}\n\nTask requirements:\n${repairSnapshot!.issue.body}\n\nRepair requirements:\n${blockingFindings}\n\nIsolated Luna contract: implement only the host-bounded task and repair; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
         : blockingFindings;
       if (run.bootstrap?.bootstrapKind === 'standalone-isolated' && !isolatedLuna) {
         return parkBootstrap(run, new Error('A standalone Luna workspace cannot transition to a non-Luna repair transport.'), store, now);

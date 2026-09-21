@@ -505,6 +505,7 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'revalidating');
     assert.equal(resolved, 0);
     assert.equal(implementation.requests[0]?.capabilities, undefined);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Task title: Fix the widget/);
     assert.match(implementation.requests[0]?.instructions ?? '', /Original bounded requirement\./);
     assert.match(implementation.requests[0]?.instructions ?? '', /\[blocking\] the diff has a bug/);
   });

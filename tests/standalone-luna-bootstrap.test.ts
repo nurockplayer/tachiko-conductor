@@ -217,4 +217,15 @@ describe('standalone Luna bootstrap', () => {
     fixture.git(identity.workspacePath, ['config', 'core.worktree', '../other-tree']);
     await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); }, /Git config requests executable behavior/);
   });
+
+  it('rejects stat-cache settings that can hide tracked worker byte changes', async () => {
+    for (const [key, value] of [['core.trustctime', 'false'], ['core.checkStat', 'minimal']] as const) {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const request = { runId: `luna-${key}`, target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+      const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+      fixture.git(identity.workspacePath, ['config', key, value]);
+      await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /Git config requests executable behavior/, key);
+    }
+  });
 });
