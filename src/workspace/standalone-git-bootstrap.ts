@@ -151,6 +151,12 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private assertWorkerGitSurface(workspace: string): void {
     const gitDir = path.join(workspace, '.git');
     if (!existsSync(gitDir) || !lstatSync(gitDir).isDirectory()) this.fail('STALE_IDENTITY', 'Standalone worker Git directory changed.');
+    // A standalone checkout owns its complete Git directory. A worker-created
+    // common-dir indirection would move config, refs, objects and grafts out
+    // of the sealed surface below, so reject it before any host Git command.
+    if (existsSync(path.join(gitDir, 'commondir'))) {
+      this.fail('STALE_IDENTITY', 'Standalone worker Git directory redirects its common metadata.');
+    }
     // Git still honors legacy graft files even when replacement refs are
     // disabled. Reject this alternate ancestry authority before a host-owned
     // Git command can use it to certify an unrelated worker commit.

@@ -215,6 +215,15 @@ describe('standalone Luna bootstrap', () => {
     await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /legacy graft ancestry/);
   });
 
+  it('rejects a worker-created common-dir redirect before host Git inspects the checkout', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-common-dir', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    writeFileSync(path.join(identity.workspacePath, '.git', 'commondir'), '../worker-controlled-common\n');
+    await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /redirects its common metadata/);
+  });
+
   it('rejects executable worktree config before its fsmonitor payload can run', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
