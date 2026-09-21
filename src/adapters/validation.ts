@@ -14,6 +14,10 @@ export interface LocalValidationConfiguration {
   readonly commands: readonly LocalValidationCommandConfiguration[];
   /** Host-owned browser artifacts; never inferred from a user cache. */
   readonly playwrightBrowsersPath?: string;
+  /** Absolute host-provisioned runtime used by the macOS sandboxed lane. */
+  readonly nodeProgram?: string;
+  /** Absolute host-provisioned pnpm executable; never resolved from PATH. */
+  readonly pnpmProgram?: string;
   /**
    * Explicit clean checkout for a supported pre-existing-PR run. It is never
    * inferred from the conductor process cwd and must prove target repository

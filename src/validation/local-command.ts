@@ -136,6 +136,18 @@ function workspaceMatches(
   return remote.status === 0 && remoteMatchesTarget(remote.stdout, request);
 }
 
+/** The reconstructed checkout has no remote by design.  Bind command evidence
+ * to its immutable exact commit and reject any tracked/index mutation. */
+function commandWorkspaceMatches(workspacePath: string, headSha: string): boolean {
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, ...args], {
+    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+  }) as SpawnSyncReturns<string>;
+  const head = invoke(['rev-parse', 'HEAD']);
+  const tracked = invoke(['diff', '--quiet', '--exit-code', 'HEAD', '--']);
+  const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
+  return head.status === 0 && head.stdout.trim() === headSha && tracked.status === 0 && hiddenIndexFlags === false;
+}
+
 function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvidence {
   return { commandIndex, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 };
 }
@@ -306,6 +318,7 @@ async function execute(
   command: { readonly argv: readonly string[]; readonly timeoutMs: number },
   workspacePath: string,
   environment: NodeJS.ProcessEnv,
+  sandboxProfile?: string,
 ): Promise<LocalValidationCommandEvidence> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
@@ -338,7 +351,11 @@ async function execute(
     };
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(executable, command.argv.slice(1), {
+      child = sandboxProfile === undefined
+        ? spawn(executable, command.argv.slice(1), {
+          shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
+        })
+        : spawn('/usr/bin/sandbox-exec', ['-p', sandboxProfile, executable, ...command.argv.slice(1)], {
         shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
       });
     } catch {
@@ -367,13 +384,48 @@ async function execute(
   });
 }
 
+function sandboxLiteral(value: string): string { return JSON.stringify(value); }
+
+/**
+ * Build a host-side seatbelt profile. This is intentionally not an environment
+ * convention: default filesystem and all networking are denied by the kernel.
+ * The only broad system reads are macOS's loader/library roots; host-provided
+ * toolchain executables and their immediate dependency directories are named
+ * absolutely, and candidate code receives no other host paths.
+ */
+function macosValidationSandboxProfile(
+  workspacePath: string,
+  runtimeRoot: string,
+  browserArtifacts: string | undefined,
+  nodeProgram: string,
+  pnpmProgram: string,
+): string | null {
+  if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return null;
+  let workspace: string; let node: string; let pnpm: string;
+  try {
+    workspace = realpathSync(workspacePath); node = realpathSync(nodeProgram); pnpm = realpathSync(pnpmProgram);
+  } catch { return null; }
+  if (!path.isAbsolute(node) || !path.isAbsolute(pnpm) || !existsSync(node) || !existsSync(pnpm)) return null;
+  const reads = [
+    workspace, runtimeRoot, node, pnpm, path.dirname(node), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
+    // pnpm launchers commonly use env/sh before entering the pinned Node
+    // runtime. These are fixed macOS executables, not PATH-discovered tools.
+    '/usr/bin/env', '/bin/sh', '/usr/lib', '/System/Library',
+  ];
+  if (browserArtifacts !== undefined) {
+    try { reads.push(realpathSync(browserArtifacts)); } catch { return null; }
+  }
+  const clauses = reads.map((entry) => `(allow file-read* (subpath ${sandboxLiteral(entry)}))`).join('\n');
+  return `(version 1)\n(deny default)\n(deny network*)\n(allow process*)\n${clauses}\n(allow file-write* (subpath ${sandboxLiteral(workspace)}))\n(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))`;
+}
+
 /**
  * Validation commands are candidate-controlled code and must not receive the
  * dispatcher's credentials.  Keep only command resolution and a fresh,
  * host-created home/cache root; notably no GitHub, SSH, ChatGPT/Codex/Luna,
  * npm, Git, or generic inherited secret variables cross this boundary.
  */
-function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string): NodeJS.ProcessEnv {
+function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string, nodeProgram?: string, pnpmProgram?: string): NodeJS.ProcessEnv {
   const home = path.join(runtimeRoot, 'home');
   const cache = path.join(runtimeRoot, 'cache');
   const config = path.join(runtimeRoot, 'config');
@@ -383,7 +435,9 @@ function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrow
     try { mkdirSync(directory, { recursive: true, mode: 0o700 }); } catch { /* handled by command failure */ }
   }
   const environment: NodeJS.ProcessEnv = {
-    PATH: process.env.PATH ?? (process.platform === 'win32' ? process.env.Path : undefined),
+    PATH: nodeProgram === undefined || pnpmProgram === undefined
+      ? process.env.PATH ?? (process.platform === 'win32' ? process.env.Path : undefined)
+      : [path.dirname(pnpmProgram), path.dirname(nodeProgram)].filter((entry, index, all) => all.indexOf(entry) === index).join(path.delimiter),
     HOME: home,
     XDG_CACHE_HOME: cache,
     XDG_CONFIG_HOME: config,
@@ -431,7 +485,11 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const evidence: LocalValidationCommandEvidence[] = [];
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
-    const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
+    // Every candidate source must prove its GitHub target before its detached
+    // reconstruction becomes command authority. A detached reconstruction has
+    // no origin deliberately, so this source proof binds its exact objects to
+    // the command workspace at creation and again at final settlement.
+    const requiresRepositoryIdentity = true;
     if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
@@ -450,20 +508,39 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
     const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
-    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath);
+    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath, this.configuration.nodeProgram, this.configuration.pnpmProgram);
+    const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
+    const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
+      ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath, this.configuration.nodeProgram, this.configuration.pnpmProgram)
+      : undefined;
     try {
+      // The production lane is meaningful only with a real macOS kernel
+      // boundary. Do not silently degrade to environment scrubbing.
+      if (configuredToolchain && (sandboxProfile === null || sandboxProfile === undefined)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      if (this.configuration.pnpmProgram !== undefined && configured.some((command) => !isCommand(command) || command.argv[0] !== this.configuration.pnpmProgram)) {
+        return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
+      }
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
         if (!isCommand(command)) {
           evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
           return { status: 'unknown', configRevision: revision, commands: evidence };
         }
-        const result = await execute(index, command, commandWorkspace.path, environment);
+        const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile);
         evidence.push(result);
         if (result.outcome === 'failed' || result.outcome === 'timed_out') {
           return { status: 'failed', configRevision: revision, commands: evidence };
         }
         if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+        if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha)) {
+          evidence.push(workspaceUnavailable(evidence.length));
+          return { status: 'unknown', configRevision: revision, commands: evidence };
+        }
+      }
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha)) {
+        evidence.push(workspaceUnavailable(evidence.length));
+        return { status: 'unknown', configRevision: revision, commands: evidence };
       }
       if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
         evidence.push(workspaceUnavailable(evidence.length));

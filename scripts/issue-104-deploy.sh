@@ -10,6 +10,9 @@ if [ ! -x "$TACHIKO_NODE_PROGRAM" ]; then
   echo "TACHIKO_NODE_PROGRAM is not executable: $TACHIKO_NODE_PROGRAM" >&2
   exit 78
 fi
+: "${TACHIKO_PNPM_PROGRAM:?TACHIKO_PNPM_PROGRAM must name the host-provisioned absolute pnpm executable}"
+case "$TACHIKO_PNPM_PROGRAM" in /*) ;; *) echo "TACHIKO_PNPM_PROGRAM must be an absolute path" >&2; exit 78 ;; esac
+if [ ! -x "$TACHIKO_PNPM_PROGRAM" ]; then echo "TACHIKO_PNPM_PROGRAM is not executable: $TACHIKO_PNPM_PROGRAM" >&2; exit 78; fi
 
 preflight() {
   "$TACHIKO_NODE_PROGRAM" "$ROOT/node_modules/tsx/dist/cli.mjs" "$ROOT/src/cli.ts" production preflight

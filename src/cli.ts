@@ -345,6 +345,13 @@ export function resolveLocalValidationConfiguration(
   if (record.playwrightBrowsersPathEnvironment !== undefined && record.playwrightBrowsersPathEnvironment !== 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH') {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.playwrightBrowsersPathEnvironment must be TACHIKO_PLAYWRIGHT_BROWSERS_PATH when supplied.');
   }
+  if (record.nodeProgramEnvironment !== undefined && record.nodeProgramEnvironment !== 'TACHIKO_NODE_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.nodeProgramEnvironment must be TACHIKO_NODE_PROGRAM when supplied.');
+  if (record.pnpmProgramEnvironment !== undefined && record.pnpmProgramEnvironment !== 'TACHIKO_PNPM_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.pnpmProgramEnvironment must be TACHIKO_PNPM_PROGRAM when supplied.');
+  if ((record.nodeProgramEnvironment === undefined) !== (record.pnpmProgramEnvironment === undefined)) throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG must configure both Node and pnpm toolchain paths together.');
+  const nodeProgram = record.nodeProgramEnvironment === undefined ? undefined : env.TACHIKO_NODE_PROGRAM;
+  const pnpmProgram = record.pnpmProgramEnvironment === undefined ? undefined : env.TACHIKO_PNPM_PROGRAM;
+  if (record.nodeProgramEnvironment !== undefined && (typeof nodeProgram !== 'string' || nodeProgram.trim() === '' || !path.isAbsolute(nodeProgram))) throw new Error('TACHIKO_NODE_PROGRAM must be an absolute host-provisioned runtime.');
+  if (record.pnpmProgramEnvironment !== undefined && (typeof pnpmProgram !== 'string' || pnpmProgram.trim() === '' || !path.isAbsolute(pnpmProgram))) throw new Error('TACHIKO_PNPM_PROGRAM must be an absolute host-provisioned pnpm executable.');
   const playwrightBrowsersPath = record.playwrightBrowsersPathEnvironment === undefined ? undefined : env.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
   if (record.playwrightBrowsersPathEnvironment !== undefined &&
     (typeof playwrightBrowsersPath !== 'string' || playwrightBrowsersPath.trim() === '' || !path.isAbsolute(playwrightBrowsersPath))) {
@@ -352,10 +359,12 @@ export function resolveLocalValidationConfiguration(
   }
   return {
     revision: record.revision,
-    commands,
+    commands: commands.map((command) => ({ ...command, argv: command.argv[0] === 'pnpm' && pnpmProgram !== undefined ? [pnpmProgram, ...command.argv.slice(1)] : command.argv })),
     ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
     ...(record.trustedIgnoredBaselinePath === undefined ? {} : { trustedIgnoredBaselinePath: record.trustedIgnoredBaselinePath }),
     ...(playwrightBrowsersPath === undefined ? {} : { playwrightBrowsersPath }),
+    ...(nodeProgram === undefined ? {} : { nodeProgram }),
+    ...(pnpmProgram === undefined ? {} : { pnpmProgram }),
   };
 }
 
@@ -1372,6 +1381,7 @@ export async function main(argv: string[]): Promise<number> {
         options: {
           program: { type: 'string' },
           'node-program': { type: 'string' },
+          'pnpm-program': { type: 'string' },
           'luna-codex-home': { type: 'string' },
           'playwright-browsers-path': { type: 'string' },
           'working-directory': { type: 'string' },
@@ -1380,12 +1390,13 @@ export async function main(argv: string[]): Promise<number> {
           'stderr-path': { type: 'string' },
         },
       });
-      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program, --node-program, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['pnpm-program'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, --pnpm-program, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
       }
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
         nodeProgram: values['node-program'],
+        pnpmProgram: values['pnpm-program'],
         lunaCodexHome: values['luna-codex-home'],
         playwrightBrowsersPath: values['playwright-browsers-path'],
         workingDirectory: values['working-directory'],

@@ -12,6 +12,8 @@ export interface DispatchLaunchdOptions {
   readonly program: string;
   /** Stable absolute Node runtime supplied by the post-merge installer. */
   readonly nodeProgram: string;
+  /** Stable absolute pnpm executable used by sandboxed local validation. */
+  readonly pnpmProgram: string;
   /** Owner-controlled, durable Luna configuration; never an implicit default. */
   readonly lunaCodexHome: string;
   /** Host-provisioned Playwright artifacts, never an ambient user cache. */
@@ -36,6 +38,7 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(label)) throw new Error('launchd label contains unsupported characters.');
   const program = absolute(options.program, 'launchd program');
   const nodeProgram = absolute(options.nodeProgram, 'launchd node program');
+  const pnpmProgram = absolute(options.pnpmProgram, 'launchd pnpm program');
   const lunaCodexHome = absolute(options.lunaCodexHome, 'launchd Luna CODEX_HOME');
   const playwrightBrowsersPath = absolute(options.playwrightBrowsersPath, 'launchd Playwright browser artifact path');
   const workingDirectory = absolute(options.workingDirectory, 'launchd working directory');
@@ -48,7 +51,7 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   <key>Label</key><string>${xml(label)}</string>
   <key>ProgramArguments</key><array><string>${xml(program)}</string></array>
   <key>WorkingDirectory</key><string>${xml(workingDirectory)}</string>
-  <key>EnvironmentVariables</key><dict><key>TACHIKO_NODE_PROGRAM</key><string>${xml(nodeProgram)}</string><key>TACHIKO_LUNA_CODEX_HOME</key><string>${xml(lunaCodexHome)}</string><key>TACHIKO_PLAYWRIGHT_BROWSERS_PATH</key><string>${xml(playwrightBrowsersPath)}</string><key>TACHIKO_EXECUTION_PROFILE_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_EXECUTION_PROFILE_CONFIG))}</string><key>TACHIKO_LOCAL_VALIDATION_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_LOCAL_VALIDATION_CONFIG))}</string><key>TACHIKO_HOSTED_CHECK_POLICY_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_HOSTED_CHECK_POLICY_CONFIG))}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>TACHIKO_NODE_PROGRAM</key><string>${xml(nodeProgram)}</string><key>TACHIKO_PNPM_PROGRAM</key><string>${xml(pnpmProgram)}</string><key>TACHIKO_LUNA_CODEX_HOME</key><string>${xml(lunaCodexHome)}</string><key>TACHIKO_PLAYWRIGHT_BROWSERS_PATH</key><string>${xml(playwrightBrowsersPath)}</string><key>TACHIKO_EXECUTION_PROFILE_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_EXECUTION_PROFILE_CONFIG))}</string><key>TACHIKO_LOCAL_VALIDATION_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_LOCAL_VALIDATION_CONFIG))}</string><key>TACHIKO_HOSTED_CHECK_POLICY_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_HOSTED_CHECK_POLICY_CONFIG))}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>

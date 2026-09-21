@@ -434,10 +434,12 @@ exact candidate, and the hosted-check policy. Luna rejects `standard`,
 `complex`, and `critical` before provider construction; they are not quiet
 fallback routes.
 
-From a stable merged checkout, set `TACHIKO_NODE_PROGRAM` to its stable
-absolute Node path and run `scripts/issue-104-deploy.sh preflight`. This reads
-only local policy and the qualified Luna config—no GitHub, pnpm install, or
-model turn. `scripts/issue-104-deploy.sh restart` first persists the existing
+From a stable merged checkout, set `TACHIKO_NODE_PROGRAM` and
+`TACHIKO_PNPM_PROGRAM` to the host-provisioned absolute Node and pnpm paths,
+then run `scripts/issue-104-deploy.sh preflight`. This reads only local policy
+and the qualified Luna config—no GitHub, pnpm install, or model turn. The
+production validator executes pnpm only by that explicit path, under macOS
+`sandbox-exec` with network and default filesystem access denied. `scripts/issue-104-deploy.sh restart` first persists the existing
 maintenance hold, preflights, and then restarts launchd; leave the hold in
 place until an operator explicitly verifies and releases it.
 
