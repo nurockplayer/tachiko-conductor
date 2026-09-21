@@ -17,11 +17,11 @@ const TASK_KINDS = Object.freeze([
 ]);
 const TASK_SHAPES = Object.freeze(['bounded', 'interacting', 'decision']);
 const WRITER_KINDS = new Set(['implementation', 'repair']);
-const TRUSTED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER']);
+const TRUSTED_ASSOCIATIONS = new Set(['OWNER']);
 
 const LABEL_DEFINITIONS = Object.freeze({
   'kind:implementation': { color: '1f6feb', description: 'Repository implementation work.' },
-  'kind:repair': { color: '388bfd', description: 'Bounded implementation repair work.' },
+  'kind:repair': { color: '388bfd', description: 'Repository implementation repair work.' },
   'kind:research': { color: '8250df', description: 'Read-only research/evidence work.' },
   'kind:decision': { color: 'a371f7', description: 'Steward/Oracle decision boundary; zero implementation writer.' },
   'kind:operational': { color: 'fb8f44', description: 'Operational/runtime action; not implementation dispatch.' },
