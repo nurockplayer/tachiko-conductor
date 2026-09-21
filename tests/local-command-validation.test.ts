@@ -12,11 +12,14 @@ import { TARGET } from './helpers.js';
 
 const dirs: string[] = [];
 
-function request() {
+function request(packageManager?: string) {
   const workspacePath = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-'));
   dirs.push(workspacePath);
   for (const args of [['init'], ['config', 'user.email', 'validation@example.test'], ['config', 'user.name', 'Validation'], ['add', '.'], ['commit', '-m', 'initial']]) {
-    if (args[0] === 'add') writeFileSync(path.join(workspacePath, 'README.md'), 'validation\n');
+    if (args[0] === 'add') {
+      writeFileSync(path.join(workspacePath, 'README.md'), 'validation\n');
+      if (packageManager !== undefined) writeFileSync(path.join(workspacePath, 'package.json'), JSON.stringify({ packageManager }));
+    }
     assert.equal(spawnSync('git', ['-C', workspacePath, ...args], { encoding: 'utf8' }).status, 0);
   }
   const headSha = spawnSync('git', ['-C', workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
@@ -74,7 +77,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
   });
 
   it('rejects substituted or mismatched pnpm before a validation command can run', async () => {
-    const owned = request();
+    const owned = request('pnpm@10.34.5');
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
     dirs.push(proofDir);
     const marker = path.join(proofDir, 'validation-ran');
