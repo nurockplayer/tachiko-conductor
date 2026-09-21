@@ -174,7 +174,8 @@ function formProposal(issue) {
     oracleRequired = true;
   }
   const seed = { kind, shape, executionProfile, oracleRequired };
-  const digest = crypto.createHash('sha256').update(JSON.stringify(seed)).digest('hex').slice(0, 12);
+  const sourceBody = typeof issue.body === 'string' ? issue.body : '';
+  const digest = crypto.createHash('sha256').update(JSON.stringify({ ...seed, sourceBody })).digest('hex').slice(0, 12);
   return { authority: { revision: `issue-form-v1:${digest}`, ...seed } };
 }
 
