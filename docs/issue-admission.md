@@ -30,7 +30,7 @@ decision    -> Steward/Oracle, zero implementation writer
 
 ## Trust boundary
 
-Issue Forms are structured intake. For repository owners/organization members (`OWNER` or `MEMBER`), a complete form may become trusted task authority. A `COLLABORATOR` association is intentionally not enough by itself; collaborators require explicit Steward authority before unattended writer admission. For untrusted authors, the same form is only a proposal and receives `needs:steward`; it cannot receive `dispatch:ready`.
+Issue Forms are structured intake. Only an `OWNER` Issue Form submission becomes trusted task authority automatically. `MEMBER`, `COLLABORATOR`, and external associations require explicit OWNER/Steward authority before unattended writer admission; association alone is not treated as repository-write authority. For untrusted authors, the same form is only a proposal and receives `needs:steward`; it cannot receive `dispatch:ready`.
 
 A trusted Steward may author/reconcile an Issue through a body or comment containing this strict marker and JSON:
 
