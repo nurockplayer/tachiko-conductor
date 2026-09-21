@@ -205,6 +205,7 @@ execution, or provider credentials and is not a calendar wake:
 ```bash
 pnpm exec tsx src/cli.ts dispatch launchd render \
   --program '/absolute/path/to/run-dispatch-driver.sh' \
+  --node-program '/stable/absolute/path/to/node' \
   --working-directory "$PWD" \
   > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
