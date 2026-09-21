@@ -1,0 +1,102 @@
+name: Issue admission
+
+"on":
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to reconcile
+        required: true
+        type: number
+  issues:
+    types: [opened, edited, reopened, closed, labeled, unlabeled]
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: issue-admission-${{ github.repository }}-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event.issue.pull_request == null) && github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    env:
+      TACHIKO_ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+    steps:
+      - name: Checkout admission policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconcile issue admission
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const path = require('node:path');
+            const admission = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/issue-admission.cjs'));
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.TACHIKO_ISSUE_NUMBER);
+            if (!Number.isSafeInteger(issue_number) || issue_number < 1) {
+              core.setFailed('A positive issue number is required.');
+              return;
+            }
+
+            const issue = (await github.rest.issues.get({ owner, repo, issue_number })).data;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100,
+            });
+
+            const decision = admission.classifyIssue({ issue, comments });
+
+            const repoLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
+              owner,
+              repo,
+              per_page: 100,
+            });
+            const existingDefinitions = new Set(repoLabels.map((label) => label.name));
+            for (const [name, definition] of Object.entries(admission.LABEL_DEFINITIONS)) {
+              if (existingDefinitions.has(name)) continue;
+              await github.rest.issues.createLabel({ owner, repo, name, ...definition });
+            }
+
+            const currentLabels = issue.labels
+              .map((label) => typeof label === 'string' ? label : label.name)
+              .filter((label) => typeof label === 'string' && label !== '');
+            const nextLabels = admission.reconcileLabels(currentLabels, decision.labels);
+            const sameLabels = currentLabels.length === nextLabels.length &&
+              [...currentLabels].sort().every((label, index) => label === nextLabels[index]);
+            if (!sameLabels) {
+              await github.rest.issues.setLabels({ owner, repo, issue_number, labels: nextLabels });
+            }
+
+            const body = admission.renderAdmission(decision);
+            const managed = comments.filter((comment) =>
+              comment.user?.login === 'github-actions[bot]' &&
+              typeof comment.body === 'string' &&
+              comment.body.includes(admission.ADMISSION_MARKER)
+            );
+            managed.sort((a, b) => Number(a.id) - Number(b.id));
+
+            if (managed.length === 0) {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            } else {
+              const canonical = managed[0];
+              if (canonical.body !== body) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: canonical.id, body });
+              }
+              for (const duplicate of managed.slice(1)) {
+                await github.rest.issues.updateComment({
+                  owner,
+                  repo,
+                  comment_id: duplicate.id,
+                  body: `Superseded by canonical Tachiko issue-admission comment ${canonical.html_url}.`,
+                });
+              }
+            }
