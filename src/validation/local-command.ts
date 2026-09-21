@@ -121,10 +121,6 @@ function workspaceMatches(
     const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
     if (baselineHead.status !== 0 || baselineHead.stdout.trim() !== request.headSha || baselineManifest === null ||
       baselineManifest.join('\n') !== manifest.join('\n') || baselineHiddenIndexFlags !== false) return false;
-    if (requireRepositoryIdentity) {
-      const baselineRemote = baselineInvoke(['remote', 'get-url', 'origin']);
-      if (baselineRemote.status !== 0 || !remoteMatchesTarget(baselineRemote.stdout, request)) return false;
-    }
   } else if (manifest.length > 0) {
     // Never globally ignore ignored paths. They are admissible only when a
     // separate host-owned clean checkout at this exact HEAD proves identical
