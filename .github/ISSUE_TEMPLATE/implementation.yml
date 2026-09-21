@@ -1,0 +1,76 @@
+name: Implementation / Repair
+description: Repository changes that may enter Tachiko implementation dispatch after classification.
+title: "[Task] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form only for repository implementation or repair work. Task shape is provider-neutral: bounded -> routine, interacting -> complex, decision -> Steward/Oracle with zero writer.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - implementation
+        - repair
+    validations:
+      required: true
+  - type: dropdown
+    id: task_shape
+    attributes:
+      label: Task shape
+      description: Choose decision when implementation must stop for a product/architecture/security authority decision first.
+      options:
+        - bounded
+        - interacting
+        - decision
+    validations:
+      required: true
+  - type: textarea
+    id: classification_reason
+    attributes:
+      label: Classification reason
+      description: Explain why the selected task shape is appropriate. Do not name a provider/model as the reason.
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: Concrete allowed implementation surface.
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Explicitly excluded work.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Deterministic conditions that prove the task is complete.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: Blocking Issues, PRs, decisions, or runtime prerequisites. Write "none" when there are none.
+    validations:
+      required: true
+  - type: textarea
+    id: stop_conditions
+    attributes:
+      label: Stop conditions
+      description: Conditions that require parking/escalation instead of guessing or expanding scope.
+    validations:
+      required: true
