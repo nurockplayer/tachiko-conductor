@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
+import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -305,6 +305,7 @@ async function execute(
   commandIndex: number,
   command: { readonly argv: readonly string[]; readonly timeoutMs: number },
   workspacePath: string,
+  environment: NodeJS.ProcessEnv,
 ): Promise<LocalValidationCommandEvidence> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
@@ -338,7 +339,7 @@ async function execute(
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(executable, command.argv.slice(1), {
-        shell: false, stdio: 'ignore', cwd: workspacePath, detached: process.platform !== 'win32',
+        shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
       });
     } catch {
       finish('unavailable', null);
@@ -364,6 +365,38 @@ async function execute(
       finish(code === 0 ? 'passed' : 'failed', code);
     });
   });
+}
+
+/**
+ * Validation commands are candidate-controlled code and must not receive the
+ * dispatcher's credentials.  Keep only command resolution and a fresh,
+ * host-created home/cache root; notably no GitHub, SSH, ChatGPT/Codex/Luna,
+ * npm, Git, or generic inherited secret variables cross this boundary.
+ */
+function credentialFreeValidationEnvironment(runtimeRoot: string): NodeJS.ProcessEnv {
+  const home = path.join(runtimeRoot, 'home');
+  const cache = path.join(runtimeRoot, 'cache');
+  const config = path.join(runtimeRoot, 'config');
+  // These are host-created directories, not a dispatcher-owned HOME where
+  // pnpm/npm configuration or auth could reside.
+  for (const directory of [home, cache, config]) {
+    try { mkdirSync(directory, { recursive: true, mode: 0o700 }); } catch { /* handled by command failure */ }
+  }
+  const environment: NodeJS.ProcessEnv = {
+    PATH: process.env.PATH ?? (process.platform === 'win32' ? process.env.Path : undefined),
+    HOME: home,
+    XDG_CACHE_HOME: cache,
+    XDG_CONFIG_HOME: config,
+    // Avoid an interactive prompt in the isolated pnpm invocation.
+    CI: 'true',
+  };
+  if (process.platform === 'win32') {
+    environment.USERPROFILE = home;
+    if (process.env.SystemRoot !== undefined) environment.SystemRoot = process.env.SystemRoot;
+    if (process.env.COMSPEC !== undefined) environment.COMSPEC = process.env.COMSPEC;
+    if (process.env.PATHEXT !== undefined) environment.PATHEXT = process.env.PATHEXT;
+  }
+  return environment;
 }
 
 /** Runs only the explicitly supplied repository/run validation commands. */
@@ -402,6 +435,8 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
+    const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
+    const environment = credentialFreeValidationEnvironment(runtimeRoot);
     try {
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
@@ -409,7 +444,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
           evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
           return { status: 'unknown', configRevision: revision, commands: evidence };
         }
-        const result = await execute(index, command, commandWorkspace.path);
+        const result = await execute(index, command, commandWorkspace.path, environment);
         evidence.push(result);
         if (result.outcome === 'failed' || result.outcome === 'timed_out') {
           return { status: 'failed', configRevision: revision, commands: evidence };
@@ -422,6 +457,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       }
       return { status: 'passed', configRevision: revision, commands: evidence };
     } finally {
+      rmSync(runtimeRoot, { recursive: true, force: true });
       commandWorkspace.dispose();
     }
   }

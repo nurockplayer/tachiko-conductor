@@ -24,6 +24,13 @@ function environment(home: string): NodeJS.ProcessEnv {
 }
 
 describe('#104 production policy', () => {
+  it('declares hosted checks explicitly not_required with no required context', () => {
+    assert.deepEqual(PRODUCTION_HOSTED_CHECK_POLICY_CONFIG, {
+      revision: PRODUCTION_POLICY_REVISION,
+      mode: 'not_required',
+    });
+  });
+
   it('preflights a revisioned routine-only Luna and model-free pnpm policy without provider activity', () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-production-policy-'));
     try {
@@ -62,6 +69,8 @@ describe('#104 production policy', () => {
     assert.match(script, /"gpt-5\.6-luna"/);
     assert.match(script, /pnpm","install","--frozen-lockfile/);
     assert.match(script, /TACHIKO_HOSTED_CHECK_POLICY_CONFIG/);
+    assert.match(script, /"mode":"not_required"/);
+    assert.doesNotMatch(script, /requiredCheckNames/);
     const sourced = spawnSync('sh', ['-c', '. "$1"; printf "%s\\n%s\\n%s" "$TACHIKO_EXECUTION_PROFILE_CONFIG" "$TACHIKO_LOCAL_VALIDATION_CONFIG" "$TACHIKO_HOSTED_CHECK_POLICY_CONFIG"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], {
       encoding: 'utf8', env: { ...process.env, TACHIKO_LUNA_CODEX_HOME: '/tmp/qualified-luna' },
     });
@@ -70,5 +79,13 @@ describe('#104 production policy', () => {
     assert.deepEqual(JSON.parse(execution!), PRODUCTION_EXECUTION_PROFILE_CONFIG);
     assert.deepEqual(JSON.parse(local!), PRODUCTION_LOCAL_VALIDATION_CONFIG);
     assert.deepEqual(JSON.parse(hosted!), PRODUCTION_HOSTED_CHECK_POLICY_CONFIG);
+  });
+
+  it('does not invent a Luna CODEX_HOME when the durable owner setting is absent', () => {
+    const sourced = spawnSync('sh', ['-c', '. "$1"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], {
+      encoding: 'utf8', env: {},
+    });
+    assert.notEqual(sourced.status, 0);
+    assert.match(sourced.stderr, /TACHIKO_LUNA_CODEX_HOME/);
   });
 });

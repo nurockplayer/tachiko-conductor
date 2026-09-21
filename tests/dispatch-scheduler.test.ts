@@ -126,10 +126,11 @@ describe('dispatch scheduler boundary', () => {
     }
   });
 
-  it('renders a provider-neutral launchd supervisor without configuration values', () => {
+  it('persists the revisioned #104 policy and owner-controlled Luna home across restarts', () => {
     const plist = renderDispatchLaunchdPlist({
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       nodeProgram: '/Users/example/.local/node/bin/node',
+      lunaCodexHome: '/Users/example/.tachiko/luna-codex-home',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
     });
     assert.match(plist, /<key>ProgramArguments<\/key><array><string>\/Users\/example\/Library/);
@@ -137,6 +138,10 @@ describe('dispatch scheduler boundary', () => {
     assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
     assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
     assert.match(plist, /<key>TACHIKO_NODE_PROGRAM<\/key><string>\/Users\/example\/\.local\/node\/bin\/node<\/string>/);
+    assert.match(plist, /<key>TACHIKO_LUNA_CODEX_HOME<\/key><string>\/Users\/example\/\.tachiko\/luna-codex-home<\/string>/);
+    assert.match(plist, /<key>TACHIKO_EXECUTION_PROFILE_CONFIG<\/key>/);
+    assert.match(plist, /<key>TACHIKO_LOCAL_VALIDATION_CONFIG<\/key>/);
+    assert.match(plist, /<key>TACHIKO_HOSTED_CHECK_POLICY_CONFIG<\/key><string>{&quot;revision&quot;:&quot;issue-104-production-v1&quot;,&quot;mode&quot;:&quot;not_required&quot;}<\/string>/);
     assert.doesNotMatch(plist, /StartCalendarInterval/);
   });
 
@@ -144,6 +149,7 @@ describe('dispatch scheduler boundary', () => {
     const options = {
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       nodeProgram: '/Users/example/.local/node/bin/node',
+      lunaCodexHome: '/Users/example/.tachiko/luna-codex-home',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
       label: 'io.tachiko.conductor.dispatch-driver',
     } as const;
@@ -156,14 +162,14 @@ describe('dispatch scheduler boundary', () => {
     assert.doesNotMatch(configured, /StartCalendarInterval/);
   });
 
-  it('pins only the canonical #101 queue location in the stable-checkout driver wrapper', () => {
+  it('pins the canonical #101 queue location and sources the #104 production policy in the stable driver', () => {
     const wrapper = readFileSync(path.resolve('scripts/dispatch-driver.sh'), 'utf8');
     const match = wrapper.match(/export TACHIKO_DISPATCH_CONFIG='([^']+)'/);
     assert.ok(match);
     assert.deepEqual(parseDispatchConfiguration(match[1]!), {
       revision: 'dispatch-production-v1', owner: 'nurockplayer', repo: 'tachiko-conductor', controlIssue: 101, queueCommentId: 5755262217, leaseDurationMs: 900_000,
     });
-    assert.doesNotMatch(wrapper, /TACHIKO_(EXECUTION_PROFILE|LOCAL_VALIDATION|HOSTED_CHECK_POLICY)_CONFIG/);
+    assert.match(wrapper, /issue-104-production-policy\.sh/);
     assert.match(wrapper, /TACHIKO_NODE_PROGRAM/);
     assert.doesNotMatch(wrapper, /exec corepack/);
   });

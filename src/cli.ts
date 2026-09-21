@@ -1363,18 +1363,20 @@ export async function main(argv: string[]): Promise<number> {
         options: {
           program: { type: 'string' },
           'node-program': { type: 'string' },
+          'luna-codex-home': { type: 'string' },
           'working-directory': { type: 'string' },
           label: { type: 'string' },
           'stdout-path': { type: 'string' },
           'stderr-path': { type: 'string' },
         },
       });
-      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program, --node-program, and --working-directory.');
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['luna-codex-home'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, --luna-codex-home, and --working-directory.');
       }
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
         nodeProgram: values['node-program'],
+        lunaCodexHome: values['luna-codex-home'],
         workingDirectory: values['working-directory'],
         ...(values.label === undefined ? {} : { label: values.label }),
         ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),

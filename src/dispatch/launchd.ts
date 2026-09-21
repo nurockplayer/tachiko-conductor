@@ -1,4 +1,9 @@
 import path from 'node:path';
+import {
+  PRODUCTION_EXECUTION_PROFILE_CONFIG,
+  PRODUCTION_HOSTED_CHECK_POLICY_CONFIG,
+  PRODUCTION_LOCAL_VALIDATION_CONFIG,
+} from '../production-policy.js';
 
 export const DEFAULT_DISPATCH_LAUNCHD_LABEL = 'io.tachiko.conductor.dispatch-driver';
 
@@ -7,6 +12,8 @@ export interface DispatchLaunchdOptions {
   readonly program: string;
   /** Stable absolute Node runtime supplied by the post-merge installer. */
   readonly nodeProgram: string;
+  /** Owner-controlled, durable Luna configuration; never an implicit default. */
+  readonly lunaCodexHome: string;
   readonly workingDirectory: string;
   readonly standardErrorPath?: string;
   readonly standardOutPath?: string;
@@ -27,6 +34,7 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(label)) throw new Error('launchd label contains unsupported characters.');
   const program = absolute(options.program, 'launchd program');
   const nodeProgram = absolute(options.nodeProgram, 'launchd node program');
+  const lunaCodexHome = absolute(options.lunaCodexHome, 'launchd Luna CODEX_HOME');
   const workingDirectory = absolute(options.workingDirectory, 'launchd working directory');
   const stdout = absolute(options.standardOutPath ?? path.join(path.dirname(program), `${label}.stdout.log`), 'launchd stdout path');
   const stderr = absolute(options.standardErrorPath ?? path.join(path.dirname(program), `${label}.stderr.log`), 'launchd stderr path');
@@ -37,7 +45,7 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   <key>Label</key><string>${xml(label)}</string>
   <key>ProgramArguments</key><array><string>${xml(program)}</string></array>
   <key>WorkingDirectory</key><string>${xml(workingDirectory)}</string>
-  <key>EnvironmentVariables</key><dict><key>TACHIKO_NODE_PROGRAM</key><string>${xml(nodeProgram)}</string></dict>
+  <key>EnvironmentVariables</key><dict><key>TACHIKO_NODE_PROGRAM</key><string>${xml(nodeProgram)}</string><key>TACHIKO_LUNA_CODEX_HOME</key><string>${xml(lunaCodexHome)}</string><key>TACHIKO_EXECUTION_PROFILE_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_EXECUTION_PROFILE_CONFIG))}</string><key>TACHIKO_LOCAL_VALIDATION_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_LOCAL_VALIDATION_CONFIG))}</string><key>TACHIKO_HOSTED_CHECK_POLICY_CONFIG</key><string>${xml(JSON.stringify(PRODUCTION_HOSTED_CHECK_POLICY_CONFIG))}</string></dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>

@@ -48,6 +48,39 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(Object.hasOwn(result.commands[0]!, 'argv'), false);
   });
 
+  it('runs candidate validation with only a fresh credential-free runtime environment', async () => {
+    const owned = request();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const proof = path.join(proofDir, 'environment.json');
+    const inherited = {
+      GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+      SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
+      CHATGPT_API_KEY: process.env.CHATGPT_API_KEY,
+      CODEX_HOME: process.env.CODEX_HOME,
+      TACHIKO_LUNA_CODEX_HOME: process.env.TACHIKO_LUNA_CODEX_HOME,
+      UNRELATED_SECRET: process.env.UNRELATED_SECRET,
+    };
+    Object.assign(process.env, {
+      GITHUB_TOKEN: 'github-secret', SSH_AUTH_SOCK: '/tmp/ssh-agent', CHATGPT_API_KEY: 'chatgpt-secret',
+      CODEX_HOME: '/tmp/codex-home', TACHIKO_LUNA_CODEX_HOME: '/tmp/luna-home', UNRELATED_SECRET: 'secret',
+    });
+    try {
+      const result = await new ConfiguredLocalValidationAdapter(configuration([
+        process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify(process.env))`,
+      ])).validate(owned);
+      assert.equal(result.status, 'passed');
+      const environment = JSON.parse(readFileSync(proof, 'utf8')) as Record<string, string>;
+      assert.deepEqual(Object.keys(environment).sort(), ['CI', 'HOME', 'PATH', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME']);
+      assert.match(environment.HOME!, /tachiko-validation-runtime-/);
+      assert.equal(environment.GITHUB_TOKEN, undefined);
+    } finally {
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
   it('maps a non-zero exit to failed compact evidence', async () => {
     const result = await new ConfiguredLocalValidationAdapter(
       configuration([process.execPath, '-e', 'process.exit(7)']),

@@ -5,6 +5,10 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
+# Revisioned #104 execution, local-validation, hosted-check, and Luna-home
+# policy.  Source it on every launchd restart; it contains no auth material.
+. "$ROOT/scripts/issue-104-production-policy.sh"
+
 # Canonical production control plane: Issue #101, Steward queue comment
 # 5755262217. This is queue location only; execution and validation policy
 # deliberately remain external and are not invented here.

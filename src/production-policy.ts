@@ -41,8 +41,10 @@ export const PRODUCTION_LOCAL_VALIDATION_CONFIG = {
 
 export const PRODUCTION_HOSTED_CHECK_POLICY_CONFIG = {
   revision: PRODUCTION_POLICY_REVISION,
-  mode: 'required',
-  requiredCheckNames: ['test'],
+  // The live repository has neither branch protection nor rulesets requiring
+  // a hosted context.  Its only active workflow is unrelated to production
+  // validation, so this revision deliberately has no hosted-check gate.
+  mode: 'not_required',
 } as const;
 
 export interface ProductionPolicyPreflight {
