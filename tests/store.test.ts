@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -8,6 +8,7 @@ import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
+import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, operationalRunProjection, sha256 } from '../src/operational/projection.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
@@ -41,6 +42,118 @@ describe('JsonFileStore — persistence round-trips', () => {
     const { store } = tempStore();
     store.create(newRun('r1'));
     assert.deepEqual(store.read('r1'), newRun('r1'));
+  });
+
+  it('writes a secret-free operational projection bound to the committed raw bytes', () => {
+    const { store, dir } = tempStore();
+    let run = applyTransition(newRun('projected'), { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'bootstrap_prepared',
+      bootstrap: {
+        owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+        baseBranch: 'main', baseSha: 'base-sha', branch: 'codex/projected', workspacePath: '/tmp/projected',
+      },
+    }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded',
+      agentResult: { ...successResult('head-sha'), executor: { provider: 'codex-cli', sessionId: 'secret-session' } },
+      pullRequest: { number: 7, headSha: 'head-sha' },
+    }, T0);
+    store.create(run);
+
+    const raw = readFileSync(path.join(dir, 'projected.json'), 'utf8');
+    const projection = JSON.parse(readFileSync(operationalProjectionPath(dir, 'projected'), 'utf8')) as Record<string, unknown>;
+    assert.equal(projection.schemaVersion, OPERATIONAL_RUN_PROJECTION_VERSION);
+    assert.equal(projection.sourceDigest, sha256(raw));
+    assert.equal(projection.workflowState, 'VALIDATING');
+    assert.deepEqual(projection.target, { owner: 'acme', repo: 'widgets', issueNumber: 42 });
+    assert.deepEqual(projection.bootstrap, { workspacePath: '/tmp/projected', branch: 'codex/projected', baseBranch: 'main', baseSha: 'base-sha' });
+    assert.deepEqual(projection.executor, { provider: 'codex-cli' });
+    assert.equal(JSON.stringify(projection).includes('secret-session'), false);
+  });
+
+  it('marks only an active review-repair implementation for bounded live-head correlation', () => {
+    const run = {
+      ...newRun('review-fix-projection'),
+      state: 'IMPLEMENTING' as const,
+      history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }],
+    };
+    assert.equal(operationalRunProjection(run, '{}').reviewFixActive, true);
+    assert.equal(operationalRunProjection(newRun('not-a-review-fix'), '{}').reviewFixActive, undefined);
+  });
+
+  it('projects the selected provider and profile before an agent session exists', () => {
+    const run = {
+      ...newRun('initial-execution-projection'),
+      state: 'IMPLEMENTING' as const,
+      execution: { profile: 'standard' as const, revision: 'profiles-v1', executor: 'claude-code', timeoutMs: 1_000 },
+    };
+
+    assert.deepEqual(operationalRunProjection(run, '{}').executor, { provider: 'claude-code', profile: 'standard' });
+  });
+
+  it('retains the active review-repair marker after a parked repair resumes', () => {
+    const run = {
+      ...newRun('resumed-review-fix-projection'),
+      state: 'IMPLEMENTING' as const,
+      history: [
+        { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 },
+        { type: 'escalate' as const, from: 'IMPLEMENTING' as const, to: 'NEEDS_HUMAN' as const, at: T0 },
+        { type: 'human_resolved' as const, from: 'NEEDS_HUMAN' as const, to: 'IMPLEMENTING' as const, at: T0 },
+      ],
+    };
+
+    assert.equal(operationalRunProjection(run, '{}').reviewFixActive, true);
+  });
+
+  it('keeps a committed raw transition successful when derived projection emission fails', () => {
+    const { store, dir } = tempStore();
+    let run = newRun('projection-best-effort');
+    store.create(run);
+    rmSync(path.join(dir, '.operational'), { recursive: true, force: true });
+    writeFileSync(path.join(dir, '.operational'), 'not a directory', 'utf8');
+
+    run = applyTransition(run, { type: 'start' }, T0);
+    assert.doesNotThrow(() => store.update(run));
+    assert.equal(new JsonFileStore({ dir }).read(run.id)?.state, 'IMPLEMENTING');
+    assert.throws(() => readFileSync(operationalProjectionPath(dir, run.id), 'utf8'));
+
+    rmSync(path.join(dir, '.operational'), { force: true });
+    assert.equal(store.rebuildOperationalProjections(), 1);
+    assert.equal(
+      JSON.parse(readFileSync(operationalProjectionPath(dir, run.id), 'utf8')).workflowState,
+      'IMPLEMENTING',
+    );
+  });
+
+  it('rebuilds valid legacy projections and removes a projection with its run', () => {
+    const { store, dir } = tempStore();
+    const run = newRun('legacy-projection');
+    writeFileSync(path.join(dir, 'legacy-projection.json'), `${JSON.stringify(run, null, 2)}\n`, 'utf8');
+    assert.equal(store.rebuildOperationalProjections(), 1);
+    assert.deepEqual(JSON.parse(readFileSync(operationalProjectionPath(dir, run.id), 'utf8')) as Record<string, unknown>, {
+      schemaVersion: 1,
+      runId: run.id,
+      sourceUpdatedAt: T0,
+      sourceDigest: sha256(readFileSync(path.join(dir, 'legacy-projection.json'), 'utf8')),
+      target: { owner: 'acme', repo: 'widgets', issueNumber: 42 },
+      workflowState: 'READY',
+      createdAt: T0,
+    });
+    store.delete(run.id);
+    assert.throws(() => readFileSync(operationalProjectionPath(dir, run.id), 'utf8'));
+  });
+
+  it('deletes the authoritative run when derived projection cleanup fails', () => {
+    const { store, dir } = tempStore();
+    const run = newRun('projection-delete-best-effort');
+    store.create(run);
+    rmSync(operationalProjectionPath(dir, run.id));
+    mkdirSync(operationalProjectionPath(dir, run.id));
+
+    assert.doesNotThrow(() => store.delete(run.id));
+    assert.equal(store.read(run.id), null);
+    assert.equal(readdirSync(operationalProjectionPath(dir, run.id)).length, 0);
   });
 
   it('serializes a cross-process workflow update with CAS across the compare/write window', () => {
@@ -231,7 +344,9 @@ describe('JsonFileStore — persistence round-trips', () => {
     store.create(run);
     run = applyTransition(run, { type: 'start' }, T0);
     store.update(run);
-    assert.deepEqual(readdirSync(dir), ['r1.json']);
+    assert.deepEqual(readdirSync(dir), ['.operational', 'r1.json']);
+    assert.deepEqual(readdirSync(path.join(dir, '.operational')), ['v1']);
+    assert.deepEqual(readdirSync(path.join(dir, '.operational', 'v1')), ['r1.json']);
   });
 
   it('reports corrupt run files with an actionable error', () => {

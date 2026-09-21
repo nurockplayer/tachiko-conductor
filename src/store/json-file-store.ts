@@ -6,6 +6,7 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '..
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetry.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
+import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
 import { isRepairAdmissionSnapshot, isRepairTaskShapeAuthority } from '../domain/repair-admission.js';
 
@@ -27,6 +28,7 @@ export interface RunStore {
   updateIfUnchanged?(expected: Run, next: Run): boolean;
   list(): Run[];
   delete(id: string): void;
+  rebuildOperationalProjections?(): number;
 }
 
 export interface JsonFileStoreOptions {
@@ -249,10 +251,31 @@ function isRun(value: unknown): value is Run {
 }
 
 /** Write atomically: write to `<path>.tmp`, then rename over the target. */
-function writeJsonAtomic(filePath: string, value: unknown): void {
+function serializedJson(value: unknown): string {
+  return `${JSON.stringify(value, null, 2)}\n`;
+}
+
+function writeJsonAtomic(filePath: string, value: unknown): string {
+  const serialized = serializedJson(value);
   const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+  writeFileSync(tmpPath, serialized, 'utf8');
   renameSync(tmpPath, filePath);
+  return serialized;
+}
+
+/**
+ * The raw Run is the durable authority. A projection is only a derived,
+ * fail-closed operational read model, so a sidecar failure after the raw
+ * atomic rename must not misreport the already-committed transition as lost.
+ * `rebuildOperationalProjections` provides the explicit recovery path.
+ */
+function writeOperationalProjectionBestEffort(runsDir: string, run: Run, committedRunBytes: string): void {
+  try {
+    writeOperationalProjection(runsDir, run, committedRunBytes);
+  } catch {
+    // The raw Run remains valid and authoritative; a missing/stale sidecar is
+    // rejected by its digest until an explicit validated rebuild succeeds.
+  }
 }
 
 function readRun(filePath: string, id: string): Run {
@@ -398,7 +421,8 @@ export class JsonFileStore implements RunStore {
       if (existsSync(filePath)) {
         throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
       }
-      writeJsonAtomic(filePath, run);
+      const serialized = writeJsonAtomic(filePath, run);
+      writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
 
@@ -413,7 +437,8 @@ export class JsonFileStore implements RunStore {
       const filePath = this.filePathFor(run.id);
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
       assertRepairAdmissionsAppendOnly(current, run);
-      writeJsonAtomic(filePath, run);
+      const serialized = writeJsonAtomic(filePath, run);
+      writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
 
@@ -425,7 +450,8 @@ export class JsonFileStore implements RunStore {
       if (runFingerprint(current) !== runFingerprint(expected)) return false;
       assertRepairAdmissionsAppendOnly(current, next);
       this.beforeConditionalWrite?.();
-      writeJsonAtomic(filePath, next);
+      const serialized = writeJsonAtomic(filePath, next);
+      writeOperationalProjectionBestEffort(this.dir, next, serialized);
       return true;
     });
   }
@@ -444,6 +470,13 @@ export class JsonFileStore implements RunStore {
         throw new Error(`No run with id "${id}" exists at ${filePath}; nothing to delete.`);
       }
       unlinkSync(filePath);
+      try { deleteOperationalProjection(this.dir, id); } catch { /* derived cleanup is best effort */ }
     });
+  }
+
+  rebuildOperationalProjections(): number {
+    const runs = this.list();
+    for (const run of runs) writeOperationalProjection(this.dir, run, readFileSync(this.filePathFor(run.id), 'utf8'));
+    return runs.length;
   }
 }

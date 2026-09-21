@@ -95,6 +95,7 @@ import {
 } from './workflow/wait-command.js';
 import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
 import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
+import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, readOperationalRuntimeProjection, registerManualLane, setMaintenanceHold, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -106,10 +107,11 @@ Usage:
   tachiko run inspect <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
+  tachiko run projections rebuild
   tachiko dispatch once
   tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
   tachiko dispatch wake
-  tachiko dispatch launchd render --program <absolute-driver-wrapper> --working-directory <absolute-path>
+  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
@@ -136,6 +138,8 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 {"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
+Operational projections are secret-free sidecars under
+$TACHIKO_DATA_DIR/.operational/v1; rebuild them only from validated persisted runs.
 New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value.
 New unattended runs also require strict revisioned repair-task-shape authority JSON.
 the selected --execution-profile is persisted with the run.
@@ -187,6 +191,35 @@ export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOn
 
 function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
   return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(os.homedir(), '.tachiko-conductor', 'dispatch', 'once.lock');
+}
+
+/**
+ * A short, independent fence for admission-state transitions.  The long-lived
+ * serve lock deliberately cannot be used here: an operator must be able to
+ * place a hold while that singleton is asleep.  Instead, reconcile holds this
+ * fence only while it can read the queue, claim work, or cross a provider
+ * boundary; hold/release serializes with that interval.
+ */
+function dispatchAdmissionLockPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH ?? `${dispatchLockPath(env)}.admission`;
+}
+
+async function withDispatchAdmissionLock<T>(operation: () => Promise<T> | T): Promise<T> {
+  for (;;) {
+    try {
+      const lock = acquireDispatchInvocationLock({ lockPath: dispatchAdmissionLockPath() });
+      try {
+        return await operation();
+      } finally {
+        lock.release();
+      }
+    } catch (error) {
+      if (!(error instanceof DispatchInvocationLockedError)) throw error;
+      // A transition waits for a current reconciliation boundary rather than
+      // racing its projection write or allowing a second admission.
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
 }
 
 /** Provider selection is external to adapters; the stateless local router is the default path. */
@@ -1268,6 +1301,28 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
+    if (subcommand === 'manual' && (rest[0] === 'register' || rest[0] === 'park') && rest.length === 1) {
+      const worktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+      const branch = execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
+      const checkpointSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const clean = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim() === '';
+      const repository = execFileSync('git', ['config', '--get', 'remote.origin.url'], { encoding: 'utf8' }).trim();
+      console.log(JSON.stringify(registerManualLane(resolveRunsDir(), { repository, worktree, branch, checkpointSha, clean, state: rest[0] === 'register' ? 'active' : 'parked', recoverable: clean }, new Date().toISOString())));
+      return 0;
+    }
+    if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
+      const desired = rest[0] === 'hold';
+      const { projection, wake } = await withDispatchAdmissionLock(() => {
+        const wasHeld = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
+        const projection = setMaintenanceHold(resolveRunsDir(), desired, new Date().toISOString());
+        // A meaningful release wakes the already-singleton driver exactly once.
+        // Repeating an already released command is deliberately a no-op at the
+        // wake boundary; it cannot manufacture another reconciliation.
+        return { projection, wake: !desired && wasHeld ? signalDispatchWake(dispatchWakePath()) : undefined };
+      });
+      console.log(JSON.stringify({ projection, ...(wake === undefined ? {} : { wake }) }));
+      return 0;
+    }
     if (subcommand === 'wake' && rest.length === 0) {
       console.log(JSON.stringify({ outcome: 'wake_signaled', token: signalDispatchWake(dispatchWakePath()) }));
       return 0;
@@ -1277,17 +1332,19 @@ export async function main(argv: string[]): Promise<number> {
         args: rest.slice(1),
         options: {
           program: { type: 'string' },
+          'node-program': { type: 'string' },
           'working-directory': { type: 'string' },
           label: { type: 'string' },
           'stdout-path': { type: 'string' },
           'stderr-path': { type: 'string' },
         },
       });
-      if (positionals.length > 0 || values.program === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program and --working-directory.');
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, and --working-directory.');
       }
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
+        nodeProgram: values['node-program'],
         workingDirectory: values['working-directory'],
         ...(values.label === undefined ? {} : { label: values.label }),
         ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
@@ -1323,29 +1380,63 @@ export async function main(argv: string[]): Promise<number> {
       throw error;
     }
     try {
-      const config = resolveDispatchConfiguration();
-      const transport = new GhCliTransport();
-      const runtime = new GitHubDispatchRuntime(transport, config);
-      const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
-      const reconcile = async () => await dispatchOnceCommand(config, {
-        workflow,
-        runtime,
-        resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-        runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority) => await runIssueCommand(workflow, ref, {
-          ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority,
-        }),
-        resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
+      const publishRuntime = (stage: string, supervisor: 'running' | 'stopped' | 'parked', nextPollAt?: string) => writeOperationalRuntimeProjection(resolveRunsDir(), {
+        schemaVersion: OPERATIONAL_RUNTIME_PROJECTION_VERSION, updatedAt: new Date().toISOString(), supervisor, stage,
+        ...(nextPollAt === undefined ? {} : { nextPollAt }), eventWakeEligible: subcommand === 'serve',
+        maintenanceHold: readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold ?? { active: false },
+        ...(() => {
+          const active = store.list().filter((run) => !['MERGED', 'FAILED', 'MERGE_READY', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY'].includes(run.state));
+          if (active.length !== 0 && active.length !== 1) return { ownership: 'ambiguous' as const, checkpoint: 'unknown' as const };
+          if (active.length === 0) return { ownership: 'none' as const, checkpoint: 'durable' as const };
+          const run = active[0]!;
+          if (run.bootstrap === undefined) return { ownership: 'ambiguous' as const, checkpoint: 'unknown' as const };
+          return { ownership: 'active' as const, checkpoint: run.headSha === undefined ? 'in_progress' as const : 'durable' as const, activeWriter: { runId: run.id, ...(run.target.kind === 'issue' ? { issue: run.target.issueNumber } : {}), ...(run.execution === undefined ? {} : { worker: run.execution.executor }), worktree: run.bootstrap.workspacePath } };
+        })(),
+        ...(readOperationalRuntimeProjection(resolveRunsDir())?.manualLane === undefined ? {} : { manualLane: readOperationalRuntimeProjection(resolveRunsDir())!.manualLane! }),
+      });
+      const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
+      const nextPollAt = () => subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined;
+      const reconcile = async () => await withDispatchAdmissionLock(async () => {
+        // This durable typed fence precedes queue reads, configuration, GitHub,
+        // workflow construction, and every model-capable boundary. The same
+        // admission lock serializes an operator hold/release with this entire
+        // interval, so a transition cannot be overwritten mid-reconcile.
+        if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) {
+          publishRuntime('maintenance_hold', 'parked', nextPollAt());
+          return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
+        }
+        publishRuntime('scanning', 'running', nextPollAt());
+        const config = resolveDispatchConfiguration();
+        const transport = new GhCliTransport();
+        const runtime = new GitHubDispatchRuntime(transport, config);
+        const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+        return await dispatchOnceCommand(config, {
+          workflow,
+          runtime,
+          resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
+          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority) => await runIssueCommand(workflow, ref, {
+            ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority,
+          }),
+          resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
+        });
+      });
+      const publishSettledRuntime = async (result: Awaited<ReturnType<typeof reconcile>>) => await withDispatchAdmissionLock(() => {
+        const held = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
+        publishRuntime(held || result.outcome === 'maintenance_hold' ? 'maintenance_hold' : result.outcome === 'dispatched' ? result.execution.state.toLowerCase() : 'idle', held || result.outcome === 'maintenance_hold' ? 'parked' : 'stopped');
       });
       if (subcommand === 'once') {
-        printDispatchResult(await reconcile());
+        const result = await reconcile();
+        await publishSettledRuntime(result);
+        printDispatchResult(result);
         return 0;
       }
       const result = await dispatchContinuously({
         dispatchOnce: reconcile,
         sleep: createDispatchWakeWaiter(dispatchWakePath()),
-        idlePollMs: values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']),
+        idlePollMs,
         ...(values['max-cycles'] === undefined ? {} : { maxCycles: Number(values['max-cycles']) }),
       });
+      if (result.last !== null) await publishSettledRuntime(result.last);
       console.log(JSON.stringify(result, null, 2));
       return 0;
     } finally {
@@ -1482,6 +1573,11 @@ export async function main(argv: string[]): Promise<number> {
     for (const run of runListCommand(store)) {
       console.log(`${run.id}\t${run.state}\t${JSON.stringify(run.target)}`);
     }
+    return 0;
+  }
+
+  if (subcommand === 'projections' && rest[0] === 'rebuild' && rest.length === 1) {
+    console.log(JSON.stringify({ ok: true, rebuilt: store.rebuildOperationalProjections() }));
     return 0;
   }
 

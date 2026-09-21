@@ -205,6 +205,7 @@ execution, or provider credentials and is not a calendar wake:
 ```bash
 pnpm exec tsx src/cli.ts dispatch launchd render \
   --program '/absolute/path/to/run-dispatch-driver.sh' \
+  --node-program '/stable/absolute/path/to/node' \
   --working-directory "$PWD" \
   > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
@@ -594,6 +595,13 @@ After `pnpm build`, the same commands work through the `tachiko` bin
 write-then-rename, so a crash mid-write never corrupts the committed file and a
 run survives a process restart intact. A fresh store instance pointed at the
 same directory resumes the run exactly where it stopped.
+
+For Control Tower, the same store emits a secret-free `OperationalRunProjectionV1`
+sidecar under `$TACHIKO_DATA_DIR/.operational/v1`. Its SHA-256 is bound to the
+committed raw run bytes: a missing, stale, malformed, or digest-mismatched
+sidecar is unknown/unlinked rather than an authority to reconstruct a run.
+Use `tachiko run projections rebuild` only to backfill sidecars from runs that
+`JsonFileStore` has successfully validated.
 
 ## Layout
 

@@ -39,6 +39,8 @@ export interface DispatchOnceOptions {
 }
 
 export type DispatchOnceResult =
+  /** A typed admission fence: no queue, GitHub, workflow, or model work ran. */
+  | { readonly outcome: 'maintenance_hold'; readonly reason: string }
   | { readonly outcome: 'no_eligible_work'; readonly reasons: readonly string[] }
   | { readonly outcome: 'existing_claim'; readonly claim: DispatchRuntimeClaim }
   | { readonly outcome: 'dispatched'; readonly entry: DispatchQueueEntry; readonly claim: DispatchRuntimeClaim; readonly execution: DispatchExecution };
