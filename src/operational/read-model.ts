@@ -36,11 +36,26 @@ export interface SystemView {
   readonly dataFreeBytes?: number;
 }
 
+/** Secret-free operational state; never inferred from heartbeat or worker prose. */
+export interface AutopilotView {
+  readonly supervisor: 'running' | 'stopped' | 'parked' | 'unknown';
+  readonly currentStage: string;
+  readonly lastMeaningfulTransition?: string;
+  readonly nextPollAt?: string;
+  readonly eventWakeEligible: 'yes' | 'no' | 'unknown';
+  readonly activeWriter?: { readonly issue?: number; readonly runId?: string; readonly worker?: string };
+  readonly restart: {
+    readonly verdict: 'SAFE TO RESTART' | 'SAFE NOW · WINDOW NOT GUARANTEED' | 'WAIT FOR CURRENT CHECKPOINT' | 'DO NOT RESTART' | 'UNKNOWN — CANNOT PROVE SAFE';
+    readonly reason: string;
+  };
+}
+
 export interface ControlTowerSnapshot {
   readonly mode: 'fixture' | 'live';
   readonly generatedAt: string;
   readonly rows: readonly WorkUnitView[];
   readonly system: SystemView;
+  readonly autopilot?: AutopilotView;
   readonly sourceNote?: string;
 }
 

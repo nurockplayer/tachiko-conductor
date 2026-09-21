@@ -11,6 +11,12 @@ export const goldenFixture: ControlTowerSnapshot = {
     { repository: 'tachiko-conductor', issue: 416, agent: { provider: 'idle', state: 'no process' }, pullRequest: { number: 141, state: 'MERGED' }, worktree: { path: 'codex/issue-416', shortId: 'b32e', branch: 'codex/issue-416', clean: true }, diskBytes: 2_500_000_000, reclaim: { state: 'reclaimable', reason: 'PR 已 merged；分類器已證明可安全回收。' } },
   ],
   system: { memoryTotalBytes: 32_000_000_000, memoryUsedBytes: 21_800_000_000, dataTotalBytes: 400_000_000_000, dataFreeBytes: 12_000_000_000 },
+  autopilot: {
+    supervisor: 'running', currentStage: 'implementing', lastMeaningfulTransition: 'Implement started · 2m ago',
+    nextPollAt: '2026-09-21T01:03:00.000Z', eventWakeEligible: 'yes',
+    activeWriter: { issue: 421, runId: 'run-421', worker: 'Terra' },
+    restart: { verdict: 'WAIT FOR CURRENT CHECKPOINT', reason: 'A typed active writer owns run-421; wait for its durable checkpoint.' },
+  },
 };
 
 export const goldenSummaryOverride = {

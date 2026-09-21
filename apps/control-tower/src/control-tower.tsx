@@ -2,7 +2,7 @@ import { Component, useEffect, useMemo, useState, type JSX, type ReactNode } fro
 import { goldenFixture } from './lib/fixture';
 import { formatBytes, provenanceLabel, rowsForFilter, statusLine, summarize } from './lib/dashboard';
 import { collectLiveSnapshot } from './lib/tauri';
-import type { ControlTowerSnapshot, DashboardFilter, WorkUnitView } from '../../../src/operational/read-model.js';
+import type { AutopilotView, ControlTowerSnapshot, DashboardFilter, WorkUnitView } from '../../../src/operational/read-model.js';
 
 const filterLabels: ReadonlyArray<readonly [DashboardFilter, string]> = [
   ['all', '全部'],
@@ -32,6 +32,18 @@ function stateLabel(row: WorkUnitView): string {
   if (row.reclaim.state === 'in_use') return '使用中';
   if (row.reclaim.state === 'blocked') return 'blocked';
   return 'unknown';
+}
+
+function countdown(nextPollAt?: string): string {
+  if (!nextPollAt) return '排程未知';
+  const milliseconds = Date.parse(nextPollAt) - Date.now();
+  if (!Number.isFinite(milliseconds)) return '排程未知';
+  const seconds = Math.max(0, Math.ceil(milliseconds / 1_000));
+  return `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+}
+
+function phaseZero(snapshot: ControlTowerSnapshot): AutopilotView {
+  return snapshot.autopilot ?? { supervisor: 'unknown', currentStage: 'unknown', eventWakeEligible: 'unknown', restart: { verdict: 'UNKNOWN — CANNOT PROVE SAFE', reason: 'No typed supervisor/checkpoint projection is available.' } };
 }
 
 export function ControlTower(): JSX.Element {
@@ -72,6 +84,7 @@ function ControlTowerBody(): JSX.Element {
   const rows = useMemo(() => rowsForFilter(snapshot.rows, filter), [snapshot.rows, filter]);
   const summary = useMemo(() => summarize(snapshot), [snapshot]);
   const memoryText = formatBytes(summary.memoryUsedBytes);
+  const autopilot = phaseZero(snapshot);
 
   return <main className="tower-shell">
     <header className="tower-header">
@@ -83,6 +96,19 @@ function ControlTowerBody(): JSX.Element {
         {filterLabels.map(([value, label]) => <button key={value} type="button" className={filter === value ? (value === 'reclaimable' ? 'selected accent' : 'selected') : ''} onClick={() => setFilter(value)}>{label}</button>)}
       </div>
     </header>
+
+    <section className="autopilot-card" aria-label="Autopilot 狀態">
+      <div className="autopilot-heading"><div><h2>Autopilot / Dispatch</h2><p>Typed operational state · raw logs are diagnostics only</p></div><span className={`verdict ${autopilot.restart.verdict.startsWith('SAFE') ? 'safe' : 'caution'}`}>{autopilot.restart.verdict}</span></div>
+      <div className="autopilot-grid">
+        <div><span>Supervisor</span><strong>{autopilot.supervisor}</strong><small>Current stage · {autopilot.currentStage}</small></div>
+        <div><span>Repository writer</span><strong>{autopilot.activeWriter ? `#${autopilot.activeWriter.issue ?? '—'} · ${autopilot.activeWriter.worker ?? 'unknown'}` : 'unknown'}</strong><small>{autopilot.activeWriter?.runId ? `Run ${autopilot.activeWriter.runId}` : 'No typed ownership proof available'}</small></div>
+        <div><span>Next scheduled poll</span><strong>{autopilot.nextPollAt ? countdown(autopilot.nextPollAt) : 'unknown'}</strong><small>{autopilot.nextPollAt ?? 'Not deterministically known'}</small></div>
+        <div><span>Earlier event wake</span><strong>{autopilot.eventWakeEligible === 'yes' ? 'possible' : autopilot.eventWakeEligible}</strong><small>{autopilot.eventWakeEligible === 'yes' ? 'Poll countdown is not a guaranteed window' : 'No earlier wake proven'}</small></div>
+      </div>
+      <p className="restart-reason">{autopilot.restart.reason}</p>
+      {autopilot.lastMeaningfulTransition ? <p className="transition">Last meaningful transition · {autopilot.lastMeaningfulTransition}</p> : null}
+      <details className="diagnostics"><summary>Diagnostics / raw evidence</summary><p>Heartbeat, wake, and worker logs are available for diagnosis only; they do not determine workflow ownership or restart safety.</p></details>
+    </section>
 
     <section className="summary-grid" aria-label="系統摘要">
       <SummaryCard label="執行中 agent" value={String(summary.activeCount)} detail={`${summary.activeWorktrees} 個 worktree`} />

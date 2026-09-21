@@ -107,11 +107,25 @@ struct SystemView {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct RestartView { verdict: String, reason: String }
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AutopilotView {
+  supervisor: String,
+  current_stage: String,
+  event_wake_eligible: String,
+  restart: RestartView,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ControlTowerSnapshot {
   mode: &'static str,
   generated_at: String,
   rows: Vec<WorkUnitView>,
   system: SystemView,
+  autopilot: AutopilotView,
   source_note: String,
 }
 
@@ -913,6 +927,18 @@ fn collect_snapshot_for_roots_with_workspace_data_path(
     generated_at,
     rows,
     system: SystemView { memory_total_bytes, memory_used_bytes, data_total_bytes, data_free_bytes },
+    // Runtime/supervisor/checkpoint state is intentionally unknown until a
+    // typed producer supplies it. No log text, GUI helper, or dirty worktree
+    // can manufacture writer or restart-safety evidence.
+    autopilot: AutopilotView {
+      supervisor: "unknown".to_owned(),
+      current_stage: "unknown".to_owned(),
+      event_wake_eligible: "unknown".to_owned(),
+      restart: RestartView {
+        verdict: "UNKNOWN — CANNOT PROVE SAFE".to_owned(),
+        reason: "No typed supervisor, mutation-owner, and durable checkpoint projection is available.".to_owned(),
+      },
+    },
     source_note: "Live observations use bounded Git, durable Conductor-run, process, disk and GitHub reads. Unlinked or unproven correlations remain unknown.".to_owned(),
   })
 }
@@ -1523,6 +1549,10 @@ mod tests {
         memory_used_bytes: None,
         data_total_bytes: None,
         data_free_bytes: Some(1_500_000_000),
+      },
+      autopilot: AutopilotView {
+        supervisor: "unknown".to_owned(), current_stage: "unknown".to_owned(), event_wake_eligible: "unknown".to_owned(),
+        restart: RestartView { verdict: "UNKNOWN — CANNOT PROVE SAFE".to_owned(), reason: "test".to_owned() },
       },
       source_note: "test".to_owned(),
     };
