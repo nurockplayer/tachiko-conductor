@@ -419,8 +419,11 @@ fn github_url_path<'a>(remote: &'a str, scheme: &str) -> Option<&'a str> {
 
 fn github_repository_from_remote(remote: &str) -> Option<String> {
   let remote = remote.trim().trim_end_matches(".git");
-  remote
-    .strip_prefix("git@github.com:")
+  let scp_path = remote.strip_prefix("git@").and_then(|value| {
+    let (host, path) = value.split_once(':')?;
+    host.eq_ignore_ascii_case("github.com").then_some(path)
+  });
+  scp_path
     .or_else(|| github_url_path(remote, "https://"))
     .or_else(|| github_url_path(remote, "ssh://"))
     .filter(|value| value.split('/').count() == 2)
@@ -803,9 +806,9 @@ fn pull_request_head_for_correlation<'a>(
   worktree: &'a VerifiedWorktree,
 ) -> Option<&'a str> {
   if correlated.active_review_fix_descendant {
-    correlated.run.pull_request_head_sha.as_deref()
-  } else {
     worktree.head_sha.as_deref()
+  } else {
+    correlated.run.pull_request_head_sha.as_deref()
   }
 }
 
@@ -1460,7 +1463,7 @@ mod tests {
       .expect("the verified local descendant remains correlated during an active repair");
     assert_eq!(correlated.run.id, "run-1");
     assert!(correlated.active_review_fix_descendant);
-    assert_eq!(pull_request_head_for_correlation(&correlated, &worktree), Some("accepted"));
+    assert_eq!(pull_request_head_for_correlation(&correlated, &worktree), Some("replacement"));
     let not_a_review_fix = RunObservation { review_fix_active: false, ..repair };
     assert!(correlated_run(&fake, &[not_a_review_fix], &run_worktrees, &worktree).is_none());
   }
@@ -1498,6 +1501,10 @@ mod tests {
 
   #[test]
   fn github_remote_parser_accepts_url_style_ssh_and_rejects_unproven_identity() {
+    assert_eq!(
+      github_repository_from_remote("git@GitHub.com:nurockplayer/tachiko-conductor.git"),
+      Some("nurockplayer/tachiko-conductor".to_owned())
+    );
     assert_eq!(
       github_repository_from_remote("ssh://git@github.com/nurockplayer/tachiko-conductor.git"),
       Some("nurockplayer/tachiko-conductor".to_owned())
