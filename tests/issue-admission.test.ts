@@ -100,6 +100,13 @@ test('untrusted Issue Form is only a proposal and cannot obtain writer authority
   assert.equal(decision.labels.includes('dispatch:ready'), false);
 });
 
+test('collaborator Issue Form still requires explicit Steward authority', () => {
+  const decision = admission.classifyIssue({ issue: implementationForm('bounded', 'COLLABORATOR') });
+  assert.equal(decision.status, 'blocked');
+  assert.ok(decision.labels.includes('needs:steward'));
+  assert.equal(decision.labels.includes('dispatch:ready'), false);
+});
+
 test('trusted API-created Issue body authority is accepted without Issue Form fields', () => {
   const body = `${admission.AUTHORITY_MARKER}\n\n\`\`\`json\n${JSON.stringify({
     revision: 'api-v1',
