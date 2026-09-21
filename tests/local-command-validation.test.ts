@@ -125,6 +125,28 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal((await adapter.validate({ ...owned, headSha })).status, 'unknown');
   });
 
+  it('accepts a large identical ignored baseline without truncating the Git status manifest', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'ignored-*/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore generated directories'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const baseline = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-'));
+    dirs.push(baseline);
+    assert.equal(spawnSync('git', ['clone', owned.workspacePath, baseline], { encoding: 'utf8' }).status, 0);
+    for (const workspace of [baseline, owned.workspacePath]) {
+      for (let index = 0; index < 1_000; index += 1) {
+        const directory = path.join(workspace, `ignored-${index}`);
+        mkdirSync(directory);
+        writeFileSync(path.join(directory, 'generated.txt'), `${index}\n`);
+      }
+    }
+    const adapter = new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', 'process.exit(0)']), trustedIgnoredBaselinePath: baseline,
+    });
+    assert.equal((await adapter.validate({ ...owned, headSha })).status, 'passed');
+  });
+
   it('runs a configured real command for an explicit verified pre-existing-PR workspace, never the ambient cwd', async () => {
     const existing = preExistingPullRequestRequest();
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));

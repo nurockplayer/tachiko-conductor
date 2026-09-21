@@ -145,6 +145,12 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   private assertWorkerGitSurface(workspace: string): void {
     const gitDir = path.join(workspace, '.git');
     if (!existsSync(gitDir) || !lstatSync(gitDir).isDirectory()) this.fail('STALE_IDENTITY', 'Standalone worker Git directory changed.');
+    // Git still honors legacy graft files even when replacement refs are
+    // disabled. Reject this alternate ancestry authority before a host-owned
+    // Git command can use it to certify an unrelated worker commit.
+    if (existsSync(path.join(gitDir, 'info', 'grafts'))) {
+      this.fail('STALE_IDENTITY', 'Standalone worker Git directory contains legacy graft ancestry.');
+    }
     const config = path.join(gitDir, 'config');
     if (!existsSync(config) || !lstatSync(config).isFile()) this.fail('STALE_IDENTITY', 'Standalone worker Git config changed.');
     // extensions.worktreeConfig activates this additional worktree-local

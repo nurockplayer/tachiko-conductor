@@ -196,6 +196,16 @@ describe('standalone Luna bootstrap', () => {
     assert.equal(fixture.commands.some(({ args }) => args.includes('core.useReplaceRefs=false')), true);
   });
 
+  it('rejects legacy graft ancestry before host Git can inspect the worker checkout', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-legacy-graft', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    mkdirSync(path.join(identity.workspacePath, '.git', 'info'), { recursive: true });
+    writeFileSync(path.join(identity.workspacePath, '.git', 'info', 'grafts'), `${fixture.baseSha}\n`);
+    await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /legacy graft ancestry/);
+  });
+
   it('rejects executable worktree config before its fsmonitor payload can run', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });

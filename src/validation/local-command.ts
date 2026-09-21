@@ -12,6 +12,10 @@ function malformed(commandIndex: number, executable = ''): LocalValidationComman
 
 const TERMINATION_GRACE_MS = 1_000;
 const SETTLEMENT_POLL_MS = 25;
+// `git status --ignored --untracked-files=all` can legitimately enumerate a
+// large trusted dependency baseline. Keep this bounded, but well above the
+// small default intended for compact command output.
+const GIT_STATUS_MAX_BUFFER = 8 * 1024 * 1024;
 /** A validation command must be long enough to make termination observable, but never unattended indefinitely. */
 export const MIN_LOCAL_VALIDATION_TIMEOUT_MS = 100;
 export const MAX_LOCAL_VALIDATION_TIMEOUT_MS = 60 * 60_000;
@@ -76,7 +80,7 @@ function workspaceMatches(
 ): boolean {
   if (workspacePath.trim() === '') return false;
   const invoke: GitInvoke = (args) => spawnSync('git', ['-C', workspacePath, ...args], {
-    encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: 512,
+    encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
   const manifest = ignoredManifest(workspacePath, invoke);
@@ -94,7 +98,7 @@ function workspaceMatches(
     } catch { return false; }
     if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return false;
     const baselineInvoke: GitInvoke = (args) => spawnSync('git', ['-C', baselinePath, ...args], {
-      encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: 512,
+      encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
     }) as SpawnSyncReturns<string>;
     const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
     const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
