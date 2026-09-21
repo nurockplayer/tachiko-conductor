@@ -1,0 +1,31 @@
+name: Tracking
+description: Source-of-truth/status Issue with no implementation writer.
+title: "[Tracking] "
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - tracking
+    validations:
+      required: true
+  - type: textarea
+    id: tracked
+    attributes:
+      label: What is being tracked
+    validations:
+      required: true
+  - type: textarea
+    id: source
+    attributes:
+      label: Source of truth
+      description: Where authoritative state comes from.
+    validations:
+      required: true
+  - type: textarea
+    id: completion
+    attributes:
+      label: Completion condition
+    validations:
+      required: true
