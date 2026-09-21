@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -508,7 +508,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
     const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
-    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath, this.configuration.nodeProgram, this.configuration.pnpmProgram);
+    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram);
     const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
     const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
       ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath, this.configuration.nodeProgram, this.configuration.pnpmProgram)
