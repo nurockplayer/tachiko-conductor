@@ -43,7 +43,20 @@ function countdown(nextPollAt?: string): string {
 }
 
 function phaseZero(snapshot: ControlTowerSnapshot): AutopilotView {
-  return snapshot.autopilot ?? { supervisor: 'unknown', currentStage: 'unknown', eventWakeEligible: 'unknown', restart: { verdict: 'UNKNOWN — CANNOT PROVE SAFE', reason: 'No typed supervisor/checkpoint projection is available.' } };
+  return snapshot.autopilot ?? { supervisor: 'unknown', currentStage: 'unknown', eventWakeEligible: 'unknown', writerOwnership: 'ambiguous', checkpoint: 'unknown', restart: { verdict: 'UNKNOWN — CANNOT PROVE SAFE', reason: 'No typed supervisor/checkpoint projection is available.' } };
+}
+
+function writerSummary(autopilot: AutopilotView): { title: string; detail: string } {
+  if (autopilot.writerOwnership === 'none') {
+    const checkpoint = autopilot.checkpoint === 'durable'
+      ? `Durable checkpoint${autopilot.checkpointSha ? ` · ${autopilot.checkpointSha.slice(0, 12)}` : ''}`
+      : 'Checkpoint is not durable';
+    return { title: 'none active', detail: `${checkpoint}${autopilot.manualWriterState ? ` · manual writer ${autopilot.manualWriterState}` : ''}` };
+  }
+  if (autopilot.writerOwnership === 'active') {
+    return { title: autopilot.activeWriter ? `#${autopilot.activeWriter.issue ?? '—'} · ${autopilot.activeWriter.worker ?? 'manual'}` : 'active', detail: autopilot.activeWriter?.runId ? `Run ${autopilot.activeWriter.runId}` : 'Typed writer ownership is active' };
+  }
+  return { title: 'unknown', detail: 'No typed ownership proof available' };
 }
 
 export function ControlTower(): JSX.Element {
@@ -85,6 +98,7 @@ function ControlTowerBody(): JSX.Element {
   const summary = useMemo(() => summarize(snapshot), [snapshot]);
   const memoryText = formatBytes(summary.memoryUsedBytes);
   const autopilot = phaseZero(snapshot);
+  const writer = writerSummary(autopilot);
 
   return <main className="tower-shell">
     <header className="tower-header">
@@ -101,7 +115,7 @@ function ControlTowerBody(): JSX.Element {
       <div className="autopilot-heading"><div><h2>Autopilot / Dispatch</h2><p>Typed operational state · raw logs are diagnostics only</p></div><span className={`verdict ${autopilot.restart.verdict.startsWith('SAFE') ? 'safe' : 'caution'}`}>{autopilot.restart.verdict}</span></div>
       <div className="autopilot-grid">
         <div><span>Supervisor</span><strong>{autopilot.supervisor}</strong><small>Current stage · {autopilot.currentStage}</small></div>
-        <div><span>Repository writer</span><strong>{autopilot.activeWriter ? `#${autopilot.activeWriter.issue ?? '—'} · ${autopilot.activeWriter.worker ?? 'unknown'}` : 'unknown'}</strong><small>{autopilot.activeWriter?.runId ? `Run ${autopilot.activeWriter.runId}` : 'No typed ownership proof available'}</small></div>
+        <div><span>Repository writer</span><strong>{writer.title}</strong><small>{writer.detail}</small></div>
         <div><span>Next scheduled poll</span><strong>{autopilot.nextPollAt ? countdown(autopilot.nextPollAt) : 'unknown'}</strong><small>{autopilot.nextPollAt ?? 'Not deterministically known'}</small></div>
         <div><span>Earlier event wake</span><strong>{autopilot.eventWakeEligible === 'yes' ? 'possible' : autopilot.eventWakeEligible}</strong><small>{autopilot.eventWakeEligible === 'yes' ? 'Poll countdown is not a guaranteed window' : 'No earlier wake proven'}</small></div>
       </div>

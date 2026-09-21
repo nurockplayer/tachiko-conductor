@@ -43,6 +43,11 @@ export interface AutopilotView {
   readonly lastMeaningfulTransition?: string;
   readonly nextPollAt?: string;
   readonly eventWakeEligible: 'yes' | 'no' | 'unknown';
+  /** Typed ownership state, independent of helper-process observations. */
+  readonly writerOwnership?: 'none' | 'active' | 'ambiguous';
+  readonly checkpoint?: 'durable' | 'in_progress' | 'unknown';
+  readonly checkpointSha?: string;
+  readonly manualWriterState?: 'active' | 'parked';
   readonly activeWriter?: { readonly issue?: number; readonly runId?: string; readonly worker?: string };
   readonly restart: {
     readonly verdict: 'SAFE TO RESTART' | 'SAFE NOW · WINDOW NOT GUARANTEED' | 'WAIT FOR CURRENT CHECKPOINT' | 'DO NOT RESTART' | 'UNKNOWN — CANNOT PROVE SAFE';

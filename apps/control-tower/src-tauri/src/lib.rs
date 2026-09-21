@@ -117,6 +117,12 @@ struct AutopilotView {
   #[serde(skip_serializing_if = "Option::is_none")]
   next_poll_at: Option<String>,
   event_wake_eligible: String,
+  writer_ownership: String,
+  checkpoint: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  checkpoint_sha: Option<String>,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  manual_writer_state: Option<String>,
   #[serde(skip_serializing_if = "Option::is_none")]
   active_writer: Option<serde_json::Value>,
   restart: RestartView,
@@ -570,7 +576,7 @@ fn load_runs(commands: &dyn CommandBoundary) -> Vec<RunObservation> {
 }
 
 fn runtime_autopilot() -> AutopilotView {
-  let unknown = || AutopilotView { supervisor: "unknown".to_owned(), current_stage: "unknown".to_owned(), next_poll_at: None, event_wake_eligible: "unknown".to_owned(), active_writer: None, restart: RestartView { verdict: "UNKNOWN — CANNOT PROVE SAFE".to_owned(), reason: "No typed supervisor, mutation-owner, and durable checkpoint projection is available.".to_owned() } };
+  let unknown = || AutopilotView { supervisor: "unknown".to_owned(), current_stage: "unknown".to_owned(), next_poll_at: None, event_wake_eligible: "unknown".to_owned(), writer_ownership: "ambiguous".to_owned(), checkpoint: "unknown".to_owned(), checkpoint_sha: None, manual_writer_state: None, active_writer: None, restart: RestartView { verdict: "UNKNOWN — CANNOT PROVE SAFE".to_owned(), reason: "No typed supervisor, mutation-owner, and durable checkpoint projection is available.".to_owned() } };
   let Some(directory) = run_directory() else { return unknown(); };
   let Ok(raw) = fs::read_to_string(directory.join(".operational/v1/runtime.json")) else { return unknown(); };
   let Ok(value) = serde_json::from_str::<Value>(&raw) else { return unknown(); };
@@ -585,9 +591,16 @@ fn runtime_autopilot() -> AutopilotView {
   let held = hold == Some(true);
   let (verdict, reason) = if ownership.as_deref() == Some("active") { ("WAIT FOR CURRENT CHECKPOINT", "A typed active writer owns repository mutation.") } else if ownership.as_deref() != Some("none") || checkpoint.as_deref() != Some("durable") { ("UNKNOWN — CANNOT PROVE SAFE", "Writer ownership or durable restart checkpoint is ambiguous.") } else if held { ("SAFE TO RESTART", "No writer is active, durable re-entry is proven, and maintenance hold prevents admission.") } else { ("SAFE NOW · WINDOW NOT GUARANTEED", "No writer is active, but new dispatch admission is not held.") };
   let active_writer = if ownership.as_deref() == Some("active") { value.get("manualLane").cloned() } else { None };
+  let checkpoint_sha = string_at(&value, &["manualLane", "checkpointSha"]);
+  let manual_writer_state = string_at(&value, &["manualLane", "state"])
+    .filter(|state| matches!(state.as_str(), "active" | "parked"));
   AutopilotView {
     supervisor: supervisor.unwrap(), current_stage: stage.unwrap(), next_poll_at: string_at(&value, &["nextPollAt"]),
     event_wake_eligible: if wake == Some(true) { "yes".to_owned() } else { "no".to_owned() },
+    writer_ownership: ownership.unwrap(),
+    checkpoint: checkpoint.unwrap(),
+    checkpoint_sha,
+    manual_writer_state,
     active_writer,
     restart: RestartView { verdict: verdict.to_owned(), reason: reason.to_owned() },
   }
@@ -1571,7 +1584,7 @@ mod tests {
         data_free_bytes: Some(1_500_000_000),
       },
       autopilot: AutopilotView {
-        supervisor: "unknown".to_owned(), current_stage: "unknown".to_owned(), next_poll_at: None, event_wake_eligible: "unknown".to_owned(), active_writer: None,
+        supervisor: "unknown".to_owned(), current_stage: "unknown".to_owned(), next_poll_at: None, event_wake_eligible: "unknown".to_owned(), writer_ownership: "ambiguous".to_owned(), checkpoint: "unknown".to_owned(), checkpoint_sha: None, manual_writer_state: None, active_writer: None,
         restart: RestartView { verdict: "UNKNOWN — CANNOT PROVE SAFE".to_owned(), reason: "test".to_owned() },
       },
       source_note: "test".to_owned(),
