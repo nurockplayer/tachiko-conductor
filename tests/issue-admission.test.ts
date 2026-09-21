@@ -35,6 +35,16 @@ test('trusted bounded implementation projects routine dispatch readiness', () =>
   assert.ok(decision.labels.includes('dispatch:ready'));
 });
 
+test('Issue Form edits rotate task authority revision even when shape is unchanged', () => {
+  const first = admission.classifyIssue({ issue: implementationForm('bounded') });
+  const base = implementationForm('bounded');
+  const second = admission.classifyIssue({
+    issue: { ...base, body: `${base.body}\n\n### Scope\nExpanded` },
+  });
+  assert.notEqual(first.authority.revision, second.authority.revision);
+  assert.equal(second.authority.executionProfile, 'routine');
+});
+
 test('trusted interacting implementation projects complex dispatch readiness', () => {
   const decision = admission.classifyIssue({ issue: implementationForm('interacting') });
   assert.equal(decision.authority.executionProfile, 'complex');
