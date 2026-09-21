@@ -12,6 +12,7 @@ import {
   type CodexCliAdapterOptions,
 } from './agents/codex-cli.js';
 import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter, type NativeThreadObservation } from './agents/codex-app-server.js';
+import { IsolatedLunaAdapter, LUNA_ISOLATED_PROVIDER } from './agents/luna-isolated.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import { WORKER_ROUTER_PROVIDER, WorkerRouterAdapter } from './agents/worker-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
@@ -71,6 +72,7 @@ import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
+import { StandaloneGitBootstrap } from './workspace/standalone-git-bootstrap.js';
 import { resolveDispatchConfiguration } from './dispatch/config.js';
 import { dispatchOnceCommand } from './dispatch/command.js';
 import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/continuous.js';
@@ -158,7 +160,7 @@ in the foreground; use status/stop from another terminal.
 export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
 export { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
 
-export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER | typeof WORKER_ROUTER_PROVIDER;
+export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER | typeof WORKER_ROUTER_PROVIDER | typeof LUNA_ISOLATED_PROVIDER;
 export type CodexExecutionConfig = Pick<
   CodexCliAdapterOptions,
   'model' | 'reasoningEffort' | 'sandboxMode' | 'approvalPolicy' | 'timeoutMs'
@@ -174,7 +176,7 @@ export function resolveSelectedExecutionProfile(
   const execution = resolveExecutionProfile(
     parseExecutionProfileConfiguration(raw),
     selected,
-    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER, WORKER_ROUTER_PROVIDER],
+    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER, WORKER_ROUTER_PROVIDER, LUNA_ISOLATED_PROVIDER],
   );
   assertExecutionSupportedByProvider(execution);
   return execution;
@@ -225,10 +227,18 @@ async function withDispatchAdmissionLock<T>(operation: () => Promise<T> | T): Pr
 /** Provider selection is external to adapters; the stateless local router is the default path. */
 export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
   const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? WORKER_ROUTER_PROVIDER;
-  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER || value === WORKER_ROUTER_PROVIDER) return value;
+  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER || value === WORKER_ROUTER_PROVIDER || value === LUNA_ISOLATED_PROVIDER) return value;
   throw new Error(
-    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER}, ${CODEX_CLI_PROVIDER}, or ${WORKER_ROUTER_PROVIDER}.`,
+    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER}, ${CODEX_CLI_PROVIDER}, ${WORKER_ROUTER_PROVIDER}, or ${LUNA_ISOLATED_PROVIDER}.`,
   );
+}
+
+function requiredLunaHome(env: NodeJS.ProcessEnv): string {
+  const value = env.TACHIKO_LUNA_CODEX_HOME;
+  if (value === undefined || !path.isAbsolute(value) || value.trim() === '') {
+    throw new Error('luna-isolated requires TACHIKO_LUNA_CODEX_HOME to name the qualified absolute CODEX_HOME.');
+  }
+  return value;
 }
 
 /** Read already-selected Codex execution values without inventing policy defaults. */
@@ -326,10 +336,15 @@ export function resolveLocalValidationConfiguration(
     (typeof record.workspacePath !== 'string' || record.workspacePath.trim() === '' || !path.isAbsolute(record.workspacePath))) {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.workspacePath must be an absolute non-empty path when supplied.');
   }
+  if (record.trustedIgnoredBaselinePath !== undefined &&
+    (typeof record.trustedIgnoredBaselinePath !== 'string' || record.trustedIgnoredBaselinePath.trim() === '' || !path.isAbsolute(record.trustedIgnoredBaselinePath))) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.trustedIgnoredBaselinePath must be an absolute non-empty path when supplied.');
+  }
   return {
     revision: record.revision,
     commands,
     ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
+    ...(record.trustedIgnoredBaselinePath === undefined ? {} : { trustedIgnoredBaselinePath: record.trustedIgnoredBaselinePath }),
   };
 }
 
@@ -826,8 +841,10 @@ function buildWorkflowDeps(
   const localValidation = resolveLocalValidationConfiguration(env);
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
   let bootstrap: ImplementationBootstrapAdapter | undefined;
+  let lunaBootstrap: ImplementationBootstrapAdapter | undefined;
   const lazyBootstrap: ImplementationBootstrapAdapter = {
     kind: 'implementation-bootstrap',
+    bootstrapKind: 'linked-worktree',
     plan: async (request) => {
       bootstrap ??= new GitWorktreeBootstrap({
         repositoryRoot: resolveRepositoryRoot(),
@@ -911,6 +928,9 @@ function buildWorkflowDeps(
           cwd: process.cwd(),
           ...(execution === undefined ? {} : { timeoutMs: execution.timeoutMs }),
         }),
+        [LUNA_ISOLATED_PROVIDER]: (execution) => new IsolatedLunaAdapter({
+          codexHome: requiredLunaHome(env), timeoutMs: execution?.timeoutMs ?? 10 * 60_000,
+        }),
       },
     }),
     reviewer: new DeepSeekReviewer({
@@ -919,6 +939,14 @@ function buildWorkflowDeps(
       client: new DeepSeekApiClient(),
     }),
     bootstrap: lazyBootstrap,
+    bootstrapForExecution: (execution) => {
+      if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;
+      lunaBootstrap ??= new StandaloneGitBootstrap({
+        repositoryRoot: resolveRepositoryRoot(),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+      });
+      return lunaBootstrap;
+    },
     ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
     ...(hostedCheckPolicy === undefined ? {} : { hostedCheckPolicy }),
     resolveImplementationCapabilities,

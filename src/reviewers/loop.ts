@@ -28,6 +28,7 @@ export interface ReviewLoopDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly bootstrap?: ImplementationBootstrapAdapter;
+  readonly bootstrapForExecution?: (execution: ResolvedExecutionConfiguration | undefined) => ImplementationBootstrapAdapter | undefined;
   readonly reviewer: ReviewerAdapter;
   /**
    * Resolves the active validation-policy identity at each reviewer effect
@@ -334,11 +335,15 @@ export async function runReviewLoop(
 
       // A persisted review does not authorize local repair against a different
       // live PR. Re-read before preparation and again after local recovery.
+      let repairSnapshot: GitHubLiveSnapshot | undefined;
       const checkOwnedFix = async (): Promise<ReviewLoopResult | null> => {
         try {
           const live = await github.readLiveSnapshot(target);
           const conflict = pullRequestIdentityConflict(run, live, { allowHeadAdvance: true });
-          if (conflict === null && live.headSha === run.headSha) return null;
+          if (conflict === null && live.headSha === run.headSha) {
+            repairSnapshot = live;
+            return null;
+          }
           const reason = conflict ?? 'Live GitHub HEAD changed before the review fix.';
           run = applyTransition(run, {
             type: 'escalate', reason,
@@ -412,17 +417,59 @@ export async function runReviewLoop(
         ? 'Exact-HEAD validation failed. Repair the implementation and its required validation before returning a new exact HEAD.'
         : renderBlockingFindings(pendingReview!);
       const progressBaseSha = run.headSha;
+      // Workspace identity is durable authority across a promoted repair. A
+      // profile change may not reinterpret a standalone Luna checkout as a
+      // linked worktree (or the reverse) merely because its path looks alike.
+      const isolatedLuna = repairExecution?.executor === 'luna-isolated';
+      if (isolatedLuna && repairSnapshot === undefined) {
+        return parkBootstrap(run, new Error('Isolated Luna repair requires a fresh bounded Issue packet.'), store, now);
+      }
+      const repairInstructions = isolatedLuna
+        ? `Task title: ${repairSnapshot!.issue.title}\n\nTask requirements:\n${repairSnapshot!.issue.body}\n\nRepair requirements:\n${blockingFindings}\n\nIsolated Luna contract: implement only the host-bounded task and repair; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
+        : blockingFindings;
+      if (run.bootstrap?.bootstrapKind === 'standalone-isolated' && !isolatedLuna) {
+        return parkBootstrap(run, new Error('A standalone Luna workspace cannot transition to a non-Luna repair transport.'), store, now);
+      }
+      const repairBootstrap = deps.bootstrapForExecution?.(repairExecution) ?? deps.bootstrap;
       let workspaceGuard: WorkspaceGuard | undefined;
-      if (run.bootstrap !== undefined) {
-        if (deps.bootstrap === undefined || progressBaseSha === undefined) {
-          return parkBootstrap(run, new Error('Review fix cannot prove its persisted implementation workspace.'), store, now);
+      if (isolatedLuna && run.bootstrap === undefined) {
+        const pullRequest = repairSnapshot?.pullRequest;
+        const publicationBranch = pullRequest?.headRef;
+        const baseBranch = pullRequest?.baseRef;
+        const baseSha = pullRequest?.baseSha;
+        const sameRepository = pullRequest?.headRepository?.owner.toLowerCase() === target.owner.toLowerCase() &&
+          pullRequest.headRepository.repo.toLowerCase() === target.repo.toLowerCase();
+        if (repairBootstrap === undefined || repairBootstrap.bootstrapKind !== 'standalone-isolated' || progressBaseSha === undefined ||
+          pullRequest === null || pullRequest === undefined || !sameRepository || publicationBranch === undefined || publicationBranch.trim() === '' ||
+          baseBranch === undefined || baseBranch.trim() === '' || baseSha === undefined || baseSha.trim() === '') {
+          return parkBootstrap(run, new Error('Promoted isolated Luna repair has no safe same-repository standalone workspace authority.'), store, now);
         }
         try {
-          await deps.bootstrap.prepare({
+          const bootstrap = await repairBootstrap.plan({
+            runId: run.id, target, baseBranch, baseSha, publicationBranch,
+          });
+          if (bootstrap.bootstrapKind !== repairBootstrap.bootstrapKind) {
+            return parkBootstrap(run, new Error('Promoted isolated Luna repair bootstrap boundary does not match its transport.'), store, now);
+          }
+          run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
+          store.update(run);
+        } catch (error) {
+          return parkBootstrap(run, error, store, now);
+        }
+      }
+      if (run.bootstrap !== undefined) {
+        if (repairBootstrap === undefined || progressBaseSha === undefined) {
+          return parkBootstrap(run, new Error('Review fix cannot prove its persisted implementation workspace.'), store, now);
+        }
+        if (repairBootstrap.bootstrapKind !== run.bootstrap.bootstrapKind) {
+          return parkBootstrap(run, new Error('Repair transport is incompatible with the persisted workspace boundary.'), store, now);
+        }
+        try {
+          await repairBootstrap.prepare({
             runId: run.id, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
             existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: progressBaseSha },
           });
-          workspaceGuard = deps.bootstrap.guard(run.bootstrap);
+          workspaceGuard = repairBootstrap.guard(run.bootstrap);
         } catch (error) {
           return parkBootstrap(run, error, store, now);
         }
@@ -455,11 +502,11 @@ export async function runReviewLoop(
       let fixResult;
       try {
         fixResult = await implementation.run({
-          target, baseSha: progressBaseSha ?? '', authority: 'live-target', instructions: blockingFindings,
-          supplementalInstructions: blockingFindings,
+          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: repairInstructions,
+          ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
-          capabilities: await deps.resolveImplementationCapabilities?.(),
-          ...(repairStartsWithFreshExecutor ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
+          ...(isolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
+          ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
       } catch (error) {
@@ -525,11 +572,11 @@ export async function runReviewLoop(
       }
 
       if (run.bootstrap !== undefined) {
-        if (deps.bootstrap === undefined || progressBaseSha === undefined) {
+        if (repairBootstrap === undefined || progressBaseSha === undefined) {
           return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now);
         }
         try {
-          await deps.bootstrap.verifyDurable({
+          await repairBootstrap.verifyDurable({
             identity: run.bootstrap, expectedHeadSha: fixResult.headSha, progressBaseSha, workspaceGuard,
           });
         } catch (error) {

@@ -11,6 +11,7 @@ export interface BootstrapPlanRequest {
   readonly target: IssueTarget;
   readonly baseBranch: string;
   readonly baseSha: string;
+  readonly publicationBranch?: string;
 }
 
 export interface BootstrapPrepareRequest extends BootstrapPlanRequest {
@@ -23,6 +24,8 @@ export interface VerifyDurableRequest {
   readonly expectedHeadSha: string;
   readonly progressBaseSha?: string;
   readonly workspaceGuard?: WorkspaceGuard;
+  /** Existing authoritative PR recovery, not a newly produced worker result. */
+  readonly adoptExistingHead?: boolean;
 }
 
 export interface DurableImplementationSnapshot {
@@ -33,6 +36,8 @@ export interface DurableImplementationSnapshot {
 /** Provider-neutral local Git boundary. Nothing here chooses or manages providers. */
 export interface ImplementationBootstrapAdapter {
   readonly kind: 'implementation-bootstrap';
+  /** The one durable workspace boundary this adapter may inspect or mutate. */
+  readonly bootstrapKind: ImplementationBootstrapIdentity['bootstrapKind'];
   plan(request: BootstrapPlanRequest): Promise<ImplementationBootstrapIdentity>;
   prepare(request: BootstrapPrepareRequest): Promise<ImplementationBootstrapIdentity>;
   /** Re-check all mutable workspace identity evidence immediately before spawn. */

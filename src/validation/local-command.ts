@@ -1,4 +1,8 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
 import type { LocalValidationConfiguration, ValidationAdapter, ValidationRequest } from '../adapters/validation.js';
@@ -8,7 +12,17 @@ function malformed(commandIndex: number, executable = ''): LocalValidationComman
 }
 
 const TERMINATION_GRACE_MS = 1_000;
+// Snapshot materialization is part of the validation authority boundary, not
+// the validation command itself. Keep it independently bounded so a valid
+// short command budget cannot make ordinary repository reconstruction
+// impossible.
+const RECONSTRUCTION_TIMEOUT_MS = 30_000;
+const IGNORED_MANIFEST_TIMEOUT_MS = 30_000;
 const SETTLEMENT_POLL_MS = 25;
+// `git status --ignored --untracked-files=all` can legitimately enumerate a
+// large trusted dependency baseline. Keep this bounded, but well above the
+// small default intended for compact command output.
+const GIT_STATUS_MAX_BUFFER = 8 * 1024 * 1024;
 /** A validation command must be long enough to make termination observable, but never unattended indefinitely. */
 export const MIN_LOCAL_VALIDATION_TIMEOUT_MS = 100;
 export const MAX_LOCAL_VALIDATION_TIMEOUT_MS = 60 * 60_000;
@@ -33,14 +47,90 @@ function remoteMatchesTarget(remote: string, request: ValidationRequest): boolea
     repo?.replace(/\.git$/i, '').toLowerCase() === request.target.repo.toLowerCase();
 }
 
-function workspaceMatches(request: ValidationRequest, workspacePath: string, requireRepositoryIdentity: boolean): boolean {
+type GitInvoke = (args: readonly string[], timeoutMs?: number) => SpawnSyncReturns<string>;
+
+function ignoredManifest(workspacePath: string, invoke: GitInvoke): string[] | null {
+  const status = invoke(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored'], IGNORED_MANIFEST_TIMEOUT_MS);
+  if (status.status !== 0) return null;
+  const ignored = status.stdout.split('\0').filter((entry) => entry.startsWith('!! ')).map((entry) => entry.slice(3));
+  const visible = status.stdout.split('\0').filter((entry) => entry !== '' && !entry.startsWith('!! '));
+  if (visible.length > 0) return null;
+  const root = path.resolve(workspacePath);
+  const fingerprint = (relative: string): string | null => {
+    const target = path.resolve(root, relative);
+    if (target !== root && !target.startsWith(`${root}${path.sep}`)) return null;
+    let stat;
+    try { stat = lstatSync(target); } catch { return null; }
+    const mode = stat.mode.toString(8);
+    if (stat.isSymbolicLink()) {
+      try { return `link ${relative} ${mode} ${createHash('sha256').update(readlinkSync(target)).digest('hex')}`; } catch { return null; }
+    }
+    if (stat.isFile()) {
+      try { return `file ${relative} ${mode} ${createHash('sha256').update(readFileSync(target)).digest('hex')}`; } catch { return null; }
+    }
+    if (!stat.isDirectory()) return null;
+    let children: readonly string[];
+    try { children = readdirSync(target).sort(); } catch { return null; }
+    const nested = children.map((name) => fingerprint(path.join(relative, name)));
+    if (nested.some((entry) => entry === null)) return null;
+    return `directory ${relative} ${mode} ${createHash('sha256').update(nested.join('\n')).digest('hex')}`;
+  };
+  const entries = ignored.map(fingerprint);
+  return entries.some((entry) => entry === null) ? null : entries.filter((entry): entry is string => entry !== null).sort();
+}
+
+function hasHiddenIndexFlags(invoke: GitInvoke): boolean | null {
+  const entries = invoke(['ls-files', '-v', '-z']);
+  if (entries.status !== 0) return null;
+  // `git ls-files -v` uses lowercase tags for assume-unchanged entries and
+  // `S` for skip-worktree entries.  Both can conceal tracked-byte changes
+  // from status, so neither is admissible evidence of a clean workspace.
+  return entries.stdout.split('\0').some((entry) => /^[a-zS] /.test(entry));
+}
+
+function workspaceMatches(
+  request: ValidationRequest,
+  workspacePath: string,
+  requireRepositoryIdentity: boolean,
+  trustedIgnoredBaselinePath?: string,
+): boolean {
   if (workspacePath.trim() === '') return false;
-  const invoke = (args: readonly string[]) => spawnSync('git', ['-C', workspacePath, ...args], {
-    encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: 512,
-  });
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, ...args], {
+    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+  }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
-  const status = invoke(['status', '--porcelain']);
-  if (head.status !== 0 || status.status !== 0 || head.stdout.trim() !== request.headSha || status.stdout.trim() !== '') return false;
+  const manifest = ignoredManifest(workspacePath, invoke);
+  const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
+  if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null || hiddenIndexFlags !== false) return false;
+  if (trustedIgnoredBaselinePath !== undefined) {
+    // A configured baseline becomes the command cwd, even when both ignored
+    // manifests are empty.  Prove it is a separate, clean checkout of this
+    // exact implementation before it gains any execution authority.
+    let baselinePath: string;
+    let workerPath: string;
+    try {
+      baselinePath = realpathSync(trustedIgnoredBaselinePath);
+      workerPath = realpathSync(workspacePath);
+    } catch { return false; }
+    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return false;
+    const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', baselinePath, ...args], {
+      encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    }) as SpawnSyncReturns<string>;
+    const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
+    const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
+    const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
+    if (baselineHead.status !== 0 || baselineHead.stdout.trim() !== request.headSha || baselineManifest === null ||
+      baselineManifest.join('\n') !== manifest.join('\n') || baselineHiddenIndexFlags !== false) return false;
+    if (requireRepositoryIdentity) {
+      const baselineRemote = baselineInvoke(['remote', 'get-url', 'origin']);
+      if (baselineRemote.status !== 0 || !remoteMatchesTarget(baselineRemote.stdout, request)) return false;
+    }
+  } else if (manifest.length > 0) {
+    // Never globally ignore ignored paths. They are admissible only when a
+    // separate host-owned clean checkout at this exact HEAD proves identical
+    // bytes existed before the worker could have written its workspace.
+    return false;
+  }
   if (!requireRepositoryIdentity) return true;
   const remote = invoke(['remote', 'get-url', 'origin']);
   return remote.status === 0 && remoteMatchesTarget(remote.stdout, request);
@@ -48,6 +138,107 @@ function workspaceMatches(request: ValidationRequest, workspacePath: string, req
 
 function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvidence {
   return { commandIndex, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 };
+}
+
+interface ValidationWorkspace {
+  readonly path: string;
+  dispose(): void;
+}
+
+function containsGitlinks(workspacePath: string, invoke: (args: readonly string[]) => SpawnSyncReturns<string>): boolean | null {
+  const entries = invoke(['-C', workspacePath, 'ls-files', '--stage', '-z']);
+  if (entries.status !== 0) return null;
+  return entries.stdout.split('\0').some((entry) => entry.startsWith('160000 '));
+}
+
+function declaresFilterAttribute(contents: string): boolean {
+  return contents.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    return trimmed !== '' && !trimmed.startsWith('#') && /(?:^|\s)[!-]?filter(?:=|\s|$)/.test(trimmed);
+  });
+}
+
+function hasTrackedFilterAttributes(
+  workspacePath: string,
+  headSha: string,
+  invoke: (args: readonly string[]) => SpawnSyncReturns<string>,
+): boolean | null {
+  const entries = invoke(['-C', workspacePath, 'ls-tree', '-r', '-z', headSha]);
+  if (entries.status !== 0) return null;
+  for (const entry of entries.stdout.split('\0')) {
+    const separator = entry.indexOf('\t');
+    if (separator === -1 || path.posix.basename(entry.slice(separator + 1)) !== '.gitattributes') continue;
+    const [mode, type, objectId] = entry.slice(0, separator).split(' ');
+    if (mode === undefined || type !== 'blob' || objectId === undefined || !/^[0-9a-f]{40,64}$/i.test(objectId)) return null;
+    const contents = invoke(['-C', workspacePath, 'cat-file', 'blob', objectId]);
+    if (contents.status !== 0) return null;
+    if (declaresFilterAttribute(contents.stdout)) return true;
+  }
+  return false;
+}
+
+function reconstructionEnvironment(): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith('GIT_CONFIG_') || key === 'GIT_DIR' || key === 'GIT_WORK_TREE' || key === 'GIT_INDEX_FILE' || key === 'GIT_ALTERNATE_OBJECT_DIRECTORIES') {
+      delete environment[key];
+    }
+  }
+  environment.GIT_CONFIG_NOSYSTEM = '1';
+  environment.GIT_CONFIG_GLOBAL = os.devNull;
+  return environment;
+}
+
+/**
+ * Materialize command input outside the worker checkout.  In particular, a
+ * clean exact HEAD does not authorize files under that checkout's .git
+ * directory: Git status deliberately does not report them, but a tracked
+ * validation script can still load them.  A no-local clone gives commands a
+ * newly-created Git directory containing only host-created clone metadata and
+ * the cryptographically addressed exact commit.
+ */
+function reconstructedWorkspace(sourcePath: string, headSha: string): ValidationWorkspace | null {
+  const snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-'));
+  const invoke = (args: readonly string[]) => spawnSync('git', [
+    '-c', `core.hooksPath=${os.devNull}`,
+    '-c', 'core.fsmonitor=false',
+    '-c', `core.attributesFile=${os.devNull}`,
+    ...args,
+  ], {
+    encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    env: reconstructionEnvironment(),
+  });
+  try {
+    const cloned = invoke(['clone', '--no-local', '--no-checkout', sourcePath, snapshot]);
+    // `clone` records the source path as origin. That path is worker-owned for
+    // isolated executions, so discard it before a validator can discover and
+    // read worker-controlled `.git` state through the reconstructed checkout.
+    const disconnected = cloned.status === 0
+      ? invoke(['-C', snapshot, 'remote', 'remove', 'origin'])
+      : undefined;
+    // A tracked attributes file is part of the candidate tree.  Inspect it
+    // through immutable blobs before checkout: otherwise an ambient filter
+    // configuration could execute a smudge command while materializing the
+    // validation snapshot.
+    const trackedFilters = disconnected?.status === 0
+      ? hasTrackedFilterAttributes(snapshot, headSha, invoke)
+      : null;
+    const checkedOut = trackedFilters === false
+      ? invoke(['-C', snapshot, 'checkout', '--detach', '--force', headSha])
+      : undefined;
+    // A plain detached checkout deliberately does not populate gitlinks. Do
+    // not misreport an incomplete tree as a validator failure; submodule
+    // provenance needs its own host-qualified reconstruction boundary.
+    const gitlinks = checkedOut?.status === 0 ? containsGitlinks(snapshot, invoke) : null;
+    if (cloned.status !== 0 || disconnected?.status !== 0 || trackedFilters !== false || checkedOut?.status !== 0 || gitlinks !== false) {
+      rmSync(snapshot, { recursive: true, force: true });
+      return null;
+    }
+    return { path: snapshot, dispose: () => rmSync(snapshot, { recursive: true, force: true }) };
+  } catch {
+    rmSync(snapshot, { recursive: true, force: true });
+    return null;
+  }
 }
 
 function isCommand(value: unknown): value is { readonly argv: readonly string[]; readonly timeoutMs: number } {
@@ -197,26 +388,41 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
     const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
-    if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity)) {
+    if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
-    for (let index = 0; index < configured.length; index += 1) {
-      const command = configured[index];
-      if (!isCommand(command)) {
-        evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
+    // A configured baseline is host-owned and already proved byte-identical
+    // for every ignored dependency.  It is therefore the only place those
+    // dependencies may be executed.  Otherwise reconstruct fresh command
+    // input so worker-controlled .git bytes have no validation authority.
+    const baseline = this.configuration.trustedIgnoredBaselinePath;
+    const commandWorkspace = baseline === undefined
+      ? reconstructedWorkspace(workspacePath, request.headSha)
+      : { path: baseline, dispose: () => {} };
+    if (commandWorkspace === null) {
+      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+    }
+    try {
+      for (let index = 0; index < configured.length; index += 1) {
+        const command = configured[index];
+        if (!isCommand(command)) {
+          evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
+          return { status: 'unknown', configRevision: revision, commands: evidence };
+        }
+        const result = await execute(index, command, commandWorkspace.path);
+        evidence.push(result);
+        if (result.outcome === 'failed' || result.outcome === 'timed_out') {
+          return { status: 'failed', configRevision: revision, commands: evidence };
+        }
+        if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+      }
+      if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
+        evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      const result = await execute(index, command, workspacePath);
-      evidence.push(result);
-      if (result.outcome === 'failed' || result.outcome === 'timed_out') {
-        return { status: 'failed', configRevision: revision, commands: evidence };
-      }
-      if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+      return { status: 'passed', configRevision: revision, commands: evidence };
+    } finally {
+      commandWorkspace.dispose();
     }
-    if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity)) {
-      evidence.push(workspaceUnavailable(evidence.length));
-      return { status: 'unknown', configRevision: revision, commands: evidence };
-    }
-    return { status: 'passed', configRevision: revision, commands: evidence };
   }
 }

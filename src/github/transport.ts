@@ -28,6 +28,8 @@ export interface ProcessRunOptions {
   readonly signal?: AbortSignal;
   /** Optional UTF-8 payload for non-interactive commands that read stdin. */
   readonly stdin?: string;
+  /** Deliberately narrowed environment for an isolated implementation runtime. */
+  readonly env?: NodeJS.ProcessEnv;
 }
 
 export interface ProcessRunner {
@@ -57,6 +59,7 @@ export class NodeProcessRunner implements ProcessRunner {
           timeout: options.timeoutMs,
           cwd: options.cwd,
           signal: options.signal,
+          ...(options.env === undefined ? {} : { env: options.env }),
           maxBuffer: 16 * 1024 * 1024,
         },
         (error: ProcessError | null, stdout: string, stderr: string) => {

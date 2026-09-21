@@ -28,6 +28,8 @@ export interface RepositoryTarget {
   readonly owner: string;
   readonly repo: string;
   readonly branch: string;
+  /** Existing same-repository PR branch that host publication must advance. */
+  readonly publicationBranch?: string;
 }
 
 /** Explicit workflow states (issue #2). */
@@ -72,12 +74,15 @@ export type TransitionType = (typeof TRANSITION_TYPES)[number];
 
 /** Immutable local identity selected before an issue implementation begins. */
 export interface ImplementationBootstrapIdentity {
+  /** Durable workspace boundary; never infer this from an operator path. */
+  readonly bootstrapKind: 'linked-worktree' | 'standalone-isolated';
   readonly owner: string;
   readonly repo: string;
   readonly issueNumber: number;
   readonly baseBranch: string;
   readonly baseSha: string;
   readonly branch: string;
+  readonly publicationBranch?: string;
   readonly workspacePath: string;
 }
 

@@ -111,4 +111,12 @@ describe('execution profiles', () => {
       /no greater than 2147483647/,
     );
   });
+
+  it('accepts only the exact qualified isolated Luna transport settings', () => {
+    const configuration = parseExecutionProfileConfiguration(CONFIG);
+    const luna = { ...configuration, profiles: { ...configuration.profiles, routine: { executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const } } };
+    assert.doesNotThrow(() => assertExecutionSupportedByProvider(resolveExecutionProfile(luna, 'routine', ['luna-isolated'])));
+    const wrong = resolveExecutionProfile({ ...luna, profiles: { ...luna.profiles, routine: { ...luna.profiles.routine, model: 'configured-model' } } }, 'routine', ['luna-isolated']);
+    assert.throws(() => assertExecutionSupportedByProvider(wrong), /unsupported/);
+  });
 });

@@ -68,6 +68,7 @@ function sameIdentity(a: ImplementationBootstrapIdentity, b: ImplementationBoots
  */
 export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   readonly kind = 'implementation-bootstrap' as const;
+  readonly bootstrapKind = 'linked-worktree' as const;
   private readonly repositoryRoot: string;
   private readonly workspaceRoot: string;
   private readonly remote: string;
@@ -187,6 +188,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   private identityFor(request: BootstrapPlanRequest): ImplementationBootstrapIdentity {
     const suffix = createHash('sha256').update(request.runId).digest('hex').slice(0, 16);
     return {
+      bootstrapKind: 'linked-worktree',
       owner: request.target.owner,
       repo: request.target.repo,
       issueNumber: request.target.issueNumber,

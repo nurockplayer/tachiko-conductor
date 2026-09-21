@@ -31,6 +31,7 @@ const dirs: string[] = [];
 const fixtures: BootstrapGitFixture[] = [];
 
 const identity: ImplementationBootstrapIdentity = {
+  bootstrapKind: 'linked-worktree',
   owner: TARGET.owner,
   repo: TARGET.repo,
   issueNumber: TARGET.issueNumber,
@@ -194,7 +195,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       github: new QueueGithub([snapshot(OLD, pr(8, OLD)), snapshot(OLD, pr(8, OLD)), snapshot(OLD, pr(8, OLD))]),
       implementation,
       reviewer: new ApprovingReviewer(),
-      bootstrap: { kind: 'implementation-bootstrap', plan: async () => identity, prepare: async () => identity, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => ({ headSha: OLD, branch: identity.branch }) },
+      bootstrap: { kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree', plan: async () => identity, prepare: async () => identity, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => ({ headSha: OLD, branch: identity.branch }) },
     }, 'run-2', { maxReviewAttempts: 1, now: () => T0 });
     assert.equal(result.outcome, 'needs_human');
     assert.equal(implementation.requests.length, 0);
@@ -345,7 +346,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
         reviewer: { kind: 'reviewer', review: async () => { calls.push('reviewer'); return { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] }; } },
         validation: new PassingValidation(),
         hostedCheckPolicy: TEST_HOSTED_POLICY,
-        bootstrap: { kind: 'implementation-bootstrap', plan: async () => identity, prepare: async () => { calls.push('prepare'); return identity; }, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => ({ headSha: NEW, branch: identity.branch }) },
+        bootstrap: { kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree', plan: async () => identity, prepare: async () => { calls.push('prepare'); return identity; }, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => ({ headSha: NEW, branch: identity.branch }) },
       }, run.id, { maxReviewAttempts: 1, now: () => T0 });
       assert.equal(result.outcome, 'needs_human', state);
       assert.deepEqual(calls, [], state);
@@ -383,7 +384,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       github: new QueueGithub([snapshot(OLD, pr(99, OLD, { headRef: 'foreign-branch' }))]),
       implementation: { kind: 'implementation-agent', run: async () => { calls.push('agent'); return successResult(OLD); } },
       reviewer: new ApprovingReviewer(),
-      bootstrap: { kind: 'implementation-bootstrap', plan: async () => prepared, prepare: async () => { calls.push('prepare'); return prepared; }, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => ({ headSha: OLD, branch: prepared.branch }) },
+      bootstrap: { kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree', plan: async () => prepared, prepare: async () => { calls.push('prepare'); return prepared; }, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => ({ headSha: OLD, branch: prepared.branch }) },
     }, run.id, { maxReviewAttempts: 1, now: () => T0 });
     assert.equal(result.outcome, 'needs_human');
     assert.deepEqual(calls, []);
@@ -587,7 +588,7 @@ for (const state of ['IMPLEMENTING', 'CHANGES_REQUESTED'] as const) {
         github: new QueueGithub(drift === 'post-tuple' ? [snapshot(OLD), live] : [live]),
         implementation: { kind: 'implementation-agent', run: async () => { calls.push('agent'); return successResult(NEW); } },
         reviewer: new ApprovingReviewer(),
-        bootstrap: { kind: 'implementation-bootstrap', plan: async () => identity, prepare: async () => { calls.push('prepare'); return identity; }, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => { throw new Error('must not verify'); } },
+        bootstrap: { kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree', plan: async () => identity, prepare: async () => { calls.push('prepare'); return identity; }, guard: () => ({ assertValid: async () => undefined }), verifyDurable: async () => { throw new Error('must not verify'); } },
       }, run.id, { maxReviewAttempts: 3, now: () => T0 });
       assert.equal(result.outcome, 'needs_human');
       assert.equal(result.run.headSha, OLD);

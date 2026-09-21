@@ -36,6 +36,8 @@ export interface WorkflowDependencies {
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
   readonly bootstrap?: ImplementationBootstrapAdapter;
+  /** Selects an immutable bootstrap boundary from the persisted execution snapshot. */
+  readonly bootstrapForExecution?: (execution: ResolvedExecutionConfiguration | undefined) => ImplementationBootstrapAdapter | undefined;
   readonly reviewer: ReviewerAdapter;
   /** Explicit repository/run validation adapter; absence is recorded as unknown and fails closed. */
   readonly validation?: ValidationAdapter;
@@ -64,6 +66,12 @@ export type WorkflowOutcome =
 function formatTarget(target: Target): string {
   if (target.kind === 'issue') return `${target.owner}/${target.repo}#${target.issueNumber}`;
   return `${target.owner}/${target.repo}@${target.branch}`;
+}
+
+function assertBootstrapBoundary(bootstrap: NonNullable<Run['bootstrap']>, adapter: ImplementationBootstrapAdapter): void {
+  if (bootstrap.bootstrapKind !== adapter.bootstrapKind) {
+    throw new Error(`Persisted ${bootstrap.bootstrapKind} workspace cannot be used by ${adapter.bootstrapKind} bootstrap transport.`);
+  }
 }
 
 function renderBlockingFindings(run: Run): string | null {
@@ -117,6 +125,14 @@ function admittedRepairExecution(run: Run, deps: WorkflowDependencies): Resolved
   let resolved: ResolvedExecutionConfiguration | undefined;
   try { resolved = deps.resolveRepairExecutionProfile(receipt.executionProfile); } catch { return null; }
   return resolved !== undefined && JSON.stringify(resolved) === JSON.stringify(receipt.execution) ? resolved : null;
+}
+
+/** The persisted workspace boundary, not the initial provider, selects its later validation/review bootstrap. */
+function bootstrapExecution(run: Run): ResolvedExecutionConfiguration | undefined {
+  if (run.bootstrap?.bootstrapKind !== 'standalone-isolated' || run.execution?.executor === 'luna-isolated') return run.execution;
+  return [...(run.repairAdmissions ?? [])].reverse().find(
+    (admission) => admission.execution.executor === 'luna-isolated' && admission.pullRequestNumber === run.pullRequest?.number,
+  )?.execution;
 }
 
 function hostedValidation(
@@ -298,6 +314,7 @@ export async function runWorkflow(
         const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
           ? admittedRepairExecution(run, deps)
           : run.execution;
+        const bootstrapAdapter = deps.bootstrapForExecution?.(effectiveExecution ?? undefined) ?? deps.bootstrap;
         if (pendingRepair && run.repairTaskShapeAuthority !== undefined && effectiveExecution === null) {
           return park(
             run,
@@ -322,8 +339,17 @@ export async function runWorkflow(
         }
         let bootstrap = run.bootstrap;
         let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
-        let initialRecoveryCandidate: { number: number; headSha: string } | undefined;
+        let initialRecoveryCandidate: { number: number; baseSha: string; headSha: string } | undefined;
         let workspaceGuard: WorkspaceGuard | undefined;
+
+        // A fresh isolated-Luna run may begin against an already-open PR. Bind
+        // its exact tuple before planning so prepare cannot seed from a stale
+        // base and later attempt to adopt a different head.
+        if (bootstrap === undefined && run.headSha === undefined &&
+          effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null && snapshot.headSha !== null) {
+          recoveryAuthority = { expectedHeadSha: snapshot.headSha };
+          initialRecoveryCandidate = { number: snapshot.pullRequest.number, baseSha: snapshot.pullRequest.baseSha, headSha: snapshot.headSha };
+        }
 
         if (bootstrap !== undefined && (snapshot.pullRequest !== null || run.headSha !== undefined || run.pullRequest !== undefined)) {
           const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
@@ -338,7 +364,7 @@ export async function runWorkflow(
           // durable verification below must succeed before anything is adopted.
           recoveryAuthority = { expectedHeadSha: run.headSha ?? snapshot.headSha! };
           if (run.headSha === undefined) {
-            initialRecoveryCandidate = { number: snapshot.pullRequest!.number, headSha: snapshot.headSha! };
+            initialRecoveryCandidate = { number: snapshot.pullRequest!.number, baseSha: snapshot.pullRequest!.baseSha, headSha: snapshot.headSha! };
           }
         }
         if (pendingRepair && snapshot.headSha !== run.headSha) {
@@ -359,26 +385,44 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
-        if (!pendingRepair && snapshot.pullRequest === null && bootstrap === undefined) {
-          if (deps.bootstrap === undefined || snapshot.repository.defaultBranch === null || snapshot.repository.defaultBranchHeadSha === null) {
+        if ((
+          !pendingRepair && (snapshot.pullRequest === null || effectiveExecution?.executor === 'luna-isolated') ||
+          pendingRepair && effectiveExecution?.executor === 'luna-isolated'
+        ) && bootstrap === undefined) {
+          const existingLuna = effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null;
+          const authoritativeBaseBranch = existingLuna ? snapshot.pullRequest?.baseRef : snapshot.repository.defaultBranch;
+          const authoritativeBaseSha = existingLuna ? snapshot.pullRequest?.baseSha : snapshot.repository.defaultBranchHeadSha;
+          const publicationBranch = existingLuna ? snapshot.pullRequest?.headRef : undefined;
+          const sameRepository = existingLuna &&
+            snapshot.pullRequest?.headRepository?.owner.toLowerCase() === target.owner.toLowerCase() &&
+            snapshot.pullRequest?.headRepository?.repo.toLowerCase() === target.repo.toLowerCase();
+          if (bootstrapAdapter === undefined || authoritativeBaseBranch === undefined || authoritativeBaseBranch === null || authoritativeBaseBranch === '' ||
+            authoritativeBaseSha === undefined || authoritativeBaseSha === null || authoritativeBaseSha === '') {
             return bootstrapFailureOutcome(run, new Error('No verified bootstrap adapter and live default branch are available.'), store, now);
           }
+          if (existingLuna && (!sameRepository || publicationBranch === undefined || publicationBranch.trim() === '')) {
+            return bootstrapFailureOutcome(run, new Error('Existing Luna PR has no safe same-repository publication branch.'), store, now);
+          }
           try {
-            bootstrap = await deps.bootstrap.plan({ runId: run.id, target, baseBranch: snapshot.repository.defaultBranch, baseSha: snapshot.repository.defaultBranchHeadSha });
+            bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: authoritativeBaseBranch,
+              baseSha: authoritativeBaseSha, ...(publicationBranch === undefined ? {} : { publicationBranch }) });
+            assertBootstrapBoundary(bootstrap, bootstrapAdapter);
             run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
             store.update(run);
+            if (pendingRepair) recoveryAuthority = { expectedHeadSha: run.headSha! };
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
           }
         }
         if (bootstrap !== undefined) {
-          if (deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
+          if (bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
           try {
-            bootstrap = await deps.bootstrap.prepare({
+            assertBootstrapBoundary(bootstrap, bootstrapAdapter);
+            bootstrap = await bootstrapAdapter.prepare({
               runId: run.id, target, baseBranch: bootstrap.baseBranch, baseSha: bootstrap.baseSha,
               existing: bootstrap, ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
             });
-            workspaceGuard = deps.bootstrap.guard(bootstrap);
+            workspaceGuard = bootstrapAdapter.guard(bootstrap);
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -389,11 +433,14 @@ export async function runWorkflow(
             if (conflict !== null) return park(run, conflict, store, now);
             if (run.headSha === undefined) {
               if (initialRecoveryCandidate !== undefined &&
-                  (snapshot.pullRequest.number !== initialRecoveryCandidate.number || snapshot.headSha !== initialRecoveryCandidate.headSha)) {
+                  (snapshot.pullRequest.number !== initialRecoveryCandidate.number ||
+                    snapshot.pullRequest.baseSha !== initialRecoveryCandidate.baseSha ||
+                    snapshot.headSha !== initialRecoveryCandidate.headSha)) {
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
               }
               try {
-                await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard });
+                await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard,
+                  ...(bootstrap.bootstrapKind === 'standalone-isolated' ? { adoptExistingHead: true, progressBaseSha: bootstrap.baseSha } : {}) });
               } catch (error) {
                 return bootstrapFailureOutcome(run, error, store, now);
               }
@@ -434,16 +481,26 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
+        const isIsolatedLuna = effectiveExecution?.executor === 'luna-isolated';
         const instructions = pendingFixInstructions ?? (
           snapshot.pullRequest === null
             ? `${snapshot.issue.body}\n\nConductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : snapshot.issue.body
         );
-        const supplementalInstructions = pendingFixInstructions ?? (
+        const boundedInstructions = isIsolatedLuna && pendingFixInstructions !== null
+          ? `Task title: ${snapshot.issue.title}\n\nTask requirements:\n${snapshot.issue.body}\n\nRepair requirements:\n${pendingFixInstructions}\n\nIsolated Luna contract: implement only the host-bounded task and repair; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
+          : isIsolatedLuna && snapshot.pullRequest === null
+          ? `Task title: ${snapshot.issue.title}\n\nTask requirements:\n${snapshot.issue.body}\n\nIsolated Luna contract: implement only the host-bounded task and its tests; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
+          : isIsolatedLuna
+            ? `Task title: ${snapshot.issue.title}\n\n${instructions}\n\nIsolated Luna contract: implement only this bounded task and its tests; run the required tests; commit one clean exact HEAD. The trusted host, not this worker, owns every push and pull-request action.`
+          : instructions;
+        const supplementalInstructions = isIsolatedLuna && snapshot.pullRequest === null
+          ? undefined
+          : pendingFixInstructions ?? (
           snapshot.pullRequest === null
             ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : undefined
-        );
+          );
         if (effectiveExecution?.executor === 'worker-router' && snapshot.pullRequest !== null && bootstrap === undefined) {
           return park(run, 'Worker-router requires a verified prepared workspace and branch for an existing implementation pull request.', store, now);
         }
@@ -468,12 +525,16 @@ export async function runWorkflow(
         let result: AgentResult;
         try {
           result = await implementation.run({
-            target, baseSha, authority: 'live-target', instructions,
+            target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target', instructions: boundedInstructions,
             ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
-            capabilities: await deps.resolveImplementationCapabilities?.(),
-            ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-            ...(run.executor === undefined ? {} : { executor: run.executor }),
+            ...(isIsolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
+            // #92 deliberately qualifies fresh bounded Luna workers.  A
+            // repair/re-entry therefore cannot pretend its prior CLI thread
+            // is a durable continuation; its explicit exact-HEAD bootstrap
+            // and newly copied bounded packet are the continuity authority.
+            ...(isIsolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(isIsolatedLuna || run.executor === undefined ? {} : { executor: run.executor }),
             runtimeOwnership: {
               runId: run.id,
               generation: run.executor?.generation ?? run.id,
@@ -526,12 +587,12 @@ export async function runWorkflow(
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
         }
         if (bootstrap !== undefined) {
-          if (result.headSha === undefined || deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
+          if (result.headSha === undefined || bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
           try {
-            await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
-            if (run.execution?.executor === 'worker-router' && snapshot.pullRequest === null) {
+            await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
+            if ((run.execution?.executor === 'worker-router' || run.execution?.executor === 'luna-isolated') && snapshot.pullRequest === null) {
               if (deps.github.createImplementationPullRequest === undefined) {
-                return bootstrapFailureOutcome(run, new Error('Worker-router implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
+                return bootstrapFailureOutcome(run, new Error('Isolated implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
               }
               await deps.github.createImplementationPullRequest({
                 target,
@@ -574,6 +635,7 @@ export async function runWorkflow(
       }
 
       case 'VALIDATING': {
+        const bootstrapAdapter = deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap;
         const activeValidation = activeValidationConfiguration(deps);
         const invalidAuthority = invalidValidationAuthority(activeValidation);
         if (invalidAuthority !== null) {
@@ -621,15 +683,16 @@ export async function runWorkflow(
         // the local worktree is fast-forwarded, so prepare and prove it again
         // immediately before the local process boundary.
         if (run.bootstrap !== undefined && deps.validation?.requiresOwnedWorkspace === true) {
-          if (deps.bootstrap === undefined || run.headSha === undefined) {
+          if (bootstrapAdapter === undefined || run.headSha === undefined) {
             return bootstrapFailureOutcome(run, new Error('Exact-HEAD validation requires the owned workspace bootstrap.'), store, now);
           }
           try {
-            const identity = await deps.bootstrap.prepare({
+            assertBootstrapBoundary(run.bootstrap, bootstrapAdapter);
+            const identity = await bootstrapAdapter.prepare({
               runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
               existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },
             });
-            await deps.bootstrap.verifyDurable({ identity, expectedHeadSha: run.headSha });
+            await bootstrapAdapter.verifyDurable({ identity, expectedHeadSha: run.headSha });
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
           }
@@ -791,7 +854,8 @@ export async function runWorkflow(
             github,
             implementation,
             reviewer,
-            bootstrap: deps.bootstrap,
+            bootstrap: deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap,
+            bootstrapForExecution: deps.bootstrapForExecution,
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
             resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,

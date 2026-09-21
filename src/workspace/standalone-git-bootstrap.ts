@@ -1,0 +1,320 @@
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync } from 'node:fs';
+import path from 'node:path';
+
+import { IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, ImplementationBootstrapError, type BootstrapPlanRequest, type BootstrapPrepareRequest, type DurableImplementationSnapshot, type ImplementationBootstrapAdapter, type VerifyDurableRequest } from '../adapters/bootstrap.js';
+import type { WorkspaceGuard } from '../adapters/agent.js';
+import type { ImplementationBootstrapIdentity } from '../domain/types.js';
+import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
+
+const SHA = /^[0-9a-f]{40}$/i;
+
+/**
+ * Host-owned, standalone checkout for #92 workers.  The worker checkout has
+ * no remotes at all; publication is performed by the host from this checkout
+ * only after the terminal clean descendant proof.
+ */
+export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
+  readonly kind = 'implementation-bootstrap' as const;
+  readonly bootstrapKind = 'standalone-isolated' as const;
+  private readonly source: string;
+  private readonly root: string;
+  private readonly runner: ProcessRunner;
+  private readonly timeoutMs: number;
+  private readonly preparedHeads = new Map<string, string>();
+  constructor(options: { repositoryRoot: string; workspaceRoot: string; runner?: ProcessRunner; timeoutMs?: number }) {
+    this.source = realpathSync(path.resolve(options.repositoryRoot));
+    this.root = path.resolve(options.workspaceRoot); mkdirSync(this.root, { recursive: true });
+    this.runner = options.runner ?? new NodeProcessRunner(); this.timeoutMs = options.timeoutMs ?? 30_000;
+  }
+  async plan(request: BootstrapPlanRequest): Promise<ImplementationBootstrapIdentity> {
+    if (!SHA.test(request.baseSha)) this.fail('INVALID_REQUEST', 'Standalone bootstrap requires an exact base SHA.');
+    await this.assertBranchName(request);
+    const identity = this.identity(request);
+    if (existsSync(identity.workspacePath)) this.fail('COLLISION', 'Standalone workspace path already exists.');
+    await this.assertPublicationRemote({ owner: request.target.owner, repo: request.target.repo });
+    // The live snapshot's base must be imported from the authenticated remote,
+    // rather than assumed to exist in a long-lived host checkout.
+    await this.assertFetchedBase(request.baseBranch, request.baseSha);
+    return identity;
+  }
+  async prepare(request: BootstrapPrepareRequest): Promise<ImplementationBootstrapIdentity> {
+    await this.assertBranchName(request);
+    const identity = { ...this.identity(request), ...(request.existing.publicationBranch === undefined ? {} : { publicationBranch: request.existing.publicationBranch }) };
+    if (!same(identity, request.existing)) this.fail('STALE_IDENTITY', 'Persisted standalone bootstrap identity changed.');
+    const authorized = request.recoveryAuthority?.expectedHeadSha ?? request.existing.baseSha;
+    if (!SHA.test(authorized)) this.fail('INVALID_REQUEST', 'Standalone recovery requires an exact authorized HEAD.');
+    if (!existsSync(identity.workspacePath)) {
+      await this.git(this.root, ['init', '--initial-branch', identity.branch, identity.workspacePath]);
+      // Fetch exactly one immutable object from the trusted host checkout, then
+      // remove the temporary local source remote before the worker can start.
+      await this.git(identity.workspacePath, ['fetch', '--no-tags', this.source, identity.baseSha]);
+      if (authorized !== identity.baseSha) {
+        // Existing-PR adoption starts at the PR's separately authenticated
+        // head, never at a cached default branch or an ancestor artifact.
+        await this.assertPublicationRemote(identity);
+        await this.git(this.source, ['fetch', '--no-tags', 'origin', authorized]);
+        const fetched = (await this.git(this.source, ['rev-parse', 'FETCH_HEAD'])).stdout.trim();
+        if (fetched !== authorized) this.fail('STALE_IDENTITY', 'Trusted host could not fetch the authoritative PR HEAD.');
+        await this.git(identity.workspacePath, ['fetch', '--no-tags', this.source, authorized]);
+      }
+      await this.git(identity.workspacePath, ['checkout', '--detach', authorized]);
+      await this.git(identity.workspacePath, ['switch', '-C', identity.branch, authorized]);
+      const remotes = (await this.git(identity.workspacePath, ['remote'])).stdout.trim();
+      if (remotes !== '') this.fail('INVALID_REQUEST', 'Standalone worker checkout unexpectedly retained a remote.');
+    }
+    await this.assert(identity, authorized);
+    this.preparedHeads.set(identity.workspacePath, authorized);
+    return identity;
+  }
+  guard(identity: ImplementationBootstrapIdentity): WorkspaceGuard { return { assertValid: (phase) => this.assert(identity, phase === 'after-execution' ? undefined : this.preparedHeads.get(identity.workspacePath) ?? identity.baseSha) }; }
+  async verifyDurable(request: VerifyDurableRequest): Promise<DurableImplementationSnapshot> {
+    await this.assert(request.identity);
+    const head = (await this.git(request.identity.workspacePath, ['rev-parse', 'HEAD'])).stdout.trim();
+    if (head !== request.expectedHeadSha) this.fail('HEAD_MISMATCH', 'Standalone worker HEAD differs from the reported exact HEAD.');
+    if (request.adoptExistingHead === true) {
+      const progressBase = request.progressBaseSha;
+      if (progressBase === undefined || progressBase === head) this.fail('HEAD_MISMATCH', 'Existing PR adoption requires a distinct authoritative PR base.');
+      await this.ancestor(request.identity.workspacePath, progressBase, head);
+      if (await this.tree(request.identity.workspacePath, progressBase) === await this.tree(request.identity.workspacePath, head)) {
+        this.fail('HEAD_MISMATCH', 'Existing PR adoption has no tree progress from the authoritative PR base.');
+      }
+      return { headSha: head, branch: request.identity.branch };
+    }
+    const progressBase = request.progressBaseSha ?? request.identity.baseSha;
+    if (head === progressBase) this.fail('HEAD_MISMATCH', 'Worker result did not advance the authorized HEAD.');
+    await this.ancestor(request.identity.workspacePath, progressBase, head);
+    if (await this.tree(request.identity.workspacePath, progressBase) === await this.tree(request.identity.workspacePath, head)) this.fail('HEAD_MISMATCH', 'Worker result has no tree progress from the authorized base.');
+    // This command is host-owned.  The worker has no remote, credentials, or
+    // source checkout authority, so it cannot publish the branch itself.
+    // Import through trusted host Git state; never run a worker checkout's
+    // hooks/config for publication.  Hooks are disabled on every host action.
+    await this.git(this.source, ['fetch', '--no-tags', '--no-recurse-submodules', request.identity.workspacePath, head]);
+    await this.assertPublicationRemote(request.identity);
+    const ref = `refs/heads/${request.identity.publicationBranch ?? request.identity.branch}`;
+    const before = await this.remoteHead(ref);
+    if (before !== null) {
+      await this.git(this.source, ['fetch', '--no-tags', 'origin', ref]);
+      await this.ancestor(this.source, before, head);
+    }
+    // Normal Git push is intentionally non-force. A concurrent/diverged ref
+    // therefore remains untouched even if it changes after the re-read.
+    await this.git(this.source, ['push', '--no-verify', 'origin', `${head}:${ref}`]);
+    await this.assertPublicationRemote(request.identity);
+    const published = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim().split(/\s+/)[0];
+    if (published !== head) this.fail('UNPUSHED_HEAD', 'Host publication did not retain the exact standalone worker HEAD.');
+    return { headSha: head, branch: request.identity.branch };
+  }
+  private identity(r: BootstrapPlanRequest): ImplementationBootstrapIdentity {
+    const branch = `tachiko/${r.runId}`;
+    const suffix = createHash('sha256').update(`${r.target.owner}/${r.target.repo}#${r.target.issueNumber}:${r.runId}`).digest('hex').slice(0, 16);
+    return { bootstrapKind: 'standalone-isolated', owner: r.target.owner, repo: r.target.repo, issueNumber: r.target.issueNumber, baseBranch: r.baseBranch, baseSha: r.baseSha, branch, ...(r.publicationBranch === undefined ? {} : { publicationBranch: r.publicationBranch }), workspacePath: path.join(this.root, `luna-${suffix}`) };
+  }
+  private async assertBranchName(request: BootstrapPlanRequest): Promise<void> {
+    const result = await this.git(this.root, ['check-ref-format', '--branch', `tachiko/${request.runId}`], [0, 1, 128]);
+    if (result.exitCode !== 0) this.fail('INVALID_REQUEST', 'Standalone bootstrap generated an invalid Git branch name.');
+  }
+  private async assert(i: ImplementationBootstrapIdentity, recovery?: string, initialBase?: string): Promise<void> {
+    if (!existsSync(i.workspacePath)) this.fail('STALE_IDENTITY', 'Standalone workspace disappeared.');
+    this.assertWorkerGitSurface(i.workspacePath);
+    await this.assertNoWorkerIndexFlags(i.workspacePath);
+    const branch = (await this.git(i.workspacePath, ['branch', '--show-current'])).stdout.trim();
+    if (branch !== i.branch) this.fail('STALE_IDENTITY', 'Standalone worker branch changed.');
+    if ((await this.git(i.workspacePath, ['remote'])).stdout.trim() !== '') this.fail('STALE_IDENTITY', 'Standalone worker checkout has a remote.');
+    if ((await this.git(i.workspacePath, ['status', '--porcelain', '--untracked-files=all'])).stdout.trim() !== '') this.fail('DIRTY_WORKSPACE', 'Standalone worker workspace is dirty.');
+    const head = (await this.git(i.workspacePath, ['rev-parse', 'HEAD'])).stdout.trim();
+    if (!SHA.test(head)) this.fail('HEAD_MISMATCH', 'Standalone worker HEAD is malformed.');
+    if (recovery !== undefined && head !== recovery) this.fail('STALE_IDENTITY', 'Standalone restart cannot adopt a different worker HEAD.');
+    if (recovery === undefined && initialBase !== undefined && head !== initialBase) this.fail('STALE_IDENTITY', 'Unrecorded pre-PR worker progress cannot be adopted after restart.');
+  }
+  /** Index flags can hide worker edits from porcelain cleanliness checks. */
+  private async assertNoWorkerIndexFlags(workspace: string): Promise<void> {
+    const entries = (await this.git(workspace, ['ls-files', '-v', '-z'])).stdout.split('\0');
+    for (const entry of entries) {
+      if (entry === '') continue;
+      // Lowercase tags are assume-unchanged; uppercase S is skip-worktree.
+      if (/^[a-zS] /.test(entry)) this.fail('DIRTY_WORKSPACE', 'Standalone worker index contains hidden-worktree flags.');
+    }
+  }
+  private async ancestor(cwd: string, base: string, head: string): Promise<void> { if ((await this.git(cwd, ['merge-base', '--is-ancestor', base, head], [0, 1])).exitCode !== 0) this.fail('HEAD_MISMATCH', 'Worker HEAD does not descend from its authorized base.'); }
+  private async tree(cwd: string, ref: string): Promise<string> { return (await this.git(cwd, ['rev-parse', `${ref}^{tree}`])).stdout.trim(); }
+  private async assertFetchedBase(branch: string, expected: string): Promise<void> {
+    await this.git(this.source, ['fetch', '--no-tags', 'origin', `refs/heads/${branch}`]);
+    const fetched = (await this.git(this.source, ['rev-parse', 'FETCH_HEAD'])).stdout.trim();
+    if (fetched !== expected) this.fail('BASE_DRIFT', 'Trusted host fetch does not match the live base SHA.');
+  }
+  private async assertPublicationRemote(request: Pick<ImplementationBootstrapIdentity, 'owner' | 'repo'>): Promise<void> {
+    const urls = [...(await this.git(this.source, ['remote', 'get-url', '--all', 'origin'])).stdout.trim().split(/\r?\n/), ...(await this.git(this.source, ['remote', 'get-url', '--all', '--push', 'origin'])).stdout.trim().split(/\r?\n/)];
+    const expected = `${request.owner}/${request.repo}`.toLowerCase();
+    if (!urls.every((url) => githubIdentity(url)?.toLowerCase() === expected)) this.fail('REPOSITORY_MISMATCH', 'Trusted host publication remote does not exactly match the target GitHub repository.');
+  }
+  private assertWorkerGitSurface(workspace: string): void {
+    const gitDir = path.join(workspace, '.git');
+    if (!existsSync(gitDir) || !lstatSync(gitDir).isDirectory()) this.fail('STALE_IDENTITY', 'Standalone worker Git directory changed.');
+    // A standalone checkout owns its complete Git directory. A worker-created
+    // common-dir indirection would move config, refs, objects and grafts out
+    // of the sealed surface below, so reject it before any host Git command.
+    if (existsSync(path.join(gitDir, 'commondir'))) {
+      this.fail('STALE_IDENTITY', 'Standalone worker Git directory redirects its common metadata.');
+    }
+    // Git still honors legacy graft files even when replacement refs are
+    // disabled. Reject this alternate ancestry authority before a host-owned
+    // Git command can use it to certify an unrelated worker commit.
+    if (existsSync(path.join(gitDir, 'info', 'grafts'))) {
+      this.fail('STALE_IDENTITY', 'Standalone worker Git directory contains legacy graft ancestry.');
+    }
+    const config = path.join(gitDir, 'config');
+    if (!existsSync(config) || !lstatSync(config).isFile()) this.fail('STALE_IDENTITY', 'Standalone worker Git config changed.');
+    // extensions.worktreeConfig activates this additional worktree-local
+    // source. Inspect it as inert text before any host Git invocation.
+    for (const candidate of [config, path.join(gitDir, 'config.worktree')]) {
+      if (!existsSync(candidate)) continue;
+      if (!lstatSync(candidate).isFile() || hasExecutableGitConfig(readFileSync(candidate, 'utf8'))) {
+        this.fail('STALE_IDENTITY', 'Worker Git config requests executable behavior.');
+      }
+    }
+    const attributeFiles = [...findAttributeFiles(workspace), path.join(gitDir, 'info', 'attributes')];
+    for (const file of attributeFiles) {
+      if (!existsSync(file)) continue;
+      if (!lstatSync(file).isFile() || hasFilterAttribute(readFileSync(file, 'utf8'))) {
+        this.fail('STALE_IDENTITY', 'Worker Git attributes request filter behavior.');
+      }
+    }
+  }
+  private async remoteHead(ref: string): Promise<string | null> { const raw = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim(); return raw === '' ? null : raw.split(/\s+/)[0] ?? null; }
+  private async git(cwd: string, args: string[], allowed: number[] = [0]) {
+    const env = { ...process.env } as NodeJS.ProcessEnv;
+    for (const key of Object.keys(env)) if (key.startsWith('GIT_CONFIG_') || ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'].includes(key)) delete env[key];
+    env.GIT_CONFIG_NOSYSTEM = '1';
+    env.GIT_CONFIG_GLOBAL = '/dev/null';
+    env.GIT_NO_REPLACE_OBJECTS = '1';
+    const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.useReplaceRefs=false', ...args], { cwd, timeoutMs: this.timeoutMs, env });
+    if (!allowed.includes(result.exitCode)) this.fail('COMMAND_FAILED', `git ${args[0]} failed.`); return result;
+  }
+  private fail(code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, message: string): never { throw new ImplementationBootstrapError(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE[code], message); }
+}
+function same(a: ImplementationBootstrapIdentity, b: ImplementationBootstrapIdentity): boolean { return a.bootstrapKind === b.bootstrapKind && a.owner === b.owner && a.repo === b.repo && a.issueNumber === b.issueNumber && a.baseBranch === b.baseBranch && a.baseSha === b.baseSha && a.branch === b.branch && a.publicationBranch === b.publicationBranch && path.resolve(a.workspacePath) === path.resolve(b.workspacePath); }
+function githubIdentity(value: string): string | null {
+  const url = value.trim(); let owner: string | undefined; let repo: string | undefined;
+  try { const parsed = new URL(url); if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'github.com' || parsed.username || parsed.password) return null; [owner, repo] = parsed.pathname.replace(/^\/+|\/+$/g, '').split('/'); }
+  catch { const match = /^git@github\.com:([^/\s]+)\/([^/\s]+)$/.exec(url); if (match === null) return null; [, owner, repo] = match; }
+  if (owner === undefined || repo === undefined || !/^[A-Za-z0-9_.-]+$/.test(owner) || !/^[A-Za-z0-9_.-]+(?:\.git)?$/.test(repo)) return null;
+  return `${owner}/${repo.replace(/\.git$/, '')}`;
+}
+
+/**
+ * Read attributes as inert text.  Asking Git to interpret a worker tree would
+ * re-open the very filter surface this boundary is intended to close.
+ */
+function findAttributeFiles(root: string): string[] {
+  const found: string[] = [];
+  const visit = (directory: string): void => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+      if (entry.name === '.git') continue;
+      const candidate = path.join(directory, entry.name);
+      // Ordinary repository symlinks are inert to this scan. A symlink named
+      // .gitattributes is rejected below only when it is attribute authority.
+      if (entry.isSymbolicLink()) {
+        if (entry.name === '.gitattributes') throw new Error('Standalone worker attribute authority must not be symbolic links.');
+        continue;
+      }
+      if (entry.isDirectory()) {
+        // A nested Git directory/worktree can carry its own config, hooks,
+        // filters and replacement refs. Host verification never recurses into
+        // worker-controlled Git repositories or submodules.
+        if (existsSync(path.join(candidate, '.git'))) throw new Error('Standalone worker checkout must not contain nested Git repositories.');
+        visit(candidate);
+      }
+      else if (entry.isFile() && entry.name === '.gitattributes') found.push(candidate);
+    }
+  };
+  visit(root);
+  return found;
+}
+
+/** Remove Git-config comments without treating quoted punctuation as syntax. */
+function uncommentConfig(line: string): string {
+  let quote = false;
+  let escaped = false;
+  let result = '';
+  for (const char of line) {
+    if (escaped) { result += char; escaped = false; continue; }
+    if (char === '\\' && quote) { result += char; escaped = true; continue; }
+    if (char === '"') { quote = !quote; result += char; continue; }
+    if (!quote && (char === '#' || char === ';')) break;
+    result += char;
+  }
+  return result.trim();
+}
+
+function logicalConfigLines(raw: string): readonly string[] {
+  const lines: string[] = [];
+  let pending = '';
+  for (const physical of raw.split(/\r?\n/)) {
+    let slashCount = 0;
+    for (let index = physical.length - 1; index >= 0 && physical[index] === '\\'; index -= 1) slashCount += 1;
+    if (slashCount % 2 === 1) { pending += physical.slice(0, -1); continue; }
+    lines.push(`${pending}${physical}`); pending = '';
+  }
+  if (pending !== '') lines.push(pending);
+  return lines;
+}
+
+/** Conservative Git-config parser for the executable configuration surface. */
+function hasExecutableGitConfig(raw: string): boolean {
+  let section = '';
+  for (const physical of logicalConfigLines(raw)) {
+    const line = uncommentConfig(physical);
+    if (line === '') continue;
+    if (line.startsWith('[') && line.endsWith(']')) {
+      const header = line.slice(1, -1).trim();
+      const match = /^([A-Za-z][A-Za-z0-9-]*)(?:\.[A-Za-z0-9-]+|\s+"(?:[^"\\]|\\.)*")?$/.exec(header);
+      if (match === null) return true; // malformed config is not safe to inspect
+      section = match[1]!.toLowerCase();
+      if (section === 'filter' || section === 'include' || section === 'includeif') return true;
+      continue;
+    }
+    const assignment = /^([A-Za-z][A-Za-z0-9.-]*)(?:\s*=\s*(.*)|\s*)$/.exec(line);
+    if (assignment === null) return true;
+    const key = assignment[1]!.toLowerCase();
+    const value = assignment[2]?.trim().toLowerCase();
+    if (section === 'filter' || key === 'filter' || key.startsWith('filter.') ||
+      (section === 'core' && ['hookspath', 'fsmonitor', 'sshcommand', 'attributesfile', 'worktree', 'trustctime', 'checkstat'].includes(key)) ||
+      (section === 'core' && ['filemode', 'symlinks'].includes(key) && !['true', 'yes', 'on', '1'].includes(value ?? '')) ||
+      (section === 'include' && key === 'path') || section === 'includeif') return true;
+  }
+  return false;
+}
+
+function attributeTokens(line: string): readonly string[] | null {
+  const tokens: string[] = [];
+  let token = '';
+  let quote = false;
+  let escaped = false;
+  const flush = () => { if (token !== '') { tokens.push(token); token = ''; } };
+  for (const char of line) {
+    if (escaped) { token += char; escaped = false; continue; }
+    if (char === '\\' && quote) { escaped = true; continue; }
+    if (char === '"') { quote = !quote; continue; }
+    if (!quote && /\s/.test(char)) { flush(); continue; }
+    token += char;
+  }
+  if (quote || escaped) return null;
+  flush();
+  return tokens;
+}
+
+/** Git attribute parser which rejects every spelling of a filter attribute. */
+function hasFilterAttribute(raw: string): boolean {
+  for (const rawLine of raw.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === '' || line.startsWith('#')) continue;
+    const tokens = attributeTokens(line);
+    if (tokens === null || tokens.length < 2) return true;
+    for (const token of tokens.slice(1)) {
+      const name = token.replace(/^[!-]/, '').split('=', 1)[0]!.toLowerCase();
+      if (name === 'filter' || name.startsWith('filter.')) return true;
+    }
+  }
+  return false;
+}

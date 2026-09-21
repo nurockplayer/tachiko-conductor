@@ -12,7 +12,7 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
-import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
+import { EXECUTION_CONFIGURATION_ERROR_CODE, type ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
@@ -138,12 +138,14 @@ class FakeValidation implements ValidationAdapter {
 
 class FakeBootstrap implements ImplementationBootstrapAdapter {
   readonly kind = 'implementation-bootstrap' as const;
+  readonly bootstrapKind = 'linked-worktree' as const;
   readonly identity = {
+    bootstrapKind: 'linked-worktree' as const,
     owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base',
     branch: 'tachiko/issue-42-test', workspacePath: '/tmp/tachiko-workspace',
   };
   async plan() { return this.identity; }
-  async prepare() { return this.identity; }
+  async prepare(..._args: unknown[]) { return this.identity; }
   guard() { return { assertValid: () => undefined }; }
   async verifyDurable(request: { expectedHeadSha: string }) { return { headSha: request.expectedHeadSha, branch: this.identity.branch }; }
 }
@@ -185,6 +187,45 @@ function reviewingRun(store: RunStore, id = 'run-1', headSha = HEAD): Run {
 }
 
 describe('runWorkflow', () => {
+  it('adopts an existing Luna PR from its authoritative base and head when default-branch fields are unavailable', async () => {
+    const store = new MemoryStore();
+    const execution: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'profiles-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+      sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const,
+    };
+    const planned: Array<{ baseBranch: string; baseSha: string }> = [];
+    const verified: Array<Record<string, unknown>> = [];
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+      async plan(request) {
+        planned.push({ baseBranch: request.baseBranch, baseSha: request.baseSha });
+        return { bootstrapKind: 'standalone-isolated', owner: 'acme', repo: 'widgets', issueNumber: 42,
+          baseBranch: request.baseBranch, baseSha: request.baseSha, branch: 'tachiko/issue-42-test', workspacePath: '/tmp/luna-existing' };
+      },
+      async prepare(request) { return request.existing; },
+      guard() { return { assertValid: () => undefined }; },
+      async verifyDurable(request) { verified.push(request as unknown as Record<string, unknown>); return { headSha: request.expectedHeadSha, branch: 'tachiko/issue-42-test' }; },
+    };
+    const github: GitHubAdapter = githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]);
+    const originalRead = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await originalRead(target);
+      return { ...live, repository: { ...live.repository, defaultBranch: null, defaultBranchHeadSha: null } };
+    };
+    const run = createRun(TARGET, T0, 'luna-existing-pr', execution);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const outcome = await runWorkflow(
+      { store, github, implementation, bootstrapForExecution: () => bootstrap, reviewer: new FakeReviewer([approve(HEAD)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id, { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(outcome.outcome, 'merge_ready');
+    assert.deepEqual(planned, [{ baseBranch: 'main', baseSha: 'base' }]);
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(verified[0]?.adoptExistingHead, true);
+    assert.equal(verified[0]?.progressBaseSha, 'base');
+  });
+
   it('fails closed in VALIDATING when no explicit local validation adapter is configured', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'validation-missing');
@@ -838,6 +879,129 @@ describe('runWorkflow', () => {
     assert.match(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
   });
 
+  it('binds an existing Luna PR head as recovery authority before standalone prepare', async () => {
+    class RecordingBootstrap extends FakeBootstrap {
+      prepareRequest: unknown;
+      override async prepare(request: unknown) { this.prepareRequest = request; return this.identity; }
+    }
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'existing-luna', execution));
+    const bootstrap = new RecordingBootstrap();
+    await runWorkflow({ store, github: githubAdapter([HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap }, 'existing-luna', { maxReviewAttempts: 1, now: () => T0 });
+    assert.deepEqual((bootstrap.prepareRequest as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
+  });
+
+  it('keeps Luna packets host-bounded and never resolves browser or MCP capabilities', async () => {
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'luna-no-capabilities', execution));
+    const implementation = new FakeImplementation([failureResult('bounded failure')]);
+    let resolved = 0;
+    await runWorkflow(
+      { store, github: githubAdapter([null, null]), implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => new FakeBootstrap(),
+        resolveImplementationCapabilities: async () => { resolved += 1; return [{ kind: 'mcp-http', name: 'tachiko_browser', endpoint: 'http://127.0.0.1:1/mcp' }]; } },
+      'luna-no-capabilities', { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(resolved, 0);
+    assert.equal(implementation.requests[0]?.capabilities, undefined);
+    assert.equal(implementation.requests[0]?.instructions,
+      'Task title: Fix the widget\n\nTask requirements:\nDoR-ready.\n\nIsolated Luna contract: implement only the host-bounded task and its tests; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.');
+    assert.doesNotMatch(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
+    assert.equal(implementation.requests[0]?.supplementalInstructions, undefined);
+  });
+
+  it('accepts case-only same-repository identity for an existing Luna PR', async () => {
+    class RecordingBootstrap extends FakeBootstrap {
+      prepareRequest: unknown;
+      override async prepare(request: unknown) { this.prepareRequest = request; return this.identity; }
+    }
+    const github = githubAdapter([HEAD, HEAD]);
+    const original = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await original(target);
+      return { ...live, pullRequest: { ...live.pullRequest!, headRepository: { owner: 'ACME', repo: 'WIDGETS' } } };
+    };
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'luna-case-repository', execution));
+    const bootstrap = new RecordingBootstrap();
+    await runWorkflow({ store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap }, 'luna-case-repository', { maxReviewAttempts: 1, now: () => T0 });
+    assert.deepEqual((bootstrap.prepareRequest as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
+  });
+
+  it('parks an existing Luna run when its authoritative PR tuple drifts after prepare', async () => {
+    class RecordingBootstrap extends FakeBootstrap {
+      prepareRequest: unknown;
+      override async prepare(request: unknown) { this.prepareRequest = request; return this.identity; }
+    }
+    const stable = snapshot(HEAD);
+    const drifted: GitHubLiveSnapshot = {
+      ...snapshot(HEAD),
+      pullRequest: {
+        ...snapshot(HEAD).pullRequest!,
+        number: 8,
+        baseRef: 'release',
+        headRef: 'tachiko/unexpected-branch',
+      },
+    };
+    let reads = 0;
+    const github: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() { throw new Error('unused'); },
+      async readBranch() { throw new Error('unused'); },
+      async listPullRequests() { throw new Error('unused'); },
+      async readLiveSnapshot() { return reads++ === 0 ? stable : drifted; },
+    };
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'existing-luna-drift', execution));
+    const bootstrap = new RecordingBootstrap();
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap },
+      'existing-luna-drift', { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.deepEqual((bootstrap.prepareRequest as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /does not match the persisted branch and repository identity|Initial recovery PR or HEAD changed/);
+    assert.equal(implementation.requests.length, 0);
+  });
+
+  it('parks an existing Luna run when only its authoritative PR base SHA drifts after prepare', async () => {
+    class RecordingBootstrap extends FakeBootstrap {
+      override async prepare(request: unknown) { return this.identity; }
+    }
+    const stable = snapshot(HEAD);
+    const drifted: GitHubLiveSnapshot = {
+      ...snapshot(HEAD),
+      pullRequest: { ...snapshot(HEAD).pullRequest!, baseSha: 'c'.repeat(40) },
+    };
+    let reads = 0;
+    const github: GitHubAdapter = {
+      kind: 'github',
+      async readIssue() { throw new Error('unused'); },
+      async readBranch() { throw new Error('unused'); },
+      async listPullRequests() { throw new Error('unused'); },
+      async readLiveSnapshot() { return reads++ === 0 ? stable : drifted; },
+    };
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'existing-luna-base-sha-drift', execution));
+    const implementation = new FakeImplementation([]);
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => new RecordingBootstrap() },
+      'existing-luna-base-sha-drift', { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /Initial recovery PR or HEAD changed/);
+    assert.equal(implementation.requests.length, 0);
+  });
+
   it('parks a provider-neutral workspace guard failure instead of terminal agent failure', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-guard'));
@@ -914,6 +1078,60 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(implementation.requests[0]?.baseSha, HEAD);
     assert.equal(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
+  });
+
+  it('reconstructs a standalone workspace before resuming a promoted Luna repair', async () => {
+    const store = new MemoryStore();
+    const luna: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+    };
+    let run = reviewingRun(store, 'resume-promoted-luna', HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    run = {
+      ...run,
+      repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' },
+      repairAdmissions: [{
+        authorityRevision: 'task-shape-v1', taskShape: 'bounded', taxonomyRevision: 'repair-finding-taxonomy-v1',
+        finding: 'review_blocking', headSha: HEAD, pullRequestNumber: 7, executionProfile: 'routine',
+        executionRevision: 'luna-v1', execution: luna, admittedAt: T0,
+      }],
+    };
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    store.update(run);
+    const identity = {
+      bootstrapKind: 'standalone-isolated' as const, owner: 'acme', repo: 'widgets', issueNumber: 42,
+      baseBranch: 'main', baseSha: 'base', branch: 'tachiko/resume-promoted-luna', publicationBranch: 'existing-pr', workspacePath: '/tmp/resume-promoted-luna',
+    };
+    const prepared: unknown[] = [];
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+      async plan() { return identity; },
+      async prepare(request) { prepared.push(request); return identity; },
+      guard() { return { assertValid: () => undefined }; },
+      async verifyDurable(request) { return { headSha: request.expectedHeadSha, branch: identity.branch }; },
+    };
+    const linked = new FakeBootstrap();
+    const github = githubAdapter([HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, pullRequest: { ...live.pullRequest!, headRef: 'existing-pr', baseRef: 'main', headRepository: { owner: 'acme', repo: 'widgets' } } };
+    };
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer: new FakeReviewer([approve(HEAD2)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+        bootstrapForExecution: (execution) => execution?.executor === 'luna-isolated' ? bootstrap : linked, resolveRepairExecutionProfile: () => luna },
+      run.id, { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready', result.outcome === 'needs_human' ? result.reason : undefined);
+    assert.deepEqual((prepared[0] as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
+    assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Task title: Fix the widget/);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Task requirements:\nDoR-ready\./);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Repair requirements:\n1\. \[blocking\] the diff has a bug/);
+    assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
   });
 
   it('never passes the final gate when live HEAD drifted after approval', async () => {
