@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { EXECUTION_PROFILE_NAMES } from '../execution-profiles.js';
+import { isRepairTaskShapeAuthority, type RepairTaskShapeAuthority } from '../domain/repair-admission.js';
 
 /** The Steward-owned, read-only queue marker. */
 export const DISPATCH_QUEUE_MARKER = '<!-- issue-dispatch-queue:v1 -->';
@@ -11,6 +12,8 @@ export interface DispatchQueueEntry {
   readonly issue: number;
   readonly route: 'codex' | 'chatgpt' | 'work' | 'human';
   readonly profile: string;
+  /** Explicit Steward/Oracle repair authority for a new unattended Codex run. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
 }
 
 export interface DispatchRuntimeClaim {
@@ -63,12 +66,14 @@ export function parseDispatchQueue(body: string): readonly DispatchQueueEntry[] 
   }
   const lines = body.slice(marker + DISPATCH_QUEUE_MARKER.length).split(/\r?\n/);
   let started = false;
-  let current: Partial<Record<'issue' | 'route' | 'profile', string>> | undefined;
+  let current: Partial<Record<'issue' | 'route' | 'profile' | 'task-shape-revision' | 'task-shape', string>> | undefined;
   const result: DispatchQueueEntry[] = [];
   const finish = () => {
     if (current === undefined) return;
     const keys = Object.keys(current).sort();
-    if (keys.join(',') !== 'issue,profile,route') throw new DispatchProtocolError('Every queue record must contain exactly issue, route, and profile.');
+    if (keys.join(',') !== 'issue,profile,route' && keys.join(',') !== 'issue,profile,route,task-shape,task-shape-revision') {
+      throw new DispatchProtocolError('Every queue record must contain issue, route, and profile, with task-shape and task-shape-revision supplied together.');
+    }
     const issue = positiveInteger(current.issue ?? '');
     if (issue === null) throw new DispatchProtocolError('Queue issue must be a positive safe integer.');
     if (!['codex', 'chatgpt', 'work', 'human'].includes(current.route ?? '')) {
@@ -81,7 +86,13 @@ export function parseDispatchQueue(body: string): readonly DispatchQueueEntry[] 
       throw new DispatchProtocolError(`Queue issue #${issue} has an unsupported execution profile "${current.profile}".`);
     }
     if (result.some((entry) => entry.issue === issue)) throw new DispatchProtocolError(`Queue contains duplicate issue #${issue}.`);
-    result.push({ issue, route: current.route as DispatchQueueEntry['route'], profile: current.profile });
+    const repairTaskShapeAuthority = current['task-shape'] === undefined
+      ? undefined
+      : { revision: current['task-shape-revision'] ?? '', shape: current['task-shape'] };
+    if (repairTaskShapeAuthority !== undefined && !isRepairTaskShapeAuthority(repairTaskShapeAuthority)) {
+      throw new DispatchProtocolError(`Queue issue #${issue} has invalid task-shape authority.`);
+    }
+    result.push({ issue, route: current.route as DispatchQueueEntry['route'], profile: current.profile, ...(repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority }) });
     current = undefined;
   };
   for (const raw of lines) {
@@ -92,15 +103,15 @@ export function parseDispatchQueue(body: string): readonly DispatchQueueEntry[] 
       started = true;
       continue;
     }
-    const item = /^\s*-\s+(issue|route|profile):\s*([^\s]+)\s*$/.exec(line);
+    const item = /^\s*-\s+(issue|route|profile|task-shape-revision|task-shape):\s*([^\s]+)\s*$/.exec(line);
     if (item !== null) {
       finish();
-      current = { [item[1] as 'issue' | 'route' | 'profile']: item[2] ?? '' };
+      current = { [item[1] as 'issue' | 'route' | 'profile' | 'task-shape-revision' | 'task-shape']: item[2] ?? '' };
       continue;
     }
-    const property = /^\s+(issue|route|profile):\s*([^\s]+)\s*$/.exec(line);
+    const property = /^\s+(issue|route|profile|task-shape-revision|task-shape):\s*([^\s]+)\s*$/.exec(line);
     if (property === null || current === undefined) throw new DispatchProtocolError(`Invalid queue syntax: "${line.trim()}".`);
-    const key = property[1] as 'issue' | 'route' | 'profile';
+    const key = property[1] as 'issue' | 'route' | 'profile' | 'task-shape-revision' | 'task-shape';
     if (current[key] !== undefined) throw new DispatchProtocolError(`Duplicate ${key} in one queue record.`);
     current[key] = property[2] ?? '';
   }

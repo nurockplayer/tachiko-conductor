@@ -2,6 +2,11 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
+import {
+  CODEX_CAPABILITY_FALLBACK_REVISION,
+  runtimeCapabilityCatalog,
+} from '../src/agents/model-capability.js';
+import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
 import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
@@ -24,12 +29,16 @@ function result(stdout: string, stderr = '', exitCode = 0): ProcessResult {
   return { stdout, stderr, exitCode };
 }
 
-function codexJsonl(summary = 'Implemented Issue #15.', threadId = '0199a213-81c0-7800-8aa1-bbab2a035a53'): string {
+function codexJsonl(
+  summary = 'Implemented Issue #15.',
+  threadId = '0199a213-81c0-7800-8aa1-bbab2a035a53',
+  usage: Record<string, unknown> = {},
+): string {
   return [
     JSON.stringify({ type: 'thread.started', thread_id: threadId }),
     JSON.stringify({ type: 'turn.started' }),
     JSON.stringify({ type: 'item.completed', item: { id: 'item-1', type: 'agent_message', text: summary } }),
-    JSON.stringify({ type: 'turn.completed', usage: {} }),
+    JSON.stringify({ type: 'turn.completed', usage }),
   ].join('\n');
 }
 
@@ -66,6 +75,44 @@ describe('CodexCliAdapter', () => {
     assert.match(String(runner.calls[0]?.args.at(-1)), /acme\/widgets#42/);
     assert.deepEqual(runner.calls[0]?.options, { timeoutMs: 9000, cwd: '/tmp/repo' });
     assert.deepEqual(runner.calls[1]?.args, ['rev-parse', 'HEAD']);
+  });
+
+  it('captures structured usage, turn, context, tool-size, and capability telemetry', async () => {
+    const stdout = [
+      JSON.stringify({ type: 'thread.started', thread_id: 'telemetry-thread' }),
+      JSON.stringify({ type: 'turn.started' }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'tool-1', type: 'command_execution', output: 'bounded output' } }),
+      JSON.stringify({ type: 'item.completed', item: { id: 'message-1', type: 'agent_message', text: 'done' } }),
+      JSON.stringify({
+        type: 'turn.completed',
+        usage: {
+          input_tokens: 1_200,
+          cached_input_tokens: 1_000,
+          output_tokens: 75,
+          reasoning_output_tokens: 12,
+        },
+      }),
+    ].join('\n');
+    const runner = new FakeRunner([result(stdout), result(HEAD)]);
+    const adapter = new CodexCliAdapter({
+      runner, cwd: '/tmp/repo', model: 'configured-model', reasoningEffort: 'high',
+    });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'success');
+    assert.equal(agentResult.telemetry?.provider, 'codex-cli');
+    assert.equal(agentResult.telemetry?.turns, 1);
+    assert.deepEqual(agentResult.telemetry?.usage, {
+      inputTokens: 1_200,
+      cachedInputTokens: 1_000,
+      outputTokens: 75,
+      reasoningTokens: 12,
+    });
+    assert.deepEqual(agentResult.telemetry?.context, { initialTokens: 1_200, peakTokens: 1_200 });
+    assert.ok((agentResult.telemetry?.largestToolResultBytes ?? 0) > 0);
+    assert.equal(agentResult.telemetry?.capability?.source, 'fallback');
+    assert.equal(agentResult.telemetry?.capability?.revision, CODEX_CAPABILITY_FALLBACK_REVISION);
   });
 
   it('resumes the exact persisted Codex thread without falling back to a fresh exec', async () => {
@@ -168,7 +215,7 @@ describe('CodexCliAdapter', () => {
   });
 
   it('never reports success when the exact post-run Git HEAD cannot be established', async () => {
-    const runner = new FakeRunner([result(codexJsonl()), result('not-a-sha')]);
+    const runner = new FakeRunner([result(codexJsonl(undefined, undefined, { input_tokens: 10, output_tokens: 2 })), result('not-a-sha')]);
     const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
 
     const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
@@ -180,6 +227,7 @@ describe('CodexCliAdapter', () => {
       provider: 'codex-cli',
       sessionId: '0199a213-81c0-7800-8aa1-bbab2a035a53',
     });
+    assert.deepEqual(agentResult.telemetry?.usage, { inputTokens: 10, outputTokens: 2 });
   });
 
   it('preserves the persisted executor identity when a resume command fails', async () => {
@@ -254,5 +302,68 @@ describe('CodexCliAdapter', () => {
     assert.equal(agentResult.exitStatus, 'failure');
     assert.match(agentResult.diagnostics?.join('\n') ?? '', /CODEX_EXEC_FAILURE.*Duplicate MCP capability name/);
     assert.equal(runner.calls.length, 0);
+  });
+
+  it('rejects an unsupported reasoning effort before starting any Codex turn', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo', model: 'configured-model',
+      // A raw operator spelling that must not survive to the spawn boundary.
+      reasoningEffort: 'turbo' as never });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.equal(agentResult.durationMs, 0);
+    assert.ok(agentResult.diagnostics?.[0]?.startsWith(EXECUTION_CONFIGURATION_ERROR_CODE.INVALID_REASONING_EFFORT));
+    assert.match(agentResult.diagnostics?.[0] ?? '', /turbo/);
+    assert.equal(runner.calls.length, 0, 'a preflight rejection must start zero model turns');
+    assert.equal(agentResult.telemetry?.turns, 0);
+    assert.equal(agentResult.telemetry?.failure?.category, 'configuration-preflight');
+  });
+
+  it('rejects an unsupported model/effort combination before starting any Codex turn', async () => {
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({
+      runner, cwd: '/tmp/repo', model: 'restricted-model', reasoningEffort: 'high',
+      // Injected authoritative capability data; production CLI uses the fallback.
+      capabilityCatalog: runtimeCapabilityCatalog([{ model: 'restricted-model', supportedReasoningEfforts: ['low'] }], 'test-catalog-v1'),
+    });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.ok(agentResult.diagnostics?.[0]?.startsWith(EXECUTION_CONFIGURATION_ERROR_CODE.UNSUPPORTED_MODEL_EFFORT));
+    assert.match(agentResult.diagnostics?.[0] ?? '', /restricted-model/);
+    assert.match(agentResult.diagnostics?.[0] ?? '', /low/);
+    assert.equal(runner.calls.length, 0, 'a preflight rejection must start zero model turns');
+    assert.equal(agentResult.telemetry?.turns, 0);
+    assert.equal(agentResult.telemetry?.capability?.source, 'runtime-discovery');
+    assert.equal(agentResult.telemetry?.capability?.revision, 'test-catalog-v1');
+    assert.equal(agentResult.telemetry?.failure?.category, 'configuration-preflight');
+  });
+
+  it('normalizes an aliased/cased effort to the canonical value at spawn without downgrading it', async () => {
+    const runner = new FakeRunner([result(codexJsonl()), result(HEAD)]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo', model: 'configured-model',
+      reasoningEffort: 'High' as never });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'success');
+    const args = runner.calls[0]?.args ?? [];
+    assert.ok(args.includes('model_reasoning_effort="high"'), `expected canonical effort, got ${args.join(' ')}`);
+    assert.ok(!args.some((arg) => arg.includes('medium')), 'normalization must never downgrade high');
+    assert.equal(runner.calls.length, 2);
+  });
+
+  it('uses the versioned fallback catalog and never rejects a valid level when discovery is unavailable', async () => {
+    const runner = new FakeRunner([result(codexJsonl()), result(HEAD)]);
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo', model: 'configured-model', reasoningEffort: 'high' });
+
+    const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
+    assert.equal(agentResult.exitStatus, 'success');
+    assert.equal(runner.calls.length, 2);
+    // The fallback identifies itself so telemetry can attribute a stale-catalog defect.
+    assert.equal(CODEX_CAPABILITY_FALLBACK_REVISION, 'codex-model-effort-fallback-v1');
   });
 });

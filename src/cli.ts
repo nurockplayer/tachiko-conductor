@@ -11,7 +11,9 @@ import {
   CodexCliAdapter,
   type CodexCliAdapterOptions,
 } from './agents/codex-cli.js';
+import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter, type NativeThreadObservation } from './agents/codex-app-server.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
+import { WORKER_ROUTER_PROVIDER, WorkerRouterAdapter } from './agents/worker-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
@@ -34,8 +36,10 @@ import {
   type StartBrowserRuntimeOptions,
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
+import { parseRepairTaskShapeAuthority, type RepairTaskShapeAuthority } from './domain/repair-admission.js';
 import {
   assertExecutionSupportedByProvider,
+  normalizeReasoningEffort,
   parseExecutionProfileConfiguration,
   resolveExecutionProfile,
   type ResolvedExecutionConfiguration,
@@ -50,6 +54,7 @@ import {
   canSynchronizeInterruptedHead,
 } from './domain/decisions.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
+import { projectRunEfficiency, type RunEfficiencyProjection } from './domain/telemetry.js';
 import {
   TRANSITION_TYPES,
   type InterruptKind,
@@ -62,34 +67,52 @@ import {
 } from './domain/types.js';
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
-import { GhCliTransport } from './github/transport.js';
+import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
 import { resolveDispatchConfiguration } from './dispatch/config.js';
 import { dispatchOnceCommand } from './dispatch/command.js';
+import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/continuous.js';
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
+import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
   type WorkflowDependencies,
+  type WorkflowOptions,
   type WorkflowOutcome,
 } from './workflow/run.js';
+import { DEFAULT_WAIT_WAKE_POLICY, type WaitWakePolicy } from './domain/wait.js';
+import {
+  acknowledgeWaitDelivery,
+  waitAwaitCommand,
+  waitObserveCommand,
+  type WaitCommandResult,
+  type WaitCommandDependencies,
+} from './workflow/wait-command.js';
+import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
+import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
 Usage:
-  tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> [--browser-profile <profile>]
+  tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> --repair-task-shape-authority <json> [--browser-profile <profile>]
   tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
-  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical>
+  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical> --repair-task-shape-authority <json>
   tachiko run show <id>
+  tachiko run inspect <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
   tachiko run projections rebuild
   tachiko dispatch once
-  tachiko dispatch launchd render --program <absolute-wrapper> --working-directory <absolute-path> [--minute <0-59>]
+  tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
+  tachiko dispatch wake
+  tachiko dispatch launchd render --program <absolute-driver-wrapper> --working-directory <absolute-path>
+  tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
+  tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
@@ -116,8 +139,15 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
 Operational projections are secret-free sidecars under
 $TACHIKO_DATA_DIR/.operational/v1; rebuild them only from validated persisted runs.
-New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
+New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value.
+New unattended runs also require strict revisioned repair-task-shape authority JSON.
 the selected --execution-profile is persisted with the run.
+wait observe/await are deterministic and model-free: they read native/runtime
+state, coalesce it into the durable wait ledger, and report whether the
+orchestrator must reconcile. They never start a model turn. One ledger is
+written per run at <wait ledger dir>/<runId>.wait.json, where the directory is
+$TACHIKO_WAIT_LEDGER_DIR (or the directory of $TACHIKO_WAIT_LEDGER_PATH) and
+defaults to <TACHIKO_DATA_DIR>/../wait.
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
 in the foreground; use status/stop from another terminal.
@@ -127,7 +157,7 @@ in the foreground; use status/stop from another terminal.
 export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
 export { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
 
-export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER;
+export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER | typeof WORKER_ROUTER_PROVIDER;
 export type CodexExecutionConfig = Pick<
   CodexCliAdapterOptions,
   'model' | 'reasoningEffort' | 'sandboxMode' | 'approvalPolicy' | 'timeoutMs'
@@ -143,7 +173,7 @@ export function resolveSelectedExecutionProfile(
   const execution = resolveExecutionProfile(
     parseExecutionProfileConfiguration(raw),
     selected,
-    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER],
+    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER, WORKER_ROUTER_PROVIDER],
   );
   assertExecutionSupportedByProvider(execution);
   return execution;
@@ -162,12 +192,12 @@ function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
   return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(os.homedir(), '.tachiko-conductor', 'dispatch', 'once.lock');
 }
 
-/** Provider selection is external to adapters; existing installs remain on Claude by default. */
+/** Provider selection is external to adapters; the stateless local router is the default path. */
 export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
-  const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? CLAUDE_CODE_PROVIDER;
-  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER) return value;
+  const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? WORKER_ROUTER_PROVIDER;
+  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER || value === WORKER_ROUTER_PROVIDER) return value;
   throw new Error(
-    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER} or ${CODEX_CLI_PROVIDER}.`,
+    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER}, ${CODEX_CLI_PROVIDER}, or ${WORKER_ROUTER_PROVIDER}.`,
   );
 }
 
@@ -185,11 +215,12 @@ export function resolveCodexExecutionConfig(env: NodeJS.ProcessEnv = process.env
     config.model = env.TACHIKO_CODEX_MODEL;
   }
   if (env.TACHIKO_CODEX_REASONING_EFFORT !== undefined) {
-    const value = env.TACHIKO_CODEX_REASONING_EFFORT;
-    if (!['minimal', 'low', 'medium', 'high', 'xhigh'].includes(value)) {
-      throw new Error('TACHIKO_CODEX_REASONING_EFFORT must be minimal, low, medium, high, or xhigh.');
-    }
-    config.reasoningEffort = value as NonNullable<CodexCliAdapterOptions['reasoningEffort']>;
+    // Accept operator aliases/case and resolve them to the one canonical value
+    // here, before any adapter can hand the spelling to a provider spawn.
+    config.reasoningEffort = normalizeReasoningEffort(
+      env.TACHIKO_CODEX_REASONING_EFFORT,
+      { provider: CODEX_CLI_PROVIDER },
+    );
   }
   if (env.TACHIKO_CODEX_SANDBOX_MODE !== undefined) {
     const value = env.TACHIKO_CODEX_SANDBOX_MODE;
@@ -589,6 +620,10 @@ export interface WorkflowCommandOptions {
   readonly execution?: ResolvedExecutionConfiguration;
   /** Immutable queue-claim identity when this run is created by dispatch once. */
   readonly dispatchClaimId?: string;
+  /** Explicit revisioned task-shape authority for a newly created unattended run. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
+  /** Optional run-scoped efficiency-signal thresholds. */
+  readonly telemetryThresholds?: WorkflowOptions['telemetryThresholds'];
 }
 
 /**
@@ -609,14 +644,22 @@ export async function runIssueCommand(
     throw new Error(`Active durable run "${run.id}" is not bound to dispatch claim "${options.dispatchClaimId}"; refusing ambiguous recovery.`);
   }
   if (run === null) {
-    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId);
+    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId, options.repairTaskShapeAuthority);
     deps.store.create(run);
-  } else if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
-    throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
+  } else {
+    if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
+      throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
+    }
+    if (options.repairTaskShapeAuthority !== undefined &&
+      (run.repairTaskShapeAuthority?.revision !== options.repairTaskShapeAuthority.revision ||
+        run.repairTaskShapeAuthority?.shape !== options.repairTaskShapeAuthority.shape)) {
+      throw new Error(`Run "${run.id}" already has an immutable repair task-shape authority; refusing to replace it.`);
+    }
   }
   return runWorkflow(deps, run.id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
     now: options.now,
+    ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
   });
 }
 
@@ -704,6 +747,7 @@ export async function resumeCommand(
   return runWorkflow(deps, id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
     now: options.now,
+    ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
   });
 }
 
@@ -789,8 +833,18 @@ function buildWorkflowDeps(
           ...(execution?.model === undefined ? {} : { model: execution.model }),
           ...(execution === undefined ? {} : { timeoutMs: execution.timeoutMs }),
         }),
-        [CODEX_CLI_PROVIDER]: (execution) => new CodexCliAdapter({
+        [CODEX_CLI_PROVIDER]: (execution) => new CodexAppServerAdapter({
           cwd: process.cwd(),
+          fallback: new CodexCliAdapter({
+            cwd: process.cwd(),
+            ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
+              ...(execution.model === undefined ? {} : { model: execution.model }),
+              ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+              ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+              ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+              timeoutMs: execution.timeoutMs,
+            }),
+          }),
           ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
             ...(execution.model === undefined ? {} : { model: execution.model }),
             ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
@@ -798,6 +852,34 @@ function buildWorkflowDeps(
             ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
             timeoutMs: execution.timeoutMs,
           }),
+        }),
+        // The configured compatible provider first attempts the local stdio
+        // App Server; only an unavailable/failed handshake falls back to the
+        // unchanged bounded CLI adapter. Durable App Server identities route
+        // back here through their own provider key after a restart.
+        [CODEX_APP_SERVER_PROVIDER]: (execution) => new CodexAppServerAdapter({
+          cwd: process.cwd(),
+          fallback: new CodexCliAdapter({
+            cwd: process.cwd(),
+            ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
+              ...(execution.model === undefined ? {} : { model: execution.model }),
+              ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+              ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+              ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+              timeoutMs: execution.timeoutMs,
+            }),
+          }),
+          ...(execution === undefined ? resolveCodexExecutionConfig(env) : {
+            ...(execution.model === undefined ? {} : { model: execution.model }),
+            ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+            ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+            ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+            timeoutMs: execution.timeoutMs,
+          }),
+        }),
+        [WORKER_ROUTER_PROVIDER]: (execution) => new WorkerRouterAdapter({
+          cwd: process.cwd(),
+          ...(execution === undefined ? {} : { timeoutMs: execution.timeoutMs }),
         }),
       },
     }),
@@ -810,6 +892,16 @@ function buildWorkflowDeps(
     ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
     ...(hostedCheckPolicy === undefined ? {} : { hostedCheckPolicy }),
     resolveImplementationCapabilities,
+    // A run carrying explicit repair authority is admitted only against this
+    // same revisioned execution-profile configuration. Missing or invalid
+    // configuration is intentionally surfaced as an unavailable profile.
+    resolveRepairExecutionProfile: (profile) => {
+      try {
+        return resolveSelectedExecutionProfile(profile, env);
+      } catch {
+        return undefined;
+      }
+    },
   };
 }
 
@@ -819,8 +911,11 @@ export function runCreateCommand(
   store: RunStore,
   owner: string,
   repo: string,
-  opts: { issue?: number; branch?: string; execution?: ResolvedExecutionConfiguration },
+  opts: { issue?: number; branch?: string; execution?: ResolvedExecutionConfiguration; repairTaskShapeAuthority?: RepairTaskShapeAuthority },
 ): Run {
+  if (opts.repairTaskShapeAuthority === undefined) {
+    throw new Error('run create requires explicit revisioned repair task-shape authority.');
+  }
   const hasIssue = opts.issue !== undefined;
   const hasBranch = opts.branch !== undefined;
   if (hasIssue && hasBranch) {
@@ -835,7 +930,7 @@ export function runCreateCommand(
   } else {
     target = { kind: 'repository', owner, repo, branch: opts.branch ?? 'main' };
   }
-  const run = createRun(target, undefined, undefined, opts.execution);
+  const run = createRun(target, undefined, undefined, opts.execution, undefined, opts.repairTaskShapeAuthority);
   store.create(run);
   return run;
 }
@@ -879,6 +974,8 @@ export interface RunView {
   interrupt: { kind: InterruptKind; reason: string } | null;
   transitions: number;
   updatedAt: string;
+  /** Structured per-run efficiency projection; absent telemetry is explicitly unknown. */
+  telemetry: RunEfficiencyProjection;
 }
 
 /** Project a run for display; a resolved interrupt is historical, not active. */
@@ -896,11 +993,22 @@ export function runShowView(run: Run): RunView {
     interrupt: activeInterrupt,
     transitions: run.history.length,
     updatedAt: run.updatedAt,
+    telemetry: projectRunEfficiency(run),
   };
 }
 
 function printRun(run: Run): void {
   console.log(JSON.stringify(runShowView(run), null, 2));
+}
+
+function printRunInspection(run: Run): void {
+  const telemetry = projectRunEfficiency(run);
+  const lines = [...telemetry.summary];
+  if (telemetry.signals.length > 0) {
+    lines.push('', 'warnings');
+    for (const signal of telemetry.signals) lines.push(`  ${signal.code}: ${signal.message}`);
+  }
+  console.log(lines.join('\n'));
 }
 
 function buildBrowserRuntime(): ManagedPlaywrightMcpRuntime {
@@ -962,6 +1070,114 @@ export async function waitForOwnedBrowser(
     signalSource.removeListener('SIGINT', stop);
     signalSource.removeListener('SIGTERM', stop);
   }
+}
+
+/**
+ * Durable wait-ledger location. `TACHIKO_WAIT_LEDGER_PATH` names a path whose
+ * directory holds the per-run ledgers; its basename is conventional (the file
+ * actually written is `<dir>/<runId>.wait.json`). Prefer
+ * `resolveWaitLedgerDirectory`/`resolveWaitLedgerFile` in callers.
+ */
+export function resolveWaitLedgerPath(env: NodeJS.ProcessEnv = process.env): string {
+  if (env.TACHIKO_WAIT_LEDGER_PATH !== undefined && env.TACHIKO_WAIT_LEDGER_PATH.trim() !== '') return env.TACHIKO_WAIT_LEDGER_PATH;
+  return path.join(path.dirname(resolveRunsDir(env)), 'wait', 'state.json');
+}
+
+/** Parse the bounded wait policy from CLI values; defaults stay revisioned. */
+export function resolveWaitWakePolicy(values: {
+  readonly 'timeout-ms'?: string;
+  readonly 'on-timeout'?: string;
+}): WaitWakePolicy {
+  const policy = DEFAULT_WAIT_WAKE_POLICY;
+  const timeoutMs = values['timeout-ms'] === undefined ? policy.timeoutMs : Number(values['timeout-ms']);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 0) throw new Error('--timeout-ms must be a non-negative safe integer.');
+  const onTimeout = values['on-timeout'] ?? policy.onTimeout;
+  if (onTimeout !== 'continue' && onTimeout !== 'policy-action') throw new Error('--on-timeout must be continue or policy-action.');
+  return { ...policy, timeoutMs, onTimeout };
+}
+
+/**
+ * Single-owner fence for one run's wait path, beside that run's ledger. Two wait
+ * processes can never perform the ledger read-modify-write concurrently.
+ */
+export function waitLockPath(runId: string, env: NodeJS.ProcessEnv = process.env): string {
+  return `${resolveWaitLedgerFile(runId, env)}.lock`;
+}
+
+/**
+ * Per-run ledger file. `TACHIKO_WAIT_LEDGER_DIR` names the directory directly;
+ * otherwise the directory of `TACHIKO_WAIT_LEDGER_PATH` is used, so the
+ * configured path stays a single explicit override.
+ */
+export function resolveWaitLedgerDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  const directory = env.TACHIKO_WAIT_LEDGER_DIR;
+  if (directory !== undefined && directory.trim() !== '') return directory;
+  return path.dirname(resolveWaitLedgerPath(env));
+}
+
+/** One ledger per run at `<wait ledger directory>/<runId>.wait.json`. */
+export function resolveWaitLedgerFile(runId: string, env: NodeJS.ProcessEnv = process.env): string {
+  return path.join(resolveWaitLedgerDirectory(env), `${runId}.wait.json`);
+}
+
+/**
+ * Build the deterministic wait dependencies for one run. A native #35 observer
+ * is only wired for App Server executors; otherwise the runtime fallback path
+ * is used. Nothing here starts or resumes a Codex turn.
+ */
+export interface CodexNativeObservationAdapter {
+  observeRuntime(executor: NonNullable<Run['executor']>): Promise<NativeThreadObservation>;
+}
+
+/**
+ * Build the deterministic wait dependencies for one run.
+ *
+ * A native #35 observer is wired only for App Server executors and only reads
+ * `thread/read`; it never starts, resumes, steers, or interrupts a turn.
+ *
+ * Exactly one observer instance is retained for the lifetime of these
+ * dependencies, so consecutive provider reads within one command observe a
+ * real transition. The active -> idle completion boundary is *also* classified
+ * from the durable previous observation in `classifyWaitChange`, so a separate
+ * CLI invocation or a runtime restart that has no observer memory preserves it.
+ */
+export function buildWaitCommandDependencies(options: {
+  readonly store: RunStore;
+  readonly run: Run;
+  readonly env?: NodeJS.ProcessEnv;
+  /** Injectable read-only App Server observation seam for deterministic wiring tests. */
+  readonly appServerAdapter?: CodexNativeObservationAdapter;
+  readonly now?: () => string;
+}): WaitCommandDependencies {
+  const env = options.env ?? process.env;
+  const run = options.run;
+  const now = options.now ?? (() => new Date().toISOString());
+  const workspace = run.bootstrap?.workspacePath;
+  const adapter = run.executor?.provider === CODEX_APP_SERVER_PROVIDER
+    ? options.appServerAdapter ?? new CodexAppServerAdapter({ cwd: workspace ?? process.cwd() })
+    : undefined;
+  const nativeObserver = adapter === undefined
+    ? undefined
+    : new NativeThreadWaitObserver({
+        client: { observeThread: () => adapter.observeRuntime(run.executor!) },
+        threadId: run.executor!.sessionId,
+        now,
+        subjectId: run.id,
+      });
+  return {
+    store: options.store,
+    ledgerStore: new WaitLedgerFileStore({ filePath: resolveWaitLedgerFile(run.id, env) }),
+    now,
+    ...(workspace === undefined ? {} : { readHead: gitHeadReader(new NodeProcessRunner(), workspace) }),
+    ...(nativeObserver === undefined ? {} : { nativeObserver }),
+  };
+}
+
+/** Print the bounded, model-free wait result and its settled marker. */
+export function printWaitResult(result: WaitCommandResult): void {
+  console.log(JSON.stringify(result, null, 2));
+  if (result.wake.shouldWake) console.log('TACHIKO_WAIT_WAKE_V1');
+  else if (result.idle) console.log('TACHIKO_WAIT_IDLE_V1');
 }
 
 export async function main(argv: string[]): Promise<number> {
@@ -1055,13 +1271,16 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
+    if (subcommand === 'wake' && rest.length === 0) {
+      console.log(JSON.stringify({ outcome: 'wake_signaled', token: signalDispatchWake(dispatchWakePath()) }));
+      return 0;
+    }
     if (subcommand === 'launchd' && rest[0] === 'render') {
       const { values, positionals } = parseArgs({
         args: rest.slice(1),
         options: {
           program: { type: 'string' },
           'working-directory': { type: 'string' },
-          minute: { type: 'string' },
           label: { type: 'string' },
           'stdout-path': { type: 'string' },
           'stderr-path': { type: 'string' },
@@ -1070,18 +1289,28 @@ export async function main(argv: string[]): Promise<number> {
       if (positionals.length > 0 || values.program === undefined || values['working-directory'] === undefined) {
         throw new Error('dispatch launchd render requires --program and --working-directory.');
       }
-      const minute = values.minute === undefined ? undefined : Number(values.minute);
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
         workingDirectory: values['working-directory'],
-        ...(minute === undefined ? {} : { minute }),
         ...(values.label === undefined ? {} : { label: values.label }),
         ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
         ...(values['stderr-path'] === undefined ? {} : { standardErrorPath: values['stderr-path'] }),
       }));
       return 0;
     }
-    if (subcommand !== 'once' || rest.length > 0) {
+    if (subcommand !== 'once' && subcommand !== 'serve') {
+      console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const { values, positionals } = parseArgs({
+      args: rest,
+      options: {
+        'idle-poll-ms': { type: 'string' },
+        'max-cycles': { type: 'string' },
+      },
+    });
+    if (positionals.length > 0 || (subcommand === 'once' && (values['idle-poll-ms'] !== undefined || values['max-cycles'] !== undefined))) {
       console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
       console.error(USAGE);
       return 1;
@@ -1101,14 +1330,81 @@ export async function main(argv: string[]): Promise<number> {
       const transport = new GhCliTransport();
       const runtime = new GitHubDispatchRuntime(transport, config);
       const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
-      const result = await dispatchOnceCommand(config, {
+      const reconcile = async () => await dispatchOnceCommand(config, {
         workflow,
         runtime,
         resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-        runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
+        runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority) => await runIssueCommand(workflow, ref, {
+          ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority,
+        }),
         resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
       });
-      printDispatchResult(result);
+      if (subcommand === 'once') {
+        printDispatchResult(await reconcile());
+        return 0;
+      }
+      const result = await dispatchContinuously({
+        dispatchOnce: reconcile,
+        sleep: createDispatchWakeWaiter(dispatchWakePath()),
+        idlePollMs: values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']),
+        ...(values['max-cycles'] === undefined ? {} : { maxCycles: Number(values['max-cycles']) }),
+      });
+      console.log(JSON.stringify(result, null, 2));
+      return 0;
+    } finally {
+      lock.release();
+    }
+  }
+
+  if (command === 'wait') {
+    if (subcommand !== 'observe' && subcommand !== 'await') {
+      console.error(`Unknown command: wait ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const { values, positionals } = parseArgs({
+      args: rest,
+      allowPositionals: true,
+      options: {
+        'timeout-ms': { type: 'string' },
+        'poll-interval-ms': { type: 'string' },
+        'on-timeout': { type: 'string' },
+      },
+    });
+    const [id, extra] = positionals;
+    if (id === undefined || extra !== undefined) throw new Error(`wait ${subcommand} requires exactly one run id.`);
+    const run = store.read(id);
+    if (run === null) throw new Error(`Run ${id} was not found.`);
+    const policy = resolveWaitWakePolicy(values);
+    const pollIntervalMs = values['poll-interval-ms'] === undefined
+      ? undefined
+      : Number(values['poll-interval-ms']);
+    if (pollIntervalMs !== undefined && (!Number.isSafeInteger(pollIntervalMs) || pollIntervalMs < 0)) {
+      throw new Error('--poll-interval-ms must be a non-negative safe integer.');
+    }
+    // The wait ledger is a per-run read-modify-write. Hold the same single-owner
+    // invocation fence `dispatch once` uses, scoped to this run, so two wait
+    // processes can never clobber each other's durable wake decisions.
+    let lock;
+    try {
+      lock = acquireDispatchInvocationLock({ lockPath: waitLockPath(id) });
+    } catch (error) {
+      if (error instanceof DispatchInvocationLockedError) {
+        console.log(JSON.stringify({ outcome: 'already_running', runId: id, reason: error.message }));
+        return 0;
+      }
+      throw error;
+    }
+    try {
+      const dependencies = buildWaitCommandDependencies({ store, run });
+      const result = subcommand === 'observe'
+        ? await waitObserveCommand({ id, mode: 'observe', policy }, dependencies)
+        : await waitAwaitCommand({ id, mode: 'wait', policy, ...(pollIntervalMs === undefined ? {} : { pollIntervalMs }) }, dependencies);
+      printWaitResult(result);
+      // Only after the wake has been emitted is it safe to mark it delivered; a
+      // crash before this point makes the next process replay it.
+      acknowledgeWaitDelivery(result, dependencies.ledgerStore);
+      // A wake is a reconciliation signal, not a failure; the caller decides.
       return 0;
     } finally {
       lock.release();
@@ -1130,6 +1426,7 @@ export async function main(argv: string[]): Promise<number> {
         issue: { type: 'string' },
         branch: { type: 'string' },
         'execution-profile': { type: 'string' },
+        'repair-task-shape-authority': { type: 'string' },
       },
     });
     const { owner, repo } = values;
@@ -1140,8 +1437,12 @@ export async function main(argv: string[]): Promise<number> {
     if (values['execution-profile'] === undefined) {
       throw new Error('run create requires --execution-profile <routine|standard|complex|critical>.');
     }
+    if (values['repair-task-shape-authority'] === undefined) {
+      throw new Error('run create requires --repair-task-shape-authority <strict-json>.');
+    }
     const execution = resolveSelectedExecutionProfile(values['execution-profile']);
-    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch, execution });
+    const repairTaskShapeAuthority = parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
+    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch, execution, repairTaskShapeAuthority });
     console.log(`Created run ${run.id} (${run.state}).`);
     printRun(run);
     return 0;
@@ -1151,6 +1452,13 @@ export async function main(argv: string[]): Promise<number> {
     const id = rest[0];
     if (id === undefined) throw new Error('run show requires a run id.');
     printRun(runShowCommand(store, id));
+    return 0;
+  }
+
+  if (subcommand === 'inspect') {
+    const id = rest[0];
+    if (id === undefined) throw new Error('run inspect requires a run id.');
+    printRunInspection(runShowCommand(store, id));
     return 0;
   }
 
@@ -1217,7 +1525,7 @@ export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: [subcommand, ...rest],
     allowPositionals: true,
-    options: { 'browser-profile': { type: 'string' }, 'execution-profile': { type: 'string' } },
+    options: { 'browser-profile': { type: 'string' }, 'execution-profile': { type: 'string' }, 'repair-task-shape-authority': { type: 'string' } },
   });
   const [ref, extra] = positionals;
   if (ref === undefined || extra !== undefined) {
@@ -1229,10 +1537,16 @@ export async function main(argv: string[]): Promise<number> {
   if (existing === null && values['execution-profile'] === undefined) {
     throw new Error('run owner/repo#123 requires --execution-profile <routine|standard|complex|critical> for a new run.');
   }
+  if (existing === null && values['repair-task-shape-authority'] === undefined) {
+    throw new Error('run owner/repo#123 requires --repair-task-shape-authority <strict-json> for a new run.');
+  }
   const execution = values['execution-profile'] === undefined
     ? undefined
     : resolveSelectedExecutionProfile(values['execution-profile']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution });
+  const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
+    ? undefined
+    : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
+  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution, repairTaskShapeAuthority });
   printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }

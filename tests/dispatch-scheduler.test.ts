@@ -124,15 +124,31 @@ describe('dispatch scheduler boundary', () => {
     }
   });
 
-  it('renders a configurable hourly launchd schedule without configuration values', () => {
+  it('renders a provider-neutral launchd supervisor without configuration values', () => {
     const plist = renderDispatchLaunchdPlist({
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
-      minute: 25,
     });
-    assert.match(plist, /<key>Minute<\/key><integer>25<\/integer>/);
     assert.match(plist, /<key>ProgramArguments<\/key><array><string>\/Users\/example\/Library/);
     assert.doesNotMatch(plist, /TACHIKO_DISPATCH_CONFIG/);
+    assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
+    assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
+    assert.doesNotMatch(plist, /StartCalendarInterval/);
+  });
+
+  it('renders the same supervisor across reinstall without creating a timer wake', () => {
+    const options = {
+      program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
+      workingDirectory: '/Users/example/Developer/tachiko-conductor',
+      label: 'io.tachiko.conductor.dispatch-driver',
+    } as const;
+    const configured = renderDispatchLaunchdPlist(options);
+    const reinstalled = renderDispatchLaunchdPlist(options);
+    assert.equal(reinstalled, configured);
+    assert.match(configured, /<key>RunAtLoad<\/key><true\/>/);
+    assert.match(configured, /<key>KeepAlive<\/key><true\/>/);
+    assert.doesNotMatch(configured, /StartInterval/);
+    assert.doesNotMatch(configured, /StartCalendarInterval/);
   });
 
   it('leaves a concurrent dispatch at a safe re-entry boundary without reading configuration or GitHub', async () => {

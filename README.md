@@ -115,6 +115,9 @@ pnpm exec tsx src/cli.ts run show <id>
 pnpm exec tsx src/cli.ts run transition <id> start
 pnpm exec tsx src/cli.ts run list
 pnpm exec tsx src/cli.ts dispatch once
+pnpm exec tsx src/cli.ts dispatch serve
+pnpm exec tsx src/cli.ts wait observe <id>
+pnpm exec tsx src/cli.ts wait await <id> --timeout-ms 60000 --on-timeout continue
 pnpm exec tsx src/cli.ts github snapshot nurockplayer/tachiko-conductor#42
 pnpm exec tsx src/cli.ts browser bootstrap github-work
 pnpm exec tsx src/cli.ts browser start github-work --headless
@@ -165,10 +168,19 @@ Before a claim, the dispatcher rereads the target Issue, associated PRs, and
 local durable runs. A closed Issue, open PR, non-terminal Run, ambiguous claim,
 or missing/mismatched claimed Run is not eligible. On restart it resumes the
 same claimed Run; an expired lease is never permission to create a second one.
-This Issue deliberately does not provide a recurring scheduler or same-host
-process lock; those remain #19's boundary.
+`tachiko dispatch serve` is the Phase-1 continuous serial driver. It holds the
+same-host lock for its lifetime, reconciles a terminal/merged run immediately,
+and then moves to the next executable queue row when the authoritative queue
+and durable Run permit it. At an active, parked, or empty boundary it only
+sleeps and rereads authoritative state; that idle path starts zero model turns.
+`--max-cycles` is an explicit bounded operational/test mode, and
+`--idle-poll-ms` controls the deterministic model-free safety poll. A local
+`tachiko dispatch wake` is a coalescing, provider-neutral nudge for a running
+driver; it changes no queue, Run, or provider state. The driver immediately
+reconciles on that wake, and a missing/unchanged wake always falls back to the
+bounded model-free safety poll.
 
-## Scheduled dispatch (macOS v0)
+## Supervised dispatch driver (macOS)
 
 `tachiko dispatch once` now takes a small local lock before reading GitHub. It
 complements (but never replaces) the GitHub claim lease: a concurrent same-host
@@ -178,30 +190,31 @@ or starting a second executor. The default lock lives outside the repository at
 `TACHIKO_DISPATCH_LOCK_PATH`. A malformed or live lock fails closed; a lock for
 a provably absent PID is retried once.
 
-For macOS, use `launchd` as the external hourly scheduler. First create a
+For macOS, use `launchd` to supervise the continuous driver. First create a
 private, absolute-path wrapper that supplies the explicitly selected dispatch,
 execution, validation, and hosted-check configurations, then ends with:
 
 ```sh
-exec /absolute/path/to/tachiko dispatch once
+exec /absolute/path/to/tachiko dispatch serve
 ```
 
-Do not put credentials in the generated plist. Render an hourly `HH:25`
-example (or choose a different minute) from the checked-in CLI:
+Do not put credentials in the generated plist. The generated supervisor starts
+the wrapper on load and restarts it if it exits; it contains no queue,
+execution, or provider credentials and is not a calendar wake:
 
 ```bash
 pnpm exec tsx src/cli.ts dispatch launchd render \
-  --program '/absolute/path/to/run-dispatch-once.sh' \
-  --working-directory "$PWD" --minute 25 \
-  > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-once.plist"
-launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-once.plist"
+  --program '/absolute/path/to/run-dispatch-driver.sh' \
+  --working-directory "$PWD" \
+  > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
+launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
 ```
 
 Remove it with `launchctl bootout "gui/$(id -u)" <plist-path>` before deleting
-the plist. The generated schedule is deliberately only a wake-up cadence: a
-late wake remains correct, and an active durable claim is resumed before new
-queue work. No launchd installation or real GitHub/Codex invocation occurs in
-CI. An opt-in local smoke requires a disposable control Issue and all normal
+the plist. Restart/re-entry remains correct because each reconciliation first
+adopts the exact durable claim/run or fails closed. No launchd installation or
+real GitHub/Codex invocation occurs in CI. An opt-in local smoke requires a
+disposable control Issue and all normal
 explicit configuration, then uses:
 
 ```bash
@@ -220,8 +233,8 @@ or reviewer text. New runs require `--execution-profile` and one revisioned
 export TACHIKO_EXECUTION_PROFILE_CONFIG='{
   "revision":"execution-profiles-v1",
   "profiles":{
-    "routine":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"low","timeoutMs":600000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
-    "standard":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"medium","timeoutMs":600000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
+    "routine":{"executor":"worker-router","timeoutMs":600000},
+    "standard":{"executor":"worker-router","timeoutMs":600000},
     "complex":{"executor":"codex-cli","model":"configured-model","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"on-request"},
     "critical":{"executor":"claude-code","model":"configured-model","timeoutMs":900000}
   }
@@ -235,6 +248,131 @@ settings are persisted with the run; continuation uses that immutable snapshot
 even if a later configuration revision remaps the profile. Unknown profiles,
 unavailable executors, malformed settings, and provider-unsupported settings
 fail before implementation starts.
+
+### Reasoning-effort normalization and pre-spawn validation
+
+Accepted spellings are normalized to the single canonical runtime value before
+any model is spawned: case, surrounding whitespace, hyphen/underscore forms, and
+a small alias set (`High`, `XHigh`/`x-high`/`extra-high`, `min`, `med`) all
+resolve to `minimal`, `low`, `medium`, `high`, or `xhigh`. Normalization is a
+fixed point on canonical values and never downgrades a request; an unsupported
+or ambiguous value (for example `highest` or `turbo`) fails closed with a typed
+`EXECUTION_CONFIG_INVALID_REASONING_EFFORT` error.
+
+The requested model/effort pair is then validated at the provider boundary
+before any turn exists. The Codex App Server adapter prefers the runtime's own
+authoritative `model/list` catalog; when discovery is unavailable, or for the
+Codex CLI adapter, it uses the versioned local fallback
+(`codex-model-effort-fallback-v1`) and reports `verified: false` rather than
+inventing a restriction. A pair the provider positively reports as unsupported
+fails as `EXECUTION_CONFIG_UNSUPPORTED_MODEL_EFFORT` with bounded evidence
+(provider, model, requested effort, supported efforts, and whether the decision
+came from runtime discovery or fallback metadata) and starts **zero model
+turns**. These configuration codes are emitted before any process/turn is
+created, so telemetry can count preflight rejections separately from executed
+model/runtime failures.
+
+### Per-run efficiency telemetry
+
+Each run carries an append-only `telemetry` ledger (`run-efficiency-v1`). The
+ledger stores only bounded structured events: provider/model/profile/reasoning
+identity, spawn and restart counts, provider-reported turn/token usage, context
+size/peak, largest tool-result payload size, configuration-preflight failures,
+executed failures/retries, and capability source/revision from the #50
+provider-boundary preflight. It never stores hidden reasoning, model prose,
+raw transcripts, tool output, or credentials.
+
+Provider fields are optional by design. When a provider does not report usage,
+the run projection returns `unknown` with a reason; it never substitutes zero.
+Partial coverage is reported as `partial` with observed/total sample counts.
+`run show <id>` exposes the structured `telemetry` projection and compact
+`telemetry.summary` lines. `run inspect <id>` prints only the compact summary
+plus deterministic warning signals.
+
+Signals are warnings by default and never block a run. They cover repeated
+unchanged-state wakeups, repeated review starts/restarts against one candidate
+HEAD, unjustified full-context spawns, unusually large tool results, repeated
+configuration-preflight failures, and abnormal reviewer restart counts. The
+default threshold set is versioned as `run-efficiency-thresholds-v1` and can be
+overridden per workflow invocation; audit-specific numbers are not embedded as
+universal limits. Event IDs make telemetry merges idempotent across workflow
+restart/re-entry, so already-persisted events are not counted twice.
+
+A `wait_status_wakeup` event may carry optional, bounded #47 wake evidence
+(`reason`, `observationSource`, `subjectId`, `observationStatus`,
+`observationDigest`). It never carries provider prose, transcripts, or tool
+output, and its content-addressed id makes a replayed wake idempotent.
+
+### Event-driven wait/status wakeups
+
+Waiting and status inspection never start a model turn. Conductor observes
+worker/subprocess/native state through one provider-neutral contract
+(`wait-observation-v1`) with normalized status, active item, monotonic
+progress counters, exact HEAD, and bounded categorical evidence. The
+observation runtime compares each report with the last durable one:
+
+- an unchanged or repeated equivalent report is coalesced and wakes nothing;
+- a progress-only change (turn/item/HEAD movement) is recorded and keeps
+  waiting without a model turn;
+- a `completed`, `failed`, or `blocked` transition wakes the orchestrator
+  exactly once with bounded evidence;
+- a bounded timeout wakes only when the wait policy requires policy/recovery
+  reasoning (`--on-timeout policy-action`); `continue` keeps waiting model-free,
+  and an identical repeated timeout for unchanged state does not wake again.
+
+A wake is a signal to reconcile live GitHub plus the durable `Run`; it is never
+workflow authority by itself, and one completion notification never substitutes
+for re-reading complete authoritative state.
+
+The durable per-run wait ledger (`<wait dir>/<runId>.wait.json`, where the
+directory is `TACHIKO_WAIT_LEDGER_DIR`, else the directory of
+`TACHIKO_WAIT_LEDGER_PATH`, else `<data>/wait`) revalidates
+subject/owner/generation before adoption. A restart therefore reconstructs the
+same coalesced state instead of duplicating a wake or a writer, and a foreign
+ledger fails closed instead of being adopted or overwritten.
+
+Native observation reuses the #35 App Server `thread/read` capability and
+starts no Codex turn. It is enrichment, never authority: the durable `Run`
+status wins whenever it is `completed`, `failed`, or `blocked`, so an idle or
+not-loaded native thread can never hide a terminal or blocked wake. A subject
+that stops being `active` is a completion boundary, derived from the durable
+previous observation rather than in-process memory, so it still holds when the
+observer is recreated per read or the runtime restarts. When the native runtime
+is unavailable, the deterministic runtime fallback still produces the same
+normalized terminal wakes and the same no-wake coalescing.
+
+The wait path is not a second writer of workflow state. Run-level wait
+telemetry is re-based onto the current durable `Run` immediately before it is
+appended and is skipped when that Run is gone or its workflow state changed
+while waiting, so a wake can never revert a concurrent transition or lose
+terminal evidence.
+
+```bash
+pnpm exec tsx src/cli.ts wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
+pnpm exec tsx src/cli.ts wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
+```
+
+### Codex App Server runtime observation
+
+For a `codex-cli` execution profile, Conductor first probes a component-local
+`codex app-server --stdio` through `initialize` / `initialized`. A healthy
+server is used only as the native runtime adapter; the durable `Run`, dispatch
+claim, prepared worktree, and exact-HEAD validation remain authoritative. An
+unavailable binary or failed handshake falls back to the existing bounded
+`codex exec --json` adapter. A known active native thread is observed first and
+then parked unless its exact durable Run/executor-generation fence proves an
+allowed control action; restart never blindly starts another turn.
+
+The adapter exposes native `thread/read`, terminal `thread/resume` plus
+`turn/start`, and exact active-turn steer/interrupt operations through local
+stdio only. Server-initiated approvals fail closed. It does not open a TCP
+listener, persist App Server process state, copy raw thread transcripts, or add
+a second queue/lease/workflow store. To check only the installed local
+App-Server handshake (without starting a model turn), opt in explicitly:
+
+```bash
+TACHIKO_CODEX_APP_SERVER_SMOKE=1 node --import tsx --test tests/codex-app-server.test.ts
+```
 
 ## Exact-HEAD validation
 
@@ -325,7 +463,70 @@ non-zero exit code.
 require result payloads supplied by adapters; `run transition` rejects them
 explicitly. Drive those through the domain API (`applyTransition`).
 
+## Container-owned worker-router execution
+
+`WorkerRouterAdapter` is the one executor placed behind the container boundary
+proven in issue #73. The untrusted worker runs only inside a digest-pinned
+container; the host worker path is never executed and there is no fallback.
+
+The adapter keeps the authority split unchanged. It runs `guard(before)`, then
+creates and starts the container, forwards the task on stdin, waits for the
+exact container terminal state, and only then runs `guard(after)`, reads the
+exact HEAD, proves base ancestry, and publishes that exact HEAD from the host.
+The worker/container commits only and never pushes.
+
+Container lifecycle is driven exclusively by the exact 64-hex ID returned by
+`docker create` (`create -> start -> wait -> inspect -> stop|kill -> rm -f`).
+There is no `ps`, PGID/orphan, or name-based discovery. The container is created
+with restart policy `no`, without privileged mode or the Docker socket.
+Timeout, cancel, and failure stop/kill the exact ID, await terminal state,
+remove it by that same ID, and never replay or fall back to host execution.
+
+Configuration:
+
+- `TACHIKO_WORKER_ROUTER_IMAGE` (required): the worker image reference, pinned
+  by digest (`name@sha256:<64-hex>` or an immutable `sha256:<64-hex>`). Tags
+  are rejected and a missing image is a typed fail-closed error.
+- `TACHIKO_WORKER_ROUTER_PATH` (optional): absolute in-container entrypoint,
+  default `/root/.local/bin/worker-router`.
+- `TACHIKO_WORKER_ROUTER_NETWORK` (optional): `none` (default) or `bridge`.
+  Provider-backed workers need an explicit `bridge` opt-in; network is never
+  enabled implicitly.
+
+Only `HOME=/root` plus the exact worker inputs `DEEPSEEK_API_KEY` and
+`WORKER_FORCE` are forwarded. The container receives the narrow commit-only
+mounts reused from #73 -- the linked worktree, its per-worktree gitdir,
+`objects`, `refs`, and a read-only `config`. `packed-refs` is deliberately not
+mounted: the prepared branch is loose, and an opt-in smoke proof packs the
+source refs to show the commit path does not need it. Only the prepared
+linked-worktree layout is accepted; plain `.git/` repositories are rejected
+because the writable worktree mount would expose their whole common Git tree.
+The bare remote, source checkout, `$HOME`, SSH agent, Docker socket, hooks, and
+other worktrees are never mounted.
+
+Failure, cancel, and timeout cleanup must end with proof that the exact
+container is absent or terminal. When `stop`/`kill`/`rm` and a final exact-ID
+inspect cannot prove that, the adapter surfaces
+`WORKER_ROUTER_CONTAINMENT_UNPROVEN` instead of the ordinary worker error, which
+is retained only as the cause/diagnostic.
+
+The container image owns the worker runtime, so a production image must bundle
+Git plus the worker entrypoint (and any provider runtime it needs). The built-in
+`worker-router` script selects `deepseek-worker` from `DEEPSEEK_API_KEY`, but
+`luna-worker` additionally needs the ChatGPT auth file under `$HOME`; that
+credential cannot be provided inside the container without weakening the mount
+boundary, so `luna` remains a documented blocker rather than a mounted secret.
+
 ## Smoke paths
+
+The opt-in worker-router acceptance path builds a disposable digest-pinned
+worker image and drives the real authority sequence end to end
+(`guard -> container -> exact terminal -> guard -> HEAD -> ancestry ->
+publication -> verifyDurable`). It is skipped unless explicitly enabled:
+
+```bash
+pnpm test:smoke:worker-router
+```
 
 The opt-in Claude Code smoke test invokes the installed `claude` CLI
 non-interactively once and is never part of CI:
@@ -339,7 +540,8 @@ pnpm test:smoke:claude
 `ImplementationRequest.sessionId` to resume after a Conductor process restart.
 An optional `AbortSignal` cancels the active process as a deterministic
 `CLAUDE_CANCELLED` failure. Results retain bounded wall-clock `durationMs`, but
-never raw stdout/stderr transcripts or model-usage details. The execution
+never raw stdout/stderr transcripts or hidden reasoning. Structured token/turn
+usage is retained when the provider reports it. The execution
 prompt requires repository validation and tests to pass before success is
 reported.
 
@@ -362,7 +564,7 @@ The following direct Codex environment values remain available for legacy
 persisted runs that have no profile snapshot:
 
 - `TACHIKO_CODEX_MODEL`
-- `TACHIKO_CODEX_REASONING_EFFORT` (`minimal`, `low`, `medium`, `high`, `xhigh`)
+- `TACHIKO_CODEX_REASONING_EFFORT` (`minimal`, `low`, `medium`, `high`, `xhigh`; case/alias spellings are normalized)
 - `TACHIKO_CODEX_SANDBOX_MODE` (`read-only`, `workspace-write`, `danger-full-access`)
 - `TACHIKO_CODEX_APPROVAL_POLICY` (`untrusted`, `on-request`, `never`)
 - `TACHIKO_CODEX_TIMEOUT_MS` (positive integer)

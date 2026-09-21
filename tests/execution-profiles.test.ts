@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import {
+  EXECUTION_CONFIGURATION_ERROR_CODE,
   assertExecutionSupportedByProvider,
+  isExecutionConfigurationError,
   parseExecutionProfileConfiguration,
   resolveExecutionProfile,
 } from '../src/execution-profiles.js';
@@ -41,6 +43,32 @@ describe('execution profiles', () => {
     assert.equal(newResolved.model, 'model-next');
   });
 
+  it('normalizes accepted case/alias spellings to the canonical runtime value before spawn', () => {
+    const aliasConfig = CONFIG
+      .replace('"reasoningEffort":"low"', '"reasoningEffort":"Low"')
+      .replace('"reasoningEffort":"medium"', '"reasoningEffort":"Med"')
+      .replace('"reasoningEffort":"high"', '"reasoningEffort":"XHigh"');
+    const configuration = parseExecutionProfileConfiguration(aliasConfig);
+
+    assert.equal(resolveExecutionProfile(configuration, 'routine', ['codex-cli']).reasoningEffort, 'low');
+    assert.equal(resolveExecutionProfile(configuration, 'standard', ['codex-cli']).reasoningEffort, 'medium');
+    // "XHigh" is the top tier and must not be downgraded to "high".
+    assert.equal(resolveExecutionProfile(configuration, 'complex', ['codex-cli']).reasoningEffort, 'xhigh');
+  });
+
+  it('fails closed with a typed error for an unsupported reasoning effort in a profile', () => {
+    const bad = CONFIG.replace('"reasoningEffort":"high"', '"reasoningEffort":"highest"');
+    assert.throws(
+      () => parseExecutionProfileConfiguration(bad),
+      (error: unknown) => {
+        assert.ok(isExecutionConfigurationError(error));
+        assert.equal(error.code, EXECUTION_CONFIGURATION_ERROR_CODE.INVALID_REASONING_EFFORT);
+        assert.equal(error.evidence.requestedEffort, 'highest');
+        return true;
+      },
+    );
+  });
+
   it('fails closed for malformed profiles, unknown profile/executor, and unsupported provider settings', () => {
     assert.throws(
       () => parseExecutionProfileConfiguration(JSON.stringify({ revision: 'v1', profiles: { routine: {} } })),
@@ -55,6 +83,21 @@ describe('execution profiles', () => {
       }),
       /unsupported by executor/,
     );
+    assert.throws(
+      () => assertExecutionSupportedByProvider({
+        profile: 'routine', revision: 'v1', executor: 'worker-router', timeoutMs: 1, model: 'ignored-model',
+      }),
+      /unsupported by executor/,
+    );
+    assert.throws(
+      () => assertExecutionSupportedByProvider({
+        profile: 'standard', revision: 'v1', executor: 'worker-router', timeoutMs: 1, sandboxMode: 'workspace-write',
+      }),
+      /unsupported by executor/,
+    );
+    assert.doesNotThrow(() => assertExecutionSupportedByProvider({
+      profile: 'routine', revision: 'v1', executor: 'worker-router', timeoutMs: 60_000,
+    }));
     assert.throws(
       () => parseExecutionProfileConfiguration(CONFIG.replace('reasoningEffort', 'reasoningEfort')),
       /unsupported setting/,

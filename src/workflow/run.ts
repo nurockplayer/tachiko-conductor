@@ -11,9 +11,18 @@ import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
 import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
-import type { HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
+import type { AgentResult, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
+import {
+  createCompletionInputFromResult,
+  recordCompletionTelemetry,
+  recordSpawnTelemetry,
+  withRunTelemetryThresholds,
+  type EfficiencyThresholds,
+} from '../domain/telemetry.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
+import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import type { RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { parkBootstrapFailure } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
@@ -33,12 +42,16 @@ export interface WorkflowDependencies {
   /** Explicit repository/run policy for interpreting the exact-HEAD hosted check list. */
   readonly hostedCheckPolicy?: HostedCheckPolicyConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
+  /** Optional because pre-authority Runs retain their historical repair path. */
+  readonly resolveRepairExecutionProfile?: (profile: 'routine' | 'complex') => ResolvedExecutionConfiguration | undefined;
 }
 
 export interface WorkflowOptions {
   /** Bounded review attempts before the loop escalates to NEEDS_HUMAN. */
   readonly maxReviewAttempts: number;
   readonly now?: () => string;
+  /** Optional run-scoped thresholds for deterministic efficiency warnings. */
+  readonly telemetryThresholds?: Partial<Omit<EfficiencyThresholds, 'revision'>> & { readonly revision?: string };
 }
 
 export type WorkflowOutcome =
@@ -91,6 +104,19 @@ function park(run: Run, reason: string, store: RunStore, now: () => string, choi
   const next = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices } }, now());
   store.update(next);
   return { outcome: 'needs_human', run: next, reason };
+}
+
+function admittedRepairExecution(run: Run, deps: WorkflowDependencies): ResolvedExecutionConfiguration | null {
+  const authority = run.repairTaskShapeAuthority;
+  if (authority === undefined || run.headSha === undefined || run.pullRequest === undefined) return null;
+  const receipt = [...(run.repairAdmissions ?? [])].reverse().find((candidate): candidate is RepairAdmissionSnapshot =>
+    candidate.authorityRevision === authority.revision && candidate.taskShape === authority.shape &&
+    candidate.headSha === run.headSha && candidate.pullRequestNumber === run.pullRequest!.number,
+  );
+  if (receipt === undefined || deps.resolveRepairExecutionProfile === undefined) return null;
+  let resolved: ResolvedExecutionConfiguration | undefined;
+  try { resolved = deps.resolveRepairExecutionProfile(receipt.executionProfile); } catch { return null; }
+  return resolved !== undefined && JSON.stringify(resolved) === JSON.stringify(receipt.execution) ? resolved : null;
 }
 
 function hostedValidation(
@@ -237,6 +263,8 @@ export async function runWorkflow(
 
   let run = store.read(runId);
   if (run === null) throw new Error(`No run with id "${runId}" found.`);
+  run = withRunTelemetryThresholds(run, options.telemetryThresholds ?? {});
+  store.update(run);
   if (run.target.kind !== 'issue') {
     throw new Error('runWorkflow currently supports issue-target runs only.');
   }
@@ -265,6 +293,20 @@ export async function runWorkflow(
           run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
           run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
         const pendingRepair = pendingReviewFix || pendingValidationRepair;
+        // A restarted repair may execute only from its append-only admission
+        // receipt. It must not inherit the initial run profile as a fallback.
+        const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
+          ? admittedRepairExecution(run, deps)
+          : run.execution;
+        if (pendingRepair && run.repairTaskShapeAuthority !== undefined && effectiveExecution === null) {
+          return park(
+            run,
+            'Repair admission is missing, stale, or its exact execution profile can no longer be resolved.',
+            store,
+            now,
+            ['Re-admit the exact repair authority and execution profile', CANCEL_RUN_DECISION],
+          );
+        }
         if (pendingRepair) {
           const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
           if (conflict !== null) return park(run, conflict, store, now);
@@ -402,7 +444,28 @@ export async function runWorkflow(
             ? `Conductor requirement: start from ${snapshot.repository.defaultBranch}@${baseSha}, then create and associate an open implementation pull request before reporting success.`
             : undefined
         );
-        let result;
+        if (effectiveExecution?.executor === 'worker-router' && snapshot.pullRequest !== null && bootstrap === undefined) {
+          return park(run, 'Worker-router requires a verified prepared workspace and branch for an existing implementation pull request.', store, now);
+        }
+        const workerAttemptKind = pendingRepair
+          ? 'repair'
+          : run.agentResult === undefined && run.executor === undefined
+            ? 'initial'
+            : 'resume';
+        const workerSpawn = recordSpawnTelemetry(run, {
+          role: 'worker',
+          attemptKind: workerAttemptKind,
+          ...(run.headSha === undefined ? {} : { headSha: run.headSha }),
+          ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
+          ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
+          ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
+          ...(effectiveExecution?.profile === undefined ? {} : { profile: effectiveExecution.profile }),
+          contextMode: 'bounded',
+          contextJustification: 'live-target-bounded',
+        }, now());
+        run = workerSpawn.run;
+        store.update(run);
+        let result: AgentResult;
         try {
           result = await implementation.run({
             target, baseSha, authority: 'live-target', instructions,
@@ -411,12 +474,34 @@ export async function runWorkflow(
             capabilities: await deps.resolveImplementationCapabilities?.(),
             ...(run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
             ...(run.executor === undefined ? {} : { executor: run.executor }),
-            ...(run.execution === undefined ? {} : { execution: run.execution }),
+            runtimeOwnership: {
+              runId: run.id,
+              generation: run.executor?.generation ?? run.id,
+              ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+            },
+            ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
           });
         } catch (error) {
           if (isWorkspaceGuardFailure(error)) return bootstrapFailureOutcome(run, error, store, now);
+          const detail = error instanceof Error ? error.message : String(error);
+          run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+            exitStatus: 'failure',
+            summary: detail,
+            diagnostics: ['AGENT_RUNTIME_INVOCATION_FAILED: provider invocation threw before returning an AgentResult'],
+          }, {
+            ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
+            ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
+            ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
+          }, 'worker', workerSpawn.invocationId), now());
+          store.update(run);
           throw error;
         }
+        run = recordCompletionTelemetry(run, createCompletionInputFromResult(result, {
+          ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
+          ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
+          ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
+        }, 'worker', workerSpawn.invocationId), now());
+        store.update(run);
         if (result.exitStatus === 'failure') {
           const takeoverReason = humanTakeoverReason(result);
           if (takeoverReason !== undefined) {
@@ -444,6 +529,18 @@ export async function runWorkflow(
           if (result.headSha === undefined || deps.bootstrap === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
           try {
             await deps.bootstrap.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
+            if (run.execution?.executor === 'worker-router' && snapshot.pullRequest === null) {
+              if (deps.github.createImplementationPullRequest === undefined) {
+                return bootstrapFailureOutcome(run, new Error('Worker-router implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
+              }
+              await deps.github.createImplementationPullRequest({
+                target,
+                headBranch: bootstrap.branch,
+                baseBranch: bootstrap.baseBranch,
+                title: `Implement ${formatTarget(target)}`,
+                body: `Closes #${target.issueNumber}\n\nConductor-owned implementation pull request for ${formatTarget(target)}.`,
+              });
+            }
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -697,6 +794,7 @@ export async function runWorkflow(
             bootstrap: deps.bootstrap,
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
+            resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,
           },
           run.id,
           {
@@ -791,6 +889,16 @@ export async function runWorkflow(
         const mergeState = pullRequest?.mergeStateStatus?.toUpperCase() ?? null;
         const contradictory = snapshot.problems.find((problem) => problem.code === 'CONTRADICTORY_STATE');
         const currentHosted = hostedValidation(snapshot, deps.hostedCheckPolicy);
+        // An explicit negative review on the exact current HEAD is blocking
+        // authority even when it created no inline thread. Do not infer a pass
+        // from the absence of unresolved threads; only the latest review per
+        // author is retained by the normalized GitHub snapshot, and stale
+        // reviews are deliberately ignored here.
+        const blockingChangeRequest = snapshot.reviews.latestByAuthor.find(
+          (review) =>
+            review.state === 'changes_requested' &&
+            (review.fresh || review.commitSha === null),
+        );
         if (currentHosted.status === 'waiting') {
           const reason = `Final GitHub readiness gate is waiting for required hosted checks at ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
@@ -819,6 +927,11 @@ export async function runWorkflow(
             : snapshot.reviews.unresolvedThreads > 0
               ? `${snapshot.reviews.unresolvedThreads} review thread(s) remain unresolved`
               : null,
+          blockingChangeRequest === undefined
+            ? null
+            : blockingChangeRequest.commitSha === null
+              ? `GitHub review ${blockingChangeRequest.id} explicitly requests changes but its commit provenance is unavailable`
+              : `GitHub review ${blockingChangeRequest.id} on the current HEAD explicitly requests changes`,
           contradictory?.message ?? null,
         ].filter((problem): problem is string => problem !== null);
 

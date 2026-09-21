@@ -9,6 +9,7 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.j
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition, type ActiveValidationConfiguration } from '../src/domain/state-machine.js';
+import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import type { AgentResult, ReviewResult, Run } from '../src/domain/types.js';
 import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
@@ -19,6 +20,9 @@ const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const HEAD2 = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const HEAD3 = 'cccccccccccccccccccccccccccccccccccccccc';
+const ROUTINE_REPAIR_EXECUTION: ResolvedExecutionConfiguration = {
+  profile: 'routine', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 60_000,
+};
 
 function reviewAuthority() {
   return {
@@ -52,8 +56,8 @@ class MemoryStore implements RunStore {
   }
 }
 
-function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string): Run {
-  let run = createRun(TARGET, T0, id);
+function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string, execution?: ResolvedExecutionConfiguration): Run {
+  let run = createRun(TARGET, T0, id, execution);
   run = applyTransition(run, { type: 'start' }, T0);
   const agentResult = { ...successResult(headSha), ...(sessionId === undefined ? {} : { sessionId }) };
   run = applyTransition(run, { type: 'agent_succeeded', agentResult, headSha }, T0);
@@ -63,6 +67,53 @@ function reviewingRun(headSha = HEAD, id = 'run-1', sessionId?: string): Run {
     pullRequest: { number: 7, headSha },
   }, T0);
   return run;
+}
+
+function repairChangesRun(id: string): Run {
+  const admitted = {
+    ...reviewingRun(HEAD, id),
+    repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' as const },
+  };
+  return applyTransition(admitted, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, reviewAuthority());
+}
+
+class ConcurrentAdmissionStore extends MemoryStore {
+  private attempts = 0;
+
+  constructor(private readonly concurrent: Run) { super(); }
+
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    this.attempts += 1;
+    if (this.attempts === 1) {
+      this.update(this.concurrent);
+      return false;
+    }
+    this.update(next);
+    return true;
+  }
+}
+
+class CasMemoryStore extends MemoryStore {
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    const current = this.read(expected.id);
+    if (current === null || JSON.stringify(current) !== JSON.stringify(expected)) return false;
+    this.update(next);
+    return true;
+  }
+}
+
+class SpawnRaceStore extends CasMemoryStore {
+  private attempts = 0;
+  constructor(private readonly concurrent: Run) { super(); }
+
+  override updateIfUnchanged(expected: Run, next: Run): boolean {
+    this.attempts += 1;
+    if (this.attempts === 2) {
+      this.update(this.concurrent);
+      return false;
+    }
+    return super.updateIfUnchanged(expected, next);
+  }
 }
 
 function snapshot(headSha: string | null): GitHubLiveSnapshot {
@@ -134,6 +185,7 @@ class FakeImplementation implements ImplementationAgent {
     instructions: string | undefined;
     sessionId: string | undefined;
     executor: ImplementationRequest['executor'];
+    execution: ImplementationRequest['execution'];
   }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
@@ -144,6 +196,7 @@ class FakeImplementation implements ImplementationAgent {
       instructions: request.instructions,
       sessionId: request.sessionId,
       executor: request.executor,
+      execution: request.execution,
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
@@ -427,6 +480,66 @@ describe('runReviewLoop', () => {
     });
   });
 
+  it('starts an authority-promoted repair with a fresh executor when providers differ', async () => {
+    const store = new CasMemoryStore();
+    let run = repairChangesRun('fresh-promoted-executor');
+    run = {
+      ...run,
+      repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'interacting' },
+      executor: { provider: 'worker-router', sessionId: 'legacy-session' },
+      agentResult: { ...run.agentResult!, sessionId: 'legacy-session', executor: { provider: 'worker-router', sessionId: 'legacy-session' } },
+    };
+    store.create(run);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+    const complex = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD, HEAD, HEAD2]), implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+        resolveRepairExecutionProfile: () => complex },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'revalidating');
+    assert.equal(implementation.requests[0]?.executor, undefined);
+    assert.equal(implementation.requests[0]?.sessionId, undefined);
+    assert.deepEqual(implementation.requests[0]?.execution, complex);
+  });
+
+  it('does not spawn after a concurrent transition wins the post-admission telemetry fence', async () => {
+    const initial = repairChangesRun('post-admission-race');
+    const started = applyTransition(initial, { type: 'start_fix' }, T0);
+    const concurrent = applyTransition(started, { type: 'escalate', reason: 'concurrent cancellation' }, T0);
+    const store = new SpawnRaceStore(concurrent);
+    store.create(initial);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+        resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
+      initial.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(store.read(initial.id)?.state, 'NEEDS_HUMAN');
+    assert.equal(implementation.requests.length, 0);
+  });
+
+  it('parks decision-shaped authority with only a terminal choice', async () => {
+    const store = new MemoryStore();
+    const run = { ...repairChangesRun('decision-authority'), repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'decision' as const } };
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.deepEqual(result.run.interrupt?.choices, ['Cancel the run']);
+    assert.equal(implementation.requests.length, 0);
+  });
+
   it('returns the fixed HEAD to VALIDATING before a second review can consume the attempt budget', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
@@ -504,8 +617,11 @@ describe('runReviewLoop', () => {
 
   it('resumes a persisted CHANGES_REQUESTED run by fixing before re-reviewing', async () => {
     const store = new MemoryStore();
+    const execution: ResolvedExecutionConfiguration = {
+      profile: 'standard', revision: 'profiles-v1', executor: 'worker-router', timeoutMs: 60_000,
+    };
     const requested = requestChanges(HEAD);
-    store.create(applyTransition(reviewingRun(), { type: 'changes_requested', reviewResult: requested }, T0, reviewAuthority()));
+    store.create(applyTransition(reviewingRun(HEAD, 'run-1', undefined, execution), { type: 'changes_requested', reviewResult: requested }, T0, reviewAuthority()));
     const reviewer = new FakeReviewer([approve(HEAD2)]);
     const implementation = new FakeImplementation([successResult(HEAD2)]);
 
@@ -518,7 +634,73 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'revalidating');
     assert.equal(result.run.state, 'VALIDATING');
     assert.equal(implementation.requests[0]?.baseSha, HEAD);
+    assert.deepEqual(implementation.requests[0]?.execution, execution);
     assert.deepEqual(reviewer.requests.map((reviewRequest) => reviewRequest.headSha), []);
+  });
+
+  it('durably parks stale repair admission when CAS is unavailable without calling a writer or reviewer', async () => {
+    const store = new MemoryStore();
+    const run = repairChangesRun('repair-no-cas');
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority,
+        resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.interrupt?.reason, 'Repair admission parked: admission_stale.');
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(reviewer.requests.length, 0);
+  });
+
+  it('retries stale admission parking from a concurrent nonterminal snapshot without calling a writer or reviewer', async () => {
+    const run = repairChangesRun('repair-cas-race');
+    const concurrent = applyTransition(run, { type: 'start_fix' }, T0);
+    const store = new ConcurrentAdmissionStore(concurrent);
+    store.create(run);
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+
+    const result = await runReviewLoop(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority,
+        resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.interruptedFrom, 'IMPLEMENTING');
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(reviewer.requests.length, 0);
+  });
+
+  it('preserves an already parked or terminal concurrent admission snapshot without writer or reviewer calls', async () => {
+    for (const state of ['parked', 'terminal'] as const) {
+      const run = repairChangesRun(`repair-${state}`);
+      const concurrent = state === 'parked'
+        ? applyTransition(run, { type: 'escalate', reason: 'concurrent human decision' }, T0)
+        : applyTransition(run, { type: 'fail', reason: 'concurrent failure' }, T0);
+      const store = new ConcurrentAdmissionStore(concurrent);
+      store.create(run);
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+
+      const result = await runReviewLoop(
+        { store, github: githubAdapter([HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority,
+          resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
+        run.id, { maxAttempts: 3, now: () => T0 },
+      );
+
+      assert.equal(result.run.state, concurrent.state, state);
+      assert.equal(store.read(run.id)?.state, concurrent.state, state);
+      assert.equal(implementation.requests.length, 0, state);
+      assert.equal(reviewer.requests.length, 0, state);
+    }
   });
 
   it('turns retryable and fatal reviewer failures into durable outcomes', async () => {

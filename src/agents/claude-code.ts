@@ -8,12 +8,18 @@ import {
 } from '../adapters/agent.js';
 import type { GitHubAdapter } from '../adapters/github.js';
 import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
+import type { ProviderExecutionTelemetry } from '../domain/telemetry.js';
 import {
   NodeProcessRunner,
   type ProcessResult,
   type ProcessRunner,
   type ProcessRunOptions,
 } from '../github/transport.js';
+import {
+  providerTelemetry,
+  tokenUsageFromProviderValue,
+  usageContextFromTokenUsage,
+} from './provider-telemetry.js';
 
 export type ClaudeRunOptions = ProcessRunOptions;
 export type ClaudeProcessRunner = ProcessRunner;
@@ -56,6 +62,7 @@ type ClaudeOutcome =
       readonly summary: string;
       readonly sessionId: string | undefined;
       readonly durationMs: number;
+      readonly telemetry: ProviderExecutionTelemetry;
     }
   | { readonly ok: false; readonly agentResult: AgentResult };
 
@@ -64,6 +71,8 @@ interface ClaudeResultJson {
   readonly session_id?: string;
   readonly result: string;
   readonly is_error: boolean;
+  readonly model?: string;
+  readonly usage?: unknown;
 }
 
 /**
@@ -135,6 +144,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
         sessionId: outcome.sessionId,
         ...(executor === undefined ? {} : { executor }),
+        telemetry: outcome.telemetry,
         durationMs: outcome.durationMs,
       };
     }
@@ -150,6 +160,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         diagnostics: [`${CLAUDE_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${this.cwd}.`],
         sessionId: outcome.sessionId,
         ...(executor === undefined ? {} : { executor }),
+        telemetry: outcome.telemetry,
         durationMs: outcome.durationMs,
       };
     }
@@ -159,6 +170,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       headSha: head.sha,
       sessionId: outcome.sessionId,
       ...(executor === undefined ? {} : { executor }),
+      telemetry: outcome.telemetry,
       durationMs: outcome.durationMs,
     };
   }
@@ -278,10 +290,18 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
         json.session_id ?? resumeSessionId,
       );
     }
+    const usage = tokenUsageFromProviderValue(json.usage);
+    const context = usageContextFromTokenUsage(usage);
     return {
       ok: true,
       summary: typeof json.result === 'string' && json.result !== '' ? json.result : 'Done.',
       sessionId: json.session_id ?? resumeSessionId,
+      telemetry: providerTelemetry({
+        provider: CLAUDE_CODE_PROVIDER,
+        ...(this.model === undefined && json.model === undefined ? {} : { model: json.model ?? this.model }),
+        ...(usage === undefined ? {} : { usage }),
+        ...(context === undefined ? {} : { context }),
+      }),
       durationMs,
     };
   }
@@ -341,7 +361,8 @@ function parseResultJson(stdout: string): ClaudeResultJson | null {
       typeof result.result !== 'string' ||
       result.result === '' ||
       typeof result.is_error !== 'boolean' ||
-      (result.session_id !== undefined && (typeof result.session_id !== 'string' || result.session_id === ''))
+      (result.session_id !== undefined && (typeof result.session_id !== 'string' || result.session_id === '')) ||
+      (result.model !== undefined && (typeof result.model !== 'string' || result.model.trim() === ''))
     ) {
       return null;
     }

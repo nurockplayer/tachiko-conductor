@@ -19,6 +19,8 @@ import { createRun } from '../src/domain/run.js';
 import type { Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
+import { LiveGitHubAdapter } from '../src/github/live-state.js';
+import type { GitHubApiTransport } from '../src/github/transport.js';
 
 const T0 = '2026-09-15T00:00:00.000Z';
 const QUEUE = `${DISPATCH_QUEUE_MARKER}
@@ -72,6 +74,52 @@ class GitHub implements GitHubAdapter {
   async readBranch(): Promise<never> { throw new Error('unused'); }
   async listPullRequests(): Promise<readonly PullRequestSnapshot[]> { return this.pulls; }
   async readLiveSnapshot(): Promise<never> { throw new Error('unused'); }
+}
+
+/** Issue #19 timeline points at an unrelated open PR #33 that only mentions it. */
+class IncidentalCrossReferenceTransport implements GitHubApiTransport {
+  async get(path: string): Promise<unknown> {
+    if (path === 'repos/acme/widgets/issues/19') {
+      return {
+        node_id: 'I_19', number: 19, title: 'queued', body: '', state: 'open',
+        html_url: 'https://github.test/acme/widgets/issues/19', created_at: T0, updated_at: T0,
+      };
+    }
+    if (path === 'repos/acme/widgets/pulls/33') {
+      return {
+        node_id: 'PR_33', number: 33, title: 'Unrelated', body: 'Discussed alongside #19.', state: 'open',
+        draft: false, html_url: 'https://github.test/acme/widgets/pull/33', mergeable: true,
+        mergeable_state: 'clean', updated_at: T0, merged_at: null,
+        head: { sha: 'head-33' }, base: { sha: 'base-33' },
+      };
+    }
+    if (path === 'repos/acme/widgets') return { default_branch: 'main' };
+    if (path === 'repos/acme/widgets/commits/main') return { sha: 'main-head' };
+    throw new Error(`No fixture for ${path}`);
+  }
+
+  async getPaginated(path: string): Promise<readonly unknown[]> {
+    if (path === 'repos/acme/widgets/issues/19/timeline') {
+      return [{
+        event: 'cross-referenced',
+        source: { issue: { number: 33, pull_request: { url: 'https://api.github.com/repos/acme/widgets/pulls/33' } } },
+      }];
+    }
+    if (path === 'repos/acme/widgets/issues/19/comments') return [];
+    throw new Error(`No fixture for ${path}`);
+  }
+
+  async graphql(): Promise<unknown> {
+    return {
+      data: {
+        repository: {
+          pullRequest: {
+            closingIssuesReferences: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } },
+          },
+        },
+      },
+    };
+  }
 }
 
 describe('dispatch queue protocol', () => {
@@ -200,6 +248,40 @@ describe('dispatch queue protocol', () => {
     assert.deepEqual(result, {
       outcome: 'no_eligible_work',
       reasons: ['#18: existing durable run existing is READY', '#19: an associated pull request is already open'],
+    });
+  });
+
+  it('does not treat an incidental open PR cross-reference as an active writer', async () => {
+    const result = await dispatchOnce({
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard`,
+      owner: 'acme', repo: 'widgets', store: new MemoryStore(), runtime: new Comments(),
+      github: new LiveGitHubAdapter({ transport: new IncidentalCrossReferenceTransport(), now: () => T0 }),
+      leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'claim-1',
+      async execute(entry) { return { runId: `run-${entry.issue}`, state: 'IMPLEMENTING' }; },
+    });
+
+    assert.equal(result.outcome, 'dispatched');
+    if (result.outcome !== 'dispatched') throw new Error('expected Codex dispatch');
+    assert.equal(result.entry.issue, 19);
+  });
+
+  it('keeps duplicate-writer protection fail-closed when association proof is unavailable', async () => {
+    const base = new IncidentalCrossReferenceTransport();
+    const transport: GitHubApiTransport = {
+      get: (path) => base.get(path),
+      getPaginated: (path) => base.getPaginated(path),
+    };
+    const result = await dispatchOnce({
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard`,
+      owner: 'acme', repo: 'widgets', store: new MemoryStore(), runtime: new Comments(),
+      github: new LiveGitHubAdapter({ transport, now: () => T0 }),
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute() { throw new Error('must fail closed before execution'); },
+    });
+
+    assert.deepEqual(result, {
+      outcome: 'no_eligible_work',
+      reasons: ['#19: an associated pull request is already open'],
     });
   });
 
@@ -482,10 +564,16 @@ describe('dispatch queue protocol', () => {
   });
 
   it('passes the immutable claim id when creating a new dispatched run', async () => {
-    const runtime = new CommandRuntime(QUEUE);
+    const runtime = new CommandRuntime(`${DISPATCH_QUEUE_MARKER}
+ready:
+  - issue: 18
+    route: codex
+    profile: complex
+    task-shape-revision: task-shape-v1
+    task-shape: interacting`);
     const store = new MemoryStore();
     const selected = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
-    const received: Array<{ ref: string; profile: string; claimId: string }> = [];
+    const received: Array<{ ref: string; profile: string; claimId: string; authority: unknown }> = [];
     await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
       workflow: { store, github: new GitHub() } as unknown as WorkflowDependencies,
       runtime,
@@ -493,8 +581,8 @@ describe('dispatch queue protocol', () => {
         assert.equal(profile, 'complex');
         return selected;
       },
-      runIssue: async (ref, execution, claimId) => {
-        received.push({ ref, profile: execution?.profile ?? '', claimId });
+      runIssue: async (ref, execution, claimId, authority) => {
+        received.push({ ref, profile: execution?.profile ?? '', claimId, authority });
         return { outcome: 'needs_human', run: { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'new-run', selected, claimId), state: 'NEEDS_HUMAN' as const }, reason: 'parked for test' };
       },
       resumeClaimedRun: async () => { throw new Error('must create, not resume'); },
@@ -504,6 +592,7 @@ describe('dispatch queue protocol', () => {
     assert.equal(received[0]?.ref, 'acme/widgets#18');
     assert.equal(received[0]?.profile, 'complex');
     assert.equal(received[0]?.claimId, parseDispatchRuntime(runtime.comments[0]!.body)?.claimId);
+    assert.deepEqual(received[0]?.authority, { revision: 'task-shape-v1', shape: 'interacting' });
   });
 
   it('rejects recovery when the durable profile and retained claim disagree', async () => {

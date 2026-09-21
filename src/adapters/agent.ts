@@ -101,6 +101,15 @@ export interface ImplementationRequest {
   readonly sessionId?: string;
   /** Provider-neutral durable executor identity for exact continuation. */
   readonly executor?: ExecutorIdentity;
+  /**
+   * The existing durable Run/claim ownership fence. Native runtime control is
+   * forbidden when this is absent; an App Server process is never ownership.
+   */
+  readonly runtimeOwnership?: {
+    readonly runId: string;
+    readonly generation: string;
+    readonly dispatchClaimId?: string;
+  };
   /** Immutable Steward-selected execution snapshot; adapters never select it. */
   readonly execution?: ResolvedExecutionConfiguration;
   /** Cancels the active implementation process. */

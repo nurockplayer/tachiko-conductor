@@ -91,6 +91,7 @@ function pull(
     node_id: `PR_${number}`,
     number,
     title: 'Implement live state',
+    body: 'Closes #42',
     state: 'open',
     draft: false,
     html_url: `https://github.test/acme/widgets/pull/${number}`,
@@ -301,6 +302,7 @@ PR: #7`;
 
   it('counts unresolved review threads across GraphQL pages', async () => {
     const transport = prTransport().queueGraphql(
+      closingIssues(42),
       {
         data: {
           repository: {
@@ -331,7 +333,22 @@ PR: #7`;
     const snapshot = await adapter.readLiveSnapshot(TARGET);
 
     assert.equal(snapshot.reviews.unresolvedThreads, 2);
-    assert.equal(transport.calls.filter((call) => call.kind === 'graphql').length, 2);
+    assert.equal(transport.calls.filter((call) => call.kind === 'graphql').length, 3);
+  });
+
+  it('fails closed when review evidence collections cannot be read instead of treating them as empty', async () => {
+    for (const path of [
+      'repos/acme/widgets/pulls/7/reviews',
+      'repos/acme/widgets/pulls/7/comments',
+    ]) {
+      const transport = prTransport().fault(
+        path,
+        new GitHubLiveStateError('GH_RATE_LIMITED', 'rate limited', { retryable: true }),
+      );
+      const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+      await expectError(adapter.readLiveSnapshot(TARGET), 'GH_RATE_LIMITED', true);
+    }
   });
 
   it('gives a latest change request precedence over another author approval', async () => {
@@ -359,6 +376,198 @@ PR: #7`;
 
     assert.equal(snapshot.reviews.decision, 'changes_requested');
     assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED', 'R_CHANGES']);
+  });
+
+  it('keeps a current-HEAD change request active across a later comment-only review from the same author', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/changes',
+      },
+      {
+        node_id: 'R_COMMENT',
+        user: { login: 'alice' },
+        state: 'COMMENTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/comment',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_CHANGES']);
+  });
+
+  it('keeps an unknown-provenance change request across a later current-HEAD comment-only review', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_UNKNOWN_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: null,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/unknown-changes',
+      },
+      {
+        node_id: 'R_COMMENT',
+        user: { login: 'alice' },
+        state: 'COMMENTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/comment',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_UNKNOWN_CHANGES']);
+    assert.equal(snapshot.reviews.latestByAuthor[0]?.commitSha, null);
+  });
+
+  it('lets a later unknown-provenance change request override an earlier current-HEAD comment', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_COMMENT',
+        user: { login: 'alice' },
+        state: 'COMMENTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/comment',
+      },
+      {
+        node_id: 'R_UNKNOWN_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: null,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/unknown-changes',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_UNKNOWN_CHANGES']);
+  });
+
+  it('lets a later current-HEAD approval clear an earlier unknown-provenance change request', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_UNKNOWN_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: null,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/unknown-changes',
+      },
+      {
+        node_id: 'R_APPROVED',
+        user: { login: 'alice' },
+        state: 'APPROVED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/approved',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'approved');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED']);
+  });
+
+  it('fails closed when a current approval ties an unknown-provenance change request', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_CURRENT_APPROVED_TIE',
+        user: { login: 'alice' },
+        state: 'APPROVED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/current-approved-tie',
+      },
+      {
+        node_id: 'R_UNKNOWN_CHANGES_TIE',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: null,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/unknown-changes-tie',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_UNKNOWN_CHANGES_TIE']);
+  });
+
+  it('fails closed on equal-timestamp approval/change-request ties regardless of collection order', async () => {
+    const approval = {
+      node_id: 'R_APPROVED_TIE',
+      user: { login: 'alice' },
+      state: 'APPROVED',
+      commit_id: HEAD,
+      submitted_at: '2026-08-14T02:00:00.000Z',
+      html_url: 'https://github.test/reviews/approved-tie',
+    };
+    const changes = {
+      node_id: 'R_CHANGES_TIE',
+      user: { login: 'alice' },
+      state: 'CHANGES_REQUESTED',
+      commit_id: HEAD,
+      submitted_at: '2026-08-14T02:00:00.000Z',
+      html_url: 'https://github.test/reviews/changes-tie',
+    };
+
+    for (const ordered of [[approval, changes], [changes, approval]]) {
+      const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', ordered);
+      const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+      const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+      assert.equal(snapshot.reviews.decision, 'changes_requested');
+      assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_CHANGES_TIE']);
+    }
+  });
+
+  it('does not let a later-submitted stale approval supersede a current-HEAD change request', async () => {
+    const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+      {
+        node_id: 'R_CHANGES',
+        user: { login: 'alice' },
+        state: 'CHANGES_REQUESTED',
+        commit_id: HEAD,
+        submitted_at: '2026-08-14T01:00:00.000Z',
+        html_url: 'https://github.test/reviews/changes',
+      },
+      {
+        node_id: 'R_STALE_APPROVAL',
+        user: { login: 'alice' },
+        state: 'APPROVED',
+        commit_id: BASE,
+        submitted_at: '2026-08-14T02:00:00.000Z',
+        html_url: 'https://github.test/reviews/stale-approval',
+      },
+    ]);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.reviews.decision, 'changes_requested');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_CHANGES']);
   });
 
   it('rejects more than one open associated pull request', async () => {
@@ -392,8 +601,8 @@ PR: #7`;
       .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
       .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7), crossRef(8)])
       .collection('repos/acme/widgets/issues/42/comments', [])
-      .queue('repos/acme/widgets/pulls/7', pull(), pull())
-      .queue('repos/acme/widgets/pulls/8', pull(8))
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: '' }), pull(7, HEAD, { body: '' }))
+      .queue('repos/acme/widgets/pulls/8', pull(8, HEAD, { body: 'Closes #12' }))
       .collection('repos/acme/widgets/issues/7/comments', [])
       .collection('repos/acme/widgets/pulls/7/reviews', [])
       .collection('repos/acme/widgets/pulls/7/comments', [])
@@ -591,5 +800,100 @@ PR: #7`;
 
     assert.deepEqual(second, first);
     assert.equal(second.observedAt, OBSERVED_AT);
+  });
+
+  it('does not associate an unrelated open PR that only mentions the Issue in prose', async () => {
+    const transport = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .collection('repos/acme/widgets/issues/42/comments', [])
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'Follow-up work discussed in #42.' }))
+      .queueGraphql(closingIssues())
+      .queue('repos/acme/widgets', { default_branch: 'main' })
+      .queue('repos/acme/widgets/commits/main', { sha: BASE });
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.pullRequest, null);
+    assert.equal(snapshot.headSha, null);
+    assert.equal(snapshot.repository.defaultBranch, 'main');
+  });
+
+  it('keeps listPullRequests and readLiveSnapshot aligned on canonical association', async () => {
+    const proseTransport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'See #42.' }))
+      .queueGraphql(closingIssues());
+    const proseAdapter = new LiveGitHubAdapter({ transport: proseTransport, now: () => OBSERVED_AT });
+    assert.deepEqual(await proseAdapter.listPullRequests(TARGET), []);
+
+    const mergedTransport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue(
+        'repos/acme/widgets/pulls/7',
+        pull(7, HEAD, {
+          state: 'closed',
+          merged_at: '2026-08-14T02:30:00.000Z',
+          body: 'Mentions #42 but implements #32.',
+        }),
+      )
+      .queueGraphql(closingIssues());
+    const mergedAdapter = new LiveGitHubAdapter({ transport: mergedTransport, now: () => OBSERVED_AT });
+    assert.deepEqual(await mergedAdapter.listPullRequests(TARGET), []);
+  });
+
+  it('keeps a genuine open implementation PR associated so it still blocks a second writer', async () => {
+    const transport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue(
+        'repos/acme/widgets/pulls/7',
+        pull(7, HEAD, { body: 'Closes #42\n\nConductor-owned implementation pull request.' }),
+      );
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const pulls = await adapter.listPullRequests(TARGET);
+
+    assert.equal(pulls.length, 1);
+    assert.equal(pulls[0]?.number, 7);
+    assert.equal(pulls[0]?.state, 'open');
+  });
+
+  it('does not pick arbitrarily when multiple cross-references are all incidental', async () => {
+    const transport = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7), crossRef(8)])
+      .collection('repos/acme/widgets/issues/42/comments', [])
+      .queue(
+        'repos/acme/widgets/pulls/7',
+        pull(7, HEAD, { body: 'Implements #32.' }),
+        pull(7, HEAD, { body: 'Implements #32.' }),
+      )
+      .queue('repos/acme/widgets/pulls/8', pull(8, HEAD, { body: 'Docs for #12.' }))
+      .queueGraphql(closingIssues(), closingIssues())
+      .queue('repos/acme/widgets', { default_branch: 'main' })
+      .queue('repos/acme/widgets/commits/main', { sha: BASE });
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const snapshot = await adapter.readLiveSnapshot(TARGET);
+
+    assert.equal(snapshot.pullRequest, null);
+  });
+
+  it('fails closed on a prose cross-reference when no first-party closing channel exists', async () => {
+    const route = new RouteTransport()
+      .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'See #42.' }), pull(7, HEAD, { body: 'See #42.' }));
+    const transport: GitHubApiTransport = {
+      get: (path) => route.get(path),
+      getPaginated: (path) => route.getPaginated(path),
+    };
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    const candidates = await adapter.listPullRequests(TARGET);
+    assert.equal(candidates.length, 1);
+    assert.equal(candidates[0]?.number, 7);
+    await expectError(adapter.readLiveSnapshot(TARGET), 'GH_PR_ASSOCIATION_UNKNOWN', true);
   });
 });

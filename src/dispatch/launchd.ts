@@ -1,10 +1,9 @@
 import path from 'node:path';
 
-export const DEFAULT_DISPATCH_LAUNCHD_LABEL = 'io.tachiko.conductor.dispatch-once';
+export const DEFAULT_DISPATCH_LAUNCHD_LABEL = 'io.tachiko.conductor.dispatch-driver';
 
 export interface DispatchLaunchdOptions {
   readonly label?: string;
-  readonly minute?: number;
   readonly program: string;
   readonly workingDirectory: string;
   readonly standardErrorPath?: string;
@@ -20,12 +19,10 @@ function absolute(value: string, name: string): string {
   return value;
 }
 
-/** Render an hourly launchd plist without embedding queue or execution secrets. */
+/** Render a launchd supervisor for the long-running provider-neutral driver. */
 export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): string {
   const label = options.label ?? DEFAULT_DISPATCH_LAUNCHD_LABEL;
-  const minute = options.minute ?? 25;
   if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(label)) throw new Error('launchd label contains unsupported characters.');
-  if (!Number.isSafeInteger(minute) || minute < 0 || minute > 59) throw new Error('launchd minute must be an integer from 0 through 59.');
   const program = absolute(options.program, 'launchd program');
   const workingDirectory = absolute(options.workingDirectory, 'launchd working directory');
   const stdout = absolute(options.standardOutPath ?? path.join(path.dirname(program), `${label}.stdout.log`), 'launchd stdout path');
@@ -37,7 +34,8 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   <key>Label</key><string>${xml(label)}</string>
   <key>ProgramArguments</key><array><string>${xml(program)}</string></array>
   <key>WorkingDirectory</key><string>${xml(workingDirectory)}</string>
-  <key>StartCalendarInterval</key><dict><key>Minute</key><integer>${minute}</integer></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Background</string>
   <key>StandardOutPath</key><string>${xml(stdout)}</string>
   <key>StandardErrorPath</key><string>${xml(stderr)}</string>

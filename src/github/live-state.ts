@@ -12,11 +12,12 @@ import type {
   GitHubReviewSummary,
   IssueSnapshot,
   PullRequestSnapshot,
+  CreateImplementationPullRequestRequest,
 } from '../adapters/github.js';
 import type { IssueTarget, RepositoryTarget, Target } from '../domain/types.js';
 import { GitHubLiveStateError } from './errors.js';
 import { parseAgentHandoffs } from './handoff.js';
-import type { GitHubApiTransport } from './transport.js';
+import type { GitHubApiTransport, GitHubWriteTransport } from './transport.js';
 
 export interface LiveGitHubAdapterOptions {
   readonly transport: GitHubApiTransport;
@@ -165,6 +166,8 @@ function hasClosingReference(
   return pattern.test(pullRequest.body);
 }
 
+type PullRequestAssociation = 'associated' | 'not_associated' | 'unknown';
+
 interface OpenPullRequest {
   readonly number: number;
   readonly path: string;
@@ -182,16 +185,32 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     this.now = options.now ?? (() => new Date().toISOString());
   }
 
+  async createImplementationPullRequest(request: CreateImplementationPullRequestRequest): Promise<{ readonly number: number }> {
+    const transport = this.transport as Partial<GitHubWriteTransport>;
+    if (typeof transport.write !== 'function') {
+      throw new GitHubLiveStateError('GH_TRANSPORT_FAILED', 'GitHub write capability is unavailable for implementation PR creation.');
+    }
+    const path = `repos/${request.target.owner}/${request.target.repo}/pulls`;
+    const raw = asRecord(await transport.write(path, 'POST', {
+      title: request.title,
+      head: request.headBranch,
+      base: request.baseBranch,
+      body: request.body,
+    }));
+    if (raw === null || typeof raw.number !== 'number' || !Number.isSafeInteger(raw.number) || raw.number <= 0) {
+      throw invalid(path, 'created pull request has no valid number');
+    }
+    return { number: raw.number };
+  }
+
   async readIssue(target: IssueTarget): Promise<IssueSnapshot> {
-    const live = await this.readLiveSnapshot(target);
+    const path = `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}`;
+    const issue = this.normalizeIssue(asRecordOrThrow(await this.transport.get(path), path), path);
     return {
       target,
-      title: live.issue.title,
-      body: live.issue.body,
-      state: live.issue.state,
-      ...(live.pullRequest === null
-        ? {}
-        : { headSha: live.pullRequest.headSha, pullRequestNumber: live.pullRequest.number }),
+      title: issue.title,
+      body: issue.body,
+      state: issue.state,
     };
   }
 
@@ -225,6 +244,11 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const record = asRecord(await this.transport.get(path));
       if (record === null) throw invalid(path, 'pull request is not an object');
+      const association = await this.classifyPullRequestAssociation(owner, repo, target.issueNumber, number, record);
+      if (association === 'not_associated') continue;
+      // Unknown is deliberately retained here: dispatch duplicate-writer
+      // protection must fail closed when a timeline candidate cannot be
+      // authoritatively disproven.
       result.push(this.normalizePullRequest(record, path));
     }
     return result;
@@ -242,32 +266,32 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const timeline = await this.transport.getPaginated(`${issuePath}/timeline`);
     const numbers = await this.discoverPullRequestNumbers(owner, repo, issueNumber, timeline);
 
-    const open: OpenPullRequest[] = [];
+    const associated: OpenPullRequest[] = [];
+    const unknownAssociationNumbers: number[] = [];
     for (const number of numbers) {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const raw = asRecordOrThrow(await this.transport.get(path), path);
       if (requirePositiveInt(raw, 'number', path) !== number) {
         throw invalid(path, `pull request number ${String(raw.number)} does not match the referenced ${number}`);
       }
-      if (raw.state === 'open') open.push({ number, path, raw });
-    }
-    let associated = open;
-    let authoritativeClosingMatches: number | null = null;
-    if (open.length > 1 && this.transport.graphql !== undefined) {
-      const closingMatches: OpenPullRequest[] = [];
-      for (const candidate of open) {
-        if (await this.pullRequestClosesIssue(owner, repo, candidate.number, issueNumber)) {
-          closingMatches.push(candidate);
-        }
+      if (raw.state !== 'open') continue;
+      const association = await this.classifyPullRequestAssociation(owner, repo, issueNumber, number, raw);
+      if (association === 'not_associated') continue;
+      if (association === 'unknown') {
+        unknownAssociationNumbers.push(number);
+        continue;
       }
-      authoritativeClosingMatches = closingMatches.length;
-      if (closingMatches.length > 0) associated = closingMatches;
+      associated.push({ number, path, raw });
     }
-    if (associated.length > 1 && (authoritativeClosingMatches === null || authoritativeClosingMatches === 0)) {
-      const bodyClosingMatches = associated.filter((candidate) =>
-        hasClosingReference(candidate.raw, owner, repo, issueNumber),
+    if (unknownAssociationNumbers.length > 0) {
+      throw new GitHubLiveStateError(
+        'GH_PR_ASSOCIATION_UNKNOWN',
+        `Issue ${owner}/${repo}#${issueNumber} has pull-request timeline candidates whose association cannot be proven; refusing to select or ignore them.`,
+        {
+          retryable: true,
+          details: { owner, repo, issueNumber, pullRequestNumbers: unknownAssociationNumbers },
+        },
       );
-      if (bodyClosingMatches.length === 1) associated = bodyClosingMatches;
     }
     if (associated.length > 1) {
       throw new GitHubLiveStateError(
@@ -532,6 +556,32 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     };
   }
 
+  /**
+   * One fail-closed rule for Issue <-> PR association. A timeline
+   * cross-reference only proves that a PR mentioned the Issue; it does not
+   * prove the PR implements or closes it. Prefer GitHub's first-party closing
+   * linkage. GitHub closing-keyword syntax remains a deterministic fallback
+   * for Conductor-created PRs and degraded first-party-linkage reads.
+   */
+  private async classifyPullRequestAssociation(
+    owner: string,
+    repo: string,
+    issueNumber: number,
+    pullRequestNumber: number,
+    raw: Record<string, unknown>,
+  ): Promise<PullRequestAssociation> {
+    if (this.transport.graphql !== undefined) {
+      try {
+        if (await this.pullRequestClosesIssue(owner, repo, pullRequestNumber, issueNumber)) return 'associated';
+        return hasClosingReference(raw, owner, repo, issueNumber) ? 'associated' : 'not_associated';
+      } catch {
+        return hasClosingReference(raw, owner, repo, issueNumber) ? 'associated' : 'unknown';
+      }
+    }
+    return hasClosingReference(raw, owner, repo, issueNumber) ? 'associated' : 'unknown';
+  }
+
+  /** Timeline cross-references are candidates, never proof of association. */
   private async discoverPullRequestNumbers(
     owner: string,
     repo: string,
@@ -811,12 +861,76 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     }
 
     const latestByAuthor = new Map<string, GitHubReviewSnapshot>();
+    const byAuthor = new Map<string, GitHubReviewSnapshot[]>();
     for (const review of reviews) {
       const key = review.author ?? '';
-      const existing = latestByAuthor.get(key);
-      if (existing === undefined || (review.submittedAt ?? '') > (existing.submittedAt ?? '')) {
-        latestByAuthor.set(key, review);
+      const entries = byAuthor.get(key) ?? [];
+      entries.push(review);
+      byAuthor.set(key, entries);
+    }
+
+    const latestOf = (entries: readonly GitHubReviewSnapshot[]): GitHubReviewSnapshot | undefined =>
+      entries.reduce<GitHubReviewSnapshot | undefined>((latest, review) => {
+        if (latest === undefined) return review;
+        const reviewTime = review.submittedAt ?? '';
+        const latestTime = latest.submittedAt ?? '';
+        if (reviewTime > latestTime) return review;
+        if (reviewTime < latestTime) return latest;
+
+        // GitHub timestamps can tie at second precision. In that ambiguity,
+        // never let ordering alone erase an explicit negative review: prefer
+        // CHANGES_REQUESTED over any positive/neutral decisive state. For other
+        // ties, the later collection entry is descriptive only.
+        if (review.state === 'changes_requested' && latest.state !== 'changes_requested') return review;
+        if (latest.state === 'changes_requested' && review.state !== 'changes_requested') return latest;
+        return review;
+      }, undefined);
+    const isDecisive = (review: GitHubReviewSnapshot): boolean =>
+      review.state === 'approved' ||
+      review.state === 'changes_requested' ||
+      review.state === 'dismissed';
+
+    for (const [key, entries] of byAuthor) {
+      const current = entries.filter((review) => review.fresh);
+      const unknown = entries.filter((review) => !review.fresh && review.commitSha === null);
+      const stale = entries.filter((review) => !review.fresh && review.commitSha !== null);
+      const currentDecision = latestOf(current.filter(isDecisive));
+      const unknownDecision = latestOf(unknown.filter(isDecisive));
+      const currentObservation = latestOf(current);
+
+      let effective: GitHubReviewSnapshot | undefined;
+      if (currentDecision?.state === 'changes_requested') {
+        // A known-current negative review remains authoritative until a later
+        // known-current decisive review changes or dismisses that decision.
+        effective = currentDecision;
+      } else if (
+        unknownDecision?.state === 'changes_requested' &&
+        (
+          currentDecision === undefined ||
+          (unknownDecision.submittedAt ?? '') >= (currentDecision.submittedAt ?? '')
+        )
+      ) {
+        // Unknown provenance is not stale provenance. A later explicit negative
+        // review may describe the current candidate, so fail closed unless a
+        // later exact-HEAD decisive review explicitly clears it. COMMENTED
+        // observations never clear a decisive review.
+        effective = unknownDecision;
+      } else if (currentDecision !== undefined) {
+        effective = currentDecision;
+      } else if (unknownDecision?.state === 'changes_requested') {
+        effective = unknownDecision;
+      } else {
+        // With no active negative/decisive current state, prefer a current-HEAD
+        // observation for descriptive review state, then unknown provenance,
+        // and use proven-stale evidence only as a last historical observation.
+        effective =
+          currentObservation ??
+          unknownDecision ??
+          latestOf(unknown) ??
+          latestOf(stale);
       }
+
+      if (effective !== undefined) latestByAuthor.set(key, effective);
     }
     const latest = [...latestByAuthor.values()].sort((a, b) => (a.submittedAt ?? '').localeCompare(b.submittedAt ?? ''));
     const decision: GitHubReviewSummary['decision'] =

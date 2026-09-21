@@ -4,11 +4,13 @@ import { describe, it } from 'node:test';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewRequest } from '../src/adapters/reviewer.js';
 import {
+  DeepSeekApiClient,
   DeepSeekReviewer,
   GhPullRequestDiffReader,
   ReviewerError,
   type PullRequestDiffReader,
   type ReviewApiClient,
+  type ReviewCompletion,
 } from '../src/reviewers/deepseek.js';
 import type { GitHubApiTransport } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
@@ -66,9 +68,9 @@ function githubAdapter(outcomes: Array<GitHubLiveSnapshot | Error> = [liveSnapsh
 class FakeClient implements ReviewApiClient {
   readonly prompts: string[] = [];
 
-  constructor(private readonly responses: Array<string | Error>) {}
+  constructor(private readonly responses: Array<string | ReviewCompletion | Error>) {}
 
-  async complete(prompt: string): Promise<string> {
+  async complete(prompt: string): Promise<string | ReviewCompletion> {
     this.prompts.push(prompt);
     const response = this.responses.shift();
     if (response === undefined) throw new Error('No fake response queued');
@@ -124,6 +126,26 @@ describe('DeepSeekReviewer', () => {
     assert.match(client.prompts[0] ?? '', /acme\/widgets#42/);
     assert.match(client.prompts[0] ?? '', /diff --git a\/src\/a.ts/);
     assert.match(client.prompts[0] ?? '', /Issue\/spec context:\nDoR-ready\./);
+  });
+
+  it('preserves structured reviewer usage when the API client reports it', async () => {
+    const client = new FakeClient([{
+      content: reviewerJson(),
+      telemetry: {
+        provider: 'deepseek',
+        model: 'deepseek-chat',
+        turns: 1,
+        usage: { inputTokens: 1_200, cachedInputTokens: 1_000, outputTokens: 75 },
+      },
+    }]);
+    const result = await makeReviewer(client).review(request());
+
+    assert.deepEqual(result.telemetry, {
+      provider: 'deepseek',
+      model: 'deepseek-chat',
+      turns: 1,
+      usage: { inputTokens: 1_200, cachedInputTokens: 1_000, outputTokens: 75 },
+    });
   });
 
   it('routes REQUEST_CHANGES with only blocking findings back to the implementation loop', async () => {
@@ -278,6 +300,92 @@ describe('DeepSeekReviewer', () => {
       reviewer.review(request()),
       (error: unknown) => error instanceof ReviewerError && error.code === 'REVIEW_INVALID_OUTPUT',
     );
+  });
+});
+
+describe('DeepSeekApiClient telemetry', () => {
+  function makeClient(payload: unknown): { readonly client: DeepSeekApiClient; readonly calls: string[] } {
+    const calls: string[] = [];
+    const fetchImpl: typeof globalThis.fetch = async (input) => {
+      calls.push(String(input));
+      return new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    return {
+      client: new DeepSeekApiClient({ apiKey: 'test-key', baseUrl: 'https://api.deepseek.test', fetchImpl }),
+      calls,
+    };
+  }
+
+  /** Real DeepSeek `/chat/completions` usage shape for a successful call. */
+  function deepSeekChatCompletion(usage: Record<string, unknown>, model = 'deepseek-reasoner'): unknown {
+    return {
+      id: 'chatcmpl-1',
+      object: 'chat.completion',
+      created: 1_700_000_000,
+      model,
+      choices: [{ index: 0, message: { role: 'assistant', content: reviewerJson() }, finish_reason: 'stop' }],
+      usage,
+    };
+  }
+
+  it('records one model turn and the real top-level DeepSeek usage fields', async () => {
+    const { client, calls } = makeClient(deepSeekChatCompletion({
+      prompt_tokens: 1_234,
+      completion_tokens: 567,
+      total_tokens: 1_801,
+      prompt_cache_hit_tokens: 1_024,
+      prompt_cache_miss_tokens: 210,
+      prompt_tokens_details: { cached_tokens: 1_024 },
+      completion_tokens_details: { reasoning_tokens: 321 },
+    }));
+
+    const completion = await client.complete('Review the diff.', { model: 'deepseek-chat' });
+
+    assert.deepEqual(calls, ['https://api.deepseek.test/chat/completions']);
+    assert.equal(completion.telemetry?.turns, 1);
+    assert.equal(completion.telemetry?.model, 'deepseek-reasoner');
+    assert.deepEqual(completion.telemetry?.usage, {
+      inputTokens: 1_234,
+      cachedInputTokens: 1_024,
+      outputTokens: 567,
+      reasoningTokens: 321,
+    });
+    assert.deepEqual(completion.telemetry?.context, { initialTokens: 1_234, peakTokens: 1_234 });
+  });
+
+  it('records nested DeepSeek cache and reasoning detail fields when top-level hits are absent', async () => {
+    const { client } = makeClient(deepSeekChatCompletion({
+      prompt_tokens: 900,
+      completion_tokens: 40,
+      prompt_tokens_details: { cached_tokens: 800 },
+      completion_tokens_details: { reasoning_tokens: 12 },
+    }, 'deepseek-chat'));
+
+    const completion = await client.complete('Review the diff.', { model: 'deepseek-chat' });
+
+    assert.equal(completion.telemetry?.turns, 1);
+    assert.deepEqual(completion.telemetry?.usage, {
+      inputTokens: 900,
+      cachedInputTokens: 800,
+      outputTokens: 40,
+      reasoningTokens: 12,
+    });
+  });
+
+  it('keeps unobservable cache and reasoning usage unknown rather than zero', async () => {
+    const { client } = makeClient(deepSeekChatCompletion({
+      prompt_tokens: 500,
+      completion_tokens: 25,
+      total_tokens: 525,
+    }, 'deepseek-chat'));
+
+    const completion = await client.complete('Review the diff.', { model: 'deepseek-chat' });
+
+    assert.equal(completion.telemetry?.turns, 1);
+    assert.deepEqual(completion.telemetry?.usage, { inputTokens: 500, outputTokens: 25 });
   });
 });
 

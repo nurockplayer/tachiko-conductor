@@ -30,7 +30,7 @@ export class ImplementationAgentRegistry implements ImplementationAgent {
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
     const selectedProvider = request.execution?.executor;
-    if (request.executor !== undefined && selectedProvider !== undefined && request.executor.provider !== selectedProvider) {
+    if (request.executor !== undefined && selectedProvider !== undefined && !isCompatibleExecutorProvider(request.executor.provider, selectedProvider)) {
       return routingFailure(
         EXECUTOR_ROUTING_ERROR_CODE.RECONSTRUCTION_FAILED,
         `Persisted executor provider "${request.executor.provider}" does not match selected execution executor "${selectedProvider}".`,
@@ -61,6 +61,11 @@ export class ImplementationAgentRegistry implements ImplementationAgent {
     }
     return await agent.run(request);
   }
+}
+
+/** App Server is a capability-detected local transport for the Codex CLI profile. */
+function isCompatibleExecutorProvider(persisted: string, selected: string): boolean {
+  return persisted === selected || (persisted === 'codex-app-server' && selected === 'codex-cli');
 }
 
 function routingFailure(

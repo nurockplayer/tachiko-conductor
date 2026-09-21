@@ -8,6 +8,8 @@
  */
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
+import type { RepairAdmissionSnapshot, RepairTaskShapeAuthority } from './repair-admission.js';
 
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;
@@ -92,6 +94,11 @@ export type AgentExitStatus = 'success' | 'failure';
 export interface ExecutorIdentity {
   readonly provider: string;
   readonly sessionId: string;
+  /**
+   * A durable Run-owned fence for runtimes which can address an active native
+   * thread.  It is deliberately not a process id or an App Server identity.
+   */
+  readonly generation?: string;
 }
 
 export interface AgentResult {
@@ -105,8 +112,10 @@ export interface AgentResult {
   readonly executor?: ExecutorIdentity;
   /** Opaque executor session token used to continue this logical run. */
   readonly sessionId?: string;
-  /** Wall-clock execution duration. Raw transcripts and model usage are not retained. */
+  /** Wall-clock execution duration. Raw transcripts and hidden reasoning are never retained. */
   readonly durationMs?: number;
+  /** Structured provider usage/provenance only; never raw output or hidden reasoning. */
+  readonly telemetry?: ProviderExecutionTelemetry;
 }
 
 export type ReviewVerdict = 'approve' | 'request_changes';
@@ -123,6 +132,8 @@ export interface ReviewResult {
   /** Exact HEAD SHA this review was performed against. Never inferred. */
   readonly headSha: string;
   readonly findings: readonly ReviewFinding[];
+  /** Structured reviewer usage/provenance only; never raw output or hidden reasoning. */
+  readonly telemetry?: ProviderExecutionTelemetry;
 }
 
 /** A fail-closed validation outcome. `waiting` is reserved for a re-checkable external dependency. */
@@ -237,6 +248,10 @@ export interface Run {
   readonly history: readonly TransitionRecord[];
   /** Steward-selected, immutable secret-free executor snapshot for this run. */
   readonly execution?: ResolvedExecutionConfiguration;
+  /** Optional for legacy JSON; when present it is the only repair shape authority. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
+  /** Append-only, exact-HEAD/PR-bound repair authorizations. */
+  readonly repairAdmissions?: readonly RepairAdmissionSnapshot[];
   /** While paused in WAITING_DEPENDENCY / NEEDS_HUMAN, the state to resume to. */
   readonly interruptedFrom?: WorkflowState;
   readonly interrupt?: Interrupt;
@@ -253,4 +268,6 @@ export interface Run {
   readonly validationResult?: ValidationResult;
   /** Current HEAD SHA of the implementation, when known. */
   readonly headSha?: string;
+  /** Append-only structured run-efficiency events; absent means telemetry was not recorded. */
+  readonly telemetry?: RunTelemetry;
 }
