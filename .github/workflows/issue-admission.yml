@@ -63,7 +63,14 @@ jobs:
             const existingDefinitions = new Set(repoLabels.map((label) => label.name));
             for (const [name, definition] of Object.entries(admission.LABEL_DEFINITIONS)) {
               if (existingDefinitions.has(name)) continue;
-              await github.rest.issues.createLabel({ owner, repo, name, ...definition });
+              try {
+                await github.rest.issues.createLabel({ owner, repo, name, ...definition });
+              } catch (error) {
+                // Different Issues have separate concurrency groups, so the very first
+                // admission runs may race while installing the shared label schema.
+                // A concurrent successful create is equivalent to this create.
+                if (error?.status !== 422) throw error;
+              }
             }
 
             const currentLabels = issue.labels
