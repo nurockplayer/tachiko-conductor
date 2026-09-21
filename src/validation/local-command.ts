@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, readFileSync, readlinkSync, realpathSync } from 'node:fs';
+import { lstatSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
@@ -112,6 +113,40 @@ function workspaceMatches(
 
 function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvidence {
   return { commandIndex, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 };
+}
+
+interface ValidationWorkspace {
+  readonly path: string;
+  dispose(): void;
+}
+
+/**
+ * Materialize command input outside the worker checkout.  In particular, a
+ * clean exact HEAD does not authorize files under that checkout's .git
+ * directory: Git status deliberately does not report them, but a tracked
+ * validation script can still load them.  A no-local clone gives commands a
+ * newly-created Git directory containing only host-created clone metadata and
+ * the cryptographically addressed exact commit.
+ */
+function reconstructedWorkspace(sourcePath: string, headSha: string): ValidationWorkspace | null {
+  const snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-'));
+  const invoke = (args: readonly string[]) => spawnSync('git', args, {
+    encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
+  });
+  try {
+    const cloned = invoke(['clone', '--no-local', '--no-checkout', sourcePath, snapshot]);
+    const checkedOut = cloned.status === 0
+      ? invoke(['-C', snapshot, 'checkout', '--detach', '--force', headSha])
+      : undefined;
+    if (checkedOut?.status !== 0) {
+      rmSync(snapshot, { recursive: true, force: true });
+      return null;
+    }
+    return { path: snapshot, dispose: () => rmSync(snapshot, { recursive: true, force: true }) };
+  } catch {
+    rmSync(snapshot, { recursive: true, force: true });
+    return null;
+  }
 }
 
 function isCommand(value: unknown): value is { readonly argv: readonly string[]; readonly timeoutMs: number } {
@@ -264,23 +299,38 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
-    for (let index = 0; index < configured.length; index += 1) {
-      const command = configured[index];
-      if (!isCommand(command)) {
-        evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
+    // A configured baseline is host-owned and already proved byte-identical
+    // for every ignored dependency.  It is therefore the only place those
+    // dependencies may be executed.  Otherwise reconstruct fresh command
+    // input so worker-controlled .git bytes have no validation authority.
+    const baseline = this.configuration.trustedIgnoredBaselinePath;
+    const commandWorkspace = baseline === undefined
+      ? reconstructedWorkspace(workspacePath, request.headSha)
+      : { path: baseline, dispose: () => {} };
+    if (commandWorkspace === null) {
+      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+    }
+    try {
+      for (let index = 0; index < configured.length; index += 1) {
+        const command = configured[index];
+        if (!isCommand(command)) {
+          evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
+          return { status: 'unknown', configRevision: revision, commands: evidence };
+        }
+        const result = await execute(index, command, commandWorkspace.path);
+        evidence.push(result);
+        if (result.outcome === 'failed' || result.outcome === 'timed_out') {
+          return { status: 'failed', configRevision: revision, commands: evidence };
+        }
+        if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+      }
+      if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
+        evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      const result = await execute(index, command, workspacePath);
-      evidence.push(result);
-      if (result.outcome === 'failed' || result.outcome === 'timed_out') {
-        return { status: 'failed', configRevision: revision, commands: evidence };
-      }
-      if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+      return { status: 'passed', configRevision: revision, commands: evidence };
+    } finally {
+      commandWorkspace.dispose();
     }
-    if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
-      evidence.push(workspaceUnavailable(evidence.length));
-      return { status: 'unknown', configRevision: revision, commands: evidence };
-    }
-    return { status: 'passed', configRevision: revision, commands: evidence };
   }
 }

@@ -67,18 +67,44 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(result.commands[0]?.outcome, 'timed_out');
   });
 
-  it('runs inside the owned clean worktree and rejects a wrong or modified checkout', async () => {
+  it('runs in an isolated exact-HEAD reconstruction and rejects a wrong checkout', async () => {
     const owned = request();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const cwdProof = path.join(proofDir, 'cwd');
     const adapter = new ConfiguredLocalValidationAdapter(
-      configuration([process.execPath, '-e', "require('node:fs').writeFileSync('proof.txt', process.cwd())"]),
+      configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(cwdProof)}, process.cwd())`]),
     );
-    const modified = await adapter.validate(owned);
-    assert.equal(modified.status, 'unknown');
-    assert.equal(existsSync(path.join(owned.workspacePath, 'proof.txt')), true);
+    const result = await adapter.validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.notEqual(path.resolve(readFileSync(cwdProof, 'utf8')), realpathSync(owned.workspacePath));
 
     const clean = request();
     const wrongHead = await adapter.validate({ ...clean, headSha: '0'.repeat(40) });
     assert.equal(wrongHead.status, 'unknown');
+  });
+
+  it('does not authorize worker-controlled .git bytes through a tracked validation script', async () => {
+    const owned = request();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'validation-ran');
+    writeFileSync(
+      path.join(owned.workspacePath, 'validate.js'),
+      `const fs = require('node:fs');\ntry { fs.readFileSync('.git/validation-helper.js'); fs.writeFileSync(${JSON.stringify(marker)}, 'ran'); } catch { process.exit(71); }\n`,
+    );
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'validate.js'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'tracked validation script'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    writeFileSync(path.join(owned.workspacePath, '.git', 'validation-helper.js'), 'module.exports = true\n');
+
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, 'validate.js']),
+    ).validate({ ...owned, headSha });
+
+    assert.equal(result.status, 'failed');
+    assert.equal(result.commands[0]?.exitCode, 71);
+    assert.equal(existsSync(marker), false);
   });
 
   it('fails closed before validation when ignored worker state could supply absent committed bytes', async () => {
@@ -160,7 +186,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const result = await adapter.validate({ target: TARGET, headSha: existing.headSha });
     assert.equal(result.status, 'passed');
     assert.equal(result.commands[0]?.outcome, 'passed');
-    assert.equal(realpathSync(readFileSync(cwdProof, 'utf8')), realpathSync(existing.workspacePath));
+    assert.notEqual(path.resolve(readFileSync(cwdProof, 'utf8')), realpathSync(existing.workspacePath));
 
     assert.equal(
       (await new ConfiguredLocalValidationAdapter({
