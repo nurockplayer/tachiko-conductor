@@ -1127,6 +1127,9 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'merge_ready', result.outcome === 'needs_human' ? result.reason : undefined);
     assert.deepEqual((prepared[0] as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
     assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Task title: Fix the widget/);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Task requirements:\nDoR-ready\./);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Repair requirements:\n1\. \[blocking\] the diff has a bug/);
     assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
   });
 
