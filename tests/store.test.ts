@@ -60,6 +60,7 @@ describe('JsonFileStore — persistence round-trips', () => {
     run = applyTransition(run, {
       type: 'bootstrap_prepared',
       bootstrap: {
+        bootstrapKind: 'linked-worktree',
         owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
         baseBranch: 'main', baseSha: 'base-sha', branch: 'codex/projected', workspacePath: '/tmp/projected',
       },
