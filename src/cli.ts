@@ -1340,6 +1340,14 @@ export async function main(argv: string[]): Promise<number> {
         schemaVersion: OPERATIONAL_RUNTIME_PROJECTION_VERSION, updatedAt: new Date().toISOString(), supervisor, stage,
         ...(nextPollAt === undefined ? {} : { nextPollAt }), eventWakeEligible: subcommand === 'serve',
         maintenanceHold: readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold ?? { active: false },
+        ...(() => {
+          const active = store.list().filter((run) => !['MERGED', 'FAILED', 'MERGE_READY', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY'].includes(run.state));
+          if (active.length !== 0 && active.length !== 1) return { ownership: 'ambiguous' as const, checkpoint: 'unknown' as const };
+          if (active.length === 0) return { ownership: 'none' as const, checkpoint: 'durable' as const };
+          const run = active[0]!;
+          if (run.bootstrap === undefined) return { ownership: 'ambiguous' as const, checkpoint: 'unknown' as const };
+          return { ownership: 'active' as const, checkpoint: run.headSha === undefined ? 'in_progress' as const : 'durable' as const, activeWriter: { runId: run.id, ...(run.target.kind === 'issue' ? { issue: run.target.issueNumber } : {}), ...(run.execution === undefined ? {} : { worker: run.execution.executor }), worktree: run.bootstrap.workspacePath } };
+        })(),
       });
       const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
       publishRuntime('scanning', 'running', subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined);

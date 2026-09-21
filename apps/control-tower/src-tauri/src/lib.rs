@@ -577,12 +577,15 @@ fn runtime_autopilot() -> AutopilotView {
   let version = value.get("schemaVersion").and_then(Value::as_u64);
   let hold = value.get("maintenanceHold").and_then(|hold| hold.get("active")).and_then(Value::as_bool);
   let wake = value.get("eventWakeEligible").and_then(Value::as_bool);
-  if version != Some(1) || !matches!(supervisor.as_deref(), Some("running" | "stopped" | "parked")) || stage.as_deref().is_none_or(str::is_empty) || hold.is_none() || wake.is_none() { return unknown(); }
+  let ownership = string_at(&value, &["ownership"]);
+  let checkpoint = string_at(&value, &["checkpoint"]);
+  if version != Some(1) || !matches!(supervisor.as_deref(), Some("running" | "stopped" | "parked")) || !matches!(ownership.as_deref(), Some("none" | "active" | "ambiguous")) || !matches!(checkpoint.as_deref(), Some("durable" | "in_progress" | "unknown")) || stage.as_deref().is_none_or(str::is_empty) || hold.is_none() || wake.is_none() { return unknown(); }
   let held = hold == Some(true);
+  let (verdict, reason) = if ownership.as_deref() == Some("active") { ("WAIT FOR CURRENT CHECKPOINT", "A typed active writer owns repository mutation.") } else if ownership.as_deref() != Some("none") || checkpoint.as_deref() != Some("durable") { ("UNKNOWN — CANNOT PROVE SAFE", "Writer ownership or durable restart checkpoint is ambiguous.") } else if held { ("SAFE TO RESTART", "No writer is active, durable re-entry is proven, and maintenance hold prevents admission.") } else { ("SAFE NOW · WINDOW NOT GUARANTEED", "No writer is active, but new dispatch admission is not held.") };
   AutopilotView {
     supervisor: supervisor.unwrap(), current_stage: stage.unwrap(), next_poll_at: string_at(&value, &["nextPollAt"]),
     event_wake_eligible: if wake == Some(true) { "yes".to_owned() } else { "no".to_owned() },
-    restart: if held { RestartView { verdict: "SAFE TO RESTART".to_owned(), reason: "Typed maintenance hold is active; new dispatch admission is blocked.".to_owned() } } else { RestartView { verdict: "SAFE NOW · WINDOW NOT GUARANTEED".to_owned(), reason: "No active writer is published, but event-driven wake may start work before the scheduled poll.".to_owned() } },
+    restart: RestartView { verdict: verdict.to_owned(), reason: reason.to_owned() },
   }
 }
 
