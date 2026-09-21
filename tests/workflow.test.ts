@@ -1110,6 +1110,7 @@ describe('runWorkflow', () => {
       guard() { return { assertValid: () => undefined }; },
       async verifyDurable(request) { return { headSha: request.expectedHeadSha, branch: identity.branch }; },
     };
+    const linked = new FakeBootstrap();
     const github = githubAdapter([HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]);
     const readLive = github.readLiveSnapshot.bind(github);
     github.readLiveSnapshot = async (target) => {
@@ -1120,7 +1121,7 @@ describe('runWorkflow', () => {
 
     const result = await runWorkflow(
       { store, github, implementation, reviewer: new FakeReviewer([approve(HEAD2)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
-        bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => luna },
+        bootstrapForExecution: (execution) => execution?.executor === 'luna-isolated' ? bootstrap : linked, resolveRepairExecutionProfile: () => luna },
       run.id, { maxReviewAttempts: 2, now: () => T0 },
     );
 

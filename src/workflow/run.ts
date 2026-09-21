@@ -127,6 +127,14 @@ function admittedRepairExecution(run: Run, deps: WorkflowDependencies): Resolved
   return resolved !== undefined && JSON.stringify(resolved) === JSON.stringify(receipt.execution) ? resolved : null;
 }
 
+/** The persisted workspace boundary, not the initial provider, selects its later validation/review bootstrap. */
+function bootstrapExecution(run: Run): ResolvedExecutionConfiguration | undefined {
+  if (run.bootstrap?.bootstrapKind !== 'standalone-isolated' || run.execution?.executor === 'luna-isolated') return run.execution;
+  return [...(run.repairAdmissions ?? [])].reverse().find(
+    (admission) => admission.execution.executor === 'luna-isolated' && admission.pullRequestNumber === run.pullRequest?.number,
+  )?.execution;
+}
+
 function hostedValidation(
   snapshot: GitHubLiveSnapshot,
   configuredPolicy: HostedCheckPolicyConfiguration | undefined,
@@ -627,7 +635,7 @@ export async function runWorkflow(
       }
 
       case 'VALIDATING': {
-        const bootstrapAdapter = deps.bootstrapForExecution?.(run.execution) ?? deps.bootstrap;
+        const bootstrapAdapter = deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap;
         const activeValidation = activeValidationConfiguration(deps);
         const invalidAuthority = invalidValidationAuthority(activeValidation);
         if (invalidAuthority !== null) {
@@ -846,7 +854,7 @@ export async function runWorkflow(
             github,
             implementation,
             reviewer,
-            bootstrap: deps.bootstrapForExecution?.(run.execution) ?? deps.bootstrap,
+            bootstrap: deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap,
             bootstrapForExecution: deps.bootstrapForExecution,
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
