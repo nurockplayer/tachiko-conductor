@@ -79,6 +79,7 @@ import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
+import { preflightProductionPolicy } from './production-policy.js';
 import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
@@ -113,6 +114,7 @@ Usage:
   tachiko dispatch once
   tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
   tachiko dispatch wake
+  tachiko production preflight
   tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
@@ -1470,6 +1472,16 @@ export async function main(argv: string[]): Promise<number> {
     } finally {
       lock.release();
     }
+  }
+
+  if (command === 'production') {
+    if (subcommand !== 'preflight' || rest.length !== 0) {
+      console.error(`Unknown command: production ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    console.log(JSON.stringify({ ok: true, preflight: preflightProductionPolicy(process.env) }, null, 2));
+    return 0;
   }
 
   if (command === 'wait') {

@@ -231,7 +231,12 @@ export function assertExecutionSupportedByProvider(execution: ResolvedExecutionC
     execution.sandboxMode !== undefined || execution.approvalPolicy !== undefined;
   const unsupported = (execution.executor === 'claude-code' && codexOnlySettings) ||
     (execution.executor === 'worker-router' && (execution.model !== undefined || codexOnlySettings)) ||
-    (execution.executor === 'luna-isolated' && (execution.model !== 'gpt-5.6-luna' || execution.sandboxMode !== 'workspace-write' || execution.approvalPolicy !== 'never'));
+    // The qualified subscription transport is deliberately a narrow,
+    // unattended lane.  Allowing its exact model settings under a stronger
+    // profile would silently turn a Steward profile change into a different
+    // operational policy.  Those profiles must be explicitly introduced by
+    // a future qualified transport instead.
+    (execution.executor === 'luna-isolated' && (execution.profile !== 'routine' || execution.model !== 'gpt-5.6-luna' || execution.sandboxMode !== 'workspace-write' || execution.approvalPolicy !== 'never'));
   if (unsupported) {
     throw new Error(`Execution profile "${execution.profile}" requests settings unsupported by executor "${execution.executor}".`);
   }

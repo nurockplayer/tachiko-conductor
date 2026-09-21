@@ -424,6 +424,23 @@ separate live Issue/PR/exact-HEAD/merge-state reconciliation. A configured
 validation adapter or hosted policy without a non-empty revision is invalid
 operator configuration: Conductor parks before validation or review executes.
 
+### #104 production policy and held restart
+
+`scripts/issue-104-production-policy.sh` is the checked-in, revisioned
+reboot-safe policy source for the qualified Luna lane. It pins `routine` to
+`luna-isolated` / `gpt-5.6-luna`, an absolute `TACHIKO_LUNA_CODEX_HOME`,
+frozen-lockfile `pnpm` hydration plus test/typecheck/build in the reconstructed
+exact candidate, and the hosted-check policy. Luna rejects `standard`,
+`complex`, and `critical` before provider construction; they are not quiet
+fallback routes.
+
+From a stable merged checkout, set `TACHIKO_NODE_PROGRAM` to its stable
+absolute Node path and run `scripts/issue-104-deploy.sh preflight`. This reads
+only local policy and the qualified Luna config—no GitHub, pnpm install, or
+model turn. `scripts/issue-104-deploy.sh restart` first persists the existing
+maintenance hold, preflights, and then restarts launchd; leave the hold in
+place until an operator explicitly verifies and releases it.
+
 Without explicit configuration, local validation is unknown and the run cannot
 advance to review. The configured runner refuses an ambient directory: it
 re-proves the clean bootstrap-owned worktree's exact HEAD before and after the

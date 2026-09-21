@@ -13,6 +13,7 @@ export * from './adapters/reviewer.js';
 export * from './adapters/validation.js';
 export * from './agents/claude-code.js';
 export * from './execution-profiles.js';
+export * from './production-policy.js';
 export * from './agents/codex-cli.js';
 export * from './agents/luna-isolated.js';
 export * from './agents/codex-app-server.js';
