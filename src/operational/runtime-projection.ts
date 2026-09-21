@@ -45,7 +45,7 @@ export function readOperationalRuntimeProjection(runsDir: string): OperationalRu
 /** Idempotently persist a restart admission fence; no queue or Run state is inferred. */
 export function setMaintenanceHold(runsDir: string, active: boolean, now: string, reason = 'Operator restart hold'): OperationalRuntimeProjectionV1 {
   const prior = readOperationalRuntimeProjection(runsDir);
-  const next: OperationalRuntimeProjectionV1 = { schemaVersion: 1, updatedAt: now, supervisor: active ? 'parked' : (prior?.supervisor ?? 'stopped'), stage: active ? 'maintenance_hold' : (prior?.stage ?? 'idle'), eventWakeEligible: false, maintenanceHold: active ? { active: true, reason } : { active: false }, ownership: prior?.ownership ?? 'ambiguous', checkpoint: prior?.checkpoint ?? 'unknown', ...(prior?.nextPollAt === undefined ? {} : { nextPollAt: prior.nextPollAt }), ...(prior?.activeWriter === undefined ? {} : { activeWriter: prior.activeWriter }) };
+  const next: OperationalRuntimeProjectionV1 = { schemaVersion: 1, updatedAt: now, supervisor: active ? 'parked' : (prior?.supervisor ?? 'stopped'), stage: active ? 'maintenance_hold' : (prior?.stage ?? 'idle'), eventWakeEligible: false, maintenanceHold: active ? { active: true, reason } : { active: false }, ownership: prior?.ownership ?? 'ambiguous', checkpoint: prior?.checkpoint ?? 'unknown', ...(prior?.nextPollAt === undefined ? {} : { nextPollAt: prior.nextPollAt }), ...(prior?.activeWriter === undefined ? {} : { activeWriter: prior.activeWriter }), ...(prior?.manualLane === undefined ? {} : { manualLane: prior.manualLane }) };
   writeOperationalRuntimeProjection(runsDir, next);
   return next;
 }

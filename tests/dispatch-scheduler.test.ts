@@ -8,6 +8,7 @@ import { describe, it } from 'node:test';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
 import { renderDispatchLaunchdPlist } from '../src/dispatch/launchd.js';
 import { main } from '../src/cli.js';
+import { readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
 
 describe('dispatch scheduler boundary', () => {
   it('keeps overlapping same-host invocations out and safely recovers a provably stale lock', () => {
@@ -169,6 +170,54 @@ describe('dispatch scheduler boundary', () => {
       console.log = original;
       if (previous === undefined) delete process.env.TACHIKO_DISPATCH_LOCK_PATH;
       else process.env.TACHIKO_DISPATCH_LOCK_PATH = previous;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps serve parked across held restart/re-entry without configuration, queue, worker, or model admission', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-held-serve-'));
+    const previous = {
+      data: process.env.TACHIKO_DATA_DIR,
+      lock: process.env.TACHIKO_DISPATCH_LOCK_PATH,
+      wake: process.env.TACHIKO_DISPATCH_WAKE_PATH,
+      execution: process.env.TACHIKO_EXECUTION_PROFILE_CONFIG,
+    };
+    const printed: string[] = [];
+    const original = console.log;
+    try {
+      process.env.TACHIKO_DATA_DIR = path.join(directory, 'runs');
+      process.env.TACHIKO_DISPATCH_LOCK_PATH = path.join(directory, 'dispatch.lock');
+      process.env.TACHIKO_DISPATCH_WAKE_PATH = path.join(directory, 'wake');
+      delete process.env.TACHIKO_EXECUTION_PROFILE_CONFIG;
+      writeOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR, {
+        schemaVersion: 1, updatedAt: '2026-09-21T00:00:00.000Z', supervisor: 'parked', stage: 'maintenance_hold',
+        eventWakeEligible: false, maintenanceHold: { active: true, reason: 'operator hold' }, ownership: 'none', checkpoint: 'durable',
+        manualLane: { repository: 'repo', worktree: '/worktree', branch: 'branch', checkpointSha: 'a'.repeat(40), clean: true, state: 'parked', recoverable: true },
+      });
+      console.log = (value?: unknown) => { printed.push(String(value)); };
+      assert.equal(await main(['dispatch', 'once']), 0);
+      assert.match(printed.at(-1) ?? '', /"outcome": "maintenance_hold"/);
+      printed.length = 0;
+      assert.equal(await main(['dispatch', 'serve', '--idle-poll-ms', '1', '--max-cycles', '2']), 0);
+      assert.match(printed.at(-1) ?? '', /"cycles": 2/);
+      assert.match(printed.at(-1) ?? '', /"maintenance_hold"/);
+      const first = readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR);
+      assert.deepEqual({ supervisor: first?.supervisor, stage: first?.stage, ownership: first?.ownership, checkpoint: first?.checkpoint, hold: first?.maintenanceHold.active, lane: first?.manualLane?.checkpointSha }, {
+        supervisor: 'parked', stage: 'maintenance_hold', ownership: 'none', checkpoint: 'durable', hold: true, lane: 'a'.repeat(40),
+      });
+      // A fresh supervised process sees the identical durable held state and
+      // cannot manufacture another writer or claim.
+      assert.equal(await main(['dispatch', 'serve', '--idle-poll-ms', '1', '--max-cycles', '1']), 0);
+      const second = readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR);
+      const { updatedAt: _firstUpdatedAt, ...firstStable } = first!;
+      const { updatedAt: _secondUpdatedAt, ...secondStable } = second!;
+      assert.deepEqual(secondStable, firstStable);
+    } finally {
+      console.log = original;
+      for (const [name, value] of Object.entries(previous)) {
+        const key = name === 'data' ? 'TACHIKO_DATA_DIR' : name === 'lock' ? 'TACHIKO_DISPATCH_LOCK_PATH' : name === 'wake' ? 'TACHIKO_DISPATCH_WAKE_PATH' : 'TACHIKO_EXECUTION_PROFILE_CONFIG';
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
       rmSync(directory, { recursive: true, force: true });
     }
   });

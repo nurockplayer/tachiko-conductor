@@ -12,6 +12,19 @@ const terminal: DispatchOnceResult = {
 };
 
 describe('continuous dispatch driver', () => {
+  it('remains alive and model-free while a typed maintenance hold is returned', async () => {
+    const held: DispatchOnceResult = { outcome: 'maintenance_hold', reason: 'Typed restart hold prevents new dispatch admission.' };
+    const calls: string[] = [];
+    const result = await dispatchContinuously({
+      dispatchOnce: async () => { calls.push('reconcile'); return held; },
+      sleep: async () => { calls.push('wait'); },
+      idlePollMs: 11,
+      maxCycles: 2,
+    });
+    assert.deepEqual(calls, ['reconcile', 'wait', 'reconcile']);
+    assert.equal(result.last?.outcome, 'maintenance_hold');
+  });
+
   it('immediately reconciles after terminal work, then waits model-free when idle', async () => {
     const results: DispatchOnceResult[] = [terminal, { outcome: 'no_eligible_work', reasons: [] }, { outcome: 'no_eligible_work', reasons: [] }];
     const sleeps: number[] = [];

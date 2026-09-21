@@ -1282,7 +1282,11 @@ export async function main(argv: string[]): Promise<number> {
       return 0;
     }
     if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
-      console.log(JSON.stringify(setMaintenanceHold(resolveRunsDir(), rest[0] === 'hold', new Date().toISOString())));
+      const projection = setMaintenanceHold(resolveRunsDir(), rest[0] === 'hold', new Date().toISOString());
+      // A release is an explicit admission change. Wake the already-singleton
+      // driver once; the token coalesces repeats and cannot start a model by itself.
+      const wake = rest[0] === 'release' ? signalDispatchWake(dispatchWakePath()) : undefined;
+      console.log(JSON.stringify({ projection, ...(wake === undefined ? {} : { wake }) }));
       return 0;
     }
     if (subcommand === 'wake' && rest.length === 0) {
@@ -1340,11 +1344,6 @@ export async function main(argv: string[]): Promise<number> {
       throw error;
     }
     try {
-      const config = resolveDispatchConfiguration();
-      if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) {
-        console.log(JSON.stringify({ outcome: 'maintenance_hold', reason: 'Typed restart hold prevents new dispatch admission.' }));
-        return 0;
-      }
       const publishRuntime = (stage: string, supervisor: 'running' | 'stopped' | 'parked', nextPollAt?: string) => writeOperationalRuntimeProjection(resolveRunsDir(), {
         schemaVersion: OPERATIONAL_RUNTIME_PROJECTION_VERSION, updatedAt: new Date().toISOString(), supervisor, stage,
         ...(nextPollAt === undefined ? {} : { nextPollAt }), eventWakeEligible: subcommand === 'serve',
@@ -1357,24 +1356,35 @@ export async function main(argv: string[]): Promise<number> {
           if (run.bootstrap === undefined) return { ownership: 'ambiguous' as const, checkpoint: 'unknown' as const };
           return { ownership: 'active' as const, checkpoint: run.headSha === undefined ? 'in_progress' as const : 'durable' as const, activeWriter: { runId: run.id, ...(run.target.kind === 'issue' ? { issue: run.target.issueNumber } : {}), ...(run.execution === undefined ? {} : { worker: run.execution.executor }), worktree: run.bootstrap.workspacePath } };
         })(),
+        ...(readOperationalRuntimeProjection(resolveRunsDir())?.manualLane === undefined ? {} : { manualLane: readOperationalRuntimeProjection(resolveRunsDir())!.manualLane! }),
       });
       const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
-      publishRuntime('scanning', 'running', subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined);
-      const transport = new GhCliTransport();
-      const runtime = new GitHubDispatchRuntime(transport, config);
-      const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
-      const reconcile = async () => await dispatchOnceCommand(config, {
-        workflow,
-        runtime,
-        resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-        runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority) => await runIssueCommand(workflow, ref, {
-          ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority,
-        }),
-        resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
-      });
+      const nextPollAt = () => subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined;
+      const reconcile = async () => {
+        // This durable typed fence precedes queue reads, configuration, GitHub,
+        // workflow construction, and every model-capable boundary.
+        if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) {
+          publishRuntime('maintenance_hold', 'parked', nextPollAt());
+          return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
+        }
+        publishRuntime('scanning', 'running', nextPollAt());
+        const config = resolveDispatchConfiguration();
+        const transport = new GhCliTransport();
+        const runtime = new GitHubDispatchRuntime(transport, config);
+        const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+        return await dispatchOnceCommand(config, {
+          workflow,
+          runtime,
+          resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
+          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority) => await runIssueCommand(workflow, ref, {
+            ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority,
+          }),
+          resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
+        });
+      };
       if (subcommand === 'once') {
         const result = await reconcile();
-        publishRuntime(result.outcome === 'dispatched' ? result.execution.state.toLowerCase() : 'idle', 'stopped');
+        publishRuntime(result.outcome === 'maintenance_hold' ? 'maintenance_hold' : result.outcome === 'dispatched' ? result.execution.state.toLowerCase() : 'idle', result.outcome === 'maintenance_hold' ? 'parked' : 'stopped');
         printDispatchResult(result);
         return 0;
       }
@@ -1384,7 +1394,7 @@ export async function main(argv: string[]): Promise<number> {
         idlePollMs,
         ...(values['max-cycles'] === undefined ? {} : { maxCycles: Number(values['max-cycles']) }),
       });
-      publishRuntime(result.last?.outcome === 'dispatched' ? result.last.execution.state.toLowerCase() : 'idle', 'stopped');
+      publishRuntime(result.last?.outcome === 'maintenance_hold' ? 'maintenance_hold' : result.last?.outcome === 'dispatched' ? result.last.execution.state.toLowerCase() : 'idle', result.last?.outcome === 'maintenance_hold' ? 'parked' : 'stopped');
       console.log(JSON.stringify(result, null, 2));
       return 0;
     } finally {
