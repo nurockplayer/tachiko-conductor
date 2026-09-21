@@ -55,7 +55,7 @@ describe('#104 production policy', () => {
       env.TACHIKO_LOCAL_VALIDATION_CONFIG = JSON.stringify({ ...PRODUCTION_LOCAL_VALIDATION_CONFIG, trustedIgnoredBaselinePath: '/tmp/worker-state' });
       assert.throws(() => preflightProductionPolicy(env), /frozen-lockfile exact-candidate policy/);
       const profiles = structuredClone(PRODUCTION_EXECUTION_PROFILE_CONFIG) as { profiles: Record<string, { executor: string }> };
-      profiles.profiles.standard.executor = 'codex-cli';
+      profiles.profiles.standard!.executor = 'codex-cli';
       assert.throws(() => preflightProductionPolicy({ ...environment(path.join(root, 'luna')), TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify(profiles) }), /execution profile configuration/);
     } finally {
       rmSync(root, { recursive: true, force: true });
