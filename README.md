@@ -206,6 +206,10 @@ execution, or provider credentials and is not a calendar wake:
 pnpm exec tsx src/cli.ts dispatch launchd render \
   --program '/absolute/path/to/run-dispatch-driver.sh' \
   --node-program '/stable/absolute/path/to/node' \
+  --pnpm-program '/stable/absolute/path/to/pnpm' \
+  --dependency-artifact-path '/absolute/path/to/lockfile-bound-pnpm-artifact' \
+  --luna-codex-home '/absolute/path/to/luna-codex-home' \
+  --playwright-browsers-path '/absolute/path/to/playwright-artifacts' \
   --working-directory "$PWD" \
   > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"

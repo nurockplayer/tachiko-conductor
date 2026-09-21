@@ -23,6 +23,8 @@ const SETTLEMENT_POLL_MS = 25;
 // large trusted dependency baseline. Keep this bounded, but well above the
 // small default intended for compact command output.
 const GIT_STATUS_MAX_BUFFER = 8 * 1024 * 1024;
+const TOOL_VERSION_TIMEOUT_MS = 5_000;
+const REQUIRED_PNPM_PACKAGE_MANAGER = 'pnpm@10.34.5';
 /** A validation command must be long enough to make termination observable, but never unattended indefinitely. */
 export const MIN_LOCAL_VALIDATION_TIMEOUT_MS = 100;
 export const MAX_LOCAL_VALIDATION_TIMEOUT_MS = 60 * 60_000;
@@ -95,7 +97,10 @@ function workspaceMatches(
   trustedIgnoredBaselinePath?: string,
 ): string[] | null {
   if (workspacePath.trim() === '') return null;
-  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, ...args], {
+  // This verification reads candidate Git metadata.  A candidate-controlled
+  // core.fsmonitor program must never gain execution authority merely because
+  // the host is proving the candidate clean.
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], {
     encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
@@ -113,7 +118,7 @@ function workspaceMatches(
       workerPath = realpathSync(workspacePath);
     } catch { return null; }
     if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return null;
-    const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', baselinePath, ...args], {
+    const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', baselinePath, '-c', 'core.fsmonitor=false', ...args], {
       encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
     }) as SpawnSyncReturns<string>;
     const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
@@ -135,7 +140,10 @@ function workspaceMatches(
 /** The reconstructed checkout has no remote by design.  Bind command evidence
  * to its immutable exact commit and reject any tracked/index mutation. */
 function commandWorkspaceManifest(workspacePath: string, headSha: string): string[] | null {
-  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, ...args], {
+  // The reconstructed checkout contains candidate history.  Every trusted
+  // host-side probe pins fsmonitor off so a copied or otherwise planted local
+  // config cannot execute while evidence is being verified.
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], {
     encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
@@ -497,6 +505,25 @@ function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrow
   return environment;
 }
 
+/**
+ * The configured pnpm path is host-provisioned, but its authority still comes
+ * from the immutable candidate package manifest.  Prove both sides before any
+ * candidate validation command can run; a missing, altered, or unverifiable
+ * version has no fallback to PATH or an ambient package-manager selection.
+ */
+export function hasPinnedPnpmAuthority(workspacePath: string, pnpmProgram: string, environment: NodeJS.ProcessEnv): boolean {
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(workspacePath, 'package.json'), 'utf8')) as { packageManager?: unknown };
+    if (manifest === null || typeof manifest !== 'object' || manifest.packageManager !== REQUIRED_PNPM_PACKAGE_MANAGER) return false;
+    const version = spawnSync(pnpmProgram, ['--version'], {
+      encoding: 'utf8', shell: false, cwd: path.dirname(workspacePath), env: environment, timeout: TOOL_VERSION_TIMEOUT_MS,
+    });
+    return version.status === 0 && version.signal === null && version.stdout.trim() === REQUIRED_PNPM_PACKAGE_MANAGER.slice('pnpm@'.length);
+  } catch {
+    return false;
+  }
+}
+
 function validHostBrowserArtifacts(directory: string | undefined): directory is string {
   if (directory === undefined || !path.isAbsolute(directory)) return directory === undefined;
   try {
@@ -564,12 +591,17 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram) ?? undefined
       : undefined;
     try {
-      // The production lane is meaningful only with a real macOS kernel
-      // boundary. Do not silently degrade to environment scrubbing.
-      if (configuredToolchain && (sandboxProfile === null || sandboxProfile === undefined)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      // A production plan has one host-provisioned pnpm authority.  Reject a
+      // substituted executable before probing a tool or starting validation.
       if (this.configuration.pnpmProgram !== undefined && configured.some((command) => !isCommand(command) || command.argv[0] !== this.configuration.pnpmProgram)) {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
       }
+      if (this.configuration.pnpmProgram !== undefined && !hasPinnedPnpmAuthority(commandWorkspace.path, this.configuration.pnpmProgram, environment)) {
+        return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      }
+      // The production lane is meaningful only with a real macOS kernel
+      // boundary. Do not silently degrade to environment scrubbing.
+      if (configuredToolchain && (sandboxProfile === null || sandboxProfile === undefined)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       // A nonempty ignored manifest is executable only when the separate
       // trusted baseline just proved those exact bytes.  The worker workspace
       // itself never grants this authority, and later checks pin this same
