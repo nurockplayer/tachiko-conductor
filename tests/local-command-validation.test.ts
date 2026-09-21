@@ -84,7 +84,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(wrongHead.status, 'unknown');
   });
 
-  it('uses the configured validation budget to reconstruct an exact-HEAD workspace', async () => {
+  it('uses a dedicated reconstruction budget rather than a short validation-command timeout', async () => {
     const owned = request();
     const wrapperDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-slow-git-'));
     dirs.push(wrapperDir);
@@ -97,7 +97,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
     try {
       const result = await new ConfiguredLocalValidationAdapter(
-        configuration([process.execPath, '-e', 'process.exit(0)'], 1_500),
+        configuration([process.execPath, '-e', 'process.exit(0)'], 100),
       ).validate(owned);
       assert.equal(result.status, 'passed');
     } finally {
@@ -114,6 +114,29 @@ describe('ConfiguredLocalValidationAdapter', () => {
     writeFileSync(
       path.join(owned.workspacePath, 'validate.js'),
       `const fs = require('node:fs');\ntry { fs.readFileSync('.git/validation-helper.js'); fs.writeFileSync(${JSON.stringify(marker)}, 'ran'); } catch { process.exit(71); }\n`,
+    );
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'validate.js'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'tracked validation script'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    writeFileSync(path.join(owned.workspacePath, '.git', 'validation-helper.js'), 'module.exports = true\n');
+
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, 'validate.js']),
+    ).validate({ ...owned, headSha });
+
+    assert.equal(result.status, 'failed');
+    assert.equal(result.commands[0]?.exitCode, 71);
+    assert.equal(existsSync(marker), false);
+  });
+
+  it('disconnects a reconstructed validator from worker-controlled Git metadata', async () => {
+    const owned = request();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'validation-ran');
+    writeFileSync(
+      path.join(owned.workspacePath, 'validate.js'),
+      `const { execFileSync } = require('node:child_process'); const fs = require('node:fs'); try { const origin = execFileSync('git', ['remote', 'get-url', 'origin'], { encoding: 'utf8' }).trim(); fs.readFileSync(origin + '/.git/validation-helper.js'); fs.writeFileSync(${JSON.stringify(marker)}, 'ran'); } catch { process.exit(71); }\n`,
     );
     assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'validate.js'], { encoding: 'utf8' }).status, 0);
     assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'tracked validation script'], { encoding: 'utf8' }).status, 0);

@@ -12,6 +12,11 @@ function malformed(commandIndex: number, executable = ''): LocalValidationComman
 }
 
 const TERMINATION_GRACE_MS = 1_000;
+// Snapshot materialization is part of the validation authority boundary, not
+// the validation command itself. Keep it independently bounded so a valid
+// short command budget cannot make ordinary repository reconstruction
+// impossible.
+const RECONSTRUCTION_TIMEOUT_MS = 30_000;
 const SETTLEMENT_POLL_MS = 25;
 // `git status --ignored --untracked-files=all` can legitimately enumerate a
 // large trusted dependency baseline. Keep this bounded, but well above the
@@ -136,17 +141,23 @@ interface ValidationWorkspace {
  * newly-created Git directory containing only host-created clone metadata and
  * the cryptographically addressed exact commit.
  */
-function reconstructedWorkspace(sourcePath: string, headSha: string, timeoutMs: number): ValidationWorkspace | null {
+function reconstructedWorkspace(sourcePath: string, headSha: string): ValidationWorkspace | null {
   const snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-'));
   const invoke = (args: readonly string[]) => spawnSync('git', args, {
-    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
   });
   try {
     const cloned = invoke(['clone', '--no-local', '--no-checkout', sourcePath, snapshot]);
-    const checkedOut = cloned.status === 0
+    // `clone` records the source path as origin. That path is worker-owned for
+    // isolated executions, so discard it before a validator can discover and
+    // read worker-controlled `.git` state through the reconstructed checkout.
+    const disconnected = cloned.status === 0
+      ? invoke(['-C', snapshot, 'remote', 'remove', 'origin'])
+      : undefined;
+    const checkedOut = disconnected?.status === 0
       ? invoke(['-C', snapshot, 'checkout', '--detach', '--force', headSha])
       : undefined;
-    if (checkedOut?.status !== 0) {
+    if (cloned.status !== 0 || disconnected?.status !== 0 || checkedOut?.status !== 0) {
       rmSync(snapshot, { recursive: true, force: true });
       return null;
     }
@@ -304,10 +315,6 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
     const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
-    const reconstructionTimeoutMs = configured.reduce(
-      (maximum, command) => isCommand(command) ? Math.max(maximum, command.timeoutMs) : maximum,
-      TERMINATION_GRACE_MS,
-    );
     if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
@@ -317,7 +324,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     // input so worker-controlled .git bytes have no validation authority.
     const baseline = this.configuration.trustedIgnoredBaselinePath;
     const commandWorkspace = baseline === undefined
-      ? reconstructedWorkspace(workspacePath, request.headSha, reconstructionTimeoutMs)
+      ? reconstructedWorkspace(workspacePath, request.headSha)
       : { path: baseline, dispose: () => {} };
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
