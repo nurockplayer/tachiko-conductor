@@ -17,6 +17,7 @@ const TERMINATION_GRACE_MS = 1_000;
 // short command budget cannot make ordinary repository reconstruction
 // impossible.
 const RECONSTRUCTION_TIMEOUT_MS = 30_000;
+const IGNORED_MANIFEST_TIMEOUT_MS = 30_000;
 const SETTLEMENT_POLL_MS = 25;
 // `git status --ignored --untracked-files=all` can legitimately enumerate a
 // large trusted dependency baseline. Keep this bounded, but well above the
@@ -46,10 +47,10 @@ function remoteMatchesTarget(remote: string, request: ValidationRequest): boolea
     repo?.replace(/\.git$/i, '').toLowerCase() === request.target.repo.toLowerCase();
 }
 
-type GitInvoke = (args: readonly string[]) => SpawnSyncReturns<string>;
+type GitInvoke = (args: readonly string[], timeoutMs?: number) => SpawnSyncReturns<string>;
 
 function ignoredManifest(workspacePath: string, invoke: GitInvoke): string[] | null {
-  const status = invoke(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored']);
+  const status = invoke(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored'], IGNORED_MANIFEST_TIMEOUT_MS);
   if (status.status !== 0) return null;
   const ignored = status.stdout.split('\0').filter((entry) => entry.startsWith('!! ')).map((entry) => entry.slice(3));
   const visible = status.stdout.split('\0').filter((entry) => entry !== '' && !entry.startsWith('!! '));
@@ -78,6 +79,15 @@ function ignoredManifest(workspacePath: string, invoke: GitInvoke): string[] | n
   return entries.some((entry) => entry === null) ? null : entries.filter((entry): entry is string => entry !== null).sort();
 }
 
+function hasHiddenIndexFlags(invoke: GitInvoke): boolean | null {
+  const entries = invoke(['ls-files', '-v', '-z']);
+  if (entries.status !== 0) return null;
+  // `git ls-files -v` uses lowercase tags for assume-unchanged entries and
+  // `S` for skip-worktree entries.  Both can conceal tracked-byte changes
+  // from status, so neither is admissible evidence of a clean workspace.
+  return entries.stdout.split('\0').some((entry) => /^[a-zS] /.test(entry));
+}
+
 function workspaceMatches(
   request: ValidationRequest,
   workspacePath: string,
@@ -85,12 +95,13 @@ function workspaceMatches(
   trustedIgnoredBaselinePath?: string,
 ): boolean {
   if (workspacePath.trim() === '') return false;
-  const invoke: GitInvoke = (args) => spawnSync('git', ['-C', workspacePath, ...args], {
-    encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, ...args], {
+    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
   const manifest = ignoredManifest(workspacePath, invoke);
-  if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null) return false;
+  const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
+  if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null || hiddenIndexFlags !== false) return false;
   if (trustedIgnoredBaselinePath !== undefined) {
     // A configured baseline becomes the command cwd, even when both ignored
     // manifests are empty.  Prove it is a separate, clean checkout of this
@@ -102,13 +113,14 @@ function workspaceMatches(
       workerPath = realpathSync(workspacePath);
     } catch { return false; }
     if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return false;
-    const baselineInvoke: GitInvoke = (args) => spawnSync('git', ['-C', baselinePath, ...args], {
-      encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', baselinePath, ...args], {
+      encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
     }) as SpawnSyncReturns<string>;
     const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
     const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
+    const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
     if (baselineHead.status !== 0 || baselineHead.stdout.trim() !== request.headSha || baselineManifest === null ||
-      baselineManifest.join('\n') !== manifest.join('\n')) return false;
+      baselineManifest.join('\n') !== manifest.join('\n') || baselineHiddenIndexFlags !== false) return false;
     if (requireRepositoryIdentity) {
       const baselineRemote = baselineInvoke(['remote', 'get-url', 'origin']);
       if (baselineRemote.status !== 0 || !remoteMatchesTarget(baselineRemote.stdout, request)) return false;
@@ -139,6 +151,44 @@ function containsGitlinks(workspacePath: string, invoke: (args: readonly string[
   return entries.stdout.split('\0').some((entry) => entry.startsWith('160000 '));
 }
 
+function declaresFilterAttribute(contents: string): boolean {
+  return contents.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    return trimmed !== '' && !trimmed.startsWith('#') && /(?:^|\s)[!-]?filter(?:=|\s|$)/.test(trimmed);
+  });
+}
+
+function hasTrackedFilterAttributes(
+  workspacePath: string,
+  headSha: string,
+  invoke: (args: readonly string[]) => SpawnSyncReturns<string>,
+): boolean | null {
+  const entries = invoke(['-C', workspacePath, 'ls-tree', '-r', '-z', headSha]);
+  if (entries.status !== 0) return null;
+  for (const entry of entries.stdout.split('\0')) {
+    const separator = entry.indexOf('\t');
+    if (separator === -1 || path.posix.basename(entry.slice(separator + 1)) !== '.gitattributes') continue;
+    const [mode, type, objectId] = entry.slice(0, separator).split(' ');
+    if (mode === undefined || type !== 'blob' || objectId === undefined || !/^[0-9a-f]{40,64}$/i.test(objectId)) return null;
+    const contents = invoke(['-C', workspacePath, 'cat-file', 'blob', objectId]);
+    if (contents.status !== 0) return null;
+    if (declaresFilterAttribute(contents.stdout)) return true;
+  }
+  return false;
+}
+
+function reconstructionEnvironment(): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith('GIT_CONFIG_') || key === 'GIT_DIR' || key === 'GIT_WORK_TREE' || key === 'GIT_INDEX_FILE' || key === 'GIT_ALTERNATE_OBJECT_DIRECTORIES') {
+      delete environment[key];
+    }
+  }
+  environment.GIT_CONFIG_NOSYSTEM = '1';
+  environment.GIT_CONFIG_GLOBAL = os.devNull;
+  return environment;
+}
+
 /**
  * Materialize command input outside the worker checkout.  In particular, a
  * clean exact HEAD does not authorize files under that checkout's .git
@@ -149,8 +199,14 @@ function containsGitlinks(workspacePath: string, invoke: (args: readonly string[
  */
 function reconstructedWorkspace(sourcePath: string, headSha: string): ValidationWorkspace | null {
   const snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-'));
-  const invoke = (args: readonly string[]) => spawnSync('git', args, {
+  const invoke = (args: readonly string[]) => spawnSync('git', [
+    '-c', `core.hooksPath=${os.devNull}`,
+    '-c', 'core.fsmonitor=false',
+    '-c', `core.attributesFile=${os.devNull}`,
+    ...args,
+  ], {
     encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    env: reconstructionEnvironment(),
   });
   try {
     const cloned = invoke(['clone', '--no-local', '--no-checkout', sourcePath, snapshot]);
@@ -160,14 +216,21 @@ function reconstructedWorkspace(sourcePath: string, headSha: string): Validation
     const disconnected = cloned.status === 0
       ? invoke(['-C', snapshot, 'remote', 'remove', 'origin'])
       : undefined;
-    const checkedOut = disconnected?.status === 0
+    // A tracked attributes file is part of the candidate tree.  Inspect it
+    // through immutable blobs before checkout: otherwise an ambient filter
+    // configuration could execute a smudge command while materializing the
+    // validation snapshot.
+    const trackedFilters = disconnected?.status === 0
+      ? hasTrackedFilterAttributes(snapshot, headSha, invoke)
+      : null;
+    const checkedOut = trackedFilters === false
       ? invoke(['-C', snapshot, 'checkout', '--detach', '--force', headSha])
       : undefined;
     // A plain detached checkout deliberately does not populate gitlinks. Do
     // not misreport an incomplete tree as a validator failure; submodule
     // provenance needs its own host-qualified reconstruction boundary.
     const gitlinks = checkedOut?.status === 0 ? containsGitlinks(snapshot, invoke) : null;
-    if (cloned.status !== 0 || disconnected?.status !== 0 || checkedOut?.status !== 0 || gitlinks !== false) {
+    if (cloned.status !== 0 || disconnected?.status !== 0 || trackedFilters !== false || checkedOut?.status !== 0 || gitlinks !== false) {
       rmSync(snapshot, { recursive: true, force: true });
       return null;
     }
