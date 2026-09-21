@@ -17,7 +17,7 @@ const TASK_KINDS = Object.freeze([
 ]);
 const TASK_SHAPES = Object.freeze(['bounded', 'interacting', 'decision']);
 const WRITER_KINDS = new Set(['implementation', 'repair']);
-const TRUSTED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+const TRUSTED_ASSOCIATIONS = new Set(['OWNER', 'MEMBER']);
 
 const LABEL_DEFINITIONS = Object.freeze({
   'kind:implementation': { color: '1f6feb', description: 'Repository implementation work.' },
