@@ -93,15 +93,15 @@ function workspaceMatches(
   workspacePath: string,
   requireRepositoryIdentity: boolean,
   trustedIgnoredBaselinePath?: string,
-): boolean {
-  if (workspacePath.trim() === '') return false;
+): string[] | null {
+  if (workspacePath.trim() === '') return null;
   const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, ...args], {
     encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
   const manifest = ignoredManifest(workspacePath, invoke);
   const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
-  if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null || hiddenIndexFlags !== false) return false;
+  if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null || hiddenIndexFlags !== false) return null;
   if (trustedIgnoredBaselinePath !== undefined) {
     // A configured baseline becomes the command cwd, even when both ignored
     // manifests are empty.  Prove it is a separate, clean checkout of this
@@ -111,8 +111,8 @@ function workspaceMatches(
     try {
       baselinePath = realpathSync(trustedIgnoredBaselinePath);
       workerPath = realpathSync(workspacePath);
-    } catch { return false; }
-    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return false;
+    } catch { return null; }
+    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return null;
     const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', baselinePath, ...args], {
       encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
     }) as SpawnSyncReturns<string>;
@@ -120,16 +120,16 @@ function workspaceMatches(
     const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
     const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
     if (baselineHead.status !== 0 || baselineHead.stdout.trim() !== request.headSha || baselineManifest === null ||
-      baselineManifest.join('\n') !== manifest.join('\n') || baselineHiddenIndexFlags !== false) return false;
+      baselineManifest.join('\n') !== manifest.join('\n') || baselineHiddenIndexFlags !== false) return null;
   } else if (manifest.length > 0) {
     // Never globally ignore ignored paths. They are admissible only when a
     // separate host-owned clean checkout at this exact HEAD proves identical
     // bytes existed before the worker could have written its workspace.
-    return false;
+    return null;
   }
-  if (!requireRepositoryIdentity) return true;
+  if (!requireRepositoryIdentity) return manifest;
   const remote = invoke(['remote', 'get-url', 'origin']);
-  return remote.status === 0 && remoteMatchesTarget(remote.stdout, request);
+  return remote.status === 0 && remoteMatchesTarget(remote.stdout, request) ? manifest : null;
 }
 
 /** The reconstructed checkout has no remote by design.  Bind command evidence
@@ -153,6 +153,12 @@ function commandWorkspaceMatches(workspacePath: string, headSha: string, expecte
 function lockfileBoundDependencyArtifact(workspacePath: string, artifactPath: string | undefined): string | null {
   if (artifactPath === undefined || !path.isAbsolute(artifactPath)) return null;
   try {
+    // Keep the configured spelling for the child environment.  On macOS,
+    // `/tmp` resolves to `/private/tmp`; both name the same host-owned store,
+    // but a real pnpm invocation (and its configuration) must receive the
+    // configured store path rather than a rewritten one.  Validate through
+    // the canonical path below so this does not admit a symlinked artifact.
+    const configuredArtifact = path.resolve(artifactPath);
     const artifact = realpathSync(artifactPath);
     const stat = lstatSync(artifact);
     const store = path.join(artifact, 'store');
@@ -162,12 +168,16 @@ function lockfileBoundDependencyArtifact(workspacePath: string, artifactPath: st
       !lstatSync(metadata).isFile() || lstatSync(metadata).isSymbolicLink() || (lstatSync(metadata).mode & 0o022) !== 0) return null;
     const expected = readFileSync(metadata, 'utf8').trim();
     const actual = createHash('sha256').update(readFileSync(path.join(workspacePath, 'pnpm-lock.yaml'))).digest('hex');
-    return /^[a-f0-9]{64}$/i.test(expected) && expected === actual ? store : null;
+    return /^[a-f0-9]{64}$/i.test(expected) && expected === actual ? path.join(configuredArtifact, 'store') : null;
   } catch { return null; }
 }
 
 function isHydratedDependencyManifest(manifest: readonly string[]): boolean {
-  return manifest.length === 1 && /^directory node_modules\/?\s/.test(manifest[0]!);
+  // `git status --ignored --untracked-files=all` may report either the
+  // ignored directory itself or its individual contents.  Admit only a
+  // nonempty manifest wholly rooted in node_modules, then freeze those exact
+  // fingerprints for every subsequent command and final settlement.
+  return manifest.length > 0 && manifest.every((entry) => /^(?:file|link|directory) node_modules(?:\/|\s)/.test(entry));
 }
 
 function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvidence {
@@ -523,9 +533,11 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     // clean state, hidden-index state, and ignored manifest are instead bound
     // to the detached command reconstruction at creation and final settlement.
     const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
-    if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
+    if (workspacePath === undefined) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
+    const admittedIgnoredManifest = workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath);
+    if (admittedIgnoredManifest === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     // A configured baseline is host-owned and already proved byte-identical
     // for every ignored dependency.  It is therefore the only place those
     // dependencies may be executed.  Otherwise reconstruct fresh command
@@ -558,8 +570,13 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       if (this.configuration.pnpmProgram !== undefined && configured.some((command) => !isCommand(command) || command.argv[0] !== this.configuration.pnpmProgram)) {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
       }
-      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
-      let hydratedManifest: readonly string[] = [];
+      // A nonempty ignored manifest is executable only when the separate
+      // trusted baseline just proved those exact bytes.  The worker workspace
+      // itself never grants this authority, and later checks pin this same
+      // manifest (or the separately captured cold-hydration manifest).
+      const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      let hydratedManifest: readonly string[] = initialIgnoredManifest;
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
         if (!isCommand(command)) {
@@ -585,7 +602,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
+      if (workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath) === null) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }

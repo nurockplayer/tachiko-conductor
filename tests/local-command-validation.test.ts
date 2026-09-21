@@ -379,7 +379,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     dirs.push(proofDir);
     const marker = path.join(proofDir, 'validation-ran');
     const adapter = new ConfiguredLocalValidationAdapter({
-      ...configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+      ...configuration(['/bin/sh', '-c', `: > ${JSON.stringify(marker)}`]),
       trustedIgnoredBaselinePath: baseline,
     });
     assert.equal((await adapter.validate({ ...owned, headSha })).status, 'passed');
@@ -464,7 +464,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
       }
     }
     const adapter = new ConfiguredLocalValidationAdapter({
-      ...configuration([process.execPath, '-e', 'process.exit(0)']), trustedIgnoredBaselinePath: baseline,
+      ...configuration(['/bin/sh', '-c', ':']), trustedIgnoredBaselinePath: baseline,
     });
     assert.equal((await adapter.validate({ ...owned, headSha })).status, 'passed');
   });
