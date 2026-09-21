@@ -114,6 +114,8 @@ struct RestartView { verdict: String, reason: String }
 struct AutopilotView {
   supervisor: String,
   current_stage: String,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  next_poll_at: Option<String>,
   event_wake_eligible: String,
   restart: RestartView,
 }
@@ -565,6 +567,25 @@ fn load_runs(commands: &dyn CommandBoundary) -> Vec<RunObservation> {
   runs
 }
 
+fn runtime_autopilot() -> AutopilotView {
+  let unknown = || AutopilotView { supervisor: "unknown".to_owned(), current_stage: "unknown".to_owned(), next_poll_at: None, event_wake_eligible: "unknown".to_owned(), restart: RestartView { verdict: "UNKNOWN — CANNOT PROVE SAFE".to_owned(), reason: "No typed supervisor, mutation-owner, and durable checkpoint projection is available.".to_owned() } };
+  let Some(directory) = run_directory() else { return unknown(); };
+  let Ok(raw) = fs::read_to_string(directory.join(".operational/v1/runtime.json")) else { return unknown(); };
+  let Ok(value) = serde_json::from_str::<Value>(&raw) else { return unknown(); };
+  let supervisor = string_at(&value, &["supervisor"]);
+  let stage = string_at(&value, &["stage"]);
+  let version = value.get("schemaVersion").and_then(Value::as_u64);
+  let hold = value.get("maintenanceHold").and_then(|hold| hold.get("active")).and_then(Value::as_bool);
+  let wake = value.get("eventWakeEligible").and_then(Value::as_bool);
+  if version != Some(1) || !matches!(supervisor.as_deref(), Some("running" | "stopped" | "parked")) || stage.as_deref().is_none_or(str::is_empty) || hold.is_none() || wake.is_none() { return unknown(); }
+  let held = hold == Some(true);
+  AutopilotView {
+    supervisor: supervisor.unwrap(), current_stage: stage.unwrap(), next_poll_at: string_at(&value, &["nextPollAt"]),
+    event_wake_eligible: if wake == Some(true) { "yes".to_owned() } else { "no".to_owned() },
+    restart: if held { RestartView { verdict: "SAFE TO RESTART".to_owned(), reason: "Typed maintenance hold is active; new dispatch admission is blocked.".to_owned() } } else { RestartView { verdict: "SAFE NOW · WINDOW NOT GUARANTEED".to_owned(), reason: "No active writer is published, but event-driven wake may start work before the scheduled poll.".to_owned() } },
+  }
+}
+
 fn git_text(commands: &dyn CommandBoundary, path: &str, args: &[&str]) -> Option<String> {
   let mut git_args = vec!["-C", path];
   git_args.extend_from_slice(args);
@@ -930,15 +951,7 @@ fn collect_snapshot_for_roots_with_workspace_data_path(
     // Runtime/supervisor/checkpoint state is intentionally unknown until a
     // typed producer supplies it. No log text, GUI helper, or dirty worktree
     // can manufacture writer or restart-safety evidence.
-    autopilot: AutopilotView {
-      supervisor: "unknown".to_owned(),
-      current_stage: "unknown".to_owned(),
-      event_wake_eligible: "unknown".to_owned(),
-      restart: RestartView {
-        verdict: "UNKNOWN — CANNOT PROVE SAFE".to_owned(),
-        reason: "No typed supervisor, mutation-owner, and durable checkpoint projection is available.".to_owned(),
-      },
-    },
+    autopilot: runtime_autopilot(),
     source_note: "Live observations use bounded Git, durable Conductor-run, process, disk and GitHub reads. Unlinked or unproven correlations remain unknown.".to_owned(),
   })
 }
@@ -1551,7 +1564,7 @@ mod tests {
         data_free_bytes: Some(1_500_000_000),
       },
       autopilot: AutopilotView {
-        supervisor: "unknown".to_owned(), current_stage: "unknown".to_owned(), event_wake_eligible: "unknown".to_owned(),
+        supervisor: "unknown".to_owned(), current_stage: "unknown".to_owned(), next_poll_at: None, event_wake_eligible: "unknown".to_owned(),
         restart: RestartView { verdict: "UNKNOWN — CANNOT PROVE SAFE".to_owned(), reason: "test".to_owned() },
       },
       source_note: "test".to_owned(),

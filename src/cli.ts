@@ -95,6 +95,7 @@ import {
 } from './workflow/wait-command.js';
 import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
 import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
+import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, readOperationalRuntimeProjection, setMaintenanceHold, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -1271,6 +1272,10 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
+    if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
+      console.log(JSON.stringify(setMaintenanceHold(resolveRunsDir(), rest[0] === 'hold', new Date().toISOString())));
+      return 0;
+    }
     if (subcommand === 'wake' && rest.length === 0) {
       console.log(JSON.stringify({ outcome: 'wake_signaled', token: signalDispatchWake(dispatchWakePath()) }));
       return 0;
@@ -1327,6 +1332,17 @@ export async function main(argv: string[]): Promise<number> {
     }
     try {
       const config = resolveDispatchConfiguration();
+      if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) {
+        console.log(JSON.stringify({ outcome: 'maintenance_hold', reason: 'Typed restart hold prevents new dispatch admission.' }));
+        return 0;
+      }
+      const publishRuntime = (stage: string, supervisor: 'running' | 'stopped' | 'parked', nextPollAt?: string) => writeOperationalRuntimeProjection(resolveRunsDir(), {
+        schemaVersion: OPERATIONAL_RUNTIME_PROJECTION_VERSION, updatedAt: new Date().toISOString(), supervisor, stage,
+        ...(nextPollAt === undefined ? {} : { nextPollAt }), eventWakeEligible: subcommand === 'serve',
+        maintenanceHold: readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold ?? { active: false },
+      });
+      const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
+      publishRuntime('scanning', 'running', subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined);
       const transport = new GhCliTransport();
       const runtime = new GitHubDispatchRuntime(transport, config);
       const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
@@ -1340,15 +1356,18 @@ export async function main(argv: string[]): Promise<number> {
         resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
       });
       if (subcommand === 'once') {
-        printDispatchResult(await reconcile());
+        const result = await reconcile();
+        publishRuntime(result.outcome === 'dispatched' ? result.execution.state.toLowerCase() : 'idle', 'stopped');
+        printDispatchResult(result);
         return 0;
       }
       const result = await dispatchContinuously({
         dispatchOnce: reconcile,
         sleep: createDispatchWakeWaiter(dispatchWakePath()),
-        idlePollMs: values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']),
+        idlePollMs,
         ...(values['max-cycles'] === undefined ? {} : { maxCycles: Number(values['max-cycles']) }),
       });
+      publishRuntime(result.last?.outcome === 'dispatched' ? result.last.execution.state.toLowerCase() : 'idle', 'stopped');
       console.log(JSON.stringify(result, null, 2));
       return 0;
     } finally {
