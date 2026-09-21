@@ -193,6 +193,35 @@ function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
   return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(os.homedir(), '.tachiko-conductor', 'dispatch', 'once.lock');
 }
 
+/**
+ * A short, independent fence for admission-state transitions.  The long-lived
+ * serve lock deliberately cannot be used here: an operator must be able to
+ * place a hold while that singleton is asleep.  Instead, reconcile holds this
+ * fence only while it can read the queue, claim work, or cross a provider
+ * boundary; hold/release serializes with that interval.
+ */
+function dispatchAdmissionLockPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH ?? `${dispatchLockPath(env)}.admission`;
+}
+
+async function withDispatchAdmissionLock<T>(operation: () => Promise<T> | T): Promise<T> {
+  for (;;) {
+    try {
+      const lock = acquireDispatchInvocationLock({ lockPath: dispatchAdmissionLockPath() });
+      try {
+        return await operation();
+      } finally {
+        lock.release();
+      }
+    } catch (error) {
+      if (!(error instanceof DispatchInvocationLockedError)) throw error;
+      // A transition waits for a current reconciliation boundary rather than
+      // racing its projection write or allowing a second admission.
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
+}
+
 /** Provider selection is external to adapters; the stateless local router is the default path. */
 export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
   const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? WORKER_ROUTER_PROVIDER;
@@ -1282,10 +1311,15 @@ export async function main(argv: string[]): Promise<number> {
       return 0;
     }
     if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
-      const projection = setMaintenanceHold(resolveRunsDir(), rest[0] === 'hold', new Date().toISOString());
-      // A release is an explicit admission change. Wake the already-singleton
-      // driver once; the token coalesces repeats and cannot start a model by itself.
-      const wake = rest[0] === 'release' ? signalDispatchWake(dispatchWakePath()) : undefined;
+      const desired = rest[0] === 'hold';
+      const { projection, wake } = await withDispatchAdmissionLock(() => {
+        const wasHeld = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
+        const projection = setMaintenanceHold(resolveRunsDir(), desired, new Date().toISOString());
+        // A meaningful release wakes the already-singleton driver exactly once.
+        // Repeating an already released command is deliberately a no-op at the
+        // wake boundary; it cannot manufacture another reconciliation.
+        return { projection, wake: !desired && wasHeld ? signalDispatchWake(dispatchWakePath()) : undefined };
+      });
       console.log(JSON.stringify({ projection, ...(wake === undefined ? {} : { wake }) }));
       return 0;
     }
@@ -1360,9 +1394,11 @@ export async function main(argv: string[]): Promise<number> {
       });
       const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
       const nextPollAt = () => subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined;
-      const reconcile = async () => {
+      const reconcile = async () => await withDispatchAdmissionLock(async () => {
         // This durable typed fence precedes queue reads, configuration, GitHub,
-        // workflow construction, and every model-capable boundary.
+        // workflow construction, and every model-capable boundary. The same
+        // admission lock serializes an operator hold/release with this entire
+        // interval, so a transition cannot be overwritten mid-reconcile.
         if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) {
           publishRuntime('maintenance_hold', 'parked', nextPollAt());
           return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
@@ -1381,10 +1417,14 @@ export async function main(argv: string[]): Promise<number> {
           }),
           resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
         });
-      };
+      });
+      const publishSettledRuntime = async (result: Awaited<ReturnType<typeof reconcile>>) => await withDispatchAdmissionLock(() => {
+        const held = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
+        publishRuntime(held || result.outcome === 'maintenance_hold' ? 'maintenance_hold' : result.outcome === 'dispatched' ? result.execution.state.toLowerCase() : 'idle', held || result.outcome === 'maintenance_hold' ? 'parked' : 'stopped');
+      });
       if (subcommand === 'once') {
         const result = await reconcile();
-        publishRuntime(result.outcome === 'maintenance_hold' ? 'maintenance_hold' : result.outcome === 'dispatched' ? result.execution.state.toLowerCase() : 'idle', result.outcome === 'maintenance_hold' ? 'parked' : 'stopped');
+        await publishSettledRuntime(result);
         printDispatchResult(result);
         return 0;
       }
@@ -1394,7 +1434,7 @@ export async function main(argv: string[]): Promise<number> {
         idlePollMs,
         ...(values['max-cycles'] === undefined ? {} : { maxCycles: Number(values['max-cycles']) }),
       });
-      publishRuntime(result.last?.outcome === 'maintenance_hold' ? 'maintenance_hold' : result.last?.outcome === 'dispatched' ? result.last.execution.state.toLowerCase() : 'idle', result.last?.outcome === 'maintenance_hold' ? 'parked' : 'stopped');
+      if (result.last !== null) await publishSettledRuntime(result.last);
       console.log(JSON.stringify(result, null, 2));
       return 0;
     } finally {

@@ -232,4 +232,56 @@ describe('dispatch scheduler boundary', () => {
       rmSync(directory, { recursive: true, force: true });
     }
   });
+
+  it('serializes maintenance transitions with admission and wakes only a meaningful release', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-maintenance-transition-'));
+    const previous = {
+      data: process.env.TACHIKO_DATA_DIR,
+      lock: process.env.TACHIKO_DISPATCH_LOCK_PATH,
+      wake: process.env.TACHIKO_DISPATCH_WAKE_PATH,
+    };
+    const printed: string[] = [];
+    const original = console.log;
+    try {
+      const lockPath = path.join(directory, 'dispatch.lock');
+      const wakePath = path.join(directory, 'wake');
+      process.env.TACHIKO_DATA_DIR = path.join(directory, 'runs');
+      process.env.TACHIKO_DISPATCH_LOCK_PATH = lockPath;
+      process.env.TACHIKO_DISPATCH_WAKE_PATH = wakePath;
+      writeOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR, {
+        schemaVersion: 1, updatedAt: '2026-09-21T00:00:00.000Z', supervisor: 'parked', stage: 'idle',
+        eventWakeEligible: true, maintenanceHold: { active: false }, ownership: 'none', checkpoint: 'durable',
+      });
+      console.log = (value?: unknown) => { printed.push(String(value)); };
+
+      // A hold waits for the active reconciliation/admission interval. It
+      // cannot rewrite the projection underneath that owner.
+      const admission = acquireDispatchInvocationLock({ lockPath: `${lockPath}.admission`, nonce: () => 'active-reconcile' });
+      const holding = main(['dispatch', 'maintenance', 'hold']);
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      assert.equal(readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR)?.maintenanceHold.active, false);
+      admission.release();
+      assert.equal(await holding, 0);
+      assert.equal(readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR)?.maintenanceHold.active, true);
+
+      printed.length = 0;
+      assert.equal(await main(['dispatch', 'maintenance', 'release']), 0);
+      const firstRelease = JSON.parse(printed.at(-1) ?? '{}') as { wake?: string };
+      assert.match(firstRelease.wake ?? '', /^[0-9a-f-]{36}$/);
+      const firstToken = readFileSync(wakePath, 'utf8');
+      printed.length = 0;
+      assert.equal(await main(['dispatch', 'maintenance', 'release']), 0);
+      const repeatedRelease = JSON.parse(printed.at(-1) ?? '{}') as { wake?: string };
+      assert.equal(repeatedRelease.wake, undefined);
+      assert.equal(readFileSync(wakePath, 'utf8'), firstToken);
+      assert.equal(readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR)?.maintenanceHold.active, false);
+    } finally {
+      console.log = original;
+      for (const [name, value] of Object.entries(previous)) {
+        const key = name === 'data' ? 'TACHIKO_DATA_DIR' : name === 'lock' ? 'TACHIKO_DISPATCH_LOCK_PATH' : 'TACHIKO_DISPATCH_WAKE_PATH';
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });
