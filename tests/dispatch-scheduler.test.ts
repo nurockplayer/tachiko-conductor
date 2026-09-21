@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
 import { renderDispatchLaunchdPlist } from '../src/dispatch/launchd.js';
+import { parseDispatchConfiguration } from '../src/dispatch/config.js';
 import { main } from '../src/cli.js';
 import { readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
 
@@ -150,6 +151,16 @@ describe('dispatch scheduler boundary', () => {
     assert.match(configured, /<key>KeepAlive<\/key><true\/>/);
     assert.doesNotMatch(configured, /StartInterval/);
     assert.doesNotMatch(configured, /StartCalendarInterval/);
+  });
+
+  it('pins only the canonical #101 queue location in the stable-checkout driver wrapper', () => {
+    const wrapper = readFileSync(path.resolve('scripts/dispatch-driver.sh'), 'utf8');
+    const match = wrapper.match(/export TACHIKO_DISPATCH_CONFIG='([^']+)'/);
+    assert.ok(match);
+    assert.deepEqual(parseDispatchConfiguration(match[1]!), {
+      revision: 'dispatch-production-v1', owner: 'nurockplayer', repo: 'tachiko-conductor', controlIssue: 101, queueCommentId: 5755262217, leaseDurationMs: 900_000,
+    });
+    assert.doesNotMatch(wrapper, /TACHIKO_(EXECUTION_PROFILE|LOCAL_VALIDATION|HOSTED_CHECK_POLICY)_CONFIG/);
   });
 
   it('leaves a concurrent dispatch at a safe re-entry boundary without reading configuration or GitHub', async () => {
