@@ -10,4 +10,13 @@ ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 # deliberately remain external and are not invented here.
 export TACHIKO_DISPATCH_CONFIG='{"revision":"dispatch-production-v1","owner":"nurockplayer","repo":"tachiko-conductor","controlIssue":101,"queueCommentId":5755262217,"leaseDurationMs":900000}'
 
-exec corepack pnpm@10.34.5 exec tsx "$ROOT/src/cli.ts" dispatch serve "$@"
+# launchd does not inherit an interactive shell PATH. The post-merge installer
+# supplies this explicit, stable runtime through its plist; this wrapper never
+# discovers a transient FNM/Corepack path or starts a restart loop on it.
+: "${TACHIKO_NODE_PROGRAM:?TACHIKO_NODE_PROGRAM must name a stable absolute Node runtime}"
+if [ ! -x "$TACHIKO_NODE_PROGRAM" ]; then
+  echo "TACHIKO_NODE_PROGRAM is not executable: $TACHIKO_NODE_PROGRAM" >&2
+  exit 78
+fi
+
+exec "$TACHIKO_NODE_PROGRAM" "$ROOT/node_modules/tsx/dist/cli.mjs" "$ROOT/src/cli.ts" dispatch serve "$@"

@@ -129,18 +129,21 @@ describe('dispatch scheduler boundary', () => {
   it('renders a provider-neutral launchd supervisor without configuration values', () => {
     const plist = renderDispatchLaunchdPlist({
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
+      nodeProgram: '/Users/example/.local/node/bin/node',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
     });
     assert.match(plist, /<key>ProgramArguments<\/key><array><string>\/Users\/example\/Library/);
     assert.doesNotMatch(plist, /TACHIKO_DISPATCH_CONFIG/);
     assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
     assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
+    assert.match(plist, /<key>TACHIKO_NODE_PROGRAM<\/key><string>\/Users\/example\/\.local\/node\/bin\/node<\/string>/);
     assert.doesNotMatch(plist, /StartCalendarInterval/);
   });
 
   it('renders the same supervisor across reinstall without creating a timer wake', () => {
     const options = {
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
+      nodeProgram: '/Users/example/.local/node/bin/node',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
       label: 'io.tachiko.conductor.dispatch-driver',
     } as const;
@@ -161,6 +164,8 @@ describe('dispatch scheduler boundary', () => {
       revision: 'dispatch-production-v1', owner: 'nurockplayer', repo: 'tachiko-conductor', controlIssue: 101, queueCommentId: 5755262217, leaseDurationMs: 900_000,
     });
     assert.doesNotMatch(wrapper, /TACHIKO_(EXECUTION_PROFILE|LOCAL_VALIDATION|HOSTED_CHECK_POLICY)_CONFIG/);
+    assert.match(wrapper, /TACHIKO_NODE_PROGRAM/);
+    assert.doesNotMatch(wrapper, /exec corepack/);
   });
 
   it('leaves a concurrent dispatch at a safe re-entry boundary without reading configuration or GitHub', async () => {

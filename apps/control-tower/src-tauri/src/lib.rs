@@ -434,10 +434,10 @@ fn pull_request(
   commands: &dyn CommandBoundary,
   repository: &str,
   number: Option<u64>,
-  expected_head_sha: Option<&str>,
+  expected_head_shas: &[&str],
 ) -> Option<PullRequestView> {
   let number = number?;
-  let expected_head_sha = expected_head_sha?;
+  (!expected_head_shas.is_empty()).then_some(())?;
   let json = commands.run(
     "gh",
     &[
@@ -453,7 +453,7 @@ fn pull_request(
   let item: Value = serde_json::from_str(&json).ok()?;
   let state = item.get("state")?.as_str()?.to_owned();
   (item.get("number")?.as_u64()? == number
-    && item.get("headRefOid")?.as_str()? == expected_head_sha)
+    && expected_head_shas.contains(&item.get("headRefOid")?.as_str()?))
     .then_some(PullRequestView { number, state })
 }
 
@@ -801,14 +801,20 @@ fn correlated_run<'a>(
   (matches.len() == 1).then(|| matches.into_iter().next()).flatten()
 }
 
-fn pull_request_head_for_correlation<'a>(
+fn pull_request_heads_for_correlation<'a>(
   correlated: &'a CorrelatedRun<'a>,
   worktree: &'a VerifiedWorktree,
-) -> Option<&'a str> {
+) -> Vec<&'a str> {
   if correlated.active_review_fix_descendant {
-    worktree.head_sha.as_deref()
+    // Before push GitHub still names the accepted durable head; after push it
+    // names the verified local descendant. Both are typed correlation evidence
+    // for this bounded active-repair interval.
+    [correlated.run.pull_request_head_sha.as_deref(), worktree.head_sha.as_deref()]
+      .into_iter()
+      .flatten()
+      .collect()
   } else {
-    correlated.run.pull_request_head_sha.as_deref()
+    correlated.run.pull_request_head_sha.as_deref().into_iter().collect()
   }
 }
 
@@ -913,7 +919,7 @@ fn collect_snapshot_for_roots_with_workspace_data_path(
           commands,
           &run.run.repository,
           run.run.pull_request_number,
-          pull_request_head_for_correlation(&run, &worktree),
+          &pull_request_heads_for_correlation(&run, &worktree),
         );
         (run.run.pull_request_number.is_none() || pull_request.is_some()).then_some((run, pull_request))
       });
@@ -1463,7 +1469,7 @@ mod tests {
       .expect("the verified local descendant remains correlated during an active repair");
     assert_eq!(correlated.run.id, "run-1");
     assert!(correlated.active_review_fix_descendant);
-    assert_eq!(pull_request_head_for_correlation(&correlated, &worktree), Some("replacement"));
+    assert_eq!(pull_request_heads_for_correlation(&correlated, &worktree), vec!["accepted", "replacement"]);
     let not_a_review_fix = RunObservation { review_fix_active: false, ..repair };
     assert!(correlated_run(&fake, &[not_a_review_fix], &run_worktrees, &worktree).is_none());
   }
@@ -1476,10 +1482,10 @@ mod tests {
       "{\"number\":7,\"state\":\"OPEN\",\"headRefOid\":\"head\"}",
     )]);
     assert_eq!(
-      pull_request(&fake, "acme/widgets", Some(7), Some("head")).map(|value| value.state),
+      pull_request(&fake, "acme/widgets", Some(7), &["head"]).map(|value| value.state),
       Some("OPEN".to_owned())
     );
-    assert!(pull_request(&fake, "acme/widgets", Some(7), Some("other-head")).is_none());
+    assert!(pull_request(&fake, "acme/widgets", Some(7), &["other-head"]).is_none());
   }
 
   #[test]

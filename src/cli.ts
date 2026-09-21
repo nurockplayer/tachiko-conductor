@@ -111,7 +111,7 @@ Usage:
   tachiko dispatch once
   tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
   tachiko dispatch wake
-  tachiko dispatch launchd render --program <absolute-driver-wrapper> --working-directory <absolute-path>
+  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
@@ -1332,17 +1332,19 @@ export async function main(argv: string[]): Promise<number> {
         args: rest.slice(1),
         options: {
           program: { type: 'string' },
+          'node-program': { type: 'string' },
           'working-directory': { type: 'string' },
           label: { type: 'string' },
           'stdout-path': { type: 'string' },
           'stderr-path': { type: 'string' },
         },
       });
-      if (positionals.length > 0 || values.program === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program and --working-directory.');
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, and --working-directory.');
       }
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
+        nodeProgram: values['node-program'],
         workingDirectory: values['working-directory'],
         ...(values.label === undefined ? {} : { label: values.label }),
         ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
