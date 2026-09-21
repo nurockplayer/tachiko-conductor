@@ -90,6 +90,38 @@ test('untrusted Issue Form is only a proposal and cannot obtain writer authority
   assert.equal(decision.labels.includes('dispatch:ready'), false);
 });
 
+test('trusted API-created Issue body authority is accepted without Issue Form fields', () => {
+  const body = `${admission.AUTHORITY_MARKER}\n\n\`\`\`json\n${JSON.stringify({
+    revision: 'api-v1',
+    kind: 'implementation',
+    shape: 'bounded',
+    executionProfile: 'routine',
+    oracleRequired: false,
+  })}\n\`\`\``;
+  const decision = admission.classifyIssue({ issue: { author_association: 'OWNER', state: 'open', body } });
+  assert.equal(decision.source, 'steward-body');
+  assert.equal(decision.status, 'ready');
+  assert.equal(decision.dispatch, 'ready');
+  assert.equal(decision.authority.revision, 'api-v1');
+});
+
+test('untrusted authority comments cannot override trusted Issue Form authority', () => {
+  const body = `${admission.AUTHORITY_MARKER}\n\n\`\`\`json\n${JSON.stringify({
+    revision: 'untrusted-v1',
+    kind: 'implementation',
+    shape: 'interacting',
+    executionProfile: 'complex',
+    oracleRequired: false,
+  })}\n\`\`\``;
+  const decision = admission.classifyIssue({
+    issue: implementationForm('bounded'),
+    comments: [{ id: 9, author_association: 'NONE', created_at: '2026-09-22T00:00:00Z', body }],
+  });
+  assert.equal(decision.source, 'issue-form');
+  assert.equal(decision.authority.shape, 'bounded');
+  assert.equal(decision.authority.executionProfile, 'routine');
+});
+
 test('latest trusted explicit authority overrides Issue Form projection', () => {
   const body = `${admission.AUTHORITY_MARKER}\n\n\`\`\`json\n${JSON.stringify({
     revision: 'steward-v2',
