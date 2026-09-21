@@ -587,9 +587,6 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
     const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, dependencyStore ?? undefined);
     const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
-    const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
-      ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram) ?? undefined
-      : undefined;
     try {
       // A production plan has one host-provisioned pnpm authority.  Reject a
       // substituted executable before probing a tool or starting validation.
@@ -599,6 +596,9 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       if (this.configuration.pnpmProgram !== undefined && !hasPinnedPnpmAuthority(commandWorkspace.path, this.configuration.pnpmProgram, environment)) {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0, this.configuration.pnpmProgram)] };
       }
+      const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
+        ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram) ?? undefined
+        : undefined;
       // The production lane is meaningful only with a real macOS kernel
       // boundary. Do not silently degrade to environment scrubbing.
       if (configuredToolchain && (sandboxProfile === null || sandboxProfile === undefined)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
