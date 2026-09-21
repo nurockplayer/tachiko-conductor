@@ -115,7 +115,7 @@ Usage:
   tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
   tachiko dispatch wake
   tachiko production preflight
-  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --working-directory <absolute-path>
+  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
@@ -342,11 +342,20 @@ export function resolveLocalValidationConfiguration(
     (typeof record.trustedIgnoredBaselinePath !== 'string' || record.trustedIgnoredBaselinePath.trim() === '' || !path.isAbsolute(record.trustedIgnoredBaselinePath))) {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.trustedIgnoredBaselinePath must be an absolute non-empty path when supplied.');
   }
+  if (record.playwrightBrowsersPathEnvironment !== undefined && record.playwrightBrowsersPathEnvironment !== 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH') {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.playwrightBrowsersPathEnvironment must be TACHIKO_PLAYWRIGHT_BROWSERS_PATH when supplied.');
+  }
+  const playwrightBrowsersPath = record.playwrightBrowsersPathEnvironment === undefined ? undefined : env.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
+  if (record.playwrightBrowsersPathEnvironment !== undefined &&
+    (typeof playwrightBrowsersPath !== 'string' || playwrightBrowsersPath.trim() === '' || !path.isAbsolute(playwrightBrowsersPath))) {
+    throw new Error('TACHIKO_PLAYWRIGHT_BROWSERS_PATH must be an absolute non-empty host-owned browser artifact directory.');
+  }
   return {
     revision: record.revision,
     commands,
     ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
     ...(record.trustedIgnoredBaselinePath === undefined ? {} : { trustedIgnoredBaselinePath: record.trustedIgnoredBaselinePath }),
+    ...(playwrightBrowsersPath === undefined ? {} : { playwrightBrowsersPath }),
   };
 }
 
@@ -1364,19 +1373,21 @@ export async function main(argv: string[]): Promise<number> {
           program: { type: 'string' },
           'node-program': { type: 'string' },
           'luna-codex-home': { type: 'string' },
+          'playwright-browsers-path': { type: 'string' },
           'working-directory': { type: 'string' },
           label: { type: 'string' },
           'stdout-path': { type: 'string' },
           'stderr-path': { type: 'string' },
         },
       });
-      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['luna-codex-home'] === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program, --node-program, --luna-codex-home, and --working-directory.');
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
       }
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
         nodeProgram: values['node-program'],
         lunaCodexHome: values['luna-codex-home'],
+        playwrightBrowsersPath: values['playwright-browsers-path'],
         workingDirectory: values['working-directory'],
         ...(values.label === undefined ? {} : { label: values.label }),
         ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),

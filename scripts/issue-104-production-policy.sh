@@ -12,7 +12,13 @@ case "$TACHIKO_LUNA_CODEX_HOME" in
   *) echo "TACHIKO_LUNA_CODEX_HOME must be an absolute path" >&2; exit 78 ;;
 esac
 export TACHIKO_LUNA_CODEX_HOME
+: "${TACHIKO_PLAYWRIGHT_BROWSERS_PATH:?TACHIKO_PLAYWRIGHT_BROWSERS_PATH must name a host-owned absolute Playwright browser artifact directory}"
+case "$TACHIKO_PLAYWRIGHT_BROWSERS_PATH" in
+  /*) ;;
+  *) echo "TACHIKO_PLAYWRIGHT_BROWSERS_PATH must be an absolute path" >&2; exit 78 ;;
+esac
+export TACHIKO_PLAYWRIGHT_BROWSERS_PATH
 export TACHIKO_IMPLEMENTATION_AGENT='luna-isolated'
-export TACHIKO_EXECUTION_PROFILE_CONFIG='{"revision":"issue-104-production-v1","profiles":{"routine":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"standard":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"complex":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"critical":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"}}}'
-export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"issue-104-production-v1","commands":[{"argv":["pnpm","install","--frozen-lockfile"],"timeoutMs":300000},{"argv":["pnpm","test"],"timeoutMs":300000},{"argv":["pnpm","typecheck"],"timeoutMs":120000},{"argv":["pnpm","build"],"timeoutMs":120000}]}'
-export TACHIKO_HOSTED_CHECK_POLICY_CONFIG='{"revision":"issue-104-production-v1","mode":"not_required"}'
+export TACHIKO_EXECUTION_PROFILE_CONFIG='{"revision":"issue-104-production-v2","profiles":{"routine":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"standard":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"complex":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"critical":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"}}}'
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"issue-104-production-v2","playwrightBrowsersPathEnvironment":"TACHIKO_PLAYWRIGHT_BROWSERS_PATH","commands":[{"argv":["pnpm","install","--frozen-lockfile"],"timeoutMs":300000},{"argv":["pnpm","test"],"timeoutMs":300000},{"argv":["pnpm","typecheck"],"timeoutMs":120000},{"argv":["pnpm","build"],"timeoutMs":120000}]}'
+export TACHIKO_HOSTED_CHECK_POLICY_CONFIG='{"revision":"issue-104-production-v2","mode":"not_required"}'

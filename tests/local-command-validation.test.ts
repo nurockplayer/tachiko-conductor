@@ -71,13 +71,47 @@ describe('ConfiguredLocalValidationAdapter', () => {
       ])).validate(owned);
       assert.equal(result.status, 'passed');
       const environment = JSON.parse(readFileSync(proof, 'utf8')) as Record<string, string>;
-      assert.deepEqual(Object.keys(environment).sort(), ['CI', 'HOME', 'PATH', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME']);
+      // macOS may add __CF_USER_TEXT_ENCODING at exec time. Assert the real
+      // denial invariant instead of treating that platform metadata as a
+      // credential inherited from the dispatcher.
       assert.match(environment.HOME!, /tachiko-validation-runtime-/);
+      assert.match(environment.XDG_CACHE_HOME!, /tachiko-validation-runtime-/);
       assert.equal(environment.GITHUB_TOKEN, undefined);
+      assert.equal(environment.SSH_AUTH_SOCK, undefined);
+      assert.equal(environment.CHATGPT_API_KEY, undefined);
+      assert.equal(environment.CODEX_HOME, undefined);
+      assert.equal(environment.TACHIKO_LUNA_CODEX_HOME, undefined);
+      assert.equal(environment.UNRELATED_SECRET, undefined);
     } finally {
       for (const [key, value] of Object.entries(inherited)) {
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
       }
+    }
+  });
+
+  it('uses only the configured host browser artifacts, never an ambient browser cache', async () => {
+    const owned = request();
+    const artifactRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-host-playwright-'));
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(artifactRoot, proofDir);
+    const proof = path.join(proofDir, 'environment.json');
+    const inherited = process.env.PLAYWRIGHT_BROWSERS_PATH;
+    process.env.PLAYWRIGHT_BROWSERS_PATH = '/ambient/user/browser-cache';
+    try {
+      const config: LocalValidationConfiguration = {
+        ...configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify(process.env))`]),
+        playwrightBrowsersPath: artifactRoot,
+      };
+      const result = await new ConfiguredLocalValidationAdapter(config).validate(owned);
+      assert.equal(result.status, 'passed');
+      const environment = JSON.parse(readFileSync(proof, 'utf8')) as Record<string, string>;
+      assert.equal(environment.PLAYWRIGHT_BROWSERS_PATH, artifactRoot);
+      assert.notEqual(environment.PLAYWRIGHT_BROWSERS_PATH, '/ambient/user/browser-cache');
+      assert.notEqual(environment.HOME, artifactRoot);
+      assert.notEqual(environment.XDG_CACHE_HOME, artifactRoot);
+    } finally {
+      if (inherited === undefined) delete process.env.PLAYWRIGHT_BROWSERS_PATH;
+      else process.env.PLAYWRIGHT_BROWSERS_PATH = inherited;
     }
   });
 

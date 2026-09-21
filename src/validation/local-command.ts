@@ -373,7 +373,7 @@ async function execute(
  * host-created home/cache root; notably no GitHub, SSH, ChatGPT/Codex/Luna,
  * npm, Git, or generic inherited secret variables cross this boundary.
  */
-function credentialFreeValidationEnvironment(runtimeRoot: string): NodeJS.ProcessEnv {
+function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string): NodeJS.ProcessEnv {
   const home = path.join(runtimeRoot, 'home');
   const cache = path.join(runtimeRoot, 'cache');
   const config = path.join(runtimeRoot, 'config');
@@ -396,7 +396,18 @@ function credentialFreeValidationEnvironment(runtimeRoot: string): NodeJS.Proces
     if (process.env.COMSPEC !== undefined) environment.COMSPEC = process.env.COMSPEC;
     if (process.env.PATHEXT !== undefined) environment.PATHEXT = process.env.PATHEXT;
   }
+  if (playwrightBrowsersPath !== undefined) environment.PLAYWRIGHT_BROWSERS_PATH = playwrightBrowsersPath;
   return environment;
+}
+
+function validHostBrowserArtifacts(directory: string | undefined): directory is string {
+  if (directory === undefined || !path.isAbsolute(directory)) return directory === undefined;
+  try {
+    const stat = lstatSync(directory);
+    return stat.isDirectory() && !stat.isSymbolicLink() && (stat.mode & 0o022) === 0;
+  } catch {
+    return false;
+  }
 }
 
 /** Runs only the explicitly supplied repository/run validation commands. */
@@ -435,8 +446,11 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
+    if (!validHostBrowserArtifacts(this.configuration.playwrightBrowsersPath)) {
+      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+    }
     const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
-    const environment = credentialFreeValidationEnvironment(runtimeRoot);
+    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath);
     try {
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];

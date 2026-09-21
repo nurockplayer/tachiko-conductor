@@ -131,6 +131,7 @@ describe('dispatch scheduler boundary', () => {
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       nodeProgram: '/Users/example/.local/node/bin/node',
       lunaCodexHome: '/Users/example/.tachiko/luna-codex-home',
+      playwrightBrowsersPath: '/Users/example/.tachiko/playwright-browsers',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
     });
     assert.match(plist, /<key>ProgramArguments<\/key><array><string>\/Users\/example\/Library/);
@@ -139,6 +140,7 @@ describe('dispatch scheduler boundary', () => {
     assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
     assert.match(plist, /<key>TACHIKO_NODE_PROGRAM<\/key><string>\/Users\/example\/\.local\/node\/bin\/node<\/string>/);
     assert.match(plist, /<key>TACHIKO_LUNA_CODEX_HOME<\/key><string>\/Users\/example\/\.tachiko\/luna-codex-home<\/string>/);
+    assert.match(plist, /<key>TACHIKO_PLAYWRIGHT_BROWSERS_PATH<\/key><string>\/Users\/example\/\.tachiko\/playwright-browsers<\/string>/);
     assert.match(plist, /<key>TACHIKO_EXECUTION_PROFILE_CONFIG<\/key>/);
     assert.match(plist, /<key>TACHIKO_LOCAL_VALIDATION_CONFIG<\/key>/);
     assert.match(plist, /<key>TACHIKO_HOSTED_CHECK_POLICY_CONFIG<\/key><string>{&quot;revision&quot;:&quot;issue-104-production-v1&quot;,&quot;mode&quot;:&quot;not_required&quot;}<\/string>/);
@@ -150,6 +152,7 @@ describe('dispatch scheduler boundary', () => {
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       nodeProgram: '/Users/example/.local/node/bin/node',
       lunaCodexHome: '/Users/example/.tachiko/luna-codex-home',
+      playwrightBrowsersPath: '/Users/example/.tachiko/playwright-browsers',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
       label: 'io.tachiko.conductor.dispatch-driver',
     } as const;
