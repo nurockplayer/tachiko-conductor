@@ -29,6 +29,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   }
   async plan(request: BootstrapPlanRequest): Promise<ImplementationBootstrapIdentity> {
     if (!SHA.test(request.baseSha)) this.fail('INVALID_REQUEST', 'Standalone bootstrap requires an exact base SHA.');
+    await this.assertBranchName(request);
     const identity = this.identity(request);
     if (existsSync(identity.workspacePath)) this.fail('COLLISION', 'Standalone workspace path already exists.');
     await this.assertPublicationRemote({ owner: request.target.owner, repo: request.target.repo });
@@ -38,6 +39,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     return identity;
   }
   async prepare(request: BootstrapPrepareRequest): Promise<ImplementationBootstrapIdentity> {
+    await this.assertBranchName(request);
     const identity = { ...this.identity(request), ...(request.existing.publicationBranch === undefined ? {} : { publicationBranch: request.existing.publicationBranch }) };
     if (!same(identity, request.existing)) this.fail('STALE_IDENTITY', 'Persisted standalone bootstrap identity changed.');
     const authorized = request.recoveryAuthority?.expectedHeadSha ?? request.existing.baseSha;
@@ -107,6 +109,10 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     const branch = `tachiko/${r.runId}`;
     const suffix = createHash('sha256').update(`${r.target.owner}/${r.target.repo}#${r.target.issueNumber}:${r.runId}`).digest('hex').slice(0, 16);
     return { bootstrapKind: 'standalone-isolated', owner: r.target.owner, repo: r.target.repo, issueNumber: r.target.issueNumber, baseBranch: r.baseBranch, baseSha: r.baseSha, branch, ...(r.publicationBranch === undefined ? {} : { publicationBranch: r.publicationBranch }), workspacePath: path.join(this.root, `luna-${suffix}`) };
+  }
+  private async assertBranchName(request: BootstrapPlanRequest): Promise<void> {
+    const result = await this.git(this.root, ['check-ref-format', '--branch', `tachiko/${request.runId}`], [0, 1, 128]);
+    if (result.exitCode !== 0) this.fail('INVALID_REQUEST', 'Standalone bootstrap generated an invalid Git branch name.');
   }
   private async assert(i: ImplementationBootstrapIdentity, recovery?: string, initialBase?: string): Promise<void> {
     if (!existsSync(i.workspacePath)) this.fail('STALE_IDENTITY', 'Standalone workspace disappeared.');

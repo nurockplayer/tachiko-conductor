@@ -152,6 +152,24 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(existsSync(marker), false);
   });
 
+  it('rejects committed gitlinks before an incomplete reconstruction can run validation', async () => {
+    const owned = request();
+    const dependencyHead = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'update-index', '--add', '--cacheinfo', `160000,${dependencyHead},dependency`], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'record dependency gitlink'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'validation-ran');
+
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+    ).validate({ ...owned, headSha });
+
+    assert.equal(result.status, 'unknown');
+    assert.equal(existsSync(marker), false);
+  });
+
   it('fails closed before validation when ignored worker state could supply absent committed bytes', async () => {
     const owned = request();
     writeFileSync(path.join(owned.workspacePath, '.gitignore'), '.env\n');

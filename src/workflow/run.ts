@@ -377,7 +377,10 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
-        if (!pendingRepair && (snapshot.pullRequest === null || effectiveExecution?.executor === 'luna-isolated') && bootstrap === undefined) {
+        if ((
+          !pendingRepair && (snapshot.pullRequest === null || effectiveExecution?.executor === 'luna-isolated') ||
+          pendingRepair && effectiveExecution?.executor === 'luna-isolated'
+        ) && bootstrap === undefined) {
           const existingLuna = effectiveExecution?.executor === 'luna-isolated' && snapshot.pullRequest !== null;
           const authoritativeBaseBranch = existingLuna ? snapshot.pullRequest?.baseRef : snapshot.repository.defaultBranch;
           const authoritativeBaseSha = existingLuna ? snapshot.pullRequest?.baseSha : snapshot.repository.defaultBranchHeadSha;
@@ -398,6 +401,7 @@ export async function runWorkflow(
             assertBootstrapBoundary(bootstrap, bootstrapAdapter);
             run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
             store.update(run);
+            if (pendingRepair) recoveryAuthority = { expectedHeadSha: run.headSha! };
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
           }

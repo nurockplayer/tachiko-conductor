@@ -133,6 +133,12 @@ interface ValidationWorkspace {
   dispose(): void;
 }
 
+function containsGitlinks(workspacePath: string, invoke: (args: readonly string[]) => SpawnSyncReturns<string>): boolean | null {
+  const entries = invoke(['-C', workspacePath, 'ls-files', '--stage', '-z']);
+  if (entries.status !== 0) return null;
+  return entries.stdout.split('\0').some((entry) => entry.startsWith('160000 '));
+}
+
 /**
  * Materialize command input outside the worker checkout.  In particular, a
  * clean exact HEAD does not authorize files under that checkout's .git
@@ -157,7 +163,11 @@ function reconstructedWorkspace(sourcePath: string, headSha: string): Validation
     const checkedOut = disconnected?.status === 0
       ? invoke(['-C', snapshot, 'checkout', '--detach', '--force', headSha])
       : undefined;
-    if (cloned.status !== 0 || disconnected?.status !== 0 || checkedOut?.status !== 0) {
+    // A plain detached checkout deliberately does not populate gitlinks. Do
+    // not misreport an incomplete tree as a validator failure; submodule
+    // provenance needs its own host-qualified reconstruction boundary.
+    const gitlinks = checkedOut?.status === 0 ? containsGitlinks(snapshot, invoke) : null;
+    if (cloned.status !== 0 || disconnected?.status !== 0 || checkedOut?.status !== 0 || gitlinks !== false) {
       rmSync(snapshot, { recursive: true, force: true });
       return null;
     }

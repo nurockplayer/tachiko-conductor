@@ -1080,6 +1080,56 @@ describe('runWorkflow', () => {
     assert.equal(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
   });
 
+  it('reconstructs a standalone workspace before resuming a promoted Luna repair', async () => {
+    const store = new MemoryStore();
+    const luna: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+    };
+    let run = reviewingRun(store, 'resume-promoted-luna', HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    run = {
+      ...run,
+      repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' },
+      repairAdmissions: [{
+        authorityRevision: 'task-shape-v1', taskShape: 'bounded', taxonomyRevision: 'repair-finding-taxonomy-v1',
+        finding: 'review_blocking', headSha: HEAD, pullRequestNumber: 7, executionProfile: 'routine',
+        executionRevision: 'luna-v1', execution: luna, admittedAt: T0,
+      }],
+    };
+    run = applyTransition(run, { type: 'start_fix' }, T0);
+    store.update(run);
+    const identity = {
+      bootstrapKind: 'standalone-isolated' as const, owner: 'acme', repo: 'widgets', issueNumber: 42,
+      baseBranch: 'main', baseSha: 'base', branch: 'tachiko/resume-promoted-luna', publicationBranch: 'existing-pr', workspacePath: '/tmp/resume-promoted-luna',
+    };
+    const prepared: unknown[] = [];
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+      async plan() { return identity; },
+      async prepare(request) { prepared.push(request); return identity; },
+      guard() { return { assertValid: () => undefined }; },
+      async verifyDurable(request) { return { headSha: request.expectedHeadSha, branch: identity.branch }; },
+    };
+    const github = githubAdapter([HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, pullRequest: { ...live.pullRequest!, headRef: 'existing-pr', baseRef: 'main', headRepository: { owner: 'acme', repo: 'widgets' } } };
+    };
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer: new FakeReviewer([approve(HEAD2)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+        bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => luna },
+      run.id, { maxReviewAttempts: 2, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'merge_ready', result.outcome === 'needs_human' ? result.reason : undefined);
+    assert.deepEqual((prepared[0] as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
+    assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
+    assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
+  });
+
   it('never passes the final gate when live HEAD drifted after approval', async () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);

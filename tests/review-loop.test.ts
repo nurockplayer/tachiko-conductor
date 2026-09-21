@@ -188,6 +188,8 @@ class FakeImplementation implements ImplementationAgent {
     executor: ImplementationRequest['executor'];
     execution: ImplementationRequest['execution'];
     capabilities: ImplementationRequest['capabilities'];
+    workspacePath: string | undefined;
+    branch: string | undefined;
   }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
@@ -200,6 +202,8 @@ class FakeImplementation implements ImplementationAgent {
       executor: request.executor,
       execution: request.execution,
       capabilities: request.capabilities,
+      workspacePath: request.workspacePath,
+      branch: request.branch,
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
@@ -597,6 +601,48 @@ describe('runReviewLoop', () => {
     assert.equal(implementation.requests[0]?.executor, undefined);
     assert.equal(implementation.requests[0]?.sessionId, undefined);
     assert.deepEqual(implementation.requests[0]?.execution, complex);
+  });
+
+  it('plans and prepares a standalone workspace for a promoted existing-PR Luna repair', async () => {
+    const store = new CasMemoryStore();
+    const run = repairChangesRun('promoted-luna-existing-pr');
+    store.create(run);
+    const luna: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+    };
+    const identity: ImplementationBootstrapIdentity = {
+      bootstrapKind: 'standalone-isolated', owner: 'acme', repo: 'widgets', issueNumber: 42,
+      baseBranch: 'main', baseSha: 'base', branch: 'tachiko/promoted-luna-existing-pr', publicationBranch: 'existing-pr', workspacePath: '/tmp/promoted-luna',
+    };
+    const planned: unknown[] = [];
+    const prepared: unknown[] = [];
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+      async plan(request) { planned.push(request); return identity; },
+      async prepare(request) { prepared.push(request); return identity; },
+      guard() { return { assertValid: () => undefined }; },
+      async verifyDurable(request) { return { headSha: request.expectedHeadSha, branch: identity.branch }; },
+    };
+    const github = githubAdapter([HEAD, HEAD, HEAD, HEAD2]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, pullRequest: { ...live.pullRequest!, headRef: 'existing-pr', baseRef: 'main', headRepository: { owner: 'acme', repo: 'widgets' } } };
+    };
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+
+    const result = await runReviewLoop(
+      { store, github, implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+        bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => luna },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'revalidating');
+    assert.deepEqual(planned, [{ runId: run.id, target: TARGET, baseBranch: 'main', baseSha: 'base', publicationBranch: 'existing-pr' }]);
+    assert.deepEqual((prepared[0] as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
+    assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
+    assert.equal(implementation.requests[0]?.branch, identity.branch);
+    assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
   });
 
   it('does not spawn after a concurrent transition wins the post-admission telemetry fence', async () => {

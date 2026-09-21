@@ -21,6 +21,15 @@ describe('standalone Luna bootstrap', () => {
     }
   });
 
+  it('rejects a persisted run ID that cannot form a safe standalone branch', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    await assert.rejects(
+      () => bootstrap.plan({ runId: 'foo..bar', target: { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha }),
+      /invalid Git branch name/,
+    );
+  });
+
   it('fetches and proves the live base when the trusted host checkout is stale', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const publisher = path.join(fixture.root, 'publisher');

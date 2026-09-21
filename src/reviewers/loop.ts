@@ -432,6 +432,31 @@ export async function runReviewLoop(
       }
       const repairBootstrap = deps.bootstrapForExecution?.(repairExecution) ?? deps.bootstrap;
       let workspaceGuard: WorkspaceGuard | undefined;
+      if (isolatedLuna && run.bootstrap === undefined) {
+        const pullRequest = repairSnapshot?.pullRequest;
+        const publicationBranch = pullRequest?.headRef;
+        const baseBranch = pullRequest?.baseRef;
+        const baseSha = pullRequest?.baseSha;
+        const sameRepository = pullRequest?.headRepository?.owner.toLowerCase() === target.owner.toLowerCase() &&
+          pullRequest.headRepository.repo.toLowerCase() === target.repo.toLowerCase();
+        if (repairBootstrap === undefined || repairBootstrap.bootstrapKind !== 'standalone-isolated' || progressBaseSha === undefined ||
+          pullRequest === null || pullRequest === undefined || !sameRepository || publicationBranch === undefined || publicationBranch.trim() === '' ||
+          baseBranch === undefined || baseBranch.trim() === '' || baseSha === undefined || baseSha.trim() === '') {
+          return parkBootstrap(run, new Error('Promoted isolated Luna repair has no safe same-repository standalone workspace authority.'), store, now);
+        }
+        try {
+          const bootstrap = await repairBootstrap.plan({
+            runId: run.id, target, baseBranch, baseSha, publicationBranch,
+          });
+          if (bootstrap.bootstrapKind !== repairBootstrap.bootstrapKind) {
+            return parkBootstrap(run, new Error('Promoted isolated Luna repair bootstrap boundary does not match its transport.'), store, now);
+          }
+          run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
+          store.update(run);
+        } catch (error) {
+          return parkBootstrap(run, error, store, now);
+        }
+      }
       if (run.bootstrap !== undefined) {
         if (repairBootstrap === undefined || progressBaseSha === undefined) {
           return parkBootstrap(run, new Error('Review fix cannot prove its persisted implementation workspace.'), store, now);
