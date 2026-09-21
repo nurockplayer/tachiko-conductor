@@ -481,11 +481,11 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const evidence: LocalValidationCommandEvidence[] = [];
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
-    // Every candidate source must prove its GitHub target before its detached
-    // reconstruction becomes command authority. A detached reconstruction has
-    // no origin deliberately, so this source proof binds its exact objects to
-    // the command workspace at creation and again at final settlement.
-    const requiresRepositoryIdentity = true;
+    // Only a configured pre-existing workspace must prove its GitHub target.
+    // An explicitly supplied workspace is bootstrap-owned; its exact HEAD,
+    // clean state, hidden-index state, and ignored manifest are instead bound
+    // to the detached command reconstruction at creation and final settlement.
+    const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
     if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath)) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
