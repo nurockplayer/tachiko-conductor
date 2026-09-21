@@ -31,8 +31,10 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     if (!SHA.test(request.baseSha)) this.fail('INVALID_REQUEST', 'Standalone bootstrap requires an exact base SHA.');
     const identity = this.identity(request);
     if (existsSync(identity.workspacePath)) this.fail('COLLISION', 'Standalone workspace path already exists.');
-    await this.git(this.source, ['cat-file', '-e', `${request.baseSha}^{commit}`]);
     await this.assertPublicationRemote({ owner: request.target.owner, repo: request.target.repo });
+    // The live snapshot's base must be imported from the authenticated remote,
+    // rather than assumed to exist in a long-lived host checkout.
+    await this.assertFetchedBase(request.baseBranch, request.baseSha);
     return identity;
   }
   async prepare(request: BootstrapPrepareRequest): Promise<ImplementationBootstrapIdentity> {
@@ -130,6 +132,11 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   }
   private async ancestor(cwd: string, base: string, head: string): Promise<void> { if ((await this.git(cwd, ['merge-base', '--is-ancestor', base, head], [0, 1])).exitCode !== 0) this.fail('HEAD_MISMATCH', 'Worker HEAD does not descend from its authorized base.'); }
   private async tree(cwd: string, ref: string): Promise<string> { return (await this.git(cwd, ['rev-parse', `${ref}^{tree}`])).stdout.trim(); }
+  private async assertFetchedBase(branch: string, expected: string): Promise<void> {
+    await this.git(this.source, ['fetch', '--no-tags', 'origin', `refs/heads/${branch}`]);
+    const fetched = (await this.git(this.source, ['rev-parse', 'FETCH_HEAD'])).stdout.trim();
+    if (fetched !== expected) this.fail('BASE_DRIFT', 'Trusted host fetch does not match the live base SHA.');
+  }
   private async assertPublicationRemote(request: Pick<ImplementationBootstrapIdentity, 'owner' | 'repo'>): Promise<void> {
     const urls = [...(await this.git(this.source, ['remote', 'get-url', '--all', 'origin'])).stdout.trim().split(/\r?\n/), ...(await this.git(this.source, ['remote', 'get-url', '--all', '--push', 'origin'])).stdout.trim().split(/\r?\n/)];
     const expected = `${request.owner}/${request.repo}`.toLowerCase();
@@ -253,7 +260,7 @@ function hasExecutableGitConfig(raw: string): boolean {
     if (assignment === null) return true;
     const key = assignment[1]!.toLowerCase();
     if (section === 'filter' || key === 'filter' || key.startsWith('filter.') ||
-      (section === 'core' && ['hookspath', 'fsmonitor', 'sshcommand', 'attributesfile'].includes(key)) ||
+      (section === 'core' && ['hookspath', 'fsmonitor', 'sshcommand', 'attributesfile', 'worktree'].includes(key)) ||
       (section === 'include' && key === 'path') || section === 'includeif') return true;
   }
   return false;

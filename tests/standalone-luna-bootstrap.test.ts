@@ -21,6 +21,19 @@ describe('standalone Luna bootstrap', () => {
     }
   });
 
+  it('fetches and proves the live base when the trusted host checkout is stale', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const publisher = path.join(fixture.root, 'publisher');
+    fixture.git(fixture.root, ['clone', fixture.remote, publisher]);
+    fixture.git(publisher, ['checkout', fixture.branch]);
+    const liveBase = fixture.commit(publisher, 'live-base.txt', 'published after host checkout\n');
+    fixture.git(publisher, ['push', 'origin', fixture.branch]);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-stale-source', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: liveBase };
+    await assert.doesNotReject(() => bootstrap.plan(request));
+    assert.equal(fixture.git(fixture.source, ['rev-parse', liveBase]), liveBase);
+  });
+
   it('gives the worker a remote-free standalone checkout and host-publishes only its exact clean descendant', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
@@ -194,5 +207,14 @@ describe('standalone Luna bootstrap', () => {
     writeFileSync(path.join(identity.workspacePath, '.git', 'config.worktree'), `[core]\nfsmonitor = ${command}\n`);
     await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /config requests executable/);
     assert.equal(existsSync(marker), false);
+  });
+
+  it('rejects a worker-controlled core.worktree override before host Git inspects another tree', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-core-worktree', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    fixture.git(identity.workspacePath, ['config', 'core.worktree', '../other-tree']);
+    await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); }, /Git config requests executable behavior/);
   });
 });

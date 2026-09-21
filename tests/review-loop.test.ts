@@ -499,12 +499,14 @@ describe('runReviewLoop', () => {
     const readLive = github.readLiveSnapshot.bind(github);
     github.readLiveSnapshot = async (target) => {
       const live = await readLive(target);
-      return { ...live, pullRequest: { ...live.pullRequest!, headRef: identity.branch, baseRef: identity.baseBranch, headRepository: { owner: identity.owner, repo: identity.repo } } };
+      return { ...live, issue: { ...live.issue, body: 'Original bounded requirement.' }, pullRequest: { ...live.pullRequest!, headRef: identity.branch, baseRef: identity.baseBranch, headRepository: { owner: identity.owner, repo: identity.repo } } };
     };
     const result = await runReviewLoop({ store, github, implementation, reviewer: new FakeReviewer([requestChanges(HEAD)]), resolveValidationAuthority: reviewAuthority, bootstrapForExecution: () => bootstrap, resolveImplementationCapabilities: async () => { resolved += 1; return [{ kind: 'mcp-http', name: 'browser', endpoint: 'http://127.0.0.1:1/mcp' }]; } }, run.id, { maxAttempts: 3, now: () => T0 });
     assert.equal(result.outcome, 'revalidating');
     assert.equal(resolved, 0);
     assert.equal(implementation.requests[0]?.capabilities, undefined);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Original bounded requirement\./);
+    assert.match(implementation.requests[0]?.instructions ?? '', /\[blocking\] the diff has a bug/);
   });
 
   it('routes only blocking findings to implementation', async () => {

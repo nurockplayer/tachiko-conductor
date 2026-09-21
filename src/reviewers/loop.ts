@@ -335,11 +335,15 @@ export async function runReviewLoop(
 
       // A persisted review does not authorize local repair against a different
       // live PR. Re-read before preparation and again after local recovery.
+      let repairSnapshot: GitHubLiveSnapshot | undefined;
       const checkOwnedFix = async (): Promise<ReviewLoopResult | null> => {
         try {
           const live = await github.readLiveSnapshot(target);
           const conflict = pullRequestIdentityConflict(run, live, { allowHeadAdvance: true });
-          if (conflict === null && live.headSha === run.headSha) return null;
+          if (conflict === null && live.headSha === run.headSha) {
+            repairSnapshot = live;
+            return null;
+          }
           const reason = conflict ?? 'Live GitHub HEAD changed before the review fix.';
           run = applyTransition(run, {
             type: 'escalate', reason,
@@ -417,6 +421,12 @@ export async function runReviewLoop(
       // profile change may not reinterpret a standalone Luna checkout as a
       // linked worktree (or the reverse) merely because its path looks alike.
       const isolatedLuna = repairExecution?.executor === 'luna-isolated';
+      if (isolatedLuna && repairSnapshot === undefined) {
+        return parkBootstrap(run, new Error('Isolated Luna repair requires a fresh bounded Issue packet.'), store, now);
+      }
+      const repairInstructions = isolatedLuna
+        ? `Task requirements:\n${repairSnapshot!.issue.body}\n\nRepair requirements:\n${blockingFindings}\n\nIsolated Luna contract: implement only the host-bounded task and repair; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
+        : blockingFindings;
       if (run.bootstrap?.bootstrapKind === 'standalone-isolated' && !isolatedLuna) {
         return parkBootstrap(run, new Error('A standalone Luna workspace cannot transition to a non-Luna repair transport.'), store, now);
       }
@@ -467,7 +477,7 @@ export async function runReviewLoop(
       let fixResult;
       try {
         fixResult = await implementation.run({
-          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: blockingFindings,
+          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: repairInstructions,
           ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           ...(isolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
