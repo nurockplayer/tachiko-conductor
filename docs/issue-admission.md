@@ -59,6 +59,8 @@ The fields are strict:
 
 The latest trusted structured authority comment wins. An invalid latest trusted authority fails closed rather than falling back to older state.
 
+Issue Form authority revisions are content-bound to the full submitted form body. Editing scope, acceptance criteria, dependencies, or stop conditions therefore rotates the revision even when the selected task shape is unchanged. Explicit Steward authority uses its supplied revision and must be bumped when that authority changes.
+
 Legacy `<!-- steward-task-shape-authority:v1 -->` `{revision, shape}` comments remain read-compatible and project as `kind=implementation`.
 
 ## Managed projection
