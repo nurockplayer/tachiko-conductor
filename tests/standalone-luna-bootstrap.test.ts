@@ -229,7 +229,7 @@ describe('standalone Luna bootstrap', () => {
   });
 
   it('rejects stat-cache settings that can hide tracked worker byte changes', async () => {
-    for (const [key, value] of [['core.trustctime', 'false'], ['core.checkStat', 'minimal']] as const) {
+    for (const [key, value] of [['core.trustctime', 'false'], ['core.checkStat', 'minimal'], ['core.filemode', 'false'], ['core.symlinks', 'false']] as const) {
       const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
       const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
       const request = { runId: `luna-${key}`, target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };

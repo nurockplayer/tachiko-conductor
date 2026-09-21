@@ -262,11 +262,13 @@ function hasExecutableGitConfig(raw: string): boolean {
       if (section === 'filter' || section === 'include' || section === 'includeif') return true;
       continue;
     }
-    const assignment = /^([A-Za-z][A-Za-z0-9.-]*)(?:\s*=|\s*$)/.exec(line);
+    const assignment = /^([A-Za-z][A-Za-z0-9.-]*)(?:\s*=\s*(.*)|\s*)$/.exec(line);
     if (assignment === null) return true;
     const key = assignment[1]!.toLowerCase();
+    const value = assignment[2]?.trim().toLowerCase();
     if (section === 'filter' || key === 'filter' || key.startsWith('filter.') ||
       (section === 'core' && ['hookspath', 'fsmonitor', 'sshcommand', 'attributesfile', 'worktree', 'trustctime', 'checkstat'].includes(key)) ||
+      (section === 'core' && ['filemode', 'symlinks'].includes(key) && !['true', 'yes', 'on', '1'].includes(value ?? '')) ||
       (section === 'include' && key === 'path') || section === 'includeif') return true;
   }
   return false;
