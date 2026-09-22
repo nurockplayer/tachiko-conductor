@@ -360,6 +360,26 @@ export function resolveLocalValidationConfiguration(
       throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.terminalGeneratedIgnoredRoots must not contain duplicates.');
     }
   }
+  let hydratedDependencyRoots: string[] | undefined;
+  if (record.hydratedDependencyRoots !== undefined) {
+    if (!Array.isArray(record.hydratedDependencyRoots) || record.hydratedDependencyRoots.length === 0 ||
+      record.hydratedDependencyRoots.some((value) => typeof value !== 'string')) {
+      throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.hydratedDependencyRoots must be a non-empty string array when supplied.');
+    }
+    hydratedDependencyRoots = record.hydratedDependencyRoots.map((value) => {
+      const root = value as string;
+      const components = root.split('/');
+      if (root.trim() !== root || /\s/.test(root) || root.includes('\\') || root.includes('\0') || path.posix.isAbsolute(root) ||
+        components.some((component) => component === '' || component === '.' || component === '..') ||
+        components[components.length - 1] !== 'node_modules') {
+        throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.hydratedDependencyRoots entries must be exact POSIX relative paths ending in node_modules without whitespace.');
+      }
+      return root;
+    });
+    if (new Set(hydratedDependencyRoots).size !== hydratedDependencyRoots.length) {
+      throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.hydratedDependencyRoots must not contain duplicates.');
+    }
+  }
   if (record.playwrightBrowsersPathEnvironment !== undefined && record.playwrightBrowsersPathEnvironment !== 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH') {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.playwrightBrowsersPathEnvironment must be TACHIKO_PLAYWRIGHT_BROWSERS_PATH when supplied.');
   }
@@ -393,6 +413,7 @@ export function resolveLocalValidationConfiguration(
     ...(gitProgram === undefined ? {} : { gitProgram }),
     ...(terminalGeneratedIgnoredRoots === undefined ? {} : { terminalGeneratedIgnoredRoots }),
     ...(dependencyArtifactPath === undefined ? {} : { dependencyArtifactPath }),
+    ...(hydratedDependencyRoots === undefined ? {} : { hydratedDependencyRoots }),
   };
 }
 

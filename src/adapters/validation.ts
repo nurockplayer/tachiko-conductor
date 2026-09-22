@@ -22,6 +22,8 @@ export interface LocalValidationConfiguration {
   readonly gitProgram?: string;
   /** Read-only host artifact containing a lockfile-bound pnpm store. */
   readonly dependencyArtifactPath?: string;
+  /** Host-owned dependency roots that offline hydration may populate. */
+  readonly hydratedDependencyRoots?: readonly string[];
   /**
    * Explicit clean checkout for a supported pre-existing-PR run. It is never
    * inferred from the conductor process cwd and must prove target repository

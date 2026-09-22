@@ -54,12 +54,12 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const pnpm = process.env.npm_execpath;
     assert.ok(pnpm !== undefined && path.isAbsolute(pnpm), 'run the Darwin regression through the pinned pnpm test command');
     const git = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
-    const outside = mkdtempSync(path.join(os.tmpdir(), 'tachiko-host-sentinel-'));
+    const outside = mkdtempSync(path.join(os.tmpdir(), 'ths-'));
     dirs.push(outside);
     const sentinel = path.join(outside, 'credential');
     writeFileSync(sentinel, 'must remain outside the sandbox');
-    const hostSocket = path.join(outside, 'host.sock');
-    const hostServer = net.createServer();
+    const hostSocket = path.join(outside, 's');
+    const hostServer = net.createServer((socket) => socket.destroy());
     await new Promise<void>((resolve, reject) => { hostServer.once('error', reject); hostServer.listen(hostSocket, resolve); });
     t.after(() => new Promise<void>((resolve, reject) => hostServer.close((error) => error === undefined ? resolve() : reject(error))));
     writeFileSync(path.join(owned.workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.5', scripts: { probe: 'node probe.cjs' } }));
@@ -69,6 +69,7 @@ const fs = require('node:fs');
 const net = require('node:net');
 const path = require('node:path');
 require('node:os').type();
+assert.equal(require('node:os').availableParallelism(), ${os.availableParallelism()});
 assert.throws(() => fs.readFileSync(${JSON.stringify(sentinel)}), /EPERM|EACCES/);
 assert.throws(() => fs.writeFileSync(${JSON.stringify(sentinel)}, 'changed'), /EPERM|EACCES/);
 const socketPath = path.join(process.env.TMPDIR, 'private.sock');
@@ -443,6 +444,30 @@ exec ${JSON.stringify(actualGit)} "$@"
     assert.equal(readFileSync(path.join(artifact, 'store', 'trusted'), 'utf8'), 'immutable');
     writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), '0'.repeat(64));
     assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 1_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
+  });
+
+  it('admits only explicitly configured workspace dependency roots and freezes their bytes', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'node_modules/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'workspace dependency fixture'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const artifact = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workspace-artifact-'));
+    dirs.push(artifact);
+    mkdirSync(path.join(artifact, 'store'));
+    writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
+    const roots = ['node_modules', 'apps/example/node_modules'];
+    const hydrate = { argv: [process.execPath, '-e', `const fs=require('node:fs'); for(const root of ${JSON.stringify(roots)}) {fs.mkdirSync(root,{recursive:true});fs.writeFileSync(root+'/fixture.js','frozen');}`], timeoutMs: 1_000 };
+    const config = { revision: 'workspace-hydration-v1', dependencyArtifactPath: artifact, commands: [hydrate] };
+    assert.equal((await new ConfiguredLocalValidationAdapter(config).validate(owned)).status, 'unknown');
+    assert.equal((await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: roots }).validate(owned)).status, 'passed');
+    const changed = { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('apps/example/node_modules/fixture.js','changed')"], timeoutMs: 1_000 };
+    assert.equal((await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: roots, commands: [hydrate, changed] }).validate(owned)).status, 'unknown');
+    for (const invalid of [['../node_modules'], ['apps/../node_modules'], ['dist'], []]) {
+      const result = await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: invalid }).validate(owned);
+      assert.equal(result.commands[0]?.outcome, 'malformed');
+    }
   });
 
   it('uses a dedicated reconstruction budget rather than a short validation-command timeout', async () => {

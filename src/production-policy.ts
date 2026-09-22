@@ -34,6 +34,7 @@ export const PRODUCTION_LOCAL_VALIDATION_CONFIG = {
   pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM',
   gitProgramEnvironment: 'TACHIKO_GIT_PROGRAM',
   dependencyArtifactPathEnvironment: 'TACHIKO_PNPM_DEPENDENCY_ARTIFACT',
+  hydratedDependencyRoots: ['node_modules', 'apps/control-tower/node_modules'],
   terminalGeneratedIgnoredRoots: ['dist'],
   commands: [
     // This always happens in a newly reconstructed exact-HEAD checkout.  It

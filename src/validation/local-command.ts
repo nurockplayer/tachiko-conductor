@@ -215,12 +215,15 @@ function lockfileBoundDependencyArtifact(workspacePath: string, artifactPath: st
   } catch { return null; }
 }
 
-function isHydratedDependencyManifest(manifest: readonly string[]): boolean {
+function isHydratedDependencyManifest(manifest: readonly string[], roots: readonly string[]): boolean {
   // `git status --ignored --untracked-files=all` may report either the
   // ignored directory itself or its individual contents.  Admit only a
-  // nonempty manifest wholly rooted in node_modules, then freeze those exact
+  // nonempty manifest wholly rooted in host-authorized node_modules trees, then freeze those exact
   // fingerprints for every subsequent command and final settlement.
-  return manifest.length > 0 && manifest.every((entry) => /^(?:file|link|directory) node_modules(?:\/|\s)/.test(entry));
+  return manifest.length > 0 && manifest.every((entry) => {
+    const relative = ignoredManifestEntryPath(entry);
+    return relative !== null && roots.some((root) => relative === root || relative.startsWith(`${root}/`));
+  });
 }
 
 function ignoredManifestEntryPath(entry: string): string | null {
@@ -522,7 +525,7 @@ function macosValidationSandboxProfile(
   const clauses = reads.map((entry) => `(allow file-read* (subpath ${sandboxLiteral(entry)}))\n(allow file-read-metadata (path-ancestors ${sandboxLiteral(entry)}))`).join('\n');
   // dyld checks the root directory itself; Node queries its page size and OS
   // identity. Neither permission grants recursive reads of the host home.
-  const sysctls = ['hw.pagesize_compat', 'kern.ostype', 'kern.osrelease', 'kern.version', 'kern.hostname', 'hw.machine']
+  const sysctls = ['hw.pagesize_compat', 'hw.logicalcpu', 'kern.ostype', 'kern.osrelease', 'kern.version', 'kern.hostname', 'hw.machine']
     .map((name) => `(sysctl-name ${sandboxLiteral(name)})`).join(' ');
   // Apple's /usr/bin/git launcher may be used by nested repository tools.
   // Admit its metadata and loader only when that exact CLT Git is configured.
@@ -534,6 +537,7 @@ function macosValidationSandboxProfile(
 (deny default)
 (deny network*)
 (allow process*)
+(allow signal (target same-sandbox))
 (allow file-read* file-test-existence (literal "/"))
 (allow file-read-metadata (literal "/tmp") (literal "/var"))
 (allow sysctl-read ${sysctls})
@@ -643,6 +647,12 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     if (revision === null || !Array.isArray(configured) || configured.length === 0) {
       return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
     }
+    const hydratedRoots = this.configuration.hydratedDependencyRoots ?? ['node_modules'];
+    if (!Array.isArray(hydratedRoots) || hydratedRoots.length === 0 || new Set(hydratedRoots).size !== hydratedRoots.length ||
+      hydratedRoots.some((root) => typeof root !== 'string' || /\s|\\|\0/.test(root) || path.posix.isAbsolute(root) ||
+        root.split('/').some((part) => part === '' || part === '.' || part === '..') || root.split('/').at(-1) !== 'node_modules')) {
+      return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
+    }
     const evidence: LocalValidationCommandEvidence[] = [];
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
@@ -730,7 +740,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         const isFinal = index === configured.length - 1;
         const manifestAdmitted = manifest !== null && (
           isHydration
-            ? isHydratedDependencyManifest(manifest)
+            ? isHydratedDependencyManifest(manifest, hydratedRoots)
             : isFinal && terminalGeneratedIgnoredRoots.length > 0
               ? terminalGeneratedManifestMatches(manifest, hydratedManifest, terminalGeneratedIgnoredRoots)
               : manifest.join('\n') === hydratedManifest.join('\n')

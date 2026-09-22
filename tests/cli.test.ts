@@ -263,9 +263,21 @@ describe('CLI command layer', () => {
     assert.deepEqual(
       resolveLocalValidationConfiguration({
         TACHIKO_NODE_PROGRAM: '/opt/tachiko/node/bin/node', TACHIKO_PNPM_PROGRAM: '/opt/tachiko/pnpm/bin/pnpm', TACHIKO_GIT_PROGRAM: '/opt/tachiko/git/bin/git',
-        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM', pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM', gitProgramEnvironment: 'TACHIKO_GIT_PROGRAM', terminalGeneratedIgnoredRoots: ['dist'], commands: [{ argv: ['pnpm', 'test'], timeoutMs: 100 }] }),
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM', pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM', gitProgramEnvironment: 'TACHIKO_GIT_PROGRAM', hydratedDependencyRoots: ['node_modules', 'apps/control-tower/node_modules'], terminalGeneratedIgnoredRoots: ['dist'], commands: [{ argv: ['pnpm', 'test'], timeoutMs: 100 }] }),
       }),
-      { revision: 'repo-v1', nodeProgram: '/opt/tachiko/node/bin/node', pnpmProgram: '/opt/tachiko/pnpm/bin/pnpm', gitProgram: '/opt/tachiko/git/bin/git', terminalGeneratedIgnoredRoots: ['dist'], commands: [{ argv: ['/opt/tachiko/pnpm/bin/pnpm', 'test'], timeoutMs: 100 }] },
+      { revision: 'repo-v1', nodeProgram: '/opt/tachiko/node/bin/node', pnpmProgram: '/opt/tachiko/pnpm/bin/pnpm', gitProgram: '/opt/tachiko/git/bin/git', hydratedDependencyRoots: ['node_modules', 'apps/control-tower/node_modules'], terminalGeneratedIgnoredRoots: ['dist'], commands: [{ argv: ['/opt/tachiko/pnpm/bin/pnpm', 'test'], timeoutMs: 100 }] },
+    );
+    for (const roots of [
+      [], [''], ['node_modules/'], ['./node_modules'], ['../node_modules'], ['apps\\control-tower/node_modules'], ['/node_modules'], ['apps/control tower/node_modules'], ['apps/control-tower/not-modules'], ['node_modules', 'node_modules'], ['apps/control-tower/node_modules\0'],
+    ]) {
+      assert.throws(
+        () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', hydratedDependencyRoots: roots, commands: [{ argv: ['tool'], timeoutMs: 100 }] }) }),
+        /hydratedDependencyRoots/,
+      );
+    }
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', hydratedDependencyRoots: 'node_modules', commands: [{ argv: ['tool'], timeoutMs: 100 }] }) }),
+      /hydratedDependencyRoots must be a non-empty string array/,
     );
     assert.throws(
       () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM', commands: [{ argv: ['pnpm'], timeoutMs: 100 }] }) }),

@@ -446,6 +446,8 @@ containing `store/` and `pnpm-lock.yaml.sha256` (the SHA-256 of the candidate
 lockfile),
 then run `scripts/issue-104-deploy.sh preflight`. This reads only local policy
 and the qualified Luna config—no GitHub, pnpm install, or model turn. The
+offline hydration is host-owned and allows exactly `node_modules` and
+`apps/control-tower/node_modules` as dependency roots.
 production validator executes pnpm only by that explicit path, under macOS
 `sandbox-exec` with IP networking and default filesystem access denied. A fresh
 private copy of the lockfile-bound store permits pnpm's project metadata writes;
