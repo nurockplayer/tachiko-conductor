@@ -62,6 +62,30 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(result.status, 'passed');
   });
 
+  it('admits only the configured Git executable and runtime-root temp under the macOS validation sandbox', { skip: process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec') }, async () => {
+    const owned = request('pnpm@10.34.5');
+    const git = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(git, '');
+    const pnpm = pinnedPnpm(owned.workspacePath, '10.34.5');
+    writeFileSync(pnpm, `#!/bin/sh
+if [ "$1" = --version ]; then printf '%s\\n' 10.34.5; exit 0; fi
+[ -n "$TMPDIR" ] && [ "$TMPDIR" = "$TMP" ] && [ "$TMPDIR" = "$TEMP" ] || exit 91
+: > "$TMPDIR/toolchain-probe" || exit 92
+git --version >/dev/null 2>&1 || exit 93
+if command -v curl >/dev/null 2>&1 && curl --version >/dev/null 2>&1; then exit 94; fi
+exit 0
+`);
+    chmodSync(pnpm, 0o755);
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'darwin-explicit-git-v1',
+      nodeProgram: process.execPath,
+      pnpmProgram: pnpm,
+      gitProgram: git,
+      commands: [{ argv: [pnpm, 'test'], timeoutMs: 30_000 }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+  });
+
   it('binds pnpm validation authority to the exact repository packageManager pin', () => {
     const owned = request();
     const matching = pinnedPnpm(owned.workspacePath, '10.34.5');
@@ -126,10 +150,14 @@ describe('ConfiguredLocalValidationAdapter', () => {
       CODEX_HOME: process.env.CODEX_HOME,
       TACHIKO_LUNA_CODEX_HOME: process.env.TACHIKO_LUNA_CODEX_HOME,
       UNRELATED_SECRET: process.env.UNRELATED_SECRET,
+      TMPDIR: process.env.TMPDIR,
+      TMP: process.env.TMP,
+      TEMP: process.env.TEMP,
     };
     Object.assign(process.env, {
       GITHUB_TOKEN: 'github-secret', SSH_AUTH_SOCK: '/tmp/ssh-agent', CHATGPT_API_KEY: 'chatgpt-secret',
       CODEX_HOME: '/tmp/codex-home', TACHIKO_LUNA_CODEX_HOME: '/tmp/luna-home', UNRELATED_SECRET: 'secret',
+      TMPDIR: '/ambient/tmpdir', TMP: '/ambient/tmp', TEMP: '/ambient/temp',
     });
     try {
       const result = await new ConfiguredLocalValidationAdapter(configuration([
@@ -148,6 +176,13 @@ describe('ConfiguredLocalValidationAdapter', () => {
       assert.equal(environment.CODEX_HOME, undefined);
       assert.equal(environment.TACHIKO_LUNA_CODEX_HOME, undefined);
       assert.equal(environment.UNRELATED_SECRET, undefined);
+      assert.match(environment.TMPDIR!, /tachiko-validation-runtime-/);
+      assert.equal(environment.TMP, environment.TMPDIR);
+      assert.equal(environment.TEMP, environment.TMPDIR);
+      assert.notEqual(environment.TMPDIR, '/ambient/tmpdir');
+      assert.equal(environment.GIT_CONFIG_NOSYSTEM, '1');
+      assert.equal(environment.GIT_CONFIG_GLOBAL, '/dev/null');
+      assert.match(environment.GIT_TEMPLATE_DIR!, /tachiko-validation-runtime-/);
     } finally {
       for (const [key, value] of Object.entries(inherited)) {
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
@@ -249,6 +284,65 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(result.commands.length, 2);
     assert.equal(result.commands[1]?.outcome, 'unavailable');
     assert.equal(existsSync(marker), false);
+  });
+
+  it('admits an explicitly configured ignored output root only from the final command', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'dist/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore generated output'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'terminal-generated-output-v1',
+      terminalGeneratedIgnoredRoots: ['dist'],
+      commands: [{
+        argv: [process.execPath, '-e', "require('node:fs').mkdirSync('dist', { recursive: true }); require('node:fs').writeFileSync('dist/output.js', 'built')"],
+        timeoutMs: 1_000,
+      }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+  });
+
+  it('does not let terminal generated-output authority leak to an intermediate command', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'dist/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore generated output'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'second-command-ran');
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'terminal-generated-output-intermediate-v1',
+      terminalGeneratedIgnoredRoots: ['dist'],
+      commands: [
+        {
+          argv: [process.execPath, '-e', "require('node:fs').mkdirSync('dist', { recursive: true }); require('node:fs').writeFileSync('dist/output.js', 'built')"],
+          timeoutMs: 1_000,
+        },
+        { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 },
+      ],
+    }).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(existsSync(marker), false);
+  });
+
+  it('fails closed when the final command creates an unexpected ignored output root', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'dist/\ncache/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore generated output'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'terminal-generated-output-unexpected-v1',
+      terminalGeneratedIgnoredRoots: ['dist'],
+      commands: [{
+        argv: [process.execPath, '-e', "const fs=require('node:fs'); fs.mkdirSync('dist',{recursive:true}); fs.writeFileSync('dist/output.js','built'); fs.mkdirSync('cache',{recursive:true}); fs.writeFileSync('cache/leak','unexpected')"],
+        timeoutMs: 1_000,
+      }],
+    }).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.commands.at(-1)?.outcome, 'unavailable');
   });
 
   it('uses only a matching host lockfile-bound store for cold offline hydration and freezes its node_modules manifest', async () => {
