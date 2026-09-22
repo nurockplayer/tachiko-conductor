@@ -439,6 +439,8 @@ exact candidate, and the hosted-check policy. Luna rejects `standard`,
 `complex`, and `critical` before provider construction; they are not quiet
 fallback routes.
 
+The repository pins Node.js **24.21.0 LTS (Krypton)** in `.node-version` and supports the current Node 24 LTS line from 24.21.0 onward. Production preflight rejects older Node releases and non-24 majors.
+
 From a stable merged checkout, set `TACHIKO_NODE_PROGRAM`,
 `TACHIKO_PNPM_PROGRAM`, and `TACHIKO_GIT_PROGRAM` to the host-provisioned absolute Node, pnpm, and Git paths.
 Git must use the qualified Apple Command Line Tools runtime: its credential-free

@@ -10,7 +10,10 @@ import {
   PRODUCTION_EXECUTION_PROFILE_CONFIG,
   PRODUCTION_HOSTED_CHECK_POLICY_CONFIG,
   PRODUCTION_LOCAL_VALIDATION_CONFIG,
+  PRODUCTION_NODE_ENGINE_RANGE,
+  PRODUCTION_NODE_MIN_VERSION,
   PRODUCTION_POLICY_REVISION,
+  isSupportedProductionNodeVersion,
   preflightProductionPolicy,
 } from '../src/production-policy.js';
 
@@ -32,6 +35,7 @@ function environment(home: string): NodeJS.ProcessEnv {
 }
 
 const supportedGitRuntime = (_program: string): boolean => true;
+const supportedNodeRuntime = (_program: string): boolean => true;
 
 describe('#104 production policy', () => {
   it('uses the real credential-free CLT qualifier by default', { skip: process.platform !== 'darwin' }, () => {
@@ -80,13 +84,45 @@ describe('#104 production policy', () => {
         }
         for (const candidate of [executable, symlink]) {
           const supplied = { ...env, [authority]: candidate };
-          assert.equal(preflightProductionPolicy(supplied, supportedGitRuntime).revision, PRODUCTION_POLICY_REVISION);
+          assert.equal(preflightProductionPolicy(
+            supplied,
+            supportedGitRuntime,
+            authority === 'TACHIKO_NODE_PROGRAM' ? supportedNodeRuntime : undefined,
+          ).revision, PRODUCTION_POLICY_REVISION);
           const sourced = spawnSync('/bin/sh', ['-c', '. "$1"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], { encoding: 'utf8', env: supplied });
           assert.equal(sourced.status, 0, sourced.stderr);
         }
       } finally { rmSync(root, { recursive: true, force: true }); }
     });
   }
+
+  it('pins the latest Node 24 LTS runtime contract', () => {
+    const manifest = JSON.parse(readFileSync(path.resolve('package.json'), 'utf8')) as { engines?: { node?: string } };
+    assert.equal(PRODUCTION_NODE_MIN_VERSION, '24.21.0');
+    assert.equal(PRODUCTION_NODE_ENGINE_RANGE, '>=24.21.0 <25');
+    assert.equal(manifest.engines?.node, PRODUCTION_NODE_ENGINE_RANGE);
+    assert.equal(readFileSync(path.resolve('.node-version'), 'utf8').trim(), PRODUCTION_NODE_MIN_VERSION);
+    assert.equal(isSupportedProductionNodeVersion('v24.21.0'), true);
+    assert.equal(isSupportedProductionNodeVersion('24.22.3'), true);
+    assert.equal(isSupportedProductionNodeVersion('v24.20.9'), false);
+    assert.equal(isSupportedProductionNodeVersion('v23.99.0'), false);
+    assert.equal(isSupportedProductionNodeVersion('v25.0.0'), false);
+  });
+
+  it('rejects a production Node runtime outside the pinned LTS line', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-production-node-'));
+    try {
+      const home = path.join(root, 'luna');
+      mkdirSync(home);
+      writeFileSync(path.join(home, 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
+      const env = environment(home);
+      assert.throws(
+        () => preflightProductionPolicy(env, supportedGitRuntime, () => false),
+        /Node\.js 24\.21\.0 LTS or newer 24\.x runtime/,
+      );
+      assert.equal(preflightProductionPolicy(env, supportedGitRuntime, supportedNodeRuntime).revision, PRODUCTION_POLICY_REVISION);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
 
   it('declares hosted checks explicitly not_required with no required context', () => {
     assert.deepEqual(PRODUCTION_HOSTED_CHECK_POLICY_CONFIG, {

@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
@@ -14,7 +15,39 @@ import { hasSupportedProductionGitRuntime } from './validation/local-command.js'
  * reboot-safe transport used by launchd/deployment; these values make its
  * contract testable without sourcing a user shell.
  */
-export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v6';
+export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v7';
+export const PRODUCTION_NODE_MIN_VERSION = '24.21.0';
+export const PRODUCTION_NODE_ENGINE_RANGE = '>=24.21.0 <25';
+
+export function isSupportedProductionNodeVersion(version: string): boolean {
+  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version.trim());
+  if (match === null) return false;
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  return major === 24 && minor >= 21 && Number.isSafeInteger(patch) && patch >= 0;
+}
+
+export function hasSupportedProductionNodeRuntime(program: string): boolean {
+  try {
+    const result = spawnSync(program, ['--version'], {
+      encoding: 'utf8',
+      shell: false,
+      timeout: 5_000,
+      env: process.platform === 'win32'
+        ? {
+            PATH: process.env.Path ?? process.env.PATH ?? 'C:\\Windows\\System32',
+            SystemRoot: process.env.SystemRoot ?? 'C:\\Windows',
+            COMSPEC: process.env.COMSPEC ?? 'C:\\Windows\\System32\\cmd.exe',
+            PATHEXT: process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD',
+          }
+        : { PATH: '/usr/bin:/bin' },
+    });
+    return result.status === 0 && result.signal === null && isSupportedProductionNodeVersion(result.stdout);
+  } catch {
+    return false;
+  }
+}
 export const PRODUCTION_EXECUTION_PROFILE_CONFIG = {
   revision: PRODUCTION_POLICY_REVISION,
   profiles: {
@@ -99,6 +132,7 @@ function isAbsoluteExecutableFile(file: string | undefined): boolean {
 export function preflightProductionPolicy(
   env: NodeJS.ProcessEnv = process.env,
   gitRuntimeIsSupported: (program: string) => boolean = hasSupportedProductionGitRuntime,
+  nodeRuntimeIsSupported: (program: string) => boolean = hasSupportedProductionNodeRuntime,
 ): ProductionPolicyPreflight {
   const executionRaw = env.TACHIKO_EXECUTION_PROFILE_CONFIG;
   const localRaw = env.TACHIKO_LOCAL_VALIDATION_CONFIG;
@@ -120,6 +154,9 @@ export function preflightProductionPolicy(
   }
   if (!isAbsoluteExecutableFile(nodeProgram)) {
     throw new Error('Issue #104 production preflight requires TACHIKO_NODE_PROGRAM to be an absolute regular executable file.');
+  }
+  if (!nodeRuntimeIsSupported(nodeProgram!)) {
+    throw new Error(`Issue #104 production preflight requires Node.js ${PRODUCTION_NODE_MIN_VERSION} LTS or newer 24.x runtime.`);
   }
   if (!isAbsoluteExecutableFile(pnpmProgram)) {
     throw new Error('Issue #104 production preflight requires TACHIKO_PNPM_PROGRAM to be an absolute regular executable file.');
