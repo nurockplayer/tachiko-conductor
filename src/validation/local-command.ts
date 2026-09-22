@@ -470,7 +470,18 @@ function macosValidationSandboxProfile(
     if (gitProgram !== undefined) {
       git = realpathSync(gitProgram);
       const probe = spawnSync(gitProgram, ['--exec-path'], {
-        encoding: 'utf8', shell: false, timeout: TOOL_VERSION_TIMEOUT_MS,
+        encoding: 'utf8',
+        shell: false,
+        timeout: TOOL_VERSION_TIMEOUT_MS,
+        env: {
+          HOME: runtimeRoot,
+          TMPDIR: runtimeRoot,
+          TMP: runtimeRoot,
+          TEMP: runtimeRoot,
+          GIT_CONFIG_NOSYSTEM: '1',
+          GIT_CONFIG_GLOBAL: '/dev/null',
+          GIT_TERMINAL_PROMPT: '0',
+        },
       });
       if (probe.status !== 0 || probe.signal !== null || probe.stdout.trim() === '') return null;
       gitExecPath = realpathSync(probe.stdout.trim());
