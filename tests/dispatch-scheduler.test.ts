@@ -143,6 +143,7 @@ describe('dispatch scheduler boundary', () => {
     assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
     assert.match(plist, /<key>TACHIKO_NODE_PROGRAM<\/key><string>\/Users\/example\/\.local\/node\/bin\/node<\/string>/);
     assert.match(plist, /<key>TACHIKO_PNPM_PROGRAM<\/key><string>\/Users\/example\/\.local\/node\/bin\/pnpm<\/string>/);
+    assert.match(plist, /<key>TACHIKO_GIT_PROGRAM<\/key><string>\/usr\/bin\/git<\/string>/);
     assert.match(plist, /<key>TACHIKO_PNPM_DEPENDENCY_ARTIFACT<\/key><string>\/Users\/example\/\.local\/tachiko\/pnpm-store<\/string>/);
     assert.match(plist, /<key>TACHIKO_LUNA_CODEX_HOME<\/key><string>\/Users\/example\/\.tachiko\/luna-codex-home<\/string>/);
     assert.match(plist, /<key>TACHIKO_PLAYWRIGHT_BROWSERS_PATH<\/key><string>\/Users\/example\/\.tachiko\/playwright-browsers<\/string>/);
