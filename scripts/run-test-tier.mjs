@@ -10,7 +10,9 @@ const tier = process.argv[2];
 const all = readdirSync(tests).filter((file) => file.endsWith('.test.ts')).sort();
 const selected = selectTests(tier, all);
 const tsx = tsxInvocation(root);
-const result = spawnSync(tsx.command, [...tsx.arguments, '--test', ...selected.map((file) => path.join('tests', file))], {
+// Each file may spawn Git, browser, and validator children. Bound file-level
+// parallelism so their process deadlines remain meaningful on shared hosts.
+const result = spawnSync(tsx.command, [...tsx.arguments, '--test', '--test-concurrency=2', ...selected.map((file) => path.join('tests', file))], {
   cwd: root,
   env: environmentForTier(tier),
   stdio: 'inherit',

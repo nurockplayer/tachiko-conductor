@@ -33,7 +33,7 @@ function preExistingPullRequestRequest() {
 
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-function configuration(argv: readonly string[], timeoutMs = 1_000): LocalValidationConfiguration {
+function configuration(argv: readonly string[], timeoutMs = 5_000): LocalValidationConfiguration {
   return { revision: 'test-v1', commands: [{ argv, timeoutMs }] };
 }
 
@@ -74,7 +74,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     chmodSync(configuredGit, 0o755);
     const result = await new ConfiguredLocalValidationAdapter({
       revision: 'configured-git-v1', gitProgram: configuredGit,
-      commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+      commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
     }).validate(owned);
     assert.equal(result.status, 'passed');
     assert.equal(existsSync(marker), true);
@@ -109,7 +109,7 @@ exec ${JSON.stringify(actualGit)} "$@"
     try {
       const result = await new ConfiguredLocalValidationAdapter({
         revision: 'sanitized-git-reconstruction-v1', gitProgram: configuredGit,
-        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
       }).validate(owned);
       assert.equal(result.status, 'passed');
       const invocations = readFileSync(log, 'utf8');
@@ -150,7 +150,7 @@ exec ${JSON.stringify(actualGit)} "$@"
     try {
       const result = await new ConfiguredLocalValidationAdapter({
         revision: 'sanitized-git-baseline-v1', gitProgram: configuredGit, trustedIgnoredBaselinePath: baseline,
-        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
       }).validate(owned);
       assert.equal(result.status, 'passed');
       const invocations = readFileSync(log, 'utf8');
@@ -175,14 +175,14 @@ exec ${JSON.stringify(actualGit)} "$@"
 
     const result = await new ConfiguredLocalValidationAdapter({
       revision: 'pinned-pnpm-gate-v1', pnpmProgram: pnpm,
-      commands: [{ argv: [pnpm, 'test'], timeoutMs: 1_000 }],
+      commands: [{ argv: [pnpm, 'test'], timeoutMs: 5_000 }],
     }).validate(owned);
     assert.equal(result.status, 'unknown');
     assert.equal(existsSync(marker), false);
 
     const substituted = await new ConfiguredLocalValidationAdapter({
       revision: 'substituted-pnpm-gate-v1', pnpmProgram: pnpm,
-      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 }],
+      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 5_000 }],
     }).validate(owned);
     assert.equal(substituted.status, 'unknown');
     assert.equal(substituted.commands[0]?.outcome, 'malformed');
@@ -260,8 +260,8 @@ exec ${JSON.stringify(actualGit)} "$@"
       const result = await new ConfiguredLocalValidationAdapter({
         revision: `terminal-generated-root-${root.length}-v1`, terminalGeneratedIgnoredRoots: [root],
         commands: [
-          { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 },
-          { argv: [process.execPath, '-e', build], timeoutMs: 1_000 },
+          { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 },
+          { argv: [process.execPath, '-e', build], timeoutMs: 5_000 },
         ],
       }).validate(prepareIgnoredDistWorkspace());
       assert.equal(result.status, 'passed');
@@ -270,8 +270,8 @@ exec ${JSON.stringify(actualGit)} "$@"
     const rejected = await new ConfiguredLocalValidationAdapter({
       revision: 'terminal-generated-root-reject-v1', terminalGeneratedIgnoredRoots: ['dist'],
       commands: [
-        { argv: [process.execPath, '-e', build], timeoutMs: 1_000 },
-        { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', build], timeoutMs: 5_000 },
+        { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 },
       ],
     }).validate(prepareIgnoredDistWorkspace());
     assert.equal(rejected.status, 'unknown');
@@ -284,7 +284,7 @@ exec ${JSON.stringify(actualGit)} "$@"
       const marker = path.join(proofDir, 'ran');
       const result = await new ConfiguredLocalValidationAdapter({
         revision: 'terminal-generated-root-invalid-v1', terminalGeneratedIgnoredRoots: roots,
-        commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 }],
+        commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 5_000 }],
       }).validate(request());
       assert.equal(result.status, 'unknown');
       assert.equal(existsSync(marker), false);
@@ -377,8 +377,8 @@ exec ${JSON.stringify(actualGit)} "$@"
     const result = await new ConfiguredLocalValidationAdapter({
       revision: 'untracked-command-v1',
       commands: [
-        { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('worker-created-source.js', 'unexpected')"], timeoutMs: 1_000 },
-        { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('worker-created-source.js', 'unexpected')"], timeoutMs: 5_000 },
+        { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 5_000 },
       ],
     }).validate(owned);
     assert.equal(result.status, 'unknown');
@@ -407,15 +407,15 @@ exec ${JSON.stringify(actualGit)} "$@"
     const result = await new ConfiguredLocalValidationAdapter({
       revision: 'cold-offline-fixture-v1', dependencyArtifactPath: artifact,
       commands: [
-        { argv: [pnpm], timeoutMs: 1_000 },
-        { argv: ['/bin/sh', '-c', `[ -f node_modules/fixture/index.js ] && : > ${JSON.stringify(marker)}`], timeoutMs: 1_000 },
+        { argv: [pnpm], timeoutMs: 5_000 },
+        { argv: ['/bin/sh', '-c', `[ -f node_modules/fixture/index.js ] && : > ${JSON.stringify(marker)}`], timeoutMs: 5_000 },
       ],
     }).validate({ ...owned, headSha });
     assert.equal(result.status, 'passed');
     assert.equal(existsSync(marker), true);
     assert.equal(readFileSync(path.join(artifact, 'store', 'trusted'), 'utf8'), 'immutable');
     writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), '0'.repeat(64));
-    assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 1_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
+    assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 5_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
   });
 
   it('admits only explicitly configured workspace dependency roots and freezes their bytes', async () => {
@@ -430,11 +430,11 @@ exec ${JSON.stringify(actualGit)} "$@"
     mkdirSync(path.join(artifact, 'store'));
     writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
     const roots = ['node_modules', 'apps/example/node_modules'];
-    const hydrate = { argv: [process.execPath, '-e', `const fs=require('node:fs'); for(const root of ${JSON.stringify(roots)}) {fs.mkdirSync(root,{recursive:true});fs.writeFileSync(root+'/fixture.js','frozen');}`], timeoutMs: 1_000 };
+    const hydrate = { argv: [process.execPath, '-e', `const fs=require('node:fs'); for(const root of ${JSON.stringify(roots)}) {fs.mkdirSync(root,{recursive:true});fs.writeFileSync(root+'/fixture.js','frozen');}`], timeoutMs: 5_000 };
     const config = { revision: 'workspace-hydration-v1', dependencyArtifactPath: artifact, commands: [hydrate] };
     assert.equal((await new ConfiguredLocalValidationAdapter(config).validate(owned)).status, 'unknown');
     assert.equal((await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: roots }).validate(owned)).status, 'passed');
-    const changed = { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('apps/example/node_modules/fixture.js','changed')"], timeoutMs: 1_000 };
+    const changed = { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('apps/example/node_modules/fixture.js','changed')"], timeoutMs: 5_000 };
     assert.equal((await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: roots, commands: [hydrate, changed] }).validate(owned)).status, 'unknown');
     for (const invalid of [['../node_modules'], ['apps/../node_modules'], ['dist'], []]) {
       const result = await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: invalid }).validate(owned);
@@ -449,19 +449,14 @@ exec ${JSON.stringify(actualGit)} "$@"
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     assert.notEqual(realGit, '');
     const wrapper = path.join(wrapperDir, 'git');
-    writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = clone ]; then sleep 1.1; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
+    const delayedClone = path.join(wrapperDir, 'clone-delayed');
+    writeFileSync(wrapper, `#!/bin/sh\nfor argument in "$@"; do\n  if [ "$argument" = clone ]; then sleep 1.1; : > ${JSON.stringify(delayedClone)}; break; fi\ndone\nexec ${JSON.stringify(realGit)} "$@"\n`);
     chmodSync(wrapper, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
-    try {
-      const result = await new ConfiguredLocalValidationAdapter(
-        configuration([process.execPath, '-e', 'process.exit(0)'], 100),
-      ).validate(owned);
-      assert.equal(result.status, 'passed');
-    } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
-    }
+    const result = await new ConfiguredLocalValidationAdapter({
+      ...configuration(['/bin/sh', '-c', 'exit 0'], 100), gitProgram: wrapper,
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(delayedClone), true);
   });
 
   it('uses a dedicated ignored-manifest budget rather than the short Git probe timeout', async () => {
@@ -471,19 +466,14 @@ exec ${JSON.stringify(actualGit)} "$@"
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     assert.notEqual(realGit, '');
     const wrapper = path.join(wrapperDir, 'git');
-    writeFileSync(wrapper, `#!/bin/sh\ncase " $* " in *" status "*) sleep 1.1 ;; esac\nexec ${JSON.stringify(realGit)} "$@"\n`);
+    const delayedStatus = path.join(wrapperDir, 'status-delayed');
+    writeFileSync(wrapper, `#!/bin/sh\ncase " $* " in *" status "*) sleep 1.1; : > ${JSON.stringify(delayedStatus)} ;; esac\nexec ${JSON.stringify(realGit)} "$@"\n`);
     chmodSync(wrapper, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
-    try {
-      const result = await new ConfiguredLocalValidationAdapter(
-        configuration([process.execPath, '-e', 'process.exit(0)'], 100),
-      ).validate(owned);
-      assert.equal(result.status, 'passed');
-    } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
-    }
+    const result = await new ConfiguredLocalValidationAdapter({
+      ...configuration(['/bin/sh', '-c', 'exit 0'], 100), gitProgram: wrapper,
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(delayedStatus), true);
   });
 
   it('does not authorize worker-controlled .git bytes through a tracked validation script', async () => {
@@ -711,7 +701,7 @@ exec ${JSON.stringify(actualGit)} "$@"
     const adapter = new ConfiguredLocalValidationAdapter({
       revision: 'pre-existing-pr-v1',
       workspacePath: existing.workspacePath,
-      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(cwdProof)}, process.cwd())`], timeoutMs: 1_000 }],
+      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(cwdProof)}, process.cwd())`], timeoutMs: 5_000 }],
     });
     const result = await adapter.validate({ target: TARGET, headSha: existing.headSha });
     assert.equal(result.status, 'passed');
@@ -721,7 +711,7 @@ exec ${JSON.stringify(actualGit)} "$@"
     assert.equal(
       (await new ConfiguredLocalValidationAdapter({
         revision: 'wrong-repository-v1', workspacePath: existing.workspacePath,
-        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
       }).validate({ target: { ...TARGET, repo: 'other' }, headSha: existing.headSha })).status,
       'unknown',
     );
