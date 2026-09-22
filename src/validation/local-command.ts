@@ -527,11 +527,14 @@ function macosValidationSandboxProfile(
   // identity. Neither permission grants recursive reads of the host home.
   const sysctls = ['hw.pagesize_compat', 'hw.logicalcpu', 'kern.ostype', 'kern.osrelease', 'kern.version', 'kern.hostname', 'hw.machine']
     .map((name) => `(sysctl-name ${sandboxLiteral(name)})`).join(' ');
-  // Apple's /usr/bin/git launcher may be used by nested repository tools.
-  // Admit its metadata and loader only when that exact CLT Git is configured.
-  const appleGitLauncher = git === '/Library/Developer/CommandLineTools/usr/bin/git'
+  // Apple's /usr/bin/git launcher may be configured directly or used by
+  // nested repository tools. Its credential-free exec-path probe must prove
+  // the CLT installation before admitting that installation's backing binary.
+  const usesCltGit = git === '/Library/Developer/CommandLineTools/usr/bin/git' ||
+    (git === '/usr/bin/git' && gitExecPath === '/Library/Developer/CommandLineTools/usr/libexec/git-core');
+  const appleGitLauncher = usesCltGit
     ? `(allow file-read-metadata (subpath "/Library/Developer/CommandLineTools"))
-(allow file-read* (literal "/Library/Developer/CommandLineTools") (literal "/Library/Developer/CommandLineTools/usr/lib/libxcrun.dylib") (literal "/private/var/db/xcode_select_link") (literal "/var/db/xcode_select_link"))`
+(allow file-read* (literal "/Library/Developer/CommandLineTools") (literal "/Library/Developer/CommandLineTools/usr/bin/git") (literal "/Library/Developer/CommandLineTools/usr/lib/libxcrun.dylib") (literal "/private/var/db/xcode_select_link") (literal "/var/db/xcode_select_link"))`
     : '';
   return `(version 1)
 (deny default)
