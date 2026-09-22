@@ -20,7 +20,7 @@ export const PRODUCTION_NODE_MIN_VERSION = '24.21.0';
 export const PRODUCTION_NODE_ENGINE_RANGE = '>=24.21.0 <25';
 
 export function isSupportedProductionNodeVersion(version: string): boolean {
-  const match = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(version.trim());
+  const match = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version.trim());
   if (match === null) return false;
   const major = Number(match[1]);
   const minor = Number(match[2]);
