@@ -32,6 +32,16 @@ if [ ! -x "$TACHIKO_PNPM_PROGRAM" ]; then
   exit 78
 fi
 export TACHIKO_PNPM_PROGRAM
+: "${TACHIKO_GIT_PROGRAM:?TACHIKO_GIT_PROGRAM must name the host-provisioned absolute Git executable}"
+case "$TACHIKO_GIT_PROGRAM" in
+  /*) ;;
+  *) echo "TACHIKO_GIT_PROGRAM must be an absolute path" >&2; exit 78 ;;
+esac
+if [ ! -x "$TACHIKO_GIT_PROGRAM" ]; then
+  echo "TACHIKO_GIT_PROGRAM is not executable: $TACHIKO_GIT_PROGRAM" >&2
+  exit 78
+fi
+export TACHIKO_GIT_PROGRAM
 : "${TACHIKO_PNPM_DEPENDENCY_ARTIFACT:?TACHIKO_PNPM_DEPENDENCY_ARTIFACT must name the host-created lockfile-bound pnpm artifact}"
 case "$TACHIKO_PNPM_DEPENDENCY_ARTIFACT" in
   /*) ;;
@@ -45,6 +55,6 @@ case "$TACHIKO_PLAYWRIGHT_BROWSERS_PATH" in
 esac
 export TACHIKO_PLAYWRIGHT_BROWSERS_PATH
 export TACHIKO_IMPLEMENTATION_AGENT='luna-isolated'
-export TACHIKO_EXECUTION_PROFILE_CONFIG='{"revision":"issue-104-production-v4","profiles":{"routine":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"standard":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"complex":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"critical":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"}}}'
-export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"issue-104-production-v4","playwrightBrowsersPathEnvironment":"TACHIKO_PLAYWRIGHT_BROWSERS_PATH","nodeProgramEnvironment":"TACHIKO_NODE_PROGRAM","pnpmProgramEnvironment":"TACHIKO_PNPM_PROGRAM","dependencyArtifactPathEnvironment":"TACHIKO_PNPM_DEPENDENCY_ARTIFACT","commands":[{"argv":["pnpm","install","--frozen-lockfile","--offline","--ignore-scripts"],"timeoutMs":300000},{"argv":["pnpm","test"],"timeoutMs":300000},{"argv":["pnpm","typecheck"],"timeoutMs":120000},{"argv":["pnpm","build"],"timeoutMs":120000}]}'
-export TACHIKO_HOSTED_CHECK_POLICY_CONFIG='{"revision":"issue-104-production-v4","mode":"not_required"}'
+export TACHIKO_EXECUTION_PROFILE_CONFIG='{"revision":"issue-104-production-v5","profiles":{"routine":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"standard":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"complex":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"},"critical":{"executor":"luna-isolated","model":"gpt-5.6-luna","reasoningEffort":"high","timeoutMs":900000,"sandboxMode":"workspace-write","approvalPolicy":"never"}}}'
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"issue-104-production-v5","playwrightBrowsersPathEnvironment":"TACHIKO_PLAYWRIGHT_BROWSERS_PATH","nodeProgramEnvironment":"TACHIKO_NODE_PROGRAM","pnpmProgramEnvironment":"TACHIKO_PNPM_PROGRAM","gitProgramEnvironment":"TACHIKO_GIT_PROGRAM","dependencyArtifactPathEnvironment":"TACHIKO_PNPM_DEPENDENCY_ARTIFACT","terminalGeneratedIgnoredRoots":["dist"],"commands":[{"argv":["pnpm","install","--frozen-lockfile","--offline","--ignore-scripts"],"timeoutMs":300000},{"argv":["pnpm","test"],"timeoutMs":300000},{"argv":["pnpm","typecheck"],"timeoutMs":120000},{"argv":["pnpm","build"],"timeoutMs":120000}]}'
+export TACHIKO_HOSTED_CHECK_POLICY_CONFIG='{"revision":"issue-104-production-v5","mode":"not_required"}'
