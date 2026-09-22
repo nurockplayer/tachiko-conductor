@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
-import { ConfiguredLocalValidationAdapter, copyDependencyStore, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
+import { ConfiguredLocalValidationAdapter, copyDependencyStore, disposePrivateTrees, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
 import { TARGET } from './helpers.js';
 
@@ -457,6 +457,83 @@ exec ${JSON.stringify(actualGit)} "$@"
     const pid = Number(readFileSync(pidFile, 'utf8').trim());
     assert.ok(Number.isSafeInteger(pid));
     assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+  });
+
+  it('cleans every owned private tree in one bounded child invocation', async () => {
+    const first = mkdtempSync(path.join(os.tmpdir(), 'tachiko-clean-first-'));
+    const second = mkdtempSync(path.join(os.tmpdir(), 'tachiko-clean-second-'));
+    dirs.push(first, second);
+    writeFileSync(path.join(first, 'first'), 'private');
+    mkdirSync(path.join(second, 'nested'));
+    writeFileSync(path.join(second, 'nested', 'second'), 'private');
+    assert.equal(await disposePrivateTrees([first, second]), true);
+    assert.equal(existsSync(first), false);
+    assert.equal(existsSync(second), false);
+  });
+
+  it('rejects unsafe cleanup targets before invoking a child', async () => {
+    for (const targets of [[], ['relative-path'], [path.parse(process.cwd()).root], ['/tmp/invalid\0path']]) {
+      assert.equal(await disposePrivateTrees(targets), false);
+    }
+  });
+
+  it('bounds a stalled cleanup child while the event loop remains responsive', async () => {
+    const privateTree = mkdtempSync(path.join(os.tmpdir(), 'tachiko-clean-stall-tree-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-clean-stall-tool-'));
+    dirs.push(privateTree, tools);
+    const pidFile = path.join(tools, 'cleaner.pid');
+    const stalledCleaner = path.join(tools, 'stalled-cleaner');
+    writeFileSync(stalledCleaner, `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\ntrap '' TERM\nwhile :; do :; done\n`);
+    chmodSync(stalledCleaner, 0o755);
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 10);
+    const startedAt = Date.now();
+    try {
+      assert.equal(await disposePrivateTrees([privateTree], { nodeProgram: stalledCleaner, timeoutMs: 1_000 }), false);
+    } finally {
+      clearInterval(ticker);
+    }
+    assert.ok(ticks > 0);
+    assert.ok(Date.now() - startedAt < 5_000);
+    assert.equal(existsSync(pidFile), true);
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    assert.ok(Number.isSafeInteger(pid));
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+  });
+
+  it('fails closed when private cleanup cannot be proven after passed commands', async () => {
+    const owned = request();
+    const attempted: string[][] = [];
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, '-e', 'process.exit(0)']),
+      undefined,
+      async (paths) => { attempted.push([...paths]); return false; },
+    ).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.commands[0]?.outcome, 'passed');
+    assert.equal(result.commands[1]?.outcome, 'unavailable');
+    assert.equal(attempted.length, 1);
+    assert.equal(attempted[0]?.length, 2);
+    for (const privateTree of attempted[0]!) {
+      assert.equal(existsSync(privateTree), true);
+      dirs.push(privateTree);
+    }
+  });
+
+  it('removes its snapshot when validation returns before creating its runtime', async () => {
+    const owned = request();
+    const attempted: string[][] = [];
+    const result = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', 'process.exit(0)']), playwrightBrowsersPath: 'relative-path',
+    }, undefined, async (paths) => {
+      attempted.push([...paths]);
+      dirs.push(...paths);
+      return disposePrivateTrees(paths);
+    }).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(attempted.length, 1);
+    assert.equal(attempted[0]?.length, 1);
+    assert.equal(existsSync(attempted[0]![0]!), false);
   });
 
   for (const copyOutcome of ['failed', 'timed_out'] as const) it(`reports unavailable ${copyOutcome} copy evidence before commands and removes its private runtime`, async () => {

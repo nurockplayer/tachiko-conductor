@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -18,6 +18,7 @@ const TERMINATION_GRACE_MS = 1_000;
 // impossible.
 const RECONSTRUCTION_TIMEOUT_MS = 30_000;
 const DEPENDENCY_STORE_COPY_TIMEOUT_MS = 30_000;
+const PRIVATE_TREE_CLEANUP_TIMEOUT_MS = 30_000;
 const IGNORED_MANIFEST_TIMEOUT_MS = 30_000;
 const SETTLEMENT_POLL_MS = 25;
 // `git status --ignored --untracked-files=all` can legitimately enumerate a
@@ -285,7 +286,6 @@ function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvide
 
 interface ValidationWorkspace {
   readonly path: string;
-  dispose(): void;
 }
 
 function containsGitlinks(workspacePath: string, invoke: (args: readonly string[]) => SpawnSyncReturns<string>): boolean | null {
@@ -328,8 +328,16 @@ function hasTrackedFilterAttributes(
  * newly-created Git directory containing only host-created clone metadata and
  * the cryptographically addressed exact commit.
  */
-function reconstructedWorkspace(sourcePath: string, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment()): ValidationWorkspace | null {
-  const snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-'));
+async function reconstructedWorkspace(
+  sourcePath: string,
+  headSha: string,
+  cleanPrivateTrees: PrivateTreeCleaner,
+  gitProgram = 'git',
+  environment = validatorGitEnvironment(),
+): Promise<ValidationWorkspace | null> {
+  let snapshot: string;
+  try { snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-')); }
+  catch { return null; }
   const invoke = (args: readonly string[]) => spawnSync(gitProgram, [
     '-c', `core.hooksPath=${os.devNull}`,
     '-c', 'core.fsmonitor=false',
@@ -362,12 +370,12 @@ function reconstructedWorkspace(sourcePath: string, headSha: string, gitProgram 
     // provenance needs its own host-qualified reconstruction boundary.
     const gitlinks = checkedOut?.status === 0 ? containsGitlinks(snapshot, invoke) : null;
     if (cloned.status !== 0 || disconnected?.status !== 0 || trackedFilters !== false || checkedOut?.status !== 0 || gitlinks !== false) {
-      rmSync(snapshot, { recursive: true, force: true });
+      try { await cleanPrivateTrees([snapshot]); } catch { /* fail closed below */ }
       return null;
     }
-    return { path: snapshot, dispose: () => rmSync(snapshot, { recursive: true, force: true }) };
+    return { path: snapshot };
   } catch {
-    rmSync(snapshot, { recursive: true, force: true });
+    try { await cleanPrivateTrees([snapshot]); } catch { /* fail closed below */ }
     return null;
   }
 }
@@ -507,6 +515,8 @@ async function execute(
 // a separate credential-free Node process: synchronous filesystem traversal
 // must never block the dispatcher event loop or outlive its own deadline.
 const DEPENDENCY_STORE_COPY_PROGRAM = "const { cpSync } = require('node:fs'); const [source, destination] = process.argv.slice(1); cpSync(source, destination, { recursive: true, verbatimSymlinks: true });";
+const PRIVATE_TREE_CLEANUP_PROGRAM = "const { rmSync } = require('node:fs'); for (const target of process.argv.slice(1)) rmSync(target, { recursive: true, force: true, maxRetries: 0 });";
+type PrivateTreeCleaner = (paths: readonly string[]) => Promise<boolean>;
 
 /**
  * Materialize a private pnpm store before any candidate command can start.
@@ -525,6 +535,26 @@ export async function copyDependencyStore(
   const result = await execute(-1, {
     argv: [nodeProgram, '-e', DEPENDENCY_STORE_COPY_PROGRAM, source, destination], timeoutMs,
   }, path.dirname(destination), {}, undefined);
+  return result.outcome === 'passed';
+}
+
+function isOwnedPrivateTreePath(value: string): boolean {
+  return path.isAbsolute(value) && !value.includes('\0') && path.resolve(value) !== path.parse(path.resolve(value)).root;
+}
+
+/** Host-side cleanup seam; candidate configuration cannot select its inputs or deadline. */
+export async function disposePrivateTrees(
+  paths: readonly string[],
+  options: { readonly timeoutMs?: number; readonly nodeProgram?: string } = {},
+): Promise<boolean> {
+  if (paths.length === 0 || !paths.every(isOwnedPrivateTreePath)) return false;
+  const timeoutMs = options.timeoutMs ?? PRIVATE_TREE_CLEANUP_TIMEOUT_MS;
+  const nodeProgram = options.nodeProgram ?? process.execPath;
+  if (!path.isAbsolute(nodeProgram) || !Number.isSafeInteger(timeoutMs) ||
+    timeoutMs < MIN_LOCAL_VALIDATION_TIMEOUT_MS || timeoutMs > MAX_LOCAL_VALIDATION_TIMEOUT_MS) return false;
+  const result = await execute(-1, {
+    argv: [nodeProgram, '-e', PRIVATE_TREE_CLEANUP_PROGRAM, ...paths], timeoutMs,
+  }, path.parse(path.resolve(paths[0]!)).root, {}, undefined);
   return result.outcome === 'passed';
 }
 
@@ -718,6 +748,8 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     // Internal test seam. It is not configuration or environment-driven, so
     // candidate code cannot select the copier or its deadline.
     private readonly copyStore: typeof copyDependencyStore = copyDependencyStore,
+    // Internal host test seam for bounded cleanup outcomes.
+    private readonly cleanPrivateTrees: PrivateTreeCleaner = disposePrivateTrees,
   ) {
     this.configRevision = configuration.revision;
   }
@@ -760,25 +792,31 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     // input so worker-controlled .git bytes have no validation authority.
     const baseline = this.configuration.trustedIgnoredBaselinePath;
     const commandWorkspace = baseline === undefined
-      ? reconstructedWorkspace(workspacePath, request.headSha, this.configuration.gitProgram, gitEnvironment)
-      : { path: baseline, dispose: () => {} };
+      ? await reconstructedWorkspace(workspacePath, request.headSha, this.cleanPrivateTrees, this.configuration.gitProgram, gitEnvironment)
+      : { path: baseline };
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
-    if (!validHostBrowserArtifacts(this.configuration.playwrightBrowsersPath)) {
-      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
-    }
-    const dependencyStore = lockfileBoundDependencyArtifact(commandWorkspace.path, this.configuration.dependencyArtifactPath);
-    if (this.configuration.dependencyArtifactPath !== undefined && dependencyStore === null) {
-      commandWorkspace.dispose();
-      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
-    }
-    // Keep the prefix short for Darwin's sockaddr_un path limit, including
-    // nested validation probes. Only this private mkdtemp directory enters
-    // the sandbox, and the canonical path admits its real metadata ancestors.
-    const runtimeRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'tcv-')));
-    const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
+    let runtimeRoot: string | undefined;
     try {
+      if (!validHostBrowserArtifacts(this.configuration.playwrightBrowsersPath)) {
+        return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      }
+      const dependencyStore = lockfileBoundDependencyArtifact(commandWorkspace.path, this.configuration.dependencyArtifactPath);
+      if (this.configuration.dependencyArtifactPath !== undefined && dependencyStore === null) {
+        return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      }
+      // Keep the prefix short for Darwin's sockaddr_un path limit, including
+      // nested validation probes. Only this private mkdtemp directory enters
+      // the sandbox, and the canonical path admits its real metadata ancestors.
+      try {
+        // Retain the created spelling until canonicalization succeeds so the
+        // finally block also owns a rare realpath failure after mkdtemp.
+        runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tcv-'));
+        runtimeRoot = realpathSync(runtimeRoot);
+      }
+      catch { return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] }; }
+      const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
       // pnpm writes project metadata even during offline hydration. Give each
       // command sequence a private copy, preserving the host artifact's bytes.
       const privateStore = dependencyStore === null ? undefined : path.join(runtimeRoot, 'store');
@@ -850,8 +888,15 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       }
       return { status: 'passed', configRevision: revision, commands: evidence };
     } finally {
-      rmSync(runtimeRoot, { recursive: true, force: true });
-      commandWorkspace.dispose();
+      const privateTrees = [
+        ...(runtimeRoot === undefined ? [] : [runtimeRoot]),
+        ...(baseline === undefined ? [commandWorkspace.path] : []),
+      ];
+      let cleaned = privateTrees.length === 0;
+      try { cleaned = cleaned || await this.cleanPrivateTrees(privateTrees); } catch { cleaned = false; }
+      if (!cleaned) {
+        return { status: 'unknown', configRevision: revision, commands: [...evidence, workspaceUnavailable(evidence.length)] };
+      }
     }
   }
 }
