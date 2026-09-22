@@ -34,6 +34,8 @@ export function createBootstrapGitFixture(options: { readonly branch?: string; r
   execFileSync('git', ['init', '--bare', remote], { stdio: 'ignore' });
   mkdirSync(source);
   git(source, ['init', '-b', branch]);
+  git(source, ['config', 'user.name', 'Tachiko']);
+  git(source, ['config', 'user.email', 'tachiko@example.invalid']);
   writeFileSync(path.join(source, 'README.md'), 'base\n');
   git(source, ['add', 'README.md']);
   git(source, ['-c', 'user.name=Tachiko', '-c', 'user.email=tachiko@example.invalid', 'commit', '-m', 'base']);

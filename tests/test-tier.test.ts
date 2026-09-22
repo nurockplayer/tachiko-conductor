@@ -1,7 +1,12 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 import path from 'node:path';
-import { environmentForTier, selectTests, tsxInvocation } from '../scripts/test-tier.mjs';
+import {
+  environmentForTier,
+  isolatedExcludedTests,
+  selectTests,
+  tsxInvocation,
+} from '../scripts/test-tier.mjs';
 
 describe('test tier runner', () => {
   it('uses Node with the tsx JavaScript entry point instead of a platform shim', () => {
@@ -19,16 +24,43 @@ describe('test tier runner', () => {
     assert.deepEqual(environmentForTier('unit', { PATH: '/bin' }), { PATH: '/bin' });
   });
 
-  it('keeps integration and smoke files out of the deterministic unit tier', () => {
+  it('keeps integration and smoke files out while full unit retains browser tests', () => {
     const files = [
       'browser-runtime-integration.test.ts',
       'claude-code-smoke.test.ts',
       'codex-cli-smoke.test.ts',
       'browser-agent-smoke.test.ts',
+      'browser-runtime.test.ts',
+      'control-tower-browser.test.ts',
+      'local-command-sandbox.test.ts',
       'workflow.test.ts',
     ];
-    assert.deepEqual(selectTests('unit', files), ['workflow.test.ts']);
+    assert.deepEqual(selectTests('unit', files), [
+      'browser-runtime.test.ts',
+      'control-tower-browser.test.ts',
+      'local-command-sandbox.test.ts',
+      'workflow.test.ts',
+    ]);
     assert.deepEqual(selectTests('integration', files), ['browser-runtime-integration.test.ts']);
     assert.deepEqual(selectTests('smoke:claude', files), ['claude-code-smoke.test.ts']);
+  });
+
+  it('uses the explicit host-only exclusion list for the isolated tier', () => {
+    assert.deepEqual(isolatedExcludedTests, [
+      'browser-runtime.test.ts',
+      'control-tower-browser.test.ts',
+      'local-command-sandbox.test.ts',
+    ]);
+
+    const files = [
+      'browser-runtime-integration.test.ts',
+      'claude-code-smoke.test.ts',
+      'browser-runtime.test.ts',
+      'control-tower-browser.test.ts',
+      'local-command-sandbox.test.ts',
+      'workflow.test.ts',
+      'other-network.test.ts',
+    ];
+    assert.deepEqual(selectTests('isolated', files), ['workflow.test.ts', 'other-network.test.ts']);
   });
 });

@@ -23,6 +23,7 @@ import {
   ConfiguredLocalValidationAdapter,
   MAX_LOCAL_VALIDATION_TIMEOUT_MS,
   MIN_LOCAL_VALIDATION_TIMEOUT_MS,
+  normalizeTerminalGeneratedIgnoredRoots,
 } from './validation/local-command.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
 import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
@@ -115,7 +116,7 @@ Usage:
   tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
   tachiko dispatch wake
   tachiko production preflight
-  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --pnpm-program <absolute-pnpm> --dependency-artifact-path <absolute-lockfile-bound-store> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
+  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --pnpm-program <absolute-pnpm> --git-program <absolute-git> --dependency-artifact-path <absolute-lockfile-bound-store> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
@@ -342,18 +343,60 @@ export function resolveLocalValidationConfiguration(
     (typeof record.trustedIgnoredBaselinePath !== 'string' || record.trustedIgnoredBaselinePath.trim() === '' || !path.isAbsolute(record.trustedIgnoredBaselinePath))) {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.trustedIgnoredBaselinePath must be an absolute non-empty path when supplied.');
   }
+  let terminalGeneratedIgnoredRoots: string[] | undefined;
+  if (record.terminalGeneratedIgnoredRoots !== undefined) {
+    if (!Array.isArray(record.terminalGeneratedIgnoredRoots) || record.terminalGeneratedIgnoredRoots.length === 0 ||
+      record.terminalGeneratedIgnoredRoots.some((value) => typeof value !== 'string' || value.trim() === '')) {
+      throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.terminalGeneratedIgnoredRoots must be a non-empty string array when supplied.');
+    }
+    terminalGeneratedIgnoredRoots = record.terminalGeneratedIgnoredRoots.map((value) => {
+      const rawRoot = (value as string).trim();
+      const normalized = normalizeTerminalGeneratedIgnoredRoots([rawRoot]);
+      if (normalized === null) {
+        throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.terminalGeneratedIgnoredRoots entries must stay inside the validation workspace.');
+      }
+      return normalized[0]!;
+    });
+    if (new Set(terminalGeneratedIgnoredRoots).size !== terminalGeneratedIgnoredRoots.length) {
+      throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.terminalGeneratedIgnoredRoots must not contain duplicates.');
+    }
+  }
+  let hydratedDependencyRoots: string[] | undefined;
+  if (record.hydratedDependencyRoots !== undefined) {
+    if (!Array.isArray(record.hydratedDependencyRoots) || record.hydratedDependencyRoots.length === 0 ||
+      record.hydratedDependencyRoots.some((value) => typeof value !== 'string')) {
+      throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.hydratedDependencyRoots must be a non-empty string array when supplied.');
+    }
+    hydratedDependencyRoots = record.hydratedDependencyRoots.map((value) => {
+      const root = value as string;
+      const components = root.split('/');
+      if (root.trim() !== root || /\s/.test(root) || root.includes('\\') || root.includes('\0') || path.posix.isAbsolute(root) ||
+        components.some((component) => component === '' || component === '.' || component === '..') ||
+        components[components.length - 1] !== 'node_modules') {
+        throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.hydratedDependencyRoots entries must be exact POSIX relative paths ending in node_modules without whitespace.');
+      }
+      return root;
+    });
+    if (new Set(hydratedDependencyRoots).size !== hydratedDependencyRoots.length) {
+      throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.hydratedDependencyRoots must not contain duplicates.');
+    }
+  }
   if (record.playwrightBrowsersPathEnvironment !== undefined && record.playwrightBrowsersPathEnvironment !== 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH') {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.playwrightBrowsersPathEnvironment must be TACHIKO_PLAYWRIGHT_BROWSERS_PATH when supplied.');
   }
   if (record.nodeProgramEnvironment !== undefined && record.nodeProgramEnvironment !== 'TACHIKO_NODE_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.nodeProgramEnvironment must be TACHIKO_NODE_PROGRAM when supplied.');
   if (record.pnpmProgramEnvironment !== undefined && record.pnpmProgramEnvironment !== 'TACHIKO_PNPM_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.pnpmProgramEnvironment must be TACHIKO_PNPM_PROGRAM when supplied.');
+  if (record.gitProgramEnvironment !== undefined && record.gitProgramEnvironment !== 'TACHIKO_GIT_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.gitProgramEnvironment must be TACHIKO_GIT_PROGRAM when supplied.');
   if (record.dependencyArtifactPathEnvironment !== undefined && record.dependencyArtifactPathEnvironment !== 'TACHIKO_PNPM_DEPENDENCY_ARTIFACT') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.dependencyArtifactPathEnvironment must be TACHIKO_PNPM_DEPENDENCY_ARTIFACT when supplied.');
   if ((record.nodeProgramEnvironment === undefined) !== (record.pnpmProgramEnvironment === undefined)) throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG must configure both Node and pnpm toolchain paths together.');
+  if (record.gitProgramEnvironment !== undefined && (record.nodeProgramEnvironment === undefined || record.pnpmProgramEnvironment === undefined)) throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG Git toolchain requires configured Node and pnpm toolchain paths.');
   const nodeProgram = record.nodeProgramEnvironment === undefined ? undefined : env.TACHIKO_NODE_PROGRAM;
   const pnpmProgram = record.pnpmProgramEnvironment === undefined ? undefined : env.TACHIKO_PNPM_PROGRAM;
+  const gitProgram = record.gitProgramEnvironment === undefined ? undefined : env.TACHIKO_GIT_PROGRAM;
   const dependencyArtifactPath = record.dependencyArtifactPathEnvironment === undefined ? undefined : env.TACHIKO_PNPM_DEPENDENCY_ARTIFACT;
   if (record.nodeProgramEnvironment !== undefined && (typeof nodeProgram !== 'string' || nodeProgram.trim() === '' || !path.isAbsolute(nodeProgram))) throw new Error('TACHIKO_NODE_PROGRAM must be an absolute host-provisioned runtime.');
   if (record.pnpmProgramEnvironment !== undefined && (typeof pnpmProgram !== 'string' || pnpmProgram.trim() === '' || !path.isAbsolute(pnpmProgram))) throw new Error('TACHIKO_PNPM_PROGRAM must be an absolute host-provisioned pnpm executable.');
+  if (record.gitProgramEnvironment !== undefined && (typeof gitProgram !== 'string' || gitProgram.trim() === '' || !path.isAbsolute(gitProgram))) throw new Error('TACHIKO_GIT_PROGRAM must be an absolute host-provisioned Git executable.');
   if (record.dependencyArtifactPathEnvironment !== undefined && (typeof dependencyArtifactPath !== 'string' || dependencyArtifactPath.trim() === '' || !path.isAbsolute(dependencyArtifactPath))) throw new Error('TACHIKO_PNPM_DEPENDENCY_ARTIFACT must be an absolute host-provisioned dependency artifact.');
   const playwrightBrowsersPath = record.playwrightBrowsersPathEnvironment === undefined ? undefined : env.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
   if (record.playwrightBrowsersPathEnvironment !== undefined &&
@@ -368,7 +411,10 @@ export function resolveLocalValidationConfiguration(
     ...(playwrightBrowsersPath === undefined ? {} : { playwrightBrowsersPath }),
     ...(nodeProgram === undefined ? {} : { nodeProgram }),
     ...(pnpmProgram === undefined ? {} : { pnpmProgram }),
+    ...(gitProgram === undefined ? {} : { gitProgram }),
+    ...(terminalGeneratedIgnoredRoots === undefined ? {} : { terminalGeneratedIgnoredRoots }),
     ...(dependencyArtifactPath === undefined ? {} : { dependencyArtifactPath }),
+    ...(hydratedDependencyRoots === undefined ? {} : { hydratedDependencyRoots }),
   };
 }
 
@@ -1386,6 +1432,7 @@ export async function main(argv: string[]): Promise<number> {
           program: { type: 'string' },
           'node-program': { type: 'string' },
           'pnpm-program': { type: 'string' },
+          'git-program': { type: 'string' },
           'dependency-artifact-path': { type: 'string' },
           'luna-codex-home': { type: 'string' },
           'playwright-browsers-path': { type: 'string' },
@@ -1395,13 +1442,14 @@ export async function main(argv: string[]): Promise<number> {
           'stderr-path': { type: 'string' },
         },
       });
-      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['pnpm-program'] === undefined || values['dependency-artifact-path'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program, --node-program, --pnpm-program, --dependency-artifact-path, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['pnpm-program'] === undefined || values['git-program'] === undefined || values['dependency-artifact-path'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, --pnpm-program, --git-program, --dependency-artifact-path, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
       }
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
         nodeProgram: values['node-program'],
         pnpmProgram: values['pnpm-program'],
+        gitProgram: values['git-program'],
         dependencyArtifactPath: values['dependency-artifact-path'],
         lunaCodexHome: values['luna-codex-home'],
         playwrightBrowsersPath: values['playwright-browsers-path'],
