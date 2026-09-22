@@ -253,6 +253,24 @@ describe('CLI command layer', () => {
       () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', trustedIgnoredBaselinePath: 'relative', commands: [{ argv: ['tool'], timeoutMs: 100 }] }) }),
       /trustedIgnoredBaselinePath must be an absolute non-empty path/,
     );
+    assert.deepEqual(
+      resolveLocalValidationConfiguration({
+        TACHIKO_PLAYWRIGHT_BROWSERS_PATH: '/var/lib/tachiko/playwright',
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', playwrightBrowsersPathEnvironment: 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH', commands: [{ argv: ['tool'], timeoutMs: 100 }] }),
+      }),
+      { revision: 'repo-v1', playwrightBrowsersPath: '/var/lib/tachiko/playwright', commands: [{ argv: ['tool'], timeoutMs: 100 }] },
+    );
+    assert.deepEqual(
+      resolveLocalValidationConfiguration({
+        TACHIKO_NODE_PROGRAM: '/opt/tachiko/node/bin/node', TACHIKO_PNPM_PROGRAM: '/opt/tachiko/pnpm/bin/pnpm',
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM', pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM', commands: [{ argv: ['pnpm', 'test'], timeoutMs: 100 }] }),
+      }),
+      { revision: 'repo-v1', nodeProgram: '/opt/tachiko/node/bin/node', pnpmProgram: '/opt/tachiko/pnpm/bin/pnpm', commands: [{ argv: ['/opt/tachiko/pnpm/bin/pnpm', 'test'], timeoutMs: 100 }] },
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM', commands: [{ argv: ['pnpm'], timeoutMs: 100 }] }) }),
+      /both Node and pnpm toolchain paths together/,
+    );
     assert.throws(
       () => resolveHostedCheckPolicyConfiguration({
         TACHIKO_HOSTED_CHECK_POLICY_CONFIG: JSON.stringify({ revision: 'repo-v1', mode: 'required', requiredCheckNames: [] }),

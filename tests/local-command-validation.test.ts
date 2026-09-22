@@ -3,29 +3,32 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
-import { ConfiguredLocalValidationAdapter } from '../src/validation/local-command.js';
+import { ConfiguredLocalValidationAdapter, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
 import { TARGET } from './helpers.js';
 
 const dirs: string[] = [];
 
-function request() {
+function request(packageManager?: string) {
   const workspacePath = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-'));
   dirs.push(workspacePath);
   for (const args of [['init'], ['config', 'user.email', 'validation@example.test'], ['config', 'user.name', 'Validation'], ['add', '.'], ['commit', '-m', 'initial']]) {
-    if (args[0] === 'add') writeFileSync(path.join(workspacePath, 'README.md'), 'validation\n');
+    if (args[0] === 'add') {
+      writeFileSync(path.join(workspacePath, 'README.md'), 'validation\n');
+      if (packageManager !== undefined) writeFileSync(path.join(workspacePath, 'package.json'), JSON.stringify({ packageManager }));
+    }
     assert.equal(spawnSync('git', ['-C', workspacePath, ...args], { encoding: 'utf8' }).status, 0);
   }
   const headSha = spawnSync('git', ['-C', workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  assert.equal(spawnSync('git', ['-C', workspacePath, 'remote', 'add', 'origin', 'https://github.com/acme/widgets.git'], { encoding: 'utf8' }).status, 0);
   return { target: TARGET, headSha, workspacePath };
 }
 
 function preExistingPullRequestRequest() {
-  const value = request();
-  assert.equal(spawnSync('git', ['-C', value.workspacePath, 'remote', 'add', 'origin', 'https://github.com/acme/widgets.git'], { encoding: 'utf8' }).status, 0);
-  return value;
+  return request();
 }
 
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
@@ -34,7 +37,70 @@ function configuration(argv: readonly string[], timeoutMs = 1_000): LocalValidat
   return { revision: 'test-v1', commands: [{ argv, timeoutMs }] };
 }
 
+function pinnedPnpm(workspacePath: string, version: string, exitCode = 0): string {
+  const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-pnpm-version-'));
+  dirs.push(tools);
+  const program = path.join(tools, 'pnpm');
+  writeFileSync(program, `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(version)}\nexit ${exitCode}\n`);
+  chmodSync(program, 0o755);
+  writeFileSync(path.join(workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.5' }));
+  return program;
+}
+
 describe('ConfiguredLocalValidationAdapter', () => {
+  it('runs configured absolute Node and repository-pinned absolute pnpm under the macOS seatbelt', { skip: process.platform !== 'darwin' || !existsSync(path.resolve('node_modules/.bin/pnpm')) }, async () => {
+    const owned = request();
+    const pnpm = path.resolve('node_modules/.bin/pnpm');
+    writeFileSync(path.join(owned.workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.5' }));
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'package.json'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'pin package manager'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'darwin-real-toolchain-v1', nodeProgram: process.execPath, pnpmProgram: pnpm,
+      commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+  });
+
+  it('binds pnpm validation authority to the exact repository packageManager pin', () => {
+    const owned = request();
+    const matching = pinnedPnpm(owned.workspacePath, '10.34.5');
+    const environment = { PATH: path.dirname(matching) };
+    assert.equal(hasPinnedPnpmAuthority(owned.workspacePath, matching, environment), true);
+
+    const mismatched = pinnedPnpm(owned.workspacePath, '10.34.4');
+    assert.equal(hasPinnedPnpmAuthority(owned.workspacePath, mismatched, { PATH: path.dirname(mismatched) }), false);
+    const unprovable = pinnedPnpm(owned.workspacePath, '10.34.5', 71);
+    assert.equal(hasPinnedPnpmAuthority(owned.workspacePath, unprovable, { PATH: path.dirname(unprovable) }), false);
+    writeFileSync(path.join(owned.workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.4' }));
+    assert.equal(hasPinnedPnpmAuthority(owned.workspacePath, matching, environment), false);
+  });
+
+  it('rejects substituted or mismatched pnpm before a validation command can run', async () => {
+    const owned = request('pnpm@10.34.5');
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'validation-ran');
+    const pnpm = pinnedPnpm(owned.workspacePath, '10.34.4');
+    writeFileSync(pnpm, `#!/bin/sh\nif [ "$1" = --version ]; then printf '%s\\n' 10.34.4; exit 0; fi\n: > ${JSON.stringify(marker)}\n`);
+    chmodSync(pnpm, 0o755);
+
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'pinned-pnpm-gate-v1', pnpmProgram: pnpm,
+      commands: [{ argv: [pnpm, 'test'], timeoutMs: 1_000 }],
+    }).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(existsSync(marker), false);
+
+    const substituted = await new ConfiguredLocalValidationAdapter({
+      revision: 'substituted-pnpm-gate-v1', pnpmProgram: pnpm,
+      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 }],
+    }).validate(owned);
+    assert.equal(substituted.status, 'unknown');
+    assert.equal(substituted.commands[0]?.outcome, 'malformed');
+    assert.equal(existsSync(marker), false);
+  });
+
   it('runs explicit argument-array commands at the real process boundary and retains no output or arguments', async () => {
     const result = await new ConfiguredLocalValidationAdapter(
       configuration([process.execPath, '-e', 'process.exit(0)']),
@@ -46,6 +112,73 @@ describe('ConfiguredLocalValidationAdapter', () => {
       durationMs: result.commands[0]?.durationMs,
     }]);
     assert.equal(Object.hasOwn(result.commands[0]!, 'argv'), false);
+  });
+
+  it('runs candidate validation with only a fresh credential-free runtime environment', async () => {
+    const owned = request();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const proof = path.join(proofDir, 'environment.json');
+    const inherited = {
+      GITHUB_TOKEN: process.env.GITHUB_TOKEN,
+      SSH_AUTH_SOCK: process.env.SSH_AUTH_SOCK,
+      CHATGPT_API_KEY: process.env.CHATGPT_API_KEY,
+      CODEX_HOME: process.env.CODEX_HOME,
+      TACHIKO_LUNA_CODEX_HOME: process.env.TACHIKO_LUNA_CODEX_HOME,
+      UNRELATED_SECRET: process.env.UNRELATED_SECRET,
+    };
+    Object.assign(process.env, {
+      GITHUB_TOKEN: 'github-secret', SSH_AUTH_SOCK: '/tmp/ssh-agent', CHATGPT_API_KEY: 'chatgpt-secret',
+      CODEX_HOME: '/tmp/codex-home', TACHIKO_LUNA_CODEX_HOME: '/tmp/luna-home', UNRELATED_SECRET: 'secret',
+    });
+    try {
+      const result = await new ConfiguredLocalValidationAdapter(configuration([
+        process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify(process.env))`,
+      ])).validate(owned);
+      assert.equal(result.status, 'passed');
+      const environment = JSON.parse(readFileSync(proof, 'utf8')) as Record<string, string>;
+      // macOS may add __CF_USER_TEXT_ENCODING at exec time. Assert the real
+      // denial invariant instead of treating that platform metadata as a
+      // credential inherited from the dispatcher.
+      assert.match(environment.HOME!, /tachiko-validation-runtime-/);
+      assert.match(environment.XDG_CACHE_HOME!, /tachiko-validation-runtime-/);
+      assert.equal(environment.GITHUB_TOKEN, undefined);
+      assert.equal(environment.SSH_AUTH_SOCK, undefined);
+      assert.equal(environment.CHATGPT_API_KEY, undefined);
+      assert.equal(environment.CODEX_HOME, undefined);
+      assert.equal(environment.TACHIKO_LUNA_CODEX_HOME, undefined);
+      assert.equal(environment.UNRELATED_SECRET, undefined);
+    } finally {
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
+  it('uses only the configured host browser artifacts, never an ambient browser cache', async () => {
+    const owned = request();
+    const artifactRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-host-playwright-'));
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(artifactRoot, proofDir);
+    const proof = path.join(proofDir, 'environment.json');
+    const inherited = process.env.PLAYWRIGHT_BROWSERS_PATH;
+    process.env.PLAYWRIGHT_BROWSERS_PATH = '/ambient/user/browser-cache';
+    try {
+      const config: LocalValidationConfiguration = {
+        ...configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(proof)}, JSON.stringify(process.env))`]),
+        playwrightBrowsersPath: artifactRoot,
+      };
+      const result = await new ConfiguredLocalValidationAdapter(config).validate(owned);
+      assert.equal(result.status, 'passed');
+      const environment = JSON.parse(readFileSync(proof, 'utf8')) as Record<string, string>;
+      assert.equal(environment.PLAYWRIGHT_BROWSERS_PATH, artifactRoot);
+      assert.notEqual(environment.PLAYWRIGHT_BROWSERS_PATH, '/ambient/user/browser-cache');
+      assert.notEqual(environment.HOME, artifactRoot);
+      assert.notEqual(environment.XDG_CACHE_HOME, artifactRoot);
+    } finally {
+      if (inherited === undefined) delete process.env.PLAYWRIGHT_BROWSERS_PATH;
+      else process.env.PLAYWRIGHT_BROWSERS_PATH = inherited;
+    }
   });
 
   it('maps a non-zero exit to failed compact evidence', async () => {
@@ -82,6 +215,69 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const clean = request();
     const wrongHead = await adapter.validate({ ...clean, headSha: '0'.repeat(40) });
     assert.equal(wrongHead.status, 'unknown');
+  });
+
+  it('never executes a candidate-planted fsmonitor while verifying validation Git metadata', async () => {
+    const owned = request();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'fsmonitor-ran');
+    const monitor = path.join(proofDir, 'fsmonitor');
+    writeFileSync(monitor, `#!/bin/sh\n: > ${JSON.stringify(marker)}\nprintf '00000000\\n'\n`);
+    chmodSync(monitor, 0o755);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'config', 'core.fsmonitor', monitor], { encoding: 'utf8' }).status, 0);
+
+    const result = await new ConfiguredLocalValidationAdapter(configuration([process.execPath, '-e', 'process.exit(0)'])).validate(owned);
+
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(marker), false);
+  });
+
+  it('fails closed when a command creates an untracked source byte before a later command can consume it', async () => {
+    const owned = request();
+    const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
+    dirs.push(proofDir);
+    const marker = path.join(proofDir, 'second-command-ran');
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'untracked-command-v1',
+      commands: [
+        { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('worker-created-source.js', 'unexpected')"], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 },
+      ],
+    }).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.commands.length, 2);
+    assert.equal(result.commands[1]?.outcome, 'unavailable');
+    assert.equal(existsSync(marker), false);
+  });
+
+  it('uses only a matching host lockfile-bound store for cold offline hydration and freezes its node_modules manifest', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'node_modules/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'pnpm-lock.yaml', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'lock dependency graph'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const artifact = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dependency-artifact-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-offline-pnpm-'));
+    dirs.push(artifact, tools);
+    mkdirSync(path.join(artifact, 'store'));
+    writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
+    const pnpm = path.join(tools, 'pnpm');
+    const marker = path.join(tools, 'validated');
+    writeFileSync(pnpm, `#!/bin/sh\n[ \"$npm_config_offline\" = true ] && [ \"$npm_config_store_dir\" = ${JSON.stringify(path.join(artifact, 'store'))} ] || exit 91\nmkdir -p node_modules/fixture\nprintf fixture > node_modules/fixture/index.js\n`);
+    chmodSync(pnpm, 0o755);
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'cold-offline-fixture-v1', dependencyArtifactPath: artifact,
+      commands: [
+        { argv: [pnpm], timeoutMs: 1_000 },
+        { argv: ['/bin/sh', '-c', `[ -f node_modules/fixture/index.js ] && : > ${JSON.stringify(marker)}`], timeoutMs: 1_000 },
+      ],
+    }).validate({ ...owned, headSha });
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(marker), true);
+    writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), '0'.repeat(64));
+    assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 1_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
   });
 
   it('uses a dedicated reconstruction budget rather than a short validation-command timeout', async () => {
@@ -255,7 +451,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     dirs.push(proofDir);
     const marker = path.join(proofDir, 'validation-ran');
     const adapter = new ConfiguredLocalValidationAdapter({
-      ...configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+      ...configuration(['/bin/sh', '-c', `: > ${JSON.stringify(marker)}`]),
       trustedIgnoredBaselinePath: baseline,
     });
     assert.equal((await adapter.validate({ ...owned, headSha })).status, 'passed');
@@ -340,7 +536,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
       }
     }
     const adapter = new ConfiguredLocalValidationAdapter({
-      ...configuration([process.execPath, '-e', 'process.exit(0)']), trustedIgnoredBaselinePath: baseline,
+      ...configuration(['/bin/sh', '-c', ':']), trustedIgnoredBaselinePath: baseline,
     });
     assert.equal((await adapter.validate({ ...owned, headSha })).status, 'passed');
   });

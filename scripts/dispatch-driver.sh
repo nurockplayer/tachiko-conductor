@@ -5,6 +5,10 @@ set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 
+# Revisioned #104 execution, local-validation, hosted-check, and Luna-home
+# policy.  Source it on every launchd restart; it contains no auth material.
+. "$ROOT/scripts/issue-104-production-policy.sh"
+
 # Canonical production control plane: Issue #101, Steward queue comment
 # 5755262217. This is queue location only; execution and validation policy
 # deliberately remain external and are not invented here.
@@ -18,5 +22,8 @@ if [ ! -x "$TACHIKO_NODE_PROGRAM" ]; then
   echo "TACHIKO_NODE_PROGRAM is not executable: $TACHIKO_NODE_PROGRAM" >&2
   exit 78
 fi
+: "${TACHIKO_PNPM_PROGRAM:?TACHIKO_PNPM_PROGRAM must name a host-provisioned absolute pnpm executable}"
+case "$TACHIKO_PNPM_PROGRAM" in /*) ;; *) echo "TACHIKO_PNPM_PROGRAM must be an absolute path" >&2; exit 78 ;; esac
+if [ ! -x "$TACHIKO_PNPM_PROGRAM" ]; then echo "TACHIKO_PNPM_PROGRAM is not executable: $TACHIKO_PNPM_PROGRAM" >&2; exit 78; fi
 
 exec "$TACHIKO_NODE_PROGRAM" "$ROOT/node_modules/tsx/dist/cli.mjs" "$ROOT/src/cli.ts" dispatch serve "$@"
