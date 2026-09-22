@@ -23,6 +23,7 @@ import {
   ConfiguredLocalValidationAdapter,
   MAX_LOCAL_VALIDATION_TIMEOUT_MS,
   MIN_LOCAL_VALIDATION_TIMEOUT_MS,
+  normalizeTerminalGeneratedIgnoredRoots,
 } from './validation/local-command.js';
 import { buildBrowserAgentConnection, type BrowserAgentConnection } from './browser/agent-config.js';
 import { openBrowserForBootstrap, type BootstrapBrowserLease } from './browser/mcp-client.js';
@@ -350,11 +351,11 @@ export function resolveLocalValidationConfiguration(
     }
     terminalGeneratedIgnoredRoots = record.terminalGeneratedIgnoredRoots.map((value) => {
       const rawRoot = (value as string).trim();
-      const normalized = path.normalize(rawRoot);
-      if (path.isAbsolute(rawRoot) || normalized === '.' || normalized === '..' || normalized.startsWith(`..${path.sep}`) || rawRoot.includes('\0')) {
+      const normalized = normalizeTerminalGeneratedIgnoredRoots([rawRoot]);
+      if (normalized === null) {
         throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.terminalGeneratedIgnoredRoots entries must stay inside the validation workspace.');
       }
-      return normalized.split(path.sep).join('/');
+      return normalized[0]!;
     });
     if (new Set(terminalGeneratedIgnoredRoots).size !== terminalGeneratedIgnoredRoots.length) {
       throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.terminalGeneratedIgnoredRoots must not contain duplicates.');

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
@@ -31,8 +31,20 @@ describe('ConfiguredLocalValidationAdapter sandbox boundary', () => {
     assert.ok(pnpm !== undefined && path.isAbsolute(pnpm), 'run the Darwin regression through the pinned pnpm test command');
     const gitFromPath = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     assert.ok(path.isAbsolute(gitFromPath), 'PATH must resolve an absolute Git executable');
-    for (const [profile, git] of [['PATH Git', gitFromPath], ['CLT Git launcher', '/usr/bin/git']] as const) {
+    for (const profile of ['PATH Git', 'CLT Git launcher', 'renamed configured tools'] as const) {
       await t.test(profile, async (profileTest) => {
+        let node = process.execPath; let packageManager = pnpm;
+        let git = profile === 'PATH Git' ? gitFromPath : '/usr/bin/git';
+        if (profile === 'renamed configured tools') {
+          const renamedTools = mkdtempSync(path.join(os.tmpdir(), 'tt-'));
+          dirs.push(renamedTools);
+          node = path.join(renamedTools, 'configured-node');
+          packageManager = path.join(renamedTools, 'configured-package-manager');
+          git = path.join(renamedTools, 'configured-vcs');
+          symlinkSync(process.execPath, node);
+          symlinkSync(pnpm, packageManager);
+          writeFileSync(git, '#!/bin/sh\nif [ "$1" = "--version" ]; then\n  echo "git version configured-authority"\nelse\n  exec /Library/Developer/CommandLineTools/usr/bin/git "$@"\nfi\n', { mode: 0o700 });
+        }
         const owned = request();
         const outside = mkdtempSync(path.join(os.tmpdir(), 'ths-'));
         dirs.push(outside);
@@ -52,6 +64,17 @@ const path = require('node:path');
 require('node:os').type();
 assert.equal(require('node:os').availableParallelism(), ${os.availableParallelism()});
 assert.match(execFileSync('git', ['--version'], { encoding: 'utf8' }), /^git version /);
+${profile === 'renamed configured tools' ? "assert.equal(execFileSync('git', ['--version'], { encoding: 'utf8' }).trim(), 'git version configured-authority');" : ''}
+assert.equal(execFileSync('pnpm', ['--version'], { encoding: 'utf8' }).trim(), '10.34.5');
+const toolBin = path.resolve(process.env.HOME, '..', 'bin');
+for (const name of ['node', 'pnpm', 'git']) {
+  const alias = path.join(toolBin, name);
+  assert.throws(() => fs.unlinkSync(alias), /EPERM|EACCES/);
+  assert.throws(() => fs.renameSync(alias, path.join(process.env.TMPDIR, name)), /EPERM|EACCES/);
+  assert.throws(() => fs.writeFileSync(alias, 'replacement'), /EPERM|EACCES/);
+}
+assert.throws(() => fs.renameSync(toolBin, toolBin + '-replaced'), /EPERM|EACCES/);
+assert.throws(() => fs.symlinkSync('/bin/true', path.join(toolBin, 'replacement')), /EPERM|EACCES/);
 assert.throws(() => fs.readFileSync(${JSON.stringify(sentinel)}), /EPERM|EACCES/);
 assert.throws(() => fs.writeFileSync(${JSON.stringify(sentinel)}, 'changed'), /EPERM|EACCES/);
 assert.throws(() => process.kill(${process.pid}, 0), /EPERM/);
@@ -69,8 +92,8 @@ hostIpc.on('error', (error) => assert.equal(error.code, 'EPERM'));
         assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'pin package manager'], { encoding: 'utf8' }).status, 0);
         owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
         const result = await new ConfiguredLocalValidationAdapter({
-          revision: `darwin-real-toolchain-${profile === 'PATH Git' ? 'path' : 'clt'}-v2`, nodeProgram: process.execPath, pnpmProgram: pnpm, gitProgram: git,
-          commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }, { argv: [pnpm, 'run', 'probe'], timeoutMs: 30_000 }],
+          revision: `darwin-real-toolchain-${profile}-v3`, nodeProgram: node, pnpmProgram: packageManager, gitProgram: git,
+          commands: [{ argv: [packageManager, '--version'], timeoutMs: 30_000 }, { argv: [packageManager, 'run', 'probe'], timeoutMs: 30_000 }, { argv: [packageManager, '--version'], timeoutMs: 30_000 }],
         }).validate(owned);
         assert.equal(result.status, 'passed', JSON.stringify(result));
         assert.equal(readFileSync(sentinel, 'utf8'), 'must remain outside the sandbox');

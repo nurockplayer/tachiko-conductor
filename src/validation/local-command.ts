@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -229,6 +229,21 @@ function isHydratedDependencyManifest(manifest: readonly string[], roots: readon
 function ignoredManifestEntryPath(entry: string): string | null {
   const match = /^(?:file|link|directory) (.+) [0-7]+ [a-f0-9]{64}$/i.exec(entry);
   return match?.[1] ?? null;
+}
+
+/** Canonical workspace-relative output roots shared by CLI and direct adapters. */
+export function normalizeTerminalGeneratedIgnoredRoots(roots: readonly string[]): string[] | null {
+  if (!Array.isArray(roots)) return null;
+  const normalizedRoots: string[] = [];
+  for (const value of roots) {
+    if (typeof value !== 'string') return null;
+    const raw = value.trim();
+    const normalized = path.normalize(raw).split(path.sep).join('/').replace(/\/+$/, '');
+    if (raw === '' || raw.includes('\0') || path.isAbsolute(raw) || normalized === '' ||
+      normalized === '.' || normalized === '..' || normalized.startsWith('../')) return null;
+    normalizedRoots.push(normalized);
+  }
+  return new Set(normalizedRoots).size === normalizedRoots.length ? normalizedRoots : null;
 }
 
 function terminalGeneratedManifestMatches(
@@ -490,10 +505,16 @@ function macosValidationSandboxProfile(
 ): string | null {
   if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return null;
   let workspace: string; let node: string; let pnpm: string; let git: string | undefined; let gitExecPath: string | undefined;
+  let configuredToolPaths: string[];
   try {
     workspace = realpathSync(workspacePath);
     node = realpathSync(nodeProgram);
     pnpm = realpathSync(pnpmProgram);
+    // Preserve the final configured symlink as well as its resolved target.
+    // Darwin canonicalizes parent aliases such as /var -> /private/var before
+    // applying seatbelt rules to the configured launcher itself.
+    configuredToolPaths = [nodeProgram, pnpmProgram, ...(gitProgram === undefined ? [] : [gitProgram])]
+      .map((program) => path.join(realpathSync(path.dirname(program)), path.basename(program)));
     if (gitProgram !== undefined) {
       git = realpathSync(gitProgram);
       const probe = spawnSync(gitProgram, ['--exec-path'], {
@@ -507,7 +528,7 @@ function macosValidationSandboxProfile(
   if (!path.isAbsolute(node) || !path.isAbsolute(pnpm) || !existsSync(node) || !existsSync(pnpm) ||
     (gitProgram !== undefined && (git === undefined || gitExecPath === undefined || !path.isAbsolute(git) || !existsSync(git)))) return null;
   const reads = [
-    workspace, runtimeRoot, node, pnpm, pnpmProgram, path.dirname(node), path.dirname(path.dirname(node)), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
+    workspace, runtimeRoot, node, pnpm, ...configuredToolPaths, path.dirname(node), path.dirname(path.dirname(node)), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
     // pnpm launchers commonly use env/sh before entering the pinned Node
     // runtime. These are fixed macOS executables, not PATH-discovered tools.
     '/usr/bin', '/bin', '/usr/lib', '/System/Library', '/usr/share',
@@ -530,8 +551,7 @@ function macosValidationSandboxProfile(
   // Apple's /usr/bin/git launcher may be configured directly or used by
   // nested repository tools. Its credential-free exec-path probe must prove
   // the CLT installation before admitting that installation's backing binary.
-  const usesCltGit = git === '/Library/Developer/CommandLineTools/usr/bin/git' ||
-    (git === '/usr/bin/git' && gitExecPath === '/Library/Developer/CommandLineTools/usr/libexec/git-core');
+  const usesCltGit = gitExecPath === '/Library/Developer/CommandLineTools/usr/libexec/git-core';
   const appleGitLauncher = usesCltGit
     ? `(allow file-read-metadata (subpath "/Library/Developer/CommandLineTools"))
 (allow file-read* (literal "/Library/Developer/CommandLineTools") (literal "/Library/Developer/CommandLineTools/usr/bin/git") (literal "/Library/Developer/CommandLineTools/usr/lib/libxcrun.dylib") (literal "/private/var/db/xcode_select_link") (literal "/var/db/xcode_select_link"))`
@@ -549,6 +569,8 @@ ${appleGitLauncher}
 (allow file-write-data (literal "/dev/null"))
 (allow file-write* (subpath ${sandboxLiteral(workspace)}))
 (allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))
+; Host-established command aliases must survive every candidate command intact.
+(deny file-write* (subpath ${sandboxLiteral(path.join(runtimeRoot, 'bin'))}))
 ; tsx uses private IPC. No IP sockets or sockets outside this run are admitted.
 (allow system-socket (socket-domain AF_UNIX))
 (allow network-bind (local unix-socket (subpath ${sandboxLiteral(runtimeRoot)})))
@@ -561,7 +583,7 @@ ${appleGitLauncher}
  * host-created home/cache root; notably no GitHub, SSH, ChatGPT/Codex/Luna,
  * npm, Git, or generic inherited secret variables cross this boundary.
  */
-function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string, nodeProgram?: string, pnpmProgram?: string, gitProgram?: string, dependencyStore?: string): NodeJS.ProcessEnv {
+function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string, nodeProgram?: string, pnpmProgram?: string, gitProgram?: string, dependencyStore?: string): NodeJS.ProcessEnv | null {
   const home = path.join(runtimeRoot, 'home');
   const cache = path.join(runtimeRoot, 'cache');
   const config = path.join(runtimeRoot, 'config');
@@ -572,10 +594,22 @@ function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrow
   for (const directory of [home, cache, config, temp, gitTemplate]) {
     try { mkdirSync(directory, { recursive: true, mode: 0o700 }); } catch { /* handled by command failure */ }
   }
+  const toolBin = path.join(runtimeRoot, 'bin');
+  if (nodeProgram !== undefined && pnpmProgram !== undefined) {
+    try {
+      mkdirSync(toolBin, { mode: 0o700 });
+      // Arbitrary configured executable filenames must still establish the
+      // bare names used by package scripts and launcher shebangs. Seatbelt
+      // denies writes to this directory, including renames and link removal.
+      for (const [name, program] of [['node', nodeProgram], ['pnpm', pnpmProgram], ['git', gitProgram]] as const) {
+        if (program !== undefined) symlinkSync(program, path.join(toolBin, name));
+      }
+    } catch { return null; }
+  }
   const environment: NodeJS.ProcessEnv = {
     PATH: nodeProgram === undefined || pnpmProgram === undefined
       ? process.env.PATH ?? (process.platform === 'win32' ? process.env.Path : undefined)
-      : [...(gitProgram === undefined ? [] : [path.dirname(gitProgram)]), path.dirname(pnpmProgram), path.dirname(nodeProgram), '/usr/bin', '/bin'].filter((entry, index, all) => all.indexOf(entry) === index).join(path.delimiter),
+      : [toolBin, ...(gitProgram === undefined ? [] : [path.dirname(gitProgram)]), path.dirname(pnpmProgram), path.dirname(nodeProgram), '/usr/bin', '/bin'].filter((entry, index, all) => all.indexOf(entry) === index).join(path.delimiter),
     HOME: home,
     XDG_CACHE_HOME: cache,
     XDG_CONFIG_HOME: config,
@@ -650,6 +684,10 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     if (revision === null || !Array.isArray(configured) || configured.length === 0) {
       return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
     }
+    const terminalGeneratedIgnoredRoots = normalizeTerminalGeneratedIgnoredRoots(this.configuration.terminalGeneratedIgnoredRoots ?? []);
+    if (terminalGeneratedIgnoredRoots === null) {
+      return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
+    }
     const hydratedRoots = this.configuration.hydratedDependencyRoots ?? ['node_modules'];
     if (!Array.isArray(hydratedRoots) || hydratedRoots.length === 0 || new Set(hydratedRoots).size !== hydratedRoots.length ||
       hydratedRoots.some((root) => typeof root !== 'string' || /\s|\\|\0/.test(root) || path.posix.isAbsolute(root) ||
@@ -703,6 +741,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         catch { return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] }; }
       }
       const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram, privateStore);
+      if (environment === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       // A production plan has one host-provisioned pnpm authority.  Reject a
       // substituted executable before probing a tool or starting validation.
       if (this.configuration.pnpmProgram !== undefined && configured.some((command) => !isCommand(command) || command.argv[0] !== this.configuration.pnpmProgram)) {
@@ -725,7 +764,6 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest, this.configuration.gitProgram, gitEnvironment)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
       let settledManifest: readonly string[] = initialIgnoredManifest;
-      const terminalGeneratedIgnoredRoots = this.configuration.terminalGeneratedIgnoredRoots ?? [];
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
         if (!isCommand(command)) {

@@ -267,6 +267,28 @@ describe('CLI command layer', () => {
       }),
       { revision: 'repo-v1', nodeProgram: '/opt/tachiko/node/bin/node', pnpmProgram: '/opt/tachiko/pnpm/bin/pnpm', gitProgram: '/opt/tachiko/git/bin/git', hydratedDependencyRoots: ['node_modules', 'apps/control-tower/node_modules'], terminalGeneratedIgnoredRoots: ['dist'], commands: [{ argv: ['/opt/tachiko/pnpm/bin/pnpm', 'test'], timeoutMs: 100 }] },
     );
+    for (const root of ['dist/', 'dist//', './dist/']) {
+      assert.deepEqual(
+        resolveLocalValidationConfiguration({
+          TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', terminalGeneratedIgnoredRoots: [root], commands: [{ argv: ['tool'], timeoutMs: 100 }] }),
+        }),
+        { revision: 'repo-v1', terminalGeneratedIgnoredRoots: ['dist'], commands: [{ argv: ['tool'], timeoutMs: 100 }] },
+      );
+    }
+    assert.throws(
+      () => resolveLocalValidationConfiguration({
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', terminalGeneratedIgnoredRoots: ['dist', 'dist/'], commands: [{ argv: ['tool'], timeoutMs: 100 }] }),
+      }),
+      /terminalGeneratedIgnoredRoots must not contain duplicates/,
+    );
+    for (const root of ['./', '../', './../', 'dist/../../']) {
+      assert.throws(
+        () => resolveLocalValidationConfiguration({
+          TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', terminalGeneratedIgnoredRoots: [root], commands: [{ argv: ['tool'], timeoutMs: 100 }] }),
+        }),
+        /terminalGeneratedIgnoredRoots entries must stay inside the validation workspace/,
+      );
+    }
     for (const roots of [
       [], [''], ['node_modules/'], ['./node_modules'], ['../node_modules'], ['apps\\control-tower/node_modules'], ['/node_modules'], ['apps/control tower/node_modules'], ['apps/control-tower/not-modules'], ['node_modules', 'node_modules'], ['apps/control-tower/node_modules\0'],
     ]) {

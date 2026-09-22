@@ -247,20 +247,25 @@ exec ${JSON.stringify(actualGit)} "$@"
   });
 
   it('freezes ignored state between commands and admits an authorized terminal generated root only at the end', async () => {
-    const owned = request();
-    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'dist/\n');
-    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
-    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore build output'], { encoding: 'utf8' }).status, 0);
-    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
-    const build = "require('node:fs').mkdirSync('dist', {recursive:true}); require('node:fs').writeFileSync('dist/output', 'ok')";
-    const result = await new ConfiguredLocalValidationAdapter({
-      revision: 'terminal-generated-root-v1', terminalGeneratedIgnoredRoots: ['dist'],
-      commands: [
-        { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 },
-        { argv: [process.execPath, '-e', build], timeoutMs: 1_000 },
-      ],
-    }).validate(owned);
-    assert.equal(result.status, 'passed');
+    const prepareIgnoredDistWorkspace = () => {
+      const owned = request();
+      writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'dist/\n');
+      assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+      assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore build output'], { encoding: 'utf8' }).status, 0);
+      owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+      return owned;
+    };
+    const build = "require('node:fs').mkdirSync('dist', {recursive:true}); require('node:fs').writeFileSync('dist/output.js', 'ok')";
+    for (const root of ['dist/', 'dist//', './dist/']) {
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: `terminal-generated-root-${root.length}-v1`, terminalGeneratedIgnoredRoots: [root],
+        commands: [
+          { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 },
+          { argv: [process.execPath, '-e', build], timeoutMs: 1_000 },
+        ],
+      }).validate(prepareIgnoredDistWorkspace());
+      assert.equal(result.status, 'passed');
+    }
 
     const rejected = await new ConfiguredLocalValidationAdapter({
       revision: 'terminal-generated-root-reject-v1', terminalGeneratedIgnoredRoots: ['dist'],
@@ -268,10 +273,22 @@ exec ${JSON.stringify(actualGit)} "$@"
         { argv: [process.execPath, '-e', build], timeoutMs: 1_000 },
         { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 },
       ],
-    }).validate(owned);
+    }).validate(prepareIgnoredDistWorkspace());
     assert.equal(rejected.status, 'unknown');
     assert.equal(rejected.commands.length, 2);
     assert.equal(rejected.commands[1]?.outcome, 'unavailable');
+
+    for (const roots of [['./'], ['../'], ['./../'], ['dist/../../'], ['dist', 'dist/']] as const) {
+      const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-terminal-root-proof-'));
+      dirs.push(proofDir);
+      const marker = path.join(proofDir, 'ran');
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: 'terminal-generated-root-invalid-v1', terminalGeneratedIgnoredRoots: roots,
+        commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 }],
+      }).validate(request());
+      assert.equal(result.status, 'unknown');
+      assert.equal(existsSync(marker), false);
+    }
   });
 
   it('uses only the configured host browser artifacts, never an ambient browser cache', async () => {
