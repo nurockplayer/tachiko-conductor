@@ -169,6 +169,10 @@ async function waitForCall(client: FakeClient, call: string): Promise<void> {
   throw new Error(`Timed out waiting for App Server call ${call}.`);
 }
 
+async function settleRealImmediate(): Promise<void> {
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
 describe('CodexAppServerAdapter', () => {
   it('uses initialize-capable native observation before terminal resume, then starts exactly one next turn', async () => {
     const client = new FakeClient();
@@ -242,27 +246,40 @@ describe('CodexAppServerAdapter', () => {
     assert.equal(fallback.calls, 1);
   });
 
-  it('bounds a stalled native turn by the selected execution timeout', async () => {
+  it('bounds a stalled native turn by the selected execution timeout', async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
     const client = new HangingClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
-    const result = await adapter.run(request());
+    const pending = adapter.run(request());
+    await waitForCall(client, 'wait');
+    t.mock.timers.tick(5);
+    const result = await pending;
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
     assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'wait', 'turn/interrupt:thread-new:turn-1', 'close']);
   });
 
-  it('bounds a stalled thread/start RPC', async () => {
+  it('bounds a stalled thread/start RPC', async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
     const client = new HangingStartThreadClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
-    const result = await adapter.run(request());
+    const pending = adapter.run(request());
+    await waitForCall(client, 'thread/start');
+    t.mock.timers.tick(5);
+    const result = await pending;
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
     assert.deepEqual(client.calls, ['thread/start', 'close']);
   });
 
-  it('bounds a stalled App Server handshake by the selected execution timeout', async () => {
+  it('bounds a stalled App Server handshake by the selected execution timeout', async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
     const adapter = new CodexAppServerAdapter({ clientFactory: new HangingFactory(), runner: new HeadRunner(), timeoutMs: 5 });
-    const result = await adapter.run(request());
+    const pending = adapter.run(request());
+    // Let openClient enter its pending factory call and schedule the timeout.
+    await settleRealImmediate();
+    t.mock.timers.tick(5);
+    const result = await pending;
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
   });
@@ -278,19 +295,27 @@ describe('CodexAppServerAdapter', () => {
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_CANCELLED/);
   });
 
-  it('bounds a stalled turn/start RPC and interrupts the exact turn observed by notification', async () => {
+  it('bounds a stalled turn/start RPC and interrupts the exact turn observed by notification', async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
     const client = new HangingStartTurnClient('turn-observed');
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
-    const result = await adapter.run(request());
+    const pending = adapter.run(request());
+    await waitForCall(client, 'turn/start:thread-new');
+    t.mock.timers.tick(5);
+    const result = await pending;
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
     assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'turn/interrupt:thread-new:turn-observed', 'close']);
   });
 
-  it('discovers and interrupts an exact turn when timeout wins before the turn/start notification is processed', async () => {
+  it('discovers and interrupts an exact turn when timeout wins before the turn/start notification is processed', async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
     const client = new DelayedStartTurnClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
-    const result = await adapter.run(request());
+    const pending = adapter.run(request());
+    await waitForCall(client, 'turn/start:thread-new');
+    t.mock.timers.tick(5);
+    const result = await pending;
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
     assert.deepEqual(client.calls, [
@@ -298,10 +323,14 @@ describe('CodexAppServerAdapter', () => {
     ]);
   });
 
-  it('uses a turn/started notification that arrives during bounded cleanup discovery', async () => {
+  it('uses a turn/started notification that arrives during bounded cleanup discovery', async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
     const client = new LateNotificationClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
-    const result = await adapter.run(request());
+    const pending = adapter.run(request());
+    await waitForCall(client, 'turn/start:thread-new');
+    t.mock.timers.tick(5);
+    const result = await pending;
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
     assert.deepEqual(client.calls, [
@@ -309,10 +338,14 @@ describe('CodexAppServerAdapter', () => {
     ]);
   });
 
-  it('bounds native observation by the configured execution timeout', async () => {
+  it('bounds native observation by the configured execution timeout', async (t) => {
+    t.mock.timers.enable({ apis: ['Date', 'setTimeout'] });
     const client = new HangingObserveClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
-    await assert.rejects(() => adapter.observeRuntime(EXECUTOR), /timed out/i);
+    const pending = assert.rejects(() => adapter.observeRuntime(EXECUTOR), /timed out/i);
+    await waitForCall(client, 'read:thread-1');
+    t.mock.timers.tick(5);
+    await pending;
     assert.deepEqual(client.calls, ['read:thread-1', 'close']);
   });
 
