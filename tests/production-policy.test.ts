@@ -21,6 +21,7 @@ function environment(home: string): NodeJS.ProcessEnv {
   return {
     TACHIKO_NODE_PROGRAM: process.execPath,
     TACHIKO_PNPM_PROGRAM: process.execPath,
+    TACHIKO_GIT_PROGRAM: process.execPath,
     TACHIKO_PNPM_DEPENDENCY_ARTIFACT: artifact,
     TACHIKO_LUNA_CODEX_HOME: home,
     TACHIKO_PLAYWRIGHT_BROWSERS_PATH: path.dirname(home),
@@ -73,6 +74,7 @@ describe('#104 production policy', () => {
     assert.match(script, /TACHIKO_LUNA_CODEX_HOME/);
     assert.match(script, /TACHIKO_PLAYWRIGHT_BROWSERS_PATH/);
     assert.match(script, /TACHIKO_PNPM_PROGRAM/);
+    assert.match(script, /TACHIKO_GIT_PROGRAM/);
     assert.match(script, /TACHIKO_EXECUTION_PROFILE_CONFIG/);
     assert.match(script, /"routine"/);
     assert.match(script, /"gpt-5\.6-luna"/);
@@ -81,13 +83,26 @@ describe('#104 production policy', () => {
     assert.match(script, /"mode":"not_required"/);
     assert.doesNotMatch(script, /requiredCheckNames/);
     const sourced = spawnSync('sh', ['-c', '. "$1"; printf "%s\\n%s\\n%s" "$TACHIKO_EXECUTION_PROFILE_CONFIG" "$TACHIKO_LOCAL_VALIDATION_CONFIG" "$TACHIKO_HOSTED_CHECK_POLICY_CONFIG"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], {
-      encoding: 'utf8', env: { ...process.env, TACHIKO_LUNA_CODEX_HOME: '/tmp/qualified-luna', TACHIKO_PLAYWRIGHT_BROWSERS_PATH: '/tmp/qualified-playwright', TACHIKO_NODE_PROGRAM: '/bin/sh', TACHIKO_PNPM_PROGRAM: '/bin/sh', TACHIKO_PNPM_DEPENDENCY_ARTIFACT: '/tmp/qualified-dependency-artifact' },
+      encoding: 'utf8', env: { ...process.env, TACHIKO_LUNA_CODEX_HOME: '/tmp/qualified-luna', TACHIKO_PLAYWRIGHT_BROWSERS_PATH: '/tmp/qualified-playwright', TACHIKO_NODE_PROGRAM: '/bin/sh', TACHIKO_PNPM_PROGRAM: '/bin/sh', TACHIKO_GIT_PROGRAM: '/bin/sh', TACHIKO_PNPM_DEPENDENCY_ARTIFACT: '/tmp/qualified-dependency-artifact' },
     });
     assert.equal(sourced.status, 0, sourced.stderr);
     const [execution, local, hosted] = sourced.stdout.split('\n');
     assert.deepEqual(JSON.parse(execution!), PRODUCTION_EXECUTION_PROFILE_CONFIG);
     assert.deepEqual(JSON.parse(local!), PRODUCTION_LOCAL_VALIDATION_CONFIG);
     assert.deepEqual(JSON.parse(hosted!), PRODUCTION_HOSTED_CHECK_POLICY_CONFIG);
+  });
+
+  it('requires the explicit Git validation toolchain before activation', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-production-policy-'));
+    try {
+      mkdirSync(path.join(root, 'luna'));
+      writeFileSync(path.join(root, 'luna', 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
+      const env = environment(path.join(root, 'luna'));
+      delete env.TACHIKO_GIT_PROGRAM;
+      assert.throws(() => preflightProductionPolicy(env), /TACHIKO_GIT_PROGRAM/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('does not invent a Luna CODEX_HOME when the durable owner setting is absent', () => {
