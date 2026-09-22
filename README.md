@@ -440,12 +440,16 @@ exact candidate, and the hosted-check policy. Luna rejects `standard`,
 fallback routes.
 
 From a stable merged checkout, set `TACHIKO_NODE_PROGRAM`,
-`TACHIKO_PNPM_PROGRAM`, and `TACHIKO_GIT_PROGRAM` to the host-provisioned absolute Node, pnpm, and Git paths,
-and `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` to a private host-created directory
+`TACHIKO_PNPM_PROGRAM`, and `TACHIKO_GIT_PROGRAM` to the host-provisioned absolute Node, pnpm, and Git paths.
+Git must use the qualified Apple Command Line Tools runtime: its credential-free
+`--exec-path` probe must resolve exactly to `/Library/Developer/CommandLineTools/usr/libexec/git-core`.
+Direct CLT Git, `/usr/bin/git` selecting CLT, and wrappers selecting that same runtime are supported;
+Homebrew Git and other installations are rejected before production activation because their runtime dependencies are not qualified for this sandbox.
+Set `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` to a private host-created directory
 containing `store/` and `pnpm-lock.yaml.sha256` (the SHA-256 of the candidate
 lockfile),
-then run `scripts/issue-104-deploy.sh preflight`. This reads only local policy
-and the qualified Luna config—no GitHub, pnpm install, or model turn. The
+then run `scripts/issue-104-deploy.sh preflight`. This reads local policy
+and the qualified Luna config and probes Git without credentials; it makes no GitHub request, pnpm install, or model turn. The
 offline hydration is host-owned and allows exactly `node_modules` and
 `apps/control-tower/node_modules` as dependency roots.
 production validator executes pnpm only by that explicit path, under macOS

@@ -84,6 +84,24 @@ function validatorGitEnvironment(): NodeJS.ProcessEnv {
   return environment;
 }
 
+const SUPPORTED_PRODUCTION_GIT_EXEC_PATH = '/Library/Developer/CommandLineTools/usr/libexec/git-core';
+
+function supportedProductionGitExecPath(gitProgram: string, environment = validatorGitEnvironment()): string | null {
+  if (!path.isAbsolute(gitProgram)) return null;
+  try {
+    const probe = spawnSync(gitProgram, ['--exec-path'], {
+      encoding: 'utf8', shell: false, timeout: TOOL_VERSION_TIMEOUT_MS, env: environment,
+    });
+    if (probe.status !== 0 || probe.signal !== null || probe.stdout.trim() === '') return null;
+    return realpathSync(probe.stdout.trim()) === SUPPORTED_PRODUCTION_GIT_EXEC_PATH ? SUPPORTED_PRODUCTION_GIT_EXEC_PATH : null;
+  } catch { return null; }
+}
+
+/** Only the CLT runtime has a qualified, closed set of sandbox dependencies. */
+export function hasSupportedProductionGitRuntime(gitProgram: string): boolean {
+  return supportedProductionGitExecPath(gitProgram) !== null;
+}
+
 function ignoredManifest(workspacePath: string, invoke: GitInvoke): string[] | null {
   const status = invoke(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored'], IGNORED_MANIFEST_TIMEOUT_MS);
   if (status.status !== 0) return null;
@@ -517,12 +535,9 @@ function macosValidationSandboxProfile(
       .map((program) => path.join(realpathSync(path.dirname(program)), path.basename(program)));
     if (gitProgram !== undefined) {
       git = realpathSync(gitProgram);
-      const probe = spawnSync(gitProgram, ['--exec-path'], {
-        encoding: 'utf8', shell: false, timeout: TOOL_VERSION_TIMEOUT_MS,
-        env: gitEnvironment,
-      });
-      if (probe.status !== 0 || probe.signal !== null || probe.stdout.trim() === '') return null;
-      gitExecPath = realpathSync(probe.stdout.trim());
+      const supportedExecPath = supportedProductionGitExecPath(gitProgram, gitEnvironment);
+      if (supportedExecPath === null) return null;
+      gitExecPath = supportedExecPath;
     }
   } catch { return null; }
   if (!path.isAbsolute(node) || !path.isAbsolute(pnpm) || !existsSync(node) || !existsSync(pnpm) ||

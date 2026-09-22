@@ -7,6 +7,7 @@ import {
   resolveExecutionProfile,
 } from './execution-profiles.js';
 import { parseTrustedLunaConfig } from './agents/luna-isolated.js';
+import { hasSupportedProductionGitRuntime } from './validation/local-command.js';
 
 /**
  * #104's checked-in, revisioned policy values.  The shell policy file is the
@@ -91,11 +92,14 @@ function isAbsoluteExecutableFile(file: string | undefined): boolean {
 }
 
 /**
- * Validate the complete deployed policy before dispatch/restart.  It is pure
- * configuration and local filesystem work: it neither reads GitHub nor
- * invokes pnpm, Codex, or any model.
+ * Validate the complete deployed policy before dispatch/restart. This uses
+ * configuration, local filesystem work and a credential-free bounded Git
+ * runtime probe: it neither reads GitHub nor invokes pnpm, Codex, or any model.
  */
-export function preflightProductionPolicy(env: NodeJS.ProcessEnv = process.env): ProductionPolicyPreflight {
+export function preflightProductionPolicy(
+  env: NodeJS.ProcessEnv = process.env,
+  gitRuntimeIsSupported: (program: string) => boolean = hasSupportedProductionGitRuntime,
+): ProductionPolicyPreflight {
   const executionRaw = env.TACHIKO_EXECUTION_PROFILE_CONFIG;
   const localRaw = env.TACHIKO_LOCAL_VALIDATION_CONFIG;
   const hostedRaw = env.TACHIKO_HOSTED_CHECK_POLICY_CONFIG;
@@ -122,6 +126,9 @@ export function preflightProductionPolicy(env: NodeJS.ProcessEnv = process.env):
   }
   if (!isAbsoluteExecutableFile(gitProgram)) {
     throw new Error('Issue #104 production preflight requires TACHIKO_GIT_PROGRAM to be an absolute regular executable file.');
+  }
+  if (!gitRuntimeIsSupported(gitProgram!)) {
+    throw new Error('Issue #104 production preflight requires TACHIKO_GIT_PROGRAM to select the supported Apple Command Line Tools Git runtime.');
   }
   if (dependencyArtifact === undefined || !path.isAbsolute(dependencyArtifact) || !isPrivateBrowserArtifactDirectory(dependencyArtifact) ||
     !isPrivateBrowserArtifactDirectory(path.join(dependencyArtifact, 'store')) || !isPrivateRegularFile(path.join(dependencyArtifact, 'pnpm-lock.yaml.sha256'))) {

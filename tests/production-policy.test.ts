@@ -31,7 +31,27 @@ function environment(home: string): NodeJS.ProcessEnv {
   };
 }
 
+const supportedGitRuntime = (_program: string): boolean => true;
+
 describe('#104 production policy', () => {
+  it('uses the real credential-free CLT qualifier by default', { skip: process.platform !== 'darwin' }, () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-production-git-'));
+    try {
+      const home = path.join(root, 'luna');
+      mkdirSync(home);
+      writeFileSync(path.join(home, 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
+      const wrapper = path.join(root, 'configured-vcs');
+      writeFileSync(wrapper, '#!/bin/sh\nexec /Library/Developer/CommandLineTools/usr/bin/git "$@"\n', { mode: 0o700 });
+      const unsupported = path.join(root, 'unsupported-vcs');
+      writeFileSync(unsupported, '#!/bin/sh\necho /unqualified/git-core\n', { mode: 0o700 });
+      const env = environment(home);
+      for (const git of ['/Library/Developer/CommandLineTools/usr/bin/git', '/usr/bin/git', wrapper]) {
+        assert.equal(preflightProductionPolicy({ ...env, TACHIKO_GIT_PROGRAM: git }).revision, PRODUCTION_POLICY_REVISION);
+      }
+      assert.throws(() => preflightProductionPolicy({ ...env, TACHIKO_GIT_PROGRAM: unsupported }), /supported Apple Command Line Tools Git runtime/);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   for (const authority of ['TACHIKO_NODE_PROGRAM', 'TACHIKO_PNPM_PROGRAM', 'TACHIKO_GIT_PROGRAM']) {
     it(`requires ${authority} to be an absolute regular executable file in preflight and shell policy`, () => {
       const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-production-tools-'));
@@ -53,14 +73,14 @@ describe('#104 production policy', () => {
         const env = environment(home);
         for (const candidate of [root, directoryLink, nonExecutable, missing, danglingLink, 'relative-tool']) {
           const supplied = { ...env, [authority]: candidate };
-          assert.throws(() => preflightProductionPolicy(supplied), new RegExp(`${authority}.*absolute regular executable file`));
+          assert.throws(() => preflightProductionPolicy(supplied, supportedGitRuntime), new RegExp(`${authority}.*absolute regular executable file`));
           const sourced = spawnSync('/bin/sh', ['-c', '. "$1"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], { encoding: 'utf8', env: supplied });
           assert.equal(sourced.status, 78, `${authority}=${candidate}: ${sourced.stderr}`);
           assert.match(sourced.stderr, new RegExp(authority));
         }
         for (const candidate of [executable, symlink]) {
           const supplied = { ...env, [authority]: candidate };
-          assert.equal(preflightProductionPolicy(supplied).revision, PRODUCTION_POLICY_REVISION);
+          assert.equal(preflightProductionPolicy(supplied, supportedGitRuntime).revision, PRODUCTION_POLICY_REVISION);
           const sourced = spawnSync('/bin/sh', ['-c', '. "$1"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], { encoding: 'utf8', env: supplied });
           assert.equal(sourced.status, 0, sourced.stderr);
         }
@@ -80,10 +100,33 @@ describe('#104 production policy', () => {
     try {
       mkdirSync(path.join(root, 'luna'));
       writeFileSync(path.join(root, 'luna', 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
-      assert.deepEqual(preflightProductionPolicy(environment(path.join(root, 'luna'))), {
+      assert.deepEqual(preflightProductionPolicy(environment(path.join(root, 'luna')), supportedGitRuntime), {
         revision: PRODUCTION_POLICY_REVISION, lunaCodexHome: path.join(root, 'luna'),
         checks: ['execution-profile', 'luna-home', 'playwright-browsers', 'dependency-artifact', 'local-validation', 'hosted-check-policy'],
       });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an unsupported Git runtime before activation and qualifies only the configured Git path', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-production-policy-'));
+    try {
+      const home = path.join(root, 'luna');
+      mkdirSync(home);
+      writeFileSync(path.join(home, 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
+      const env = environment(home);
+      const rejectedPaths: string[] = [];
+      assert.throws(
+        () => preflightProductionPolicy(env, (program) => { rejectedPaths.push(program); return false; }),
+        /supported Apple Command Line Tools Git runtime/,
+      );
+      assert.deepEqual(rejectedPaths, [process.execPath]);
+
+      const acceptedPaths: string[] = [];
+      const result = preflightProductionPolicy(env, (program) => { acceptedPaths.push(program); return true; });
+      assert.equal(result.revision, PRODUCTION_POLICY_REVISION);
+      assert.deepEqual(acceptedPaths, [process.execPath]);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -96,10 +139,10 @@ describe('#104 production policy', () => {
       writeFileSync(path.join(root, 'luna', 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
       const env = environment(path.join(root, 'luna'));
       env.TACHIKO_LOCAL_VALIDATION_CONFIG = JSON.stringify({ ...PRODUCTION_LOCAL_VALIDATION_CONFIG, trustedIgnoredBaselinePath: '/tmp/worker-state' });
-      assert.throws(() => preflightProductionPolicy(env), /frozen-lockfile exact-candidate policy/);
+      assert.throws(() => preflightProductionPolicy(env, supportedGitRuntime), /frozen-lockfile exact-candidate policy/);
       const profiles = structuredClone(PRODUCTION_EXECUTION_PROFILE_CONFIG) as { profiles: Record<string, { executor: string }> };
       profiles.profiles.standard!.executor = 'codex-cli';
-      assert.throws(() => preflightProductionPolicy({ ...environment(path.join(root, 'luna')), TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify(profiles) }), /execution profile configuration/);
+      assert.throws(() => preflightProductionPolicy({ ...environment(path.join(root, 'luna')), TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify(profiles) }, supportedGitRuntime), /execution profile configuration/);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -143,7 +186,7 @@ describe('#104 production policy', () => {
       writeFileSync(path.join(root, 'luna', 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
       const env = environment(path.join(root, 'luna'));
       env.TACHIKO_PLAYWRIGHT_BROWSERS_PATH = path.join(root, 'missing-browser-artifacts');
-      assert.throws(() => preflightProductionPolicy(env), /artifact directory must be an existing private non-symlink/);
+      assert.throws(() => preflightProductionPolicy(env, supportedGitRuntime), /artifact directory must be an existing private non-symlink/);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
@@ -153,7 +196,7 @@ describe('#104 production policy', () => {
       mkdirSync(path.join(root, 'luna'));
       writeFileSync(path.join(root, 'luna', 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
       writeFileSync(path.join(root, 'luna', 'auth.json'), '{}');
-      assert.throws(() => preflightProductionPolicy(environment(path.join(root, 'luna'))), /auth\.json/);
+      assert.throws(() => preflightProductionPolicy(environment(path.join(root, 'luna')), supportedGitRuntime), /auth\.json/);
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

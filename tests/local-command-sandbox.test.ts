@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { afterEach, describe, it } from 'node:test';
 
-import { ConfiguredLocalValidationAdapter } from '../src/validation/local-command.js';
+import { ConfiguredLocalValidationAdapter, hasSupportedProductionGitRuntime } from '../src/validation/local-command.js';
 import { TARGET } from './helpers.js';
 
 const dirs: string[] = [];
@@ -26,6 +26,26 @@ function request() {
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('ConfiguredLocalValidationAdapter sandbox boundary', () => {
+  it('rejects an installed Homebrew Git runtime before executing candidate validation', { skip: process.platform !== 'darwin' }, async (t) => {
+    const git = '/opt/homebrew/bin/git';
+    if (!existsSync(git)) { t.skip('Homebrew Git is not installed on this host'); return; }
+    assert.equal(spawnSync(git, ['--version'], { encoding: 'utf8' }).status, 0);
+    assert.equal(hasSupportedProductionGitRuntime(git), false);
+    const pnpm = process.env.npm_execpath;
+    assert.ok(pnpm !== undefined && path.isAbsolute(pnpm));
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.5' }));
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'package.json']).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'pin package manager']).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'unsupported-git-runtime-v1', nodeProgram: process.execPath, pnpmProgram: pnpm, gitProgram: git,
+      commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }],
+    }).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.deepEqual(result.commands, [{ commandIndex: 0, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 }]);
+  });
+
   it('runs pinned tools with private IPC while denying host files, sockets and IP networking under the macOS seatbelt', { skip: process.platform !== 'darwin' }, async (t) => {
     const pnpm = process.env.npm_execpath;
     assert.ok(pnpm !== undefined && path.isAbsolute(pnpm), 'run the Darwin regression through the pinned pnpm test command');
