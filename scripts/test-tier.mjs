@@ -1,10 +1,11 @@
 import path from 'node:path';
 
 export const integrationTest = 'browser-runtime-integration.test.ts';
-// These browser tests require genuine TCP listeners, unavailable in the no-IP production sandbox.
+// These tests require genuine TCP listeners or host sandbox context unavailable in production.
 export const isolatedExcludedTests = Object.freeze([
   'browser-runtime.test.ts',
   'control-tower-browser.test.ts',
+  'local-command-sandbox.test.ts',
 ]);
 export const smokeTiers = new Map([
   ['smoke:claude', { test: 'claude-code-smoke.test.ts', environment: 'TACHIKO_SMOKE' }],
