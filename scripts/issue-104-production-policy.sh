@@ -17,8 +17,8 @@ case "$TACHIKO_NODE_PROGRAM" in
   /*) ;;
   *) echo "TACHIKO_NODE_PROGRAM must be an absolute path" >&2; exit 78 ;;
 esac
-if [ ! -x "$TACHIKO_NODE_PROGRAM" ]; then
-  echo "TACHIKO_NODE_PROGRAM is not executable: $TACHIKO_NODE_PROGRAM" >&2
+if [ ! -f "$TACHIKO_NODE_PROGRAM" ] || [ ! -x "$TACHIKO_NODE_PROGRAM" ]; then
+  echo "TACHIKO_NODE_PROGRAM is not a regular executable file: $TACHIKO_NODE_PROGRAM" >&2
   exit 78
 fi
 export TACHIKO_NODE_PROGRAM
@@ -27,8 +27,8 @@ case "$TACHIKO_PNPM_PROGRAM" in
   /*) ;;
   *) echo "TACHIKO_PNPM_PROGRAM must be an absolute path" >&2; exit 78 ;;
 esac
-if [ ! -x "$TACHIKO_PNPM_PROGRAM" ]; then
-  echo "TACHIKO_PNPM_PROGRAM is not executable: $TACHIKO_PNPM_PROGRAM" >&2
+if [ ! -f "$TACHIKO_PNPM_PROGRAM" ] || [ ! -x "$TACHIKO_PNPM_PROGRAM" ]; then
+  echo "TACHIKO_PNPM_PROGRAM is not a regular executable file: $TACHIKO_PNPM_PROGRAM" >&2
   exit 78
 fi
 export TACHIKO_PNPM_PROGRAM
@@ -37,8 +37,8 @@ case "$TACHIKO_GIT_PROGRAM" in
   /*) ;;
   *) echo "TACHIKO_GIT_PROGRAM must be an absolute path" >&2; exit 78 ;;
 esac
-if [ ! -x "$TACHIKO_GIT_PROGRAM" ]; then
-  echo "TACHIKO_GIT_PROGRAM is not executable: $TACHIKO_GIT_PROGRAM" >&2
+if [ ! -f "$TACHIKO_GIT_PROGRAM" ] || [ ! -x "$TACHIKO_GIT_PROGRAM" ]; then
+  echo "TACHIKO_GIT_PROGRAM is not a regular executable file: $TACHIKO_GIT_PROGRAM" >&2
   exit 78
 fi
 export TACHIKO_GIT_PROGRAM

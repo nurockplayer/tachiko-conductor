@@ -1,4 +1,4 @@
-import { existsSync, lstatSync, readFileSync } from 'node:fs';
+import { accessSync, constants, existsSync, lstatSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 
 import {
@@ -79,6 +79,16 @@ function isPrivateRegularFile(file: string): boolean {
   } catch { return false; }
 }
 
+function isAbsoluteExecutableFile(file: string | undefined): boolean {
+  if (file === undefined || !path.isAbsolute(file)) return false;
+  try {
+    // Follow host-managed symlinks, matching the shell policy's -f/-x tests.
+    if (!statSync(file).isFile()) return false;
+    accessSync(file, constants.X_OK);
+    return true;
+  } catch { return false; }
+}
+
 /**
  * Validate the complete deployed policy before dispatch/restart.  It is pure
  * configuration and local filesystem work: it neither reads GitHub nor
@@ -103,14 +113,14 @@ export function preflightProductionPolicy(env: NodeJS.ProcessEnv = process.env):
   if (playwrightBrowsersPath === undefined || !path.isAbsolute(playwrightBrowsersPath) || playwrightBrowsersPath.trim() === '') {
     throw new Error('Issue #104 production preflight requires an absolute TACHIKO_PLAYWRIGHT_BROWSERS_PATH.');
   }
-  if (nodeProgram === undefined || !path.isAbsolute(nodeProgram) || !existsSync(nodeProgram)) {
-    throw new Error('Issue #104 production preflight requires an existing absolute TACHIKO_NODE_PROGRAM.');
+  if (!isAbsoluteExecutableFile(nodeProgram)) {
+    throw new Error('Issue #104 production preflight requires TACHIKO_NODE_PROGRAM to be an absolute regular executable file.');
   }
-  if (pnpmProgram === undefined || !path.isAbsolute(pnpmProgram) || !existsSync(pnpmProgram)) {
-    throw new Error('Issue #104 production preflight requires an existing absolute TACHIKO_PNPM_PROGRAM.');
+  if (!isAbsoluteExecutableFile(pnpmProgram)) {
+    throw new Error('Issue #104 production preflight requires TACHIKO_PNPM_PROGRAM to be an absolute regular executable file.');
   }
-  if (gitProgram === undefined || !path.isAbsolute(gitProgram) || !existsSync(gitProgram)) {
-    throw new Error('Issue #104 production preflight requires an existing absolute TACHIKO_GIT_PROGRAM.');
+  if (!isAbsoluteExecutableFile(gitProgram)) {
+    throw new Error('Issue #104 production preflight requires TACHIKO_GIT_PROGRAM to be an absolute regular executable file.');
   }
   if (dependencyArtifact === undefined || !path.isAbsolute(dependencyArtifact) || !isPrivateBrowserArtifactDirectory(dependencyArtifact) ||
     !isPrivateBrowserArtifactDirectory(path.join(dependencyArtifact, 'store')) || !isPrivateRegularFile(path.join(dependencyArtifact, 'pnpm-lock.yaml.sha256'))) {

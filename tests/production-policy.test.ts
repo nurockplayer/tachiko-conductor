@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -32,6 +32,42 @@ function environment(home: string): NodeJS.ProcessEnv {
 }
 
 describe('#104 production policy', () => {
+  for (const authority of ['TACHIKO_NODE_PROGRAM', 'TACHIKO_PNPM_PROGRAM', 'TACHIKO_GIT_PROGRAM']) {
+    it(`requires ${authority} to be an absolute regular executable file in preflight and shell policy`, () => {
+      const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-production-tools-'));
+      try {
+        const home = path.join(root, 'luna');
+        mkdirSync(home);
+        writeFileSync(path.join(home, 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
+        const executable = path.join(root, 'tool');
+        const nonExecutable = path.join(root, 'not-executable');
+        const symlink = path.join(root, 'tool-link');
+        const directoryLink = path.join(root, 'directory-link');
+        const missing = path.join(root, 'missing');
+        const danglingLink = path.join(root, 'dangling-link');
+        writeFileSync(executable, '#!/bin/sh\nexit 0\n', { mode: 0o700 });
+        writeFileSync(nonExecutable, '#!/bin/sh\nexit 0\n', { mode: 0o600 });
+        symlinkSync(executable, symlink);
+        symlinkSync(home, directoryLink);
+        symlinkSync(missing, danglingLink);
+        const env = environment(home);
+        for (const candidate of [root, directoryLink, nonExecutable, missing, danglingLink, 'relative-tool']) {
+          const supplied = { ...env, [authority]: candidate };
+          assert.throws(() => preflightProductionPolicy(supplied), new RegExp(`${authority}.*absolute regular executable file`));
+          const sourced = spawnSync('/bin/sh', ['-c', '. "$1"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], { encoding: 'utf8', env: supplied });
+          assert.equal(sourced.status, 78, `${authority}=${candidate}: ${sourced.stderr}`);
+          assert.match(sourced.stderr, new RegExp(authority));
+        }
+        for (const candidate of [executable, symlink]) {
+          const supplied = { ...env, [authority]: candidate };
+          assert.equal(preflightProductionPolicy(supplied).revision, PRODUCTION_POLICY_REVISION);
+          const sourced = spawnSync('/bin/sh', ['-c', '. "$1"', 'sh', path.resolve('scripts/issue-104-production-policy.sh')], { encoding: 'utf8', env: supplied });
+          assert.equal(sourced.status, 0, sourced.stderr);
+        }
+      } finally { rmSync(root, { recursive: true, force: true }); }
+    });
+  }
+
   it('declares hosted checks explicitly not_required with no required context', () => {
     assert.deepEqual(PRODUCTION_HOSTED_CHECK_POLICY_CONFIG, {
       revision: PRODUCTION_POLICY_REVISION,
