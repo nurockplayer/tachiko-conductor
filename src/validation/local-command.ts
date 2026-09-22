@@ -51,6 +51,39 @@ function remoteMatchesTarget(remote: string, request: ValidationRequest): boolea
 
 type GitInvoke = (args: readonly string[], timeoutMs?: number) => SpawnSyncReturns<string>;
 
+/**
+ * Git is validator infrastructure, rather than candidate validation code.
+ * Give every validator-owned Git invocation the same small, host-defined
+ * environment: it is deliberately not a filtered copy of the dispatcher
+ * environment.  In particular, no provider token, SSH agent, credential
+ * helper override, or unrelated dispatcher secret can cross this boundary.
+ *
+ * Git's installed exec path is discovered by the configured executable; the
+ * fixed PATH is only enough for an explicitly configured wrapper's shebang
+ * and for the platform Git executable when no wrapper is configured.
+ */
+function validatorGitEnvironment(): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {
+    // Windows cannot locate a qualified Git executable or its DLLs without
+    // the OS PATH. Select that one operational value explicitly; do not copy
+    // any other dispatcher environment entry.
+    PATH: process.platform === 'win32'
+      ? process.env.Path ?? process.env.PATH ?? 'C:\\Windows\\System32'
+      : '/usr/bin:/bin',
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: os.devNull,
+    GIT_TERMINAL_PROMPT: '0',
+  };
+  if (process.platform === 'win32') {
+    // Windows process creation requires these OS-owned values.  Select them
+    // individually rather than propagating the dispatcher's environment.
+    environment.SystemRoot = process.env.SystemRoot ?? 'C:\\Windows';
+    environment.COMSPEC = process.env.COMSPEC ?? 'C:\\Windows\\System32\\cmd.exe';
+    environment.PATHEXT = process.env.PATHEXT ?? '.COM;.EXE;.BAT;.CMD';
+  }
+  return environment;
+}
+
 function ignoredManifest(workspacePath: string, invoke: GitInvoke): string[] | null {
   const status = invoke(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored'], IGNORED_MANIFEST_TIMEOUT_MS);
   if (status.status !== 0) return null;
@@ -96,13 +129,14 @@ function workspaceMatches(
   requireRepositoryIdentity: boolean,
   trustedIgnoredBaselinePath?: string,
   gitProgram = 'git',
+  environment = validatorGitEnvironment(),
 ): string[] | null {
   if (workspacePath.trim() === '') return null;
   // This verification reads candidate Git metadata.  A candidate-controlled
   // core.fsmonitor program must never gain execution authority merely because
   // the host is proving the candidate clean.
   const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], {
-    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
   const manifest = ignoredManifest(workspacePath, invoke);
@@ -120,7 +154,7 @@ function workspaceMatches(
     } catch { return null; }
     if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return null;
     const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, ['-C', baselinePath, '-c', 'core.fsmonitor=false', ...args], {
-      encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+      encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
     }) as SpawnSyncReturns<string>;
     const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
     const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
@@ -140,12 +174,12 @@ function workspaceMatches(
 
 /** The reconstructed checkout has no remote by design.  Bind command evidence
  * to its immutable exact commit and reject any tracked/index mutation. */
-function commandWorkspaceManifest(workspacePath: string, headSha: string, gitProgram = 'git'): string[] | null {
+function commandWorkspaceManifest(workspacePath: string, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment()): string[] | null {
   // The reconstructed checkout contains candidate history.  Every trusted
   // host-side probe pins fsmonitor off so a copied or otherwise planted local
   // config cannot execute while evidence is being verified.
   const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], {
-    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
   const tracked = invoke(['diff', '--quiet', '--exit-code', 'HEAD', '--']);
@@ -154,8 +188,8 @@ function commandWorkspaceManifest(workspacePath: string, headSha: string, gitPro
   return ignoredManifest(workspacePath, invoke);
 }
 
-function commandWorkspaceMatches(workspacePath: string, headSha: string, expectedIgnored: readonly string[] = [], gitProgram = 'git'): boolean {
-  const manifest = commandWorkspaceManifest(workspacePath, headSha, gitProgram);
+function commandWorkspaceMatches(workspacePath: string, headSha: string, expectedIgnored: readonly string[] = [], gitProgram = 'git', environment = validatorGitEnvironment()): boolean {
+  const manifest = commandWorkspaceManifest(workspacePath, headSha, gitProgram, environment);
   return manifest !== null && manifest.join('\n') === expectedIgnored.join('\n');
 }
 
@@ -249,18 +283,6 @@ function hasTrackedFilterAttributes(
   return false;
 }
 
-function reconstructionEnvironment(): NodeJS.ProcessEnv {
-  const environment = { ...process.env };
-  for (const key of Object.keys(environment)) {
-    if (key.startsWith('GIT_CONFIG_') || key === 'GIT_DIR' || key === 'GIT_WORK_TREE' || key === 'GIT_INDEX_FILE' || key === 'GIT_ALTERNATE_OBJECT_DIRECTORIES') {
-      delete environment[key];
-    }
-  }
-  environment.GIT_CONFIG_NOSYSTEM = '1';
-  environment.GIT_CONFIG_GLOBAL = os.devNull;
-  return environment;
-}
-
 /**
  * Materialize command input outside the worker checkout.  In particular, a
  * clean exact HEAD does not authorize files under that checkout's .git
@@ -269,7 +291,7 @@ function reconstructionEnvironment(): NodeJS.ProcessEnv {
  * newly-created Git directory containing only host-created clone metadata and
  * the cryptographically addressed exact commit.
  */
-function reconstructedWorkspace(sourcePath: string, headSha: string, gitProgram = 'git'): ValidationWorkspace | null {
+function reconstructedWorkspace(sourcePath: string, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment()): ValidationWorkspace | null {
   const snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-'));
   const invoke = (args: readonly string[]) => spawnSync(gitProgram, [
     '-c', `core.hooksPath=${os.devNull}`,
@@ -278,7 +300,7 @@ function reconstructedWorkspace(sourcePath: string, headSha: string, gitProgram 
     ...args,
   ], {
     encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
-    env: reconstructionEnvironment(),
+    env: environment,
   });
   try {
     const cloned = invoke(['clone', '--no-local', '--no-checkout', sourcePath, snapshot]);
@@ -461,6 +483,7 @@ function macosValidationSandboxProfile(
   nodeProgram: string,
   pnpmProgram: string,
   gitProgram?: string,
+  gitEnvironment = validatorGitEnvironment(),
 ): string | null {
   if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return null;
   let workspace: string; let node: string; let pnpm: string; let git: string | undefined; let gitExecPath: string | undefined;
@@ -472,7 +495,7 @@ function macosValidationSandboxProfile(
       git = realpathSync(gitProgram);
       const probe = spawnSync(gitProgram, ['--exec-path'], {
         encoding: 'utf8', shell: false, timeout: TOOL_VERSION_TIMEOUT_MS,
-        env: { HOME: runtimeRoot, TMPDIR: runtimeRoot, TMP: runtimeRoot, TEMP: runtimeRoot, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: os.devNull, GIT_TERMINAL_PROMPT: '0' },
+        env: gitEnvironment,
       });
       if (probe.status !== 0 || probe.signal !== null || probe.stdout.trim() === '') return null;
       gitExecPath = realpathSync(probe.stdout.trim());
@@ -606,7 +629,8 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     if (workspacePath === undefined) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
-    const admittedIgnoredManifest = workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram);
+    const gitEnvironment = validatorGitEnvironment();
+    const admittedIgnoredManifest = workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment);
     if (admittedIgnoredManifest === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     // A configured baseline is host-owned and already proved byte-identical
     // for every ignored dependency.  It is therefore the only place those
@@ -614,7 +638,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     // input so worker-controlled .git bytes have no validation authority.
     const baseline = this.configuration.trustedIgnoredBaselinePath;
     const commandWorkspace = baseline === undefined
-      ? reconstructedWorkspace(workspacePath, request.headSha, this.configuration.gitProgram)
+      ? reconstructedWorkspace(workspacePath, request.headSha, this.configuration.gitProgram, gitEnvironment)
       : { path: baseline, dispose: () => {} };
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
@@ -640,7 +664,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0, this.configuration.pnpmProgram)] };
       }
       const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
-        ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram) ?? undefined
+        ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram, gitEnvironment) ?? undefined
         : undefined;
       // The production lane is meaningful only with a real macOS kernel
       // boundary. Do not silently degrade to environment scrubbing.
@@ -650,7 +674,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // itself never grants this authority, and later checks pin this same
       // manifest (or the separately captured cold-hydration manifest).
       const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
-      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest, this.configuration.gitProgram)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest, this.configuration.gitProgram, gitEnvironment)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
       let settledManifest: readonly string[] = initialIgnoredManifest;
       const terminalGeneratedIgnoredRoots = this.configuration.terminalGeneratedIgnoredRoots ?? [];
@@ -666,7 +690,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
           return { status: 'failed', configRevision: revision, commands: evidence };
         }
         if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
-        const manifest = commandWorkspaceManifest(commandWorkspace.path, request.headSha, this.configuration.gitProgram);
+        const manifest = commandWorkspaceManifest(commandWorkspace.path, request.headSha, this.configuration.gitProgram, gitEnvironment);
         const isHydration = index === 0 && this.configuration.dependencyArtifactPath !== undefined;
         const isFinal = index === configured.length - 1;
         const manifestAdmitted = manifest !== null && (
@@ -683,11 +707,11 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         if (isHydration) hydratedManifest = manifest;
         settledManifest = manifest;
       }
-      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, settledManifest, this.configuration.gitProgram)) {
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, settledManifest, this.configuration.gitProgram, gitEnvironment)) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      if (workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram) === null) {
+      if (workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment) === null) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }

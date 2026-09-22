@@ -94,6 +94,90 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(existsSync(marker), true);
   });
 
+  it('runs admission, reconstruction, and command-workspace Git probes without dispatcher credentials', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitattributes'), 'README.md text\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitattributes'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'exercise immutable attribute probe'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-sanitized-git-'));
+    dirs.push(tools);
+    const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(actualGit, '');
+    const log = path.join(tools, 'invocations');
+    const configuredGit = path.join(tools, 'git');
+    writeFileSync(configuredGit, `#!/bin/sh
+for key in GITHUB_TOKEN GH_TOKEN SSH_AUTH_SOCK AWS_SECRET_ACCESS_KEY OPENAI_API_KEY PROVIDER_API_TOKEN UNRELATED_DISPATCHER_SECRET GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+  printenv "$key" >/dev/null && exit 92
+done
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+exec ${JSON.stringify(actualGit)} "$@"
+`);
+    chmodSync(configuredGit, 0o755);
+    const inherited = Object.fromEntries(['GITHUB_TOKEN', 'GH_TOKEN', 'SSH_AUTH_SOCK', 'AWS_SECRET_ACCESS_KEY', 'OPENAI_API_KEY', 'PROVIDER_API_TOKEN', 'UNRELATED_DISPATCHER_SECRET', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'].map((key) => [key, process.env[key]]));
+    Object.assign(process.env, {
+      GITHUB_TOKEN: 'github-secret', GH_TOKEN: 'gh-secret', SSH_AUTH_SOCK: '/tmp/agent.sock', AWS_SECRET_ACCESS_KEY: 'provider-secret',
+      OPENAI_API_KEY: 'api-secret', PROVIDER_API_TOKEN: 'provider-token', UNRELATED_DISPATCHER_SECRET: 'dispatcher-secret',
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '!false',
+    });
+    try {
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: 'sanitized-git-reconstruction-v1', gitProgram: configuredGit,
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+      }).validate(owned);
+      assert.equal(result.status, 'passed');
+      const invocations = readFileSync(log, 'utf8');
+      for (const probe of [' status ', ' rev-parse ', ' clone ', ' remote remove', ' ls-tree ', ' cat-file ', ' checkout ', ' ls-files ']) {
+        assert.match(` ${invocations}`, new RegExp(probe));
+      }
+    } finally {
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
+  it('runs trusted-baseline admission and settlement Git probes without dispatcher credentials', async () => {
+    const owned = request();
+    const baseline = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-sanitized-git-'));
+    dirs.push(baseline, tools);
+    assert.equal(spawnSync('git', ['clone', owned.workspacePath, baseline], { encoding: 'utf8' }).status, 0);
+    const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(actualGit, '');
+    const log = path.join(tools, 'invocations');
+    const configuredGit = path.join(tools, 'git');
+    writeFileSync(configuredGit, `#!/bin/sh
+for key in GITHUB_TOKEN GH_TOKEN SSH_AUTH_SOCK AWS_SECRET_ACCESS_KEY OPENAI_API_KEY PROVIDER_API_TOKEN UNRELATED_DISPATCHER_SECRET GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+  printenv "$key" >/dev/null && exit 92
+done
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+exec ${JSON.stringify(actualGit)} "$@"
+`);
+    chmodSync(configuredGit, 0o755);
+    const inherited = Object.fromEntries(['GITHUB_TOKEN', 'GH_TOKEN', 'SSH_AUTH_SOCK', 'AWS_SECRET_ACCESS_KEY', 'OPENAI_API_KEY', 'PROVIDER_API_TOKEN', 'UNRELATED_DISPATCHER_SECRET', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'].map((key) => [key, process.env[key]]));
+    Object.assign(process.env, {
+      GITHUB_TOKEN: 'github-secret', GH_TOKEN: 'gh-secret', SSH_AUTH_SOCK: '/tmp/agent.sock', AWS_SECRET_ACCESS_KEY: 'provider-secret',
+      OPENAI_API_KEY: 'api-secret', PROVIDER_API_TOKEN: 'provider-token', UNRELATED_DISPATCHER_SECRET: 'dispatcher-secret',
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '!false',
+    });
+    try {
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: 'sanitized-git-baseline-v1', gitProgram: configuredGit, trustedIgnoredBaselinePath: baseline,
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+      }).validate(owned);
+      assert.equal(result.status, 'passed');
+      const invocations = readFileSync(log, 'utf8');
+      assert.match(` ${invocations}`, / status /);
+      assert.match(` ${invocations}`, / rev-parse /);
+      assert.match(` ${invocations}`, / ls-files /);
+    } finally {
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
   it('rejects substituted or mismatched pnpm before a validation command can run', async () => {
     const owned = request('pnpm@10.34.5');
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
