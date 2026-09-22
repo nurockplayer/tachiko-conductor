@@ -434,7 +434,7 @@ operator configuration: Conductor parks before validation or review executes.
 `scripts/issue-104-production-policy.sh` is the checked-in, revisioned
 reboot-safe policy source for the qualified Luna lane. It pins `routine` to
 `luna-isolated` / `gpt-5.6-luna`, an absolute `TACHIKO_LUNA_CODEX_HOME`,
-frozen-lockfile `pnpm` hydration plus test/typecheck/build in the reconstructed
+frozen-lockfile `pnpm` hydration plus `test:isolated`/typecheck/build in the reconstructed
 exact candidate, and the hosted-check policy. Luna rejects `standard`,
 `complex`, and `critical` before provider construction; they are not quiet
 fallback routes.
@@ -447,14 +447,26 @@ lockfile),
 then run `scripts/issue-104-deploy.sh preflight`. This reads only local policy
 and the qualified Luna config—no GitHub, pnpm install, or model turn. The
 production validator executes pnpm only by that explicit path, under macOS
-`sandbox-exec` with network and default filesystem access denied. The store is
-read-only to candidate code and hydration is offline; Git is admitted only by
-the explicit configured executable, validation temp files stay under the
+`sandbox-exec` with IP networking and default filesystem access denied. A fresh
+private copy of the lockfile-bound store permits pnpm's project metadata writes;
+the host artifact remains read-only and hydration is offline. Fixed macOS
+loader metadata, tool executables, and Unix sockets under the private runtime
+root are admitted; host homes and sockets remain outside the boundary. Git
+uses the explicit configured executable, validation temp files stay under the
 private runtime root, and only the final build may create the configured
 non-authoritative `dist/` output. A missing, dirty, or
 lockfile-mismatched artifact makes validation unknown. `scripts/issue-104-deploy.sh restart` first persists the existing
 maintenance hold, preflights, and then restarts launchd; leave the hold in
 place until an operator explicitly verifies and releases it.
+
+The production `test:isolated` tier excludes exactly `browser-runtime.test.ts`
+and `control-tower-browser.test.ts` from the ordinary unit tier because they
+start TCP servers. `pnpm test` retains both files and remains required for
+captain validation before merge, alongside the real Darwin sandbox regression.
+The isolated tier never treats a denied network operation as a reason to skip
+additional tests. The Darwin regression must run through pinned pnpm and fails
+if its real toolchain cannot start; it checks private IPC and denial of host
+file access and loopback connections.
 
 Without explicit configuration, local validation is unknown and the run cannot
 advance to review. The configured runner refuses an ambient directory: it

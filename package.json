@@ -17,6 +17,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.test.json",
     "test": "node scripts/run-test-tier.mjs unit",
+    "test:isolated": "node scripts/run-test-tier.mjs isolated",
     "test:integration": "node scripts/run-test-tier.mjs integration",
     "test:smoke:claude": "node scripts/run-test-tier.mjs smoke:claude",
     "test:smoke:codex": "node scripts/run-test-tier.mjs smoke:codex",

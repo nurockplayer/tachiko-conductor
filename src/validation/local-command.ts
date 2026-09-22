@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -507,10 +507,10 @@ function macosValidationSandboxProfile(
     workspace, runtimeRoot, node, pnpm, pnpmProgram, path.dirname(node), path.dirname(path.dirname(node)), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
     // pnpm launchers commonly use env/sh before entering the pinned Node
     // runtime. These are fixed macOS executables, not PATH-discovered tools.
-    '/usr/bin/env', '/bin/sh', '/usr/lib', '/System/Library', '/usr/share',
+    '/usr/bin', '/bin', '/usr/lib', '/System/Library', '/usr/share',
     // Small fixed OS metadata/device set required by real Node startup. These
     // are not user homes, caches, credentials, or configuration directories.
-    '/dev/null', '/dev/urandom', '/var/db/timezone', '/private/var/db/timezone',
+    '/dev/null', '/dev/urandom', '/var/db/timezone', '/private/var/db/timezone', '/private/var/select/sh',
   ];
   if (git !== undefined && gitExecPath !== undefined && gitProgram !== undefined) reads.push(git, gitProgram, gitExecPath);
   if (browserArtifacts !== undefined) {
@@ -519,8 +519,33 @@ function macosValidationSandboxProfile(
   if (dependencyArtifactPath !== undefined) {
     try { reads.push(realpathSync(dependencyArtifactPath)); } catch { return null; }
   }
-  const clauses = reads.map((entry) => `(allow file-read* (subpath ${sandboxLiteral(entry)}))`).join('\n');
-  return `(version 1)\n(deny default)\n(deny network*)\n(allow process*)\n${clauses}\n(allow file-write* (subpath ${sandboxLiteral(workspace)}))\n(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))`;
+  const clauses = reads.map((entry) => `(allow file-read* (subpath ${sandboxLiteral(entry)}))\n(allow file-read-metadata (path-ancestors ${sandboxLiteral(entry)}))`).join('\n');
+  // dyld checks the root directory itself; Node queries its page size and OS
+  // identity. Neither permission grants recursive reads of the host home.
+  const sysctls = ['hw.pagesize_compat', 'kern.ostype', 'kern.osrelease', 'kern.version', 'kern.hostname', 'hw.machine']
+    .map((name) => `(sysctl-name ${sandboxLiteral(name)})`).join(' ');
+  // Apple's /usr/bin/git launcher may be used by nested repository tools.
+  // Admit its metadata and loader only when that exact CLT Git is configured.
+  const appleGitLauncher = git === '/Library/Developer/CommandLineTools/usr/bin/git'
+    ? `(allow file-read-metadata (subpath "/Library/Developer/CommandLineTools"))
+(allow file-read* (literal "/Library/Developer/CommandLineTools") (literal "/Library/Developer/CommandLineTools/usr/lib/libxcrun.dylib") (literal "/private/var/db/xcode_select_link") (literal "/var/db/xcode_select_link"))`
+    : '';
+  return `(version 1)
+(deny default)
+(deny network*)
+(allow process*)
+(allow file-read* file-test-existence (literal "/"))
+(allow file-read-metadata (literal "/tmp") (literal "/var"))
+(allow sysctl-read ${sysctls})
+${clauses}
+${appleGitLauncher}
+(allow file-write-data (literal "/dev/null"))
+(allow file-write* (subpath ${sandboxLiteral(workspace)}))
+(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))
+; tsx uses private IPC. No IP sockets or sockets outside this run are admitted.
+(allow system-socket (socket-domain AF_UNIX))
+(allow network-bind (local unix-socket (subpath ${sandboxLiteral(runtimeRoot)})))
+(allow network-outbound (remote unix-socket (subpath ${sandboxLiteral(runtimeRoot)})))`;
 }
 
 /**
@@ -543,7 +568,7 @@ function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrow
   const environment: NodeJS.ProcessEnv = {
     PATH: nodeProgram === undefined || pnpmProgram === undefined
       ? process.env.PATH ?? (process.platform === 'win32' ? process.env.Path : undefined)
-      : [...(gitProgram === undefined ? [] : [path.dirname(gitProgram)]), path.dirname(pnpmProgram), path.dirname(nodeProgram)].filter((entry, index, all) => all.indexOf(entry) === index).join(path.delimiter),
+      : [...(gitProgram === undefined ? [] : [path.dirname(gitProgram)]), path.dirname(pnpmProgram), path.dirname(nodeProgram), '/usr/bin', '/bin'].filter((entry, index, all) => all.indexOf(entry) === index).join(path.delimiter),
     HOME: home,
     XDG_CACHE_HOME: cache,
     XDG_CONFIG_HOME: config,
@@ -651,10 +676,20 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       commandWorkspace.dispose();
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
-    const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
-    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram, dependencyStore ?? undefined);
+    // Keep the prefix short for Darwin's sockaddr_un path limit, including
+    // nested validation probes. Only this private mkdtemp directory enters
+    // the sandbox, and the canonical path admits its real metadata ancestors.
+    const runtimeRoot = realpathSync(mkdtempSync(path.join(os.tmpdir(), 'tcv-')));
     const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
     try {
+      // pnpm writes project metadata even during offline hydration. Give each
+      // command sequence a private copy, preserving the host artifact's bytes.
+      const privateStore = dependencyStore === null ? undefined : path.join(runtimeRoot, 'store');
+      if (dependencyStore !== null && privateStore !== undefined) {
+        try { cpSync(dependencyStore, privateStore, { recursive: true, verbatimSymlinks: true }); }
+        catch { return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] }; }
+      }
+      const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram, privateStore);
       // A production plan has one host-provisioned pnpm authority.  Reject a
       // substituted executable before probing a tool or starting validation.
       if (this.configuration.pnpmProgram !== undefined && configured.some((command) => !isCommand(command) || command.argv[0] !== this.configuration.pnpmProgram)) {

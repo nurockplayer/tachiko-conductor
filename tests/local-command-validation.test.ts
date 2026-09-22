@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import net from 'node:net';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
@@ -48,18 +49,47 @@ function pinnedPnpm(workspacePath: string, version: string, exitCode = 0): strin
 }
 
 describe('ConfiguredLocalValidationAdapter', () => {
-  it('runs configured absolute Node and repository-pinned absolute pnpm under the macOS seatbelt', { skip: process.platform !== 'darwin' || !existsSync(path.resolve('node_modules/.bin/pnpm')) }, async () => {
+  it('runs pinned tools with private IPC while denying host files, sockets and IP networking under the macOS seatbelt', { skip: process.platform !== 'darwin' }, async (t) => {
     const owned = request();
-    const pnpm = path.resolve('node_modules/.bin/pnpm');
-    writeFileSync(path.join(owned.workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.5' }));
-    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'package.json'], { encoding: 'utf8' }).status, 0);
+    const pnpm = process.env.npm_execpath;
+    assert.ok(pnpm !== undefined && path.isAbsolute(pnpm), 'run the Darwin regression through the pinned pnpm test command');
+    const git = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    const outside = mkdtempSync(path.join(os.tmpdir(), 'tachiko-host-sentinel-'));
+    dirs.push(outside);
+    const sentinel = path.join(outside, 'credential');
+    writeFileSync(sentinel, 'must remain outside the sandbox');
+    const hostSocket = path.join(outside, 'host.sock');
+    const hostServer = net.createServer();
+    await new Promise<void>((resolve, reject) => { hostServer.once('error', reject); hostServer.listen(hostSocket, resolve); });
+    t.after(() => new Promise<void>((resolve, reject) => hostServer.close((error) => error === undefined ? resolve() : reject(error))));
+    writeFileSync(path.join(owned.workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.5', scripts: { probe: 'node probe.cjs' } }));
+    writeFileSync(path.join(owned.workspacePath, 'probe.cjs'), `
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const net = require('node:net');
+const path = require('node:path');
+require('node:os').type();
+assert.throws(() => fs.readFileSync(${JSON.stringify(sentinel)}), /EPERM|EACCES/);
+assert.throws(() => fs.writeFileSync(${JSON.stringify(sentinel)}, 'changed'), /EPERM|EACCES/);
+const socketPath = path.join(process.env.TMPDIR, 'private.sock');
+const server = net.createServer((socket) => { socket.end(); server.close(); });
+server.listen(socketPath, () => net.connect(socketPath).on('error', (error) => { throw error; }));
+const internet = net.connect({ host: '127.0.0.1', port: 1 });
+internet.on('connect', () => { throw new Error('host loopback must remain denied'); });
+internet.on('error', (error) => assert.equal(error.code, 'EPERM'));
+const hostIpc = net.connect(${JSON.stringify(hostSocket)});
+hostIpc.on('connect', () => { throw new Error('host Unix sockets must remain denied'); });
+hostIpc.on('error', (error) => assert.equal(error.code, 'EPERM'));
+`);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'package.json', 'probe.cjs'], { encoding: 'utf8' }).status, 0);
     assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'pin package manager'], { encoding: 'utf8' }).status, 0);
     owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
     const result = await new ConfiguredLocalValidationAdapter({
-      revision: 'darwin-real-toolchain-v1', nodeProgram: process.execPath, pnpmProgram: pnpm,
-      commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }],
+      revision: 'darwin-real-toolchain-v2', nodeProgram: process.execPath, pnpmProgram: pnpm, gitProgram: git,
+      commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }, { argv: [pnpm, 'run', 'probe'], timeoutMs: 30_000 }],
     }).validate(owned);
-    assert.equal(result.status, 'passed');
+    assert.equal(result.status, 'passed', JSON.stringify(result));
+    assert.equal(readFileSync(sentinel, 'utf8'), 'must remain outside the sandbox');
   });
 
   it('binds pnpm validation authority to the exact repository packageManager pin', () => {
@@ -242,9 +272,9 @@ exec ${JSON.stringify(actualGit)} "$@"
       // macOS may add __CF_USER_TEXT_ENCODING at exec time. Assert the real
       // denial invariant instead of treating that platform metadata as a
       // credential inherited from the dispatcher.
-    assert.match(environment.HOME!, /tachiko-validation-runtime-/);
-    assert.match(environment.XDG_CACHE_HOME!, /tachiko-validation-runtime-/);
-    assert.match(environment.TMPDIR!, /tachiko-validation-runtime-/);
+    assert.match(environment.HOME!, /[/\\]tcv-[^/\\]+[/\\]home$/);
+    assert.match(environment.XDG_CACHE_HOME!, /[/\\]tcv-[^/\\]+[/\\]cache$/);
+    assert.match(environment.TMPDIR!, /[/\\]tcv-[^/\\]+[/\\]tmp$/);
     assert.equal(environment.TMP, environment.TMPDIR);
     assert.equal(environment.TEMP, environment.TMPDIR);
       assert.equal(environment.GITHUB_TOKEN, undefined);
@@ -395,10 +425,11 @@ exec ${JSON.stringify(actualGit)} "$@"
     const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-offline-pnpm-'));
     dirs.push(artifact, tools);
     mkdirSync(path.join(artifact, 'store'));
+    writeFileSync(path.join(artifact, 'store', 'trusted'), 'immutable');
     writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
     const pnpm = path.join(tools, 'pnpm');
     const marker = path.join(tools, 'validated');
-    writeFileSync(pnpm, `#!/bin/sh\n[ \"$npm_config_offline\" = true ] && [ \"$npm_config_store_dir\" = ${JSON.stringify(path.join(artifact, 'store'))} ] || exit 91\nmkdir -p node_modules/fixture\nprintf fixture > node_modules/fixture/index.js\n`);
+    writeFileSync(pnpm, `#!/bin/sh\n[ \"$npm_config_offline\" = true ] && [ \"$npm_config_store_dir\" != ${JSON.stringify(path.join(artifact, 'store'))} ] && [ -f \"$npm_config_store_dir/trusted\" ] || exit 91\nprintf changed > \"$npm_config_store_dir/trusted\"\nmkdir -p node_modules/fixture\nprintf fixture > node_modules/fixture/index.js\n`);
     chmodSync(pnpm, 0o755);
     const result = await new ConfiguredLocalValidationAdapter({
       revision: 'cold-offline-fixture-v1', dependencyArtifactPath: artifact,
@@ -409,6 +440,7 @@ exec ${JSON.stringify(actualGit)} "$@"
     }).validate({ ...owned, headSha });
     assert.equal(result.status, 'passed');
     assert.equal(existsSync(marker), true);
+    assert.equal(readFileSync(path.join(artifact, 'store', 'trusted'), 'utf8'), 'immutable');
     writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), '0'.repeat(64));
     assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 1_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
   });

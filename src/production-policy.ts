@@ -13,7 +13,7 @@ import { parseTrustedLunaConfig } from './agents/luna-isolated.js';
  * reboot-safe transport used by launchd/deployment; these values make its
  * contract testable without sourcing a user shell.
  */
-export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v5';
+export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v6';
 export const PRODUCTION_EXECUTION_PROFILE_CONFIG = {
   revision: PRODUCTION_POLICY_REVISION,
   profiles: {
@@ -39,7 +39,7 @@ export const PRODUCTION_LOCAL_VALIDATION_CONFIG = {
     // This always happens in a newly reconstructed exact-HEAD checkout.  It
     // hydrates from the lockfile, never mutates it, and has no model boundary.
     { argv: ['pnpm', 'install', '--frozen-lockfile', '--offline', '--ignore-scripts'], timeoutMs: 300_000 },
-    { argv: ['pnpm', 'test'], timeoutMs: 300_000 },
+    { argv: ['pnpm', 'test:isolated'], timeoutMs: 300_000 },
     { argv: ['pnpm', 'typecheck'], timeoutMs: 120_000 },
     { argv: ['pnpm', 'build'], timeoutMs: 120_000 },
   ],

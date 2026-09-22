@@ -1,4 +1,5 @@
 export const integrationTest: string;
+export const isolatedExcludedTests: readonly string[];
 export const smokeTiers: Map<string, { test: string; environment: string }>;
 export function selectTests(tier: string | undefined, allTests: string[]): string[];
 export function environmentForTier(
