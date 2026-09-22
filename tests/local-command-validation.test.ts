@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
-import { ConfiguredLocalValidationAdapter, copyDependencyStore, disposePrivateTrees, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
+import { ConfiguredLocalValidationAdapter, copyDependencyStore, disposePrivateTrees, hasPinnedPnpmAuthority, ignoredManifest } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
 import { TARGET } from './helpers.js';
 
@@ -31,6 +31,24 @@ function preExistingPullRequestRequest() {
   return request();
 }
 
+function linkedWorktreeRequest() {
+  const source = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-linked-source-'));
+  const workspaceParent = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-linked-root-'));
+  const workspacePath = path.join(workspaceParent, 'worktree');
+  // Remove the workspace path from cleanup before its parent so Git's linked
+  // worktree metadata is no longer needed when the fixture is torn down.
+  dirs.push(workspacePath, workspaceParent, source);
+  for (const args of [['init'], ['config', 'user.email', 'validation@example.test'], ['config', 'user.name', 'Validation']]) {
+    assert.equal(spawnSync('git', ['-C', source, ...args], { encoding: 'utf8' }).status, 0);
+  }
+  writeFileSync(path.join(source, 'README.md'), 'validation\n');
+  assert.equal(spawnSync('git', ['-C', source, 'add', 'README.md'], { encoding: 'utf8' }).status, 0);
+  assert.equal(spawnSync('git', ['-C', source, 'commit', '-m', 'initial'], { encoding: 'utf8' }).status, 0);
+  const headSha = spawnSync('git', ['-C', source, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  assert.equal(spawnSync('git', ['-C', source, 'worktree', 'add', '--detach', workspacePath, headSha], { encoding: 'utf8' }).status, 0);
+  return { target: TARGET, headSha, workspacePath };
+}
+
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 function configuration(argv: readonly string[], timeoutMs = 5_000): LocalValidationConfiguration {
@@ -48,6 +66,28 @@ function pinnedPnpm(workspacePath: string, version: string, exitCode = 0): strin
 }
 
 describe('ConfiguredLocalValidationAdapter', () => {
+  it('fails closed when bounded ignored-manifest limits are exceeded', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'ignored\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore fixture'], { encoding: 'utf8' }).status, 0);
+    mkdirSync(path.join(owned.workspacePath, 'ignored', 'deep', 'more'), { recursive: true });
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'deep', 'more', 'leaf'), 'deep');
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'tiny'), 'ok');
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'large'), 'x'.repeat(32));
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'sparse'), '');
+    truncateSync(path.join(owned.workspacePath, 'ignored', 'sparse'), 128);
+    const authority = { path: owned.workspacePath, gitDir: path.join(owned.workspacePath, '.git') };
+    assert.notEqual(await ignoredManifest(authority, 'git', { maxEntries: 100, maxDepth: 10, maxFileBytes: 256, maxTotalBytes: 1_024, maxOutputBytes: 1_024 * 1_024 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxEntries: 100, maxDepth: 10, maxFileBytes: 64, maxTotalBytes: 1_024, maxOutputBytes: 1_024 * 1_024 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxEntries: 100, maxDepth: 10, maxFileBytes: 256, maxTotalBytes: 100, maxOutputBytes: 1_024 * 1_024 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxEntries: 1 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxDepth: 1 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxFileBytes: 16 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxTotalBytes: 16 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxOutputBytes: 16 }), null);
+  });
+
   it('binds pnpm validation authority to the exact repository packageManager pin', () => {
     const owned = request();
     const matching = pinnedPnpm(owned.workspacePath, '10.34.5');
@@ -113,7 +153,7 @@ exec ${JSON.stringify(actualGit)} "$@"
       }).validate(owned);
       assert.equal(result.status, 'passed');
       const invocations = readFileSync(log, 'utf8');
-      for (const probe of [' status ', ' rev-parse ', ' clone ', ' remote remove', ' ls-tree ', ' cat-file ', ' checkout ', ' ls-files ']) {
+      for (const probe of [' ls-files ', ' rev-parse ', ' clone ', ' remote remove', ' ls-tree ', ' cat-file ', ' checkout ']) {
         assert.match(` ${invocations}`, new RegExp(probe));
       }
     } finally {
@@ -154,7 +194,7 @@ exec ${JSON.stringify(actualGit)} "$@"
       }).validate(owned);
       assert.equal(result.status, 'passed');
       const invocations = readFileSync(log, 'utf8');
-      assert.match(` ${invocations}`, / status /);
+      assert.match(` ${invocations}`, / ls-files /);
       assert.match(` ${invocations}`, / rev-parse /);
       assert.match(` ${invocations}`, / ls-files /);
     } finally {
@@ -351,6 +391,74 @@ exec ${JSON.stringify(actualGit)} "$@"
     const clean = request();
     const wrongHead = await adapter.validate({ ...clean, headSha: '0'.repeat(40) });
     assert.equal(wrongHead.status, 'unknown');
+  });
+
+  it('validates an ordinary linked worktree with a .git file indirection', async () => {
+    const owned = linkedWorktreeRequest();
+    assert.equal(readFileSync(path.join(owned.workspacePath, '.git'), 'utf8').startsWith('gitdir:'), true);
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, '-e', 'process.exit(0)']),
+    ).validate(owned);
+    assert.equal(result.status, 'passed');
+  });
+
+  it('accepts a linked worktree as the trusted ignored-state baseline', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'node_modules/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore dependencies'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const source = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-source-'));
+    const baselineParent = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-root-'));
+    const baseline = path.join(baselineParent, 'worktree');
+    dirs.push(baseline, baselineParent, source);
+    assert.equal(spawnSync('git', ['clone', owned.workspacePath, source], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', source, 'worktree', 'add', '--detach', baseline, owned.headSha], { encoding: 'utf8' }).status, 0);
+    assert.equal(readFileSync(path.join(baseline, '.git'), 'utf8').startsWith('gitdir:'), true);
+    for (const workspace of [owned.workspacePath, baseline]) {
+      mkdirSync(path.join(workspace, 'node_modules', 'trusted'), { recursive: true });
+      writeFileSync(path.join(workspace, 'node_modules', 'trusted', 'index.js'), 'module.exports = true\n');
+    }
+    const marker = path.join(baselineParent, 'validation-ran');
+    const result = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+      trustedIgnoredBaselinePath: baseline,
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(marker), true);
+  });
+
+  it('rejects tracked drift despite worker Git replace, worktree, or include metadata', async () => {
+    for (const mode of ['replace', 'worktree', 'include'] as const) {
+      const owned = request();
+      const proofDir = mkdtempSync(path.join(os.tmpdir(), `tachiko-git-${mode}-proof-`));
+      dirs.push(proofDir);
+      const marker = path.join(proofDir, 'validation-ran');
+      const replacementWorktree = path.join(proofDir, 'replacement-worktree');
+      mkdirSync(replacementWorktree);
+      if (mode === 'replace') {
+        const tree = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).stdout.trim();
+        const replacement = spawnSync('git', ['-C', owned.workspacePath, 'commit-tree', tree, '-m', 'replacement'], {
+          encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 'Validation', GIT_AUTHOR_EMAIL: 'validation@example.test', GIT_COMMITTER_NAME: 'Validation', GIT_COMMITTER_EMAIL: 'validation@example.test' },
+        }).stdout.trim();
+        assert.match(replacement, /^[0-9a-f]{40}$/);
+        assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'replace', owned.headSha, replacement], { encoding: 'utf8' }).status, 0);
+      } else {
+        const config = path.join(owned.workspacePath, '.git', 'config');
+        const include = path.join(proofDir, 'included-config');
+        if (mode === 'worktree') writeFileSync(config, `${readFileSync(config, 'utf8')}\n[core]\n\tworktree = ${replacementWorktree}\n`);
+        else {
+          writeFileSync(include, `[core]\n\tworktree = ${replacementWorktree}\n`);
+          writeFileSync(config, `${readFileSync(config, 'utf8')}\n[include]\n\tpath = ${include}\n`);
+        }
+      }
+      writeFileSync(path.join(owned.workspacePath, 'README.md'), `${mode} hidden drift\n`);
+      const result = await new ConfiguredLocalValidationAdapter(
+        configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+      ).validate(owned);
+      assert.equal(result.status, 'unknown', mode);
+      assert.equal(existsSync(marker), false, mode);
+    }
   });
 
   it('never executes a candidate-planted fsmonitor while verifying validation Git metadata', async () => {
@@ -694,7 +802,7 @@ exec ${JSON.stringify(actualGit)} "$@"
     assert.equal(existsSync(marker), false);
   });
 
-  it('rejects tracked filter attributes before snapshot checkout can invoke an ambient smudge command', async () => {
+  it('rejects tracked filter attributes before snapshot checkout can invoke ambient clean or smudge commands', async () => {
     const owned = request();
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
     dirs.push(proofDir);
@@ -703,7 +811,7 @@ exec ${JSON.stringify(actualGit)} "$@"
     const globalConfig = path.join(proofDir, 'gitconfig');
     writeFileSync(smudge, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\ncat\n`);
     chmodSync(smudge, 0o755);
-    writeFileSync(globalConfig, `[filter "marker"]\n\tsmudge = ${JSON.stringify(smudge)}\n`);
+    writeFileSync(globalConfig, `[filter "marker"]\n\tclean = ${JSON.stringify(smudge)}\n\tsmudge = ${JSON.stringify(smudge)}\n`);
     writeFileSync(path.join(owned.workspacePath, '.gitattributes'), 'probe.txt filter=marker\n');
     writeFileSync(path.join(owned.workspacePath, 'probe.txt'), 'candidate bytes\n');
     assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitattributes', 'probe.txt'], { encoding: 'utf8' }).status, 0);

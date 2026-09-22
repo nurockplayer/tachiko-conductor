@@ -86,6 +86,17 @@ assert.equal(require('node:os').availableParallelism(), ${os.availableParallelis
 assert.match(execFileSync('git', ['--version'], { encoding: 'utf8' }), /^git version /);
 ${profile === 'renamed configured tools' ? "assert.equal(execFileSync('git', ['--version'], { encoding: 'utf8' }).trim(), 'git version configured-authority');" : ''}
 assert.equal(execFileSync('pnpm', ['--version'], { encoding: 'utf8' }).trim(), '10.34.5');
+const gitFile = path.join(process.cwd(), '.git');
+const gitMetadata = fs.statSync(gitFile).isDirectory()
+  ? gitFile
+  : path.resolve(process.cwd(), fs.readFileSync(gitFile, 'utf8').trim().replace(/^gitdir:\\s*/, ''));
+assert.throws(() => fs.writeFileSync(path.join(gitMetadata, 'config'), 'replacement'), /EPERM|EACCES/);
+assert.throws(() => fs.renameSync(path.join(gitMetadata, 'config'), path.join(gitMetadata, 'config.replaced')), /EPERM|EACCES/);
+assert.throws(() => fs.renameSync(gitMetadata, gitMetadata + '-replaced'), /EPERM|EACCES/);
+if (fs.statSync(gitFile).isDirectory()) {
+  assert.throws(() => fs.writeFileSync(path.join(gitFile, 'config'), 'replacement'), /EPERM|EACCES/);
+  assert.throws(() => fs.renameSync(gitFile, gitFile + '-replaced'), /EPERM|EACCES/);
+}
 const toolBin = path.resolve(process.env.HOME, '..', 'bin');
 for (const name of ['node', 'pnpm', 'git']) {
   const alias = path.join(toolBin, name);
@@ -117,6 +128,51 @@ hostIpc.on('error', (error) => assert.equal(error.code, 'EPERM'));
         }).validate(owned);
         assert.equal(result.status, 'passed', JSON.stringify(result));
         assert.equal(readFileSync(sentinel, 'utf8'), 'must remain outside the sandbox');
+
+        const baseline = mkdtempSync(path.join(os.tmpdir(), 'tbs-'));
+        dirs.push(baseline);
+        assert.equal(spawnSync('git', ['clone', '--no-local', owned.workspacePath, baseline], { encoding: 'utf8' }).status, 0);
+        const baselineResult = await new ConfiguredLocalValidationAdapter({
+          revision: `darwin-baseline-metadata-${profile}-v1`, nodeProgram: node, pnpmProgram: packageManager, gitProgram: git,
+          trustedIgnoredBaselinePath: baseline,
+          commands: [{ argv: [packageManager, '--version'], timeoutMs: 30_000 }, { argv: [packageManager, 'run', 'probe'], timeoutMs: 30_000 }, { argv: [packageManager, '--version'], timeoutMs: 30_000 }],
+        }).validate(owned);
+        assert.equal(baselineResult.status, 'passed', JSON.stringify(baselineResult));
+
+        const drifted = request();
+        writeFileSync(path.join(drifted.workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.5', scripts: { drift: 'node drift.cjs' } }));
+        writeFileSync(path.join(drifted.workspacePath, 'drift.cjs'), `
+const { execFileSync } = require('node:child_process');
+const fs = require('node:fs');
+const path = require('node:path');
+fs.writeFileSync('README.md', 'tracked drift\\n');
+const gitFile = path.join(process.cwd(), '.git');
+const gitMetadata = fs.statSync(gitFile).isDirectory()
+  ? gitFile
+  : path.resolve(process.cwd(), fs.readFileSync(gitFile, 'utf8').trim().replace(/^gitdir:\\s*/, ''));
+const attempt = (fn) => { try { fn(); } catch {} };
+attempt(() => execFileSync('git', ['config', '--local', 'core.worktree', path.join(process.cwd(), 'replacement-worktree')]));
+attempt(() => execFileSync('git', ['config', '--local', 'include.path', path.join(process.cwd(), 'replacement-include')]));
+attempt(() => fs.renameSync(path.join(gitMetadata, 'config'), path.join(gitMetadata, 'config.replaced')));
+attempt(() => fs.renameSync(gitMetadata, gitMetadata + '-replaced'));
+attempt(() => execFileSync('git', ['add', 'README.md']));
+attempt(() => {
+  const head = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+  const tree = execFileSync('git', ['write-tree'], { encoding: 'utf8' }).trim();
+  const replacement = execFileSync('git', ['commit-tree', tree, '-p', head], { input: 'replacement\\n', encoding: 'utf8' }).trim();
+  execFileSync('git', ['replace', head, replacement]);
+});
+`);
+        assert.equal(spawnSync('git', ['-C', drifted.workspacePath, 'add', 'package.json', 'drift.cjs']).status, 0);
+        assert.equal(spawnSync('git', ['-C', drifted.workspacePath, 'commit', '-m', 'add tracked drift probe']).status, 0);
+        drifted.headSha = spawnSync('git', ['-C', drifted.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+        const driftResult = await new ConfiguredLocalValidationAdapter({
+          revision: `darwin-tracked-drift-${profile}-v1`, nodeProgram: node, pnpmProgram: packageManager, gitProgram: git,
+          commands: [{ argv: [packageManager, 'run', 'drift'], timeoutMs: 30_000 }, { argv: [packageManager, '--version'], timeoutMs: 30_000 }],
+        }).validate(drifted);
+        assert.equal(driftResult.status, 'unknown', JSON.stringify(driftResult));
+        assert.equal(driftResult.commands[0]?.outcome, 'passed', JSON.stringify(driftResult));
+        assert.equal(driftResult.commands[1]?.outcome, 'unavailable', JSON.stringify(driftResult));
       });
     }
   });

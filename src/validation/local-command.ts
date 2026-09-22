@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, symlinkSync } from 'node:fs';
+import { constants as fsConstants, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, realpathSync, statSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -20,6 +20,11 @@ const RECONSTRUCTION_TIMEOUT_MS = 30_000;
 const DEPENDENCY_STORE_COPY_TIMEOUT_MS = 30_000;
 const PRIVATE_TREE_CLEANUP_TIMEOUT_MS = 30_000;
 const IGNORED_MANIFEST_TIMEOUT_MS = 30_000;
+const IGNORED_MANIFEST_MAX_ENTRIES = 50_000;
+const IGNORED_MANIFEST_MAX_DEPTH = 64;
+const IGNORED_MANIFEST_MAX_FILE_BYTES = 256 * 1024 * 1024;
+const IGNORED_MANIFEST_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const IGNORED_MANIFEST_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 const SETTLEMENT_POLL_MS = 25;
 // `git status --ignored --untracked-files=all` can legitimately enumerate a
 // large trusted dependency baseline. Keep this bounded, but well above the
@@ -53,6 +58,56 @@ function remoteMatchesTarget(remote: string, request: ValidationRequest): boolea
 
 type GitInvoke = (args: readonly string[], timeoutMs?: number) => SpawnSyncReturns<string>;
 
+export interface GitAuthority {
+  readonly path: string;
+  readonly gitDir: string;
+}
+
+function boundedRegularMetadata(pathname: string): string | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(pathname, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.size > 4_096) return null;
+    const buffer = Buffer.alloc(4_097);
+    const read = readSync(fd, buffer, 0, buffer.length, 0);
+    return read <= 4_096 ? buffer.subarray(0, read).toString('utf8') : null;
+  } catch { return null; }
+  finally { if (fd !== undefined) try { closeSync(fd); } catch { /* fail closed above */ } }
+}
+
+function gitArguments(authority: GitAuthority, args: readonly string[]): string[] {
+  return [
+    `--git-dir=${authority.gitDir}`, `--work-tree=${authority.path}`,
+    '-c', `core.hooksPath=${os.devNull}`, '-c', 'core.fsmonitor=false',
+    '-c', `core.attributesFile=${os.devNull}`, '-c', 'core.bare=false',
+    '-c', 'core.ignoreStat=false', '-c', 'core.checkStat=default',
+    '-c', 'core.trustctime=true', '-c', 'core.filemode=true',
+    '-c', 'core.sparseCheckout=false', '-c', 'index.sparse=false', ...args,
+  ];
+}
+
+function directGitAuthority(workspacePath: string): GitAuthority | null {
+  try {
+    const root = realpathSync(workspacePath);
+    const metadata = path.join(root, '.git');
+    const stat = lstatSync(metadata);
+    if (stat.isSymbolicLink()) return null;
+    let gitDir: string;
+    if (stat.isDirectory()) gitDir = realpathSync(metadata);
+    else if (stat.isFile() && stat.size <= 4_096) {
+      const contents = boundedRegularMetadata(metadata);
+      const match = contents === null ? null : /^gitdir:\s*([^\r\n]+)\s*$/.exec(contents);
+      if (match?.[1] === undefined || match[1].includes('\0')) return null;
+      const pointed = path.resolve(root, match[1]);
+      if (lstatSync(pointed).isSymbolicLink()) return null;
+      gitDir = realpathSync(pointed);
+    } else return null;
+    if (!lstatSync(gitDir).isDirectory()) return null;
+    return { path: root, gitDir };
+  } catch { return null; }
+}
+
 /**
  * Git is validator infrastructure, rather than candidate validation code.
  * Give every validator-owned Git invocation the same small, host-defined
@@ -75,6 +130,8 @@ function validatorGitEnvironment(): NodeJS.ProcessEnv {
     GIT_CONFIG_NOSYSTEM: '1',
     GIT_CONFIG_GLOBAL: os.devNull,
     GIT_TERMINAL_PROMPT: '0',
+    GIT_NO_REPLACE_OBJECTS: '1',
+    GIT_OPTIONAL_LOCKS: '0',
   };
   if (process.platform === 'win32') {
     // Windows process creation requires these OS-owned values.  Select them
@@ -104,34 +161,57 @@ export function hasSupportedProductionGitRuntime(gitProgram: string): boolean {
   return supportedProductionGitExecPath(gitProgram) !== null;
 }
 
-function ignoredManifest(workspacePath: string, invoke: GitInvoke): string[] | null {
-  const status = invoke(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored'], IGNORED_MANIFEST_TIMEOUT_MS);
-  if (status.status !== 0) return null;
-  const ignored = status.stdout.split('\0').filter((entry) => entry.startsWith('!! ')).map((entry) => entry.slice(3));
-  const visible = status.stdout.split('\0').filter((entry) => entry !== '' && !entry.startsWith('!! '));
-  if (visible.length > 0) return null;
-  const root = path.resolve(workspacePath);
-  const fingerprint = (relative: string): string | null => {
-    const target = path.resolve(root, relative);
-    if (target !== root && !target.startsWith(`${root}${path.sep}`)) return null;
-    let stat;
-    try { stat = lstatSync(target); } catch { return null; }
-    const mode = stat.mode.toString(8);
-    if (stat.isSymbolicLink()) {
-      try { return `link ${relative} ${mode} ${createHash('sha256').update(readlinkSync(target)).digest('hex')}`; } catch { return null; }
-    }
-    if (stat.isFile()) {
-      try { return `file ${relative} ${mode} ${createHash('sha256').update(readFileSync(target)).digest('hex')}`; } catch { return null; }
-    }
-    if (!stat.isDirectory()) return null;
-    let children: readonly string[];
-    try { children = readdirSync(target).sort(); } catch { return null; }
-    const nested = children.map((name) => fingerprint(path.join(relative, name)));
-    if (nested.some((entry) => entry === null)) return null;
-    return `directory ${relative} ${mode} ${createHash('sha256').update(nested.join('\n')).digest('hex')}`;
+export interface IgnoredManifestLimits {
+  readonly timeoutMs?: number;
+  readonly maxEntries?: number;
+  readonly maxDepth?: number;
+  readonly maxFileBytes?: number;
+  readonly maxTotalBytes?: number;
+  readonly maxOutputBytes?: number;
+  readonly nodeProgram?: string;
+}
+
+// Fixed, credential-free verifier. It performs untracked/ignored Git listing
+// and every ignored tree walk in its own process. It rejects symlinked
+// ancestors, fingerprints leaf links themselves, and streams file bytes.
+const IGNORED_MANIFEST_PROGRAM = String.raw`const fs=require('node:fs'),p=require('node:path'),c=require('node:crypto'),cp=require('node:child_process');
+const [git,dir,root,result,raw]=process.argv.slice(1),lim=JSON.parse(raw),env={PATH:process.platform==='win32'?(process.env.Path||process.env.PATH||'C:\\Windows\\System32'):'/usr/bin:/bin',GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:require('node:os').devNull,GIT_TERMINAL_PROMPT:'0',GIT_NO_REPLACE_OBJECTS:'1',GIT_OPTIONAL_LOCKS:'0'};
+let count=0,total=0,out=0; const fail=()=>{try{fs.writeFileSync(result,JSON.stringify({ok:false}))}catch{}}; const under=(x)=>x===root||x.startsWith(root+p.sep); const add=(s)=>{out+=Buffer.byteLength(s)+1;if(out>lim.maxOutputBytes)throw Error('output');return s};
+async function hashFile(file,size){if(size>lim.maxFileBytes||total+size>lim.maxTotalBytes)throw Error('size'); const h=c.createHash('sha256');let read=0;await new Promise((yes,no)=>{const s=fs.createReadStream(file);s.on('data',b=>{read+=b.length;total+=b.length;if(read>lim.maxFileBytes||total>lim.maxTotalBytes){s.destroy(Error('size'))}else h.update(b)});s.on('error',no);s.on('end',yes)});if(read!==size)throw Error('changed');return h.digest('hex')}
+async function walk(rel,depth){if(++count>lim.maxEntries||depth>lim.maxDepth||rel.includes(String.fromCharCode(0)))throw Error('entries');let parent=root;const parts=rel.split(/[\\/]/);for(const part of parts.slice(0,-1)){if(part===''||part==='.'||part==='..')throw Error('path');parent=p.resolve(parent,part);if(!under(parent))throw Error('escape');const ancestor=await fs.promises.lstat(parent);if(!ancestor.isDirectory()||ancestor.isSymbolicLink())throw Error('ancestor')}const target=p.resolve(root,rel);if(!under(target))throw Error('escape');const st=await fs.promises.lstat(target),mode=st.mode.toString(8);if(st.isSymbolicLink())return add('link '+rel+' '+mode+' '+c.createHash('sha256').update(await fs.promises.readlink(target)).digest('hex'));if(st.isFile())return add('file '+rel+' '+mode+' '+await hashFile(target,st.size));if(!st.isDirectory())throw Error('special');const names=[];const handle=await fs.promises.opendir(target);try{for await(const entry of handle){if(++count>lim.maxEntries)throw Error('entries');names.push(entry.name)}}finally{await handle.close().catch(()=>{})}names.sort();const nested=[];for(const n of names){if(n==='.'||n==='..')throw Error('name');nested.push(await walk(p.join(rel,n),depth+1))}return add('directory '+rel+' '+mode+' '+c.createHash('sha256').update(nested.join(String.fromCharCode(10))).digest('hex'))}
+(async()=>{try{const base=['--git-dir='+dir,'--work-tree='+root,'-c','core.hooksPath='+require('node:os').devNull,'-c','core.fsmonitor=false','-c','core.attributesFile='+require('node:os').devNull,'-c','core.bare=false','-c','core.ignoreStat=false','-c','core.checkStat=default','-c','core.trustctime=true','-c','core.filemode=true','-c','core.sparseCheckout=false','-c','index.sparse=false'];const status=cp.spawnSync(git,base.concat(['status','--porcelain=v1','-z','--untracked-files=all','--ignored']),{encoding:'utf8',shell:false,env,maxBuffer:lim.maxOutputBytes});if(status.status!==0||status.signal)throw Error('status');const records=status.stdout.split(String.fromCharCode(0)).filter(Boolean),visible=records.filter(x=>!x.startsWith('!! '));if(visible.length)throw Error('visible');const manifest=[];for(const x of records)if(x.startsWith('!! ')){const rel=x.slice(3);manifest.push(await walk(rel,rel.split(/[\\/]/).length-1))}manifest.sort();const json=JSON.stringify({ok:true,manifest});if(Buffer.byteLength(json)>lim.maxOutputBytes)throw Error('output');fs.writeFileSync(result,json)}catch{fail()}})();`;
+
+export async function ignoredManifest(
+  authority: GitAuthority,
+  gitProgram = 'git',
+  options: IgnoredManifestLimits = {},
+): Promise<string[] | null> {
+  const limits = {
+    timeoutMs: options.timeoutMs ?? IGNORED_MANIFEST_TIMEOUT_MS,
+    maxEntries: options.maxEntries ?? IGNORED_MANIFEST_MAX_ENTRIES,
+    maxDepth: options.maxDepth ?? IGNORED_MANIFEST_MAX_DEPTH,
+    maxFileBytes: options.maxFileBytes ?? IGNORED_MANIFEST_MAX_FILE_BYTES,
+    maxTotalBytes: options.maxTotalBytes ?? IGNORED_MANIFEST_MAX_TOTAL_BYTES,
+    maxOutputBytes: options.maxOutputBytes ?? IGNORED_MANIFEST_MAX_OUTPUT_BYTES,
   };
-  const entries = ignored.map(fingerprint);
-  return entries.some((entry) => entry === null) ? null : entries.filter((entry): entry is string => entry !== null).sort();
+  const nodeProgram = options.nodeProgram ?? process.execPath;
+  if (!path.isAbsolute(authority.path) || !path.isAbsolute(authority.gitDir) || !path.isAbsolute(nodeProgram) ||
+    !Object.values(limits).every((value) => Number.isSafeInteger(value) && value > 0)) return null;
+  let temporary: string;
+  try { temporary = mkdtempSync(path.join(os.tmpdir(), 'tcv-manifest-')); } catch { return null; }
+  const result = path.join(temporary, 'result.json');
+  let manifest: string[] | null = null;
+  try {
+    const execution = await execute(-1, { argv: [nodeProgram, '-e', IGNORED_MANIFEST_PROGRAM, gitProgram, authority.gitDir, authority.path, result, JSON.stringify(limits)], timeoutMs: limits.timeoutMs }, temporary, {}, undefined);
+    if (execution.outcome !== 'passed') return null;
+    if (statSync(result).size > limits.maxOutputBytes) return null;
+    const raw = readFileSync(result, 'utf8');
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed === 'object' && parsed !== null && (parsed as { ok?: unknown }).ok === true && Array.isArray((parsed as { manifest?: unknown }).manifest) &&
+      (parsed as { manifest: unknown[] }).manifest.every((entry) => typeof entry === 'string')) manifest = (parsed as { manifest: string[] }).manifest;
+  } catch { manifest = null; }
+  finally { if (!(await disposePrivateTrees([temporary]))) manifest = null; }
+  return manifest;
 }
 
 function hasHiddenIndexFlags(invoke: GitInvoke): boolean | null {
@@ -143,25 +223,32 @@ function hasHiddenIndexFlags(invoke: GitInvoke): boolean | null {
   return entries.stdout.split('\0').some((entry) => /^[a-zS] /.test(entry));
 }
 
-function workspaceMatches(
+async function workspaceMatches(
   request: ValidationRequest,
   workspacePath: string,
   requireRepositoryIdentity: boolean,
   trustedIgnoredBaselinePath?: string,
   gitProgram = 'git',
   environment = validatorGitEnvironment(),
-): string[] | null {
-  if (workspacePath.trim() === '') return null;
+): Promise<string[] | null> {
+  const authority = directGitAuthority(workspacePath);
+  if (authority === null) return null;
   // This verification reads candidate Git metadata.  A candidate-controlled
   // core.fsmonitor program must never gain execution authority merely because
   // the host is proving the candidate clean.
-  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], {
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(authority, args), {
     encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
-  const manifest = ignoredManifest(workspacePath, invoke);
+  // Do not content-compare through worker metadata/config: use a no-local
+  // private bare clone and private index below as the settlement authority.
+  const comparison = await baselineWorkspace(workspacePath, disposePrivateTrees, request.headSha, gitProgram, environment);
+  if (comparison === null) return null;
+  const comparisonInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(comparison, args), { encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment }) as SpawnSyncReturns<string>;
+  const tracked = comparisonInvoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
+  const manifest = await ignoredManifest(comparison, gitProgram);
   const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
-  if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null || hiddenIndexFlags !== false) return null;
+  if (head.status !== 0 || head.stdout.trim() !== request.headSha || tracked.status !== 0 || manifest === null || hiddenIndexFlags !== false) { await disposePrivateTrees([comparison.privateRoot]); return null; }
   if (trustedIgnoredBaselinePath !== undefined) {
     // A configured baseline becomes the command cwd, even when both ignored
     // manifests are empty.  Prove it is a separate, clean checkout of this
@@ -171,22 +258,28 @@ function workspaceMatches(
     try {
       baselinePath = realpathSync(trustedIgnoredBaselinePath);
       workerPath = realpathSync(workspacePath);
-    } catch { return null; }
-    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return null;
-    const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, ['-C', baselinePath, '-c', 'core.fsmonitor=false', ...args], {
+    } catch { await disposePrivateTrees([comparison.privateRoot]); return null; }
+    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) { await disposePrivateTrees([comparison.privateRoot]); return null; }
+    const baselineAuthority = await baselineWorkspace(baselinePath, disposePrivateTrees, request.headSha, gitProgram, environment);
+    if (baselineAuthority === null) { await disposePrivateTrees([comparison.privateRoot]); return null; }
+    const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(baselineAuthority, args), {
       encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
     }) as SpawnSyncReturns<string>;
     const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
-    const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
+    const baselineTracked = baselineInvoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
+    const baselineManifest = await ignoredManifest(baselineAuthority, gitProgram);
     const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
-    if (baselineHead.status !== 0 || baselineHead.stdout.trim() !== request.headSha || baselineManifest === null ||
-      baselineManifest.join('\n') !== manifest.join('\n') || baselineHiddenIndexFlags !== false) return null;
+    const baselineValid = baselineHead.status === 0 && baselineHead.stdout.trim() === request.headSha && baselineTracked.status === 0 && baselineManifest !== null && baselineManifest.join('\n') === manifest.join('\n') && baselineHiddenIndexFlags === false;
+    const baselineCleaned = await disposePrivateTrees([baselineAuthority.privateRoot]);
+    if (!baselineCleaned) { await disposePrivateTrees([comparison.privateRoot]); return null; }
+    if (!baselineValid) { await disposePrivateTrees([comparison.privateRoot]); return null; }
   } else if (manifest.length > 0) {
     // Never globally ignore ignored paths. They are admissible only when a
     // separate host-owned clean checkout at this exact HEAD proves identical
     // bytes existed before the worker could have written its workspace.
-    return null;
+    await disposePrivateTrees([comparison.privateRoot]); return null;
   }
+  if (!(await disposePrivateTrees([comparison.privateRoot]))) return null;
   if (!requireRepositoryIdentity) return manifest;
   const remote = invoke(['remote', 'get-url', 'origin']);
   return remote.status === 0 && remoteMatchesTarget(remote.stdout, request) ? manifest : null;
@@ -194,22 +287,22 @@ function workspaceMatches(
 
 /** The reconstructed checkout has no remote by design.  Bind command evidence
  * to its immutable exact commit and reject any tracked/index mutation. */
-function commandWorkspaceManifest(workspacePath: string, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment()): string[] | null {
+async function commandWorkspaceManifest(authority: GitAuthority, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment()): Promise<string[] | null> {
   // The reconstructed checkout contains candidate history.  Every trusted
   // host-side probe pins fsmonitor off so a copied or otherwise planted local
   // config cannot execute while evidence is being verified.
-  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], {
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(authority, args), {
     encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
   }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
-  const tracked = invoke(['diff', '--quiet', '--exit-code', 'HEAD', '--']);
+  const tracked = invoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
   const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
   if (head.status !== 0 || head.stdout.trim() !== headSha || tracked.status !== 0 || hiddenIndexFlags !== false) return null;
-  return ignoredManifest(workspacePath, invoke);
+  return ignoredManifest(authority, gitProgram);
 }
 
-function commandWorkspaceMatches(workspacePath: string, headSha: string, expectedIgnored: readonly string[] = [], gitProgram = 'git', environment = validatorGitEnvironment()): boolean {
-  const manifest = commandWorkspaceManifest(workspacePath, headSha, gitProgram, environment);
+async function commandWorkspaceMatches(authority: GitAuthority, headSha: string, expectedIgnored: readonly string[] = [], gitProgram = 'git', environment = validatorGitEnvironment()): Promise<boolean> {
+  const manifest = await commandWorkspaceManifest(authority, headSha, gitProgram, environment);
   return manifest !== null && manifest.join('\n') === expectedIgnored.join('\n');
 }
 
@@ -286,10 +379,13 @@ function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvide
 
 interface ValidationWorkspace {
   readonly path: string;
+  readonly gitDir: string;
+  readonly privateRoot: string;
+  readonly protectedGitDir?: readonly string[];
 }
 
 function containsGitlinks(workspacePath: string, invoke: (args: readonly string[]) => SpawnSyncReturns<string>): boolean | null {
-  const entries = invoke(['-C', workspacePath, 'ls-files', '--stage', '-z']);
+  const entries = invoke(['ls-files', '--stage', '-z']);
   if (entries.status !== 0) return null;
   return entries.stdout.split('\0').some((entry) => entry.startsWith('160000 '));
 }
@@ -306,14 +402,14 @@ function hasTrackedFilterAttributes(
   headSha: string,
   invoke: (args: readonly string[]) => SpawnSyncReturns<string>,
 ): boolean | null {
-  const entries = invoke(['-C', workspacePath, 'ls-tree', '-r', '-z', headSha]);
+  const entries = invoke(['ls-tree', '-r', '-z', headSha]);
   if (entries.status !== 0) return null;
   for (const entry of entries.stdout.split('\0')) {
     const separator = entry.indexOf('\t');
     if (separator === -1 || path.posix.basename(entry.slice(separator + 1)) !== '.gitattributes') continue;
     const [mode, type, objectId] = entry.slice(0, separator).split(' ');
     if (mode === undefined || type !== 'blob' || objectId === undefined || !/^[0-9a-f]{40,64}$/i.test(objectId)) return null;
-    const contents = invoke(['-C', workspacePath, 'cat-file', 'blob', objectId]);
+    const contents = invoke(['cat-file', 'blob', objectId]);
     if (contents.status !== 0) return null;
     if (declaresFilterAttribute(contents.stdout)) return true;
   }
@@ -338,6 +434,9 @@ async function reconstructedWorkspace(
   let snapshot: string;
   try { snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-')); }
   catch { return null; }
+  const workspace = path.join(snapshot, 'workspace');
+  const gitDir = path.join(snapshot, 'git');
+  const authority: GitAuthority = { path: workspace, gitDir };
   const invoke = (args: readonly string[]) => spawnSync(gitProgram, [
     '-c', `core.hooksPath=${os.devNull}`,
     '-c', 'core.fsmonitor=false',
@@ -348,34 +447,89 @@ async function reconstructedWorkspace(
     env: environment,
   });
   try {
-    const cloned = invoke(['clone', '--no-local', '--no-checkout', sourcePath, snapshot]);
+    const cloned = invoke(['clone', '--no-local', '--no-checkout', `--separate-git-dir=${gitDir}`, sourcePath, workspace]);
     // `clone` records the source path as origin. That path is worker-owned for
     // isolated executions, so discard it before a validator can discover and
     // read worker-controlled `.git` state through the reconstructed checkout.
     const disconnected = cloned.status === 0
-      ? invoke(['-C', snapshot, 'remote', 'remove', 'origin'])
+      ? invoke(gitArguments(authority, ['remote', 'remove', 'origin']))
       : undefined;
     // A tracked attributes file is part of the candidate tree.  Inspect it
     // through immutable blobs before checkout: otherwise an ambient filter
     // configuration could execute a smudge command while materializing the
     // validation snapshot.
     const trackedFilters = disconnected?.status === 0
-      ? hasTrackedFilterAttributes(snapshot, headSha, invoke)
+      ? hasTrackedFilterAttributes(workspace, headSha, (args) => invoke(gitArguments(authority, args)))
       : null;
     const checkedOut = trackedFilters === false
-      ? invoke(['-C', snapshot, 'checkout', '--detach', '--force', headSha])
+      ? invoke(gitArguments(authority, ['checkout', '--detach', '--force', headSha]))
       : undefined;
     // A plain detached checkout deliberately does not populate gitlinks. Do
     // not misreport an incomplete tree as a validator failure; submodule
     // provenance needs its own host-qualified reconstruction boundary.
-    const gitlinks = checkedOut?.status === 0 ? containsGitlinks(snapshot, invoke) : null;
+    const gitlinks = checkedOut?.status === 0 ? containsGitlinks(workspace, (args) => invoke(gitArguments(authority, args))) : null;
     if (cloned.status !== 0 || disconnected?.status !== 0 || trackedFilters !== false || checkedOut?.status !== 0 || gitlinks !== false) {
       try { await cleanPrivateTrees([snapshot]); } catch { /* fail closed below */ }
       return null;
     }
-    return { path: snapshot };
+    return { path: workspace, gitDir, privateRoot: snapshot };
   } catch {
     try { await cleanPrivateTrees([snapshot]); } catch { /* fail closed below */ }
+    return null;
+  }
+}
+
+/** Create private, immutable settlement metadata while retaining the trusted
+ * baseline directory as the candidate cwd. Its original metadata remains
+ * protected by the command sandbox and is never removed by validator cleanup. */
+async function baselineWorkspace(
+  baselinePath: string,
+  cleanPrivateTrees: PrivateTreeCleaner,
+  expectedHead: string,
+  gitProgram = 'git',
+  environment = validatorGitEnvironment(),
+): Promise<ValidationWorkspace | null> {
+  const protectedAuthority = directGitAuthority(baselinePath);
+  if (protectedAuthority === null) return null;
+  let privateRoot: string;
+  try { privateRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-')); } catch { return null; }
+  const gitDir = path.join(privateRoot, 'git');
+  try {
+    const clone = spawnSync(gitProgram, ['-c', `core.hooksPath=${os.devNull}`, '-c', 'core.fsmonitor=false', '-c', `core.attributesFile=${os.devNull}`, 'clone', '--no-local', '--bare', baselinePath, gitDir], {
+      encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
+    });
+    if (clone.status !== 0 || clone.signal !== null) throw Error('clone');
+    const metadata = realpathSync(gitDir);
+    const disconnected = spawnSync(gitProgram, gitArguments({ path: protectedAuthority.path, gitDir: metadata }, ['remote', 'remove', 'origin']), { encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment });
+    if (disconnected.status !== 0 || disconnected.signal !== null) throw Error('remote');
+    // A bare clone has no index. Populate its private index before the
+    // candidate can run so later diff/status probes never consult baseline
+    // metadata or create a lock in the protected settlement authority.
+    const privateAuthority = { path: protectedAuthority.path, gitDir: metadata };
+    const privateInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(privateAuthority, args), { encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment }) as SpawnSyncReturns<string>;
+    // Inspect immutable blobs before any status/diff can consult worktree attributes.
+    if (hasTrackedFilterAttributes(protectedAuthority.path, expectedHead, privateInvoke) !== false) throw Error('filter');
+    const indexed = spawnSync(gitProgram, gitArguments(privateAuthority, ['read-tree', expectedHead]), {
+      encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
+    });
+    const verified = spawnSync(gitProgram, gitArguments({ path: protectedAuthority.path, gitDir: metadata }, ['rev-parse', 'HEAD']), { encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment });
+    if (indexed.status !== 0 || indexed.signal !== null || verified.status !== 0 || verified.signal !== null || verified.stdout.trim() !== expectedHead) throw Error('index');
+    const pointer = path.join(protectedAuthority.path, '.git');
+    const protectedPaths = [pointer, protectedAuthority.gitDir];
+    const commonPath = path.join(protectedAuthority.gitDir, 'commondir');
+    let hasCommon = false;
+    try { lstatSync(commonPath); hasCommon = true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+    if (hasCommon) {
+      const common = boundedRegularMetadata(commonPath);
+      if (common === null || common.trim() === '' || common.includes('\0')) throw Error('commondir');
+      const resolvedCommon = realpathSync(path.resolve(protectedAuthority.gitDir, common.trim()));
+      if (!lstatSync(resolvedCommon).isDirectory()) throw Error('commondir');
+      protectedPaths.push(resolvedCommon);
+    }
+    return { path: protectedAuthority.path, gitDir: metadata, privateRoot, protectedGitDir: [...new Set(protectedPaths)] };
+  } catch {
+    try { await cleanPrivateTrees([privateRoot]); } catch { /* fail closed */ }
     return null;
   }
 }
@@ -570,6 +724,8 @@ function sandboxLiteral(value: string): string { return JSON.stringify(value); }
 function macosValidationSandboxProfile(
   workspacePath: string,
   runtimeRoot: string,
+  gitMetadataPath: string,
+  protectedGitMetadataPath: readonly string[] | undefined,
   browserArtifacts: string | undefined,
   dependencyArtifactPath: string | undefined,
   nodeProgram: string,
@@ -578,10 +734,12 @@ function macosValidationSandboxProfile(
   gitEnvironment = validatorGitEnvironment(),
 ): string | null {
   if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return null;
-  let workspace: string; let node: string; let pnpm: string; let git: string | undefined; let gitExecPath: string | undefined;
+  let workspace: string; let metadata: string; let protectedMetadata: string[]; let node: string; let pnpm: string; let git: string | undefined; let gitExecPath: string | undefined;
   let configuredToolPaths: string[];
   try {
     workspace = realpathSync(workspacePath);
+    metadata = realpathSync(gitMetadataPath);
+    protectedMetadata = protectedGitMetadataPath === undefined ? [] : protectedGitMetadataPath.map((entry) => realpathSync(entry));
     node = realpathSync(nodeProgram);
     pnpm = realpathSync(pnpmProgram);
     // Preserve the final configured symlink as well as its resolved target.
@@ -599,7 +757,7 @@ function macosValidationSandboxProfile(
   if (!path.isAbsolute(node) || !path.isAbsolute(pnpm) || !existsSync(node) || !existsSync(pnpm) ||
     (gitProgram !== undefined && (git === undefined || gitExecPath === undefined || !path.isAbsolute(git) || !existsSync(git)))) return null;
   const reads = [
-    workspace, runtimeRoot, node, pnpm, ...configuredToolPaths, path.dirname(node), path.dirname(path.dirname(node)), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
+    workspace, metadata, ...protectedMetadata, runtimeRoot, node, pnpm, ...configuredToolPaths, path.dirname(node), path.dirname(path.dirname(node)), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
     // pnpm launchers commonly use env/sh before entering the pinned Node
     // runtime. These are fixed macOS executables, not PATH-discovered tools.
     '/usr/bin', '/bin', '/usr/lib', '/System/Library', '/usr/share',
@@ -640,6 +798,9 @@ ${appleGitLauncher}
 (allow file-write-data (literal "/dev/null"))
 (allow file-write* (subpath ${sandboxLiteral(workspace)}))
 (allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))
+; Settlement metadata is host authority, including baseline's original metadata.
+(deny file-write* (subpath ${sandboxLiteral(metadata)}))
+${protectedMetadata.map((entry) => `(deny file-write* (subpath ${sandboxLiteral(entry)}))`).join('\n')}
 ; Host-established command aliases must survive every candidate command intact.
 (deny file-write* (subpath ${sandboxLiteral(path.join(runtimeRoot, 'bin'))}))
 ; tsx uses private IPC. No IP sockets or sockets outside this run are admitted.
@@ -784,7 +945,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
     const gitEnvironment = validatorGitEnvironment();
-    const admittedIgnoredManifest = workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment);
+    const admittedIgnoredManifest = await workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment);
     if (admittedIgnoredManifest === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     // A configured baseline is host-owned and already proved byte-identical
     // for every ignored dependency.  It is therefore the only place those
@@ -793,7 +954,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const baseline = this.configuration.trustedIgnoredBaselinePath;
     const commandWorkspace = baseline === undefined
       ? await reconstructedWorkspace(workspacePath, request.headSha, this.cleanPrivateTrees, this.configuration.gitProgram, gitEnvironment)
-      : { path: baseline };
+      : await baselineWorkspace(baseline, this.cleanPrivateTrees, request.headSha, this.configuration.gitProgram, gitEnvironment);
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
@@ -836,7 +997,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0, this.configuration.pnpmProgram)] };
       }
       const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
-        ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram, gitEnvironment) ?? undefined
+        ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, commandWorkspace.gitDir, commandWorkspace.protectedGitDir, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram, gitEnvironment) ?? undefined
         : undefined;
       // The production lane is meaningful only with a real macOS kernel
       // boundary. Do not silently degrade to environment scrubbing.
@@ -846,7 +1007,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // itself never grants this authority, and later checks pin this same
       // manifest (or the separately captured cold-hydration manifest).
       const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
-      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest, this.configuration.gitProgram, gitEnvironment)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, initialIgnoredManifest, this.configuration.gitProgram, gitEnvironment))) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
       let settledManifest: readonly string[] = initialIgnoredManifest;
       for (let index = 0; index < configured.length; index += 1) {
@@ -861,7 +1022,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
           return { status: 'failed', configRevision: revision, commands: evidence };
         }
         if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
-        const manifest = commandWorkspaceManifest(commandWorkspace.path, request.headSha, this.configuration.gitProgram, gitEnvironment);
+        const manifest = await commandWorkspaceManifest(commandWorkspace, request.headSha, this.configuration.gitProgram, gitEnvironment);
         const isHydration = index === 0 && this.configuration.dependencyArtifactPath !== undefined;
         const isFinal = index === configured.length - 1;
         const manifestAdmitted = manifest !== null && (
@@ -878,11 +1039,11 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         if (isHydration) hydratedManifest = manifest;
         settledManifest = manifest;
       }
-      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, settledManifest, this.configuration.gitProgram, gitEnvironment)) {
+      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, settledManifest, this.configuration.gitProgram, gitEnvironment))) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      if (workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment) === null) {
+      if ((await workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment)) === null) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
@@ -890,7 +1051,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     } finally {
       const privateTrees = [
         ...(runtimeRoot === undefined ? [] : [runtimeRoot]),
-        ...(baseline === undefined ? [commandWorkspace.path] : []),
+        commandWorkspace.privateRoot,
       ];
       let cleaned = privateTrees.length === 0;
       try { cleaned = cleaned || await this.cleanPrivateTrees(privateTrees); } catch { cleaned = false; }
