@@ -188,6 +188,25 @@ function isHydratedDependencyManifest(manifest: readonly string[]): boolean {
   return manifest.length > 0 && manifest.every((entry) => /^(?:file|link|directory) node_modules(?:\/|\s)/.test(entry));
 }
 
+function ignoredManifestEntryPath(entry: string): string | null {
+  const match = /^(?:file|link|directory) (.+) [0-7]+ [a-f0-9]{64}$/i.exec(entry);
+  return match?.[1] ?? null;
+}
+
+function terminalGeneratedManifestMatches(
+  manifest: readonly string[],
+  frozenManifest: readonly string[],
+  allowedRoots: readonly string[],
+): boolean {
+  const frozen = new Set(frozenManifest);
+  if (!frozenManifest.every((entry) => manifest.includes(entry))) return false;
+  return manifest.every((entry) => {
+    if (frozen.has(entry)) return true;
+    const relative = ignoredManifestEntryPath(entry);
+    return relative !== null && allowedRoots.some((root) => relative === root || relative.startsWith(`${root}/`));
+  });
+}
+
 function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvidence {
   return { commandIndex, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 };
 }
@@ -440,13 +459,25 @@ function macosValidationSandboxProfile(
   dependencyArtifactPath: string | undefined,
   nodeProgram: string,
   pnpmProgram: string,
+  gitProgram?: string,
 ): string | null {
   if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return null;
-  let workspace: string; let node: string; let pnpm: string;
+  let workspace: string; let node: string; let pnpm: string; let git: string | undefined; let gitExecPath: string | undefined;
   try {
-    workspace = realpathSync(workspacePath); node = realpathSync(nodeProgram); pnpm = realpathSync(pnpmProgram);
+    workspace = realpathSync(workspacePath);
+    node = realpathSync(nodeProgram);
+    pnpm = realpathSync(pnpmProgram);
+    if (gitProgram !== undefined) {
+      git = realpathSync(gitProgram);
+      const probe = spawnSync(gitProgram, ['--exec-path'], {
+        encoding: 'utf8', shell: false, timeout: TOOL_VERSION_TIMEOUT_MS,
+      });
+      if (probe.status !== 0 || probe.signal !== null || probe.stdout.trim() === '') return null;
+      gitExecPath = realpathSync(probe.stdout.trim());
+    }
   } catch { return null; }
-  if (!path.isAbsolute(node) || !path.isAbsolute(pnpm) || !existsSync(node) || !existsSync(pnpm)) return null;
+  if (!path.isAbsolute(node) || !path.isAbsolute(pnpm) || !existsSync(node) || !existsSync(pnpm) ||
+    (gitProgram !== undefined && (git === undefined || gitExecPath === undefined || !path.isAbsolute(git) || !existsSync(git)))) return null;
   const reads = [
     workspace, runtimeRoot, node, pnpm, pnpmProgram, path.dirname(node), path.dirname(path.dirname(node)), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
     // pnpm launchers commonly use env/sh before entering the pinned Node
@@ -456,6 +487,12 @@ function macosValidationSandboxProfile(
     // are not user homes, caches, credentials, or configuration directories.
     '/dev/null', '/dev/urandom', '/var/db/timezone', '/private/var/db/timezone',
   ];
+  if (git !== undefined && gitExecPath !== undefined && gitProgram !== undefined) {
+    // Add the configured Git executable and its own helper directory only.
+    // PATH may name the containing directory, but seatbelt still denies every
+    // unrelated executable in that directory.
+    reads.push(git, gitProgram, gitExecPath);
+  }
   if (browserArtifacts !== undefined) {
     try { reads.push(realpathSync(browserArtifacts)); } catch { return null; }
   }
@@ -469,25 +506,44 @@ function macosValidationSandboxProfile(
 /**
  * Validation commands are candidate-controlled code and must not receive the
  * dispatcher's credentials.  Keep only command resolution and a fresh,
- * host-created home/cache root; notably no GitHub, SSH, ChatGPT/Codex/Luna,
- * npm, Git, or generic inherited secret variables cross this boundary.
+ * host-created home/cache/temp root; notably no GitHub, SSH, ChatGPT/Codex/Luna,
+ * npm, Git credentials, or generic inherited secret variables cross this boundary.
  */
-function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string, nodeProgram?: string, pnpmProgram?: string, dependencyStore?: string): NodeJS.ProcessEnv {
+function credentialFreeValidationEnvironment(
+  runtimeRoot: string,
+  playwrightBrowsersPath?: string,
+  nodeProgram?: string,
+  pnpmProgram?: string,
+  gitProgram?: string,
+  dependencyStore?: string,
+): NodeJS.ProcessEnv {
   const home = path.join(runtimeRoot, 'home');
   const cache = path.join(runtimeRoot, 'cache');
   const config = path.join(runtimeRoot, 'config');
+  const temp = path.join(runtimeRoot, 'tmp');
+  const gitTemplate = path.join(runtimeRoot, 'git-template');
   // These are host-created directories, not a dispatcher-owned HOME where
-  // pnpm/npm configuration or auth could reside.
-  for (const directory of [home, cache, config]) {
+  // package-manager, Git, or provider configuration/auth could reside.
+  for (const directory of [home, cache, config, temp, gitTemplate]) {
     try { mkdirSync(directory, { recursive: true, mode: 0o700 }); } catch { /* handled by command failure */ }
   }
+  const explicitPath = nodeProgram === undefined || pnpmProgram === undefined
+    ? process.env.PATH ?? (process.platform === 'win32' ? process.env.Path : undefined)
+    : [path.dirname(pnpmProgram), path.dirname(nodeProgram), ...(gitProgram === undefined ? [] : [path.dirname(gitProgram)])]
+      .filter((entry, index, all) => all.indexOf(entry) === index)
+      .join(path.delimiter);
   const environment: NodeJS.ProcessEnv = {
-    PATH: nodeProgram === undefined || pnpmProgram === undefined
-      ? process.env.PATH ?? (process.platform === 'win32' ? process.env.Path : undefined)
-      : [path.dirname(pnpmProgram), path.dirname(nodeProgram)].filter((entry, index, all) => all.indexOf(entry) === index).join(path.delimiter),
+    PATH: explicitPath,
     HOME: home,
     XDG_CACHE_HOME: cache,
     XDG_CONFIG_HOME: config,
+    TMPDIR: temp,
+    TMP: temp,
+    TEMP: temp,
+    GIT_CONFIG_NOSYSTEM: '1',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_TEMPLATE_DIR: gitTemplate,
     // Avoid an interactive prompt in the isolated pnpm invocation.
     CI: 'true',
   };
@@ -585,8 +641,15 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
     const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
-    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, dependencyStore ?? undefined);
-    const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
+    const environment = credentialFreeValidationEnvironment(
+      runtimeRoot,
+      this.configuration.playwrightBrowsersPath ?? undefined,
+      this.configuration.nodeProgram,
+      this.configuration.pnpmProgram,
+      this.configuration.gitProgram,
+      dependencyStore ?? undefined,
+    );
+    const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined || this.configuration.gitProgram !== undefined;
     try {
       // A production plan has one host-provisioned pnpm authority.  Reject a
       // substituted executable before probing a tool or starting validation.
@@ -597,7 +660,15 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0, this.configuration.pnpmProgram)] };
       }
       const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
-        ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram) ?? undefined
+        ? macosValidationSandboxProfile(
+          commandWorkspace.path,
+          runtimeRoot,
+          this.configuration.playwrightBrowsersPath ?? undefined,
+          this.configuration.dependencyArtifactPath,
+          this.configuration.nodeProgram,
+          this.configuration.pnpmProgram,
+          this.configuration.gitProgram,
+        ) ?? undefined
         : undefined;
       // The production lane is meaningful only with a real macOS kernel
       // boundary. Do not silently degrade to environment scrubbing.
@@ -609,6 +680,8 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
       if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
+      let settledManifest: readonly string[] = initialIgnoredManifest;
+      const terminalGeneratedIgnoredRoots = this.configuration.terminalGeneratedIgnoredRoots ?? [];
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
         if (!isCommand(command)) {
@@ -622,15 +695,23 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         }
         if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
         const manifest = commandWorkspaceManifest(commandWorkspace.path, request.headSha);
-        if (manifest === null || (index === 0 && this.configuration.dependencyArtifactPath !== undefined
-          ? !isHydratedDependencyManifest(manifest)
-          : manifest.join('\n') !== hydratedManifest.join('\n'))) {
+        const isHydration = index === 0 && this.configuration.dependencyArtifactPath !== undefined;
+        const isFinal = index === configured.length - 1;
+        const manifestAdmitted = manifest !== null && (
+          isHydration
+            ? isHydratedDependencyManifest(manifest)
+            : isFinal && terminalGeneratedIgnoredRoots.length > 0
+              ? terminalGeneratedManifestMatches(manifest, hydratedManifest, terminalGeneratedIgnoredRoots)
+              : manifest.join('\n') === hydratedManifest.join('\n')
+        );
+        if (!manifestAdmitted || manifest === null) {
           evidence.push(workspaceUnavailable(evidence.length));
           return { status: 'unknown', configRevision: revision, commands: evidence };
         }
-        if (index === 0 && this.configuration.dependencyArtifactPath !== undefined) hydratedManifest = manifest;
+        if (isHydration) hydratedManifest = manifest;
+        settledManifest = manifest;
       }
-      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, hydratedManifest)) {
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, settledManifest)) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
