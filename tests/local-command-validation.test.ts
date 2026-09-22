@@ -76,6 +76,24 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(hasPinnedPnpmAuthority(owned.workspacePath, matching, environment), false);
   });
 
+  it('uses a configured Git executable for validator admission and reconstruction probes', async () => {
+    const owned = request();
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-configured-git-'));
+    dirs.push(tools);
+    const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(actualGit, '');
+    const marker = path.join(tools, 'configured-git-ran');
+    const configuredGit = path.join(tools, 'git');
+    writeFileSync(configuredGit, `#!/bin/sh\n: > ${JSON.stringify(marker)}\nexec ${JSON.stringify(actualGit)} "$@"\n`);
+    chmodSync(configuredGit, 0o755);
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'configured-git-v1', gitProgram: configuredGit,
+      commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(marker), true);
+  });
+
   it('rejects substituted or mismatched pnpm before a validation command can run', async () => {
     const owned = request('pnpm@10.34.5');
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
@@ -140,8 +158,11 @@ describe('ConfiguredLocalValidationAdapter', () => {
       // macOS may add __CF_USER_TEXT_ENCODING at exec time. Assert the real
       // denial invariant instead of treating that platform metadata as a
       // credential inherited from the dispatcher.
-      assert.match(environment.HOME!, /tachiko-validation-runtime-/);
-      assert.match(environment.XDG_CACHE_HOME!, /tachiko-validation-runtime-/);
+    assert.match(environment.HOME!, /tachiko-validation-runtime-/);
+    assert.match(environment.XDG_CACHE_HOME!, /tachiko-validation-runtime-/);
+    assert.match(environment.TMPDIR!, /tachiko-validation-runtime-/);
+    assert.equal(environment.TMP, environment.TMPDIR);
+    assert.equal(environment.TEMP, environment.TMPDIR);
       assert.equal(environment.GITHUB_TOKEN, undefined);
       assert.equal(environment.SSH_AUTH_SOCK, undefined);
       assert.equal(environment.CHATGPT_API_KEY, undefined);
@@ -153,6 +174,34 @@ describe('ConfiguredLocalValidationAdapter', () => {
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
       }
     }
+  });
+
+  it('freezes ignored state between commands and admits an authorized terminal generated root only at the end', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'dist/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore build output'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const build = "require('node:fs').mkdirSync('dist', {recursive:true}); require('node:fs').writeFileSync('dist/output', 'ok')";
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'terminal-generated-root-v1', terminalGeneratedIgnoredRoots: ['dist'],
+      commands: [
+        { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', build], timeoutMs: 1_000 },
+      ],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+
+    const rejected = await new ConfiguredLocalValidationAdapter({
+      revision: 'terminal-generated-root-reject-v1', terminalGeneratedIgnoredRoots: ['dist'],
+      commands: [
+        { argv: [process.execPath, '-e', build], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 },
+      ],
+    }).validate(owned);
+    assert.equal(rejected.status, 'unknown');
+    assert.equal(rejected.commands.length, 2);
+    assert.equal(rejected.commands[1]?.outcome, 'unavailable');
   });
 
   it('uses only the configured host browser artifacts, never an ambient browser cache', async () => {

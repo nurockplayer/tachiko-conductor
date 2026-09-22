@@ -207,6 +207,7 @@ pnpm exec tsx src/cli.ts dispatch launchd render \
   --program '/absolute/path/to/run-dispatch-driver.sh' \
   --node-program '/stable/absolute/path/to/node' \
   --pnpm-program '/stable/absolute/path/to/pnpm' \
+  --git-program '/stable/absolute/path/to/git' \
   --dependency-artifact-path '/absolute/path/to/lockfile-bound-pnpm-artifact' \
   --luna-codex-home '/absolute/path/to/luna-codex-home' \
   --playwright-browsers-path '/absolute/path/to/playwright-artifacts' \
@@ -438,8 +439,8 @@ exact candidate, and the hosted-check policy. Luna rejects `standard`,
 `complex`, and `critical` before provider construction; they are not quiet
 fallback routes.
 
-From a stable merged checkout, set `TACHIKO_NODE_PROGRAM` and
-`TACHIKO_PNPM_PROGRAM` to the host-provisioned absolute Node and pnpm paths,
+From a stable merged checkout, set `TACHIKO_NODE_PROGRAM`,
+`TACHIKO_PNPM_PROGRAM`, and `TACHIKO_GIT_PROGRAM` to the host-provisioned absolute Node, pnpm, and Git paths,
 and `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` to a private host-created directory
 containing `store/` and `pnpm-lock.yaml.sha256` (the SHA-256 of the candidate
 lockfile),
@@ -447,7 +448,10 @@ then run `scripts/issue-104-deploy.sh preflight`. This reads only local policy
 and the qualified Luna config—no GitHub, pnpm install, or model turn. The
 production validator executes pnpm only by that explicit path, under macOS
 `sandbox-exec` with network and default filesystem access denied. The store is
-read-only to candidate code and hydration is offline; a missing, dirty, or
+read-only to candidate code and hydration is offline; Git is admitted only by
+the explicit configured executable, validation temp files stay under the
+private runtime root, and only the final build may create the configured
+non-authoritative `dist/` output. A missing, dirty, or
 lockfile-mismatched artifact makes validation unknown. `scripts/issue-104-deploy.sh restart` first persists the existing
 maintenance hold, preflights, and then restarts launchd; leave the hold in
 place until an operator explicitly verifies and releases it.
