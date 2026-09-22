@@ -88,6 +88,82 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(await ignoredManifest(authority, 'git', { maxOutputBytes: 16 }), null);
   });
 
+  it('passes selected Windows Git runtime variables to the nested ignored-manifest helper without dispatcher credentials', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'ignored/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore fixture'], { encoding: 'utf8' }).status, 0);
+    mkdirSync(path.join(owned.workspacePath, 'ignored'), { recursive: true });
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'fixture.txt'), 'fixture\n');
+    const authority = { path: owned.workspacePath, gitDir: path.join(owned.workspacePath, '.git') };
+
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-windows-git-env-'));
+    dirs.push(tools);
+    const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(actualGit, '');
+    const log = path.join(tools, 'git-environment.log');
+    const configuredGit = path.join(tools, 'git');
+    writeFileSync(configuredGit, `#!/bin/sh
+printf 'PATH=%s\\n' "$PATH" >> ${JSON.stringify(log)}
+printf 'SystemRoot=%s\\n' "$SystemRoot" >> ${JSON.stringify(log)}
+printf 'COMSPEC=%s\\n' "$COMSPEC" >> ${JSON.stringify(log)}
+printf 'PATHEXT=%s\\n' "$PATHEXT" >> ${JSON.stringify(log)}
+printf 'GITHUB_TOKEN=%s\\n' "$GITHUB_TOKEN" >> ${JSON.stringify(log)}
+printf 'UNRELATED_DISPATCHER_SECRET=%s\\n' "$UNRELATED_DISPATCHER_SECRET" >> ${JSON.stringify(log)}
+exec ${JSON.stringify(actualGit)} "$@"
+`);
+    chmodSync(configuredGit, 0o755);
+
+    const preload = path.join(tools, 'win32-platform.cjs');
+    writeFileSync(preload, "Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' });\n");
+    const nodeShim = path.join(tools, 'node-win32-shim');
+    writeFileSync(nodeShim, `#!/bin/sh
+exec ${JSON.stringify(process.execPath)} --require ${JSON.stringify(preload)} "$@"
+`);
+    chmodSync(nodeShim, 0o755);
+
+    const selectedPath = path.join(tools, 'selected-windows-path');
+    mkdirSync(selectedPath);
+    const environmentKeys = ['Path', 'PATH', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'GITHUB_TOKEN', 'UNRELATED_DISPATCHER_SECRET'];
+    const inherited = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.assign(process.env, {
+      Path: selectedPath,
+      PATH: '/ambient/path-that-must-not-win',
+      SystemRoot: 'C:\\SelectedSystemRoot',
+      COMSPEC: 'C:\\SelectedSystemRoot\\System32\\cmd.exe',
+      PATHEXT: '.COM;.EXE;.BAT;.CMD',
+      GITHUB_TOKEN: 'github-secret',
+      UNRELATED_DISPATCHER_SECRET: 'dispatcher-secret',
+    });
+    try {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' });
+      const manifest = await ignoredManifest(authority, configuredGit, {
+        nodeProgram: nodeShim,
+        maxEntries: 100,
+        maxDepth: 10,
+        maxFileBytes: 1_024,
+        maxTotalBytes: 1_024,
+        maxOutputBytes: 1_024 * 1_024,
+      });
+      assert.ok(manifest?.some((entry) => entry.includes('ignored/fixture.txt')));
+      const invocationEnvironment = readFileSync(log, 'utf8');
+      assert.match(invocationEnvironment, new RegExp(`PATH=${selectedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+      assert.match(invocationEnvironment, /SystemRoot=C:\\SelectedSystemRoot/);
+      assert.match(invocationEnvironment, /COMSPEC=C:\\SelectedSystemRoot\\System32\\cmd\.exe/);
+      assert.match(invocationEnvironment, /PATHEXT=\.COM;\.EXE;\.BAT;\.CMD/);
+      assert.match(invocationEnvironment, /GITHUB_TOKEN=\n/);
+      assert.match(invocationEnvironment, /UNRELATED_DISPATCHER_SECRET=\n/);
+      assert.doesNotMatch(invocationEnvironment, /ambient\/path-that-must-not-win/);
+    } finally {
+      if (platformDescriptor === undefined) delete (process as unknown as { platform?: string }).platform;
+      else Object.defineProperty(process, 'platform', platformDescriptor);
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
   it('binds pnpm validation authority to the exact repository packageManager pin', () => {
     const owned = request();
     const matching = pinnedPnpm(owned.workspacePath, '10.34.5');
