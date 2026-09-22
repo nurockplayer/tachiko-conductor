@@ -13,7 +13,7 @@ import { parseTrustedLunaConfig } from './agents/luna-isolated.js';
  * reboot-safe transport used by launchd/deployment; these values make its
  * contract testable without sourcing a user shell.
  */
-export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v4';
+export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v5';
 export const PRODUCTION_EXECUTION_PROFILE_CONFIG = {
   revision: PRODUCTION_POLICY_REVISION,
   profiles: {
@@ -32,7 +32,9 @@ export const PRODUCTION_LOCAL_VALIDATION_CONFIG = {
   playwrightBrowsersPathEnvironment: 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH',
   nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM',
   pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM',
+  gitProgramEnvironment: 'TACHIKO_GIT_PROGRAM',
   dependencyArtifactPathEnvironment: 'TACHIKO_PNPM_DEPENDENCY_ARTIFACT',
+  terminalGeneratedIgnoredRoots: ['dist'],
   commands: [
     // This always happens in a newly reconstructed exact-HEAD checkout.  It
     // hydrates from the lockfile, never mutates it, and has no model boundary.
@@ -90,6 +92,7 @@ export function preflightProductionPolicy(env: NodeJS.ProcessEnv = process.env):
   const playwrightBrowsersPath = env.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
   const nodeProgram = env.TACHIKO_NODE_PROGRAM;
   const pnpmProgram = env.TACHIKO_PNPM_PROGRAM;
+  const gitProgram = env.TACHIKO_GIT_PROGRAM;
   const dependencyArtifact = env.TACHIKO_PNPM_DEPENDENCY_ARTIFACT;
   if (executionRaw === undefined || localRaw === undefined || hostedRaw === undefined) {
     throw new Error('Issue #104 production preflight requires execution, local-validation, and hosted-check policy configuration.');
@@ -105,6 +108,9 @@ export function preflightProductionPolicy(env: NodeJS.ProcessEnv = process.env):
   }
   if (pnpmProgram === undefined || !path.isAbsolute(pnpmProgram) || !existsSync(pnpmProgram)) {
     throw new Error('Issue #104 production preflight requires an existing absolute TACHIKO_PNPM_PROGRAM.');
+  }
+  if (gitProgram === undefined || !path.isAbsolute(gitProgram) || !existsSync(gitProgram)) {
+    throw new Error('Issue #104 production preflight requires an existing absolute TACHIKO_GIT_PROGRAM.');
   }
   if (dependencyArtifact === undefined || !path.isAbsolute(dependencyArtifact) || !isPrivateBrowserArtifactDirectory(dependencyArtifact) ||
     !isPrivateBrowserArtifactDirectory(path.join(dependencyArtifact, 'store')) || !isPrivateRegularFile(path.join(dependencyArtifact, 'pnpm-lock.yaml.sha256'))) {
