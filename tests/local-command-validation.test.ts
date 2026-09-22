@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
-import { ConfiguredLocalValidationAdapter, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
+import { ConfiguredLocalValidationAdapter, copyDependencyStore, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
 import { TARGET } from './helpers.js';
 
@@ -416,6 +416,83 @@ exec ${JSON.stringify(actualGit)} "$@"
     assert.equal(readFileSync(path.join(artifact, 'store', 'trusted'), 'utf8'), 'immutable');
     writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), '0'.repeat(64));
     assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 5_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
+  });
+
+  it('copies dependency artifacts in a child process without dereferencing links', async () => {
+    const source = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-source-'));
+    const destinationRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-destination-'));
+    dirs.push(source, destinationRoot);
+    writeFileSync(path.join(source, 'host-artifact'), 'immutable host bytes');
+    symlinkSync('host-artifact', path.join(source, 'artifact-link'));
+
+    const destination = path.join(destinationRoot, 'store');
+    assert.equal(await copyDependencyStore(source, destination), true);
+    assert.equal(readFileSync(path.join(destination, 'host-artifact'), 'utf8'), 'immutable host bytes');
+    assert.equal(readlinkSync(path.join(destination, 'artifact-link')), 'host-artifact');
+    writeFileSync(path.join(destination, 'host-artifact'), 'private mutation');
+    assert.equal(readFileSync(path.join(source, 'host-artifact'), 'utf8'), 'immutable host bytes');
+    assert.equal(readlinkSync(path.join(source, 'artifact-link')), 'host-artifact');
+    assert.equal(await copyDependencyStore(path.join(source, 'missing'), path.join(destinationRoot, 'failed-store')), false);
+  });
+
+  it('bounds a stalled copy child without blocking the event loop and waits for its process group', async () => {
+    const source = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-stall-source-'));
+    const destinationRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-stall-destination-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-stall-tool-'));
+    dirs.push(source, destinationRoot, tools);
+    const pidFile = path.join(tools, 'copier.pid');
+    const stalledCopier = path.join(tools, 'stalled-copier');
+    writeFileSync(stalledCopier, `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\ntrap '' TERM\nwhile :; do :; done\n`);
+    chmodSync(stalledCopier, 0o755);
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 10);
+    const startedAt = Date.now();
+    try {
+      assert.equal(await copyDependencyStore(source, path.join(destinationRoot, 'store'), { nodeProgram: stalledCopier, timeoutMs: 1_000 }), false);
+    } finally {
+      clearInterval(ticker);
+    }
+    assert.ok(ticks > 0);
+    assert.ok(Date.now() - startedAt < 5_000);
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    assert.ok(Number.isSafeInteger(pid));
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+  });
+
+  for (const copyOutcome of ['failed', 'timed_out'] as const) it(`reports unavailable ${copyOutcome} copy evidence before commands and removes its private runtime`, async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'pnpm-lock.yaml'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'lock dependency graph'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const artifact = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-failure-artifact-'));
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-failure-proof-'));
+    dirs.push(artifact, proof);
+    mkdirSync(path.join(artifact, 'store'));
+    writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
+    const marker = path.join(proof, 'candidate-ran');
+    const copier = path.join(proof, 'copier');
+    const copierStarted = path.join(proof, 'copier-started');
+    writeFileSync(copier, `#!/bin/sh\n: > ${JSON.stringify(copierStarted)}\n${copyOutcome === 'failed' ? 'exit 17' : "trap '' TERM\nwhile :; do :; done"}\n`);
+    chmodSync(copier, 0o755);
+    let privateStore: string | undefined;
+    const adapter = new ConfiguredLocalValidationAdapter({
+      revision: 'copy-failure-v1', dependencyArtifactPath: artifact,
+      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 5_000 }],
+    }, async (_source, destination) => {
+      privateStore = destination;
+      mkdirSync(destination);
+      writeFileSync(path.join(destination, 'partial'), 'partial copy');
+      return copyDependencyStore(_source, destination, { nodeProgram: copier, timeoutMs: 1_000 });
+    });
+
+    const result = await adapter.validate({ ...owned, headSha });
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.commands[0]?.outcome, 'unavailable');
+    assert.equal(existsSync(copierStarted), true);
+    assert.equal(existsSync(marker), false);
+    assert.notEqual(privateStore, undefined);
+    assert.equal(existsSync(path.dirname(privateStore!)), false);
   });
 
   it('admits only explicitly configured workspace dependency roots and freezes their bytes', async () => {

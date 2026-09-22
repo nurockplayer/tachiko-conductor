@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { cpSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -17,6 +17,7 @@ const TERMINATION_GRACE_MS = 1_000;
 // short command budget cannot make ordinary repository reconstruction
 // impossible.
 const RECONSTRUCTION_TIMEOUT_MS = 30_000;
+const DEPENDENCY_STORE_COPY_TIMEOUT_MS = 30_000;
 const IGNORED_MANIFEST_TIMEOUT_MS = 30_000;
 const SETTLEMENT_POLL_MS = 25;
 // `git status --ignored --untracked-files=all` can legitimately enumerate a
@@ -502,6 +503,31 @@ async function execute(
   });
 }
 
+// This source is fixed validator infrastructure.  It is intentionally run in
+// a separate credential-free Node process: synchronous filesystem traversal
+// must never block the dispatcher event loop or outlive its own deadline.
+const DEPENDENCY_STORE_COPY_PROGRAM = "const { cpSync } = require('node:fs'); const [source, destination] = process.argv.slice(1); cpSync(source, destination, { recursive: true, verbatimSymlinks: true });";
+
+/**
+ * Materialize a private pnpm store before any candidate command can start.
+ * The optional overrides are an internal test seam; production callers use
+ * the fixed current Node runtime and the host-defined deadline.
+ */
+export async function copyDependencyStore(
+  source: string,
+  destination: string,
+  options: { readonly timeoutMs?: number; readonly nodeProgram?: string } = {},
+): Promise<boolean> {
+  const timeoutMs = options.timeoutMs ?? DEPENDENCY_STORE_COPY_TIMEOUT_MS;
+  const nodeProgram = options.nodeProgram ?? process.execPath;
+  if (!path.isAbsolute(source) || !path.isAbsolute(destination) || !path.isAbsolute(nodeProgram) ||
+    !Number.isSafeInteger(timeoutMs) || timeoutMs < MIN_LOCAL_VALIDATION_TIMEOUT_MS || timeoutMs > MAX_LOCAL_VALIDATION_TIMEOUT_MS) return false;
+  const result = await execute(-1, {
+    argv: [nodeProgram, '-e', DEPENDENCY_STORE_COPY_PROGRAM, source, destination], timeoutMs,
+  }, path.dirname(destination), {}, undefined);
+  return result.outcome === 'passed';
+}
+
 function sandboxLiteral(value: string): string { return JSON.stringify(value); }
 
 /**
@@ -687,7 +713,12 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
   readonly configRevision: string;
   readonly requiresOwnedWorkspace = true;
 
-  constructor(private readonly configuration: LocalValidationConfiguration) {
+  constructor(
+    private readonly configuration: LocalValidationConfiguration,
+    // Internal test seam. It is not configuration or environment-driven, so
+    // candidate code cannot select the copier or its deadline.
+    private readonly copyStore: typeof copyDependencyStore = copyDependencyStore,
+  ) {
     this.configRevision = configuration.revision;
   }
 
@@ -752,8 +783,9 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // command sequence a private copy, preserving the host artifact's bytes.
       const privateStore = dependencyStore === null ? undefined : path.join(runtimeRoot, 'store');
       if (dependencyStore !== null && privateStore !== undefined) {
-        try { cpSync(dependencyStore, privateStore, { recursive: true, verbatimSymlinks: true }); }
-        catch { return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] }; }
+        if (!(await this.copyStore(dependencyStore, privateStore))) {
+          return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+        }
       }
       const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, this.configuration.gitProgram, privateStore);
       if (environment === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
