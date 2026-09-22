@@ -262,14 +262,55 @@ describe('CLI command layer', () => {
     );
     assert.deepEqual(
       resolveLocalValidationConfiguration({
-        TACHIKO_NODE_PROGRAM: '/opt/tachiko/node/bin/node', TACHIKO_PNPM_PROGRAM: '/opt/tachiko/pnpm/bin/pnpm',
-        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM', pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM', commands: [{ argv: ['pnpm', 'test'], timeoutMs: 100 }] }),
+        TACHIKO_NODE_PROGRAM: '/opt/tachiko/node/bin/node',
+        TACHIKO_PNPM_PROGRAM: '/opt/tachiko/pnpm/bin/pnpm',
+        TACHIKO_GIT_PROGRAM: '/opt/tachiko/git/bin/git',
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
+          revision: 'repo-v1',
+          nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM',
+          pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM',
+          gitProgramEnvironment: 'TACHIKO_GIT_PROGRAM',
+          terminalGeneratedIgnoredRoots: ['dist'],
+          commands: [{ argv: ['pnpm', 'test'], timeoutMs: 100 }],
+        }),
       }),
-      { revision: 'repo-v1', nodeProgram: '/opt/tachiko/node/bin/node', pnpmProgram: '/opt/tachiko/pnpm/bin/pnpm', commands: [{ argv: ['/opt/tachiko/pnpm/bin/pnpm', 'test'], timeoutMs: 100 }] },
+      {
+        revision: 'repo-v1',
+        nodeProgram: '/opt/tachiko/node/bin/node',
+        pnpmProgram: '/opt/tachiko/pnpm/bin/pnpm',
+        gitProgram: '/opt/tachiko/git/bin/git',
+        terminalGeneratedIgnoredRoots: ['dist'],
+        commands: [{ argv: ['/opt/tachiko/pnpm/bin/pnpm', 'test'], timeoutMs: 100 }],
+      },
     );
     assert.throws(
       () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM', commands: [{ argv: ['pnpm'], timeoutMs: 100 }] }) }),
       /both Node and pnpm toolchain paths together/,
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
+          revision: 'repo-v1',
+          terminalGeneratedIgnoredRoots: ['../escape'],
+          commands: [{ argv: ['tool'], timeoutMs: 100 }],
+        }),
+      }),
+      /must stay inside the validation workspace/,
+    );
+    assert.throws(
+      () => resolveLocalValidationConfiguration({
+        TACHIKO_GIT_PROGRAM: 'relative/git',
+        TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
+          revision: 'repo-v1',
+          nodeProgramEnvironment: 'TACHIKO_NODE_PROGRAM',
+          pnpmProgramEnvironment: 'TACHIKO_PNPM_PROGRAM',
+          gitProgramEnvironment: 'TACHIKO_GIT_PROGRAM',
+          commands: [{ argv: ['pnpm'], timeoutMs: 100 }],
+        }),
+        TACHIKO_NODE_PROGRAM: '/opt/node',
+        TACHIKO_PNPM_PROGRAM: '/opt/pnpm',
+      }),
+      /TACHIKO_GIT_PROGRAM must be an absolute/,
     );
     assert.throws(
       () => resolveHostedCheckPolicyConfiguration({
