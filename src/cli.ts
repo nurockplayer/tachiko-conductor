@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import os from 'node:os';
 import path from 'node:path';
+import { realpathSync } from 'node:fs';
 import { execFileSync, spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
@@ -119,7 +120,7 @@ Usage:
   tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --pnpm-program <absolute-pnpm> --dependency-artifact-path <absolute-lockfile-bound-store> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
-  tachiko mission wait start <id> --probe-argv '<JSON string[]>' [--wake-argv '<JSON string[]>'] [--poll-interval-ms <n>] [--probe-timeout-ms <n>]
+  tachiko mission wait start <id> --owner <owner> --session-id <id> --probe-argv '<JSON string[]>' [--wake-argv '<JSON string[]>'] [--worktree <path>] [--cwd <path>] [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko mission wait status <id>
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
@@ -157,13 +158,14 @@ written per run at <wait ledger dir>/<runId>.wait.json, where the directory is
 $TACHIKO_WAIT_LEDGER_DIR (or the directory of $TACHIKO_WAIT_LEDGER_PATH) and
 defaults to <TACHIKO_DATA_DIR>/../wait.
 mission wait start runs a detached model-free supervisor with a standalone
-mission identity. The probe and wake callback are argv arrays executed without
+mission identity bound to owner, session, worktree, and cwd. Probe and wake callback are argv arrays executed without
 a shell. The probe prints JSON with status running|active|completed|failed|blocked
 and optional items, turns, activeItemId, lastCompletedTurnId fields. A durable
 receipt is written before the wake callback runs; callbacks receive its stable
 id in TACHIKO_MISSION_RECEIPT_ID and must deduplicate that key durably. Callback
-delivery is retried after a crash/failure, so delivery is at-least-once. status
-only reads the durable mission record and never invokes the probe or a model.
+delivery is retried after a crash/failure, so delivery is at-least-once. Timeout
+continue advances the model-free observation deadline; policy-action stores one
+timeout receipt. status only reads durable state and never invokes a probe or model.
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
 in the foreground; use status/stop from another terminal.
@@ -1556,13 +1558,30 @@ export async function main(argv: string[]): Promise<number> {
           probeCount: state.probeCount,
           receipt: state.receipt,
           callback: state.callback,
+          deadlineAt: state.deadlineAt,
+          timeoutCount: state.timeoutCount,
           ...(state.error === undefined ? {} : { error: state.error }),
           updatedAt: state.updatedAt,
         }, null, 2));
         return 0;
       }
+      const state = missionStore.read();
+      if (state === null) throw new Error(`Mission wait ${id} was not found.`);
+      const currentCwd = realpathSync(process.cwd());
+      const currentWorktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', cwd: currentCwd, timeout: 5_000 }).trim();
+      if (currentCwd !== state.config.cwd || currentWorktree !== state.config.worktree) {
+        throw new Error(`Mission ${id} owner/worktree/cwd binding changed; refusing supervisor restart.`);
+      }
       try {
-        await superviseExternalMissionAsync(missionStore);
+        let acquired = false;
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          try { await superviseExternalMissionAsync(missionStore); acquired = true; break; }
+          catch (error) {
+            if (!(error instanceof DispatchInvocationLockedError) || attempt === 19) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        if (!acquired) return 0;
         return 0;
       } catch (error) {
         if (error instanceof DispatchInvocationLockedError) return 0;
@@ -1578,6 +1597,12 @@ export async function main(argv: string[]): Promise<number> {
         'wake-argv': { type: 'string' },
         'poll-interval-ms': { type: 'string' },
         'probe-timeout-ms': { type: 'string' },
+        owner: { type: 'string' },
+        'session-id': { type: 'string' },
+        worktree: { type: 'string' },
+        cwd: { type: 'string' },
+        'timeout-ms': { type: 'string' },
+        'on-timeout': { type: 'string' },
       },
     });
     const [id, extra] = positionals;
@@ -1587,7 +1612,17 @@ export async function main(argv: string[]): Promise<number> {
     const wakeArgv = values['wake-argv'] === undefined ? [] : parseArgvJson(values['wake-argv'], '--wake-argv');
     const pollIntervalMs = values['poll-interval-ms'] === undefined ? 5_000 : Number(values['poll-interval-ms']);
     const probeTimeoutMs = values['probe-timeout-ms'] === undefined ? 30_000 : Number(values['probe-timeout-ms']);
-    const proposed = validateExternalMissionConfig({ id, probeArgv, wakeArgv, pollIntervalMs, probeTimeoutMs });
+    if (values.owner === undefined) throw new Error('mission wait start requires --owner <owner>.');
+    if (values['session-id'] === undefined) throw new Error('mission wait start requires --session-id <id>.');
+    const currentCwd = realpathSync(process.cwd());
+    const currentWorktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', cwd: currentCwd, timeout: 5_000 }).trim();
+    const cwd = realpathSync(values.cwd ?? currentCwd);
+    const worktree = realpathSync(values.worktree ?? currentWorktree);
+    if (cwd !== currentCwd || worktree !== currentWorktree) throw new Error('--cwd and --worktree must identify the current working directory and its Git worktree.');
+    const overallTimeoutMs = values['timeout-ms'] === undefined ? 24 * 60 * 60_000 : Number(values['timeout-ms']);
+    const onTimeout = values['on-timeout'] ?? 'continue';
+    if (onTimeout !== 'continue' && onTimeout !== 'policy-action') throw new Error('--on-timeout must be continue or policy-action.');
+    const proposed = validateExternalMissionConfig({ id, owner: values.owner, sessionId: values['session-id'], worktree, cwd, probeArgv, wakeArgv, pollIntervalMs, probeTimeoutMs, overallTimeoutMs, onTimeout });
     const missionStore = new ExternalMissionStore(resolveMissionWaitDirectory(), id);
     let supervisorPid: number | undefined;
     const result = startExternalMission(missionStore, proposed, () => {
@@ -1595,6 +1630,7 @@ export async function main(argv: string[]): Promise<number> {
       if (entry === undefined) throw new Error('Cannot locate the tachiko CLI entry point to start the detached supervisor.');
       const child = spawn(process.execPath, [path.resolve(entry), 'mission', 'wait', 'supervise', id], {
         detached: true,
+        cwd: proposed.cwd,
         stdio: 'ignore',
         env: { ...process.env, TACHIKO_MISSION_WAIT_DIR: resolveMissionWaitDirectory() },
       });

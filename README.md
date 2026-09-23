@@ -357,6 +357,14 @@ pnpm exec tsx src/cli.ts wait observe <id> [--timeout-ms <n>] [--on-timeout <con
 pnpm exec tsx src/cli.ts wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
 ```
 
+For long-running subprocesses or CI work without a Conductor Run, the standalone
+`mission wait start` supervisor persists owner/session/worktree/cwd identity,
+observes model-free, and sends one bounded receipt through a configured callback.
+The Mission Lead must end its turn after starting it instead of polling status.
+This is a Codex CLI callback path, not a native ChatGPT Desktop continuation API;
+Desktop wake requires an external callback configured for the intended session.
+See [the external Mission Lead wait guide](docs/mission-external-wait.md).
+
 ### Codex App Server runtime observation
 
 For a `codex-cli` execution profile, Conductor first probes a component-local
