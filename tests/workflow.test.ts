@@ -6,7 +6,7 @@ import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } from '../src/adapters/agent.js';
 import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
-import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
+import type { ImplementationBootstrapAdapter, VerifyDurableRequest } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
@@ -934,6 +934,161 @@ describe('runWorkflow', () => {
 
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'MERGE_READY');
+  });
+
+  it('preserves a concurrent Run change made while the FINAL_GATE live read is pending', async () => {
+    const store = new MemoryStore();
+    let run = reviewingRun(store, 'final-gate-run-cas', HEAD);
+    run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    store.update(run);
+    let entered!: () => void;
+    let finish!: (live: GitHubLiveSnapshot) => void;
+    const readEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const liveRead = new Promise<GitHubLiveSnapshot>((resolve) => { finish = resolve; });
+    const base = githubAdapter([]);
+    const github: GitHubAdapter = { ...base, async readLiveSnapshot() { entered(); return liveRead; } };
+
+    const pending = runWorkflow(
+      { store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    await readEntered;
+    const concurrent = store.read(run.id)!;
+    store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during live read' }, T0));
+    finish(snapshot(HEAD));
+
+    const outcome = await pending;
+    assert.equal(outcome.run.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.history.some((entry) => entry.type === 'final_gate_verified'), false);
+  });
+
+  it('does not proceed to a worker when the Run changes during awaited bootstrap planning', async () => {
+    const store = new MemoryStore();
+    const execution: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'luna-cas-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+      sandboxMode: 'workspace-write', approvalPolicy: 'never',
+    };
+    const run = createRun(TARGET, T0, 'bootstrap-plan-run-cas', execution);
+    store.create(run);
+    let entered!: () => void;
+    let finish!: () => void;
+    const planEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const planRelease = new Promise<void>((resolve) => { finish = resolve; });
+    const bootstrap = new class extends FakeBootstrap {
+      override async plan() { entered(); await planRelease; return this.identity; }
+    }();
+    const implementation = new FakeImplementation([]);
+    const pending = runWorkflow(
+      { store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    await planEntered;
+    const concurrent = store.read(run.id)!;
+    store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during plan' }, T0));
+    finish();
+
+    const outcome = await pending;
+    assert.equal(outcome.run.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.bootstrap, undefined);
+    assert.equal(implementation.requests.length, 0);
+  });
+
+  it('does not proceed to a worker when the Run changes during awaited bootstrap preparation', async () => {
+    const store = new MemoryStore();
+    const execution: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'luna-prepare-cas-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+      sandboxMode: 'workspace-write', approvalPolicy: 'never',
+    };
+    const run = createRun(TARGET, T0, 'bootstrap-prepare-run-cas', execution);
+    store.create(run);
+    let entered!: () => void;
+    let finish!: () => void;
+    const prepareEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const prepareRelease = new Promise<void>((resolve) => { finish = resolve; });
+    const bootstrap = new class extends FakeBootstrap {
+      override async prepare() { entered(); await prepareRelease; return this.identity; }
+    }();
+    const implementation = new FakeImplementation([]);
+    const pending = runWorkflow(
+      { store, github: githubAdapter([null, null]), implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    await prepareEntered;
+    const concurrent = store.read(run.id)!;
+    store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during prepare' }, T0));
+    finish();
+
+    const outcome = await pending;
+    assert.equal(outcome.run.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
+    assert.equal(implementation.requests.length, 0);
+  });
+
+  it('does not record recovered durable output when the Run changes during awaited recovery verification', async () => {
+    const store = new MemoryStore();
+    const execution: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'luna-recovery-cas-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+      sandboxMode: 'workspace-write', approvalPolicy: 'never',
+    };
+    let run = createRun(TARGET, T0, 'bootstrap-recovery-run-cas', execution);
+    run = applyTransition(run, { type: 'start' }, T0);
+    const baseBootstrap = new FakeBootstrap();
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: baseBootstrap.identity }, T0);
+    store.create(run);
+    let entered!: () => void;
+    let finish!: () => void;
+    const verifyEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const verifyRelease = new Promise<void>((resolve) => { finish = resolve; });
+    const bootstrap = new class extends FakeBootstrap {
+      override async verifyDurable(request: VerifyDurableRequest) {
+        entered(); await verifyRelease;
+        return { headSha: request.expectedHeadSha, branch: this.identity.branch };
+      }
+    }();
+    const implementation = new FakeImplementation([]);
+    const pending = runWorkflow(
+      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    await verifyEntered;
+    const concurrent = store.read(run.id)!;
+    store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won during recovery' }, T0));
+    finish();
+
+    const outcome = await pending;
+    assert.equal(outcome.run.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.headSha, undefined);
+    assert.equal(implementation.requests.length, 0);
+  });
+
+  it('rechecks the exact durable Run immediately before standalone publication', async () => {
+    const store = new MemoryStore();
+    const run = createRun(TARGET, T0, 'pre-push-run-cas');
+    store.create(run);
+    let publicationAttempts = 0;
+    const bootstrap = new class extends FakeBootstrap {
+      override async verifyDurable(request: VerifyDurableRequest) {
+        const concurrent = store.read(run.id)!;
+        store.update(applyTransition(concurrent, { type: 'escalate', reason: 'operator cancellation won before push' }, T0));
+        request.beforePublish?.();
+        publicationAttempts += 1;
+        return { headSha: request.expectedHeadSha, branch: this.identity.branch };
+      }
+    }();
+    const outcome = await runWorkflow(
+      { store, github: githubAdapter([null, null, HEAD]), implementation: new FakeImplementation([successResult(HEAD)]), reviewer: new FakeReviewer([]), bootstrap },
+      run.id,
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+    assert.equal(outcome.run.state, 'NEEDS_HUMAN');
+    assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
+    assert.equal(publicationAttempts, 0);
   });
 
   it('rechecks publication admission after live review and before readiness is published', async () => {

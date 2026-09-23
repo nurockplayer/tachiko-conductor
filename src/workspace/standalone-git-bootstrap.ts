@@ -99,6 +99,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     }
     // Normal Git push is intentionally non-force. A concurrent/diverged ref
     // therefore remains untouched even if it changes after the re-read.
+    request.beforePublish?.();
     await this.git(this.source, ['push', '--no-verify', 'origin', `${head}:${ref}`]);
     await this.assertPublicationRemote(request.identity);
     const published = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim().split(/\s+/)[0];
