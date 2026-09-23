@@ -78,7 +78,7 @@ import { dispatchOnceCommand } from './dispatch/command.js';
 import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/continuous.js';
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
-import { ExternalMissionStore, createExternalMissionState, parseArgvJson, superviseExternalMissionAsync, validateExternalMissionConfig } from './mission/external-wait.js';
+import { ExternalMissionStore, parseArgvJson, startExternalMission, superviseExternalMissionAsync, validateExternalMissionConfig } from './mission/external-wait.js';
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
 import { preflightProductionPolicy } from './production-policy.js';
 import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
@@ -1562,10 +1562,6 @@ export async function main(argv: string[]): Promise<number> {
         return 0;
       }
       try {
-        const startDelayMs = Number(process.env.TACHIKO_MISSION_SUPERVISOR_DELAY_MS ?? 0);
-        if (Number.isSafeInteger(startDelayMs) && startDelayMs > 0 && startDelayMs <= 5_000) {
-          await new Promise<void>((resolve) => setTimeout(resolve, startDelayMs));
-        }
         await superviseExternalMissionAsync(missionStore);
         return 0;
       } catch (error) {
@@ -1593,50 +1589,28 @@ export async function main(argv: string[]): Promise<number> {
     const probeTimeoutMs = values['probe-timeout-ms'] === undefined ? 30_000 : Number(values['probe-timeout-ms']);
     const proposed = validateExternalMissionConfig({ id, probeArgv, wakeArgv, pollIntervalMs, probeTimeoutMs });
     const missionStore = new ExternalMissionStore(resolveMissionWaitDirectory(), id);
-    const startLock = acquireDispatchInvocationLock({ lockPath: `${missionStore.lockPath}.start` });
-    try {
-      let state = missionStore.read();
-      if (state === null) {
-        state = createExternalMissionState(proposed);
-        missionStore.write(state);
-      } else {
-        const sameConfig = JSON.stringify(state.config.probeArgv) === JSON.stringify(proposed.probeArgv) &&
-          JSON.stringify(state.config.wakeArgv) === JSON.stringify(proposed.wakeArgv) &&
-          state.config.pollIntervalMs === proposed.pollIntervalMs && state.config.probeTimeoutMs === proposed.probeTimeoutMs;
-        if (!sameConfig) throw new Error(`Mission id ${id} already belongs to a different durable wait configuration.`);
-        if (state.receipt !== null && state.callback !== 'failed' && state.callback !== 'pending') {
-          console.log(JSON.stringify({ missionId: id, status: state.status, receipt: state.receipt, callback: state.callback }, null, 2));
-          return 0;
-        }
-        let alreadyRunning = false;
-        try {
-          const owner = acquireDispatchInvocationLock({ lockPath: missionStore.lockPath });
-          owner.release();
-        } catch (error) {
-          if (!(error instanceof DispatchInvocationLockedError)) throw error;
-          alreadyRunning = true;
-        }
-        if (alreadyRunning) {
-          console.log(JSON.stringify({ missionId: id, status: state.status, supervisorPid: state.supervisorPid, alreadyRunning: true }, null, 2));
-          return 0;
-        }
-      }
+    let supervisorPid: number | undefined;
+    const result = startExternalMission(missionStore, proposed, () => {
       const entry = process.argv[1];
       if (entry === undefined) throw new Error('Cannot locate the tachiko CLI entry point to start the detached supervisor.');
       const child = spawn(process.execPath, [path.resolve(entry), 'mission', 'wait', 'supervise', id], {
         detached: true,
         stdio: 'ignore',
-        env: { ...process.env, TACHIKO_MISSION_WAIT_DIR: resolveMissionWaitDirectory(), TACHIKO_MISSION_SUPERVISOR_DELAY_MS: '250' },
+        env: { ...process.env, TACHIKO_MISSION_WAIT_DIR: resolveMissionWaitDirectory() },
       });
       if (child.pid === undefined) throw new Error('Could not start the detached mission wait supervisor.');
+      supervisorPid = child.pid;
       child.unref();
-      state = { ...state, status: state.receipt === null ? 'starting' : state.status, supervisorPid: child.pid, updatedAt: new Date().toISOString() };
-      missionStore.write(state);
-      console.log(JSON.stringify({ missionId: id, status: state.status, supervisorPid: child.pid, receipt: state.receipt }, null, 2));
-      return 0;
-    } finally {
-      startLock.release();
-    }
+    });
+    console.log(JSON.stringify({
+      missionId: id,
+      status: result.state.status,
+      ...(supervisorPid === undefined ? {} : { supervisorPid }),
+      ...(result.alreadyRunning ? { alreadyRunning: true } : {}),
+      receipt: result.state.receipt,
+      callback: result.state.callback,
+    }, null, 2));
+    return 0;
   }
 
   if (command === 'wait') {

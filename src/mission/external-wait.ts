@@ -102,7 +102,9 @@ export function parseArgvJson(value: string, option: string): string[] {
 export function validateExternalMissionConfig(input: Omit<ExternalMissionConfig, 'generation'> & { readonly generation?: string }): ExternalMissionConfig {
   if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,119}$/.test(input.id)) throw new Error('Mission id must contain 1-120 letters, numbers, dots, underscores, or hyphens.');
   for (const [name, argv] of [['--probe-argv', input.probeArgv], ['--wake-argv', input.wakeArgv]] as const) {
-    if (!Array.isArray(argv) || argv.length === 0 || argv.some((part) => typeof part !== 'string' || part.length === 0)) throw new Error(`${name} must be a non-empty argument vector.`);
+    if (!Array.isArray(argv) || (name === '--probe-argv' && argv.length === 0) || argv.some((part) => typeof part !== 'string' || part.length === 0)) {
+      throw new Error(`${name} must be ${name === '--probe-argv' ? 'a non-empty' : 'an'} argument vector.`);
+    }
   }
   if (!Number.isSafeInteger(input.pollIntervalMs) || input.pollIntervalMs < 250) throw new Error('--poll-interval-ms must be a safe integer of at least 250.');
   if (!Number.isSafeInteger(input.probeTimeoutMs) || input.probeTimeoutMs < 1 || input.probeTimeoutMs > 120_000) throw new Error('--probe-timeout-ms must be between 1 and 120000.');
@@ -223,6 +225,46 @@ export async function superviseExternalMissionAsync(
 
 export function createExternalMissionState(config: ExternalMissionConfig): ExternalMissionState {
   return { revision: REVISION, config, status: 'starting', previous: null, receipt: null, callback: config.wakeArgv.length === 0 ? 'not-needed' : 'pending', probeCount: 0, supervisorPid: null, updatedAt: new Date().toISOString() };
+}
+
+function sameMissionConfig(left: ExternalMissionConfig, right: ExternalMissionConfig): boolean {
+  return JSON.stringify(left.probeArgv) === JSON.stringify(right.probeArgv) &&
+    JSON.stringify(left.wakeArgv) === JSON.stringify(right.wakeArgv) &&
+    left.pollIntervalMs === right.pollIntervalMs && left.probeTimeoutMs === right.probeTimeoutMs;
+}
+
+/** Persist the start state before spawning, with no parent write after launch. */
+export function startExternalMission(
+  store: ExternalMissionStore,
+  config: ExternalMissionConfig,
+  launch: () => void,
+): { readonly state: ExternalMissionState; readonly started: boolean; readonly alreadyRunning: boolean } {
+  const startLock = acquireDispatchInvocationLock({ lockPath: `${store.lockPath}.start` });
+  try {
+    let state = store.read();
+    if (state === null) state = createExternalMissionState(config);
+    else if (!sameMissionConfig(state.config, config)) throw new Error(`Mission id ${config.id} already belongs to a different durable wait configuration.`);
+
+    if (state.receipt !== null && state.callback !== 'failed' && state.callback !== 'pending') {
+      return { state, started: false, alreadyRunning: false };
+    }
+    try {
+      const owner = acquireDispatchInvocationLock({ lockPath: store.lockPath });
+      owner.release();
+    } catch (error) {
+      if (!(error instanceof DispatchInvocationLockedError)) throw error;
+      return { state, started: false, alreadyRunning: true };
+    }
+
+    state = { ...state, status: state.receipt === null ? 'starting' : state.status, supervisorPid: null, updatedAt: new Date().toISOString() };
+    store.write(state);
+    launch();
+    // The child may already have persisted observations or the receipt here.
+    // Read it for the response, and never replace it with the parent's snapshot.
+    return { state: store.read() ?? state, started: true, alreadyRunning: false };
+  } finally {
+    startLock.release();
+  }
 }
 
 export { DispatchInvocationLockedError };

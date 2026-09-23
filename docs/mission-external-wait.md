@@ -13,14 +13,22 @@ in the child process environment or an existing credential helper; command
 arguments are saved in a mode-0600 local state file.
 
 ```sh
+export TACHIKO_MISSION_CODEX_SESSION_ID='01234567-89ab-cdef-0123-456789abcdef'
+
 tachiko mission wait start issue-47-ci \
   --probe-argv '["./scripts/mission-status","issue-47-ci"]' \
-  --wake-argv '["./scripts/desktop-wake","--mission","issue-47-ci"]' \
+  --wake-argv '["node","scripts/mission-codex-wake.mjs"]' \
   --poll-interval-ms 30000 \
   --probe-timeout-ms 15000
-
-tachiko mission wait status issue-47-ci
 ```
+
+After `start` returns, the Mission Lead ends its turn. It does not poll `status`
+or wait on the command session. The detached supervisor invokes the callback at
+the decision boundary, and the callback resumes the configured Codex CLI
+session with `codex exec resume <session-id> <prompt>`. `status` is for a human
+operator diagnosing the monitor, not a model polling loop. The included
+`scripts/mission-codex-wake.mjs` is a working Codex CLI callback; set the session
+ID in `TACHIKO_MISSION_CODEX_SESSION_ID` before starting the monitor.
 
 The probe must exit successfully and print one JSON object no larger than 16
 KiB. `status` must be `running`, `active`, `completed`, `failed`, or `blocked`.
@@ -36,18 +44,42 @@ The callback receives `TACHIKO_MISSION_RECEIPT_ID`,
 `TACHIKO_MISSION_RECEIPT_PATH`, and `TACHIKO_MISSION_ID` in its environment.
 The receipt is persisted before the callback starts. Callback delivery is
 at-least-once: after a crash between the callback's action and its success
-record, `mission wait start` can retry it with the same receipt ID. A Desktop
-continuation adapter must durably consume that ID before asking the Desktop
-agent to continue; this is the idempotency boundary that prevents one receipt
-from starting multiple model turns. Keep the callback short and have it enqueue
-the continuation if the Desktop API can take a long time.
+record, `mission wait start` can retry it with the same receipt ID. The included
+Codex callback fsyncs a claim file keyed by that ID, starts `codex exec resume`
+as a detached child, and returns after the OS confirms the child started. Its
+stdout and stderr go to separate files under the claim directory's `logs/`
+subdirectory (override with `TACHIKO_MISSION_CODEX_LOG_DIR`). A retry cannot
+start another turn for the same receipt. This is deliberately at-most-once
+after the claim: a crash between claim creation and CLI startup can leave a
+receipt unhandled. Inspect the claim, logs, and Codex session before manually
+resolving that case. An immediate process spawn error removes the claim so a
+later callback retry can try again. A Desktop API adapter should use the same
+durable receipt claim before enqueueing its continuation.
 
-Repeat `mission wait start` with the same ID and options to recover a stopped
+Repeat `mission wait start` with the same ID and options to restart a stopped
 supervisor or retry a failed callback. Reusing the ID with different options
-fails closed. The monitor owns a same-host lock, and `status` remains safe to
-poll from the Desktop interface because it never performs the wait itself.
-State is stored under `$TACHIKO_MISSION_WAIT_DIR`, or by default beside the
-Conductor run directory at `../missions`.
+fails closed. The monitor owns a same-host lock and prevents concurrent state
+writers. It does not install its own watchdog: if the supervisor process exits,
+observation stops until an operator or service calls the same `start` command
+again. For unattended hours-long waits, run that command from a persistent
+user service that restarts on reboot, or from a model-free watchdog loop, for
+example:
+
+```sh
+while true; do
+  tachiko mission wait start issue-47-ci \
+    --probe-argv '["./scripts/mission-status","issue-47-ci"]' \
+    --wake-argv '["node","scripts/mission-codex-wake.mjs"]' \
+    --poll-interval-ms 30000 \
+    --probe-timeout-ms 15000
+  sleep 60
+done
+```
+
+The start lock and supervisor lock make repeated watchdog calls safe; an active
+supervisor owns the only write lock. State is stored under
+`$TACHIKO_MISSION_WAIT_DIR`, or by default beside the Conductor run directory
+at `../missions`.
 
 Example probe contract for a CI wrapper:
 
