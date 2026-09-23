@@ -14,6 +14,7 @@ import { createHostAdmissionRegistry, resolveHostAdmissionConfig, resolveHostAdm
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { createRun } from '../src/domain/run.js';
 import { findRunByTarget, parseGitHubRepositoryRemote } from '../src/cli.js';
+import { readManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
 import { T0, TARGET } from './helpers.js';
 
 const config: AdmissionConfig = { schemaVersion: 1, revision: 'test-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
@@ -355,6 +356,68 @@ describe('provider-neutral durable mission admission', () => {
       assert.equal(experiment.outcome, 'admitted');
       if (experiment.outcome === 'admitted') assert.throws(() => registry.assertCanPublish(experiment.token, captain.missionId), /cannot publish/);
       assert.throws(() => registry.admit({ laneId: 'bad-experiment', role: 'isolated_experiment', experimentOfMissionId: captain.missionId, evidence: evidence(40) }), /separate workspace and state surface/);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('gives same-Issue experiments stable distinct high-autonomy capacity identities', () => {
+    const limits: AdmissionConfig = { schemaVersion: 1, revision: 'experiment-capacity-v1', limits: { maxCaptains: 2, maxWriters: 3, maxHighAutonomy: 1 } };
+    const { directory, filePath, registry } = fixture({ config: limits });
+    try {
+      const parent = registry.admit({ laneId: 'experiment-parent', role: 'production_captain', evidence: evidence(44) });
+      assert.equal(parent.outcome, 'admitted');
+      if (parent.outcome !== 'admitted') throw new Error('expected captain admission');
+      const first = registry.admit({ laneId: 'exp-one', role: 'isolated_experiment', experimentOfMissionId: parent.missionId, highAutonomy: true,
+        evidence: evidence(44, { workspace: '/tmp/exp-one-work', stateSurface: '/tmp/exp-one-state' }) });
+      const second = registry.admit({ laneId: 'exp-two', role: 'isolated_experiment', experimentOfMissionId: parent.missionId, highAutonomy: true,
+        evidence: evidence(44, { workspace: '/tmp/exp-two-work', stateSurface: '/tmp/exp-two-state' }) });
+      assert.equal(first.outcome, 'admitted');
+      assert.equal(second.outcome, 'parked');
+      if (first.outcome !== 'admitted' || second.outcome !== 'parked') throw new Error('expected first experiment admitted and second parked');
+      assert.notEqual(first.missionId, second.missionId);
+      assert.equal(registry.snapshot().counts.writers, 1, 'experiments remain outside production writer capacity');
+      assert.equal(registry.snapshot().counts.highAutonomy, 1);
+      const revision = registry.snapshot().revision;
+      const unchangedRetry = registry.admit({ laneId: 'exp-two', role: 'isolated_experiment', experimentOfMissionId: parent.missionId, highAutonomy: true,
+        evidence: evidence(44, { workspace: '/tmp/exp-two-work', stateSurface: '/tmp/exp-two-state' }) });
+      assert.deepEqual(unchangedRetry, { outcome: 'parked', missionId: second.missionId, reason: 'capacity_high_autonomy', revision });
+
+      const restarted = new MissionAdmissionRegistry({ filePath, config: limits, lockTimeoutMs: 10_000 });
+      const restartedFirst = restarted.readLane('exp-one');
+      const restartedSecond = restarted.readLane('exp-two');
+      assert.equal(restartedFirst?.missionId, first.missionId);
+      assert.equal(restartedSecond?.missionId, second.missionId);
+      assert.equal(restarted.snapshot().counts.writers, 1);
+      assert.equal(restarted.snapshot().counts.highAutonomy, 1);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('publishes a manual owner receipt before registry state and leaves a non-authorizing stale receipt on the prepublish crash seam', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-receipt-seam-'));
+    const filePath = path.join(directory, 'registry.json');
+    const receiptPath = path.join(directory, 'manual.json');
+    const crashAfterReceipt = new MissionAdmissionRegistry({ filePath, config, beforePublish: () => { throw new Error('injected registry publication crash'); } });
+    const evidenceValue = { repository: 'example/widgets', repositoryScope: true as const, workspace: path.join(directory, 'worktree') };
+    mkdirSync(evidenceValue.workspace);
+    const writeCandidate = (candidate: Extract<AdmissionResult, { outcome: 'admitted' }>) => {
+      const receipt: ManualOwnerReceipt = { schemaVersion: 1, laneId: 'manual:seam', missionId: candidate.missionId, repository: 'example/widgets', workspace: evidenceValue.workspace,
+        branch: 'main', checkpointSha: 'a'.repeat(40), status: 'active', generation: candidate.token.generation, token: candidate.token };
+      writeManualOwnerReceipt(receiptPath, receipt);
+    };
+    try {
+      assert.throws(() => crashAfterReceipt.admit({ laneId: 'manual:seam', role: 'production_captain', evidence: evidenceValue, highAutonomy: true }, { beforePublish: writeCandidate }), /injected registry publication crash/);
+      const stale = readManualOwnerReceipt(receiptPath);
+      assert.ok(stale?.token);
+      assert.equal((statSync(receiptPath).mode & 0o777), 0o600);
+      assert.deepEqual(crashAfterReceipt.snapshot().counts, { captains: 0, writers: 0, highAutonomy: 0, parked: 0 });
+      assert.throws(() => crashAfterReceipt.assertCanMutate(stale!.token!), /stale|no longer/);
+
+      const recoveredRegistry = new MissionAdmissionRegistry({ filePath, config });
+      const admitted = recoveredRegistry.admit({ laneId: 'manual:seam', role: 'production_captain', evidence: evidenceValue, highAutonomy: true }, { beforePublish: writeCandidate });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') throw new Error('expected recovered admission');
+      const published = readManualOwnerReceipt(receiptPath);
+      assert.deepEqual(published?.token, admitted.token);
+      recoveredRegistry.assertCanMutate(published!.token!);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
@@ -775,8 +838,19 @@ describe('provider-neutral durable mission admission', () => {
       assert.throws(() => admissionRegistry.assertCanMutate({ laneId: JSON.parse(readFileSync(registration.ownerReceiptPath, 'utf8')).laneId, generation: receipt.generation, token: receipt.token.token }), /stale|no longer/);
       const staleRetire = runCli(['dispatch', 'manual', 'retire', '--stopped', '--expected-generation', String(receipt.generation)], workspace, env);
       assert.notEqual(staleRetire.status, 0);
+      const parkedProjectionBytes = readFileSync(projectionPath, 'utf8');
+      rmSync(projectionPath);
+      mkdirSync(projectionPath);
+      const projectionFailure = runCli(['dispatch', 'manual', 'retire', '--stopped', '--expected-generation', String(parkedResult.parkedGeneration)], workspace, env);
+      assert.notEqual(projectionFailure.status, 0);
+      assert.match(projectionFailure.stderr, /retired in the registry, but its parked projection could not be cleared/);
+      const releasedDespiteProjectionFailure = admissionRegistry.readLane(JSON.parse(parkedReceiptBytes).laneId);
+      assert.equal(releasedDespiteProjectionFailure?.status, 'released', 'registry retirement is authoritative even when projection cleanup fails');
+      rmSync(projectionPath, { recursive: true, force: true });
+      writeFileSync(projectionPath, parkedProjectionBytes);
       const retired = runCli(['dispatch', 'manual', 'retire', '--stopped', '--expected-generation', String(parkedResult.parkedGeneration)], workspace, env);
       assert.equal(retired.status, 0, retired.stderr);
+      assert.equal(JSON.parse(readFileSync(projectionPath, 'utf8')).manualLane, undefined, 'exact-generation retry clears only the matching parked projection');
       assert.equal(existsSync(registration.ownerReceiptPath), true, 'retirement retains a private generation tombstone');
       const released = admissionRegistry.readLane(JSON.parse(readFileSync(path.join(registryPath), 'utf8')).lanes[0].laneId);
       assert.equal(released?.status, 'released');
@@ -845,7 +919,7 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it('emits an owner-only recovery receipt if private receipt publication fails, then recovers from stdin', () => {
+  it('fails manual admission closed when prepublication private receipt writing fails, without exposing a token', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-manual-receipt-failure-'));
     const workspace = path.join(directory, 'worktree');
     const runs = path.join(directory, 'runs');
@@ -861,20 +935,20 @@ describe('provider-neutral durable mission admission', () => {
       writeFileSync(receipts, 'block receipt directory creation');
       const failed = runCli(['dispatch', 'manual', 'register'], workspace, env);
       assert.notEqual(failed.status, 0);
-      const structured = JSON.parse(failed.stdout) as { outcome: string; recoveryReceipt: { token: { token: string }; status: string } };
-      assert.equal(structured.outcome, 'manual_receipt_write_failed');
-      assert.equal(structured.recoveryReceipt.status, 'active');
-      assert.match(failed.stderr, /dispatch manual recover --receipt-stdin/);
-      assert.doesNotMatch(failed.stderr, new RegExp(structured.recoveryReceipt.token.token));
+      assert.equal(failed.stdout, '');
+      assert.match(failed.stderr, /receipt could not be durably published before admission/);
+      assert.doesNotMatch(failed.stdout + failed.stderr, /"token"\s*:/);
       const registry = new MissionAdmissionRegistry({ filePath: registryPath, config: cliConfig });
-      assert.equal(registry.snapshot().counts.captains, 1);
-      const competitor = registry.admit({ laneId: 'competitor-before-manual-recovery', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 407 } });
-      assert.equal(competitor.outcome, 'duplicate');
+      assert.equal(registry.snapshot().counts.captains, 0, 'receipt failure happens before registry publication');
       rmSync(receipts); mkdirSync(receipts);
-      const recovery = runCli(['dispatch', 'manual', 'recover', '--receipt-stdin'], workspace, env, JSON.stringify(structured.recoveryReceipt));
-      assert.equal(recovery.status, 0, recovery.stderr);
-      assert.equal(existsSync(path.join(realpathSync(receipts), `${createHashForTest('acme/widgets', workspace)}.json`)), true);
-      assert.doesNotMatch(recovery.stdout, new RegExp(structured.recoveryReceipt.token.token));
+      const retried = runCli(['dispatch', 'manual', 'register'], workspace, env);
+      assert.equal(retried.status, 0, retried.stderr);
+      const receiptPath = path.join(realpathSync(receipts), `${createHashForTest('acme/widgets', workspace)}.json`);
+      const receipt = readManualOwnerReceipt(receiptPath);
+      assert.ok(receipt?.token);
+      assert.equal((statSync(receiptPath).mode & 0o777), 0o600);
+      assert.equal(registry.snapshot().counts.captains, 1);
+      assert.doesNotMatch(retried.stdout, new RegExp(receipt!.token!.token));
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });

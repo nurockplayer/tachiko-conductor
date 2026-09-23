@@ -1551,7 +1551,16 @@ export async function main(argv: string[]): Promise<number> {
         } else if (prior?.status === 'parked') {
           throw new Error(`Manual lane remains reserved at parked generation ${prior.generation} (${prior.parkedReason}); retire its exact clean checkpoint before registering again.`);
         } else {
-          const admission = registry.admit({ laneId, role: 'production_captain', evidence: identity, highAutonomy: true });
+          const admission = registry.admit({ laneId, role: 'production_captain', evidence: identity, highAutonomy: true }, {
+            beforePublish: (candidate) => {
+              const receipt: ManualOwnerReceipt = { schemaVersion: 1, laneId, missionId: candidate.missionId, repository, workspace: identity.workspace!, branch, checkpointSha, status: 'active', generation: candidate.token.generation, token: candidate.token };
+              try { writeManualOwnerReceipt(receiptPath, receipt); }
+              catch (error) {
+                const detail = error instanceof Error ? error.message : String(error);
+                throw new Error(`Manual owner receipt could not be durably published before admission: ${detail}`);
+              }
+            },
+          });
           if (admission.outcome !== 'admitted') throw new Error(admission.outcome === 'duplicate'
             ? `Manual production lane overlaps active or parked lane "${admission.conflictingLaneId}".`
             : `Manual production lane is parked by ${admission.reason}.`);
@@ -1559,17 +1568,10 @@ export async function main(argv: string[]): Promise<number> {
           revision = admission.revision;
           token = admission.token;
         }
-        try {
-          const receipt: ManualOwnerReceipt = { schemaVersion: 1, laneId, missionId, repository, workspace: identity.workspace!, branch, checkpointSha, status: 'active', generation: token.generation, token };
-          writeManualOwnerReceipt(receiptPath, receipt);
-        } catch (error) {
-          const detail = error instanceof Error ? error.message : String(error);
-          const recovery: ManualOwnerReceipt = { schemaVersion: 1, laneId, missionId, repository, workspace: identity.workspace!, branch, checkpointSha, status: 'active', generation: token.generation, token };
-          console.log(JSON.stringify({ outcome: 'manual_receipt_write_failed', recoveryReceipt: recovery }));
-          throw new Error(`Manual lane ${laneId} generation ${token.generation} is fenced, but its private owner receipt could not be saved. Preserve the fence and run dispatch manual recover --receipt-stdin with the structured recoveryReceipt from stdout: ${detail}`);
-        }
+        const receipt = readManualOwnerReceipt(receiptPath);
+        if (receipt?.status !== 'active' || receipt.generation !== token.generation || receipt.token?.token !== token.token) throw new Error(`Manual lane ${laneId} generation ${token.generation} was admitted but its exact private owner receipt is unavailable; retain the registry fence and reconcile from its private receipt.`);
         let projection: ReturnType<typeof registerManualLane>;
-        try { projection = manualProjection(readManualOwnerReceipt(receiptPath)!, 'active', clean, revision); }
+        try { projection = manualProjection(receipt, 'active', clean, revision); }
         catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           throw new Error(`Manual lane ${laneId} generation ${token.generation} has a private owner receipt at ${receiptPath}, but projection publication failed; preserve the fence and retry reconciliation: ${detail}`);
@@ -1618,13 +1620,17 @@ export async function main(argv: string[]): Promise<number> {
       }
       if (receipt.status !== 'parked' || expectedGeneration !== receipt.generation || !clean || !stopped || branch !== receipt.branch || checkpointSha !== receipt.checkpointSha ||
         !((prior?.status === 'parked' && prior.generation === receipt.generation) || (prior?.status === 'released' && prior.generation === receipt.generation + 1))) throw new Error('Manual retirement requires the exact parked receipt generation and unchanged clean stopped branch/HEAD checkpoint.');
-      const projection = retireManualLane(resolveRunsDir(), laneId, now);
       let revision: number;
       try { revision = registry.retireManual(laneId, receipt.generation, { worktree, branch, checkpointSha, clean, stopped }); }
       catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        manualProjection(receipt, 'parked', true, registry.snapshot().revision);
-        throw new Error(`Manual retirement did not release its exact parked generation; the parked projection was restored: ${detail}`);
+        throw new Error(`Manual retirement did not release its exact parked generation; the parked projection remains authoritative: ${detail}`);
+      }
+      let projection: ReturnType<typeof retireManualLane>;
+      try { projection = retireManualLane(resolveRunsDir(), laneId, now); }
+      catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Manual lane generation ${receipt.generation} is retired in the registry, but its parked projection could not be cleared; preserve the released generation and retry exact-generation reconciliation: ${detail}`);
       }
       // Retain the parked private receipt as a harmless generation tombstone.
       // The next authorized register replaces it while holding this same lock.

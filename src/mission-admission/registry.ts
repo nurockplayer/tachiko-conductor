@@ -213,6 +213,17 @@ function deterministicMissionId(evidence: MissionEvidence): string {
   return `mission-${digest}`;
 }
 
+function deterministicExperimentMissionId(laneId: string, parentMissionId: string): string {
+  const digest = createHash('sha256').update(`isolated-experiment\0${parentMissionId}\0${laneId}`).digest('hex').slice(0, 32);
+  return `experiment-${digest}`;
+}
+
+/** A validated captain/delegate pair shares one capacity identity; each experiment owns its own. */
+function capacityMissionId(lane: Pick<LaneRecord, 'missionId' | 'role'>): string {
+  const scope = lane.role === 'isolated_experiment' ? 'experiment' : 'production';
+  return `${scope}:${lane.missionId}`;
+}
+
 function validateLane(value: unknown): value is LaneRecord {
   if (!object(value)) return false;
   const allowed = ['laneId', 'missionId', 'evidence', 'role', 'status', 'generation', 'token', 'highAutonomy', 'delegatedFromLaneId', 'experimentOfMissionId', 'parkedReason', 'updatedAt'];
@@ -228,6 +239,7 @@ function validateLane(value: unknown): value is LaneRecord {
   if (value.role === 'delegated_mutation_writer' && value.status === 'parked') return false;
   if (value.role !== 'delegated_mutation_writer' && value.delegatedFromLaneId !== undefined) return false;
   if (value.role === 'isolated_experiment' && !nonEmpty(value.experimentOfMissionId)) return false;
+  if (value.role === 'isolated_experiment' && value.missionId !== deterministicExperimentMissionId(value.laneId as string, value.experimentOfMissionId as string)) return false;
   if (value.role !== 'isolated_experiment' && value.experimentOfMissionId !== undefined) return false;
   if (value.parkedReason !== undefined && !['capacity_captains', 'capacity_writers', 'capacity_high_autonomy', 'capacity_repository', 'workflow_wait', 'workflow_settled', 'manual_checkpoint'].includes(String(value.parkedReason))) return false;
   if ((value.status === 'parked') !== (value.parkedReason !== undefined)) return false;
@@ -267,7 +279,7 @@ function validateState(value: unknown): RegistryState {
   if (new Set(tokens).size !== tokens.length) throw new AdmissionStateError('Admission registry contains duplicate active generation tokens.');
   const active = value.lanes.filter((lane) => lane.status === 'active');
   const writers = new Set(active.filter((lane) => mutation(lane.role)).map((lane) => lane.missionId));
-  const highAutonomyMissions = new Set(active.filter((lane) => lane.highAutonomy).map((lane) => lane.missionId));
+  const highAutonomyMissions = new Set(active.filter((lane) => lane.highAutonomy).map(capacityMissionId));
   if (value.config.limits.maxPerRepository !== undefined) {
     const captainsByRepository = new Map<string, number>();
     for (const lane of active) if (lane.role === 'production_captain') {
@@ -402,7 +414,9 @@ export class MissionAdmissionRegistry {
       const owner = request.role === 'delegated_mutation_writer' ? state.lanes.find((lane) => lane.laneId === request.delegatedFromLaneId && lane.status === 'active' && lane.role === 'production_captain') : undefined;
       if (request.role === 'delegated_mutation_writer' && (!owner || !overlaps(owner.evidence, evidence) || (prior !== undefined && prior.missionId !== owner.missionId))) throw new AdmissionStateError('Delegated writer must overlap and share the mission of an active production captain lane.');
       if (request.role === 'delegated_mutation_writer' && request.highAutonomy === true) throw new AdmissionStateError('Delegated writers share their captain mission capacity and cannot request separate high-autonomy capacity.');
-      let missionId = owner?.missionId ?? prior?.missionId ?? deterministicMissionId(evidence);
+      let missionId = request.role === 'isolated_experiment'
+        ? deterministicExperimentMissionId(request.laneId, request.experimentOfMissionId!)
+        : owner?.missionId ?? prior?.missionId ?? deterministicMissionId(evidence);
       const candidate: LaneRecord = {
         laneId: request.laneId, missionId, evidence: prior ? mergeEvidence(prior.evidence, evidence) : evidence,
         role: request.role, status: 'active', generation: (prior?.generation ?? 0) + 1, token: randomUUID(),
@@ -573,7 +587,7 @@ export interface AdmissionProjection {
 function project(state: RegistryState): AdmissionProjection {
   const active = state.lanes.filter((lane) => lane.status === 'active');
   const writers = new Set(active.filter((lane) => mutation(lane.role)).map((lane) => lane.missionId));
-  const highAutonomy = new Set(active.filter((lane) => lane.highAutonomy).map((lane) => lane.missionId));
+  const highAutonomy = new Set(active.filter((lane) => lane.highAutonomy).map(capacityMissionId));
   const priority = (lane: LaneRecord): number => {
     if (lane.status === 'active' && lane.role === 'production_captain') return 0;
     if (lane.status === 'active' && lane.role === 'delegated_mutation_writer') return 1;
@@ -604,8 +618,8 @@ function capacityReason(state: RegistryState, candidate: LaneRecord): ParkedReas
   if (candidate.role === 'production_captain' && active.filter((lane) => lane.role === 'production_captain').length >= limits.maxCaptains) return 'capacity_captains';
   const writerMissions = new Set(active.filter((lane) => mutation(lane.role)).map((lane) => lane.missionId));
   if (mutation(candidate.role) && !writerMissions.has(candidate.missionId) && writerMissions.size >= limits.maxWriters) return 'capacity_writers';
-  const highAutonomyMissions = new Set(active.filter((lane) => lane.highAutonomy).map((lane) => lane.missionId));
-  if (candidate.highAutonomy && !highAutonomyMissions.has(candidate.missionId) && highAutonomyMissions.size >= limits.maxHighAutonomy) return 'capacity_high_autonomy';
+  const highAutonomyMissions = new Set(active.filter((lane) => lane.highAutonomy).map(capacityMissionId));
+  if (candidate.highAutonomy && !highAutonomyMissions.has(capacityMissionId(candidate)) && highAutonomyMissions.size >= limits.maxHighAutonomy) return 'capacity_high_autonomy';
   if (candidate.role === 'production_captain' && limits.maxPerRepository !== undefined &&
     active.filter((lane) => lane.role === 'production_captain' && lane.evidence.repository === candidate.evidence.repository).length >= limits.maxPerRepository) return 'capacity_repository';
   return null;
