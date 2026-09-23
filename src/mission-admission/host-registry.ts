@@ -16,6 +16,7 @@ export const MISSION_ADMISSION_PATH_ENV = 'TACHIKO_MISSION_ADMISSION_PATH';
 export const MISSION_ADMISSION_CONFIG_ENV = 'TACHIKO_MISSION_ADMISSION_CONFIG';
 export const MANUAL_OWNER_RECEIPTS_DIR_ENV = 'TACHIKO_MANUAL_OWNER_RECEIPTS_DIR';
 export const HEARTBEAT_OWNER_RECEIPTS_DIR_ENV = 'TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR';
+export const RUN_OWNER_RECEIPTS_DIR_ENV = 'TACHIKO_RUN_OWNER_RECEIPTS_DIR';
 
 export interface HostAdmissionResolverOptions {
   readonly env?: NodeJS.ProcessEnv;
@@ -102,6 +103,19 @@ export function resolveHeartbeatOwnerReceiptPath(repository: string, workspace: 
   const receiptPath = path.join(receiptDirectory, `${receiptId}.json`);
   if (containsPath(physicalWorkspace, receiptPath) || containsPath(runsDirectory, receiptPath)) {
     throw new AdmissionStateError('Heartbeat admission receipt must be outside the workspace and per-Run data directory.');
+  }
+  return receiptPath;
+}
+
+export function resolveRunOwnerReceiptPath(repository: string, runId: string, evidence?: import('./registry.js').MissionEvidence, { env = process.env, homeDirectory = os.homedir() }: HostAdmissionResolverOptions = {}): string {
+  if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new AdmissionStateError('Run owner receipt requires canonical repository and safe Run identity.');
+  const configuredDirectory = env[RUN_OWNER_RECEIPTS_DIR_ENV] ?? path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'run-receipts');
+  if (!path.isAbsolute(configuredDirectory)) throw new AdmissionStateError(`${RUN_OWNER_RECEIPTS_DIR_ENV} must be an absolute host path.`);
+  const receiptDirectory = physicalPath(configuredDirectory);
+  const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
+  const receiptPath = path.join(receiptDirectory, `${createHash('sha256').update(`${repository}\0${runId}`).digest('hex')}.json`);
+  if (containsPath(runsDirectory, receiptPath) || (evidence?.workspace !== undefined && containsPath(physicalPath(evidence.workspace), receiptPath))) {
+    throw new AdmissionStateError('Run owner receipt must be outside the repository workspace and per-Run data directory.');
   }
   return receiptPath;
 }

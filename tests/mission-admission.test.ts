@@ -674,7 +674,7 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
   });
 
-  it('exposes read-only bounded admission status without capability tokens or physical paths', () => {
+  it('exposes read-only bounded admission status with owning Run/workspace evidence and no capability tokens', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-status-'));
     const workspace = path.join(directory, 'worktree');
     mkdirSync(workspace);
@@ -717,7 +717,9 @@ describe('provider-neutral durable mission admission', () => {
       assert.equal(projection.omittedLaneCount, 8);
       assert.equal(projection.lanesTruncated, true);
       assert.equal(JSON.stringify(projection).includes(admitted.token.token), false);
-      assert.equal(JSON.stringify(projection).includes(workspace), false);
+      const owner = projection.lanes.find((lane) => lane.laneId === 'status-lane')!;
+      assert.deepEqual(owner.evidence, { repository: 'acme/widgets', issue: 9000, workspace: realpathSync.native(workspace) });
+      assert.equal(owner.reason, 'active_owner');
       assert.equal(readFileSync(env.TACHIKO_DISPATCH_WAKE_PATH!, 'utf8'), wakeBefore, 'status is read-only and does not signal dispatch');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });

@@ -481,12 +481,12 @@ export class MissionAdmissionRegistry {
     });
   }
 
-  renew(token: AdmissionToken): AdmissionToken {
+  renew(token: AdmissionToken, beforePublish?: () => void): AdmissionToken {
     return this.transact((state) => {
       const lane = requireCurrentToken(state, token);
       lane.updatedAt = this.now();
       return tokenRecord(lane);
-    });
+    }, () => beforePublish?.());
   }
 
   readLane(laneId: string): AdmissionLaneView | null {
@@ -496,7 +496,7 @@ export class MissionAdmissionRegistry {
     return structuredClone(view);
   }
 
-  park(token: AdmissionToken, reason: ParkedReason): number {
+  park(token: AdmissionToken, reason: ParkedReason, beforePublish?: () => void): number {
     return this.transact((state) => {
       const lane = requireCurrentToken(state, token);
       if (lane.role === 'delegated_mutation_writer') throw new AdmissionStateError('Delegated writer cannot park; retain its active generation until stopped proof permits release.');
@@ -505,7 +505,7 @@ export class MissionAdmissionRegistry {
       lane.status = 'parked'; lane.token = null; lane.generation += 1; lane.parkedReason = reason; lane.updatedAt = this.now();
       state.revision += 1; state.lastTransition = { kind: reason, laneId: lane.laneId, at: lane.updatedAt };
       return state.revision;
-    });
+    }, () => beforePublish?.());
   }
 
   parkManual(token: AdmissionToken, proof: { readonly worktree: string; readonly branch: string; readonly checkpointSha: string; readonly clean: boolean; readonly stopped: boolean }): number {
@@ -552,6 +552,23 @@ export class MissionAdmissionRegistry {
       assertNoActiveDelegates(state, lane);
       lane.status = 'released'; lane.token = null; lane.generation += 1; lane.updatedAt = this.now(); delete (lane as { parkedReason?: ParkedReason }).parkedReason;
       state.revision += 1; state.lastTransition = { kind: 'released', laneId: lane.laneId, at: lane.updatedAt };
+      return state.revision;
+    }, () => beforePublish?.());
+  }
+
+  /** Exact-generation operator settlement for a parked production Run lane. */
+  releaseParked(laneId: string, expectedParkedGeneration: number, executionStopped: boolean, beforePublish?: () => void): number {
+    if (!nonEmpty(laneId) || !Number.isSafeInteger(expectedParkedGeneration) || expectedParkedGeneration <= 0 || executionStopped !== true) {
+      throw new AdmissionStateError('Parked Run settlement requires its exact generation and explicit operator-stopped attestation.');
+    }
+    return this.transact((state) => {
+      const lane = state.lanes.find((record) => record.laneId === laneId);
+      if (lane?.status === 'released' && lane.generation === expectedParkedGeneration + 1) return state.revision;
+      if (!lane || lane.status !== 'parked' || lane.generation !== expectedParkedGeneration || lane.role !== 'production_captain' || lane.parkedReason === 'manual_checkpoint') {
+        throw new AdmissionStateError('Parked Run settlement is stale or does not identify the expected production Run generation.');
+      }
+      lane.status = 'released'; lane.token = null; lane.generation += 1; lane.updatedAt = this.now(); delete (lane as { parkedReason?: ParkedReason }).parkedReason;
+      state.revision += 1; state.lastTransition = { kind: 'operator_stopped_release', laneId: lane.laneId, at: lane.updatedAt };
       return state.revision;
     }, () => beforePublish?.());
   }

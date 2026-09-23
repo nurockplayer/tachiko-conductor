@@ -8,12 +8,14 @@ import { describe, it } from 'node:test';
 
 import {
   githubSnapshotCommand,
+  assertCanonicalDispatchResumeClaim,
   findRunByTarget,
   LIVE_HEAD_SYNC_DECISION,
   main,
   parseIssueNumber,
   parseIssueRef,
   printDispatchResult,
+  recoverRunAdmission,
   resolveCodexExecutionConfig,
   resolveSelectedExecutionProfile,
   resolveHostedCheckPolicyConfiguration,
@@ -37,7 +39,10 @@ import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
 import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
+import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { DispatchAdmissionWaitError } from '../src/dispatch/runner.js';
+import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../src/dispatch/invocation-lock.js';
+import type { DispatchRuntimeClaim } from '../src/dispatch/queue.js';
 import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -635,7 +640,7 @@ describe('workflow run and resume commands', () => {
       assert.equal(owner.outcome, 'admitted');
       const implementation = new FakeImplementation([]);
       await assert.rejects(
-        runIssueCommand(deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])), 'acme/widgets#43', { admission }),
+        runIssueCommand(deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])), 'acme/widgets#43', { admission, runOwnerReceiptPath: path.join(dir, 'run-owner-43.json') }),
         /overlaps active or parked lane "other-issue"/,
       );
       assert.equal(implementation.calls, 0);
@@ -653,8 +658,8 @@ describe('workflow run and resume commands', () => {
       assert.equal(owner.outcome, 'admitted');
       const implementation = new FakeImplementation([successResult(HEAD)]);
       await assert.rejects(
-        runIssueCommand(deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])), 'acme/widgets#44', { admission, admissionWorkspace: process.cwd(), now: () => T0 }),
-        /overlaps reserved lane "ambient-owner"/,
+        runIssueCommand(deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])), 'acme/widgets#44', { admission, admissionWorkspace: process.cwd(), runOwnerReceiptPath: path.join(dir, 'run-owner-44.json'), now: () => T0 }),
+        /overlaps active or parked lane "ambient-owner"/,
       );
       assert.equal(implementation.calls, 0, 'ambient workspace conflict is detected before model execution');
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -754,6 +759,174 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.run.state, 'MERGE_READY');
     const persisted = store.read('run-1');
     assert.equal(persisted?.interrupt?.resolvedAt, T0);
+  });
+
+  it('accepts only the exact live dispatch claim and lets one of two human decisions win the Run CAS', async () => {
+    const store = new MemoryStore();
+    const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
+    let run = createRun(TARGET, T0, 'dispatch-human-run', execution, 'dispatch-claim-1');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+    run = applyTransition(run, { type: 'escalate', reason: 'operator input', interrupt: { evidence: 'needs decision', choices: ['A', 'B'] } }, T0);
+    store.create(run);
+    const config = { revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 };
+    const liveClaim: DispatchRuntimeClaim = { issue: 42, claimId: 'dispatch-claim-1', runId: run.id, profile: 'complex', state: 'needs_human', claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z' };
+    assert.doesNotThrow(() => assertCanonicalDispatchResumeClaim(run, liveClaim, config));
+    assert.throws(() => assertCanonicalDispatchResumeClaim(run, { ...liveClaim, runId: null }, config), /missing, stale, replaced, or differently bound/);
+    assert.doesNotThrow(() => assertCanonicalDispatchResumeClaim(run, { ...liveClaim, runId: null }, config, run), 'a null runtime Run id may be recovered only with separate unique claim-to-Run proof');
+    for (const stale of [null, { ...liveClaim, claimId: 'replaced' }, { ...liveClaim, state: 'retired' as const }, { ...liveClaim, runId: 'other-run' }]) {
+      assert.throws(() => assertCanonicalDispatchResumeClaim(run, stale, config), /missing, stale, replaced, or differently bound/);
+    }
+
+    let rendezvous!: () => void;
+    const bothDecisionsReady = new Promise<void>((resolve) => { rendezvous = resolve; });
+    let participants = 0;
+    const commitDispatchResumeTransition: NonNullable<NonNullable<Parameters<typeof resumeCommand>[3]>['commitDispatchResumeTransition']> = async (_expected, _next, commitRun) => {
+      participants += 1;
+      if (participants === 2) rendezvous();
+      await bothDecisionsReady;
+      commitRun();
+    };
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+    const reviewer = new FakeReviewer([{ verdict: 'approve', reviewerName: 'oracle', headSha: HEAD, findings: [] }]);
+    const workflow = deps(store, githubAdapter([HEAD, HEAD, HEAD]), implementation, reviewer);
+    const decide = (choice: string) => resumeCommand(workflow, run.id, choice, { dispatchClaimId: liveClaim.claimId, commitDispatchResumeTransition, now: () => T0 });
+    const results = await Promise.allSettled([decide('A'), decide('B')]);
+    assert.equal(results.filter((result) => result.status === 'fulfilled').length, 1);
+    assert.equal(results.filter((result) => result.status === 'rejected').length, 1);
+    assert.equal(reviewer.calls, 1, `CAS loser does not start a second worker: ${results.map((result) => result.status === 'rejected' ? String(result.reason) : result.value.outcome).join('; ')}`);
+  });
+
+  it('keeps the active Run fence if claim publication fails after the parked Run CAS', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-resume-claim-crash-'));
+    try {
+      const store = new MemoryStore();
+      const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
+      let run = createRun(TARGET, T0, 'dispatch-resume-crash', execution, 'dispatch-claim-crash');
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+      run = applyTransition(run, { type: 'escalate', reason: 'operator input', interrupt: { evidence: 'decision required', choices: ['A'] } }, T0);
+      store.create(run);
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: { schemaVersion: 1, revision: 'resume-crash-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const receiptPath = path.join(directory, 'run-owner.json');
+      let releaseCount = 0;
+      const outcomePromise = resumeCommand(deps(store, githubAdapter([HEAD, HEAD, HEAD]), new FakeImplementation([]), new FakeReviewer([])), run.id, 'A', {
+        dispatchClaimId: run.dispatchClaimId,
+        admission: registry,
+        admissionWorkspace: directory,
+        runOwnerReceiptPath: receiptPath,
+        releaseDispatchAdmissionLock: () => { releaseCount += 1; },
+        commitDispatchResumeTransition: async (_expected, _next, commitRun) => {
+          commitRun();
+          throw new Error('injected process failure after Run CAS and before claim publication');
+        },
+      });
+      await assert.rejects(outcomePromise, /injected process failure/);
+      assert.equal(store.read(run.id)?.state, 'REVIEWING', 'Run decision is durably recorded before claim publication');
+      assert.equal(registry.readLane(`run:${run.id}`)?.status, 'active', 'uncertain post-CAS state retains admission fence');
+      assert.ok(readRunOwnerReceipt(receiptPath)?.token, 'owner receipt remains recoverable');
+      assert.equal(releaseCount, 0, 'workflow lock release callback is not reached before workflow execution');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('releases the exact pre-execution generation after a dispatch resume Run CAS loss', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-resume-cas-loss-'));
+    const lockPath = path.join(directory, 'dispatch.admission');
+    const prepareLock = acquireDispatchInvocationLock({ lockPath });
+    let prepareReleased = false;
+    const releasePrepare = () => { if (!prepareReleased) { prepareReleased = true; prepareLock.release(); } };
+    try {
+      const store = new MemoryStore();
+      const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
+      let run = createRun(TARGET, T0, 'dispatch-resume-cas-loss', execution, 'dispatch-claim-cas-loss');
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+      run = applyTransition(run, { type: 'escalate', reason: 'operator input', interrupt: { evidence: 'decision required', choices: ['A'] } }, T0);
+      store.create(run);
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: { schemaVersion: 1, revision: 'resume-cas-loss-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const withDispatchAdmissionLock = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+        for (;;) {
+          try {
+            const lock = acquireDispatchInvocationLock({ lockPath });
+            try { return await operation(); } finally { lock.release(); }
+          } catch (error) {
+            if (!(error instanceof DispatchInvocationLockedError)) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+        }
+      };
+      let timeout: NodeJS.Timeout | undefined;
+      const outcome = resumeCommand(deps(store, githubAdapter([HEAD, HEAD, HEAD]), new FakeImplementation([]), new FakeReviewer([])), run.id, 'A', {
+        dispatchClaimId: run.dispatchClaimId,
+        admission: registry,
+        admissionWorkspace: directory,
+        runOwnerReceiptPath: path.join(directory, 'run-owner.json'),
+        releaseDispatchAdmissionLock: releasePrepare,
+        withDispatchAdmissionLock,
+        commitDispatchResumeTransition: async (_expected, _next, commitRun) => {
+          store.update({ ...run, updatedAt: '2026-09-15T00:00:00.010Z' });
+          commitRun();
+        },
+      });
+      await assert.rejects(Promise.race([
+        outcome,
+        new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('CAS-loss settlement deadlocked on the prepare lock')), 2_000); }),
+      ]), /changed while the decision was being prepared/);
+      if (timeout !== undefined) clearTimeout(timeout);
+      const released = registry.readLane(`run:${run.id}`);
+      assert.equal(released?.status, 'released', 'failed CAS releases the exact generation that never authorized execution');
+      assert.equal(released?.generation, 2, 'the original generation is fenced by one release transition');
+      assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN', 'the competing Run snapshot is preserved');
+      assert.ok(prepareReleased, 'outer short lock was released before exact-generation settlement');
+    } finally {
+      releasePrepare();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('releases prepare lock before settling a pre-execution Run-store failure', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-run-create-lock-failure-'));
+    const lockPath = path.join(directory, 'dispatch.admission');
+    const prepareLock = acquireDispatchInvocationLock({ lockPath });
+    const releasePrepare = () => { try { prepareLock.release(); } catch { /* idempotent test cleanup */ } };
+    try {
+      const store = new MemoryStore();
+      store.create = () => { throw new Error('injected Run persistence failure'); };
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: { schemaVersion: 1, revision: 'create-failure-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const withDispatchAdmissionLock = async <T>(operation: () => Promise<T> | T): Promise<T> => {
+        for (;;) {
+          try {
+            const lock = acquireDispatchInvocationLock({ lockPath });
+            try { return await operation(); } finally { lock.release(); }
+          } catch (error) {
+            if (!(error instanceof DispatchInvocationLockedError)) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 1));
+          }
+        }
+      };
+      let timeout: NodeJS.Timeout | undefined;
+      const bounded = Promise.race([
+        runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', {
+          admission: registry,
+          admissionWorkspace: directory,
+          runOwnerReceiptPath: path.join(directory, 'run-owner.json'),
+          releaseDispatchAdmissionLock: releasePrepare,
+          withDispatchAdmissionLock,
+        }),
+        new Promise<never>((_, reject) => { timeout = setTimeout(() => reject(new Error('pre-execution cleanup deadlocked on prepare lock')), 2_000); }),
+      ]);
+      await assert.rejects(bounded, /injected Run persistence failure/);
+      if (timeout !== undefined) clearTimeout(timeout);
+      assert.equal(registry.readLane('run:run-1'), null);
+    } finally {
+      releasePrepare();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('terminates a parked run when the advertised cancel choice is selected', async () => {
@@ -886,9 +1059,10 @@ describe('workflow run and resume commands', () => {
         },
       };
       const workflowDeps = deps(store, flakyGithub, new FakeImplementation([]), new FakeReviewer([{ verdict: 'approve', reviewerName: 'oracle', headSha: HEAD2, findings: [] }]));
-      await assert.rejects(resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission }), /temporary GitHub sync preflight failure/);
+      const receiptPath = path.join(dir, 'run-owner-sync-retry.json');
+      await assert.rejects(resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission, runOwnerReceiptPath: receiptPath }), /temporary GitHub sync preflight failure/);
       assert.equal(admission.readLane(`run:${run.id}`)?.status, 'released');
-      const retried = await resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission, now: () => T0 });
+      const retried = await resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission, runOwnerReceiptPath: receiptPath, now: () => T0 });
       assert.equal(retried.outcome, 'merge_ready');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -915,6 +1089,7 @@ describe('workflow run and resume commands', () => {
         runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', {
           dispatchClaimId: 'claim-race',
           admission,
+          runOwnerReceiptPath: path.join(dir, 'run-owner-race.json'),
         }),
         (error: unknown) => {
           assert.ok(error instanceof DispatchAdmissionWaitError);
@@ -961,7 +1136,7 @@ describe('workflow run and resume commands', () => {
       const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'create-failure-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
       const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
       await assert.rejects(
-        runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', { admission }),
+        runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', { admission, runOwnerReceiptPath: path.join(dir, 'run-owner-create-failure.json') }),
         /injected durable create failure/,
       );
       assert.equal(admission.readLane(`run:${store.createdId}`)?.status, 'released');
@@ -978,12 +1153,100 @@ describe('workflow run and resume commands', () => {
         override async run(): Promise<AgentResult> { throw new Error('provider invocation settlement is uncertain'); }
       }
       await assert.rejects(
-        runIssueCommand(deps(store, githubAdapter([HEAD]), new UncertainImplementation([]), new FakeReviewer([])), 'acme/widgets#42', { admission, admissionWorkspace: process.cwd() }),
+        runIssueCommand(deps(store, githubAdapter([HEAD]), new UncertainImplementation([]), new FakeReviewer([])), 'acme/widgets#42', { admission, admissionWorkspace: process.cwd(), runOwnerReceiptPath: path.join(dir, 'run-owner-uncertain.json') }),
         /provider invocation settlement is uncertain/,
       );
       const run = store.list()[0];
       assert.ok(run);
       assert.equal(admission.readLane(`run:${run.id}`)?.status, 'active');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('recovers uncertain Run ownership only with exact private receipt generation and stopped attestation', async () => {
+    const { dir } = tempStore();
+    try {
+      const store = new MemoryStore();
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: { schemaVersion: 1, revision: 'run-recovery-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const receiptPath = path.join(dir, 'owner-receipt.json');
+      class UncertainImplementation extends FakeImplementation { override async run(): Promise<AgentResult> { throw new Error('worker settlement uncertain'); } }
+      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), new UncertainImplementation([]), new FakeReviewer([])), 'acme/widgets#42', {
+        admission, admissionWorkspace: process.cwd(), runOwnerReceiptPath: receiptPath,
+      }), /worker settlement uncertain/);
+      const run = store.list()[0]!;
+      const receipt = readRunOwnerReceipt(receiptPath)!;
+      assert.equal(receipt.phase, 'execution_possible');
+      assert.ok(receipt.token);
+      assert.equal(admission.readLane(`run:${run.id}`)?.generation, receipt.generation);
+      writeRunOwnerReceipt(receiptPath, { ...receipt, phase: 'pre_execution' });
+      assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation, false, receiptPath), /receipt phase alone cannot prove supervisor death/);
+      writeRunOwnerReceipt(receiptPath, receipt);
+      assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation, false, receiptPath), /explicit --stopped/);
+      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'active');
+      const originalRelease = admission.release.bind(admission);
+      admission.release = (token, stopped, beforePublish) => { beforePublish?.(); throw new Error('simulated crash before registry publication'); };
+      assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation, true, receiptPath), /simulated crash before registry publication/);
+      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'active');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'release_transition', 'prepublish crash retains the active capability in the private receipt');
+      admission.release = (token, stopped, beforePublish) => { originalRelease(token, stopped, beforePublish); throw new Error('simulated crash after registry publication'); };
+      assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation, true, receiptPath), /simulated crash after registry publication/);
+      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'released');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'release_transition', 'postpublish crash leaves a reconcilable transition receipt');
+      admission.release = originalRelease;
+      assert.equal(recoverRunAdmission(store, admission, run.id, receipt.generation, true, receiptPath), 'released', 'exact-generation recovery reconciles a postpublish crash');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'released');
+      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'released');
+      assert.equal(recoverRunAdmission(store, admission, run.id, receipt.generation, true, receiptPath), 'released', 'exact-generation recovery retry is idempotent');
+
+      const successor = admission.admit({ laneId: `run:${run.id}`, role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: run.id, workspace: process.cwd() } });
+      assert.equal(successor.outcome, 'admitted');
+      if (successor.outcome !== 'admitted') throw new Error('expected successor generation');
+      assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation, true, receiptPath), /does not match expected generation|do not identify the exact recoverable active generation/);
+      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'active', 'stale recovery cannot release a successor generation');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('retires a parked Run after receipt prepublication wins but re-admission registry publication fails', async () => {
+    const { dir } = tempStore();
+    try {
+      const runId = 'parked-readmit-crash';
+      const run = createRun(TARGET, T0, runId);
+      const store = new MemoryStore();
+      store.create(run);
+      const receiptPath = path.join(dir, 'owner-receipt.json');
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: { schemaVersion: 1, revision: 'parked-readmit-crash-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const admitted = admission.admit({ laneId: `run:${runId}`, role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: runId, workspace: dir } });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') throw new Error('expected initial Run admission');
+      const parkedReceipt = { schemaVersion: 1 as const, laneId: admitted.token.laneId, missionId: admitted.missionId, repository: 'acme/widgets', runId, issue: 42, workspace: dir, token: admitted.token, generation: admitted.token.generation, phase: 'park_transition' as const };
+      admission.park(admitted.token, 'workflow_wait', () => writeRunOwnerReceipt(receiptPath, parkedReceipt));
+      writeRunOwnerReceipt(receiptPath, { schemaVersion: 1, laneId: admitted.token.laneId, missionId: admitted.missionId, repository: 'acme/widgets', runId, issue: 42, workspace: dir, generation: admitted.token.generation + 1, phase: 'parked' });
+      const parkedGeneration = admission.readLane(admitted.token.laneId)?.generation;
+      assert.ok(parkedGeneration);
+
+      const actualAdmit = admission.admit.bind(admission);
+      admission.admit = (request, options) => actualAdmit(request, {
+        ...options,
+        beforePublish: (candidate) => {
+          options?.beforePublish?.(candidate);
+          throw new Error('injected registry publication failure after candidate receipt write');
+        },
+      });
+      await assert.rejects(runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', {
+        admission,
+        admissionWorkspace: dir,
+        runOwnerReceiptPath: receiptPath,
+      }), /injected registry publication failure/);
+      const candidateReceipt = readRunOwnerReceipt(receiptPath);
+      assert.equal(candidateReceipt?.phase, 'pre_execution');
+      assert.equal(candidateReceipt?.generation, parkedGeneration + 1);
+      assert.equal(admission.readLane(admitted.token.laneId)?.status, 'parked', 'failed re-admission leaves the old parked ownership in force');
+
+      assert.equal(recoverRunAdmission(store, admission, runId, parkedGeneration, true, receiptPath), 'released', 'the exact old parked owner can be operator-stopped and retired using its public registry generation');
+      const releasedLane = admission.readLane(admitted.token.laneId);
+      assert.equal(releasedLane?.status, 'released');
+      assert.equal(releasedLane?.generation, parkedGeneration + 1);
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'released');
+      assert.equal(recoverRunAdmission(store, admission, runId, parkedGeneration, true, receiptPath), 'released', 'exact recovery is idempotent after publication');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -1015,7 +1278,7 @@ describe('workflow run and resume commands', () => {
       };
       const implementation = new FakeImplementation([successResult(HEAD)]);
       await assert.rejects(
-        runIssueCommand(deps(store, expiringGithub, implementation, new FakeReviewer([])), 'acme/widgets#42', { admission }),
+        runIssueCommand(deps(store, expiringGithub, implementation, new FakeReviewer([])), 'acme/widgets#42', { admission, runOwnerReceiptPath: path.join(dir, 'run-owner-mutation-fence.json') }),
         /Admission generation token is stale/,
       );
       assert.equal(implementation.calls, 0);
