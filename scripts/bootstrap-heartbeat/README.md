@@ -57,6 +57,11 @@ because its parent returned. The `supervisorStopped` proof means the direct wake
 `childrenStopped` means the guard observed the process group empty at the recorded time.
 The heartbeat invocation waits for that guard result before deciding whether the fingerprint was
 settled, so a successful direct marker is not retried while a same-group child is still running.
+The model-free helper trusts the pinned runner and guard as its supervisor for stop attestation:
+the helper verifies the exact private receipt and current registry generation, while the runner
+and guard are responsible for asserting that the managed provider and contained children have
+stopped before settlement. This is a trusted local process boundary, not independent proof against
+a malicious same-user process or a target that violates the documented no-detach contract.
 
 The supported target is the pinned default Codex executable and companion running the fixed
 GPT-6 Sol/high profile. `--codex` and `--profile` overrides are rejected. Custom wake targets,

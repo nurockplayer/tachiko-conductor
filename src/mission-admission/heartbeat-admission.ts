@@ -198,7 +198,7 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
     }
     if (request.expectedGeneration !== null && receipt.token.generation !== request.expectedGeneration) return { schemaVersion: 1, outcome: 'not_owned', laneId };
     if (lane?.status === 'active' && receipt.status === 'active' && lane.missionId === receipt.missionId && lane.generation === receipt.token.generation) {
-      registry.assertCanMutate(receipt.token);
+      registry.assertCurrentOwner(receipt.token);
       return { schemaVersion: 1, outcome: 'recoverable', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId };
     }
     if (lane?.status === 'released' && receipt.status === 'settled' && lane.generation === receipt.token.generation + 1) {
@@ -212,7 +212,7 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
     if (prior?.status === 'active') {
       const receipt = privateReceipt(receiptPath);
       if (receipt === null || receipt.status !== 'active' || receipt.laneId !== laneId || receipt.missionId !== prior.missionId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace || receipt.supervisorId !== request.supervisorId || receipt.token.generation !== prior.generation) throw new Error('Active heartbeat ownership has no matching private recovery receipt; refusing takeover.');
-      registry.assertCanMutate(receipt.token);
+      registry.assertCurrentOwner(receipt.token);
       return { schemaVersion: 1, outcome: 'already_reserved', laneId, missionId: prior.missionId, generation: prior.generation, receiptId: receipt.receiptId, revision: registry.snapshot().revision };
     }
     const result = registry.admit({ laneId, role: 'production_captain', evidence, highAutonomy: true }, {

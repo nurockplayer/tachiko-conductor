@@ -1060,9 +1060,9 @@ describe('workflow run and resume commands', () => {
       };
       const workflowDeps = deps(store, flakyGithub, new FakeImplementation([]), new FakeReviewer([{ verdict: 'approve', reviewerName: 'oracle', headSha: HEAD2, findings: [] }]));
       const receiptPath = path.join(dir, 'run-owner-sync-retry.json');
-      await assert.rejects(resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission, runOwnerReceiptPath: receiptPath }), /temporary GitHub sync preflight failure/);
+      await assert.rejects(resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission, admissionWorkspace: dir, runOwnerReceiptPath: receiptPath }), /temporary GitHub sync preflight failure/);
       assert.equal(admission.readLane(`run:${run.id}`)?.status, 'released');
-      const retried = await resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission, runOwnerReceiptPath: receiptPath, now: () => T0 });
+      const retried = await resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission, admissionWorkspace: dir, runOwnerReceiptPath: receiptPath, now: () => T0 });
       assert.equal(retried.outcome, 'merge_ready');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });

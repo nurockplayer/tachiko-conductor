@@ -899,7 +899,7 @@ export function recoverRunAdmission(store: RunStore, registry: MissionAdmissionR
     throw new Error('Run owner receipt and registry do not identify the exact recoverable active generation.');
   }
   if (!operatorStopped) throw new Error('External recovery requires explicit --stopped operator attestation that the provider and children have stopped; receipt phase alone cannot prove supervisor death.');
-  registry.assertCanMutate(receipt.token);
+  registry.assertCurrentOwner(receipt.token);
   const transition = { ...receipt, phase: 'release_transition' as const, token: receipt.token };
   registry.release(receipt.token, true, () => writeRunOwnerReceipt(canonicalReceiptPath, transition));
   finalizeRunOwnerReceipt(canonicalReceiptPath, receipt.token, 'released', expectedGeneration + 1);
@@ -1767,7 +1767,7 @@ export async function main(argv: string[]): Promise<number> {
         if (!validateManualOwnerReceipt(parsed) || parsed.status !== 'active' || parsed.laneId !== laneId || parsed.repository !== repository || parsed.workspace !== identity.workspace || parsed.token === undefined) throw new Error('Recovery receipt does not identify this active manual owner.');
         const current = registry.readLane(laneId);
         if (current?.status !== 'active' || current.missionId !== parsed.missionId || current.generation !== parsed.generation || current.role !== 'production_captain' || current.evidence.repositoryScope !== true || current.evidence.workspace !== identity.workspace) throw new Error('Recovery receipt is stale or does not match current registry ownership.');
-        registry.assertCanMutate(parsed.token);
+        registry.assertCurrentOwner(parsed.token);
         writeManualOwnerReceipt(receiptPath, parsed);
         const projection = manualProjection(parsed, 'active', clean, registry.snapshot().revision);
         console.log(JSON.stringify({ projection, laneId, missionId: parsed.missionId, ownerReceiptPath: receiptPath }));

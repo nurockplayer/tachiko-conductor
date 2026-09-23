@@ -41,6 +41,8 @@ export interface AdmissionRequest {
   readonly highAutonomy?: boolean;
   /** Required for delegated_mutation_writer and must identify its production captain lane. */
   readonly delegatedFromLaneId?: string;
+  /** Exact active capability of delegatedFromLaneId; never persisted. */
+  readonly delegatedFromToken?: AdmissionToken;
   /** Required for isolated_experiment; its mission relationship is descriptive only. */
   readonly experimentOfMissionId?: string;
 }
@@ -66,6 +68,7 @@ export interface LaneRecord {
   token: string | null;
   highAutonomy: boolean;
   delegatedFromLaneId?: string;
+  delegatedFromGeneration?: number;
   experimentOfMissionId?: string;
   parkedReason?: ParkedReason;
   updatedAt: string;
@@ -226,7 +229,7 @@ function capacityMissionId(lane: Pick<LaneRecord, 'missionId' | 'role'>): string
 
 function validateLane(value: unknown): value is LaneRecord {
   if (!object(value)) return false;
-  const allowed = ['laneId', 'missionId', 'evidence', 'role', 'status', 'generation', 'token', 'highAutonomy', 'delegatedFromLaneId', 'experimentOfMissionId', 'parkedReason', 'updatedAt'];
+  const allowed = ['laneId', 'missionId', 'evidence', 'role', 'status', 'generation', 'token', 'highAutonomy', 'delegatedFromLaneId', 'delegatedFromGeneration', 'experimentOfMissionId', 'parkedReason', 'updatedAt'];
   const required = ['laneId', 'missionId', 'evidence', 'role', 'status', 'generation', 'token', 'highAutonomy', 'updatedAt'];
   if (!Object.keys(value).every((key) => allowed.includes(key)) || !required.every((key) => key in value) ||
     !nonEmpty(value.laneId) || !nonEmpty(value.missionId) || !evidenceIsValid(value.evidence) ||
@@ -235,9 +238,9 @@ function validateLane(value: unknown): value is LaneRecord {
     !(value.token === null || nonEmpty(value.token)) || typeof value.highAutonomy !== 'boolean' || !nonEmpty(value.updatedAt)) return false;
   if (value.status === 'active' && (value.token === null || value.generation === 0)) return false;
   if (value.status !== 'active' && value.token !== null) return false;
-  if (value.role === 'delegated_mutation_writer' && !nonEmpty(value.delegatedFromLaneId)) return false;
+  if (value.role === 'delegated_mutation_writer' && (!nonEmpty(value.delegatedFromLaneId) || !safePositive(value.delegatedFromGeneration))) return false;
   if (value.role === 'delegated_mutation_writer' && value.status === 'parked') return false;
-  if (value.role !== 'delegated_mutation_writer' && value.delegatedFromLaneId !== undefined) return false;
+  if (value.role !== 'delegated_mutation_writer' && (value.delegatedFromLaneId !== undefined || value.delegatedFromGeneration !== undefined)) return false;
   if (value.role === 'isolated_experiment' && !nonEmpty(value.experimentOfMissionId)) return false;
   if (value.role === 'isolated_experiment' && value.missionId !== deterministicExperimentMissionId(value.laneId as string, value.experimentOfMissionId as string)) return false;
   if (value.role !== 'isolated_experiment' && value.experimentOfMissionId !== undefined) return false;
@@ -263,7 +266,8 @@ function validateState(value: unknown): RegistryState {
       const right = value.lanes[j]!;
       if (left.status !== 'released' && right.status !== 'released' && production(left.role) && production(right.role) && overlaps(left.evidence, right.evidence) &&
         !(left.role === 'delegated_mutation_writer' && left.delegatedFromLaneId === right.laneId) &&
-        !(right.role === 'delegated_mutation_writer' && right.delegatedFromLaneId === left.laneId)) {
+        !(right.role === 'delegated_mutation_writer' && right.delegatedFromLaneId === left.laneId) &&
+        !(left.role === 'delegated_mutation_writer' && right.role === 'delegated_mutation_writer' && left.delegatedFromLaneId === right.delegatedFromLaneId && left.delegatedFromGeneration === right.delegatedFromGeneration)) {
         throw new AdmissionStateError(`Admission registry has ambiguous overlapping active lanes ${left.laneId} and ${right.laneId}.`);
       }
       if (left.status !== 'released' && right.status !== 'released' && (left.role === 'isolated_experiment' || right.role === 'isolated_experiment') &&
@@ -292,8 +296,16 @@ function validateState(value: unknown): RegistryState {
     writers.size > value.config.limits.maxWriters || highAutonomyMissions.size > value.config.limits.maxHighAutonomy) throw new AdmissionStateError('Admission registry exceeds configured active capacity.');
   for (const delegate of value.lanes.filter((lane) => lane.role === 'delegated_mutation_writer')) {
     const owner = value.lanes.find((lane) => lane.laneId === delegate.delegatedFromLaneId && lane.role === 'production_captain');
-    if (!owner || (delegate.status === 'active' && owner.status !== 'active') || owner.missionId !== delegate.missionId || !overlaps(owner.evidence, delegate.evidence) || delegate.highAutonomy) {
+    const parentCurrent = delegate.status !== 'active' || (owner?.status === 'active' && owner.generation === delegate.delegatedFromGeneration && evidenceIncludes(delegate.evidence, owner.evidence));
+    if (!owner || !parentCurrent || delegate.delegatedFromGeneration! > owner.generation || owner.missionId !== delegate.missionId || delegate.highAutonomy) {
       throw new AdmissionStateError(`Admission registry contains orphaned or mismatched delegated writer ${delegate.laneId}.`);
+    }
+  }
+  const activeDelegates = value.lanes.filter((lane) => lane.status === 'active' && lane.role === 'delegated_mutation_writer');
+  for (let i = 0; i < activeDelegates.length; i += 1) for (let j = i + 1; j < activeDelegates.length; j += 1) {
+    const left = activeDelegates[i]!; const right = activeDelegates[j]!;
+    if (left.delegatedFromLaneId === right.delegatedFromLaneId && left.delegatedFromGeneration === right.delegatedFromGeneration) {
+      throw new AdmissionStateError(`Admission registry contains multiple active delegates for captain ${left.delegatedFromLaneId}.`);
     }
   }
   return value as unknown as RegistryState;
@@ -401,10 +413,11 @@ export class MissionAdmissionRegistry {
   admit(request: AdmissionRequest, options: { readonly beforePublish?: (result: Extract<AdmissionResult, { readonly outcome: 'admitted' }>) => void } = {}): AdmissionResult {
     if (!nonEmpty(request.laneId) || !(MISSION_ADMISSION_ROLES as readonly string[]).includes(request.role)) throw new AdmissionStateError('Admission request has an invalid lane identifier or role.');
     const evidence = canonicalizeMissionEvidence(request.evidence);
-    if (request.role === 'delegated_mutation_writer' && !nonEmpty(request.delegatedFromLaneId)) throw new AdmissionStateError('Delegated writers require an explicit captain lane.');
+    if (request.role === 'delegated_mutation_writer' && (!nonEmpty(request.delegatedFromLaneId) || request.delegatedFromToken === undefined)) throw new AdmissionStateError('Delegated writers require an explicit captain lane and its exact active generation token.');
     if (request.role === 'isolated_experiment' && !nonEmpty(request.experimentOfMissionId)) throw new AdmissionStateError('Experiments require an explicit production mission relationship.');
     if (request.role === 'isolated_experiment' && (!evidence.workspace || !evidence.stateSurface)) throw new AdmissionStateError('Experiments require isolated workspace and state-surface evidence.');
-    if ((request.role === 'read_only_review' || request.role === 'read_only_consultation') && (request.delegatedFromLaneId || request.highAutonomy)) throw new AdmissionStateError('Read-only lanes cannot request delegated mutation or high-autonomy authority.');
+    if ((request.role === 'read_only_review' || request.role === 'read_only_consultation') && (request.delegatedFromLaneId || request.delegatedFromToken || request.highAutonomy)) throw new AdmissionStateError('Read-only lanes cannot request delegated mutation or high-autonomy authority.');
+    if (request.role !== 'delegated_mutation_writer' && request.delegatedFromToken !== undefined) throw new AdmissionStateError('Only delegated mutation writers can present a parent capability.');
     const now = this.now();
     return this.transact((state) => {
       const prior = state.lanes.find((lane) => lane.laneId === request.laneId);
@@ -412,16 +425,19 @@ export class MissionAdmissionRegistry {
       if (prior?.status === 'parked' && prior.parkedReason === 'manual_checkpoint') throw new AdmissionStateError('Manual checkpoint reservations must be retired with their exact parked generation before this lane can be admitted again.');
       if (prior && prior.role !== request.role) throw new AdmissionStateError('A lane identifier cannot change roles across generations.');
       const owner = request.role === 'delegated_mutation_writer' ? state.lanes.find((lane) => lane.laneId === request.delegatedFromLaneId && lane.status === 'active' && lane.role === 'production_captain') : undefined;
-      if (request.role === 'delegated_mutation_writer' && (!owner || !overlaps(owner.evidence, evidence) || (prior !== undefined && prior.missionId !== owner.missionId))) throw new AdmissionStateError('Delegated writer must overlap and share the mission of an active production captain lane.');
+      if (request.role === 'delegated_mutation_writer' && (!owner || request.delegatedFromToken?.laneId !== owner.laneId || request.delegatedFromToken.generation !== owner.generation || request.delegatedFromToken.token !== owner.token || (prior !== undefined && prior.missionId !== owner.missionId))) throw new AdmissionStateError('Delegated writer requires the exact active capability of its production captain.');
+      if (owner && state.lanes.some((lane) => lane.status === 'active' && lane.role === 'delegated_mutation_writer' && lane.delegatedFromLaneId === owner.laneId && lane.delegatedFromGeneration === owner.generation)) throw new AdmissionStateError(`Captain ${owner.laneId} already has an active delegated writer for this mission.`);
       if (request.role === 'delegated_mutation_writer' && request.highAutonomy === true) throw new AdmissionStateError('Delegated writers share their captain mission capacity and cannot request separate high-autonomy capacity.');
       let missionId = request.role === 'isolated_experiment'
         ? deterministicExperimentMissionId(request.laneId, request.experimentOfMissionId!)
         : owner?.missionId ?? prior?.missionId ?? deterministicMissionId(evidence);
       const candidate: LaneRecord = {
-        laneId: request.laneId, missionId, evidence: prior ? mergeEvidence(prior.evidence, evidence) : evidence,
+        laneId: request.laneId, missionId,
+        evidence: owner ? mergeEvidence(mergeEvidence(owner.evidence, prior?.evidence ?? owner.evidence), evidence) : prior ? mergeEvidence(prior.evidence, evidence) : evidence,
         role: request.role, status: 'active', generation: (prior?.generation ?? 0) + 1, token: randomUUID(),
         highAutonomy: request.highAutonomy ?? false,
         ...(request.delegatedFromLaneId ? { delegatedFromLaneId: request.delegatedFromLaneId } : {}),
+        ...(owner ? { delegatedFromGeneration: owner.generation } : {}),
         ...(request.experimentOfMissionId ? { experimentOfMissionId: request.experimentOfMissionId } : {}), updatedAt: now,
       };
       if (request.role === 'isolated_experiment' || state.lanes.some((lane) => lane.status !== 'released' && lane.role === 'isolated_experiment')) {
@@ -463,6 +479,7 @@ export class MissionAdmissionRegistry {
     return this.transact((state) => {
       const lane = requireCurrentToken(state, token);
       if (lane.role !== 'production_captain') throw new AdmissionStateError(`${lane.role} cannot strengthen production ownership evidence.`);
+      assertNoActiveDelegates(state, lane);
       const strengthened = mergeEvidence(lane.evidence, evidence);
       const experimentConflict = state.lanes.find((other) => other.laneId !== lane.laneId && other.status !== 'released' &&
         other.role === 'isolated_experiment' && sharedPhysicalSurface(other.evidence, strengthened));
@@ -573,16 +590,25 @@ export class MissionAdmissionRegistry {
     }, () => beforePublish?.());
   }
 
+  /** Verify the exact live capability without granting physical mutation rights. */
+  assertCurrentOwner(token: AdmissionToken): void {
+    requireCurrentToken(this.readState(), token);
+  }
+
   assertCanMutate(token: AdmissionToken): void {
-    const lane = this.readState().lanes.find((record) => record.laneId === token.laneId);
-    if (!lane || lane.status !== 'active' || lane.generation !== token.generation || lane.token !== token.token) throw new AdmissionStateError('Admission generation token is stale or does not own the active lane.');
+    const state = this.readState();
+    const lane = requireCurrentToken(state, token);
     if (!mutation(lane.role)) throw new AdmissionStateError(`${lane.role} cannot mutate production state.`);
+    if (lane.evidence.workspace === undefined) throw new AdmissionStateError('Mutation authority requires canonical workspace evidence.');
+    if (lane.role === 'production_captain') assertNoActiveDelegates(state, lane);
   }
 
   assertCanPublish(token: AdmissionToken, productionMissionId: string): void {
-    const lane = this.readState().lanes.find((record) => record.laneId === token.laneId);
-    if (!lane || lane.status !== 'active' || lane.generation !== token.generation || lane.token !== token.token) throw new AdmissionStateError('Admission generation token is stale or does not own the active lane.');
+    const state = this.readState();
+    const lane = requireCurrentToken(state, token);
     if (lane.role !== 'production_captain' || lane.missionId !== productionMissionId) throw new AdmissionStateError(`${lane.role} cannot publish to this production mission.`);
+    if (lane.evidence.workspace === undefined) throw new AdmissionStateError('Publication authority requires canonical workspace evidence.');
+    assertNoActiveDelegates(state, lane);
   }
 
   snapshot(): AdmissionProjection {
@@ -674,4 +700,8 @@ function mergeEvidence(oldValue: MissionEvidence, nextValue: MissionEvidence): M
 
 function sameEvidence(left: MissionEvidence, right: MissionEvidence): boolean {
   return Object.keys(left).length === Object.keys(right).length && Object.entries(left).every(([key, value]) => right[key as keyof MissionEvidence] === value);
+}
+
+function evidenceIncludes(evidence: MissionEvidence, required: MissionEvidence): boolean {
+  try { return sameEvidence(mergeEvidence(required, evidence), evidence); } catch { return false; }
 }

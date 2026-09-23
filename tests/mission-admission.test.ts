@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { describe, it } from 'node:test';
 
-import { canonicalizeMissionEvidence, MissionAdmissionRegistry, type AdmissionConfig, type AdmissionResult, type MissionEvidence } from '../src/mission-admission/registry.js';
+import { canonicalizeMissionEvidence, MissionAdmissionRegistry, type AdmissionConfig, type AdmissionResult, type AdmissionToken, type MissionEvidence } from '../src/mission-admission/registry.js';
 import { acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
 import { createHostAdmissionRegistry, resolveHostAdmissionConfig, resolveHostAdmissionPath } from '../src/mission-admission/host-registry.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
@@ -48,6 +48,22 @@ function childAdmission(filePath: string, laneId: string, issue: number): Promis
     child.on('close', (code) => {
       if (code !== 0) reject(new Error(`Admission child exited ${code}: ${stderr}`));
       else { try { resolve(JSON.parse(stdout.trim()) as AdmissionResult); } catch (error) { reject(error); } }
+    });
+  });
+}
+
+function childDelegateAdmission(filePath: string, laneId: string, parent: AdmissionToken, configInput: AdmissionConfig): Promise<{ readonly outcome?: string; readonly token?: AdmissionToken; readonly error?: string }> {
+  const evidence = { repository: 'example/widgets', issue: 303, workspace: `/tmp/${laneId}` };
+  const source = `import { MissionAdmissionRegistry } from ${JSON.stringify(MODULE_URL)}; const registry = new MissionAdmissionRegistry({ filePath: ${JSON.stringify(filePath)}, config: ${JSON.stringify(configInput)}, lockTimeoutMs: 10000 }); try { const result = registry.admit({ laneId: ${JSON.stringify(laneId)}, role: 'delegated_mutation_writer', delegatedFromLaneId: ${JSON.stringify(parent.laneId)}, delegatedFromToken: ${JSON.stringify(parent)}, evidence: ${JSON.stringify(evidence)} }); console.log(JSON.stringify(result)); } catch (error) { console.log(JSON.stringify({ error: error instanceof Error ? error.message : String(error) })); }`;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', source], { cwd: ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = ''; let stderr = '';
+    child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      if (code !== 0) reject(new Error(`Delegate contender exited ${code}: ${stderr}`));
+      else { try { resolve(JSON.parse(stdout.trim()) as { outcome?: string; token?: AdmissionToken; error?: string }); } catch (error) { reject(error); } }
     });
   });
 }
@@ -216,6 +232,8 @@ describe('provider-neutral durable mission admission', () => {
       const admitted = registry.admit({ laneId: 'strengthen-me', role: 'production_captain', evidence: { repository: 'example/widgets', issue: 204, run: 'run-204' } });
       assert.equal(admitted.outcome, 'admitted');
       if (admitted.outcome !== 'admitted') return;
+      assert.throws(() => registry.assertCanMutate(admitted.token), /canonical workspace evidence/);
+      assert.equal(registry.assertCurrentOwner(admitted.token), undefined, 'logical reservation remains valid for receipt recovery');
       const before = registry.readLane(admitted.token.laneId)!;
       const revised = registry.strengthen(admitted.token, { repository: 'example/widgets', issue: 204, run: 'run-204', pullRequest: 88, workspace: directory });
       const after = registry.readLane(admitted.token.laneId)!;
@@ -252,8 +270,11 @@ describe('provider-neutral durable mission admission', () => {
       const owners = restarted.snapshot().lanes.filter((lane) => lane.evidence.workspace === realpathSync(shared));
       assert.equal(owners.length, 1, 'only one serialized strengthener can publish the shared surface');
       assert.equal(restarted.snapshot().counts.captains, 2, 'strengthening retains both pre-existing lane generations');
-      assert.equal(restarted.assertCanMutate(first.token), undefined);
-      assert.equal(restarted.assertCanMutate(second.token), undefined);
+      for (const admitted of [first, second]) {
+        const lane = restarted.readLane(admitted.token.laneId)!;
+        if (lane.evidence.workspace === undefined) assert.throws(() => restarted.assertCanMutate(admitted.token), /canonical workspace evidence/);
+        else assert.equal(restarted.assertCanMutate(admitted.token), undefined);
+      }
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
@@ -505,7 +526,7 @@ describe('provider-neutral durable mission admission', () => {
       const captain = registry.admit({ laneId: 'captain', role: 'production_captain', evidence: evidence(90) });
       assert.equal(captain.outcome, 'admitted');
       if (captain.outcome !== 'admitted') return;
-      const writer = registry.admit({ laneId: 'writer', role: 'delegated_mutation_writer', delegatedFromLaneId: 'captain', evidence: evidence(90) });
+      const writer = registry.admit({ laneId: 'writer', role: 'delegated_mutation_writer', delegatedFromLaneId: 'captain', delegatedFromToken: captain.token, evidence: evidence(90) });
       assert.equal(writer.outcome, 'admitted');
       assert.equal(registry.snapshot().counts.captains, 1);
       assert.equal(registry.snapshot().counts.writers, 1);
@@ -544,12 +565,18 @@ describe('provider-neutral durable mission admission', () => {
       const captain = registry.admit({ laneId: 'captain-with-delegate', role: 'production_captain', evidence: evidence(95) });
       assert.equal(captain.outcome, 'admitted');
       if (captain.outcome !== 'admitted') return;
-      const delegate = registry.admit({ laneId: 'active-delegate', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, evidence: evidence(95) });
+      const delegate = registry.admit({ laneId: 'active-delegate', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, delegatedFromToken: captain.token, evidence: evidence(95) });
       assert.equal(delegate.outcome, 'admitted');
+      assert.throws(() => registry.assertCanMutate(captain.token), /delegated writer .* remains active or uncertain/);
+      assert.throws(() => registry.assertCanPublish(captain.token, captain.missionId), /delegated writer .* remains active or uncertain/);
       assert.throws(() => registry.park(captain.token, 'workflow_wait'), /delegated writer .* remains active or uncertain/);
       assert.throws(() => registry.release(captain.token, true), /delegated writer .* remains active or uncertain/);
       assert.equal(registry.readLane(captain.token.laneId)?.status, 'active');
       if (delegate.outcome === 'admitted') registry.release(delegate.token, true);
+      assert.equal(registry.assertCanMutate(captain.token), undefined);
+      assert.equal(registry.assertCanPublish(captain.token, captain.missionId), undefined);
+      registry.strengthen(captain.token, { repository: 'example/widgets', issue: 95, pullRequest: 995 });
+      assert.equal(registry.snapshot().counts.writers, 1, 'released historical delegate does not invalidate later captain evidence strengthening');
       registry.release(captain.token, true);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
@@ -560,7 +587,7 @@ describe('provider-neutral durable mission admission', () => {
       const captain = registry.admit({ laneId: 'captain-delegate-park', role: 'production_captain', evidence: evidence(96) });
       assert.equal(captain.outcome, 'admitted');
       if (captain.outcome !== 'admitted') return;
-      const delegate = registry.admit({ laneId: 'delegate-no-park', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, evidence: evidence(96) });
+      const delegate = registry.admit({ laneId: 'delegate-no-park', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, delegatedFromToken: captain.token, evidence: evidence(96) });
       assert.equal(delegate.outcome, 'admitted');
       if (delegate.outcome !== 'admitted') return;
       assert.throws(() => registry.park(delegate.token, 'workflow_wait'), /Delegated writer cannot park/);
@@ -570,6 +597,87 @@ describe('provider-neutral durable mission admission', () => {
       Object.assign(storedDelegate, { status: 'parked', token: null, generation: delegate.token.generation + 1, parkedReason: 'workflow_wait' });
       writeFileSync(filePath, JSON.stringify(persisted), 'utf8');
       assert.throws(() => registry.snapshot(), /invalid lane record/);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('requires the exact parent capability and permits only one evidence-inheriting delegate per mission', () => {
+    const { directory, registry } = fixture({ config: { schemaVersion: 1, revision: 'delegate-capability-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } } });
+    try {
+      const captain = registry.admit({ laneId: 'delegate-parent', role: 'production_captain', evidence: { repository: 'example/widgets', issue: 301, pullRequest: 701, run: 'run-301', claim: 'claim-301' } });
+      assert.equal(captain.outcome, 'admitted');
+      if (captain.outcome !== 'admitted') return;
+      assert.throws(() => registry.admit({ laneId: 'missing-parent-cap', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, evidence: evidence(301) }), /exact active generation token/);
+      assert.throws(() => registry.admit({ laneId: 'wrong-parent-cap', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, delegatedFromToken: { ...captain.token, token: 'wrong' }, evidence: evidence(301) }), /exact active capability/);
+      assert.throws(() => registry.admit({ laneId: 'stale-parent-cap', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, delegatedFromToken: { ...captain.token, generation: captain.token.generation + 1 }, evidence: evidence(301) }), /exact active capability/);
+
+      const workspace = path.join(directory, 'delegate-workspace'); mkdirSync(workspace);
+      const delegate = registry.admit({
+        laneId: 'delegate-parent-child', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId,
+        delegatedFromToken: captain.token,
+        evidence: { repository: 'example/widgets', issue: 301, pullRequest: 701, run: 'run-301', claim: 'claim-301', workspace },
+      });
+      assert.equal(delegate.outcome, 'admitted');
+      if (delegate.outcome !== 'admitted') return;
+      const delegatedLane = registry.readLane(delegate.token.laneId)!;
+      assert.equal(delegatedLane.evidence.issue, 301);
+      assert.equal(delegatedLane.evidence.pullRequest, 701);
+      assert.equal(delegatedLane.evidence.run, 'run-301');
+      assert.equal(delegatedLane.evidence.claim, 'claim-301');
+      assert.equal(delegatedLane.evidence.workspace, realpathSync(workspace), 'delegate inherits every parent field and adds its canonical workspace');
+      assert.equal(delegatedLane.delegatedFromGeneration, captain.token.generation);
+
+      assert.throws(() => registry.admit({
+        laneId: 'disjoint-child', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId,
+        delegatedFromToken: captain.token,
+        evidence: { repository: 'example/widgets', issue: 301, workspace: path.join(directory, 'disjoint'), stateSurface: path.join(directory, 'other-state') },
+      }), /already has an active delegated writer/);
+      const conflictParent = registry.admit({ laneId: 'conflict-parent', role: 'production_captain', evidence: { repository: 'example/widgets', issue: 302 } });
+      assert.equal(conflictParent.outcome, 'admitted');
+      if (conflictParent.outcome === 'admitted') assert.throws(() => registry.admit({ laneId: 'conflicting-child', role: 'delegated_mutation_writer', delegatedFromLaneId: conflictParent.token.laneId, delegatedFromToken: conflictParent.token, evidence: { repository: 'example/widgets', issue: 999 } }), /conflicts on issue/);
+      assert.throws(() => registry.strengthen(captain.token, { repository: 'example/widgets', workspace: path.join(directory, 'new-parent-workspace') }), /delegated writer .* remains active or uncertain/);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('rejects persisted delegates with missing parent generation or duplicate active siblings', () => {
+    const { directory, filePath, registry } = fixture({ config: { schemaVersion: 1, revision: 'delegate-state-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } } });
+    try {
+      const captain = registry.admit({ laneId: 'state-parent', role: 'production_captain', evidence: evidence(302) });
+      assert.equal(captain.outcome, 'admitted');
+      if (captain.outcome !== 'admitted') return;
+      const delegate = registry.admit({ laneId: 'state-child', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, delegatedFromToken: captain.token, evidence: evidence(302) });
+      assert.equal(delegate.outcome, 'admitted');
+      if (delegate.outcome !== 'admitted') return;
+      const original = readFileSync(filePath, 'utf8');
+      const invalid = JSON.parse(original) as { lanes: Array<Record<string, unknown>> };
+      delete invalid.lanes.find((lane) => lane.laneId === delegate.token.laneId)!.delegatedFromGeneration;
+      writeFileSync(filePath, JSON.stringify(invalid));
+      assert.throws(() => registry.snapshot(), /invalid lane record/);
+      const duplicate = JSON.parse(original) as { lanes: Array<Record<string, unknown>>; revision: number };
+      const sibling = { ...duplicate.lanes.find((lane) => lane.laneId === delegate.token.laneId)!, laneId: 'duplicate-child', token: 'different-live-token' };
+      duplicate.lanes.push(sibling); duplicate.revision += 1;
+      writeFileSync(filePath, JSON.stringify(duplicate));
+      assert.throws(() => registry.snapshot(), /multiple active delegates/);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('serializes disjoint delegate contenders so only one can own the captain mission', async () => {
+    const raceConfig: AdmissionConfig = { schemaVersion: 1, revision: 'delegate-race-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } };
+    const { directory, filePath, registry } = fixture({ config: raceConfig });
+    try {
+      const captain = registry.admit({ laneId: 'race-delegate-parent', role: 'production_captain', evidence: { repository: 'example/widgets', issue: 303 } });
+      assert.equal(captain.outcome, 'admitted');
+      if (captain.outcome !== 'admitted') return;
+      const results = await Promise.all([
+        childDelegateAdmission(filePath, 'race-delegate-a', captain.token, raceConfig),
+        childDelegateAdmission(filePath, 'race-delegate-b', captain.token, raceConfig),
+      ]);
+      assert.equal(results.filter((result) => result.outcome === 'admitted').length, 1);
+      assert.equal(results.filter((result) => /already has an active delegated writer/.test(result.error ?? '')).length, 1);
+      const restarted = new MissionAdmissionRegistry({ filePath, config: raceConfig });
+      assert.equal(restarted.snapshot().lanes.filter((lane) => lane.role === 'delegated_mutation_writer' && lane.status === 'active').length, 1);
+      const child = results.find((result) => result.outcome === 'admitted')!;
+      restarted.release(child.token!, true);
+      restarted.release(captain.token, true);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

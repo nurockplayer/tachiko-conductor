@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -678,7 +678,9 @@ describe('runReviewLoop', () => {
       filePath: path.join(directory, 'registry.json'),
       config: { schemaVersion: 1, revision: 'review-repair-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
     });
-    const admitted = registry.admit({ laneId: 'captain', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42 } });
+    const workspace = path.join(directory, 'workspace');
+    mkdirSync(workspace);
+    const admitted = registry.admit({ laneId: 'captain', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42, workspace } });
     assert.equal(admitted.outcome, 'admitted');
     if (admitted.outcome !== 'admitted') return;
     try {
