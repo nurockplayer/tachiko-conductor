@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,6 +7,7 @@ import { describe, it } from 'node:test';
 
 import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
 import { handleHeartbeatAdmission, handleHeartbeatAdmissionJson, type HeartbeatAdmissionOptions } from '../src/mission-admission/heartbeat-admission.js';
+import { resolveHeartbeatOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 
 const config: AdmissionConfig = { schemaVersion: 1, revision: 'heartbeat-admission-test-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
 const supervisorId = 'tachiko-heartbeat-service';
@@ -121,6 +122,72 @@ describe('model-free heartbeat mission admission helper', () => {
       assert.equal((JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { receiptId: string }).receiptId, successor.receiptId, 'stale settle cannot delete or replace successor recovery receipt');
       assert.equal(restartedRegistry.readLane(successor.laneId)?.status, 'active');
       handleHeartbeatAdmission(f.settle('acme/widgets', successor.generation, successor.receiptId), restartedOptions);
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('keys heartbeat lane and receipt by canonical repository plus physical workspace and migrates cleanly', () => {
+    const f = setup({ limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } });
+    const workspaceB = path.join(f.directory, 'workspace-b');
+    mkdirSync(workspaceB);
+    const options: HeartbeatAdmissionOptions = {
+      ...f.options,
+      receiptPath: (_repository, workspace) => path.join(f.directory, 'private-receipts', `${path.basename(workspace)}.json`),
+    };
+    const requestAt = (action: 'reserve' | 'inspect', workspace: string) => action === 'reserve'
+      ? { schemaVersion: 1, action, repository: 'acme/widgets', workspace, supervisorId }
+      : { schemaVersion: 1, action, repository: 'acme/widgets', workspace };
+    try {
+      const a = handleHeartbeatAdmission(requestAt('reserve', f.workspace), options);
+      assert.equal(a.outcome, 'reserved');
+      if (a.outcome !== 'reserved') return;
+      const blockedB = handleHeartbeatAdmission(requestAt('reserve', workspaceB), options);
+      assert.equal(blockedB.outcome, 'owned_elsewhere', 'repository-wide ownership blocks a simultaneous second checkout');
+      const settledA = handleHeartbeatAdmission(f.settle('acme/widgets', a.generation, a.receiptId), options);
+      assert.equal(settledA.outcome, 'settled');
+      const b = handleHeartbeatAdmission(requestAt('reserve', workspaceB), options);
+      assert.equal(b.outcome, 'reserved', 'a cleanly settled checkout can migrate to a different physical workspace');
+      if (b.outcome !== 'reserved') return;
+      assert.notEqual(b.laneId, a.laneId);
+      assert.notEqual(b.receiptId, a.receiptId);
+      assert.equal(f.registry.readLane(a.laneId)?.status, 'released');
+      assert.equal(f.registry.readLane(b.laneId)?.status, 'active');
+      handleHeartbeatAdmission({
+        schemaVersion: 1, action: 'settle', repository: 'acme/widgets', workspace: workspaceB,
+        supervisorId, expectedGeneration: b.generation, receiptId: b.receiptId,
+        stopProof: { childrenStopped: true, supervisorStopped: true, observedAt: '2026-09-23T00:00:00.000Z' },
+      }, options);
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('canonicalizes receipt workspace aliases and allows independent sibling workspaces', () => {
+    const f = setup({ limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } });
+    const sibling = path.join(f.directory, 'workspace-sibling');
+    mkdirSync(sibling);
+    const alias = path.join(f.directory, 'workspace-alias');
+    symlinkSync(f.workspace, alias, 'dir');
+    const home = path.join(f.directory, 'home');
+    const env = { HOME: home, TACHIKO_DATA_DIR: path.join(home, 'runs') };
+    try {
+      const receiptA = resolveHeartbeatOwnerReceiptPath('acme/widgets', f.workspace, { env, homeDirectory: home });
+      const receiptAlias = resolveHeartbeatOwnerReceiptPath('acme/widgets', alias, { env, homeDirectory: home });
+      const receiptSibling = resolveHeartbeatOwnerReceiptPath('acme/other', sibling, { env, homeDirectory: home });
+      assert.equal(receiptA, receiptAlias, 'symlink aliases use one canonical receipt identity');
+      assert.notEqual(receiptA, receiptSibling, 'a distinct repository and physical workspace gets an independent receipt');
+
+      const options: HeartbeatAdmissionOptions = {
+        ...f.options,
+        receiptPath: (repository, workspace) => path.join(f.directory, 'private-receipts', `${repository.replace('/', '-')}-${path.basename(workspace)}.json`),
+      };
+      const first = handleHeartbeatAdmission(f.request('reserve', 'acme/widgets'), options);
+      const second = handleHeartbeatAdmission({ schemaVersion: 1, action: 'reserve', repository: 'acme/other', workspace: sibling, supervisorId }, options);
+      assert.equal(first.outcome, 'reserved');
+      assert.equal(second.outcome, 'reserved', 'non-overlapping sibling workspace ownership remains independent');
+      if (first.outcome === 'reserved') handleHeartbeatAdmission(f.settle('acme/widgets', first.generation, first.receiptId), options);
+      if (second.outcome === 'reserved') handleHeartbeatAdmission({
+        schemaVersion: 1, action: 'settle', repository: 'acme/other', workspace: sibling,
+        supervisorId, expectedGeneration: second.generation, receiptId: second.receiptId,
+        stopProof: { childrenStopped: true, supervisorStopped: true, observedAt: '2026-09-23T00:00:00.000Z' },
+      }, options);
     } finally { rmSync(f.directory, { recursive: true, force: true }); }
   });
 

@@ -490,6 +490,67 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('keeps delegated generations active until stopped proof permits release', () => {
+    const { directory, filePath, registry } = fixture();
+    try {
+      const captain = registry.admit({ laneId: 'captain-delegate-park', role: 'production_captain', evidence: evidence(96) });
+      assert.equal(captain.outcome, 'admitted');
+      if (captain.outcome !== 'admitted') return;
+      const delegate = registry.admit({ laneId: 'delegate-no-park', role: 'delegated_mutation_writer', delegatedFromLaneId: captain.token.laneId, evidence: evidence(96) });
+      assert.equal(delegate.outcome, 'admitted');
+      if (delegate.outcome !== 'admitted') return;
+      assert.throws(() => registry.park(delegate.token, 'workflow_wait'), /Delegated writer cannot park/);
+      assert.equal(registry.readLane(delegate.token.laneId)?.status, 'active');
+      const persisted = JSON.parse(readFileSync(filePath, 'utf8')) as { lanes: Array<Record<string, unknown>> };
+      const storedDelegate = persisted.lanes.find((lane) => lane.laneId === delegate.token.laneId)!;
+      Object.assign(storedDelegate, { status: 'parked', token: null, generation: delegate.token.generation + 1, parkedReason: 'workflow_wait' });
+      writeFileSync(filePath, JSON.stringify(persisted), 'utf8');
+      assert.throws(() => registry.snapshot(), /invalid lane record/);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('checks isolated experiments against parked ownership and ancestor surfaces', () => {
+    const constrained: AdmissionConfig = { schemaVersion: 1, revision: 'experiment-parked-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+    const { directory, registry } = fixture({ config: constrained });
+    try {
+      const owner = registry.admit({ laneId: 'experiment-blocker', role: 'production_captain', evidence: evidence(97) });
+      const parked = registry.admit({ laneId: 'parked-surface-owner', role: 'production_captain', evidence: { repository: 'other/repo', issue: 4, workspace: '/tmp/parked-surface', stateSurface: '/tmp/parked-state' } });
+      assert.equal(owner.outcome, 'admitted');
+      assert.equal(parked.outcome, 'parked');
+      assert.throws(() => registry.admit({ laneId: 'experiment-on-parked', role: 'isolated_experiment', experimentOfMissionId: 'mission-any', evidence: { repository: 'third/repo', workspace: '/tmp/parked-surface/nested', stateSurface: '/tmp/other-state' } }), /separate workspace and state surface/);
+      assert.equal(registry.snapshot().lanes.some((lane) => lane.laneId === 'experiment-on-parked'), false);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('rejects strengthening into an experiment physical surface before publishing state', () => {
+    const { directory, registry } = fixture();
+    try {
+      const captain = registry.admit({ laneId: 'captain-strengthen-experiment', role: 'production_captain', evidence: { repository: 'example/widgets', issue: 98 } });
+      assert.equal(captain.outcome, 'admitted');
+      if (captain.outcome !== 'admitted') return;
+      const experiment = registry.admit({ laneId: 'experiment-strengthen-guard', role: 'isolated_experiment', experimentOfMissionId: captain.missionId, evidence: { repository: 'elsewhere/repo', workspace: '/tmp/isolated-exp', stateSurface: '/tmp/isolated-state' } });
+      assert.equal(experiment.outcome, 'admitted');
+      const before = registry.snapshot();
+      assert.throws(() => registry.strengthen(captain.token, { repository: 'example/widgets', workspace: '/tmp/isolated-exp/nested' }), /isolated experiment lane/);
+      const after = registry.snapshot();
+      assert.equal(after.revision, before.revision);
+      assert.deepEqual(after.lanes.find((lane) => lane.laneId === captain.token.laneId)?.evidence, before.lanes.find((lane) => lane.laneId === captain.token.laneId)?.evidence);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('treats canonical ancestor and descendant workspace/state paths as one physical production surface', () => {
+    const { directory, registry } = fixture();
+    try {
+      const root = path.join(directory, 'shared');
+      const nested = path.join(root, 'nested');
+      mkdirSync(nested, { recursive: true });
+      const first = registry.admit({ laneId: 'physical-parent', role: 'production_captain', evidence: { repository: 'acme/a', issue: 1, workspace: root } });
+      const second = registry.admit({ laneId: 'physical-child', role: 'production_captain', evidence: { repository: 'different/b', issue: 2, stateSurface: nested } });
+      assert.equal(first.outcome, 'admitted');
+      assert.equal(second.outcome, 'duplicate');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('rejects persisted noncanonical evidence and per-repository capacity overflow', () => {
     const constrained: AdmissionConfig = { schemaVersion: 1, revision: 'repo-limit-v1', limits: { maxCaptains: 2, maxWriters: 1, maxHighAutonomy: 2, maxPerRepository: 1 } };
     const { directory, filePath, registry } = fixture({ config: constrained });

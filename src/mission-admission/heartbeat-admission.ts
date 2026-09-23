@@ -88,8 +88,8 @@ function parseRequest(input: unknown): HeartbeatAdmissionRequest {
   throw new Error('Heartbeat admission request is malformed or contains unsupported fields.');
 }
 
-function laneForRepository(repository: string): string {
-  return `${HEARTBEAT_ADMISSION_LANE_PREFIX}${createHash('sha256').update(repository).digest('hex').slice(0, 32)}`;
+function laneForRepositoryWorkspace(repository: string, workspace: string): string {
+  return `${HEARTBEAT_ADMISSION_LANE_PREFIX}${createHash('sha256').update(`${repository}\0${workspace}`).digest('hex').slice(0, 32)}`;
 }
 
 function privateReceipt(filePath: string): HeartbeatAdmissionReceipt | null {
@@ -168,7 +168,7 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
   const resolverOptions = { env, ...(options.homeDirectory === undefined ? {} : { homeDirectory: options.homeDirectory }) };
   const registry = options.registry ?? createHostAdmissionRegistry(resolverOptions);
   const evidence = canonicalizeMissionEvidence({ repository: request.repository, repositoryScope: true, workspace: request.workspace });
-  const laneId = laneForRepository(evidence.repository);
+  const laneId = laneForRepositoryWorkspace(evidence.repository, evidence.workspace!);
   const receiptPath = options.receiptPath?.(evidence.repository, evidence.workspace!) ?? resolveHeartbeatOwnerReceiptPath(evidence.repository, evidence.workspace!, resolverOptions);
 
   if (request.action === 'inspect') return { schemaVersion: 1, outcome: 'inspected', ...statusProjection(registry, laneId) };

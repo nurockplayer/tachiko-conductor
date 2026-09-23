@@ -187,7 +187,11 @@ function evidenceIsValid(value: unknown): value is MissionEvidence {
 function sharedPhysicalSurface(a: MissionEvidence, b: MissionEvidence): boolean {
   const left = [a.workspace, a.stateSurface].filter((value): value is string => value !== undefined);
   const right = [b.workspace, b.stateSurface].filter((value): value is string => value !== undefined);
-  return left.some((value) => right.includes(value));
+  const contains = (parent: string, child: string): boolean => {
+    const relative = path.relative(parent, child);
+    return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+  };
+  return left.some((leftPath) => right.some((rightPath) => contains(leftPath, rightPath) || contains(rightPath, leftPath)));
 }
 
 function overlaps(a: MissionEvidence, b: MissionEvidence): boolean {
@@ -221,6 +225,7 @@ function validateLane(value: unknown): value is LaneRecord {
   if (value.status === 'active' && (value.token === null || value.generation === 0)) return false;
   if (value.status !== 'active' && value.token !== null) return false;
   if (value.role === 'delegated_mutation_writer' && !nonEmpty(value.delegatedFromLaneId)) return false;
+  if (value.role === 'delegated_mutation_writer' && value.status === 'parked') return false;
   if (value.role !== 'delegated_mutation_writer' && value.delegatedFromLaneId !== undefined) return false;
   if (value.role === 'isolated_experiment' && !nonEmpty(value.experimentOfMissionId)) return false;
   if (value.role !== 'isolated_experiment' && value.experimentOfMissionId !== undefined) return false;
@@ -354,6 +359,10 @@ export class MissionAdmissionRegistry {
       const beforeRevision = state.revision;
       const result = operation(state);
       if (JSON.stringify(state) !== before) {
+        // Validate the complete candidate while still under the transaction
+        // lock. This catches invalid transitions (including isolation and
+        // capacity invariants) before any receipt callback or atomic publish.
+        validateState(state);
         beforeStatePublish?.(result);
         this.beforePublish?.();
         writeAtomic(this.filePath, state);
@@ -401,9 +410,9 @@ export class MissionAdmissionRegistry {
         ...(request.delegatedFromLaneId ? { delegatedFromLaneId: request.delegatedFromLaneId } : {}),
         ...(request.experimentOfMissionId ? { experimentOfMissionId: request.experimentOfMissionId } : {}), updatedAt: now,
       };
-      if (request.role === 'isolated_experiment' || state.lanes.some((lane) => lane.status === 'active' && lane.role === 'isolated_experiment')) {
-        const sharedSurface = state.lanes.find((lane) => lane.status === 'active' && lane.laneId !== request.laneId && (lane.role === 'isolated_experiment' || request.role === 'isolated_experiment') &&
-          sharedPhysicalSurface(lane.evidence, evidence));
+      if (request.role === 'isolated_experiment' || state.lanes.some((lane) => lane.status !== 'released' && lane.role === 'isolated_experiment')) {
+        const sharedSurface = state.lanes.find((lane) => lane.status !== 'released' && lane.laneId !== request.laneId && (lane.role === 'isolated_experiment' || request.role === 'isolated_experiment') &&
+          sharedPhysicalSurface(lane.evidence, candidate.evidence));
         if (sharedSurface) throw new AdmissionStateError(`Experiment must use a separate workspace and state surface from active lane ${sharedSurface.laneId}.`);
       }
       const conflict = state.lanes.find((lane) => lane.status !== 'released' && lane.laneId !== request.laneId && production(lane.role) && production(request.role) &&
@@ -441,6 +450,9 @@ export class MissionAdmissionRegistry {
       const lane = requireCurrentToken(state, token);
       if (lane.role !== 'production_captain') throw new AdmissionStateError(`${lane.role} cannot strengthen production ownership evidence.`);
       const strengthened = mergeEvidence(lane.evidence, evidence);
+      const experimentConflict = state.lanes.find((other) => other.laneId !== lane.laneId && other.status !== 'released' &&
+        other.role === 'isolated_experiment' && sharedPhysicalSurface(other.evidence, strengthened));
+      if (experimentConflict) throw new AdmissionStateError(`Strengthened ownership evidence overlaps isolated experiment lane "${experimentConflict.laneId}"; refusing to publish.`);
       for (const other of state.lanes) {
         if (other.laneId === lane.laneId || other.status === 'released' || !production(other.role) || !overlaps(other.evidence, strengthened)) continue;
         if (other.role === 'delegated_mutation_writer' && other.delegatedFromLaneId === lane.laneId) continue;
@@ -473,6 +485,7 @@ export class MissionAdmissionRegistry {
   park(token: AdmissionToken, reason: ParkedReason): number {
     return this.transact((state) => {
       const lane = requireCurrentToken(state, token);
+      if (lane.role === 'delegated_mutation_writer') throw new AdmissionStateError('Delegated writer cannot park; retain its active generation until stopped proof permits release.');
       assertNoActiveDelegates(state, lane);
       if (!(['capacity_captains', 'capacity_writers', 'capacity_high_autonomy', 'capacity_repository', 'workflow_wait', 'workflow_settled'].includes(reason))) throw new AdmissionStateError('Park reason is invalid.');
       lane.status = 'parked'; lane.token = null; lane.generation += 1; lane.parkedReason = reason; lane.updatedAt = this.now();

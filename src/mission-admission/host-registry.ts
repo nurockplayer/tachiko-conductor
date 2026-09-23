@@ -98,7 +98,7 @@ export function resolveHeartbeatOwnerReceiptPath(repository: string, workspace: 
   const configuredDirectory = env[HEARTBEAT_OWNER_RECEIPTS_DIR_ENV] ?? path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'heartbeat-receipts');
   if (!path.isAbsolute(configuredDirectory)) throw new AdmissionStateError(`${HEARTBEAT_OWNER_RECEIPTS_DIR_ENV} must be an absolute host path.`);
   const receiptDirectory = physicalPath(configuredDirectory);
-  const receiptId = createHash('sha256').update(repository).digest('hex');
+  const receiptId = createHash('sha256').update(`${repository}\0${physicalWorkspace}`).digest('hex');
   const receiptPath = path.join(receiptDirectory, `${receiptId}.json`);
   if (containsPath(physicalWorkspace, receiptPath) || containsPath(runsDirectory, receiptPath)) {
     throw new AdmissionStateError('Heartbeat admission receipt must be outside the workspace and per-Run data directory.');
