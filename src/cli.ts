@@ -715,6 +715,20 @@ function evidenceForRun(run: Run, additional: { readonly pullRequest?: number; r
     : { ...shared, claim: `branch:${run.target.branch}` });
 }
 
+/** Resume from the workspace already bound to this Run, never from the caller's ambient cwd. */
+function persistedRunWorkspace(run: Run): string | undefined {
+  if (run.bootstrap !== undefined) return run.bootstrap.workspacePath;
+  const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  const receiptPath = resolveRunOwnerReceiptPath(repository, run.id, evidenceForRun(run));
+  const receipt = readRunOwnerReceipt(receiptPath);
+  if (receipt === null) return undefined;
+  if (receipt.runId !== run.id || receipt.laneId !== `run:${run.id}` || receipt.repository !== repository ||
+    receipt.issue !== (run.target.kind === 'issue' ? run.target.issueNumber : undefined) || receipt.claimId !== run.dispatchClaimId) {
+    throw new Error(`Run owner receipt does not match Run "${run.id}"; refusing workspace recovery.`);
+  }
+  return receipt.workspace;
+}
+
 /** Public, bounded admission status. Physical surfaces and capability tokens are intentionally omitted. */
 export function dispatchAdmissionStatus(registry: MissionAdmissionRegistry, store?: RunStore) {
   const snapshot = registry.snapshot();
@@ -851,7 +865,15 @@ function releasePreExecutionRunAdmission(registry: MissionAdmissionRegistry, tok
 }
 
 /** Settle only the exact receipt generation. This retires authority and never resumes or spawns work. */
-export function recoverRunAdmission(store: RunStore, registry: MissionAdmissionRegistry, runId: string, expectedGeneration: number, operatorStopped: boolean, receiptPath?: string): 'released' {
+export function recoverRunAdmission(
+  store: RunStore,
+  registry: MissionAdmissionRegistry,
+  runId: string,
+  expectedGeneration: number,
+  operatorStopped: boolean,
+  receiptPath?: string,
+  crashAfter?: { readonly parkReceiptNormalization?: () => void; readonly parkReceiptFinalization?: () => void },
+): 'released' {
   if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw new Error('Run admission recovery requires --generation <positive integer>.');
   const run = store.read(runId);
   if (run === null) throw new Error(`No run with id "${runId}" found.`);
@@ -865,7 +887,8 @@ export function recoverRunAdmission(store: RunStore, registry: MissionAdmissionR
   }
   if (receipt.generation !== expectedGeneration &&
     !(receipt.phase === 'released' && receipt.generation === expectedGeneration + 1) &&
-    !(receipt.phase === 'pre_execution' && receipt.generation === expectedGeneration + 1)) {
+    !(receipt.phase === 'pre_execution' && receipt.generation === expectedGeneration + 1) &&
+    !(receipt.phase === 'park_transition' && receipt.generation === expectedGeneration - 1)) {
     throw new Error(`Run owner receipt generation ${receipt.generation} does not match expected generation ${expectedGeneration}.`);
   }
   const lane = registry.readLane(laneId);
@@ -882,17 +905,29 @@ export function recoverRunAdmission(store: RunStore, registry: MissionAdmissionR
     }
   }
   if (lane.status === 'parked') {
+    const expectedParkReason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
+    const interruptedParkPublication = receipt.phase === 'park_transition' && receipt.generation === expectedGeneration - 1 &&
+      lane.generation === expectedGeneration && lane.parkedReason === expectedParkReason &&
+      receipt.workspace === lane.evidence.workspace;
+    const normalizedParkRetry = receipt.generation === expectedGeneration && lane.generation === expectedGeneration &&
+      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && lane.parkedReason === expectedParkReason &&
+      receipt.workspace === lane.evidence.workspace;
     const interruptedParkedReadmission = lane.generation === expectedGeneration && receipt.generation === expectedGeneration + 1 &&
       (receipt.phase === 'pre_execution' || receipt.phase === 'parked_release_transition');
     const exactParkedGeneration = lane.generation === expectedGeneration && receipt.generation === expectedGeneration &&
       (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition');
-    if (!interruptedParkedReadmission && !exactParkedGeneration) throw new Error('Parked registry lane does not match the Run owner receipt phase and generation.');
+    if (!interruptedParkPublication && !normalizedParkRetry && !interruptedParkedReadmission && !exactParkedGeneration) throw new Error('Parked registry lane does not match the Run owner receipt phase and generation.');
     if (!operatorStopped) throw new Error('Parked Run recovery requires explicit --stopped operator attestation that the provider and children have stopped.');
     const { token: _token, ...withoutToken } = receipt;
-    const transition = { ...withoutToken, phase: 'parked_release_transition' as const, generation: expectedGeneration };
+    if (interruptedParkPublication) {
+      writeRunOwnerReceipt(canonicalReceiptPath, { ...withoutToken, phase: 'parked', generation: lane.generation });
+      crashAfter?.parkReceiptNormalization?.();
+    }
+    const transition = { ...withoutToken, phase: 'parked_release_transition' as const, generation: lane.generation };
     writeRunOwnerReceipt(canonicalReceiptPath, transition);
     registry.releaseParked(laneId, lane.generation, true, () => writeRunOwnerReceipt(canonicalReceiptPath, transition));
     writeRunOwnerReceipt(canonicalReceiptPath, { ...transition, phase: 'released', generation: lane.generation + 1 });
+    crashAfter?.parkReceiptFinalization?.();
     return 'released';
   }
   if (lane.status !== 'active' || receipt.token === undefined || receipt.token.generation !== expectedGeneration || receipt.token.laneId !== laneId) {
@@ -1937,21 +1972,20 @@ export async function main(argv: string[]): Promise<number> {
           withAdmissionLock: async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation),
           resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
           runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock) => {
-            const workspace = process.cwd();
             return await runIssueCommand(workflow, ref, {
-              ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!, admissionWorkspace: workspace,
+              ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
             });
           },
           resumeClaimedRun: async (run, dispatchClaimId, missionAdmission, release, withLock) => {
             if (run.target.kind !== 'issue') throw new Error(`Dispatch claimed Run ${run.id} is not an issue Run.`);
-            const workspace = run.bootstrap?.workspacePath ?? process.cwd();
+            const workspace = persistedRunWorkspace(run);
             return await runIssueCommand(workflow, `${run.target.owner}/${run.target.repo}#${run.target.issueNumber}`, {
               ...(run.execution === undefined ? {} : { execution: run.execution }),
               dispatchClaimId,
               ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }),
               admission: missionAdmission!,
-              admissionWorkspace: workspace,
+              ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
             });
           },
@@ -2158,6 +2192,7 @@ export async function main(argv: string[]): Promise<number> {
     const outcome = await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
       const run = store.read(id);
       if (run === null) throw new Error(`No run with id "${id}" found.`);
+      const admissionWorkspace = persistedRunWorkspace(run);
       const withLock = async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation);
       let commitDispatchResumeTransition: WorkflowCommandOptions['commitDispatchResumeTransition'];
       if (run.dispatchClaimId !== undefined) {
@@ -2194,7 +2229,9 @@ export async function main(argv: string[]): Promise<number> {
         };
       }
       return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities), id, values.decision!, {
-        admission: createHostAdmissionRegistry(), admissionWorkspace: process.cwd(), releaseDispatchAdmissionLock: releaseAdmissionLock,
+        admission: createHostAdmissionRegistry(),
+        ...(admissionWorkspace === undefined ? {} : { admissionWorkspace }),
+        releaseDispatchAdmissionLock: releaseAdmissionLock,
         withDispatchAdmissionLock: withLock,
         ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId, commitDispatchResumeTransition }),
       });
@@ -2234,7 +2271,7 @@ export async function main(argv: string[]): Promise<number> {
   const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
     ? undefined
     : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(), admissionWorkspace: process.cwd() });
+  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry() });
   printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }

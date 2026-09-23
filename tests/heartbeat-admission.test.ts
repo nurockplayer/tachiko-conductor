@@ -17,8 +17,9 @@ function setup(overrides: { readonly beforePublish?: () => void; readonly limits
   const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-heartbeat-admission-'));
   const workspace = path.join(directory, 'workspace');
   mkdirSync(workspace);
+  const registryPath = path.join(directory, 'host', 'registry.json');
   const registry = new MissionAdmissionRegistry({
-    filePath: path.join(directory, 'host', 'registry.json'),
+    filePath: registryPath,
     config: { ...config, limits: overrides.limits ?? config.limits },
     ...(overrides.beforePublish === undefined ? {} : { beforePublish: overrides.beforePublish }),
   });
@@ -37,7 +38,15 @@ function setup(overrides: { readonly beforePublish?: () => void; readonly limits
     receiptId,
     stopProof: { childrenStopped: true, supervisorStopped: overrides.stopped ?? true, observedAt: '2026-09-23T00:00:00.000Z' },
   });
-  return { directory, workspace, registry, receiptPath, options, request, settle };
+  const recover = (repository: string, generation: number, overrides: { readonly supervisor?: string } = {}) => ({
+    schemaVersion: 1,
+    action: 'recover',
+    repository,
+    workspace,
+    supervisorId: overrides.supervisor ?? supervisorId,
+    expectedGeneration: generation,
+  });
+  return { directory, workspace, registry, registryPath, receiptPath, options, request, settle, recover };
 }
 
 describe('model-free heartbeat mission admission helper', () => {
@@ -235,7 +244,20 @@ describe('model-free heartbeat mission admission helper', () => {
       assert.throws(() => handleHeartbeatAdmission(f.settle('acme/widgets', reserved.generation, reserved.receiptId), f.options), /injected release publication failure/);
       assert.equal(f.registry.readLane(reserved.laneId)?.status, 'active');
       assert.equal((JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { status: string }).status, 'settled');
-      const repeated = handleHeartbeatAdmission(f.settle('acme/widgets', reserved.generation, reserved.receiptId), f.options);
+      const wrongOwner = handleHeartbeatAdmission(f.recover('acme/widgets', reserved.generation, { supervisor: 'other-supervisor' }), f.options);
+      assert.equal(wrongOwner.outcome, 'not_owned', 'settlement pending remains private to its exact supervisor identity');
+      const pending = handleHeartbeatAdmission(f.recover('acme/widgets', reserved.generation), f.options);
+      assert.equal(pending.outcome, 'settlement_pending');
+      if (pending.outcome !== 'settlement_pending') throw new Error('expected exact pending settlement');
+      assert.equal(pending.generation, reserved.generation);
+      assert.equal(pending.receiptId, reserved.receiptId);
+      const restartedOptions: HeartbeatAdmissionOptions = {
+        registry: new MissionAdmissionRegistry({ filePath: f.registryPath, config }),
+        receiptPath: () => f.receiptPath,
+      };
+      const afterRestart = handleHeartbeatAdmission(f.recover('acme/widgets', reserved.generation), restartedOptions);
+      assert.equal(afterRestart.outcome, 'settlement_pending');
+      const repeated = handleHeartbeatAdmission(f.settle('acme/widgets', reserved.generation, reserved.receiptId), restartedOptions);
       assert.equal(repeated.outcome, 'settled');
       assert.equal(f.registry.readLane(reserved.laneId)?.status, 'released');
     } finally { rmSync(f.directory, { recursive: true, force: true }); }

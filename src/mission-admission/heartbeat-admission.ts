@@ -170,7 +170,7 @@ function statusProjection(registry: MissionAdmissionRegistry, laneId: string) {
 type HeartbeatStatusProjection = ReturnType<typeof statusProjection>;
 export type HeartbeatAdmissionResult =
   | ({ readonly schemaVersion: 1; readonly outcome: 'inspected' } & HeartbeatStatusProjection)
-  | { readonly schemaVersion: 1; readonly outcome: 'recoverable' | 'already_settled'; readonly laneId: string; readonly generation: number; readonly receiptId: string }
+  | { readonly schemaVersion: 1; readonly outcome: 'recoverable' | 'settlement_pending' | 'already_settled'; readonly laneId: string; readonly generation: number; readonly receiptId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'absent' | 'not_owned'; readonly laneId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'reserved' | 'already_reserved'; readonly laneId: string; readonly missionId: string; readonly generation: number; readonly receiptId: string; readonly revision: number }
   | { readonly schemaVersion: 1; readonly outcome: 'waiting'; readonly laneId: string; readonly missionId: string; readonly reason: string; readonly revision: number }
@@ -197,6 +197,10 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
       return { schemaVersion: 1, outcome: 'not_owned', laneId };
     }
     if (request.expectedGeneration !== null && receipt.token.generation !== request.expectedGeneration) return { schemaVersion: 1, outcome: 'not_owned', laneId };
+    if (lane?.status === 'active' && receipt.status === 'settled' && lane.missionId === receipt.missionId && lane.generation === receipt.token.generation) {
+      registry.assertCurrentOwner(receipt.token);
+      return { schemaVersion: 1, outcome: 'settlement_pending', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId };
+    }
     if (lane?.status === 'active' && receipt.status === 'active' && lane.missionId === receipt.missionId && lane.generation === receipt.token.generation) {
       registry.assertCurrentOwner(receipt.token);
       return { schemaVersion: 1, outcome: 'recoverable', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId };

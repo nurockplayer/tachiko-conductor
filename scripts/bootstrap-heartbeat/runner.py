@@ -1156,6 +1156,23 @@ def reconcile_pending_admission(config: dict[str, Any], state: dict[str, Any]) -
     if pending["host_id"] != host_id:
         raise RuntimeError("heartbeat admission belongs to a different host; refusing automatic reconciliation")
     recovery = recover_heartbeat(config, pending)
+    if recovery.get("outcome") == "settlement_pending":
+        generation = recovery.get("generation")
+        receipt_id = recovery.get("receiptId")
+        if (type(generation) is not int or not isinstance(receipt_id, str)
+                or pending["generation"] != generation or pending["receipt_id"] != receipt_id):
+            raise RuntimeError("pending settlement does not match durable heartbeat generation")
+        # The helper's settled receipt is written only after accepting the
+        # supervisor's explicit stop attestation. It survives a failed
+        # registry publication and authorizes this exact no-spawn retry even
+        # when the previous execution may have started during this boot.
+        result = settle_heartbeat(config, pending["supervisor_id"], generation, receipt_id)
+        if result.get("outcome") != "settled":
+            raise RuntimeError("prior heartbeat settlement is still pending")
+        state["pending_admission"] = None
+        save_state(state)
+        log("retried exact heartbeat settlement from its durable stopped receipt")
+        return True
     if recovery.get("outcome") == "already_settled":
         if (pending["generation"] is None or recovery.get("generation") != pending["generation"]
                 or recovery.get("receiptId") != pending["receipt_id"]):

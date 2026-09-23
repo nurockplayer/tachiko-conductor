@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -602,6 +602,107 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.outcome, 'merge_ready');
     assert.equal(outcome.run.state, 'MERGE_READY');
     assert.equal(store.list().length, 1);
+  });
+
+  it('keeps initial admission logical until a workspace is actually prepared', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-logical-admission-'));
+    try {
+      const store = new MemoryStore();
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: { schemaVersion: 1, revision: 'logical-admission-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } } });
+      registry.admit({ laneId: 'ambient-cwd-owner', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 99, workspace: process.cwd() } });
+      const implementation = new FakeImplementation([]);
+      await assert.rejects(runIssueCommand(
+        deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])),
+        'acme/widgets#42',
+        { admission: registry, runOwnerReceiptPath: path.join(directory, 'owner.json'), now: () => T0 },
+      ), /explicit execution workspace/);
+      const run = store.list()[0]!;
+      const lane = registry.readLane(`run:${run.id}`)!;
+      assert.equal(lane.evidence.workspace, undefined, 'initial logical reservation does not capture ambient cwd');
+      assert.equal(implementation.calls, 0, 'the mutation fence still requires a physical workspace');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('binds initial admission to the prepared worktree instead of conflicting ambient cwd', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-prepared-admission-'));
+    try {
+      const store = new MemoryStore();
+      const canonicalWorkspace = path.join(directory, 'prepared-worktree');
+      mkdirSync(canonicalWorkspace);
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: { schemaVersion: 1, revision: 'prepared-admission-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } } });
+      registry.admit({ laneId: 'ambient-cwd-owner', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 99, workspace: process.cwd() } });
+      const identity = { bootstrapKind: 'linked-worktree' as const, owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: HEAD, branch: 'codex/run-42', workspacePath: canonicalWorkspace };
+      let prepareCalls = 0;
+      const bootstrap = {
+        kind: 'implementation-bootstrap' as const,
+        bootstrapKind: 'linked-worktree' as const,
+        async plan() { return identity; },
+        async prepare() { prepareCalls += 1; return identity; },
+        guard() { return { assertValid() {} }; },
+        async verifyDurable() { return { headSha: HEAD, branch: identity.branch }; },
+      };
+      class UncertainImplementation implements ImplementationAgent {
+        readonly kind = 'implementation-agent' as const;
+        observedWorkspace: string | undefined;
+        async run(request: Parameters<ImplementationAgent['run']>[0]): Promise<AgentResult> {
+          this.observedWorkspace = request.workspacePath;
+          throw new Error('stop after observing prepared workspace');
+        }
+      }
+      const implementation = new UncertainImplementation();
+      const live = githubAdapter([HEAD, HEAD]);
+      const noPullRequestGithub: GitHubAdapter = {
+        ...live,
+        async readLiveSnapshot(target) {
+          const snapshot = await live.readLiveSnapshot(target);
+          return {
+            ...snapshot,
+            repository: { ...snapshot.repository, defaultBranch: 'main', defaultBranchHeadSha: HEAD },
+            pullRequest: null,
+            headSha: null,
+          };
+        },
+      };
+      const workflow = { ...deps(store, noPullRequestGithub, implementation, new FakeReviewer([])), bootstrap };
+      await assert.rejects(runIssueCommand(workflow, 'acme/widgets#42', {
+        admission: registry,
+        runOwnerReceiptPath: path.join(directory, 'owner.json'),
+        now: () => T0,
+      }), /stop after observing prepared workspace/);
+      const run = store.list()[0]!;
+      const lane = registry.readLane(`run:${run.id}`)!;
+      assert.equal(prepareCalls, 1);
+      assert.equal(implementation.observedWorkspace, canonicalWorkspace);
+      assert.equal(lane.evidence.workspace, realpathSync(canonicalWorkspace));
+      assert.notEqual(lane.evidence.workspace, process.cwd());
+      assert.equal(lane.status, 'active', 'uncertain worker execution keeps the exact bound workspace fenced');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('resumes against the persisted workspace instead of the current caller workspace', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-persisted-admission-'));
+    try {
+      const store = new MemoryStore();
+      const canonicalWorkspace = path.join(directory, 'prepared-worktree');
+      mkdirSync(canonicalWorkspace);
+      let run = createRun(TARGET, T0, 'resume-persisted-workspace');
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+      run = applyTransition(run, { type: 'escalate', reason: 'operator input', interrupt: { evidence: 'decision required', choices: ['A'] } }, T0);
+      run = { ...run, bootstrap: { bootstrapKind: 'linked-worktree', owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: HEAD, branch: 'codex/run-resume', workspacePath: canonicalWorkspace } };
+      store.create(run);
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: { schemaVersion: 1, revision: 'persisted-admission-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const receiptPath = path.join(directory, 'owner.json');
+      await resumeCommand(deps(store, githubAdapter([HEAD]), new FakeImplementation([]), new FakeReviewer([])), run.id, 'A', {
+        admission: registry,
+        runOwnerReceiptPath: receiptPath,
+        now: () => T0,
+      });
+      const lane = registry.readLane(`run:${run.id}`)!;
+      assert.equal(lane.evidence.workspace, realpathSync(canonicalWorkspace));
+      assert.notEqual(lane.evidence.workspace, process.cwd());
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('reuses an existing persisted run instead of creating a second one', async () => {
@@ -1248,6 +1349,84 @@ describe('workflow run and resume commands', () => {
       assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'released');
       assert.equal(recoverRunAdmission(store, admission, runId, parkedGeneration, true, receiptPath), 'released', 'exact recovery is idempotent after publication');
     } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('recovers a parked Run across each private park-release receipt crash boundary', () => {
+    for (const crashPoint of ['normalize', 'before', 'after', 'finalize'] as const) {
+      const { dir } = tempStore();
+      try {
+        const runId = `park-publish-${crashPoint}`;
+        let run = createRun(TARGET, T0, runId);
+        run = applyTransition(run, { type: 'start' }, T0);
+        run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+        run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+        run = applyTransition(run, { type: 'escalate', reason: 'operator input', interrupt: { evidence: 'decision required', choices: ['A'] } }, T0);
+        const store = new MemoryStore();
+        store.create(run);
+        const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: { schemaVersion: 1, revision: `park-publish-${crashPoint}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+        const receiptPath = path.join(dir, 'owner-receipt.json');
+        const canonicalWorkspace = realpathSync(dir);
+        const admitted = registry.admit({ laneId: `run:${runId}`, role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: runId, workspace: canonicalWorkspace } });
+        assert.equal(admitted.outcome, 'admitted');
+        if (admitted.outcome !== 'admitted') throw new Error('expected Run admission');
+        const parkReceipt = { schemaVersion: 1 as const, laneId: admitted.token.laneId, missionId: admitted.missionId, repository: 'acme/widgets', runId, issue: 42, workspace: canonicalWorkspace, token: admitted.token, generation: admitted.token.generation, phase: 'park_transition' as const };
+        registry.park(admitted.token, 'workflow_wait', () => writeRunOwnerReceipt(receiptPath, parkReceipt));
+        const parkedGeneration = admitted.token.generation + 1;
+        assert.equal(registry.readLane(admitted.token.laneId)?.generation, parkedGeneration);
+        assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'park_transition', 'fixture is the exact postpublication/pre-finalization crash state');
+        assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, false, receiptPath), /explicit --stopped/);
+        assert.throws(() => recoverRunAdmission(store, registry, runId, admitted.token.generation, true, receiptPath), /phase and generation/,
+          'the prior active generation is not the public parked generation');
+        const { token: _token, ...tokenlessParkReceipt } = parkReceipt;
+        writeRunOwnerReceipt(receiptPath, { ...tokenlessParkReceipt, phase: 'parked', generation: admitted.token.generation });
+        assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath), /generation/,
+          'a tokenless parked receipt at the wrong generation cannot authorize recovery');
+        writeRunOwnerReceipt(receiptPath, parkReceipt);
+
+        const releaseParked = registry.releaseParked.bind(registry);
+        if (crashPoint === 'before' || crashPoint === 'after') {
+          registry.releaseParked = (laneId, generation, stopped, beforePublish) => {
+            beforePublish?.();
+            if (crashPoint === 'before') throw new Error('injected crash before parked release publication');
+            const result = releaseParked(laneId, generation, stopped);
+            throw new Error(`injected crash after parked release publication ${result}`);
+          };
+        }
+        if (crashPoint === 'normalize') {
+          assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath, {
+            parkReceiptNormalization: () => { throw new Error('injected crash after park receipt normalization'); },
+          }), /injected crash after park receipt normalization/);
+          assert.equal(registry.readLane(admitted.token.laneId)?.status, 'parked');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.generation, parkedGeneration);
+        } else if (crashPoint === 'finalize') {
+          assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath, {
+            parkReceiptFinalization: () => { throw new Error('injected crash after park receipt finalization'); },
+          }), /injected crash after park receipt finalization/);
+          assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'released');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.generation, parkedGeneration + 1);
+        } else {
+          assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath), /injected crash/);
+        }
+        if (crashPoint === 'before') {
+          assert.equal(registry.readLane(admitted.token.laneId)?.status, 'parked');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked_release_transition');
+        } else if (crashPoint === 'after') {
+          assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released');
+          assert.equal(registry.readLane(admitted.token.laneId)?.generation, parkedGeneration + 1);
+          assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked_release_transition');
+        }
+        registry.releaseParked = releaseParked;
+        assert.equal(recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath), 'released');
+        assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'released');
+        assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released');
+        const successor = registry.admit({ laneId: admitted.token.laneId, role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: runId, workspace: canonicalWorkspace } });
+        assert.equal(successor.outcome, 'admitted');
+        assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath), /does not match expected generation|do not identify the exact recoverable active generation/);
+        assert.equal(registry.readLane(admitted.token.laneId)?.status, 'active', 'old recovery cannot release a successor generation');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
   });
 
   it('rechecks the admission generation immediately before implementation mutation', async () => {

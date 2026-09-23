@@ -233,7 +233,8 @@ class HeartbeatTest(unittest.TestCase):
             "const q = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
             "if (q.action === 'inspect') { console.log(JSON.stringify({schemaVersion:1,outcome:'inspected',lane:s.active?{status:'active',generation:s.generation}:{status:'released',generation:s.releasedGeneration||((s.generation||0)+1)}}));\n"
             "} else if (q.action === 'recover') {\n"
-            " if (s.active && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'recoverable',generation:s.generation,receiptId:s.receiptId}));\n"
+            " if (s.active && s.settlementPending && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'settlement_pending',generation:s.generation,receiptId:s.receiptId}));\n"
+            " else if (s.active && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'recoverable',generation:s.generation,receiptId:s.receiptId}));\n"
             " else if (!s.active && q.expectedGeneration !== null && s.releasedGeneration === q.expectedGeneration + 1) console.log(JSON.stringify({schemaVersion:1,outcome:'already_settled',generation:q.expectedGeneration,receiptId:s.receiptId}));\n"
             " else if (!s.active && q.expectedGeneration === null && !s.generation) console.log(JSON.stringify({schemaVersion:1,outcome:'absent'}));\n"
             " else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
@@ -247,7 +248,8 @@ class HeartbeatTest(unittest.TestCase):
             "} else if (q.action === 'settle') {\n"
             " if (s.mode === 'stale') process.exit(2);\n"
             " if (!s.active || q.expectedGeneration !== s.generation || q.receiptId !== s.receiptId || q.supervisorId !== s.supervisorId || !q.stopProof?.childrenStopped || !q.stopProof?.supervisorStopped || q.stopProof.observedAt === 'pending') process.exit(2);\n"
-            " s.active = false; s.releasedGeneration = s.generation + 1; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'settled'}));\n"
+            " if (s.failSettlement) { s.failSettlement = false; fs.writeFileSync(statePath, JSON.stringify(s)); process.exit(2); }\n"
+            " s.active = false; s.settlementPending = false; s.releasedGeneration = s.generation + 1; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'settled'}));\n"
             "}\n"
         )
         helper_entry.write_text(helper_source, encoding="utf-8")
@@ -462,6 +464,27 @@ class HeartbeatTest(unittest.TestCase):
         self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
         self.assertEqual(self.state()["pending_admission"]["phase"], "spawn_uncertain")
         self.assertEqual(self.records(), [])
+
+    def test_durable_settlement_receipt_retries_same_boot_uncertain_execution_without_spawn(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("spawn_uncertain")
+        admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        admission.update(settlementPending=True, failSettlement=True)
+        self.admission_state.write_text(json.dumps(admission), encoding="utf-8")
+
+        failed = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIsNotNone(self.state()["pending_admission"], "failed exact settlement keeps durable pending state")
+        self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertEqual(self.records(), [], "settlement retry never spawns a wake")
+
+        retried = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        settled = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertFalse(settled["active"])
+        self.assertEqual(settled["releasedGeneration"], 2)
+        self.assertEqual(self.records(), [], "recovery precedes polling and never spawns a wake")
 
     def test_same_boot_dead_preexecution_owner_can_settle_exact_generation(self) -> None:
         self.invoke("run", "--prime")
