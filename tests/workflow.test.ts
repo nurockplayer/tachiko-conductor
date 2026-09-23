@@ -42,6 +42,13 @@ class MemoryStore implements RunStore {
     this.runs.set(run.id, run);
   }
 
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    const current = this.read(expected.id);
+    if (current === null || JSON.stringify(current) !== JSON.stringify(expected)) return false;
+    this.update(next);
+    return true;
+  }
+
   list(): Run[] {
     return [...this.runs.values()];
   }
@@ -670,6 +677,91 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(capabilityIndex, 2);
     assert.deepEqual(implementation.requests.map((request) => request.capabilities), [[capabilities[0]], [capabilities[1]]]);
+  });
+
+  it('CAS-fences initial and resumed workers after capabilities resolve against concurrent human and HEAD/PR changes', async (t) => {
+    for (const phase of ['initial', 'resumed'] as const) {
+      for (const change of ['human', 'head_pr'] as const) {
+        await t.test(`${phase}/${change}`, async () => {
+          const store = new MemoryStore();
+          let run = createRun(TARGET, T0, `capability-${phase}-${change}`);
+          if (phase === 'resumed') run = applyTransition(run, { type: 'start' }, T0);
+          store.create(run);
+          const implementation = new FakeImplementation([successResult(HEAD)]);
+          let concurrent: Run | undefined;
+          const result = await runWorkflow({
+            store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]),
+            resolveImplementationCapabilities: async () => {
+              const current = store.read(run.id)!;
+              concurrent = change === 'human'
+                ? applyTransition(current, { type: 'escalate', reason: 'Concurrent cancel decision', interrupt: { evidence: 'cancel', choices: ['Cancel the run'] } }, T0)
+                : { ...current, headSha: HEAD2, pullRequest: { number: 8, headSha: HEAD2 } };
+              store.update(concurrent);
+              return [];
+            },
+          }, run.id, { maxReviewAttempts: 2, now: () => T0 });
+          assert.equal(result.outcome, 'needs_human');
+          assert.equal(implementation.requests.length, 0, 'capability resolver yielded after the initial/resume worker snapshot became stale');
+          assert.deepEqual(store.read(run.id), concurrent, 'stale worker admission preserves concurrent Run state');
+        });
+      }
+    }
+  });
+
+  it('CAS-fences success and failure completion against concurrent Run changes during the worker', async (t) => {
+    for (const mode of ['success', 'failure'] as const) {
+      await t.test(mode, async () => {
+        const store = new MemoryStore();
+        const initial = createRun(TARGET, T0, `completion-${mode}-race`);
+        store.create(initial);
+        let concurrent: Run | undefined;
+        const implementation = {
+          kind: 'implementation-agent' as const,
+          async run() {
+            const current = store.read(initial.id)!;
+            concurrent = applyTransition(current, {
+              type: 'escalate', reason: `Concurrent decision during worker ${mode}`,
+              interrupt: { evidence: `concurrent-${mode}`, choices: ['Cancel the run'] },
+            }, T0);
+            store.update(concurrent);
+            if (mode === 'failure') throw new Error('synthetic worker failure');
+            return successResult(HEAD);
+          },
+        };
+        const result = await runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, initial.id, { maxReviewAttempts: 2, now: () => T0 });
+        assert.equal(result.outcome, 'needs_human');
+        assert.deepEqual(store.read(initial.id), concurrent, 'worker completion/failure telemetry must not overwrite the concurrent decision');
+      });
+    }
+  });
+
+  it('CAS-fences result-derived Run writes after the post-worker GitHub await', async () => {
+    const store = new MemoryStore();
+    const initial = createRun(TARGET, T0, 'post-worker-github-race');
+    store.create(initial);
+    let workerCompleted = false;
+    let concurrent: Run | undefined;
+    const implementation = {
+      kind: 'implementation-agent' as const,
+      async run() { workerCompleted = true; return successResult(HEAD); },
+    };
+    const github = githubAdapter([HEAD, HEAD, HEAD, HEAD]);
+    const readLiveSnapshot = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const result = await readLiveSnapshot(target);
+      if (workerCompleted && concurrent === undefined) {
+        const current = store.read(initial.id)!;
+        concurrent = applyTransition(current, {
+          type: 'escalate', reason: 'Concurrent cancellation while validating worker output',
+          interrupt: { evidence: 'cancel-after-worker', choices: ['Cancel the run'] },
+        }, T0);
+        store.update(concurrent);
+      }
+      return result;
+    };
+    const result = await runWorkflow({ store, github, implementation, reviewer: new FakeReviewer([]) }, initial.id, { maxReviewAttempts: 2, now: () => T0 });
+    assert.equal(result.outcome, 'needs_human');
+    assert.deepEqual(store.read(initial.id), concurrent, 'the final result-to-Run association uses CAS after GitHub resolution');
   });
 
   it('fails the run when the implementation agent fails', async () => {

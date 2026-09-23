@@ -49,6 +49,13 @@ class MemoryStore implements RunStore {
     this.runs.set(run.id, run);
   }
 
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    const current = this.read(expected.id);
+    if (current === null || JSON.stringify(current) !== JSON.stringify(expected)) return false;
+    this.update(next);
+    return true;
+  }
+
   list(): Run[] {
     return [...this.runs.values()];
   }
@@ -84,7 +91,7 @@ class ConcurrentAdmissionStore extends MemoryStore {
 
   constructor(private readonly concurrent: Run) { super(); }
 
-  updateIfUnchanged(expected: Run, next: Run): boolean {
+  override updateIfUnchanged(expected: Run, next: Run): boolean {
     this.attempts += 1;
     if (this.attempts === 1) {
       this.update(this.concurrent);
@@ -96,7 +103,7 @@ class ConcurrentAdmissionStore extends MemoryStore {
 }
 
 class CasMemoryStore extends MemoryStore {
-  updateIfUnchanged(expected: Run, next: Run): boolean {
+  override updateIfUnchanged(expected: Run, next: Run): boolean {
     const current = this.read(expected.id);
     if (current === null || JSON.stringify(current) !== JSON.stringify(expected)) return false;
     this.update(next);
@@ -694,6 +701,7 @@ describe('runReviewLoop', () => {
           resolveImplementationCapabilities: async () => { capabilityResolutions += 1; return []; },
           resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
           assertCanMutate: () => registry.assertCanMutate(admitted.token),
+          assertCurrentMutation: () => registry.assertCanMutate(admitted.token),
         },
         run.id,
         {
@@ -711,6 +719,95 @@ describe('runReviewLoop', () => {
       assert.equal(publications, 0, 'no repair publication can follow the rejected worker boundary');
     } finally {
       rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a concurrent NEEDS_HUMAN Run written while repair capabilities resolve', async () => {
+    const original = repairChangesRun('repair-capability-run-race');
+    const store = new CasMemoryStore();
+    store.create(original);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
+    const concurrent = applyTransition(original, {
+      type: 'escalate', reason: 'Concurrent cancellation review',
+      interrupt: { evidence: 'Cancel the Run', choices: ['Cancel the run'] },
+    }, T0);
+    let markers = 0;
+    const result = await runReviewLoop({
+      store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]),
+      resolveValidationAuthority: reviewAuthority,
+      resolveImplementationCapabilities: async () => {
+        store.update(concurrent);
+        return [];
+      },
+      resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+    }, original.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { markers += 1; } });
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(result.run.interrupt?.reason, concurrent.interrupt?.reason);
+    assert.deepEqual(store.read(original.id), concurrent, 'stale reconciliation must preserve the concurrent cancel decision byte-for-byte');
+    assert.equal(markers, 1, 'the uncertainty marker occurs after preflight but before final Run CAS');
+  });
+
+  it('releases a preflight-overlap repair lane when no worker or uncertainty marker began', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-review-overlap-release-'));
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'review-overlap-release-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } },
+    });
+    const blocker = registry.admit({ laneId: 'workspace-blocker', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 9, workspace: '/tmp/review-overlap' } });
+    const owner = registry.admit({ laneId: 'repair-owner', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42 } });
+    assert.equal(blocker.outcome, 'admitted');
+    assert.equal(owner.outcome, 'admitted');
+    if (owner.outcome !== 'admitted') return;
+    try {
+      const original = repairChangesRun('repair-overlap-preflight');
+      const store = new CasMemoryStore();
+      store.create(original);
+      const implementation = new FakeImplementation([]);
+      let markers = 0;
+      await assert.rejects(runReviewLoop({
+        store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]),
+        resolveValidationAuthority: reviewAuthority,
+        resolveImplementationCapabilities: async () => [],
+        resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+        assertCanMutate: () => registry.strengthen(owner.token, { repository: 'acme/widgets', issue: 42, workspace: '/tmp/review-overlap' }),
+        assertCurrentMutation: () => registry.assertCanMutate(owner.token),
+      }, original.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { markers += 1; } }), /overlaps reserved lane/);
+      assert.equal(implementation.requests.length, 0);
+      assert.equal(markers, 0, 'overlap is detected before execution uncertainty is recorded');
+      assert.equal(registry.readLane(owner.token.laneId)?.status, 'active');
+      registry.release(owner.token, true);
+      assert.equal(registry.readLane(owner.token.laneId)?.status, 'released', 'the host can release a provably pre-execution lane');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('does not overwrite a concurrent Run when a repair worker completes or throws', async (t) => {
+    for (const mode of ['success', 'failure'] as const) {
+      await t.test(mode, async () => {
+        const original = repairChangesRun(`repair-worker-${mode}-race`);
+        const store = new CasMemoryStore();
+        store.create(original);
+        const concurrent = applyTransition(original, {
+          type: 'escalate', reason: `Concurrent human decision during ${mode} worker`,
+          interrupt: { evidence: `concurrent-${mode}`, choices: ['Cancel the run'] },
+        }, T0);
+        const implementation = {
+          kind: 'implementation-agent' as const,
+          async run() {
+            store.update(concurrent);
+            if (mode === 'failure') throw new Error('synthetic worker invocation failure');
+            return successResult(HEAD2);
+          },
+        };
+        const result = await runReviewLoop({
+          store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]),
+          resolveValidationAuthority: reviewAuthority,
+          resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+        }, original.id, { maxAttempts: 3, now: () => T0 });
+        assert.equal(result.outcome, 'needs_human');
+        assert.equal(result.run.interrupt?.reason, concurrent.interrupt?.reason);
+        assert.deepEqual(store.read(original.id), concurrent, 'completion or failure telemetry must use CAS and preserve concurrent Run state');
+      });
     }
   });
 
@@ -829,7 +926,11 @@ describe('runReviewLoop', () => {
   });
 
   it('durably parks stale repair admission when CAS is unavailable without calling a writer or reviewer', async () => {
-    const store = new MemoryStore();
+    const backing = new MemoryStore();
+    const store: RunStore = {
+      name: 'no-cas', create: (run) => backing.create(run), read: (id) => backing.read(id),
+      update: (run) => backing.update(run), list: () => backing.list(), delete: (id) => backing.delete(id),
+    };
     const run = repairChangesRun('repair-no-cas');
     store.create(run);
     const implementation = new FakeImplementation([]);

@@ -20,7 +20,7 @@ import {
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUEST_DECISION } from '../domain/decisions.js';
-import { parkBootstrapFailure } from '../workflow/bootstrap-failure.js';
+import { createBootstrapFailureRun, parkBootstrapFailure } from '../workflow/bootstrap-failure.js';
 import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 
 export interface ReviewLoopDependencies {
@@ -39,6 +39,8 @@ export interface ReviewLoopDependencies {
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
   /** Provider-neutral mutation fence rechecked immediately before a repair worker starts. */
   readonly assertCanMutate?: (workspacePath?: string) => void;
+  /** Generation-only recheck after uncertainty is marked; must not strengthen evidence. */
+  readonly assertCurrentMutation?: () => void;
   /**
    * Resolves only the provider-neutral profile selected by explicit repair
    * authority. It is intentionally absent for legacy runs, which have no
@@ -112,8 +114,15 @@ function renderFailure(prefix: string, error: unknown): string {
   return `${prefix}${code === null ? '' : ` (${code})`}: ${errorMessage(error)}`;
 }
 
-function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => string): ReviewLoopResult {
+function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => string, expected?: Run): ReviewLoopResult {
   const executor = isWorkspaceGuardFailure(error) ? error.executor ?? run.executor : run.executor;
+  if (expected !== undefined) {
+    const parked = createBootstrapFailureRun(run, error, now, executor);
+    if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(expected, parked.run)) {
+      return parkStaleRepairAdmission(run.id, expected, store, now);
+    }
+    return { outcome: 'needs_human', ...parked };
+  }
   const parked = parkBootstrapFailure(run, error, store, now, executor);
   return { outcome: 'needs_human', ...parked };
 }
@@ -495,20 +504,16 @@ export async function runReviewLoop(
       }, now());
       const beforeSpawn = run;
       run = workerSpawn.run;
-      // Admission's CAS also fenced IMPLEMENTING, but telemetry is another
-      // durable transition before the side effect. Re-fence it so a later
-      // cancellation/park cannot be overwritten or followed by a worker.
-      if (authority !== undefined) {
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(beforeSpawn, run)) {
-          return parkStaleRepairAdmission(run.id, beforeSpawn, store, now);
-        }
-      } else {
-        store.update(run);
+      // Fence the telemetry handoff in every mode, then fence it again after
+      // awaited capability resolution immediately before entering the worker.
+      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(beforeSpawn, run)) {
+        return parkStaleRepairAdmission(run.id, beforeSpawn, store, now);
       }
-      const recordWorkerInvocationFailure = (error: unknown): ReviewLoopResult => {
-        if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now);
+      const workerHandoff = run;
+      const recordWorkerInvocationFailure = (error: unknown): ReviewLoopResult | null => {
+        if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now, workerHandoff);
         const detail = error instanceof Error ? error.message : String(error);
-        run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+        const failed = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult({
           exitStatus: 'failure',
           summary: detail,
           diagnostics: ['AGENT_RUNTIME_INVOCATION_FAILED: provider invocation threw before returning an AgentResult'],
@@ -517,20 +522,37 @@ export async function runReviewLoop(
           ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
           ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
         }, 'worker', workerSpawn.invocationId), now());
-        store.update(run);
-        throw error;
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, failed)) {
+          return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+        }
+        run = failed;
+        return null;
       };
       let capabilities;
       try {
         capabilities = isolatedLuna ? undefined : await deps.resolveImplementationCapabilities?.();
       } catch (error) {
-        return recordWorkerInvocationFailure(error);
+        const outcome = recordWorkerInvocationFailure(error);
+        if (outcome !== null) return outcome;
+        throw error;
       }
-      options.onExecutionStart?.();
-      // The execution-start callback records uncertainty; capability
-      // resolution may have yielded while ownership changed. Recheck the
-      // provider-neutral mutation fence immediately before the worker call.
-      deps.assertCanMutate?.(run.bootstrap?.workspacePath);
+      // Strengthen physical workspace evidence while execution is still
+      // provably pre-worker, so a normal overlap rejection can release the
+      // admission generation through the CLI pre-execution path.
+      try {
+        deps.assertCanMutate?.(run.bootstrap?.workspacePath);
+        options.onExecutionStart?.();
+        // The callback marks uncertainty and can race with ownership changes.
+        // Recheck only the generation now; evidence is already strengthened.
+        deps.assertCurrentMutation?.();
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, workerHandoff)) {
+          return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+        }
+      } catch (error) {
+        const outcome = recordWorkerInvocationFailure(error);
+        if (outcome !== null) return outcome;
+        throw error;
+      }
       let fixResult;
       try {
         fixResult = await implementation.run({
@@ -542,18 +564,23 @@ export async function runReviewLoop(
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
       } catch (error) {
-        return recordWorkerInvocationFailure(error);
+        const outcome = recordWorkerInvocationFailure(error);
+        if (outcome !== null) return outcome;
+        throw error;
       }
-      run = recordCompletionTelemetry(run, createCompletionInputFromResult(fixResult, {
+      const completed = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(fixResult, {
         ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
         ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
         ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
       }, 'worker', workerSpawn.invocationId), now());
-      store.update(run);
+      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, completed)) {
+        return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+      }
+      run = completed;
       if (fixResult.exitStatus === 'failure') {
         const takeoverReason = humanTakeoverReason(fixResult);
         if (takeoverReason !== undefined) {
-          run = applyTransition(
+          const takeover = applyTransition(
             run,
             {
               type: 'escalate',
@@ -566,16 +593,18 @@ export async function runReviewLoop(
             },
             now(),
           );
-          store.update(run);
+          if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, takeover)) return parkStaleRepairAdmission(run.id, completed, store, now);
+          run = takeover;
           return { outcome: 'needs_human', run, reason: takeoverReason };
         }
-        run = applyTransition(run, { type: 'agent_failed', agentResult: fixResult, headSha: fixResult.headSha }, now());
-        store.update(run);
+        const failed = applyTransition(run, { type: 'agent_failed', agentResult: fixResult, headSha: fixResult.headSha }, now());
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, failed)) return parkStaleRepairAdmission(run.id, completed, store, now);
+        run = failed;
         return { outcome: 'failed', run, reason: `Implementation failed while fixing review findings: ${fixResult.summary}` };
       }
       if (fixResult.headSha === undefined || fixResult.headSha === run.headSha) {
         const reason = 'Implementation did not produce a new exact HEAD after review changes.';
-        run = applyTransition(
+        const noHead = applyTransition(
           run,
           {
             type: 'escalate',
@@ -587,20 +616,21 @@ export async function runReviewLoop(
           },
           now(),
         );
-        store.update(run);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, noHead)) return parkStaleRepairAdmission(run.id, completed, store, now);
+        run = noHead;
         return { outcome: 'needs_human', run, reason };
       }
 
       if (run.bootstrap !== undefined) {
         if (repairBootstrap === undefined || progressBaseSha === undefined) {
-          return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now);
+          return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now, run);
         }
         try {
           await repairBootstrap.verifyDurable({
             identity: run.bootstrap, expectedHeadSha: fixResult.headSha, progressBaseSha, workspaceGuard,
           });
         } catch (error) {
-          return parkBootstrap(run, error, store, now);
+          return parkBootstrap(run, error, store, now, run);
         }
       }
 
@@ -611,7 +641,7 @@ export async function runReviewLoop(
         validatedHead = validatedSnapshot.headSha;
       } catch (error) {
         const reason = renderFailure('GitHub live-state validation failed after the fix', error);
-        run = applyTransition(
+        const failedValidation = applyTransition(
           run,
           {
             type: 'escalate',
@@ -623,12 +653,13 @@ export async function runReviewLoop(
           },
           now(),
         );
-        store.update(run);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, failedValidation)) return parkStaleRepairAdmission(run.id, run, store, now);
+        run = failedValidation;
         return { outcome: 'needs_human', run, reason };
       }
       if (validatedHead !== fixResult.headSha) {
         const reason = `Live GitHub HEAD ${validatedHead ?? '(none)'} does not match the fix HEAD ${fixResult.headSha}.`;
-        run = applyTransition(
+        const movedHead = applyTransition(
           run,
           {
             type: 'escalate',
@@ -642,22 +673,25 @@ export async function runReviewLoop(
           },
           now(),
         );
-        store.update(run);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, movedHead)) return parkStaleRepairAdmission(run.id, run, store, now);
+        run = movedHead;
         return { outcome: 'needs_human', run, reason };
       }
       const conflict = pullRequestIdentityConflict(run, validatedSnapshot!, { allowHeadAdvance: true });
       if (conflict !== null || validatedSnapshot!.pullRequest === null ||
         (run.pullRequest !== undefined && validatedSnapshot!.pullRequest.number !== run.pullRequest.number)) {
         const reason = conflict ?? 'Live pull request disappeared or changed after the review fix.';
-        run = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] } }, now());
-        store.update(run);
+        const identityConflict = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] } }, now());
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, identityConflict)) return parkStaleRepairAdmission(run.id, run, store, now);
+        run = identityConflict;
         return { outcome: 'needs_human', run, reason };
       }
-      run = applyTransition(run, {
+      const fixed = applyTransition(run, {
         type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha,
         pullRequest: { number: validatedSnapshot!.pullRequest.number, headSha: fixResult.headSha },
       }, now());
-      store.update(run);
+      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, fixed)) return parkStaleRepairAdmission(run.id, run, store, now);
+      run = fixed;
       // A new fix creates a new exact HEAD. Validation is owned by the outer
       // workflow so it must collect fresh local and hosted evidence before a
       // reviewer can see that HEAD.
