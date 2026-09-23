@@ -25,6 +25,31 @@ export interface DispatchExecution {
   readonly state: WorkflowState;
 }
 
+/** Bounded control-plane evidence; contains no generation token or filesystem path. */
+export interface DispatchAdmissionObservation {
+  readonly schemaVersion: 1;
+  /** Current read-only snapshot revision. */
+  readonly revision: number;
+  /** Revision at which this request was parked or found a conflict. */
+  readonly decisionRevision: number;
+  readonly missionId: string;
+  readonly laneId: string;
+  readonly role: 'production_captain';
+  readonly counts: { readonly captains: number; readonly writers: number; readonly highAutonomy: number; readonly parked: number };
+  readonly limits: { readonly maxCaptains: number; readonly maxWriters: number; readonly maxHighAutonomy: number; readonly maxPerRepository?: number };
+  readonly result: 'parked' | 'duplicate';
+  readonly reason: string;
+  readonly lastTransition: { readonly kind: string; readonly laneId?: string; readonly at: string } | null;
+}
+
+/** Nonterminal typed hold returned when a durable dispatch Run lacks admission. */
+export class DispatchAdmissionWaitError extends Error {
+  constructor(readonly runId: string, readonly laneId: string, readonly waitKind: 'capacity' | 'owner', message: string, readonly admission?: DispatchAdmissionObservation) {
+    super(message);
+    this.name = 'DispatchAdmissionWaitError';
+  }
+}
+
 export interface DispatchOnceOptions {
   readonly queueBody: string;
   readonly owner: string;
@@ -43,6 +68,7 @@ export type DispatchOnceResult =
   | { readonly outcome: 'maintenance_hold'; readonly reason: string }
   | { readonly outcome: 'no_eligible_work'; readonly reasons: readonly string[] }
   | { readonly outcome: 'existing_claim'; readonly claim: DispatchRuntimeClaim }
+  | { readonly outcome: 'admission_wait'; readonly waitKind: 'capacity' | 'owner'; readonly entry: DispatchQueueEntry; readonly runId: string; readonly claim: DispatchRuntimeClaim; readonly reason: string; readonly admission?: DispatchAdmissionObservation }
   | { readonly outcome: 'dispatched'; readonly entry: DispatchQueueEntry; readonly claim: DispatchRuntimeClaim; readonly execution: DispatchExecution };
 
 function target(entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>) {
@@ -61,8 +87,8 @@ function activeRun(store: RunStore, entry: DispatchQueueEntry, options: Pick<Dis
 function claimedRun(store: RunStore, claim: DispatchRuntimeClaim, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): Run | null {
   if (claim.runId !== null) {
     const run = store.read(claim.runId);
-    if (run === null || !isTarget(run, entry, options)) {
-      throw new DispatchProtocolError('Dispatch runtime claim names a missing or different durable run; refusing recovery.');
+    if (run === null || !isTarget(run, entry, options) || run.dispatchClaimId !== claim.claimId) {
+      throw new DispatchProtocolError('Dispatch runtime claim names a missing, differently targeted, or differently claimed durable run; refusing recovery.');
     }
     return run;
   }
@@ -195,7 +221,7 @@ async function executeWithHeartbeat(
   entry: DispatchQueueEntry,
   existing: Run | null,
   claim: DispatchRuntimeClaim,
-): Promise<{ readonly claim: DispatchRuntimeClaim; readonly execution: DispatchExecution }> {
+): Promise<{ readonly claim: DispatchRuntimeClaim; readonly execution: DispatchExecution } | { readonly wait: DispatchAdmissionWaitError; readonly claim: DispatchRuntimeClaim }> {
   let activeClaim = await refreshClaim(options.runtime, commentId, claim, options.now(), options.leaseDurationMs);
   let heartbeatFailure: unknown = null;
   let heartbeat = Promise.resolve();
@@ -210,6 +236,22 @@ async function executeWithHeartbeat(
     try {
       execution = await options.execute(entry, existing, activeClaim);
     } catch (error) {
+      if (error instanceof DispatchAdmissionWaitError) {
+        if (activeClaim.runId !== null && activeClaim.runId !== error.runId) throw new DispatchProtocolError('Admission wait Run does not match the retained dispatch claim.');
+        clearInterval(interval);
+        await heartbeat;
+        if (heartbeatFailure !== null) {
+          const message = heartbeatFailure instanceof Error ? heartbeatFailure.message : String(heartbeatFailure);
+          throw new DispatchProtocolError(`Claim ${activeClaim.claimId} could not be kept alive during admission wait: ${message}`);
+        }
+        const waiting: DispatchRuntimeClaim = { ...activeClaim, runId: error.runId, state: 'claimed', heartbeatAt: options.now(), leaseUntil: new Date(Date.parse(options.now()) + options.leaseDurationMs).toISOString() };
+        await options.runtime.updateRuntimeComment(commentId, renderDispatchRuntime(waiting));
+        const observed = selectDispatchRuntime(await options.runtime.listRuntimeComments());
+        if (observed === null || observed.id !== commentId || observed.claim.claimId !== activeClaim.claimId || observed.claim.runId !== error.runId || observed.claim.state !== 'claimed') {
+          throw new DispatchProtocolError('Dispatch admission wait did not retain the exact claim and Run identity.');
+        }
+        return { wait: error, claim: observed.claim };
+      }
       const message = error instanceof Error ? error.message : String(error);
       throw new DispatchProtocolError(`Claim ${activeClaim.claimId} was retained but execution could not start safely: ${message}`);
     }
@@ -269,6 +311,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
         }
         const claim = await supersedeTerminalClaim(options.runtime, existing.id, queued, options);
         const dispatched = await executeWithHeartbeat(options, existing.id, queued, checked.run, claim);
+        if ('wait' in dispatched) return { outcome: 'admission_wait', waitKind: dispatched.wait.waitKind, entry: queued, runId: dispatched.wait.runId, claim: dispatched.claim, reason: dispatched.wait.message, ...(dispatched.wait.admission === undefined ? {} : { admission: dispatched.wait.admission }) };
         return { outcome: 'dispatched', entry: queued, ...dispatched };
       }
       return { outcome: 'no_eligible_work', reasons };
@@ -276,6 +319,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     const run = claimedRun(options.store, existing.claim, entry, options);
     if (run === null || !isSettledRun(run)) {
       const dispatched = await executeWithHeartbeat(options, existing.id, entry, run, existing.claim);
+      if ('wait' in dispatched) return { outcome: 'admission_wait', waitKind: dispatched.wait.waitKind, entry, runId: dispatched.wait.runId, claim: dispatched.claim, reason: dispatched.wait.message, ...(dispatched.wait.admission === undefined ? {} : { admission: dispatched.wait.admission }) };
       return { outcome: 'dispatched', entry, ...dispatched };
     }
 
@@ -304,6 +348,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       }
       const claim = await supersedeTerminalClaim(options.runtime, existing.id, queued, options);
       const dispatched = await executeWithHeartbeat(options, existing.id, queued, checked.run, claim);
+      if ('wait' in dispatched) return { outcome: 'admission_wait', waitKind: dispatched.wait.waitKind, entry: queued, runId: dispatched.wait.runId, claim: dispatched.claim, reason: dispatched.wait.message, ...(dispatched.wait.admission === undefined ? {} : { admission: dispatched.wait.admission }) };
       return { outcome: 'dispatched', entry: queued, ...dispatched };
     }
     await retireTerminalClaim(options.runtime, existing.id, reconciled, options.now());
@@ -327,6 +372,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       ...(options.createClaimId === undefined ? {} : { createClaimId: options.createClaimId }),
     });
     const dispatched = await executeWithHeartbeat(options, claimed.commentId, entry, checked.run, claimed.claim);
+    if ('wait' in dispatched) return { outcome: 'admission_wait', waitKind: dispatched.wait.waitKind, entry, runId: dispatched.wait.runId, claim: dispatched.claim, reason: dispatched.wait.message, ...(dispatched.wait.admission === undefined ? {} : { admission: dispatched.wait.admission }) };
     return { outcome: 'dispatched', entry, ...dispatched };
   }
   return { outcome: 'no_eligible_work', reasons };

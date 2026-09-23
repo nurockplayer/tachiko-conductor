@@ -27,6 +27,7 @@ import type { RunStore } from '../store/json-file-store.js';
 import { parkBootstrapFailure } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
 import { evaluateHostedCheckPolicy } from '../validation/hosted-policy.js';
+import { canonicalizeMissionEvidence, type AdmissionToken, type MissionAdmissionRegistry, type MissionEvidence } from '../mission-admission/registry.js';
 
 export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
@@ -54,6 +55,42 @@ export interface WorkflowOptions {
   readonly now?: () => string;
   /** Optional run-scoped thresholds for deterministic efficiency warnings. */
   readonly telemetryThresholds?: Partial<Omit<EfficiencyThresholds, 'revision'>> & { readonly revision?: string };
+  /** Called immediately before a model, reviewer, or other delegated execution boundary. */
+  readonly onExecutionStart?: () => void;
+  /** Host admission capability enforced at mutation and publication boundaries. */
+  readonly admissionFence?: { readonly registry: MissionAdmissionRegistry; readonly token: AdmissionToken; readonly productionMissionId: string; readonly executionWorkspace?: string };
+}
+
+function runAdmissionEvidence(run: Run, additional: { readonly pullRequest?: number; readonly workspace?: string } = {}): MissionEvidence {
+  const base = {
+    repository: `${run.target.owner}/${run.target.repo}`,
+    run: run.id,
+    ...(run.dispatchClaimId === undefined ? {} : { claim: run.dispatchClaimId }),
+    ...(run.pullRequest === undefined ? {} : { pullRequest: run.pullRequest.number }),
+    ...(run.bootstrap === undefined ? {} : { workspace: run.bootstrap.workspacePath }),
+    ...(additional.pullRequest === undefined ? {} : { pullRequest: additional.pullRequest }),
+    ...(additional.workspace === undefined ? {} : { workspace: additional.workspace }),
+  };
+  return canonicalizeMissionEvidence(run.target.kind === 'issue'
+    ? { ...base, issue: run.target.issueNumber }
+    : { ...base, claim: `branch:${run.target.branch}` });
+}
+
+function strengthenAdmissionEvidence(options: WorkflowOptions, run: Run, additional: { readonly pullRequest?: number; readonly workspace?: string } = {}): void {
+  const fence = options.admissionFence;
+  if (fence !== undefined) fence.registry.strengthen(fence.token, runAdmissionEvidence(run, additional));
+}
+
+function assertMutationAdmission(options: WorkflowOptions, run?: Run, workspace?: string): void {
+  const fence = options.admissionFence;
+  if (fence === undefined) return;
+  if (run !== undefined) strengthenAdmissionEvidence(options, run, workspace === undefined ? {} : { workspace });
+  fence.registry.assertCanMutate(fence.token);
+}
+
+function assertPublicationAdmission(options: WorkflowOptions): void {
+  const fence = options.admissionFence;
+  if (fence !== undefined) fence.registry.assertCanPublish(fence.token, fence.productionMissionId);
 }
 
 export type WorkflowOutcome =
@@ -192,15 +229,20 @@ async function validateExactHead(
   snapshot: GitHubLiveSnapshot,
   validation: ValidationAdapter | undefined,
   hostedPolicy: HostedCheckPolicyConfiguration | undefined,
+  onExecutionStart?: () => void,
 ): Promise<ValidationResult> {
   if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
   const reusable = run.validationResult;
-  const local = reusable?.headSha === run.headSha && reusable.local.status === 'passed' &&
+  let local = reusable?.headSha === run.headSha && reusable.local.status === 'passed' &&
     validation !== undefined && validation.configRevision.trim() !== '' && reusable.local.configRevision === validation.configRevision
     ? reusable.local
     : validation === undefined
       ? unavailableLocalValidation()
-      : await validation.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+      : undefined;
+  if (local === undefined) {
+    onExecutionStart?.();
+    local = await validation!.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+  }
   return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
 }
 
@@ -367,6 +409,10 @@ export async function runWorkflow(
             initialRecoveryCandidate = { number: snapshot.pullRequest!.number, baseSha: snapshot.pullRequest!.baseSha, headSha: snapshot.headSha! };
           }
         }
+        if (bootstrap === undefined && (run.pullRequest !== undefined || run.headSha !== undefined)) {
+          const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (conflict !== null) return park(run, conflict, store, now);
+        }
         if (pendingRepair && snapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
@@ -384,6 +430,7 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
+        if (snapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number });
 
         if ((
           !pendingRepair && (snapshot.pullRequest === null || effectiveExecution?.executor === 'luna-isolated') ||
@@ -407,6 +454,10 @@ export async function runWorkflow(
             bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: authoritativeBaseBranch,
               baseSha: authoritativeBaseSha, ...(publicationBranch === undefined ? {} : { publicationBranch }) });
             assertBootstrapBoundary(bootstrap, bootstrapAdapter);
+            strengthenAdmissionEvidence(options, run, {
+              ...(snapshot.pullRequest === null ? {} : { pullRequest: snapshot.pullRequest.number }),
+              workspace: bootstrap.workspacePath,
+            });
             run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
             store.update(run);
             if (pendingRepair) recoveryAuthority = { expectedHeadSha: run.headSha! };
@@ -418,6 +469,8 @@ export async function runWorkflow(
           if (bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
           try {
             assertBootstrapBoundary(bootstrap, bootstrapAdapter);
+            options.onExecutionStart?.();
+            assertMutationAdmission(options, run, bootstrap.workspacePath);
             bootstrap = await bootstrapAdapter.prepare({
               runId: run.id, target, baseBranch: bootstrap.baseBranch, baseSha: bootstrap.baseSha,
               existing: bootstrap, ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
@@ -431,6 +484,7 @@ export async function runWorkflow(
           if (snapshot.pullRequest !== null) {
             const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
             if (conflict !== null) return park(run, conflict, store, now);
+            strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number, workspace: bootstrap.workspacePath });
             if (run.headSha === undefined) {
               if (initialRecoveryCandidate !== undefined &&
                   (snapshot.pullRequest.number !== initialRecoveryCandidate.number ||
@@ -439,6 +493,8 @@ export async function runWorkflow(
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
               }
               try {
+                options.onExecutionStart?.();
+                assertMutationAdmission(options, run, bootstrap.workspacePath);
                 await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard,
                   ...(bootstrap.bootstrapKind === 'standalone-isolated' ? { adoptExistingHead: true, progressBaseSha: bootstrap.baseSha } : {}) });
               } catch (error) {
@@ -524,11 +580,22 @@ export async function runWorkflow(
         store.update(run);
         let result: AgentResult;
         try {
+          const capabilities = isIsolatedLuna ? undefined : await deps.resolveImplementationCapabilities?.();
+          const executionWorkspace = bootstrap?.workspacePath ?? options.admissionFence?.executionWorkspace;
+          if (options.admissionFence !== undefined && executionWorkspace === undefined) {
+            throw new Error('Mission admission cannot authorize an unbootstrapped worker without an explicit execution workspace.');
+          }
+          strengthenAdmissionEvidence(options, run, {
+            ...(snapshot.pullRequest === null ? {} : { pullRequest: snapshot.pullRequest.number }),
+            ...(executionWorkspace === undefined ? {} : { workspace: executionWorkspace }),
+          });
+          options.onExecutionStart?.();
+          assertMutationAdmission(options, run, executionWorkspace);
           result = await implementation.run({
             target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target', instructions: boundedInstructions,
             ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
-            ...(isIsolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
+            ...(capabilities === undefined ? {} : { capabilities }),
             // #92 deliberately qualifies fresh bounded Luna workers.  A
             // repair/re-entry therefore cannot pretend its prior CLI thread
             // is a durable continuation; its explicit exact-HEAD bootstrap
@@ -589,11 +656,15 @@ export async function runWorkflow(
         if (bootstrap !== undefined) {
           if (result.headSha === undefined || bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
           try {
+            options.onExecutionStart?.();
+            assertMutationAdmission(options);
             await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
             if ((run.execution?.executor === 'worker-router' || run.execution?.executor === 'luna-isolated') && snapshot.pullRequest === null) {
               if (deps.github.createImplementationPullRequest === undefined) {
                 return bootstrapFailureOutcome(run, new Error('Isolated implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
               }
+              options.onExecutionStart?.();
+              assertPublicationAdmission(options);
               await deps.github.createImplementationPullRequest({
                 target,
                 headBranch: bootstrap.branch,
@@ -610,6 +681,7 @@ export async function runWorkflow(
           if (conflict !== null || snapshot.pullRequest === null || snapshot.headSha !== result.headSha) {
             return park(run, conflict ?? 'Live pull request does not prove the implementation exact HEAD.', store, now);
           }
+          strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number, workspace: bootstrap.workspacePath });
           run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha, pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha } }, now());
         } else {
           // An implementation result is only a claim.  Re-read the live PR
@@ -625,6 +697,10 @@ export async function runWorkflow(
             pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true }) !== null) {
             return park(run, 'Live pull request does not prove the implementation exact HEAD and accepted PR identity.', store, now);
           }
+          strengthenAdmissionEvidence(options, run, {
+            pullRequest: snapshot.pullRequest.number,
+            ...(options.admissionFence?.executionWorkspace === undefined ? {} : { workspace: options.admissionFence.executionWorkspace }),
+          });
           run = applyTransition(run, {
             type: 'agent_succeeded', agentResult: result, headSha: result.headSha,
             pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha },
@@ -655,6 +731,7 @@ export async function runWorkflow(
         }
         const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
         if (conflict !== null) return park(run, conflict, store, now);
+        if (snapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number });
         if (snapshot.pullRequest === null || snapshot.headSha === null || snapshot.headSha !== run.headSha) {
           const reason =
             snapshot.pullRequest === null || snapshot.headSha === null
@@ -688,10 +765,13 @@ export async function runWorkflow(
           }
           try {
             assertBootstrapBoundary(run.bootstrap, bootstrapAdapter);
+            options.onExecutionStart?.();
+            assertMutationAdmission(options);
             const identity = await bootstrapAdapter.prepare({
               runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
               existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },
             });
+            assertMutationAdmission(options);
             await bootstrapAdapter.verifyDurable({ identity, expectedHeadSha: run.headSha });
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -699,7 +779,7 @@ export async function runWorkflow(
         }
         let validationResult: ValidationResult;
         try {
-          validationResult = await validateExactHead(run, target, snapshot, deps.validation, deps.hostedCheckPolicy);
+          validationResult = await validateExactHead(run, target, snapshot, deps.validation, deps.hostedCheckPolicy, options.onExecutionStart);
         } catch (error) {
           const reason = `Local validation could not be observed safely: ${error instanceof Error ? error.message : String(error)}`;
           validationResult = combineValidation(
@@ -733,6 +813,7 @@ export async function runWorkflow(
         }
         const postValidationConflict = pullRequestIdentityConflict(run, postValidationSnapshot);
         if (postValidationConflict !== null) return park(run, postValidationConflict, store, now);
+        if (postValidationSnapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: postValidationSnapshot.pullRequest.number });
         if (postValidationSnapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD changed during validation from ${run.headSha ?? '(none)'} to ${postValidationSnapshot.headSha ?? '(none)'}.`;
           return park(run, reason, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
@@ -848,6 +929,7 @@ export async function runWorkflow(
             ['Configure a stable validation-policy identity and retry', CANCEL_RUN_DECISION],
           );
         }
+        const reviewRun = run;
         const loop = await runReviewLoop(
           {
             store,
@@ -859,11 +941,20 @@ export async function runWorkflow(
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
             resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,
+            assertCanMutate: (workspacePath) => {
+              const executionWorkspace = workspacePath ?? reviewRun.bootstrap?.workspacePath ?? options.admissionFence?.executionWorkspace;
+              if (options.admissionFence !== undefined && executionWorkspace === undefined) {
+                throw new Error('Mission admission cannot authorize an unbootstrapped repair without an explicit execution workspace.');
+              }
+              strengthenAdmissionEvidence(options, reviewRun, executionWorkspace === undefined ? {} : { workspace: executionWorkspace });
+              assertMutationAdmission(options, reviewRun, executionWorkspace);
+            },
           },
           run.id,
           {
           maxAttempts: options.maxReviewAttempts,
           now,
+          onExecutionStart: options.onExecutionStart,
           },
         );
         run = loop.run;
@@ -930,6 +1021,7 @@ export async function runWorkflow(
           store.update(run);
           return { outcome: 'needs_human', run, reason };
         }
+        if (snapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number });
 
         const currentValidationAuthority = activeValidationConfiguration(deps);
         if (!isValidationFresh(run, currentValidationAuthority)) {
@@ -1017,6 +1109,7 @@ export async function runWorkflow(
           return { outcome: 'needs_human', run, reason };
         }
 
+        assertPublicationAdmission(options);
         run = completeLiveFinalGate(run, now(), activeValidationConfiguration(deps));
         store.update(run);
         break;

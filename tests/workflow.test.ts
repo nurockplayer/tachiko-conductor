@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } from '../src/adapters/agent.js';
@@ -15,6 +18,7 @@ import type { RunStore } from '../src/store/json-file-store.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE, type ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
+import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
@@ -838,6 +842,91 @@ describe('runWorkflow', () => {
 
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'MERGE_READY');
+  });
+
+  it('rechecks publication admission after live review and before readiness is published', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-final-gate-fence-'));
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'final-gate-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admitted = registry.admit({ laneId: 'captain', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42 } });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') return;
+    try {
+      const store = new MemoryStore();
+      let run = reviewingRun(store, 'stale-final-gate-fence', HEAD);
+      run = applyTransition(run, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+      store.update(run);
+      const baseGithub = githubAdapter([HEAD]);
+      let livePublicationCalls = 0;
+      const github: GitHubAdapter = {
+        ...baseGithub,
+        async readLiveSnapshot(target) {
+          const live = await baseGithub.readLiveSnapshot(target);
+          registry.release(admitted.token, true);
+          return live;
+        },
+        async createImplementationPullRequest() { livePublicationCalls += 1; return { number: 8 }; },
+      };
+
+      await assert.rejects(runWorkflow(
+        {
+          store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([]),
+          validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+        },
+        run.id,
+        {
+          maxReviewAttempts: 1,
+          now: () => T0,
+          admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId },
+        },
+      ), /Admission generation token is stale/);
+
+      const persisted = store.read(run.id)!;
+      assert.equal(persisted.state, 'FINAL_GATE');
+      assert.equal(persisted.history.some((entry) => entry.type === 'final_gate_verified'), false);
+      assert.equal(livePublicationCalls, 0, 'stale generation cannot publish merge readiness or an implementation PR');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('strengthens from the reconciled live PR before a second Issue can start bootstrap or a worker', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-live-pr-overlap-'));
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'live-pr-overlap-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } },
+    });
+    const store = new MemoryStore();
+    const run = createRun(TARGET, T0, 'live-pr-candidate');
+    store.create(run);
+    const candidate = registry.admit({ laneId: 'run:live-pr-candidate', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42, run: run.id }, highAutonomy: true });
+    const existing = registry.admit({ laneId: 'other-issue-pr-owner', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 41, pullRequest: 7, run: 'other-run' }, highAutonomy: true });
+    assert.equal(candidate.outcome, 'admitted');
+    assert.equal(existing.outcome, 'admitted');
+    if (candidate.outcome !== 'admitted') return;
+    try {
+      const implementation = new FakeImplementation([]);
+      let publications = 0;
+      const github: GitHubAdapter = {
+        ...githubAdapter([HEAD]),
+        async createImplementationPullRequest() { publications += 1; return { number: 8 }; },
+      };
+      await assert.rejects(runWorkflow(
+        {
+          store, github, implementation, reviewer: new FakeReviewer([]),
+          bootstrap: new FakeBootstrap(), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+        },
+        run.id,
+        { maxReviewAttempts: 1, now: () => T0, admissionFence: { registry, token: candidate.token, productionMissionId: candidate.missionId, executionWorkspace: '/tmp/tachiko-ambient' } },
+      ), /Strengthened ownership evidence overlaps reserved lane "other-issue-pr-owner"/);
+      assert.equal(implementation.requests.length, 0);
+      assert.equal(publications, 0);
+      assert.equal(store.read(run.id)?.bootstrap, undefined, 'the PR overlap is rejected before workspace planning or prepare');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('returns a terminal outcome for a run already in MERGED without looping', async () => {

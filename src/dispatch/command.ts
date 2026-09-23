@@ -4,6 +4,7 @@ import type { RepairTaskShapeAuthority } from '../domain/repair-admission.js';
 import type { WorkflowDependencies, WorkflowOutcome } from '../workflow/run.js';
 import type { DispatchConfiguration } from './config.js';
 import { dispatchOnce, type DispatchOnceResult, type DispatchRuntimeApi } from './runner.js';
+import type { MissionAdmissionRegistry } from '../mission-admission/registry.js';
 
 export interface DispatchCommandRuntime extends DispatchRuntimeApi {
   readQueueComment(): Promise<string>;
@@ -13,9 +14,11 @@ export interface DispatchCommandDependencies {
   readonly workflow: WorkflowDependencies;
   readonly runtime: DispatchCommandRuntime;
   readonly resolveExecutionProfile: (profile: string) => ResolvedExecutionConfiguration;
-  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string, repairTaskShapeAuthority: RepairTaskShapeAuthority) => Promise<WorkflowOutcome>;
+  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string, repairTaskShapeAuthority: RepairTaskShapeAuthority, admission?: MissionAdmissionRegistry) => Promise<WorkflowOutcome>;
   /** Resume the Run bound by the retained runtime claim, never a target lookup. */
-  readonly resumeClaimedRun: (run: Run) => Promise<WorkflowOutcome>;
+  readonly resumeClaimedRun: (run: Run, dispatchClaimId: string, admission?: MissionAdmissionRegistry) => Promise<WorkflowOutcome>;
+  /** Executable CLI always supplies the host-global admission registry. */
+  readonly admission?: MissionAdmissionRegistry;
   readonly now?: () => string;
 }
 
@@ -46,14 +49,14 @@ export async function dispatchOnceCommand(
         if (existing.execution.profile !== entry.profile) {
           throw new Error(`Durable run ${existing.id} profile does not match the retained dispatch claim.`);
         }
-        const outcome = await deps.resumeClaimedRun(existing);
+        const outcome = await deps.resumeClaimedRun(existing, claim.claimId, deps.admission);
         return { runId: outcome.run.id, state: outcomeState(outcome) };
       }
       const selected = deps.resolveExecutionProfile(entry.profile);
       if (entry.repairTaskShapeAuthority === undefined) {
         throw new Error(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
       }
-      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority);
+      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority, deps.admission);
       return { runId: outcome.run.id, state: outcomeState(outcome) };
     },
   });

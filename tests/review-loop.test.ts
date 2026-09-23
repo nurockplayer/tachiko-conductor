@@ -14,6 +14,7 @@ import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.j
 import type { AgentResult, ImplementationBootstrapIdentity, ReviewResult, Run } from '../src/domain/types.js';
 import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
+import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { TARGET, failureResult, successResult, validationPassed } from './helpers.js';
 
@@ -662,6 +663,55 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(store.read(initial.id)?.state, 'NEEDS_HUMAN');
     assert.equal(implementation.requests.length, 0);
+  });
+
+  it('rechecks mutation admission after capability resolution and before a repair worker starts', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-review-repair-fence-'));
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'review-repair-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admitted = registry.admit({ laneId: 'captain', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42 } });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') return;
+    try {
+      const run = repairChangesRun('stale-repair-fence');
+      const store = new CasMemoryStore();
+      store.create(run);
+      const implementation = new FakeImplementation([successResult(HEAD2)]);
+      const reviewer = new FakeReviewer([]);
+      let capabilityResolutions = 0;
+      let executionMarkers = 0;
+      let publications = 0;
+      const github: GitHubAdapter = {
+        ...githubAdapter([HEAD, HEAD, HEAD]),
+        async createImplementationPullRequest() { publications += 1; return { number: 8 }; },
+      };
+
+      await assert.rejects(runReviewLoop(
+        {
+          store, github, implementation, reviewer, resolveValidationAuthority: reviewAuthority,
+          resolveImplementationCapabilities: async () => { capabilityResolutions += 1; return []; },
+          resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+          assertCanMutate: () => registry.assertCanMutate(admitted.token),
+        },
+        run.id,
+        {
+          maxAttempts: 3,
+          now: () => T0,
+          // Simulate the host losing this generation after the persisted
+          // initial implementation/review, at the uncertainty marker.
+          onExecutionStart: () => { executionMarkers += 1; registry.release(admitted.token, true); },
+        },
+      ), /Admission generation token is stale/);
+      assert.equal(capabilityResolutions, 1, 'non-mutating capability resolution precedes the final fence');
+      assert.equal(executionMarkers, 1, 'the marker does not itself grant authority');
+      assert.equal(implementation.requests.length, 0, 'stale ownership prevents the repair worker from starting');
+      assert.equal(reviewer.requests.length, 0);
+      assert.equal(publications, 0, 'no repair publication can follow the rejected worker boundary');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('parks decision-shaped authority with only a terminal choice', async () => {

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
@@ -75,6 +77,7 @@ import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
 import { StandaloneGitBootstrap } from './workspace/standalone-git-bootstrap.js';
 import { resolveDispatchConfiguration } from './dispatch/config.js';
 import { dispatchOnceCommand } from './dispatch/command.js';
+import { DispatchAdmissionWaitError, type DispatchAdmissionObservation } from './dispatch/runner.js';
 import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/continuous.js';
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
@@ -98,7 +101,10 @@ import {
 } from './workflow/wait-command.js';
 import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
 import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
-import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, readOperationalRuntimeProjection, registerManualLane, setMaintenanceHold, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
+import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, readOperationalRuntimeProjection, registerManualLane, retireManualLane, setMaintenanceHold, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
+import { createHostAdmissionRegistry, resolveManualOwnerReceiptPath } from './mission-admission/host-registry.js';
+import { canonicalizeMissionEvidence, type AdmissionToken, type MissionAdmissionRegistry } from './mission-admission/registry.js';
+import { readManualOwnerReceipt, validateManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from './mission-admission/manual-owner-receipt.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -113,6 +119,11 @@ Usage:
   tachiko run projections rebuild
   tachiko dispatch once
   tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
+  tachiko dispatch admission status
+  tachiko dispatch manual register
+  tachiko dispatch manual park --stopped
+  tachiko dispatch manual retire --stopped --expected-generation <n>
+  tachiko dispatch manual recover --receipt-stdin
   tachiko dispatch wake
   tachiko production preflight
   tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --pnpm-program <absolute-pnpm> --dependency-artifact-path <absolute-lockfile-bound-store> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
@@ -675,11 +686,114 @@ function targetsEqual(a: Target, b: Target): boolean {
   return (b as RepositoryTarget).branch === (a as RepositoryTarget).branch;
 }
 
-/** Find an active persisted run whose target matches exactly, if any. */
+/** Find a unique active persisted run whose target matches exactly, if any. */
 export function findRunByTarget(store: RunStore, target: Target): Run | null {
-  return store.list().find((run) =>
+  const matches = store.list().filter((run) =>
     targetsEqual(run.target, target) && run.state !== 'MERGED' && run.state !== 'FAILED',
-  ) ?? null;
+  );
+  if (matches.length > 1) throw new Error(`Multiple active durable Runs overlap target ${target.kind === 'issue' ? `${target.owner}/${target.repo}#${target.issueNumber}` : `${target.owner}/${target.repo}:${target.branch}`}; refusing ambiguous ownership.`);
+  return matches[0] ?? null;
+}
+
+function evidenceForRun(run: Run, additional: { readonly pullRequest?: number; readonly workspace?: string } = {}): ReturnType<typeof canonicalizeMissionEvidence> {
+  const shared = {
+    repository: `${run.target.owner}/${run.target.repo}`,
+    run: run.id,
+    ...(run.dispatchClaimId === undefined ? {} : { claim: run.dispatchClaimId }),
+    ...(run.pullRequest === undefined ? {} : { pullRequest: run.pullRequest.number }),
+    ...(run.bootstrap === undefined ? {} : { workspace: run.bootstrap.workspacePath }),
+    ...(additional.pullRequest === undefined ? {} : { pullRequest: additional.pullRequest }),
+    ...(additional.workspace === undefined ? {} : { workspace: additional.workspace }),
+  };
+  return canonicalizeMissionEvidence(run.target.kind === 'issue'
+    ? { ...shared, issue: run.target.issueNumber }
+    : { ...shared, claim: `branch:${run.target.branch}` });
+}
+
+/** Public, bounded admission status. Physical surfaces and capability tokens are intentionally omitted. */
+export function dispatchAdmissionStatus(registry: MissionAdmissionRegistry) {
+  const snapshot = registry.snapshot();
+  return {
+    schemaVersion: snapshot.schemaVersion,
+    revision: snapshot.revision,
+    counts: snapshot.counts,
+    limits: snapshot.limits,
+    omittedLaneCount: snapshot.omittedLaneCount,
+    lanesTruncated: snapshot.lanesTruncated,
+    lanes: snapshot.lanes.map(({ laneId, missionId, evidence, role, status, generation, highAutonomy, parkedReason }) => ({
+      laneId, missionId, role, status, generation, highAutonomy,
+      evidence: {
+        repository: evidence.repository,
+        ...(evidence.issue === undefined ? {} : { issue: evidence.issue }),
+        ...(evidence.pullRequest === undefined ? {} : { pullRequest: evidence.pullRequest }),
+        ...(evidence.repositoryScope === true ? { repositoryScope: true as const } : {}),
+      },
+      ...(parkedReason === undefined ? {} : { parkedReason }),
+    })),
+    lastTransition: snapshot.lastTransition,
+  };
+}
+
+function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run): AdmissionToken {
+  const laneId = `run:${run.id}`;
+  const result = registry.admit({ laneId, role: 'production_captain', evidence: evidenceForRun(run), highAutonomy: true });
+  if (result.outcome !== 'admitted') {
+    const snapshot = registry.snapshot();
+    const observation: DispatchAdmissionObservation = {
+      schemaVersion: 1,
+      revision: snapshot.revision,
+      decisionRevision: result.revision,
+      missionId: result.missionId,
+      laneId,
+      role: 'production_captain',
+      counts: snapshot.counts,
+      limits: snapshot.limits,
+      result: result.outcome,
+      reason: result.outcome === 'parked' ? result.reason : `overlaps:${result.conflictingLaneId}`,
+      lastTransition: snapshot.lastTransition,
+    };
+    if (result.outcome === 'parked') {
+      const detail = `Run "${run.id}" is waiting for mission admission capacity (${result.reason}).`;
+      if (run.dispatchClaimId !== undefined) throw new DispatchAdmissionWaitError(run.id, laneId, 'capacity', detail, observation);
+      throw new Error(`Run "${run.id}" cannot enter mission admission: ${detail}`);
+    }
+    const conflict = registry.readLane(result.conflictingLaneId);
+    if (conflict?.role === 'production_captain' && conflict.evidence.repositoryScope === true && conflict.evidence.repository === `${run.target.owner}/${run.target.repo}`.toLowerCase()) {
+      const detail = `Run "${run.id}" is waiting for repository ownership held by manual lane "${conflict.laneId}".`;
+      if (run.dispatchClaimId !== undefined) throw new DispatchAdmissionWaitError(run.id, laneId, 'owner', detail, observation);
+      throw new Error(`Run "${run.id}" cannot enter mission admission: ${detail}`);
+    }
+    throw new Error(`Run "${run.id}" cannot enter mission admission: overlaps active or parked lane "${result.conflictingLaneId}".`);
+  }
+  return result.token;
+}
+
+function settleRunAdmission(registry: MissionAdmissionRegistry, token: AdmissionToken, run: Run): void {
+  if (run.state === 'FAILED' || run.state === 'MERGED') registry.release(token, true);
+  else registry.park(token, run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled');
+}
+
+export function parseGitHubRepositoryRemote(remote: string): string {
+  const trimmed = remote.trim();
+  let ownerRepo: string | null = null;
+  const scp = /^git@github\.com:([^?#]+)$/i.exec(trimmed);
+  if (scp) ownerRepo = scp[1]!;
+  else {
+    try {
+      const url = new URL(trimmed);
+      const validCredentials = url.protocol === 'https:' ? url.username === '' && url.password === '' : (url.username === '' || url.username === 'git') && url.password === '';
+      if (url.hostname.toLowerCase() !== 'github.com' || !validCredentials || url.search !== '' || url.hash !== '' || (url.protocol !== 'https:' && url.protocol !== 'ssh:')) {
+        throw new Error('remote must be a direct GitHub HTTPS or SSH URL');
+      }
+      ownerRepo = url.pathname.replace(/^\//, '');
+    } catch (error) {
+      if (error instanceof Error && error.message === 'remote must be a direct GitHub HTTPS or SSH URL') throw error;
+      throw new Error('Cannot resolve repository identity from git remote.origin.url.');
+    }
+  }
+  const normalized = ownerRepo?.replace(/\/+$/, '').replace(/\.git$/i, '').toLowerCase();
+  if (!normalized || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(normalized)) throw new Error('Git remote does not identify exactly one GitHub owner/repository.');
+  return normalized;
 }
 
 export interface WorkflowCommandOptions {
@@ -693,6 +807,10 @@ export interface WorkflowCommandOptions {
   readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
   /** Optional run-scoped efficiency-signal thresholds. */
   readonly telemetryThresholds?: WorkflowOptions['telemetryThresholds'];
+  /** Optional seam for helper-level tests; executable CLI always supplies the host registry. */
+  readonly admission?: MissionAdmissionRegistry;
+  /** Physical ambient provider cwd when execution has no prepared workspace. */
+  readonly admissionWorkspace?: string;
 }
 
 /**
@@ -706,15 +824,13 @@ export async function runIssueCommand(
   options: WorkflowCommandOptions = {},
 ): Promise<WorkflowOutcome> {
   const target = parseIssueRef(ref);
-  let run = deps.store.list().find((candidate) =>
-    targetsEqual(candidate.target, target) && candidate.state !== 'MERGED' && candidate.state !== 'FAILED',
-  ) ?? null;
-  if (options.dispatchClaimId !== undefined && run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
+  let run = findRunByTarget(deps.store, target);
+  if (run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
     throw new Error(`Active durable run "${run.id}" is not bound to dispatch claim "${options.dispatchClaimId}"; refusing ambiguous recovery.`);
   }
+  const isNewRun = run === null;
   if (run === null) {
     run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId, options.repairTaskShapeAuthority);
-    deps.store.create(run);
   } else {
     if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
       throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
@@ -725,11 +841,29 @@ export async function runIssueCommand(
       throw new Error(`Run "${run.id}" already has an immutable repair task-shape authority; refusing to replace it.`);
     }
   }
-  return runWorkflow(deps, run.id, {
-    maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
-    now: options.now,
-    ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
-  });
+  // Dispatch runs are the durable intent attached to the runtime claim. Write
+  // that READY Run before admission so a capacity wait can be recovered by
+  // claim id without reconstructing profile or repair authority.
+  const precreatedClaimRun = isNewRun && options.dispatchClaimId !== undefined;
+  if (precreatedClaimRun) deps.store.create(run);
+  const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run);
+  let mayReleaseAsPreExecution = admissionToken !== undefined;
+  try {
+    if (isNewRun && !precreatedClaimRun) deps.store.create(run);
+    const outcome = await runWorkflow(deps, run.id, {
+      maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
+      now: options.now,
+      ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
+      onExecutionStart: () => { mayReleaseAsPreExecution = false; },
+      ...(admissionToken === undefined ? {} : { admissionFence: { registry: options.admission!, token: admissionToken, productionMissionId: options.admission!.readLane(admissionToken.laneId)!.missionId, ...(options.admissionWorkspace === undefined ? {} : { executionWorkspace: options.admissionWorkspace }) } }),
+    });
+    mayReleaseAsPreExecution = false;
+    if (admissionToken !== undefined) settleRunAdmission(options.admission!, admissionToken, outcome.run);
+    return outcome;
+  } catch (error) {
+    if (admissionToken !== undefined && mayReleaseAsPreExecution) options.admission!.release(admissionToken, true);
+    throw error;
+  }
 }
 
 /**
@@ -747,6 +881,9 @@ export async function resumeCommand(
 ): Promise<WorkflowOutcome> {
   const run = deps.store.read(id);
   if (run === null) throw new Error(`No run with id "${id}" found.`);
+  if (run.dispatchClaimId !== options.dispatchClaimId) {
+    throw new Error(`Run "${id}" is bound to dispatch claim "${run.dispatchClaimId}"; matching dispatch ownership is required to resume it.`);
+  }
   if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') {
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
@@ -755,6 +892,11 @@ export async function resumeCommand(
   if (choices.length > 0 && !choices.includes(decision)) {
     throw new Error(`Invalid decision "${decision}". Choose exactly one of: ${choices.join(' | ')}.`);
   }
+  const targetOwner = findRunByTarget(deps.store, run.target);
+  if (targetOwner !== null && targetOwner.id !== id) throw new Error(`Run "${id}" is not the unique active durable Run for its target.`);
+  const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run);
+  let mayReleaseAsPreExecution = admissionToken !== undefined;
+  try {
   const now = options.now ?? (() => new Date().toISOString());
   if (
     decision.trim() === CANCEL_RUN_DECISION &&
@@ -762,6 +904,8 @@ export async function resumeCommand(
   ) {
     const cancelled = applyTransition(run, { type: 'fail', reason: CANCEL_RUN_DECISION }, now());
     deps.store.update(cancelled);
+    mayReleaseAsPreExecution = false;
+    if (admissionToken !== undefined) settleRunAdmission(options.admission!, admissionToken, cancelled);
     return { outcome: 'failed', run: cancelled, reason: CANCEL_RUN_DECISION };
   }
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
@@ -813,11 +957,20 @@ export async function resumeCommand(
     now(),
   );
   deps.store.update(resumed);
-  return runWorkflow(deps, id, {
+  const outcome = await runWorkflow(deps, id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
     now: options.now,
     ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
+    onExecutionStart: () => { mayReleaseAsPreExecution = false; },
+    ...(admissionToken === undefined ? {} : { admissionFence: { registry: options.admission!, token: admissionToken, productionMissionId: options.admission!.readLane(admissionToken.laneId)!.missionId, ...(options.admissionWorkspace === undefined ? {} : { executionWorkspace: options.admissionWorkspace }) } }),
   });
+  mayReleaseAsPreExecution = false;
+  if (admissionToken !== undefined) settleRunAdmission(options.admission!, admissionToken, outcome.run);
+  return outcome;
+  } catch (error) {
+    if (admissionToken !== undefined && mayReleaseAsPreExecution) options.admission!.release(admissionToken, true);
+    throw error;
+  }
 }
 
 export function resumeCommandHint(runId: string, browserProfile?: string): string {
@@ -1353,14 +1506,131 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
-    if (subcommand === 'manual' && (rest[0] === 'register' || rest[0] === 'park') && rest.length === 1) {
+    if (subcommand === 'admission' && rest[0] === 'status' && rest.length === 1) {
+      console.log(JSON.stringify(dispatchAdmissionStatus(createHostAdmissionRegistry()), null, 2));
+      return 0;
+    }
+    if (subcommand === 'manual' && ['register', 'park', 'retire', 'recover'].includes(rest[0] ?? '')) {
+      const action = rest[0];
+      const stopped = rest.includes('--stopped');
+      const expectedFlag = rest.indexOf('--expected-generation');
+      const receiptStdin = rest.includes('--receipt-stdin');
+      const expectedRaw = expectedFlag >= 0 ? rest[expectedFlag + 1] : undefined;
+      if ((action === 'register' && (rest.length !== 1)) ||
+        (action === 'park' && (!stopped || rest.some((item) => item !== 'park' && item !== '--stopped'))) ||
+        (action === 'retire' && (!stopped || expectedFlag < 0 || expectedRaw === undefined || rest.length !== 4 || rest.filter((item) => item === '--expected-generation').length !== 1)) ||
+        (action === 'recover' && (!receiptStdin || rest.length !== 2))) {
+        throw new Error('Manual commands require register; park --stopped; retire --stopped --expected-generation <n>; or recover --receipt-stdin.');
+      }
+      const expectedGeneration = expectedRaw === undefined ? undefined : Number(expectedRaw);
+      if (action === 'retire' && (!Number.isSafeInteger(expectedGeneration) || expectedGeneration! <= 0)) throw new Error('--expected-generation must be a positive integer.');
+      return await withDispatchAdmissionLock(async () => {
       const worktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
       const branch = execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
       const checkpointSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
       const clean = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim() === '';
-      const repository = execFileSync('git', ['config', '--get', 'remote.origin.url'], { encoding: 'utf8' }).trim();
-      console.log(JSON.stringify(registerManualLane(resolveRunsDir(), { repository, worktree, branch, checkpointSha, clean, state: rest[0] === 'register' ? 'active' : 'parked', recoverable: clean }, new Date().toISOString())));
+      const remote = execFileSync('git', ['config', '--get', 'remote.origin.url'], { encoding: 'utf8' }).trim();
+      const repository = parseGitHubRepositoryRemote(remote);
+      const registry = createHostAdmissionRegistry();
+      const identity = canonicalizeMissionEvidence({ repository, repositoryScope: true, workspace: worktree });
+      const laneId = `manual:${createHash('sha256').update(`${repository}\0${identity.workspace}`).digest('hex').slice(0, 32)}`;
+      const receiptPath = resolveManualOwnerReceiptPath(repository, identity.workspace!);
+      const now = new Date().toISOString();
+      const manualProjection = (receipt: ManualOwnerReceipt, state: 'active' | 'parked', clean: boolean, revision?: number) => registerManualLane(resolveRunsDir(), {
+        repository, worktree: identity.workspace!, branch: receipt.branch, checkpointSha: receipt.checkpointSha,
+        clean, state, recoverable: clean, laneId, missionId: receipt.missionId,
+        ...(revision === undefined ? {} : { admissionRevision: revision }),
+      }, now);
+      if (action === 'register') {
+        const prior = registry.readLane(laneId);
+        let missionId: string;
+        let revision: number;
+        let token: AdmissionToken;
+        if (prior?.status === 'active') {
+          throw new Error(`Manual lane already has active ownership at generation ${prior.generation}; a second registration cannot reuse that capability.`);
+        } else if (prior?.status === 'parked') {
+          throw new Error(`Manual lane remains reserved at parked generation ${prior.generation} (${prior.parkedReason}); retire its exact clean checkpoint before registering again.`);
+        } else {
+          const admission = registry.admit({ laneId, role: 'production_captain', evidence: identity, highAutonomy: true });
+          if (admission.outcome !== 'admitted') throw new Error(admission.outcome === 'duplicate'
+            ? `Manual production lane overlaps active or parked lane "${admission.conflictingLaneId}".`
+            : `Manual production lane is parked by ${admission.reason}.`);
+          missionId = admission.missionId;
+          revision = admission.revision;
+          token = admission.token;
+        }
+        try {
+          const receipt: ManualOwnerReceipt = { schemaVersion: 1, laneId, missionId, repository, workspace: identity.workspace!, branch, checkpointSha, status: 'active', generation: token.generation, token };
+          writeManualOwnerReceipt(receiptPath, receipt);
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          const recovery: ManualOwnerReceipt = { schemaVersion: 1, laneId, missionId, repository, workspace: identity.workspace!, branch, checkpointSha, status: 'active', generation: token.generation, token };
+          console.log(JSON.stringify({ outcome: 'manual_receipt_write_failed', recoveryReceipt: recovery }));
+          throw new Error(`Manual lane ${laneId} generation ${token.generation} is fenced, but its private owner receipt could not be saved. Preserve the fence and run dispatch manual recover --receipt-stdin with the structured recoveryReceipt from stdout: ${detail}`);
+        }
+        let projection: ReturnType<typeof registerManualLane>;
+        try { projection = manualProjection(readManualOwnerReceipt(receiptPath)!, 'active', clean, revision); }
+        catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(`Manual lane ${laneId} generation ${token.generation} has a private owner receipt at ${receiptPath}, but projection publication failed; preserve the fence and retry reconciliation: ${detail}`);
+        }
+        console.log(JSON.stringify({ projection, laneId, missionId, admissionRevision: revision, ownerReceiptPath: receiptPath }));
+        return 0;
+      }
+      if (action === 'recover') {
+        let parsed: unknown;
+        try { parsed = JSON.parse(readFileSync(0, 'utf8')); } catch { throw new Error('Manual recovery stdin must contain one strict JSON ManualOwnerReceipt.'); }
+        if (!validateManualOwnerReceipt(parsed) || parsed.status !== 'active' || parsed.laneId !== laneId || parsed.repository !== repository || parsed.workspace !== identity.workspace || parsed.token === undefined) throw new Error('Recovery receipt does not identify this active manual owner.');
+        const current = registry.readLane(laneId);
+        if (current?.status !== 'active' || current.missionId !== parsed.missionId || current.generation !== parsed.generation || current.role !== 'production_captain' || current.evidence.repositoryScope !== true || current.evidence.workspace !== identity.workspace) throw new Error('Recovery receipt is stale or does not match current registry ownership.');
+        registry.assertCanMutate(parsed.token);
+        writeManualOwnerReceipt(receiptPath, parsed);
+        const projection = manualProjection(parsed, 'active', clean, registry.snapshot().revision);
+        console.log(JSON.stringify({ projection, laneId, missionId: parsed.missionId, ownerReceiptPath: receiptPath }));
+        return 0;
+      }
+      const prior = registry.readLane(laneId);
+      const receipt = readManualOwnerReceipt(receiptPath);
+      if (receipt === null || receipt.laneId !== laneId || receipt.repository !== repository || receipt.workspace !== identity.workspace) throw new Error('Private manual owner receipt is missing or belongs to a different worktree; refusing mutation.');
+      if (action === 'park') {
+        if (!clean || !stopped || branch !== receipt.branch) throw new Error('Manual park requires the original branch and a clean stopped worktree.');
+        let generation: number;
+        let revision: number;
+        if (receipt.status === 'active' || (receipt.status === 'parking' && prior?.status === 'active')) {
+          if (!receipt.token || prior?.status !== 'active' || prior.generation !== receipt.generation || prior.missionId !== receipt.missionId) throw new Error('Manual owner receipt is stale or no longer matches active registry ownership.');
+          if (receipt.status === 'parking' && (branch !== receipt.branch || checkpointSha !== receipt.checkpointSha)) throw new Error('Interrupted manual park must resume from its exact recorded branch and HEAD checkpoint.');
+          const parking: ManualOwnerReceipt = receipt.status === 'parking' ? receipt : { ...receipt, status: 'parking', branch, checkpointSha };
+          if (receipt.status !== 'parking') writeManualOwnerReceipt(receiptPath, parking);
+          revision = registry.parkManual(receipt.token, { worktree, branch, checkpointSha, clean, stopped });
+          const parkedLane = registry.readLane(laneId)!;
+          generation = parkedLane.generation;
+          writeManualOwnerReceipt(receiptPath, { schemaVersion: 1, laneId, missionId: receipt.missionId, repository, workspace: identity.workspace!, branch, checkpointSha, status: 'parked', generation });
+        } else if (receipt.status === 'parking' && prior?.status === 'parked' && prior.generation === receipt.generation + 1 && prior.parkedReason === 'manual_checkpoint') {
+          generation = prior.generation; revision = registry.snapshot().revision;
+          writeManualOwnerReceipt(receiptPath, { schemaVersion: 1, laneId, missionId: receipt.missionId, repository, workspace: identity.workspace!, branch: receipt.branch, checkpointSha: receipt.checkpointSha, status: 'parked', generation });
+        } else if (receipt.status === 'parked' && prior?.status === 'parked' && prior.generation === receipt.generation && prior.parkedReason === 'manual_checkpoint') {
+          generation = receipt.generation; revision = registry.snapshot().revision;
+        } else throw new Error('Manual owner receipt and registry do not establish a current active or parked generation.');
+        const parkedReceipt = readManualOwnerReceipt(receiptPath)!;
+        const projection = manualProjection(parkedReceipt, 'parked', true, revision);
+        console.log(JSON.stringify({ projection, laneId, missionId: receipt.missionId, admissionRevision: revision, parkedGeneration: generation, ownerReceiptPath: receiptPath }));
+        return 0;
+      }
+      if (receipt.status !== 'parked' || expectedGeneration !== receipt.generation || !clean || !stopped || branch !== receipt.branch || checkpointSha !== receipt.checkpointSha ||
+        !((prior?.status === 'parked' && prior.generation === receipt.generation) || (prior?.status === 'released' && prior.generation === receipt.generation + 1))) throw new Error('Manual retirement requires the exact parked receipt generation and unchanged clean stopped branch/HEAD checkpoint.');
+      const projection = retireManualLane(resolveRunsDir(), laneId, now);
+      let revision: number;
+      try { revision = registry.retireManual(laneId, receipt.generation, { worktree, branch, checkpointSha, clean, stopped }); }
+      catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        manualProjection(receipt, 'parked', true, registry.snapshot().revision);
+        throw new Error(`Manual retirement did not release its exact parked generation; the parked projection was restored: ${detail}`);
+      }
+      // Retain the parked private receipt as a harmless generation tombstone.
+      // The next authorized register replaces it while holding this same lock.
+      console.log(JSON.stringify({ projection, laneId, missionId: receipt.missionId, admissionRevision: revision, retiredGeneration: receipt.generation + 1 }));
       return 0;
+      });
     }
     if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
       const desired = rest[0] === 'hold';
@@ -1470,14 +1740,25 @@ export async function main(argv: string[]): Promise<number> {
         const transport = new GhCliTransport();
         const runtime = new GitHubDispatchRuntime(transport, config);
         const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+        const admission = createHostAdmissionRegistry();
         return await dispatchOnceCommand(config, {
           workflow,
           runtime,
+          admission,
           resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority) => await runIssueCommand(workflow, ref, {
-            ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority,
+          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission) => await runIssueCommand(workflow, ref, {
+            ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!, admissionWorkspace: process.cwd(),
           }),
-          resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
+          resumeClaimedRun: async (run, dispatchClaimId, missionAdmission) => {
+            if (run.target.kind !== 'issue') throw new Error(`Dispatch claimed Run ${run.id} is not an issue Run.`);
+            return await runIssueCommand(workflow, `${run.target.owner}/${run.target.repo}#${run.target.issueNumber}`, {
+              ...(run.execution === undefined ? {} : { execution: run.execution }),
+              dispatchClaimId,
+              ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }),
+              admission: missionAdmission!,
+              admissionWorkspace: process.cwd(),
+            });
+          },
         });
       });
       const publishSettledRuntime = async (result: Awaited<ReturnType<typeof reconcile>>) => await withDispatchAdmissionLock(() => {
@@ -1668,6 +1949,7 @@ export async function main(argv: string[]): Promise<number> {
       buildWorkflowDeps(store, resolveCapabilities),
       id,
       values.decision,
+      { admission: createHostAdmissionRegistry(), admissionWorkspace: process.cwd() },
     );
     printOutcome(outcome, values['browser-profile']);
     return outcome.outcome === 'failed' ? 1 : 0;
@@ -1704,7 +1986,7 @@ export async function main(argv: string[]): Promise<number> {
   const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
     ? undefined
     : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution, repairTaskShapeAuthority });
+  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(), admissionWorkspace: process.cwd() });
   printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }

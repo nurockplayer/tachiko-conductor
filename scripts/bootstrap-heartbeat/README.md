@@ -1,10 +1,9 @@
 # Tachiko Conductor bootstrap heartbeat
 
-This macOS-first bootstrap polls bounded GitHub state without calling a model. It wakes one
-replaceable target only when the normalized state changes or 30 minutes have elapsed since the
-last successful reconciliation. GitHub, canonical `agent-handoff:v1` comments, exact PR heads,
-and the repository's standing SCD policy remain authoritative; this is not a queue, lease, or
-workflow engine.
+This macOS-first bootstrap polls bounded GitHub state without calling a model. It wakes the
+qualified GPT-6 Sol target when normalized state changes or the safety interval elapses. GitHub,
+canonical `agent-handoff:v1` comments, exact PR heads, and the repository policy remain
+authoritative; this is not a queue or workflow engine.
 
 ## Operator commands
 
@@ -18,84 +17,74 @@ scripts/bootstrap-heartbeat/uninstall.sh
 ```
 
 Installation defaults to a 180-second LaunchAgent interval and a 1,800-second safety interval.
-Each GitHub poll has a 60-second subprocess timeout so a stalled request cannot retain the lock
-forever. The bounded GraphQL projection rejects truncation and any GitHub-reported query cost over
-100 points, keeping the 180-second schedule sustainable; each open PR includes at most 100 review
-threads so a long-lived lane stays observable without unbounded pagination. Wake execution has a 1,500-second deadline; timeout terminates its isolated process
-group and leaves the fingerprint unconsumed for retry. Exit zero alone is a re-entry boundary:
-the target must also print `TACHIKO_HEARTBEAT_SETTLED_V1` on its own final line to consume the
-fingerprint and reset the safety clock. Installation resolves `gh`, validates the audited ChatGPT-bundled Codex executable,
-pins its adjacent `codex-code-mode-host` companion, records the exact user-owned SCD profile digest,
-primes a GitHub baseline without waking Codex,
-and loads `io.tachiko.conductor.scd-heartbeat`.
-The resolved `gh` executable is opened and checked for root/current-user ownership and safe leaf
-permissions during installation, then copied from that verified descriptor into a digest-named,
-mode-0700 snapshot in the private state directory. Polls execute those pinned bytes rather than
-reopening a replaceable Homebrew path; a successful reinstall prunes older digest snapshots.
-The LaunchAgent likewise executes a digest-named private snapshot of the repository runner instead
-of reopening Python source from a replaceable checkout path.
-Installation updates config, plist, pinned snapshots, and the loaded service as one rollback-capable
-operation; an activation failure restores the previous installed files and loaded service.
+Each GitHub poll has a 60-second timeout and rejects truncated results or query cost above 100.
+Wake execution has a 1,500-second deadline. Exit zero alone is a re-entry boundary: the target
+must also print `TACHIKO_HEARTBEAT_SETTLED_V1` on its own final line before the fingerprint is
+consumed and the safety clock reset.
+
+Before any wake, the runner verifies and calls a pinned, model-free TypeScript helper from the
+repository build. The helper reserves the same host-global mission-admission registry used by
+dispatch and manual work. It pins the resolved Node executable, the complete built JavaScript
+import closure, the registry path, repository/workspace identity, and an explicit revisioned
+capacity configuration at installation. Nondefault positive limits are supported when supplied
+with `--admission-config-json`. All entry paths use the canonical per-user registry at
+`$HOME/.tachiko-conductor/mission-admission/registry.json`; the installer rejects a different
+`--admission-registry-path` or inherited path override. A physical symlink alias that resolves to
+that canonical file is accepted. This keeps heartbeat, native dispatch, and manual admission on
+one host ownership domain.
+The LaunchAgent does not inherit arbitrary admission-domain variables. `wake_env` cannot override
+the registry, config, Run root, or private receipt directory.
+
+Only a fresh `reserved` result permits a wake. Capacity waits and known owners are quiet and
+model-free. `already_reserved` is reconciliation evidence and never starts another process. A
+helper/config/receipt error fails closed. Admission receipts are private 0600 files in the pinned
+host receipts directory; ordinary output, bounded operational state, wake argv, and logs contain
+no capability token.
+
+The guard inherits the heartbeat lock and retains it across supervisor death. It releases the
+registry generation only after the direct target has exited and process-group inspection proves
+the group empty. Unknown process inspection, uncertain child state, stale/corrupt receipts, or
+failed helper settlement retain custody. A surviving same-group descendant keeps both the lock
+and admission reservation, even after the direct process exits. It is not treated as stopped just
+because its parent returned. The `supervisorStopped` proof means the direct wake process exited;
+`childrenStopped` means the guard observed the process group empty at the recorded time.
+The heartbeat invocation waits for that guard result before deciding whether the fingerprint was
+settled, so a successful direct marker is not retried while a same-group child is still running.
+
+The supported target is the pinned default Codex executable and companion running the fixed
+GPT-6 Sol/high profile. `--codex` and `--profile` overrides are rejected. Custom wake targets,
+including a target named `dispatch once`, remain disabled until a verified native admission and
+process-containment adapter exists. The process-group check covers the target's session group; it
+cannot prove that a target never detached a mutation-capable descendant. The default target is
+accepted under the operational contract that it does not daemonize or detach mutation-capable
+children. Any inspection uncertainty fails closed. The obsolete Terra target is not installed;
+the service remains held if the required Sol profile is unavailable or does not declare GPT-6 Sol
+at high reasoning effort.
+
+## Migration and recovery
+
+Config schema 2 pins the helper, Node bytes, fixed admission domain, and wake target contract.
+Existing schema-1 configs are rejected. Build the helper with the repository's pinned toolchain,
+then rerun installation:
+
+```sh
+corepack pnpm@10.34.5 build
+scripts/bootstrap-heartbeat/install.sh
+```
+
+Valid heartbeat state schema 1 is preserved across reinstall. Installation does not take over or
+expire an active mission based on age. To investigate a retained reservation, first verify the
+supervisor and its process group are stopped. The private receipt is at the configured receipts
+directory; inspect it locally with owner-only permissions and compare its generation/supervisor
+identity with `dispatch admission status`. Never copy its token into argv, logs, projections, or
+GitHub. Recovery settlement must use the pinned helper with the exact receipt generation and
+explicit stop proof. If the receipt is missing/corrupt or the process tree cannot be proven stopped,
+leave admission held for operator reconciliation.
 
 State and bounded logs live in
 `~/Library/Application Support/io.tachiko.conductor.scd-heartbeat/`; the generated plist lives
-in `~/Library/LaunchAgents/`. Uninstall removes and unloads only the plist, preserving state and
-logs for diagnosis.
-
-Use `runner.py install --help` for interval and path overrides. `one-shot.sh` runs the same
-change detector as launchd; `runner.py run --prime` deliberately resets the baseline without a
-wake.
-
-## Replace the wake target
-
-The detector executes the absolute argv array in `config.json`; it has no knowledge of Codex or
-Conductor dispatch semantics. The default installer generates the current direct SCD/Codex argv.
-After the native dispatcher is available, reinstall with an explicit command such as:
-
-```sh
-scripts/bootstrap-heartbeat/install.sh \
-  --acknowledge-relocatable-wake-target \
-  --wake-command-json '["/absolute/path/to/node","/absolute/path/to/tachiko-conductor/dist/cli.js","dispatch","once"]' \
-  --required-file /absolute/path/to/tachiko-conductor/dist/cli.js
-```
-
-That changes only the launcher boundary. Fingerprinting, wake policy, lock, state, and LaunchAgent
-remain unchanged. The acknowledgement is required because wake execution uses a private verified
-snapshot: only the first argv entry must be relocation-safe. Location-dependent CLI scripts remain
-at their original path by running them as an argument to a relocation-safe interpreter, as in the
-future `tachiko dispatch once` example above; `--required-file` pins and validates that entry file.
-Installation rejects executable symlinks up front rather than accepting an unusable configuration.
-Every replaceable target uses the same provider-neutral completion protocol: emit
-`TACHIKO_HEARTBEAT_SETTLED_V1` only after all currently executable in-scope work is settled or
-there is no executable work. A successful process exit without that acknowledgement remains
-eligible for the next poll instead of sleeping until the safety interval.
-Install and uninstall acquire the same heartbeat flock as polling and wake execution. They fail
-closed while a poll or wake is active, so config, plist, and verified executable snapshots cannot
-be replaced concurrently. Lock metadata includes the OS process-start identity, allowing a crash
-before wake-guard creation to recover from PID reuse without accepting an ambiguous same-process owner.
-
-## Fail-closed behavior
-
-- Pagination/truncation, invalid GitHub data, invalid state/config, or an unsafe wake target never
-  wakes a model. Wake executables must be owned by root/current user, must not be group/world
-  writable, and are SHA-256 pinned at install time alongside the default SCD profile. Each wake
-  executes a private snapshot copied from the already-verified executable descriptor, so a
-  pathname replacement between verification and launch cannot change the executed bytes. The
-  default Codex target's verified code-mode companion is materialized beside that snapshot so
-  location-based runtime discovery remains intact without reopening unverified bytes. Like the
-  main executable, that copied companion permits standard macOS application-directory ancestry;
-  its opened leaf must still have a pinned digest, safe ownership and safe permissions.
-- One advisory `flock` covers collection and the entire direct wake. A dedicated same-host guard
-  retains it if the supervisor dies, while the wake target and its background descendants never
-  inherit the descriptor. Normal direct-child completion releases the guard without waiting for
-  background work or descendant-held output pipes. A nonblocking, volume-bounded tail drain
-  preserves the direct target's final completion acknowledgement. Forced timeout cleanup retains
-  the flock through TERM/KILL of the entire target group.
-  Concurrent launchd fires cannot create another writer.
-- Invalid lock metadata or unlocked metadata naming a live/unknown owner fails closed. Metadata for
-  a provably exited PID can be recovered because the kernel lock has already been released.
-- A failed wake does not consume the changed fingerprint or reset the safety clock.
-- A zero-exit wake without the explicit settled acknowledgement also does not consume it.
+in `~/Library/LaunchAgents/`. Uninstall removes and unloads only the plist, preserving evidence.
+Install and uninstall share the heartbeat lock and fail while a poll or wake is active.
 
 Run focused tests with:
 

@@ -37,6 +37,8 @@ export interface ReviewLoopDependencies {
    */
   readonly resolveValidationAuthority: () => ActiveValidationConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
+  /** Provider-neutral mutation fence rechecked immediately before a repair worker starts. */
+  readonly assertCanMutate?: (workspacePath?: string) => void;
   /**
    * Resolves only the provider-neutral profile selected by explicit repair
    * authority. It is intentionally absent for legacy runs, which have no
@@ -49,6 +51,8 @@ export interface ReviewLoopOptions {
   /** Maximum review attempts before the loop escalates to NEEDS_HUMAN. */
   readonly maxAttempts: number;
   readonly now?: () => string;
+  /** Called before a repair worker or reviewer execution boundary. */
+  readonly onExecutionStart?: () => void;
 }
 
 export type ReviewLoopResult =
@@ -448,6 +452,7 @@ export async function runReviewLoop(
           const bootstrap = await repairBootstrap.plan({
             runId: run.id, target, baseBranch, baseSha, publicationBranch,
           });
+          deps.assertCanMutate?.(bootstrap.workspacePath);
           if (bootstrap.bootstrapKind !== repairBootstrap.bootstrapKind) {
             return parkBootstrap(run, new Error('Promoted isolated Luna repair bootstrap boundary does not match its transport.'), store, now);
           }
@@ -465,6 +470,7 @@ export async function runReviewLoop(
           return parkBootstrap(run, new Error('Repair transport is incompatible with the persisted workspace boundary.'), store, now);
         }
         try {
+          deps.assertCanMutate?.(run.bootstrap.workspacePath);
           await repairBootstrap.prepare({
             runId: run.id, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
             existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: progressBaseSha },
@@ -499,17 +505,7 @@ export async function runReviewLoop(
       } else {
         store.update(run);
       }
-      let fixResult;
-      try {
-        fixResult = await implementation.run({
-          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: repairInstructions,
-          ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
-          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
-          ...(isolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
-          ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
-          ...(repairExecution === undefined ? {} : { execution: repairExecution }),
-        });
-      } catch (error) {
+      const recordWorkerInvocationFailure = (error: unknown): ReviewLoopResult => {
         if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now);
         const detail = error instanceof Error ? error.message : String(error);
         run = recordCompletionTelemetry(run, createCompletionInputFromResult({
@@ -523,6 +519,30 @@ export async function runReviewLoop(
         }, 'worker', workerSpawn.invocationId), now());
         store.update(run);
         throw error;
+      };
+      let capabilities;
+      try {
+        capabilities = isolatedLuna ? undefined : await deps.resolveImplementationCapabilities?.();
+      } catch (error) {
+        return recordWorkerInvocationFailure(error);
+      }
+      options.onExecutionStart?.();
+      // The execution-start callback records uncertainty; capability
+      // resolution may have yielded while ownership changed. Recheck the
+      // provider-neutral mutation fence immediately before the worker call.
+      deps.assertCanMutate?.(run.bootstrap?.workspacePath);
+      let fixResult;
+      try {
+        fixResult = await implementation.run({
+          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: repairInstructions,
+          ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
+          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
+          ...(capabilities === undefined ? {} : { capabilities }),
+          ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
+          ...(repairExecution === undefined ? {} : { execution: repairExecution }),
+        });
+      } catch (error) {
+        return recordWorkerInvocationFailure(error);
       }
       run = recordCompletionTelemetry(run, createCompletionInputFromResult(fixResult, {
         ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
@@ -738,6 +758,7 @@ export async function runReviewLoop(
     store.update(run);
     let reviewResult: ReviewResult;
     try {
+      options.onExecutionStart?.();
       reviewResult = await reviewer.review({
         target,
         headSha: reviewHeadSha,

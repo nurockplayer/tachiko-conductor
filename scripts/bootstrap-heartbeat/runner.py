@@ -10,6 +10,8 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import re
+import select
 import selectors
 import shutil
 import signal
@@ -17,6 +19,7 @@ import stat
 import subprocess
 import sys
 import time
+import uuid
 from typing import Any
 
 
@@ -38,7 +41,7 @@ DEFAULT_PROMPT = (
     "at a non-terminal re-entry boundary."
 )
 STATE_SCHEMA = 1
-CONFIG_SCHEMA = 1
+CONFIG_SCHEMA = 2
 DEFAULT_POLL_SECONDS = 180
 DEFAULT_SAFETY_SECONDS = 1800
 DEFAULT_POLL_TIMEOUT_SECONDS = 60
@@ -250,6 +253,54 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or any(character not in "0123456789abcdef" for character in runner_digest)
             or Path(config["runner"]) != ROOT / ("verified-runner-" + runner_digest)):
         raise RuntimeError("invalid pinned heartbeat runner identity")
+    node_digest = config.get("admission_node_sha256")
+    if (not isinstance(node_digest, str) or len(node_digest) != 64
+            or any(character not in "0123456789abcdef" for character in node_digest)
+            or Path(config.get("admission_node", "")) != ROOT / ("verified-node-" + node_digest)):
+        raise RuntimeError("invalid pinned admission Node identity")
+    helper_files = config.get("admission_helper_files")
+    helper_entry = config.get("admission_helper")
+    if not isinstance(helper_files, list) or not helper_files or not isinstance(helper_entry, str) or not Path(helper_entry).is_absolute():
+        raise RuntimeError("invalid pinned admission helper closure")
+    closure_digest = config.get("admission_helper_sha256")
+    if (not isinstance(closure_digest, str) or len(closure_digest) != 64
+            or any(character not in "0123456789abcdef" for character in closure_digest)):
+        raise RuntimeError("invalid pinned admission helper digest")
+    for item in helper_files:
+        if (not isinstance(item, dict) or set(item) != {"path", "sha256"}
+                or not isinstance(item["path"], str) or not Path(item["path"]).is_absolute()
+                or not isinstance(item["sha256"], str) or len(item["sha256"]) != 64
+                or any(character not in "0123456789abcdef" for character in item["sha256"])):
+            raise RuntimeError("invalid pinned admission helper file")
+    if not any(item["path"] == helper_entry for item in helper_files):
+        raise RuntimeError("admission helper entry is outside its pinned closure")
+    helper_root = Path(helper_entry).parents[1]
+    closure_manifest = []
+    for item in helper_files:
+        file_path = Path(item["path"])
+        try:
+            relative = file_path.relative_to(helper_root).as_posix()
+        except ValueError as error:
+            raise RuntimeError("admission helper file escapes its pinned closure") from error
+        closure_manifest.append((relative, item["sha256"]))
+    calculated_closure = hashlib.sha256("\n".join(f"{name} {digest}" for name, digest in sorted(closure_manifest)).encode()).hexdigest()
+    if calculated_closure != closure_digest or helper_entry != str(helper_root / "mission-admission/heartbeat-admission-cli.js"):
+        raise RuntimeError("admission helper closure digest or entry does not match its pinned layout")
+    admission = config.get("admission")
+    if (not isinstance(admission, dict) or set(admission) != {"repository", "workspace", "home", "registry", "runs", "receipts", "config"}
+            or admission.get("repository") != "nurockplayer/tachiko-conductor"
+            or any(not isinstance(admission.get(key), str) or not Path(admission[key]).is_absolute()
+                   for key in ("workspace", "home", "registry", "runs", "receipts"))
+            or not isinstance(admission.get("config"), dict)):
+        raise RuntimeError("invalid fixed heartbeat admission domain")
+    admission_config = admission["config"]
+    if (set(admission_config) != {"schemaVersion", "revision", "limits"} or admission_config.get("schemaVersion") != 1
+            or not isinstance(admission_config.get("revision"), str) or not admission_config["revision"]
+            or not isinstance(admission_config.get("limits"), dict)
+            or set(admission_config["limits"]) - {"maxCaptains", "maxWriters", "maxHighAutonomy", "maxPerRepository"}
+            or any(type(value) is not int or value < 1 for value in admission_config["limits"].values())
+            or any(key not in admission_config["limits"] for key in ("maxCaptains", "maxWriters", "maxHighAutonomy"))):
+        raise RuntimeError("invalid fixed heartbeat admission configuration")
     if type(config.get("poll_interval_seconds")) is not int or config["poll_interval_seconds"] < 1:
         raise RuntimeError("invalid poll_interval_seconds")
     if type(config.get("poll_timeout_seconds")) is not int or config["poll_timeout_seconds"] < 1:
@@ -267,9 +318,33 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("invalid wake_command")
     if not Path(command[0]).is_absolute():
         raise RuntimeError("wake executable must be absolute")
+    wake_kind = config.get("wake_target_kind")
+    if wake_kind not in ({"codex", "test"} if testing() else {"codex"}):
+        raise RuntimeError("unqualified custom wake targets are not supported by the heartbeat supervisor")
     wake_env = config.get("wake_env", {})
     if not isinstance(wake_env, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in wake_env.items()):
         raise RuntimeError("invalid wake_env")
+    forbidden_wake_env = {"TACHIKO_MISSION_ADMISSION_PATH", "TACHIKO_MISSION_ADMISSION_CONFIG", "TACHIKO_DATA_DIR", "TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR"}
+    if forbidden_wake_env.intersection(wake_env):
+        raise RuntimeError("wake_env cannot override the pinned mission-admission domain")
+    if wake_kind == "codex":
+        codex = str(DEFAULT_CODEX)
+        profile = str(DEFAULT_PROFILE)
+        expected_command = [
+            codex, "exec", "--profile", Path(profile).stem.replace(".config", ""),
+            "--strict-config", "--model", "gpt-6-sol", "-c", 'model_reasoning_effort="high"',
+            "-C", config["repo"], DEFAULT_PROMPT,
+        ]
+        expected_env = {"CODEX_HOME": str(Path(profile).parent)}
+        if command != expected_command or wake_env != expected_env:
+            raise RuntimeError("wake target does not match the pinned GPT-6 Sol heartbeat contract")
+        profile_path = Path(profile)
+        try:
+            profile_text = profile_path.read_text(encoding="utf-8")
+        except OSError as error:
+            raise RuntimeError("pinned GPT-6 Sol heartbeat profile is unavailable") from error
+        if not re.search(r'(?m)^model\s*=\s*["\']gpt-6-sol["\']\s*$', profile_text) or not re.search(r'(?m)^model_reasoning_effort\s*=\s*["\']high["\']\s*$', profile_text):
+            raise RuntimeError("heartbeat profile must pin GPT-6 Sol at high reasoning effort")
     required = config.get("required_files", [])
     if not isinstance(required, list):
         raise RuntimeError("invalid required_files")
@@ -475,6 +550,65 @@ def pin_runner_source(path: Path) -> tuple[Path, str, bool]:
         os.close(source_fd)
 
 
+def pin_admission_node(path: Path) -> tuple[Path, str, bool]:
+    if not path.is_file() or path.is_symlink() or not os.access(path, os.X_OK):
+        raise RuntimeError("Node executable unavailable or unsafe: " + str(path))
+    source_fd = os.open(path, os.O_RDONLY)
+    try:
+        metadata = os.fstat(source_fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022:
+            raise RuntimeError("Node executable ownership or permissions unsafe: " + str(path))
+        digest = fd_sha256(source_fd)
+        existed = (ROOT / ("verified-node-" + digest)).exists()
+        target = materialize_verified_executable(source_fd, "verified-node-" + digest)
+        return target, digest, not existed
+    finally:
+        os.close(source_fd)
+
+
+def pin_admission_helper(repo: Path) -> tuple[Path, str, list[dict[str, str]], bool]:
+    source_root = repo / "dist"
+    entry_relative = Path("mission-admission/heartbeat-admission-cli.js")
+    pending = [entry_relative]
+    sources: dict[Path, bytes] = {}
+    while pending:
+        relative = pending.pop()
+        if relative in sources:
+            continue
+        source = source_root / relative
+        if not source.is_file() or source.is_symlink():
+            raise RuntimeError("compiled heartbeat admission helper is missing or unsafe; run the pinned project build first")
+        data = source.read_bytes()
+        sources[relative] = data
+        for specifier in re.findall(r"(?:from\s*|import\s*)[\"']([^\"']+)[\"']", data.decode("utf-8")):
+            if specifier.startswith("node:"):
+                continue
+            if not specifier.startswith("."):
+                raise RuntimeError("heartbeat admission helper has an external import that cannot be pinned")
+            child = (relative.parent / specifier)
+            if child.suffix != ".js":
+                raise RuntimeError("heartbeat admission helper has a non-JS local import")
+            normalized = Path(os.path.normpath(str(child)))
+            if normalized.is_absolute() or ".." in normalized.parts:
+                raise RuntimeError("heartbeat admission helper import escapes compiled source root")
+            pending.append(normalized)
+    sources[Path("package.json")] = b'{"type":"module"}\n'
+    digests = {relative: hashlib.sha256(data).hexdigest() for relative, data in sources.items()}
+    manifest = "\n".join(f"{relative.as_posix()} {digests[relative]}" for relative in sorted(sources))
+    closure_digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+    bundle = ROOT / ("verified-admission-" + closure_digest)
+    existed = bundle.is_dir()
+    bundle.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(bundle, 0o700)
+    for relative, data in sources.items():
+        target = bundle / relative
+        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(target.parent, 0o700)
+        atomic_write(target, data, 0o600)
+    files = [{"path": str(bundle / relative), "sha256": digests[relative]} for relative in sorted(sources)]
+    return bundle / entry_relative, closure_digest, files, not existed
+
+
 def prune_stale_digest_snapshots(prefix: str, current: Path) -> None:
     try:
         candidates = list(ROOT.iterdir())
@@ -505,8 +639,10 @@ def restore_optional_file(path: Path, previous: bytes | None) -> None:
 def linux_process_identity(pid: int) -> tuple[str, str] | None:
     try:
         raw = (Path("/proc") / str(pid) / "stat").read_text(encoding="utf-8")
-    except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+    except (FileNotFoundError, NotADirectoryError):
         return None
+    except OSError as error:
+        raise RuntimeError("could not inspect guarded process identity") from error
     closing = raw.rfind(")")
     fields = raw[closing + 2:].split() if closing >= 0 else []
     if len(fields) < 20:
@@ -515,39 +651,63 @@ def linux_process_identity(pid: int) -> tuple[str, str] | None:
 
 
 def process_group_has_live_members(process_group: int) -> bool | None:
+    scanned_empty = False
     proc = Path("/proc")
     if proc.is_dir():
-        for entry in proc.iterdir():
+        try:
+            entries = list(proc.iterdir())
+        except OSError:
+            return None
+        for entry in entries:
             if not entry.name.isdigit():
                 continue
             try:
                 raw = (entry / "stat").read_text(encoding="utf-8")
-            except (FileNotFoundError, PermissionError, OSError):
+            except FileNotFoundError:
                 continue
+            except OSError:
+                return None
             closing = raw.rfind(")")
             fields = raw[closing + 2:].split() if closing >= 0 else []
-            if len(fields) >= 3 and fields[0] != "Z" and fields[2] == str(process_group):
+            if len(fields) < 3:
+                return None
+            if fields[0] != "Z" and fields[2] == str(process_group):
                 return True
-        return False
-    try:
-        result = subprocess.run(
-            ["/bin/ps", "-axo", "pgid=,state="], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-            check=False, timeout=2,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return None
-    if result.returncode:
-        return None
-    for line in result.stdout.splitlines():
-        fields = line.split()
+        scanned_empty = True
+    else:
         try:
-            pgid = int(fields[0])
-        except (IndexError, ValueError):
-            continue
-        if pgid == process_group and len(fields) > 1 and not fields[1].startswith("Z"):
-            return True
-    return False
+            result = subprocess.run(
+                ["/bin/ps", "-axo", "pgid=,state="], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                check=False, timeout=2,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode:
+            return None
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            try:
+                pgid = int(fields[0])
+            except (IndexError, ValueError):
+                return None
+            if pgid == process_group and len(fields) > 1 and not fields[1].startswith("Z"):
+                return True
+        scanned_empty = True
+    if scanned_empty:
+        # The process may have forked into this group after the /proc or ps
+        # snapshot. Only ESRCH from a second kernel query proves the group is
+        # gone; an existing or inaccessible group remains unknown.
+        try:
+            os.killpg(process_group, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return None
+        except OSError:
+            return None
+        return None
+    return None
 
 
 def process_identity(pid: int) -> str | None:
@@ -558,38 +718,163 @@ def process_identity(pid: int) -> str | None:
         return "linux-start:" + identity[1]
     try:
         result = subprocess.run(
-            ["/bin/ps", "-p", str(pid), "-o", "uid=,lstart=,command="],
+            ["/bin/ps", "-p", str(pid), "-o", "uid=,lstart=,state=,command="],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=2, check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise RuntimeError("could not inspect lock owner process identity") from error
-    value = " ".join(result.stdout.split())
+    fields = result.stdout.split(None, 7)
     if result.returncode != 0:
-        if not value:
+        if not fields:
             return None
         raise RuntimeError("could not inspect lock owner process identity")
-    if not value:
+    if not fields:
         return None
-    return "ps:" + value
+    if len(fields) < 8:
+        raise RuntimeError("could not inspect lock owner process identity")
+    if fields[6].startswith("Z"):
+        return None
+    return "ps:" + " ".join([fields[0], *fields[1:6], *fields[7:]])
 
 
-def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
+def verify_admission_helper(config: dict[str, Any]) -> None:
+    node = Path(config["admission_node"])
+    metadata = node.lstat()
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
+            or metadata.st_mode & 0o022 or not metadata.st_mode & 0o111
+            or hashlib.sha256(node.read_bytes()).hexdigest() != config["admission_node_sha256"]):
+        raise RuntimeError("pinned admission Node bytes failed verification")
+    for item in config["admission_helper_files"]:
+        candidate = Path(item["path"])
+        metadata = candidate.lstat()
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
+                or metadata.st_mode & 0o022 or hashlib.sha256(candidate.read_bytes()).hexdigest() != item["sha256"]):
+            raise RuntimeError("pinned admission helper closure failed verification")
+
+
+def admission_domain_environment(config: dict[str, Any]) -> dict[str, str]:
+    admission = config["admission"]
+    return {
+        "TACHIKO_MISSION_ADMISSION_PATH": admission["registry"],
+        "TACHIKO_MISSION_ADMISSION_CONFIG": json.dumps(admission["config"], sort_keys=True, separators=(",", ":")),
+        "TACHIKO_DATA_DIR": admission["runs"],
+        "TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR": admission["receipts"],
+        "TACHIKO_DISPATCH_WAKE_PATH": str(Path(admission["home"]) / ".tachiko-conductor/dispatch/wake"),
+    }
+
+
+def admission_helper_environment(config: dict[str, Any]) -> dict[str, str]:
+    return {"HOME": config["admission"]["home"], "PATH": "/usr/bin:/bin", **admission_domain_environment(config)}
+
+
+def admission_call(config: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
+    verify_admission_helper(config)
+    try:
+        result = subprocess.run(
+            [config["admission_node"], config["admission_helper"]], cwd=config["repo"],
+            input=json.dumps(request, separators=(",", ":")) + "\n", text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+            timeout=15, env=admission_helper_environment(config),
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError("pinned admission helper could not establish ownership") from error
+    if result.returncode != 0:
+        raise RuntimeError("pinned admission helper rejected the ownership transaction")
+    try:
+        value = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("pinned admission helper returned invalid bounded JSON") from error
+    if not isinstance(value, dict) or value.get("schemaVersion") != 1 or not isinstance(value.get("outcome"), str):
+        raise RuntimeError("pinned admission helper returned an ambiguous result")
+    return value
+
+
+def reserve_heartbeat(config: dict[str, Any], supervisor_id: str) -> dict[str, Any]:
+    admission = config["admission"]
+    return admission_call(config, {
+        "schemaVersion": 1, "action": "reserve", "repository": admission["repository"],
+        "workspace": admission["workspace"], "supervisorId": supervisor_id,
+    })
+
+
+def write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    offset = 0
+    while offset < len(view):
+        written = os.write(fd, view[offset:])
+        if written <= 0:
+            raise OSError("short write while publishing guarded handoff")
+        offset += written
+
+
+def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int, int]:
     read_fd, write_fd = os.pipe()
+    result_read_fd, result_write_fd = os.pipe()
     guard_pid = os.fork()
     if guard_pid:
         os.close(read_fd)
-        return guard_pid, write_fd
+        os.close(result_write_fd)
+        return guard_pid, write_fd, result_read_fd
     try:
+        # The guard is a background custody process. Holding these descriptors
+        # would keep its caller's captured stdout/stderr open for the whole
+        # descendant lifetime, even after the supervisor returned.
+        for descriptor in (0, 1, 2):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
         os.close(write_fd)
-        message = os.read(read_fd, 64)
+        os.close(result_read_fd)
+        header = b""
+        while len(header) < 4:
+            chunk = os.read(read_fd, 4 - len(header))
+            if not chunk:
+                raise RuntimeError("guard handoff ended before its frame header")
+            header += chunk
+        frame_size = int.from_bytes(header, "big")
+        if frame_size < 2 or frame_size > 64 * 1024:
+            raise RuntimeError("guard handoff frame size is invalid")
+        message = bytearray()
+        while len(message) < frame_size:
+            chunk = os.read(read_fd, frame_size - len(message))
+            if not chunk:
+                raise RuntimeError("guard handoff frame was truncated")
+            message.extend(chunk)
+        if os.read(read_fd, 1):
+            raise RuntimeError("guard handoff contains trailing bytes")
         os.close(read_fd)
-        if not message:
-            os._exit(0)
-        target_pid = int(message.splitlines()[0])
-        if target_pid < 1:
-            os._exit(0)
+        metadata = json.loads(message)
+        if metadata.get("cancelled_before_spawn") is True:
+            settlement = metadata["settlement"]
+            request = dict(settlement["request"])
+            request["stopProof"] = {
+                "childrenStopped": True, "supervisorStopped": True,
+                "observedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            while True:
+                try:
+                    result = admission_call(settlement["config"], request)
+                    if result.get("outcome") == "settled":
+                        try: os.write(result_write_fd, b"settled\n")
+                        except OSError: pass
+                        try: os.close(result_write_fd)
+                        except OSError: pass
+                        os.lseek(lock_fd, 0, os.SEEK_SET)
+                        os.ftruncate(lock_fd, 0)
+                        os.fsync(lock_fd)
+                        os.close(lock_fd)
+                        os._exit(0)
+                except BaseException:
+                    pass
+                time.sleep(5)
+        target_pid = metadata["target_pid"]
+        settlement = metadata["settlement"]
+        if type(target_pid) is not int or target_pid < 1:
+            raise RuntimeError("invalid guarded child identity")
         initial_linux_identity = linux_process_identity(target_pid) if Path("/proc").is_dir() else None
+        initial_process_identity = None if initial_linux_identity is not None else process_identity(target_pid)
         deadline = time.monotonic() + timeout_seconds
         terminate_deadline: float | None = None
         killed = False
@@ -600,6 +885,10 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
                 if (current_identity is None or current_identity[0] == "Z"
                         or current_identity[1] != initial_linux_identity[1]):
                     direct_exited = True
+            else:
+                current_identity = process_identity(target_pid)
+                if current_identity is None or current_identity != initial_process_identity:
+                    direct_exited = True
             try:
                 os.kill(target_pid, 0)
             except ProcessLookupError:
@@ -608,8 +897,6 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
                 pass
             now = time.monotonic()
             if terminate_deadline is None:
-                if now < deadline and direct_exited:
-                    break
                 if now >= deadline:
                     try:
                         os.killpg(target_pid, signal.SIGTERM)
@@ -622,34 +909,60 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int]:
                 except (ProcessLookupError, PermissionError):
                     pass
                 killed = True
-            if terminate_deadline is not None and direct_exited:
+            if direct_exited:
                 group_live = process_group_has_live_members(target_pid)
                 if group_live is False:
-                    break
-                if group_live is None:
-                    try:
-                        os.killpg(target_pid, 0)
-                    except ProcessLookupError:
-                        break
+                    # This time is evidence from the guard's observed empty group,
+                    # after the direct target has stopped. It is never pre-start data.
+                    request = dict(settlement["request"])
+                    request["stopProof"] = {
+                        "childrenStopped": True, "supervisorStopped": True,
+                        "observedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    }
+                    while True:
+                        try:
+                            result = admission_call(settlement["config"], request)
+                            if result.get("outcome") == "settled":
+                                try: os.write(result_write_fd, b"settled\n" if terminate_deadline is None else b"terminated\n")
+                                except OSError: pass
+                                try: os.close(result_write_fd)
+                                except OSError: pass
+                                try:
+                                    os.lseek(lock_fd, 0, os.SEEK_SET)
+                                    os.ftruncate(lock_fd, 0)
+                                    os.fsync(lock_fd)
+                                except OSError:
+                                    pass
+                                os.close(lock_fd)
+                                os._exit(0)
+                        except BaseException:
+                            pass
+                        time.sleep(5)
+                # Unknown inspection is not evidence that descendants stopped.
+                # Continue holding both registry ownership and the flock.
             time.sleep(0.05)
     except BaseException:
-        time.sleep(timeout_seconds + 10)
-    finally:
-        try:
-            os.lseek(lock_fd, 0, os.SEEK_SET)
-            os.ftruncate(lock_fd, 0)
-            os.fsync(lock_fd)
-        except OSError:
-            pass
-        os.close(lock_fd)
-    os._exit(0)
+        # Any ambiguous guard state retains the inherited lock indefinitely.
+        while True:
+            time.sleep(60)
 
 
-def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
+def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], supervisor_id: str) -> tuple[int, bool]:
     verified_executable = verify_wake_target(config)
     child = None
-    guard_pid, guard_write_fd = spawn_lock_guard(lock_fd, config["wake_timeout_seconds"])
+    settlement = {
+        "config": config,
+        "request": {
+            "schemaVersion": 1, "action": "settle", "repository": config["admission"]["repository"],
+            "workspace": config["admission"]["workspace"], "supervisorId": supervisor_id,
+            "expectedGeneration": reservation["generation"], "receiptId": reservation["receiptId"],
+            "stopProof": {"childrenStopped": True, "supervisorStopped": True, "observedAt": "pending"},
+        },
+    }
+    guard_pid, guard_write_fd, guard_result_fd = spawn_lock_guard(lock_fd, config["wake_timeout_seconds"])
     guard_started = False
+    wake_deadline = time.monotonic() + config["wake_timeout_seconds"]
+    guard_result_deadline = wake_deadline + 7
     output = bytearray()
     selector = selectors.DefaultSelector()
 
@@ -682,23 +995,47 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
     try:
         environment = os.environ.copy()
         environment.update(config.get("wake_env", {}))
+        # The model-capable child must observe the same admission authority
+        # that just granted this generation, even if launchd inherited stale
+        # domain variables or the owner supplied an explicit host path.
+        environment["HOME"] = config["admission"]["home"]
+        environment.update(admission_domain_environment(config))
 
         def publish_guard_pid() -> None:
-            os.write(guard_write_fd, (str(os.getpid()) + "\n").encode())
+            frame = json.dumps({"target_pid": os.getpid(), "settlement": settlement}, separators=(",", ":")).encode()
+            if len(frame) > 64 * 1024:
+                raise RuntimeError("guard handoff exceeds bounded frame size")
+            write_all(guard_write_fd, len(frame).to_bytes(4, "big") + frame)
             os.close(guard_write_fd)
 
-        child = subprocess.Popen(
-            config["wake_command"], cwd=config["repo"], stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
-            executable=str(verified_executable), start_new_session=True,
-            pass_fds=(guard_write_fd,), preexec_fn=publish_guard_pid,
-        )
+        try:
+            child = subprocess.Popen(
+                config["wake_command"], cwd=config["repo"], stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=environment,
+                executable=str(verified_executable), start_new_session=True,
+                pass_fds=(guard_write_fd,), preexec_fn=publish_guard_pid,
+            )
+        except BaseException:
+            # If preexec published the bound PID, the guard can prove the
+            # failed exec process has exited. Appending a second frame would
+            # make the initial handoff ambiguous, so EOF is the only parent
+            # action here; a missing first frame remains fail-closed.
+            os.close(guard_write_fd)
+            guard_started = True
+            os.set_blocking(guard_result_fd, False)
+            cancel_deadline = time.monotonic() + 15
+            while time.monotonic() < cancel_deadline:
+                readable, _, _ = select.select([guard_result_fd], [], [], min(0.1, cancel_deadline - time.monotonic()))
+                if readable and os.read(guard_result_fd, 64).strip() == b"settled":
+                    os.waitpid(guard_pid, 0)
+                    break
+            raise
         os.close(guard_write_fd)
         guard_started = True
         assert child.stdout is not None
         os.set_blocking(child.stdout.fileno(), False)
         selector.register(child.stdout, selectors.EVENT_READ)
-        deadline = time.monotonic() + config["wake_timeout_seconds"]
+        deadline = wake_deadline
         timed_out = False
 
         def remember(chunk: bytes) -> None:
@@ -758,13 +1095,46 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
             if group_alive():
                 signal_group(signal.SIGKILL)
             child.wait()
+            # The guard performs the authoritative generation settlement after
+            # it independently observes the group empty. Do not make the next
+            # poll race that cleanup.
+            os.set_blocking(guard_result_fd, False)
+            while time.monotonic() < guard_result_deadline:
+                readable, _, _ = select.select([guard_result_fd], [], [], min(0.1, guard_result_deadline - time.monotonic()))
+                if readable:
+                    chunk = os.read(guard_result_fd, 64)
+                    if not chunk or b"\n" in chunk:
+                        break
             atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
             return 124, False
         code = child.wait()
         atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
         nonempty_lines = [line for line in output.splitlines() if line.strip()]
-        settled = code == 0 and bool(nonempty_lines) and nonempty_lines[-1] == SETTLED_MARKER.encode()
-        return code, settled
+        marker_settled = code == 0 and bool(nonempty_lines) and nonempty_lines[-1] == SETTLED_MARKER.encode()
+        acknowledgement = bytearray()
+        os.set_blocking(guard_result_fd, False)
+        # Do not let an already-successful direct wake be retried while its
+        # descendants remain in the guarded group. The guard also enforces the
+        # hard timeout and settles only after observing an empty group. If the
+        # guard cannot prove settlement, return after its kill grace while its
+        # inherited flock/registry fence remain held.
+        ack_deadline = wake_deadline + 7
+        while True:
+            remaining = ack_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([guard_result_fd], [], [], remaining)
+            if readable:
+                chunk = os.read(guard_result_fd, 64)
+                if not chunk:
+                    break
+                acknowledgement.extend(chunk)
+                if b"\n" in acknowledgement:
+                    break
+        clean_guard = bytes(acknowledgement).strip() == b"settled"
+        if not clean_guard:
+            return code, False
+        return code, marker_settled
     finally:
         if not guard_started:
             try:
@@ -773,7 +1143,9 @@ def run_wake(config: dict[str, Any], lock_fd: int) -> tuple[int, bool]:
                 pass
             os.close(guard_write_fd)
         if child is None or child.poll() is not None:
-            os.waitpid(guard_pid, 0)
+            if not guard_started:
+                os.waitpid(guard_pid, 0)
+        os.close(guard_result_fd)
         selector.close()
         signal.signal(signal.SIGTERM, old_term)
         signal.signal(signal.SIGINT, old_int)
@@ -874,6 +1246,18 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
                 log("no-op: normalized GitHub state unchanged and safety interval not due")
             return 0
         reason = "normalized GitHub state changed" if changed else "safety reconciliation interval elapsed"
+        try:
+            verify_wake_target(config)
+            supervisor_id = str(uuid.uuid4())
+            reservation = reserve_heartbeat(config, supervisor_id)
+        except Exception as error:
+            log("admission error; no wake: " + str(error))
+            return 1
+        # Only a newly committed generation authorizes a new model process.
+        # Existing receipts are reconciliation evidence, never a spawn permit.
+        if reservation.get("outcome") != "reserved":
+            log("no-op: mission admission did not grant a fresh generation")
+            return 0
         attempt = dict(state)
         attempt.update(last_attempt_at=now, last_attempt_fingerprint=fingerprint,
                        last_attempt_exit=-1, last_attempt_reason=reason)
@@ -881,7 +1265,7 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
         log("waking target: " + reason)
         # The dedicated guard retains the flock if this supervisor is killed. A
         # replacement runner cannot overlap an orphaned wake target on this host.
-        code, settled = run_wake(config, lock_stream.fileno())
+        code, settled = run_wake(config, lock_stream.fileno(), reservation, supervisor_id)
         attempt["last_attempt_exit"] = code
         if code:
             save_state(attempt)
@@ -952,7 +1336,7 @@ def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dic
     digest = hashlib.sha256(profile.read_bytes()).hexdigest()
     command = [
         str(codex), "exec", "--profile", profile.stem.replace(".config", ""),
-        "--strict-config", "--model", "gpt-5.6-terra",
+        "--strict-config", "--model", "gpt-6-sol",
         "-c", 'model_reasoning_effort="high"', "-C", str(repo), DEFAULT_PROMPT,
     ]
     required_files = [
@@ -966,6 +1350,38 @@ def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dic
     return command, {"CODEX_HOME": str(profile.parent)}, required_files
 
 
+def admission_domain(repo: Path, registry_override: str | None, config_raw: str | None) -> dict[str, Any]:
+    home = Path.home().resolve()
+    repository = "nurockplayer/tachiko-conductor"
+    runs = Path(os.environ.get("TACHIKO_DATA_DIR", str(home / ".tachiko-conductor/runs"))).expanduser().resolve()
+    canonical_registry = (home / ".tachiko-conductor/mission-admission/registry.json").resolve()
+    inherited_registry = os.environ.get("TACHIKO_MISSION_ADMISSION_PATH")
+    registry = Path(registry_override or inherited_registry or canonical_registry).expanduser()
+    receipts = Path(os.environ.get("TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR", str(home / ".tachiko-conductor/mission-admission/heartbeat-receipts"))).expanduser()
+    if not registry.is_absolute() or not receipts.is_absolute():
+        raise RuntimeError("mission-admission registry and receipt paths must be absolute")
+    registry = registry.resolve()
+    if registry != canonical_registry or (inherited_registry and Path(inherited_registry).expanduser().resolve() != canonical_registry):
+        raise RuntimeError("heartbeat admission registry must resolve to the canonical per-user host path")
+    receipts = receipts.resolve()
+    if registry == runs or runs in registry.parents or repo == registry or repo in registry.parents:
+        raise RuntimeError("mission-admission registry must be host-global and outside Run/repository storage")
+    default_config = {"schemaVersion": 1, "revision": "mission-admission-v1", "limits": {"maxCaptains": 1, "maxWriters": 1, "maxHighAutonomy": 1}}
+    raw = config_raw or os.environ.get("TACHIKO_MISSION_ADMISSION_CONFIG")
+    try:
+        config = json.loads(raw) if raw else default_config
+    except json.JSONDecodeError as error:
+        raise RuntimeError("admission config must be strict revisioned JSON") from error
+    if (not isinstance(config, dict) or set(config) != {"schemaVersion", "revision", "limits"}
+            or config.get("schemaVersion") != 1 or not isinstance(config.get("revision"), str) or not config["revision"]
+            or not isinstance(config.get("limits"), dict) or set(config["limits"]) - {"maxCaptains", "maxWriters", "maxHighAutonomy", "maxPerRepository"}
+            or any(type(value) is not int or value < 1 for value in config["limits"].values())
+            or any(key not in config["limits"] for key in ("maxCaptains", "maxWriters", "maxHighAutonomy"))):
+        raise RuntimeError("admission config must use the supported positive-integer limits schema")
+    return {"repository": repository, "workspace": str(repo), "home": str(home), "registry": str(registry),
+            "runs": str(runs), "receipts": str(receipts), "config": config}
+
+
 def install(args: argparse.Namespace) -> int:
     os.umask(0o077)
     repo = Path(args.repo).resolve()
@@ -974,37 +1390,34 @@ def install(args: argparse.Namespace) -> int:
         raise RuntimeError("repository directory is not a Git checkout: " + str(repo))
     if args.interval < 1 or args.safety_interval < 1:
         raise RuntimeError("intervals must be positive")
+    if Path(args.codex).resolve() != DEFAULT_CODEX or Path(args.profile).resolve() != DEFAULT_PROFILE:
+        raise RuntimeError("only the qualified default GPT-6 Sol executable and profile are supported")
     if args.wake_command_json:
+        if not testing():
+            raise RuntimeError("custom wake targets are disabled until a verified admission and child-containment adapter exists")
         if not args.acknowledge_relocatable_wake_target:
-            raise RuntimeError(
-                "custom wake target requires --acknowledge-relocatable-wake-target; "
-                "scripts and binaries that depend on their executable location are unsupported"
-            )
+            raise RuntimeError("custom target requires --acknowledge-relocatable-wake-target")
         try:
             wake_command = json.loads(args.wake_command_json)
         except json.JSONDecodeError as error:
-            raise RuntimeError("invalid --wake-command-json") from error
-        wake_env: dict[str, str] = {}
-        if not isinstance(wake_command, list) or not wake_command or not isinstance(wake_command[0], str):
-            raise RuntimeError("invalid --wake-command-json")
-        wake_executable = Path(wake_command[0])
-        if not wake_executable.is_absolute() or not wake_executable.is_file() or wake_executable.is_symlink():
-            raise RuntimeError("custom wake executable unavailable")
-        required_files = [{
-            "path": str(wake_executable),
-            "sha256": hashlib.sha256(wake_executable.read_bytes()).hexdigest(),
-        }]
-        for required_name in args.required_file:
-            required_path = Path(required_name)
-            if not required_path.is_absolute() or not required_path.is_file() or required_path.is_symlink():
-                raise RuntimeError("custom required wake file unavailable: " + str(required_path))
-            if required_path.resolve() != wake_executable.resolve():
-                required_files.append({
-                    "path": str(required_path),
-                    "sha256": hashlib.sha256(required_path.read_bytes()).hexdigest(),
-                })
+            raise RuntimeError("custom wake command must be a JSON string array") from error
+        if not isinstance(wake_command, list) or not wake_command or not all(isinstance(item, str) and item for item in wake_command):
+            raise RuntimeError("custom wake command must be a non-empty JSON string array")
+        custom_executable = Path(wake_command[0])
+        if custom_executable.is_symlink() or not custom_executable.is_file() or not os.access(custom_executable, os.X_OK):
+            raise RuntimeError("custom wake executable unavailable or unsafe")
+        wake_command[0] = str(custom_executable.resolve())
+        wake_env = {}
+        required_files = [{"path": wake_command[0], "sha256": hashlib.sha256(Path(wake_command[0]).read_bytes()).hexdigest()}]
+        for required_path in args.required_file:
+            path = Path(required_path).resolve()
+            required_files.append({"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+        wake_kind = "test"
     else:
         wake_command, wake_env, required_files = default_wake(repo, Path(args.codex), Path(args.profile))
+        wake_kind = "codex"
+    domain_config = admission_domain(repo, args.admission_registry_path, args.admission_config_json)
+    node_source = Path(resolved_tool("node"))
     gh_source = Path(resolved_tool("gh"))
     config_values = {
         "schema": CONFIG_SCHEMA, "gh": str(gh_source), "gh_sha256": "", "repo": str(repo),
@@ -1013,7 +1426,10 @@ def install(args: argparse.Namespace) -> int:
         "wake_timeout_seconds": DEFAULT_WAKE_TIMEOUT_SECONDS,
         "safety_interval_seconds": args.safety_interval,
         "wake_executable_relocatable": True, "wake_command": wake_command,
-        "wake_env": wake_env, "required_files": required_files, "installed_at": now_epoch(),
+        "wake_target_kind": wake_kind, "wake_env": wake_env, "required_files": required_files,
+        "admission": domain_config, "admission_node": str(node_source), "admission_node_sha256": "",
+        "admission_helper": "", "admission_helper_sha256": "", "admission_helper_files": [],
+        "installed_at": now_epoch(),
     }
     plist: dict[str, Any] = {
         "Label": LABEL,
@@ -1033,15 +1449,24 @@ def install(args: argparse.Namespace) -> int:
     gh_snapshot_created = False
     runner_snapshot: Path | None = None
     runner_snapshot_created = False
+    node_snapshot: Path | None = None
+    node_snapshot_created = False
+    helper_entry: Path | None = None
+    helper_created = False
     service_transitioned = False
     previous_service_loaded = False
     domain = f"gui/{os.getuid()}"
     try:
         gh_snapshot, gh_digest, gh_snapshot_created = pin_github_tool(gh_source)
         runner_snapshot, runner_digest, runner_snapshot_created = pin_runner_source(runner)
+        node_snapshot, node_digest, node_snapshot_created = pin_admission_node(node_source)
+        helper_entry, helper_digest, helper_files, helper_created = pin_admission_helper(repo)
         config_values.update(
             gh=str(gh_snapshot), gh_sha256=gh_digest,
             runner=str(runner_snapshot), runner_sha256=runner_digest,
+            admission_node=str(node_snapshot), admission_node_sha256=node_digest,
+            admission_helper=str(helper_entry), admission_helper_sha256=helper_digest,
+            admission_helper_files=helper_files,
         )
         plist["ProgramArguments"] = ["/usr/bin/python3", str(runner_snapshot), "run"]
         config = validate_config(config_values)
@@ -1131,6 +1556,8 @@ def parser() -> argparse.ArgumentParser:
     install_parser.add_argument("--wake-command-json")
     install_parser.add_argument("--acknowledge-relocatable-wake-target", action="store_true")
     install_parser.add_argument("--required-file", action="append", default=[])
+    install_parser.add_argument("--admission-registry-path")
+    install_parser.add_argument("--admission-config-json")
     install_parser.add_argument("--no-load", action="store_true", help=argparse.SUPPRESS)
     uninstall_parser = subs.add_parser("uninstall")
     uninstall_parser.add_argument("--no-load", action="store_true", help=argparse.SUPPRESS)

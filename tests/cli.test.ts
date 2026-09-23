@@ -36,6 +36,8 @@ import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/doma
 import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
+import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
+import { DispatchAdmissionWaitError } from '../src/dispatch/runner.js';
 import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -611,6 +613,46 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.run.id, 'run-1');
   });
 
+  it('includes a persisted PR in initial admission so different Issues cannot share one PR', async () => {
+    const store = new MemoryStore();
+    let run = createRun({ ...TARGET, issueNumber: 43 }, T0, 'run-43');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+    store.create(run);
+    const config: AdmissionConfig = { schemaVersion: 1, revision: 'same-pr-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } };
+    const { dir } = tempStore();
+    try {
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config });
+      const owner = admission.admit({ laneId: 'other-issue', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42, pullRequest: 7, run: 'run-42' } });
+      assert.equal(owner.outcome, 'admitted');
+      const implementation = new FakeImplementation([]);
+      await assert.rejects(
+        runIssueCommand(deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])), 'acme/widgets#43', { admission }),
+        /overlaps active or parked lane "other-issue"/,
+      );
+      assert.equal(implementation.calls, 0);
+      assert.equal(admission.readLane('run:run-43'), null, 'conflicting persisted PR evidence is rejected before a new lane is recorded');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('strengthens an unbootstrapped lane with the actual ambient cwd before its provider call', async () => {
+    const store = new MemoryStore();
+    const config: AdmissionConfig = { schemaVersion: 1, revision: 'same-cwd-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } };
+    const { dir } = tempStore();
+    try {
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config });
+      const owner = admission.admit({ laneId: 'ambient-owner', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 40, workspace: process.cwd() } });
+      assert.equal(owner.outcome, 'admitted');
+      const implementation = new FakeImplementation([successResult(HEAD)]);
+      await assert.rejects(
+        runIssueCommand(deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])), 'acme/widgets#44', { admission, admissionWorkspace: process.cwd(), now: () => T0 }),
+        /overlaps reserved lane "ambient-owner"/,
+      );
+      assert.equal(implementation.calls, 0, 'ambient workspace conflict is detected before model execution');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('refuses a supplied repair authority that differs from an active durable run', async () => {
     const store = new MemoryStore();
     const run = createRun(TARGET, T0, 'run-1', undefined, undefined, REPAIR_AUTHORITY);
@@ -808,6 +850,170 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.outcome, 'merge_ready');
     assert.equal(outcome.run.headSha, HEAD2);
     assert.equal(outcome.run.history.some((entry) => entry.type === 'human_resolved' && entry.to === 'VALIDATING'), true);
+  });
+
+  it('releases a pre-execution sync failure so the same parked run can retry', async () => {
+    const { dir } = tempStore();
+    try {
+      const store = new MemoryStore();
+      let run = createRun(TARGET, T0, 'run-sync-retry');
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+      run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'deepseek', headSha: HEAD, findings: [{ severity: 'blocking', summary: 'fix browser flow' }] } }, T0, TEST_VALIDATION_AUTHORITY);
+      run = applyTransition(run, { type: 'start_fix' }, T0);
+      run = applyTransition(run, { type: 'escalate', reason: 'live HEAD changed', interrupt: { evidence: 'new commit', choices: [LIVE_HEAD_SYNC_DECISION, 'Cancel the run'] } }, T0);
+      store.create(run);
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'preflight-retry-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
+      const github = githubAdapter([HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]);
+      let failFirstSync = true;
+      const flakyGithub: GitHubAdapter = {
+        ...github,
+        async readLiveSnapshot(target) {
+          if (failFirstSync) {
+            failFirstSync = false;
+            throw new Error('temporary GitHub sync preflight failure');
+          }
+          return github.readLiveSnapshot(target);
+        },
+      };
+      const workflowDeps = deps(store, flakyGithub, new FakeImplementation([]), new FakeReviewer([{ verdict: 'approve', reviewerName: 'oracle', headSha: HEAD2, findings: [] }]));
+      await assert.rejects(resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission }), /temporary GitHub sync preflight failure/);
+      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'released');
+      const retried = await resumeCommand(workflowDeps, run.id, LIVE_HEAD_SYNC_DECISION, { admission, now: () => T0 });
+      assert.equal(retried.outcome, 'merge_ready');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('labels a concurrent release separately from the earlier admission denial revision', async () => {
+    const { dir } = tempStore();
+    try {
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'observation-race-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
+      const owner = admission.admit({ laneId: 'holder', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 1 } });
+      assert.equal(owner.outcome, 'admitted');
+      if (owner.outcome !== 'admitted') throw new Error('expected holder admission');
+      const snapshot = admission.snapshot.bind(admission);
+      let released = false;
+      admission.snapshot = () => {
+        if (!released) {
+          released = true;
+          admission.release(owner.token, true);
+        }
+        return snapshot();
+      };
+      const store = new MemoryStore();
+      await assert.rejects(
+        runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', {
+          dispatchClaimId: 'claim-race',
+          admission,
+        }),
+        (error: unknown) => {
+          assert.ok(error instanceof DispatchAdmissionWaitError);
+          assert.equal(error.admission?.result, 'parked');
+          assert.equal(error.admission?.decisionRevision, 2);
+          assert.equal(error.admission?.revision, 3);
+          assert.equal(error.admission?.counts.captains, 0);
+          assert.equal(error.admission?.lastTransition?.kind, 'released');
+          return true;
+        },
+      );
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('rejects direct execution and resume of Runs still bound to a dispatch claim', async () => {
+    const store = new MemoryStore();
+    const claimed = createRun(TARGET, T0, 'claimed-run', undefined, 'claim-live');
+    store.create(claimed);
+    await assert.rejects(
+      runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42'),
+      /bound to dispatch claim "undefined"/,
+    );
+
+    let parked = applyTransition(claimed, { type: 'start' }, T0);
+    parked = applyTransition(parked, { type: 'escalate', reason: 'decision', interrupt: { choices: ['retry'] } }, T0);
+    store.update(parked);
+    await assert.rejects(
+      resumeCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'claimed-run', 'retry'),
+      /matching dispatch ownership is required/,
+    );
+  });
+
+  it('releases direct admission when durable Run creation fails before workflow execution', async () => {
+    const { dir } = tempStore();
+    try {
+      class FailingCreateStore extends MemoryStore {
+        createdId: string | undefined;
+        override create(run: Run): void {
+          this.createdId = run.id;
+          throw new Error('injected durable create failure');
+        }
+      }
+      const store = new FailingCreateStore();
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'create-failure-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
+      await assert.rejects(
+        runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', { admission }),
+        /injected durable create failure/,
+      );
+      assert.equal(admission.readLane(`run:${store.createdId}`)?.status, 'released');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('retains active admission after an implementation invocation throws with uncertain child settlement', async () => {
+    const { dir } = tempStore();
+    try {
+      const store = new MemoryStore();
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'uncertain-child-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
+      class UncertainImplementation extends FakeImplementation {
+        override async run(): Promise<AgentResult> { throw new Error('provider invocation settlement is uncertain'); }
+      }
+      await assert.rejects(
+        runIssueCommand(deps(store, githubAdapter([HEAD]), new UncertainImplementation([]), new FakeReviewer([])), 'acme/widgets#42', { admission, admissionWorkspace: process.cwd() }),
+        /provider invocation settlement is uncertain/,
+      );
+      const run = store.list()[0];
+      assert.ok(run);
+      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'active');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('rechecks the admission generation immediately before implementation mutation', async () => {
+    const { dir } = tempStore();
+    try {
+      const store = new MemoryStore();
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'mutation-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
+      let token: { laneId: string; generation: number; token: string } | undefined;
+      const originalAdmit = admission.admit.bind(admission);
+      admission.admit = ((request, options) => {
+        const result = originalAdmit(request, options);
+        if (result.outcome === 'admitted') token = result.token;
+        return result;
+      }) as typeof admission.admit;
+      const github = githubAdapter([HEAD]);
+      const readLiveSnapshot = github.readLiveSnapshot.bind(github);
+      const expiringGithub: GitHubAdapter = {
+        ...github,
+        async readLiveSnapshot(target) {
+          const live = await readLiveSnapshot(target);
+          if (token !== undefined) {
+            admission.release(token, true);
+            token = undefined;
+          }
+          return live;
+        },
+      };
+      const implementation = new FakeImplementation([successResult(HEAD)]);
+      await assert.rejects(
+        runIssueCommand(deps(store, expiringGithub, implementation, new FakeReviewer([])), 'acme/widgets#42', { admission }),
+        /Admission generation token is stale/,
+      );
+      assert.equal(implementation.calls, 0);
+      assert.equal(admission.readLane(`run:${store.list()[0]!.id}`)?.status, 'released');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('applies the same advertised sync after ordinary review-state drift instead of parking again', async () => {

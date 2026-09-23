@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import {
@@ -11,13 +14,16 @@ import {
   selectDispatchRuntime,
   type DispatchRuntimeComment,
 } from '../src/dispatch/queue.js';
-import { dispatchOnce } from '../src/dispatch/runner.js';
+import { dispatchOnce, runtimeClaimFromBody } from '../src/dispatch/runner.js';
 import { dispatchOnceCommand } from '../src/dispatch/command.js';
 import { parseDispatchConfiguration } from '../src/dispatch/config.js';
 import type { GitHubAdapter, IssueSnapshot, PullRequestSnapshot } from '../src/adapters/github.js';
 import { createRun } from '../src/domain/run.js';
 import type { Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
+import { JsonFileStore } from '../src/store/json-file-store.js';
+import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
+import { runIssueCommand } from '../src/cli.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
 import { LiveGitHubAdapter } from '../src/github/live-state.js';
 import type { GitHubApiTransport } from '../src/github/transport.js';
@@ -31,6 +37,7 @@ ready:
   - issue: 19
     route: codex
     profile: standard`;
+const DISPATCH_AUTHORITY = { revision: 'task-shape-v1', shape: 'interacting' } as const;
 
 class Comments {
   readonly comments: DispatchRuntimeComment[] = [];
@@ -205,7 +212,7 @@ describe('dispatch queue protocol', () => {
       },
       execution: { runId: 'run-18', state: 'IMPLEMENTING' },
     });
-    store.create(createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'run-18'));
+    store.create(createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'run-18', undefined, 'claim-1'));
     const alreadyClaimed = await dispatchOnce({
       queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
       leaseDurationMs: 60_000, now: () => T0, async execute(entry) { return { runId: `run-${entry.issue}`, state: 'VALIDATING' }; },
@@ -300,7 +307,7 @@ describe('dispatch queue protocol', () => {
   it('never re-executes a terminal claim and safely supersedes it after its queue entry is removed', async () => {
     const runtime = new Comments();
     const store = new MemoryStore();
-    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'done'), state: 'FAILED' as const };
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'done', undefined, 'old-claim'), state: 'FAILED' as const };
     store.create(terminal);
     runtime.comments.push({
       id: 'comment-1',
@@ -328,7 +335,7 @@ describe('dispatch queue protocol', () => {
   it('retires an absent terminal claim so an identical later re-dispatch creates fresh work', async () => {
     const runtime = new Comments();
     const store = new MemoryStore();
-    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'done'), state: 'FAILED' as const };
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'done', undefined, 'old-claim'), state: 'FAILED' as const };
     store.create(terminal);
     runtime.comments.push({
       id: 'comment-1',
@@ -375,7 +382,7 @@ describe('dispatch queue protocol', () => {
     const runtime = new Comments();
     const store = new MemoryStore();
     store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'old-terminal'), state: 'FAILED' });
-    const claimed = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'claimed-run');
+    const claimed = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'claimed-run', undefined, 'claim-1');
     store.create(claimed);
     runtime.comments.push({
       id: 'comment-1',
@@ -393,10 +400,25 @@ describe('dispatch queue protocol', () => {
     assert.equal(received?.id, claimed.id);
   });
 
+  it('fails closed when a retained Run ID is bound to a different dispatch claim', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    const mismatched = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'mismatched', undefined, 'other-claim');
+    store.create(mismatched);
+    runtime.comments.push({ id: 'comment-1', body: renderDispatchRuntime({
+      issue: 18, claimId: 'claim-1', runId: mismatched.id, profile: 'complex', state: 'claimed',
+      claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+    }) });
+    await assert.rejects(dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime, leaseDurationMs: 60_000, now: () => T0,
+      async execute() { throw new Error('mismatched Run must not execute'); },
+    }), /differently claimed durable run/);
+  });
+
   it('reconciles a terminal durable Run to its retained runtime claim after a crash window', async () => {
     const runtime = new Comments();
     const store = new MemoryStore();
-    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'terminal'), state: 'FAILED' as const };
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'terminal', undefined, 'claim-1'), state: 'FAILED' as const };
     store.create(terminal);
     runtime.comments.push({
       id: 'comment-1',
@@ -492,7 +514,7 @@ describe('dispatch queue protocol', () => {
   it('does not rewrite an already reconciled terminal claim on a settled wake', async () => {
     const runtime = new Comments();
     const store = new MemoryStore();
-    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'terminal'), state: 'FAILED' as const };
+    const terminal = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'terminal', undefined, 'claim-1'), state: 'FAILED' as const };
     store.create(terminal);
     runtime.comments.push({
       id: 'comment-1',
@@ -514,7 +536,7 @@ describe('dispatch queue protocol', () => {
     it(`does not rewrite an already reconciled ${state} claim on a settled wake`, async () => {
       const runtime = new Comments();
       const store = new MemoryStore();
-      const settled = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, `settled-${state.toLowerCase()}`), state };
+      const settled = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, `settled-${state.toLowerCase()}`, undefined, 'claim-1'), state };
       store.create(settled);
       runtime.comments.push({
         id: 'comment-1',
@@ -538,7 +560,7 @@ describe('dispatch queue protocol', () => {
     const runtime = new CommandRuntime(QUEUE);
     const store = new MemoryStore();
     const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
-    const existing = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing', execution);
+    const existing = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing', execution, 'claim-1');
     store.create(existing);
     runtime.comments.push({
       id: 'comment-1',
@@ -595,11 +617,153 @@ ready:
     assert.deepEqual(received[0]?.authority, { revision: 'task-shape-v1', shape: 'interacting' });
   });
 
+  it('keeps one claim-bound READY Run through capacity denial and restart, then admits that exact Run after capacity frees', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-admission-'));
+    const queue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complex\n    task-shape-revision: task-shape-v1\n    task-shape: interacting`;
+    const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
+    const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'dispatch-admission-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+    const storeDir = path.join(directory, 'runs');
+    const registryPath = path.join(directory, 'host', 'admission.json');
+    const claimRegistry = () => new MissionAdmissionRegistry({ filePath: registryPath, config: admissionConfig });
+    try {
+      const store = new JsonFileStore({ dir: storeDir });
+      const admission = claimRegistry();
+      const capacityHolder = admission.admit({ laneId: 'capacity-holder', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 19 } });
+      assert.equal(capacityHolder.outcome, 'admitted');
+      if (capacityHolder.outcome !== 'admitted') throw new Error('expected capacity holder');
+
+      let modelCalls = 0;
+      const workflow = {
+        store,
+        github: new GitHub(),
+        implementation: { provider: 'codex-cli', async run() { modelCalls += 1; throw new Error('model must not run in the capacity wait'); } },
+        reviewer: { name: 'reviewer', async review() { throw new Error('review must not run'); } },
+      } as unknown as WorkflowDependencies;
+      const runtime = new CommandRuntime(queue);
+      const first = await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
+        workflow, runtime, admission,
+        resolveExecutionProfile: () => execution,
+        runIssue: async (ref, selected, claimId, authority, registry) => await runIssueCommand(workflow, ref, { execution: selected, dispatchClaimId: claimId, repairTaskShapeAuthority: authority, admission: registry }),
+        resumeClaimedRun: async (run, claimId, registry) => {
+          if (run.target.kind !== 'issue') throw new Error('expected issue run');
+          return await runIssueCommand(workflow, `acme/widgets#${run.target.issueNumber}`, {
+            ...(run.execution === undefined ? {} : { execution: run.execution }), dispatchClaimId: claimId,
+            ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }), admission: registry,
+          });
+        },
+        now: () => T0,
+      });
+      assert.equal(first.outcome, 'admission_wait');
+      if (first.outcome !== 'admission_wait') throw new Error('expected typed capacity wait');
+      assert.equal(first.waitKind, 'capacity');
+      assert.equal(first.admission?.revision, admission.snapshot().revision);
+      assert.equal(first.admission?.role, 'production_captain');
+      assert.equal(first.admission?.result, 'parked');
+      assert.deepEqual(first.admission?.counts, { captains: 1, writers: 1, highAutonomy: 0, parked: 1 });
+      assert.equal(JSON.stringify(first.admission).includes('token'), false, 'admission wait telemetry must not contain capability tokens');
+      assert.equal(JSON.stringify(first.admission).includes('workspace'), false, 'admission wait telemetry must not contain physical paths');
+      assert.equal(first.claim.state, 'claimed');
+      assert.ok(first.claim.runId);
+      assert.equal(store.list().length, 1);
+      const firstRun = store.read(first.claim.runId!)!;
+      assert.equal(firstRun.state, 'READY');
+      assert.equal(firstRun.dispatchClaimId, first.claim.claimId);
+      assert.deepEqual(firstRun.execution, execution);
+      assert.deepEqual(firstRun.repairTaskShapeAuthority, DISPATCH_AUTHORITY);
+      assert.equal(modelCalls, 0);
+
+      const serializedClaim = runtime.comments[0]!.body;
+      const restartedRuntime = new CommandRuntime(queue);
+      restartedRuntime.comments.push({ ...runtime.comments[0]! });
+      const restartedStore = new JsonFileStore({ dir: storeDir });
+      const restartedAdmission = claimRegistry();
+      const parkedRevision = restartedAdmission.snapshot().revision;
+      const repeated = await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
+        workflow: { ...workflow, store: restartedStore }, runtime: restartedRuntime, admission: restartedAdmission,
+        resolveExecutionProfile: () => { throw new Error('must use durable execution snapshot'); },
+        runIssue: async () => { throw new Error('claim has a durable Run'); },
+        resumeClaimedRun: async (run, claimId, registry) => {
+          if (run.target.kind !== 'issue') throw new Error('expected issue run');
+          return await runIssueCommand({ ...workflow, store: restartedStore }, `acme/widgets#${run.target.issueNumber}`, {
+            ...(run.execution === undefined ? {} : { execution: run.execution }), dispatchClaimId: claimId,
+            ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }), admission: registry,
+          });
+        },
+        now: () => T0,
+      });
+      assert.equal(repeated.outcome, 'admission_wait');
+      if (repeated.outcome !== 'admission_wait') throw new Error('expected typed repeat wait');
+      assert.equal(repeated.runId, firstRun.id);
+      assert.equal(repeated.claim.claimId, first.claim.claimId);
+      assert.equal(restartedStore.list().length, 1);
+      assert.equal(restartedStore.read(firstRun.id)?.state, 'READY');
+      assert.equal(restartedAdmission.snapshot().revision, parkedRevision);
+      assert.equal(runtimeClaimFromBody(serializedClaim)?.runId, firstRun.id);
+      assert.equal(modelCalls, 0);
+
+      restartedAdmission.release(capacityHolder.token, true);
+      const admitted = await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
+        workflow: { ...workflow, store: restartedStore }, runtime: restartedRuntime, admission: restartedAdmission,
+        resolveExecutionProfile: () => { throw new Error('must use durable execution snapshot'); },
+        runIssue: async () => { throw new Error('must resume the existing claim-bound Run'); },
+        resumeClaimedRun: async (run, claimId, registry) => {
+          if (run.target.kind !== 'issue') throw new Error('expected issue run');
+          return await runIssueCommand({ ...workflow, store: restartedStore }, `acme/widgets#${run.target.issueNumber}`, {
+            ...(run.execution === undefined ? {} : { execution: run.execution }), dispatchClaimId: claimId,
+            ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }), admission: registry,
+          });
+        },
+        now: () => T0,
+      });
+      assert.equal(admitted.outcome, 'dispatched');
+      if (admitted.outcome !== 'dispatched') throw new Error('expected admitted execution');
+      assert.equal(admitted.claim.runId, firstRun.id);
+      assert.equal(admitted.claim.claimId, first.claim.claimId);
+      assert.equal(restartedStore.list().length, 1);
+      assert.equal(restartedStore.read(firstRun.id)?.state, 'NEEDS_HUMAN');
+      assert.equal(restartedAdmission.readLane(`run:${firstRun.id}`)?.status, 'parked');
+      assert.equal(modelCalls, 0);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('returns typed owner wait for a known repository-wide manual owner without invoking workflow providers', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-manual-owner-'));
+    const queue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complex\n    task-shape-revision: task-shape-v1\n    task-shape: interacting`;
+    const config: AdmissionConfig = { schemaVersion: 1, revision: 'manual-owner-wait-v1', limits: { maxCaptains: 2, maxWriters: 1, maxHighAutonomy: 1 } };
+    try {
+      const store = new JsonFileStore({ dir: path.join(directory, 'runs') });
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(directory, 'host', 'admission.json'), config });
+      const owner = admission.admit({ laneId: 'manual:owner', role: 'production_captain', evidence: { repository: 'acme/widgets', repositoryScope: true, workspace: path.join(directory, 'manual') } });
+      assert.equal(owner.outcome, 'admitted');
+      const workflow = { store, github: new GitHub(), implementation: { async run() { throw new Error('implementation must not run'); } }, reviewer: {} } as unknown as WorkflowDependencies;
+      const runtime = new CommandRuntime(queue);
+      const waiting = await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 }, {
+        workflow, runtime, admission,
+        resolveExecutionProfile: () => ({ profile: 'complex', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 }),
+        runIssue: async (ref, execution, claimId, authority, registry) => await runIssueCommand(workflow, ref, { execution, dispatchClaimId: claimId, repairTaskShapeAuthority: authority, admission: registry }),
+        resumeClaimedRun: async (run, claimId, registry) => {
+          if (run.target.kind !== 'issue') throw new Error('expected issue run');
+          return await runIssueCommand(workflow, `acme/widgets#${run.target.issueNumber}`, {
+            ...(run.execution === undefined ? {} : { execution: run.execution }), dispatchClaimId: claimId,
+            ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }), admission: registry,
+          });
+        },
+        now: () => T0,
+      });
+      assert.equal(waiting.outcome, 'admission_wait');
+      if (waiting.outcome !== 'admission_wait') throw new Error('expected typed owner wait');
+      assert.equal(waiting.waitKind, 'owner');
+      assert.equal(waiting.claim.runId, store.list()[0]?.id);
+      assert.equal(store.list()[0]?.state, 'READY');
+      assert.equal(admission.readLane('manual:owner')?.status, 'active');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('rejects recovery when the durable profile and retained claim disagree', async () => {
     const runtime = new CommandRuntime(QUEUE);
     const store = new MemoryStore();
     const execution = { profile: 'standard' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
-    const existing = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing', execution);
+    const existing = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing', execution, 'claim-1');
     store.create(existing);
     runtime.comments.push({
       id: 'comment-1',

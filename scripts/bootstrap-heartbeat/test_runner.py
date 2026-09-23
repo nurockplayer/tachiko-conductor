@@ -4,15 +4,18 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
 import plistlib
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -29,6 +32,7 @@ class HeartbeatTest(unittest.TestCase):
         self.gh = self.root / "gh"
         self.wake = self.root / "wake"
         self.launchctl = self.root / "launchctl"
+        self.admission_state = self.root / "admission-state.json"
         self.plist = self.root / "LaunchAgents" / "heartbeat.plist"
         self.gh.write_text(
             "#!/usr/bin/python3\nimport os, pathlib, time\n"
@@ -43,7 +47,7 @@ class HeartbeatTest(unittest.TestCase):
             "    companion = pathlib.Path(os.environ['SCD_HEARTBEAT_TEST_ROOT']) / 'codex-code-mode-host'\n"
             "    if companion.read_text() != 'trusted companion\\n': sys.exit(86)\n"
             "with pathlib.Path(os.environ['MOCK_WAKE_CALLS']).open('a') as f: "
-            "f.write(json.dumps({'args': sys.argv[1:]}) + '\\n')\n"
+            "f.write(json.dumps({'args': sys.argv[1:], 'admission_path': os.environ.get('TACHIKO_MISSION_ADMISSION_PATH')}) + '\\n')\n"
             "print('x' * int(os.environ.get('MOCK_WAKE_OUTPUT', '0')))\n"
             "background = float(os.environ.get('MOCK_WAKE_BACKGROUND_SLEEP', '0'))\n"
             "if background:\n"
@@ -92,7 +96,9 @@ class HeartbeatTest(unittest.TestCase):
             "MOCK_WAKE_CALLS": str(self.calls),
             "MOCK_WAKE_BACKGROUND_PID": str(self.root / "background.pid"),
             "MOCK_LAUNCHCTL_FAIL_MARKER": str(self.root / "launchctl-failed-once"),
+            "MOCK_ADMISSION_STATE": str(self.admission_state),
         })
+        self.env.pop("TACHIKO_MISSION_ADMISSION_PATH", None)
         self.write_config()
 
     def tearDown(self) -> None:
@@ -113,8 +119,51 @@ class HeartbeatTest(unittest.TestCase):
         runner_snapshot = self.state_root / ("verified-runner-" + runner_digest)
         runner_snapshot.write_bytes(RUNNER.read_bytes())
         runner_snapshot.chmod(0o700)
+        node = Path(shutil.which("node") or "")
+        self.assertTrue(node.is_file(), "Node is required for the pinned admission helper tests")
+        node_digest = hashlib.sha256(node.read_bytes()).hexdigest()
+        node_snapshot = self.state_root / ("verified-node-" + node_digest)
+        node_snapshot.write_bytes(node.read_bytes())
+        node_snapshot.chmod(0o700)
+        helper_root = self.state_root / "verified-admission-test"
+        helper_entry = helper_root / "mission-admission" / "heartbeat-admission-cli.js"
+        helper_entry.parent.mkdir(parents=True, exist_ok=True)
+        helper_source = (
+            "import fs from 'node:fs';\n"
+            "const statePath = " + json.dumps(str(self.admission_state)) + ";\n"
+            "let s = {}; try { s = JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch {}\n"
+            "const q = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+            "if (q.action === 'reserve') {\n"
+            " if (s.mode === 'waiting') { console.log(JSON.stringify({schemaVersion:1,outcome:'waiting'})); process.exit(0); }\n"
+            " if (s.mode === 'corrupt') { process.exit(2); }\n"
+            " if (s.active) { console.log(JSON.stringify({schemaVersion:1,outcome:'already_reserved'})); process.exit(0); }\n"
+            " s.generation = (s.generation || 0) + 1; s.receiptId = '00000000-0000-4000-8000-' + String(s.generation).padStart(12,'0');\n"
+            " s.supervisorId = q.supervisorId; s.active = true; fs.writeFileSync(statePath, JSON.stringify(s));\n"
+            " console.log(JSON.stringify({schemaVersion:1,outcome:'reserved',generation:s.generation,receiptId:s.receiptId,revision:s.generation}));\n"
+            "} else if (q.action === 'settle') {\n"
+            " if (s.mode === 'stale') process.exit(2);\n"
+            " if (!s.active || q.expectedGeneration !== s.generation || q.receiptId !== s.receiptId || q.supervisorId !== s.supervisorId || !q.stopProof?.childrenStopped || !q.stopProof?.supervisorStopped || q.stopProof.observedAt === 'pending') process.exit(2);\n"
+            " s.active = false; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'settled'}));\n"
+            "}\n"
+        )
+        helper_entry.write_text(helper_source, encoding="utf-8")
+        package_json = helper_root / "package.json"
+        package_json.write_text('{"type":"module"}\n', encoding="utf-8")
+        helper_files = []
+        for path in (package_json, helper_entry):
+            path_digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            helper_files.append({"path": str(path), "sha256": path_digest})
+        closure_digest = hashlib.sha256("\n".join(
+            f"{Path(item['path']).relative_to(helper_root).as_posix()} {item['sha256']}" for item in sorted(helper_files, key=lambda i: i["path"])
+        ).encode()).hexdigest()
+        admission = {
+            "repository": "nurockplayer/tachiko-conductor", "workspace": str(Path.cwd().resolve()),
+            "home": str(Path.home()), "registry": str(self.root / "host-registry.json"),
+            "runs": str(self.root / "runs"), "receipts": str(self.root / "receipts"),
+            "config": {"schemaVersion": 1, "revision": "test-config-v2", "limits": {"maxCaptains": 2, "maxWriters": 2, "maxHighAutonomy": 1}},
+        }
         config = {
-            "schema": 1,
+            "schema": 2,
             "gh": str(gh_snapshot),
             "gh_sha256": gh_digest,
             "repo": str(Path.cwd()),
@@ -125,11 +174,16 @@ class HeartbeatTest(unittest.TestCase):
             "wake_timeout_seconds": 1500,
             "safety_interval_seconds": safety,
             "wake_executable_relocatable": True,
+            "wake_target_kind": "test",
             "wake_command": [str(self.wake), "dispatchable-target"],
             "wake_env": {},
             "required_files": [{
                 "path": str(self.wake), "sha256": hashlib.sha256(self.wake.read_bytes()).hexdigest()
             }],
+            "admission": admission,
+            "admission_node": str(node_snapshot), "admission_node_sha256": node_digest,
+            "admission_helper": str(helper_entry), "admission_helper_sha256": closure_digest,
+            "admission_helper_files": helper_files,
             "installed_at": 1000,
         }
         (self.state_root / "config.json").write_text(json.dumps(config), encoding="utf-8")
@@ -235,6 +289,224 @@ class HeartbeatTest(unittest.TestCase):
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="2805"))
         self.assertEqual(len(self.records()), 4, "failed wake must retry unconsumed change")
         self.assertEqual(self.records()[0]["args"], ["dispatchable-target"])
+
+    def test_admission_capacity_denial_and_existing_receipt_never_spawn(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.admission_state.write_text(json.dumps({"mode": "waiting"}), encoding="utf-8")
+        denied = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(denied.returncode, 0, denied.stderr)
+        self.assertEqual(self.records(), [], "capacity denial remains a quiet model-free result")
+        self.admission_state.write_text(json.dumps({"active": True, "generation": 1, "receiptId": "old"}), encoding="utf-8")
+        retry = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"), check=False)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(self.records(), [], "already-reserved reconciliation never authorizes another model")
+
+    def test_corrupt_or_tampered_admission_helper_fails_closed(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.admission_state.write_text(json.dumps({"mode": "corrupt"}), encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.records(), [])
+        self.admission_state.write_text("{}", encoding="utf-8")
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        Path(config["admission_helper"]).write_text("// replaced\n", encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.records(), [], "helper byte tampering must deny ownership and model launch")
+
+    def test_wake_environment_cannot_override_admission_domain(self) -> None:
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_env"] = {"TACHIKO_MISSION_ADMISSION_PATH": str(self.root / "attacker-registry.json")}
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.assertEqual(self.invoke("run", "--prime", check=False).returncode, 1)
+        self.assertFalse((self.root / "attacker-registry.json").exists())
+        self.assertEqual(self.records(), [])
+
+    def test_wake_child_uses_pinned_admission_domain_over_conflicting_ambient_environment(self) -> None:
+        self.invoke("run", "--prime")
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        self.write_payload("ambient-domain")
+        alternate = self.root / "ambient-registry.json"
+        result = self.invoke(
+            "run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1179",
+                            TACHIKO_MISSION_ADMISSION_PATH=str(alternate),
+                            TACHIKO_MISSION_ADMISSION_CONFIG="{}",
+                            TACHIKO_DATA_DIR=str(self.root / "wrong-runs")),
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.records()[0]["admission_path"], config["admission"]["registry"])
+        self.assertNotEqual(self.records()[0]["admission_path"], str(alternate))
+        self.assertFalse(alternate.exists())
+
+    def test_guard_settlement_failure_times_out_without_consuming_or_unlocking(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_timeout_seconds"] = 1
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        self.admission_state.write_text(json.dumps({"mode": "stale"}), encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertNotEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
+        receipt = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(receipt["active"], "ambiguous settlement must retain the registry generation")
+        self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(len(self.records()), 1, "ambiguous guard settlement must not permit overlap")
+        receipt.pop("mode", None)
+        self.admission_state.write_text(json.dumps(receipt), encoding="utf-8")
+        deadline = time.time() + 7
+        while (self.state_root / "runner.lock").read_bytes() and time.time() < deadline:
+            time.sleep(0.1)
+        self.assertEqual((self.state_root / "runner.lock").read_bytes(), b"", "guard may settle after state repair")
+
+    def test_real_pinned_helper_competes_with_native_lane_then_guard_settles(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_runner_under_test", RUNNER)
+            self.assertIsNotNone(spec and spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        node_source = Path(shutil.which("node") or "")
+        node, node_digest, _ = module.pin_admission_node(node_source)
+        helper, helper_digest, helper_files, _ = module.pin_admission_helper(Path.cwd().resolve())
+        admission = {
+            "repository": "nurockplayer/tachiko-conductor", "workspace": str((self.root / "workspace").resolve()),
+            "home": str((self.root / "home").resolve()),
+            "registry": str((self.root / "home" / ".tachiko-conductor" / "mission-admission" / "registry.json").resolve()),
+            "runs": str(self.root / "runs"), "receipts": str(self.root / "receipts"),
+            "config": {"schemaVersion": 1, "revision": "cross-language-smoke-v1", "limits": {"maxCaptains": 2, "maxWriters": 2, "maxHighAutonomy": 1}},
+        }
+        Path(admission["workspace"]).mkdir()
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config.update({"admission": admission, "admission_node": str(node), "admission_node_sha256": node_digest,
+                       "admission_helper": str(helper), "admission_helper_sha256": helper_digest,
+                       "admission_helper_files": helper_files})
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        runtime_config = dict(config)
+        runtime_config["wake_env"] = {}
+        helper_env = module.admission_helper_environment(runtime_config)
+        registry_js = Path(helper).parents[1] / "mission-admission/registry.js"
+        host_registry_js = Path(helper).parents[1] / "mission-admission/host-registry.js"
+        direct_source = (
+            "import { createHostAdmissionRegistry } from " + json.dumps(host_registry_js.as_uri()) + ";\n"
+            "const registry = createHostAdmissionRegistry();\n"
+            "const result = registry.admit({laneId:'native-direct-smoke',role:'production_captain',highAutonomy:true,evidence:{repository:'nurockplayer/tachiko-conductor',issue:117,workspace:" + json.dumps(admission["workspace"]) + "}});\n"
+            "console.log(JSON.stringify(result));\n"
+        )
+        direct = subprocess.run([str(node), "--input-type=module", "-e", direct_source], env=helper_env,
+                                text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        direct_result = json.loads(direct.stdout)
+        self.assertEqual(direct_result["outcome"], "admitted")
+
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        denied = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(denied.returncode, 0, denied.stderr + (self.state_root / "heartbeat.log").read_text())
+        self.assertEqual(self.records(), [], "a native/direct production lane must deny the heartbeat wake")
+
+        release_source = (
+            "import { MissionAdmissionRegistry } from " + json.dumps(registry_js.as_uri()) + ";\n"
+            "const registry = new MissionAdmissionRegistry({filePath: process.env.TACHIKO_MISSION_ADMISSION_PATH, config: JSON.parse(process.env.TACHIKO_MISSION_ADMISSION_CONFIG)});\n"
+            "const lane = registry.readLane('native-direct-smoke');\n"
+            "registry.release({laneId:lane.laneId,generation:lane.generation,token:" + json.dumps(direct_result["token"]["token"]) + "},true);\n"
+        )
+        subprocess.run([str(node), "--input-type=module", "-e", release_source], env=helper_env,
+                       text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        resumed = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1002",
+            TACHIKO_MISSION_ADMISSION_PATH=str(self.root / "attacker-registry.json"),
+        ), check=False)
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(len(self.records()), 1)
+        self.assertEqual(self.records()[0]["admission_path"], admission["registry"],
+                         "native CLI in the wake must use the helper's fixed registry domain")
+        inspect = module.admission_call(runtime_config, {
+            "schemaVersion": 1, "action": "inspect", "repository": admission["repository"],
+            "workspace": admission["workspace"],
+        })
+        self.assertEqual(inspect["outcome"], "inspected")
+        heartbeat_lane = inspect["lane"]
+        self.assertIsNotNone(heartbeat_lane)
+        self.assertEqual(heartbeat_lane["status"], "released", "guard must settle the exact registry generation")
+
+    def test_empty_process_snapshot_requires_kernel_group_absence(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_group_scan_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+        empty_ps = subprocess.CompletedProcess(["ps"], 0, stdout="", stderr="")
+        with mock.patch.object(module.Path, "is_dir", return_value=False), \
+             mock.patch.object(module.subprocess, "run", return_value=empty_ps), \
+             mock.patch.object(module.os, "killpg", return_value=None):
+            self.assertIsNone(module.process_group_has_live_members(12345),
+                              "a fork after the process snapshot must not be mistaken for an empty group")
+        with mock.patch.object(module.Path, "is_dir", return_value=False), \
+             mock.patch.object(module.subprocess, "run", return_value=empty_ps), \
+             mock.patch.object(module.os, "killpg", side_effect=ProcessLookupError()):
+            self.assertFalse(module.process_group_has_live_members(12345),
+                             "only kernel-confirmed process-group absence proves stop")
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the synchronized /proc race regression requires Linux")
+    def test_process_group_scan_miss_after_fork_remains_unknown(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_fork_scan_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"], start_new_session=True)
+        original_iterdir = module.Path.iterdir
+        try:
+            def snapshot_without_target(directory: Path):
+                entries = list(original_iterdir(directory))
+                if str(directory) == "/proc":
+                    # Model a process forked into the guarded PGID just after
+                    # the directory snapshot was taken.
+                    entries = [entry for entry in entries if entry.name != str(child.pid)]
+                return iter(entries)
+
+            with mock.patch.object(module.Path, "iterdir", snapshot_without_target):
+                self.assertIsNone(module.process_group_has_live_members(child.pid),
+                                  "a child omitted from the process snapshot must remain guarded by kernel PGID evidence")
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
 
     def test_canonicalization_ignores_connection_order(self) -> None:
         self.invoke("run", "--prime")
@@ -488,7 +760,9 @@ class HeartbeatTest(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(
             len(self.records()), 2,
-            "guard must terminate the timed-out direct target before releasing the lock",
+            "guard must terminate the timed-out direct target before releasing the lock; log=" +
+            (self.state_root / "heartbeat.log").read_text() + " registry=" +
+            self.admission_state.read_text() + " lock=" + (self.state_root / "runner.lock").read_text(),
         )
 
     def test_orphan_timeout_kills_term_resistant_process_group_before_unlock(self) -> None:
@@ -524,33 +798,55 @@ class HeartbeatTest(unittest.TestCase):
             time.sleep(0.1)
         self.assertEqual(len(self.records()), 2, "guard must unlock only after process-group cleanup")
 
-    def test_wake_descendant_cannot_retain_lock_after_direct_child_exits(self) -> None:
+    def test_wake_descendant_retains_lock_until_process_group_is_empty(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")
         background_pid_path = self.root / "background.pid"
         background = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_BACKGROUND_SLEEP="5")
-        self.invoke("run", env=background)
+        first = subprocess.Popen([sys.executable, str(RUNNER), "run"], env=background)
+        deadline = time.time() + 5
+        while not background_pid_path.exists() and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(background_pid_path.exists(), "wake target must create the test descendant")
         background_pid = int(background_pid_path.read_text(encoding="utf-8"))
         try:
             os.kill(background_pid, 0)
             self.write_payload("C")
             self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
             self.assertEqual(
-                len(self.records()), 2,
-                "a background descendant must not retain the single-writer lock",
+                len(self.records()), 1,
+                "a live descendant must retain the single-writer admission and lock",
             )
+            first.wait(timeout=10)
+            self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1003"))
+            self.assertEqual(len(self.records()), 2, "fresh admission may resume after guard settles the prior generation")
         finally:
+            if first.poll() is None:
+                first.kill()
+                first.wait(timeout=5)
             try:
                 os.kill(background_pid, 9)
             except ProcessLookupError:
                 pass
+
+    def test_long_guard_handoff_frame_is_delivered_completely(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["wake_env"] = {"MOCK_LONG_HANDOFF": "x" * 20_000}
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.admission_state.exists())
+        self.assertFalse(json.loads(self.admission_state.read_text()) ["active"])
 
     def test_direct_exit_does_not_wait_for_descendant_output_eof(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")
         config_path = self.state_root / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        config["wake_timeout_seconds"] = 2
+        config["wake_timeout_seconds"] = 10
         config_path.write_text(json.dumps(config), encoding="utf-8")
         background_pid_path = self.root / "background.pid"
         environment = dict(
@@ -564,8 +860,10 @@ class HeartbeatTest(unittest.TestCase):
         background_pid = int(background_pid_path.read_text(encoding="utf-8"))
         try:
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertLess(time.monotonic() - started, 1.5)
+            self.assertGreaterEqual(time.monotonic() - started, 4.0, "successful state waits for the descendant group to stop")
+            self.assertLess(time.monotonic() - started, 8.0)
             self.assertEqual(self.state()["last_attempt_exit"], 0)
+            self.assertEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
         finally:
             try:
                 os.kill(background_pid, 9)
@@ -584,7 +882,7 @@ class HeartbeatTest(unittest.TestCase):
         result = self.invoke("run", env=stalled, check=False)
         heartbeat_log = (self.state_root / "heartbeat.log").read_text(encoding="utf-8")
         self.assertEqual(result.returncode, 124, result.stderr + heartbeat_log)
-        self.assertLess(time.monotonic() - started, 1.8)
+        self.assertLess(time.monotonic() - started, 3.0)
         self.assertEqual(self.state()["last_attempt_exit"], 124)
         self.assertNotEqual(self.state()["successful_fingerprint"], self.state()["last_attempt_fingerprint"])
         self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
@@ -667,17 +965,26 @@ class HeartbeatTest(unittest.TestCase):
         if (self.state_root / "state.json").exists():
             (self.state_root / "state.json").unlink()
         command = json.dumps([str(self.wake), "future-dispatch-once"])
+        home = self.root.resolve()
+        canonical_registry = home / ".tachiko-conductor" / "mission-admission" / "registry.json"
+        canonical_registry.parent.mkdir(parents=True)
+        canonical_registry.write_text("{}", encoding="utf-8")
+        registry_alias = self.root / "registry-alias.json"
+        registry_alias.symlink_to(canonical_registry)
         args = (
             "--repo", str(Path.cwd()), "--interval", "180", "--safety-interval", "1800",
             "--wake-command-json", command, "--acknowledge-relocatable-wake-target", "--no-load",
+            "--admission-registry-path", str(registry_alias),
         )
-        self.invoke("install", *args)
+        install_env = dict(self.env, HOME=str(home))
+        self.invoke("install", *args, env=install_env)
         before = (self.state_root / "state.json").read_bytes()
-        self.invoke("install", *args)
+        self.invoke("install", *args, env=install_env)
         self.assertEqual((self.state_root / "state.json").read_bytes(), before)
         with self.plist.open("rb") as stream:
             plist = plistlib.load(stream)
         config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(config["admission"]["registry"], str(canonical_registry))
         self.assertEqual(plist["StartInterval"], 180)
         self.assertEqual(plist["WorkingDirectory"], str(Path.cwd()))
         self.assertEqual(plist["ProgramArguments"], ["/usr/bin/python3", config["runner"], "run"])
@@ -692,6 +999,27 @@ class HeartbeatTest(unittest.TestCase):
         self.invoke("uninstall", "--no-load")
         self.assertFalse(self.plist.exists())
         self.assertTrue((self.state_root / "state.json").exists(), "uninstall preserves evidence/state")
+
+    def test_install_rejects_noncanonical_admission_registry_paths(self) -> None:
+        command = json.dumps([str(self.wake), "future-dispatch-once"])
+        args = (
+            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load",
+        )
+        home = self.root.resolve()
+        install_env = dict(self.env, HOME=str(home))
+        explicit = self.invoke(
+            *args, "--admission-registry-path", str(self.root / "alternate" / "registry.json"),
+            env=install_env, check=False,
+        )
+        self.assertNotEqual(explicit.returncode, 0)
+        self.assertIn("canonical per-user host path", explicit.stderr)
+        inherited = self.invoke(
+            *args, env=dict(install_env, TACHIKO_MISSION_ADMISSION_PATH=str(self.root / "alternate" / "registry.json")),
+            check=False,
+        )
+        self.assertNotEqual(inherited.returncode, 0)
+        self.assertIn("canonical per-user host path", inherited.stderr)
 
     def test_reinstall_cannot_race_an_active_wake_snapshot(self) -> None:
         self.invoke("run", "--prime")
@@ -964,7 +1292,7 @@ class HeartbeatTest(unittest.TestCase):
         self.invoke(
             "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
             "--acknowledge-relocatable-wake-target", "--required-file", str(cli),
-            "--no-load",
+            "--no-load", env=dict(self.env, HOME=str(self.root.resolve())),
         )
         config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
         self.assertIn({
