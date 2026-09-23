@@ -23,6 +23,15 @@ interface InspectRequest {
   readonly workspace: string;
 }
 
+interface RecoverRequest {
+  readonly schemaVersion: 1;
+  readonly action: 'recover';
+  readonly repository: string;
+  readonly workspace: string;
+  readonly supervisorId: string;
+  readonly expectedGeneration: number | null;
+}
+
 interface SettleRequest {
   readonly schemaVersion: 1;
   readonly action: 'settle';
@@ -38,7 +47,7 @@ interface SettleRequest {
   };
 }
 
-type HeartbeatAdmissionRequest = ReserveRequest | InspectRequest | SettleRequest;
+type HeartbeatAdmissionRequest = ReserveRequest | InspectRequest | RecoverRequest | SettleRequest;
 
 export interface HeartbeatAdmissionReceipt {
   readonly schemaVersion: 1;
@@ -78,6 +87,11 @@ function parseRequest(input: unknown): HeartbeatAdmissionRequest {
   if (input.action === 'inspect' && exactKeys(input, ['schemaVersion', 'action', 'repository', 'workspace']) &&
     boundedString(input.repository, 255) && /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(input.repository) && path.isAbsolute(String(input.workspace)) && boundedString(input.workspace, 2_048)) {
     return input as unknown as InspectRequest;
+  }
+  if (input.action === 'recover' && exactKeys(input, ['schemaVersion', 'action', 'repository', 'workspace', 'supervisorId', 'expectedGeneration']) &&
+    boundedString(input.repository, 255) && /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(input.repository) && path.isAbsolute(String(input.workspace)) && boundedString(input.workspace, 2_048) &&
+    boundedString(input.supervisorId, 128) && (input.expectedGeneration === null || (Number.isSafeInteger(input.expectedGeneration) && (input.expectedGeneration as number) > 0))) {
+    return input as unknown as RecoverRequest;
   }
   if (input.action === 'settle' && exactKeys(input, ['schemaVersion', 'action', 'repository', 'workspace', 'supervisorId', 'expectedGeneration', 'receiptId', 'stopProof']) &&
     boundedString(input.repository, 255) && /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(input.repository) && path.isAbsolute(String(input.workspace)) && boundedString(input.workspace, 2_048) &&
@@ -156,6 +170,8 @@ function statusProjection(registry: MissionAdmissionRegistry, laneId: string) {
 type HeartbeatStatusProjection = ReturnType<typeof statusProjection>;
 export type HeartbeatAdmissionResult =
   | ({ readonly schemaVersion: 1; readonly outcome: 'inspected' } & HeartbeatStatusProjection)
+  | { readonly schemaVersion: 1; readonly outcome: 'recoverable' | 'already_settled'; readonly laneId: string; readonly generation: number; readonly receiptId: string }
+  | { readonly schemaVersion: 1; readonly outcome: 'absent' | 'not_owned'; readonly laneId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'reserved' | 'already_reserved'; readonly laneId: string; readonly missionId: string; readonly generation: number; readonly receiptId: string; readonly revision: number }
   | { readonly schemaVersion: 1; readonly outcome: 'waiting'; readonly laneId: string; readonly missionId: string; readonly reason: string; readonly revision: number }
   | { readonly schemaVersion: 1; readonly outcome: 'owned_elsewhere'; readonly laneId: string; readonly missionId: string; readonly reason: 'overlapping_production_lane'; readonly revision: number }
@@ -172,6 +188,24 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
   const receiptPath = options.receiptPath?.(evidence.repository, evidence.workspace!) ?? resolveHeartbeatOwnerReceiptPath(evidence.repository, evidence.workspace!, resolverOptions);
 
   if (request.action === 'inspect') return { schemaVersion: 1, outcome: 'inspected', ...statusProjection(registry, laneId) };
+
+  if (request.action === 'recover') {
+    const lane = registry.readLane(laneId);
+    const receipt = privateReceipt(receiptPath);
+    if (lane === null && receipt === null) return { schemaVersion: 1, outcome: 'absent', laneId };
+    if (receipt === null || receipt.laneId !== laneId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace || receipt.supervisorId !== request.supervisorId) {
+      return { schemaVersion: 1, outcome: 'not_owned', laneId };
+    }
+    if (request.expectedGeneration !== null && receipt.token.generation !== request.expectedGeneration) return { schemaVersion: 1, outcome: 'not_owned', laneId };
+    if (lane?.status === 'active' && receipt.status === 'active' && lane.missionId === receipt.missionId && lane.generation === receipt.token.generation) {
+      registry.assertCanMutate(receipt.token);
+      return { schemaVersion: 1, outcome: 'recoverable', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId };
+    }
+    if (lane?.status === 'released' && receipt.status === 'settled' && lane.generation === receipt.token.generation + 1) {
+      return { schemaVersion: 1, outcome: 'already_settled', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId };
+    }
+    return { schemaVersion: 1, outcome: 'not_owned', laneId };
+  }
 
   if (request.action === 'reserve') {
     const prior = registry.readLane(laneId);

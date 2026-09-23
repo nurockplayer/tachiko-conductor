@@ -15,6 +15,7 @@ import { JsonFileStore } from '../src/store/json-file-store.js';
 import { createRun } from '../src/domain/run.js';
 import { findRunByTarget, parseGitHubRepositoryRemote } from '../src/cli.js';
 import { readManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
+import { handleHeartbeatAdmission } from '../src/mission-admission/heartbeat-admission.js';
 import { T0, TARGET } from './helpers.js';
 
 const config: AdmissionConfig = { schemaVersion: 1, revision: 'test-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
@@ -569,6 +570,46 @@ describe('provider-neutral durable mission admission', () => {
       Object.assign(storedDelegate, { status: 'parked', token: null, generation: delegate.token.generation + 1, parkedReason: 'workflow_wait' });
       writeFileSync(filePath, JSON.stringify(persisted), 'utf8');
       assert.throws(() => registry.snapshot(), /invalid lane record/);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('recovers only the exact heartbeat owner receipt without reserving a successor generation', () => {
+    const { directory, registry } = fixture();
+    const workspace = path.join(directory, 'heartbeat-workspace');
+    const receiptPath = path.join(directory, 'private', 'heartbeat.json');
+    mkdirSync(workspace);
+    const base = { schemaVersion: 1 as const, repository: 'example/widgets', workspace };
+    const run = (action: Record<string, unknown>) => handleHeartbeatAdmission(action, {
+      registry, homeDirectory: directory, receiptPath: () => receiptPath,
+    });
+    try {
+      const reserved = run({ ...base, action: 'reserve', supervisorId: 'supervisor-a' });
+      assert.equal(reserved.outcome, 'reserved');
+      if (reserved.outcome !== 'reserved') return;
+      const beforeRecover = registry.snapshot();
+      const wrongOwner = run({ ...base, action: 'recover', supervisorId: 'supervisor-b', expectedGeneration: reserved.generation });
+      assert.deepEqual(wrongOwner, { schemaVersion: 1, outcome: 'not_owned', laneId: reserved.laneId });
+      const exact = run({ ...base, action: 'recover', supervisorId: 'supervisor-a', expectedGeneration: reserved.generation });
+      assert.deepEqual(exact, {
+        schemaVersion: 1, outcome: 'recoverable', laneId: reserved.laneId,
+        generation: reserved.generation, receiptId: reserved.receiptId,
+      });
+      assert.equal(JSON.stringify(exact).includes('token'), false);
+      assert.equal(registry.snapshot().revision, beforeRecover.revision, 'recovery inspection is read-only');
+
+      const settled = run({
+        ...base, action: 'settle', supervisorId: 'supervisor-a', expectedGeneration: reserved.generation,
+        receiptId: reserved.receiptId,
+        stopProof: { childrenStopped: true, supervisorStopped: true, observedAt: new Date().toISOString() },
+      });
+      assert.equal(settled.outcome, 'settled');
+      const afterRelease = registry.snapshot();
+      const alreadySettled = run({ ...base, action: 'recover', supervisorId: 'supervisor-a', expectedGeneration: reserved.generation });
+      assert.deepEqual(alreadySettled, {
+        schemaVersion: 1, outcome: 'already_settled', laneId: reserved.laneId,
+        generation: reserved.generation, receiptId: reserved.receiptId,
+      });
+      assert.equal(registry.snapshot().revision, afterRelease.revision, 'settled reconciliation cannot allocate a new generation');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

@@ -22,8 +22,9 @@ Wake execution has a 1,500-second deadline. Exit zero alone is a re-entry bounda
 must also print `TACHIKO_HEARTBEAT_SETTLED_V1` on its own final line before the fingerprint is
 consumed and the safety clock reset.
 
-Before any wake, the runner verifies and calls a pinned, model-free TypeScript helper from the
-repository build. The helper reserves the same host-global mission-admission registry used by
+Before any wake, the runner verifies and calls a pinned, model-free TypeScript helper built during
+installation from a private `git archive` of one captured commit. It never consumes ambient
+`dist/` or `node_modules`. The helper reserves the same host-global mission-admission registry used by
 dispatch and manual work. It pins the resolved Node executable, the complete built JavaScript
 import closure, the registry path, repository/workspace identity, and an explicit revisioned
 capacity configuration at installation. Nondefault positive limits are supported when supplied
@@ -32,6 +33,12 @@ with `--admission-config-json`. All entry paths use the canonical per-user regis
 `--admission-registry-path` or inherited path override. A physical symlink alias that resolves to
 that canonical file is accepted. This keeps heartbeat, native dispatch, and manual admission on
 one host ownership domain.
+The build requires clean committed TypeScript/build inputs, the repository's exact
+`pnpm@10.34.5` lockfile, and a pinned Node/Corepack/TypeScript identity. Its canonical manifest
+binds commit and tree IDs, archive/package/lockfile digests, toolchain identities, every emitted
+`dist/` file, and the runtime import closure. Installation verifies and atomically pins exactly those
+bytes, reusing a bundle only when its full manifest and files match. Use `--no-load` to prepare and
+validate an install without bootstrapping LaunchAgent; this does not enable the held service.
 The LaunchAgent does not inherit arbitrary admission-domain variables. `wake_env` cannot override
 the registry, config, Run root, or private receipt directory.
 
@@ -63,17 +70,24 @@ at high reasoning effort.
 
 ## Migration and recovery
 
-Config schema 2 pins the helper, Node bytes, fixed admission domain, and wake target contract.
-Existing schema-1 configs are rejected. Build the helper with the repository's pinned toolchain,
-then rerun installation:
+Config schema 2 pins the helper build manifest, Node bytes, fixed admission domain, and wake target
+contract. Existing schema-1 configs are rejected. `install.sh` creates a fresh staged build from the
+captured committed source and performs the full provenance verification itself:
 
 ```sh
-corepack pnpm@10.34.5 build
-scripts/bootstrap-heartbeat/install.sh
+scripts/bootstrap-heartbeat/install.sh --no-load
 ```
 
-Valid heartbeat state schema 1 is preserved across reinstall. Installation does not take over or
-expire an active mission based on age. To investigate a retained reservation, first verify the
+Valid state schema 1 fingerprints migrate without claiming any old reservation is safe. State
+schema 2 records a private supervisor UUID, host/boot identity, process identity, exact registry
+generation/receipt ID, and either `reserved_pre_execution` or `spawn_uncertain`. A caught failure
+before `Popen` settles the exact generation. On re-entry, reconciliation runs under the canonical
+heartbeat lock before the unchanged-GitHub fast path. Automatic orphan settlement requires the same
+durable host and a verified different boot, or same-boot proof that the owner process died while
+still `reserved_pre_execution`. Same-boot `spawn_uncertain` remains fenced even if a PID or process
+group appears empty; process death alone cannot prove descendants stopped. `already_reserved` never
+authorizes a spawn. Installation does not take over or expire an active mission based on age. To
+investigate a retained reservation, first verify the
 supervisor and its process group are stopped. The private receipt is at the configured receipts
 directory; inspect it locally with owner-only permissions and compare its generation/supervisor
 identity with `dispatch admission status`. Never copy its token into argv, logs, projections, or

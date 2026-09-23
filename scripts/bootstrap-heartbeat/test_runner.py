@@ -109,6 +109,104 @@ class HeartbeatTest(unittest.TestCase):
         self.assertIn("reviewThreads(first: 100)", source)
         self.assertIn("MAX_POLL_QUERY_COST = 100", source)
 
+    def test_runtime_import_closure_rejects_dynamic_loaders_and_traversal(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_closure_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        node = Path(shutil.which("node") or "")
+        compiler_root = Path.cwd() / "node_modules/typescript"
+        self.assertTrue(compiler_root.is_dir(), "closure test needs the repository-pinned TypeScript parser")
+        with tempfile.TemporaryDirectory(dir=self.root) as temporary:
+            output = Path(temporary)
+            entry = Path("mission-admission/heartbeat-admission-cli.js")
+            (output / entry).parent.mkdir(parents=True)
+            cases = [
+                ("await import('./other.js');", "dynamic import"),
+                ("import { createRequire } from 'node:module'; createRequire(import.meta.url);", "createRequire"),
+                ("import { createRequire } from 'node:module'; const x = module.createRequire(import.meta.url);", "module.createRequire"),
+                ("import '../outside.js';", "path traversal"),
+            ]
+            for source, label in cases:
+                with self.subTest(loader=label):
+                    (output / entry).write_text(source, encoding="utf-8")
+                    with self.assertRaises(RuntimeError):
+                        module.validate_runtime_import_closure(node, compiler_root, output, {entry}, entry)
+
+    def test_existing_staged_bundle_requires_exact_manifest_and_output_bytes(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_bundle_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        bundle = self.root / "pinned-bundle"
+        bundle.mkdir(mode=0o700)
+        bundle.chmod(0o700)
+        nested = bundle / "mission-admission" / "entry.js"
+        nested.parent.mkdir(parents=True)
+        content = b"export {}\n"
+        nested.write_bytes(content)
+        manifest = b'{"entry":"mission-admission/entry.js"}\n'
+        (bundle / "build-manifest.json").write_bytes(manifest)
+        expected = {Path("mission-admission/entry.js"): hashlib.sha256(content).hexdigest()}
+        module.verify_existing_admission_bundle(bundle, manifest, expected)
+
+        nested.write_bytes(content + b"// tampered\n")
+        with self.assertRaisesRegex(RuntimeError, "byte verification"):
+            module.verify_existing_admission_bundle(bundle, manifest, expected)
+        nested.write_bytes(content)
+        (bundle / "unlisted.js").write_text("// unmanifested", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "file set"):
+            module.verify_existing_admission_bundle(bundle, manifest, expected)
+        (bundle / "unlisted.js").unlink()
+        (bundle / "build-manifest.json").write_bytes(b'{"entry":"changed"}\n')
+        with self.assertRaisesRegex(RuntimeError, "mismatched build manifest"):
+            module.verify_existing_admission_bundle(bundle, manifest, expected)
+
+    def test_dangling_digest_bundle_symlink_is_existing_and_refused(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_symlink_bundle_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        dangling = self.root / "verified-admission-deadbeef"
+        self.assertFalse(module.existing_admission_bundle(dangling))
+        dangling.symlink_to(self.root / "missing-target")
+        with self.assertRaisesRegex(RuntimeError, "directory is unsafe"):
+            module.existing_admission_bundle(dangling)
+        self.assertTrue(dangling.is_symlink(), "refusal must not replace or follow the dangling alias")
+
     def write_config(self, *, safety: int = 1800) -> None:
         self.state_root.mkdir(parents=True, exist_ok=True)
         gh_digest = hashlib.sha256(self.gh.read_bytes()).hexdigest()
@@ -133,17 +231,23 @@ class HeartbeatTest(unittest.TestCase):
             "const statePath = " + json.dumps(str(self.admission_state)) + ";\n"
             "let s = {}; try { s = JSON.parse(fs.readFileSync(statePath, 'utf8')); } catch {}\n"
             "const q = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
-            "if (q.action === 'reserve') {\n"
+            "if (q.action === 'inspect') { console.log(JSON.stringify({schemaVersion:1,outcome:'inspected',lane:s.active?{status:'active',generation:s.generation}:{status:'released',generation:s.releasedGeneration||((s.generation||0)+1)}}));\n"
+            "} else if (q.action === 'recover') {\n"
+            " if (s.active && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'recoverable',generation:s.generation,receiptId:s.receiptId}));\n"
+            " else if (!s.active && q.expectedGeneration !== null && s.releasedGeneration === q.expectedGeneration + 1) console.log(JSON.stringify({schemaVersion:1,outcome:'already_settled',generation:q.expectedGeneration,receiptId:s.receiptId}));\n"
+            " else if (!s.active && q.expectedGeneration === null && !s.generation) console.log(JSON.stringify({schemaVersion:1,outcome:'absent'}));\n"
+            " else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
+            "} else if (q.action === 'reserve') {\n"
             " if (s.mode === 'waiting') { console.log(JSON.stringify({schemaVersion:1,outcome:'waiting'})); process.exit(0); }\n"
             " if (s.mode === 'corrupt') { process.exit(2); }\n"
-            " if (s.active) { console.log(JSON.stringify({schemaVersion:1,outcome:'already_reserved'})); process.exit(0); }\n"
+            " if (s.active) { console.log(JSON.stringify({schemaVersion:1,outcome:'already_reserved',generation:s.generation,receiptId:s.receiptId,revision:s.generation})); process.exit(0); }\n"
             " s.generation = (s.generation || 0) + 1; s.receiptId = '00000000-0000-4000-8000-' + String(s.generation).padStart(12,'0');\n"
             " s.supervisorId = q.supervisorId; s.active = true; fs.writeFileSync(statePath, JSON.stringify(s));\n"
             " console.log(JSON.stringify({schemaVersion:1,outcome:'reserved',generation:s.generation,receiptId:s.receiptId,revision:s.generation}));\n"
             "} else if (q.action === 'settle') {\n"
             " if (s.mode === 'stale') process.exit(2);\n"
             " if (!s.active || q.expectedGeneration !== s.generation || q.receiptId !== s.receiptId || q.supervisorId !== s.supervisorId || !q.stopProof?.childrenStopped || !q.stopProof?.supervisorStopped || q.stopProof.observedAt === 'pending') process.exit(2);\n"
-            " s.active = false; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'settled'}));\n"
+            " s.active = false; s.releasedGeneration = s.generation + 1; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'settled'}));\n"
             "}\n"
         )
         helper_entry.write_text(helper_source, encoding="utf-8")
@@ -153,9 +257,35 @@ class HeartbeatTest(unittest.TestCase):
         for path in (package_json, helper_entry):
             path_digest = hashlib.sha256(path.read_bytes()).hexdigest()
             helper_files.append({"path": str(path), "sha256": path_digest})
-        closure_digest = hashlib.sha256("\n".join(
-            f"{Path(item['path']).relative_to(helper_root).as_posix()} {item['sha256']}" for item in sorted(helper_files, key=lambda i: i["path"])
-        ).encode()).hexdigest()
+        helper_build = {
+            "source_commit": "a" * 40, "source_tree": "b" * 40, "git_archive_sha256": "c" * 64,
+            "package_json_sha256": "d" * 64, "lockfile_sha256": "e" * 64,
+            "node_path": str(node), "node_sha256": node_digest, "node_version": "v22.0.0",
+            "corepack_path": "/usr/bin/corepack", "corepack_sha256": "f" * 64,
+            "corepack_version": "0.34.0", "pnpm_version": "10.34.5",
+            "typescript_version": "5.9.3", "typescript_package_sha256": "1" * 64,
+            "typescript_tree_sha256": "2" * 64,
+            "install_command": ["corepack", "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
+            "build_command": ["corepack", "pnpm@10.34.5", "build"],
+            "entry": "mission-admission/heartbeat-admission-cli.js",
+            "files": [{"path": Path(item["path"]).relative_to(helper_root).as_posix(), "sha256": item["sha256"]}
+                      for item in sorted(helper_files, key=lambda i: i["path"])],
+        }
+        manifest_bytes = (json.dumps(helper_build, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        manifest_path = helper_root / "build-manifest.json"
+        manifest_path.write_bytes(manifest_bytes)
+        helper_files.append({"path": str(manifest_path), "sha256": hashlib.sha256(manifest_bytes).hexdigest()})
+        closure_digest = hashlib.sha256(manifest_bytes).hexdigest()
+        canonical_helper_root = self.state_root / ("verified-admission-" + closure_digest)
+        if canonical_helper_root.exists():
+            shutil.rmtree(canonical_helper_root)
+        os.rename(helper_root, canonical_helper_root)
+        helper_root = canonical_helper_root
+        helper_root.chmod(0o700)
+        helper_entry = helper_root / "mission-admission" / "heartbeat-admission-cli.js"
+        for item in helper_files:
+            relative = Path(item["path"]).relative_to(self.state_root / "verified-admission-test")
+            item["path"] = str(helper_root / relative)
         admission = {
             "repository": "nurockplayer/tachiko-conductor", "workspace": str(Path.cwd().resolve()),
             "home": str(Path.home()), "registry": str(self.root / "host-registry.json"),
@@ -183,7 +313,7 @@ class HeartbeatTest(unittest.TestCase):
             "admission": admission,
             "admission_node": str(node_snapshot), "admission_node_sha256": node_digest,
             "admission_helper": str(helper_entry), "admission_helper_sha256": closure_digest,
-            "admission_helper_files": helper_files,
+            "admission_helper_files": helper_files, "admission_build": helper_build,
             "installed_at": 1000,
         }
         (self.state_root / "config.json").write_text(json.dumps(config), encoding="utf-8")
@@ -302,6 +432,84 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(retry.returncode, 0, retry.stderr)
         self.assertEqual(self.records(), [], "already-reserved reconciliation never authorizes another model")
 
+    def _set_pending_admission(self, phase: str, *, boot_id: str = "test-boot", pid: int = 999999) -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "old-supervisor", "host_id": "test-host", "boot_id": boot_id,
+            "pid": pid, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": 1, "receipt_id": "00000000-0000-4000-8000-000000000001", "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        self.admission_state.write_text(json.dumps({
+            "active": True, "generation": 1,
+            "receiptId": "00000000-0000-4000-8000-000000000001", "supervisorId": "old-supervisor",
+        }), encoding="utf-8")
+
+    def test_reentry_reconciles_verified_prior_boot_before_unchanged_fingerprint(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("spawn_uncertain", boot_id="prior-boot")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "recovery precedes the unchanged-state return and never spawns")
+
+    def test_same_boot_uncertain_execution_remains_fenced(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("spawn_uncertain")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertEqual(self.state()["pending_admission"]["phase"], "spawn_uncertain")
+        self.assertEqual(self.records(), [])
+
+    def test_same_boot_dead_preexecution_owner_can_settle_exact_generation(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("reserved_pre_execution")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [])
+
+    def test_same_boot_uncertain_intent_clears_only_after_registry_proves_exact_release(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_pending_admission("spawn_uncertain")
+        receipt = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        receipt.update(active=False, releasedGeneration=2)
+        self.admission_state.write_text(json.dumps(receipt), encoding="utf-8")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        final_admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertEqual(final_admission["generation"], 1, "orphan reconciliation never reserves a successor generation")
+        self.assertEqual(self.records(), [])
+
+    def test_caught_spawn_uncertain_state_write_failure_settles_before_any_child(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001",
+                                                SCD_HEARTBEAT_TEST_FAIL_PHASE_SAVE="spawn_uncertain"), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertFalse(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
+        self.assertEqual(self.records(), [], "known pre-spawn failure settles the exact generation")
+
+    def test_guard_setup_failure_settles_exact_generation_and_releases_runner_lock(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        failed = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_GUARD_SETUP="1",
+        ), check=False)
+        self.assertEqual(failed.returncode, 1)
+        failed_admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertFalse(failed_admission["active"])
+        self.assertEqual(failed_admission["releasedGeneration"], failed_admission["generation"] + 1)
+        self.assertEqual(self.records(), [], "guard setup failure precedes Popen")
+
+        retry = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(len(self.records()), 1, "the runner lock and exact admission were released for retry")
+
     def test_corrupt_or_tampered_admission_helper_fails_closed(self) -> None:
         self.invoke("run", "--prime")
         self.write_payload("B")
@@ -315,6 +523,22 @@ class HeartbeatTest(unittest.TestCase):
         result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"), check=False)
         self.assertEqual(result.returncode, 1)
         self.assertEqual(self.records(), [], "helper byte tampering must deny ownership and model launch")
+
+    def test_config_rejects_noncanonical_helper_root_and_duplicate_paths(self) -> None:
+        self.invoke("run", "--prime")
+        config_path = self.state_root / "config.json"
+        pristine = json.loads(config_path.read_text(encoding="utf-8"))
+
+        wrong_root = json.loads(json.dumps(pristine))
+        wrong_root["admission_helper"] = str(self.root / "other-bundle" / "mission-admission" / "heartbeat-admission-cli.js")
+        config_path.write_text(json.dumps(wrong_root), encoding="utf-8")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+
+        duplicate = json.loads(json.dumps(pristine))
+        duplicate["admission_helper_files"].append(dict(duplicate["admission_helper_files"][0]))
+        config_path.write_text(json.dumps(duplicate), encoding="utf-8")
+        self.assertEqual(self.invoke("run", check=False).returncode, 1)
+        self.assertEqual(self.records(), [], "malformed closure identities fail before any model-capable wake")
 
     def test_wake_environment_cannot_override_admission_domain(self) -> None:
         config_path = self.state_root / "config.json"
@@ -384,7 +608,34 @@ class HeartbeatTest(unittest.TestCase):
 
         node_source = Path(shutil.which("node") or "")
         node, node_digest, _ = module.pin_admission_node(node_source)
-        helper, helper_digest, helper_files, _ = module.pin_admission_helper(Path.cwd().resolve())
+        ambient_entry = Path.cwd() / "dist/mission-admission/heartbeat-admission-cli.js"
+        ambient_entry.parent.mkdir(parents=True, exist_ok=True)
+        had_ambient = ambient_entry.exists()
+        ambient_bytes = ambient_entry.read_bytes() if had_ambient else None
+        poison = b"// stale untracked dist must never be pinned\n"
+        ambient_entry.write_bytes(poison)
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            helper, helper_digest, helper_files, helper_build, _ = module.pin_admission_helper(Path.cwd().resolve(), node_source)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+            if had_ambient:
+                assert ambient_bytes is not None
+                ambient_entry.write_bytes(ambient_bytes)
+            else:
+                ambient_entry.unlink(missing_ok=True)
+        self.assertNotEqual(Path(helper).read_bytes(), poison)
+        expected_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path.cwd(), check=True,
+                                       text=True, stdout=subprocess.PIPE).stdout.strip()
+        self.assertEqual(helper_build["source_commit"], expected_head)
+        self.assertEqual(helper_build["pnpm_version"], "10.34.5")
+        self.assertEqual(helper_build["typescript_version"], "5.9.3")
         admission = {
             "repository": "nurockplayer/tachiko-conductor", "workspace": str((self.root / "workspace").resolve()),
             "home": str((self.root / "home").resolve()),
@@ -397,10 +648,44 @@ class HeartbeatTest(unittest.TestCase):
         config = json.loads(config_path.read_text(encoding="utf-8"))
         config.update({"admission": admission, "admission_node": str(node), "admission_node_sha256": node_digest,
                        "admission_helper": str(helper), "admission_helper_sha256": helper_digest,
-                       "admission_helper_files": helper_files})
+                       "admission_helper_files": helper_files, "admission_build": helper_build})
         config_path.write_text(json.dumps(config), encoding="utf-8")
         runtime_config = dict(config)
         runtime_config["wake_env"] = {}
+        module.verify_admission_helper(config)
+        helper_root = Path(helper).parents[1]
+        extra_bundle_file = helper_root / "unlisted.js"
+        extra_bundle_file.write_text("// not in manifest", encoding="utf-8")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "unlisted or missing"):
+                module.verify_admission_helper(config)
+        finally:
+            extra_bundle_file.unlink()
+        symlink_bundle_file = helper_root / "symlink.js"
+        symlink_bundle_file.symlink_to(Path(helper))
+        try:
+            with self.assertRaisesRegex(RuntimeError, "symlink"):
+                module.verify_admission_helper(config)
+        finally:
+            symlink_bundle_file.unlink()
+        mismatched_source = json.loads(json.dumps(config))
+        mismatched_source["admission_build"]["source_commit"] = "0" * len(helper_build["source_commit"])
+        with self.assertRaisesRegex(RuntimeError, "closure digest or entry"):
+            module.validate_config(mismatched_source)
+        transitive = Path(helper).parents[1] / "mission-admission/registry.js"
+        transitive_bytes = transitive.read_bytes()
+        transitive.unlink()
+        try:
+            with self.assertRaisesRegex(OSError, "No such file"):
+                module.verify_admission_helper(config)
+        finally:
+            transitive.write_bytes(transitive_bytes)
+        transitive.write_bytes(transitive_bytes + b"// tampered\n")
+        try:
+            with self.assertRaisesRegex(RuntimeError, "closure failed verification"):
+                module.verify_admission_helper(config)
+        finally:
+            transitive.write_bytes(transitive_bytes)
         helper_env = module.admission_helper_environment(runtime_config)
         registry_js = Path(helper).parents[1] / "mission-admission/registry.js"
         host_registry_js = Path(helper).parents[1] / "mission-admission/host-registry.js"

@@ -6,10 +6,12 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
 import plistlib
+import platform
 import re
 import select
 import selectors
@@ -18,6 +20,8 @@ import signal
 import stat
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import uuid
 from typing import Any
@@ -40,7 +44,7 @@ DEFAULT_PROMPT = (
     f"print {SETTLED_MARKER} on its own final line. Do not print that marker when ending "
     "at a non-terminal re-entry boundary."
 )
-STATE_SCHEMA = 1
+STATE_SCHEMA = 2
 CONFIG_SCHEMA = 2
 DEFAULT_POLL_SECONDS = 180
 DEFAULT_SAFETY_SECONDS = 1800
@@ -275,17 +279,62 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     if not any(item["path"] == helper_entry for item in helper_files):
         raise RuntimeError("admission helper entry is outside its pinned closure")
     helper_root = Path(helper_entry).parents[1]
-    closure_manifest = []
+    expected_helper_root = ROOT / ("verified-admission-" + closure_digest)
+    if helper_root != expected_helper_root:
+        raise RuntimeError("admission helper bundle path does not match its closure digest")
+    normalized_helper_paths: set[Path] = set()
+    try:
+        if helper_root.resolve(strict=True) != helper_root:
+            raise RuntimeError("admission helper bundle path contains a symlink or alias")
+        for item in helper_files:
+            file_path = Path(item["path"])
+            if file_path.resolve(strict=True) != file_path:
+                raise RuntimeError("admission helper file path contains a symlink or alias")
+            if file_path in normalized_helper_paths:
+                raise RuntimeError("admission helper closure contains duplicate normalized paths")
+            normalized_helper_paths.add(file_path)
+    except OSError as error:
+        raise RuntimeError("admission helper closure path is missing or inaccessible") from error
     for item in helper_files:
         file_path = Path(item["path"])
         try:
-            relative = file_path.relative_to(helper_root).as_posix()
+            file_path.relative_to(helper_root)
         except ValueError as error:
             raise RuntimeError("admission helper file escapes its pinned closure") from error
-        closure_manifest.append((relative, item["sha256"]))
-    calculated_closure = hashlib.sha256("\n".join(f"{name} {digest}" for name, digest in sorted(closure_manifest)).encode()).hexdigest()
-    if calculated_closure != closure_digest or helper_entry != str(helper_root / "mission-admission/heartbeat-admission-cli.js"):
+    build = config.get("admission_build")
+    manifest_path = helper_root / "build-manifest.json"
+    manifest_item = next((item for item in helper_files if item["path"] == str(manifest_path)), None)
+    try:
+        manifest_bytes = manifest_path.read_bytes()
+        parsed_build = json.loads(manifest_bytes)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("admission helper build manifest is missing or corrupt") from error
+    canonical_manifest = (json.dumps(parsed_build, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if (not isinstance(build, dict) or build != parsed_build or canonical_manifest != manifest_bytes
+            or hashlib.sha256(manifest_bytes).hexdigest() != closure_digest
+            or manifest_item is None or hashlib.sha256(manifest_bytes).hexdigest() != manifest_item["sha256"]
+            or helper_entry != str(helper_root / "mission-admission/heartbeat-admission-cli.js")
+            or parsed_build.get("entry") != "mission-admission/heartbeat-admission-cli.js"):
         raise RuntimeError("admission helper closure digest or entry does not match its pinned layout")
+    required_build_digests = ("git_archive_sha256", "package_json_sha256", "lockfile_sha256", "node_sha256",
+                              "corepack_sha256", "typescript_package_sha256", "typescript_tree_sha256")
+    if (not re.fullmatch(r"[0-9a-f]{40,64}", str(parsed_build.get("source_commit", "")))
+            or not re.fullmatch(r"[0-9a-f]{40,64}", str(parsed_build.get("source_tree", "")))
+            or parsed_build.get("pnpm_version") != "10.34.5"
+            or parsed_build.get("typescript_version") != "5.9.3"
+            or parsed_build.get("install_command") != ["corepack", "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"]
+            or parsed_build.get("build_command") != ["corepack", "pnpm@10.34.5", "build"]
+            or parsed_build.get("node_sha256") != node_digest
+            or not isinstance(parsed_build.get("node_path"), str) or not Path(parsed_build["node_path"]).is_absolute()
+            or not isinstance(parsed_build.get("corepack_path"), str) or not Path(parsed_build["corepack_path"]).is_absolute()
+            or any(not re.fullmatch(r"[0-9a-f]{64}", str(parsed_build.get(key, ""))) for key in required_build_digests)):
+        raise RuntimeError("admission build provenance is incomplete or uses an unsupported toolchain")
+    manifest_files = parsed_build.get("files")
+    configured_files = {Path(item["path"]).relative_to(helper_root).as_posix(): item["sha256"]
+                        for item in helper_files if item["path"] != str(manifest_path)}
+    if (not isinstance(manifest_files, list)
+            or configured_files != {item.get("path"): item.get("sha256") for item in manifest_files if isinstance(item, dict)}):
+        raise RuntimeError("pinned admission closure does not match its complete build manifest")
     admission = config.get("admission")
     if (not isinstance(admission, dict) or set(admission) != {"repository", "workspace", "home", "registry", "runs", "receipts", "config"}
             or admission.get("repository") != "nurockplayer/tachiko-conductor"
@@ -414,12 +463,36 @@ def load_state() -> dict[str, Any]:
     for key, kind in fields.items():
         if type(state.get(key)) is not kind:
             raise RuntimeError("invalid heartbeat state field: " + key)
-    if state["schema"] != STATE_SCHEMA:
+    if state["schema"] == 1:
+        # Old installs had no durable supervisor phase. Keep the successful
+        # fingerprint, but do not infer that any old active registry lane is
+        # safe to take over.
+        state["schema"] = STATE_SCHEMA
+        state["pending_admission"] = None
+    elif state["schema"] != STATE_SCHEMA:
         raise RuntimeError("unsupported heartbeat state schema")
+    pending = state.get("pending_admission")
+    if pending is not None:
+        required = {"supervisor_id", "host_id", "boot_id", "pid", "process_identity", "phase",
+                    "generation", "receipt_id", "started_at"}
+        if (not isinstance(pending, dict) or set(pending) != required
+                or not isinstance(pending["supervisor_id"], str) or not isinstance(pending["host_id"], str)
+                or not isinstance(pending["boot_id"], str) or type(pending["pid"]) is not int
+                or not isinstance(pending["process_identity"], str)
+                or pending["phase"] not in {"reserved_pre_execution", "spawn_uncertain"}
+                or (pending["generation"] is not None and (type(pending["generation"]) is not int or pending["generation"] < 1))
+                or (pending["receipt_id"] is not None and not isinstance(pending["receipt_id"], str))
+                or type(pending["started_at"]) is not int):
+            raise RuntimeError("invalid durable heartbeat admission phase")
+    else:
+        state["pending_admission"] = None
     return state
 
 
 def save_state(state: dict[str, Any]) -> None:
+    if (testing() and isinstance(state.get("pending_admission"), dict)
+            and os.environ.get("SCD_HEARTBEAT_TEST_FAIL_PHASE_SAVE") == state["pending_admission"].get("phase")):
+        raise OSError("injected heartbeat phase save failure")
     atomic_write(STATE, (json.dumps(state, sort_keys=True) + "\n").encode())
 
 
@@ -430,7 +503,7 @@ def prime(config: dict[str, Any], reason: str) -> None:
         "schema": STATE_SCHEMA, "successful_fingerprint": fingerprint,
         "last_success_at": now, "last_attempt_at": now,
         "last_attempt_fingerprint": fingerprint, "last_attempt_exit": 0,
-        "last_attempt_reason": "prime",
+        "last_attempt_reason": "prime", "pending_admission": None,
     })
     log(f"primed normalized GitHub baseline; no wake ({reason})")
 
@@ -566,47 +639,228 @@ def pin_admission_node(path: Path) -> tuple[Path, str, bool]:
         os.close(source_fd)
 
 
-def pin_admission_helper(repo: Path) -> tuple[Path, str, list[dict[str, str]], bool]:
-    source_root = repo / "dist"
-    entry_relative = Path("mission-admission/heartbeat-admission-cli.js")
-    pending = [entry_relative]
-    sources: dict[Path, bytes] = {}
+def _git_output(repo: Path, *args: str) -> bytes:
+    result = subprocess.run(["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode:
+        raise RuntimeError("could not identify committed admission-helper source snapshot")
+    return result.stdout
+
+
+def _checked_extract_git_archive(archive: bytes, destination: Path) -> None:
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
+        for member in bundle.getmembers():
+            name = Path(member.name)
+            if name.is_absolute() or ".." in name.parts or not (member.isdir() or member.isfile()):
+                raise RuntimeError("committed source archive contains an unsupported path or file type")
+        bundle.extractall(destination)
+
+
+def _hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def validate_runtime_import_closure(node: Path, compiler_root: Path, output_root: Path,
+                                    emitted_files: set[Path], entry: Path) -> set[Path]:
+    parser_script = r'''const fs=require('node:fs'); const path=require('node:path');
+const ts=require(process.argv[1]); const root=process.argv[2]; const files=[];
+function walk(dir){for(const entry of fs.readdirSync(dir,{withFileTypes:true})){const p=path.join(dir,entry.name); if(entry.isSymbolicLink()) throw Error('symlink in emitted output'); if(entry.isDirectory()) walk(p); else if(entry.isFile()&&p.endsWith('.js')) files.push(p);}}
+walk(root); const result={};
+for(const file of files){const src=fs.readFileSync(file,'utf8'); const ast=ts.createSourceFile(file,src,ts.ScriptTarget.Latest,true,ts.ScriptKind.JS); const imports=[]; let dynamic=false;
+function isCreateRequire(expression){return (ts.isIdentifier(expression)&&expression.text==='createRequire')||(ts.isPropertyAccessExpression(expression)&&expression.name.text==='createRequire');}
+function visit(node){if((ts.isImportDeclaration(node)||ts.isExportDeclaration(node))&&node.moduleSpecifier&&ts.isStringLiteral(node.moduleSpecifier)) imports.push(node.moduleSpecifier.text);
+if(ts.isImportTypeNode(node)) dynamic=true;
+if(ts.isImportDeclaration(node)&&node.moduleSpecifier&&ts.isStringLiteral(node.moduleSpecifier)&&node.moduleSpecifier.text==='node:module'&&node.importClause&&node.importClause.namedBindings&&ts.isNamedImports(node.importClause.namedBindings)&&node.importClause.namedBindings.elements.some(e=>(e.propertyName||e.name).text==='createRequire')) dynamic=true;
+if(ts.isCallExpression(node)&&(node.expression.kind===ts.SyntaxKind.ImportKeyword||(ts.isIdentifier(node.expression)&&node.expression.text==='require')||isCreateRequire(node.expression))) dynamic=true;
+ts.forEachChild(node,visit);} visit(ast); result[path.relative(root,file).split(path.sep).join('/') ]={imports,dynamic};}
+process.stdout.write(JSON.stringify(result));'''
+    parsed = subprocess.run([str(node), "-e", parser_script, str(compiler_root), str(output_root)],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, check=True, timeout=30)
+    parsed_imports = json.loads(parsed.stdout)
+    pending = [entry]
+    reached: set[Path] = set()
     while pending:
         relative = pending.pop()
-        if relative in sources:
+        if relative in reached:
             continue
-        source = source_root / relative
-        if not source.is_file() or source.is_symlink():
-            raise RuntimeError("compiled heartbeat admission helper is missing or unsafe; run the pinned project build first")
-        data = source.read_bytes()
-        sources[relative] = data
-        for specifier in re.findall(r"(?:from\s*|import\s*)[\"']([^\"']+)[\"']", data.decode("utf-8")):
+        if relative not in emitted_files:
+            raise RuntimeError("staged helper import is missing from the emitted output")
+        reached.add(relative)
+        syntax = parsed_imports.get(relative.as_posix())
+        if not isinstance(syntax, dict) or syntax.get("dynamic") is not False:
+            raise RuntimeError("staged heartbeat helper uses unsupported dynamic module loading")
+        for specifier in syntax["imports"]:
             if specifier.startswith("node:"):
                 continue
-            if not specifier.startswith("."):
-                raise RuntimeError("heartbeat admission helper has an external import that cannot be pinned")
-            child = (relative.parent / specifier)
-            if child.suffix != ".js":
-                raise RuntimeError("heartbeat admission helper has a non-JS local import")
-            normalized = Path(os.path.normpath(str(child)))
-            if normalized.is_absolute() or ".." in normalized.parts:
-                raise RuntimeError("heartbeat admission helper import escapes compiled source root")
-            pending.append(normalized)
-    sources[Path("package.json")] = b'{"type":"module"}\n'
-    digests = {relative: hashlib.sha256(data).hexdigest() for relative, data in sources.items()}
-    manifest = "\n".join(f"{relative.as_posix()} {digests[relative]}" for relative in sorted(sources))
-    closure_digest = hashlib.sha256(manifest.encode("utf-8")).hexdigest()
+            if not specifier.startswith(".") or not specifier.endswith(".js"):
+                raise RuntimeError("staged helper has an unsupported external or non-JS import")
+            child = Path(os.path.normpath(str(relative.parent / specifier)))
+            if child.is_absolute() or ".." in child.parts or child not in emitted_files:
+                raise RuntimeError("staged helper import is missing or escapes emitted output")
+            pending.append(child)
+    return reached
+
+
+def verify_existing_admission_bundle(bundle: Path, manifest_bytes: bytes,
+                                     file_hashes: dict[Path, str]) -> None:
+    """Refuse reuse unless a private bundle is exactly the manifest's file set."""
+    try:
+        bundle_meta = bundle.lstat()
+        if (not stat.S_ISDIR(bundle_meta.st_mode) or stat.S_ISLNK(bundle_meta.st_mode)
+                or bundle_meta.st_uid != os.getuid() or bundle_meta.st_mode & 0o077):
+            raise RuntimeError("existing staged admission bundle directory is unsafe")
+        expected = {relative.as_posix() for relative in file_hashes} | {"build-manifest.json"}
+        actual: set[str] = set()
+        for candidate in bundle.rglob("*"):
+            metadata = candidate.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError("existing staged admission bundle contains a symlink")
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise RuntimeError("existing staged admission bundle contains a special file")
+            actual.add(candidate.relative_to(bundle).as_posix())
+        if actual != expected:
+            raise RuntimeError("existing staged admission bundle file set differs from its manifest")
+        if (bundle / "build-manifest.json").read_bytes() != manifest_bytes:
+            raise RuntimeError("existing staged admission bundle has a mismatched build manifest")
+        for relative, expected_digest in file_hashes.items():
+            candidate = bundle / relative
+            if _hash_file(candidate) != expected_digest:
+                raise RuntimeError("existing staged admission bundle failed byte verification")
+    except OSError as error:
+        raise RuntimeError("existing staged admission bundle is incomplete") from error
+
+
+def existing_admission_bundle(bundle: Path) -> bool:
+    """Use lstat so dangling symlinks and other existing objects fail closed."""
+    try:
+        metadata = bundle.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as error:
+        raise RuntimeError("could not inspect existing staged admission bundle") from error
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise RuntimeError("existing staged admission bundle directory is unsafe")
+    return True
+
+
+def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list[dict[str, str]], dict[str, Any], bool]:
+    """Build the helper from one committed snapshot, then pin its complete dist tree."""
+    entry_relative = Path("mission-admission/heartbeat-admission-cli.js")
+    head = _git_output(repo, "rev-parse", "HEAD").decode().strip()
+    tree = _git_output(repo, "rev-parse", f"{head}^{{tree}}").decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head) or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise RuntimeError("invalid committed source identity")
+    dirty = _git_output(repo, "status", "--porcelain", "--untracked-files=all", "--",
+                        "src", "package.json", "pnpm-lock.yaml", "tsconfig.json").strip()
+    if dirty and not testing():
+        raise RuntimeError("admission helper install requires clean committed TypeScript/build inputs")
+    archive = _git_output(repo, "archive", "--format=tar", head)
+    archive_digest = hashlib.sha256(archive).hexdigest()
+    package_bytes = _git_output(repo, "show", f"{head}:package.json")
+    lock_bytes = _git_output(repo, "show", f"{head}:pnpm-lock.yaml")
+    package = json.loads(package_bytes)
+    if package.get("packageManager") != "pnpm@10.34.5":
+        raise RuntimeError("committed package manager must pin pnpm@10.34.5")
+    node_source = node_source.resolve(strict=True)
+    if not node_source.is_file() or node_source.is_symlink() or not os.access(node_source, os.X_OK):
+        raise RuntimeError("Node build executable is unavailable or unsafe")
+    node_version = subprocess.run([str(node_source), "--version"], check=True, text=True,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+    corepack = Path(resolved_tool("corepack"))
+    corepack_version = subprocess.run([str(corepack), "--version"], check=True, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
+    tool_env = {"PATH": os.pathsep.join([str(node_source.parent), str(corepack.parent), "/usr/bin", "/bin"]),
+                "HOME": str(Path.home()), "CI": "1", "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+    with tempfile.TemporaryDirectory(prefix="admission-build-", dir=ROOT) as source_dir:
+        staged_source = Path(source_dir)
+        _checked_extract_git_archive(archive, staged_source)
+        if ((staged_source / "package.json").read_bytes() != package_bytes
+                or (staged_source / "pnpm-lock.yaml").read_bytes() != lock_bytes):
+            raise RuntimeError("Git archive attributes changed committed package/build inputs")
+        subprocess.run([str(corepack), "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"], cwd=staged_source,
+                       env=tool_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       text=True, check=True, timeout=900)
+        installed_pnpm = subprocess.run([str(corepack), "pnpm@10.34.5", "--version"], cwd=staged_source,
+                                        env=tool_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, check=True, timeout=120).stdout.strip()
+        if installed_pnpm != "10.34.5":
+            raise RuntimeError("staged build did not use lockfile-bound pnpm@10.34.5")
+        compiler_root = (staged_source / "node_modules/typescript").resolve(strict=True)
+        compiler_package = compiler_root / "package.json"
+        compiler_info = json.loads(compiler_package.read_text(encoding="utf-8"))
+        if compiler_info.get("version") != "5.9.3":
+            raise RuntimeError("staged TypeScript compiler does not match the lockfile-pinned toolchain")
+        compiler_hash = hashlib.sha256()
+        for compiler_file in sorted(path for path in compiler_root.rglob("*") if path.is_file() and not path.is_symlink()):
+            compiler_hash.update(compiler_file.relative_to(compiler_root).as_posix().encode() + b"\0")
+            compiler_hash.update(bytes.fromhex(_hash_file(compiler_file)))
+        compiler_digest = compiler_hash.hexdigest()
+        subprocess.run([str(corepack), "pnpm@10.34.5", "build"], cwd=staged_source,
+                       env=tool_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                       text=True, check=True, timeout=300)
+        output_root = staged_source / "dist"
+        if not output_root.is_dir() or output_root.is_symlink():
+            raise RuntimeError("staged build did not emit a safe dist directory")
+        emitted: dict[Path, bytes] = {}
+        for path in output_root.rglob("*"):
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise RuntimeError("staged helper output contains a symlink")
+            if stat.S_ISREG(metadata.st_mode):
+                relative = path.relative_to(output_root)
+                emitted[relative] = path.read_bytes()
+        if entry_relative not in emitted:
+            raise RuntimeError("staged build omitted the heartbeat admission entry")
+        # Ensure every static runtime import is reachable and backed by an
+        # emitted regular file; reject dynamic or non-Node external loading.
+        validate_runtime_import_closure(node_source, compiler_root, output_root, set(emitted), entry_relative)
+        emitted[Path("package.json")] = b'{"type":"module"}\n'
+        file_hashes = {relative: hashlib.sha256(data).hexdigest() for relative, data in emitted.items()}
+        build_inputs = {
+            "source_commit": head, "source_tree": tree, "git_archive_sha256": archive_digest,
+            "package_json_sha256": hashlib.sha256(package_bytes).hexdigest(),
+            "lockfile_sha256": hashlib.sha256(lock_bytes).hexdigest(),
+            "node_path": str(node_source), "node_sha256": _hash_file(node_source), "node_version": node_version,
+            "corepack_path": str(corepack.resolve()), "corepack_sha256": _hash_file(corepack.resolve()),
+            "corepack_version": corepack_version, "pnpm_version": installed_pnpm,
+            "typescript_version": compiler_info["version"], "typescript_package_sha256": _hash_file(compiler_package),
+            "typescript_tree_sha256": compiler_digest,
+            "install_command": ["corepack", "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
+            "build_command": ["corepack", "pnpm@10.34.5", "build"],
+            "entry": entry_relative.as_posix(),
+            "files": [{"path": rel.as_posix(), "sha256": file_hashes[rel]} for rel in sorted(emitted)],
+        }
+    if _git_output(repo, "rev-parse", "HEAD").decode().strip() != head:
+        raise RuntimeError("repository HEAD moved during admission-helper preparation")
+    manifest_bytes = (json.dumps(build_inputs, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    closure_digest = hashlib.sha256(manifest_bytes).hexdigest()
     bundle = ROOT / ("verified-admission-" + closure_digest)
-    existed = bundle.is_dir()
-    bundle.mkdir(mode=0o700, parents=True, exist_ok=True)
-    os.chmod(bundle, 0o700)
-    for relative, data in sources.items():
-        target = bundle / relative
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chmod(target.parent, 0o700)
-        atomic_write(target, data, 0o600)
-    files = [{"path": str(bundle / relative), "sha256": digests[relative]} for relative in sorted(sources)]
-    return bundle / entry_relative, closure_digest, files, not existed
+    existed = existing_admission_bundle(bundle)
+    if existed:
+        verify_existing_admission_bundle(bundle, manifest_bytes, file_hashes)
+    else:
+        temporary = Path(tempfile.mkdtemp(prefix="admission-pin-", dir=ROOT))
+        try:
+            for relative, data in emitted.items():
+                target = temporary / relative
+                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                atomic_write(target, data, 0o600)
+            atomic_write(temporary / "build-manifest.json", manifest_bytes, 0o600)
+            os.chmod(temporary, 0o700)
+            os.rename(temporary, bundle)
+        except BaseException:
+            shutil.rmtree(temporary, ignore_errors=True)
+            raise
+    files = [{"path": str(bundle / relative), "sha256": file_hashes[relative]} for relative in sorted(emitted)]
+    files.append({"path": str(bundle / "build-manifest.json"), "sha256": hashlib.sha256(manifest_bytes).hexdigest()})
+    return bundle / entry_relative, closure_digest, files, build_inputs, not existed
 
 
 def prune_stale_digest_snapshots(prefix: str, current: Path) -> None:
@@ -739,18 +993,49 @@ def process_identity(pid: int) -> str | None:
 
 
 def verify_admission_helper(config: dict[str, Any]) -> None:
+    helper_root = Path(config["admission_helper"]).parents[1]
+    expected_helper_root = ROOT / ("verified-admission-" + config["admission_helper_sha256"])
+    if helper_root != expected_helper_root:
+        raise RuntimeError("pinned admission helper bundle path does not match its closure identity")
+    try:
+        root_metadata = helper_root.lstat()
+    except OSError as error:
+        raise RuntimeError("pinned admission helper bundle is missing") from error
+    if (not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode)
+            or root_metadata.st_uid != os.getuid() or root_metadata.st_mode & 0o077
+            or helper_root.resolve(strict=True) != helper_root):
+        raise RuntimeError("pinned admission helper bundle directory is unsafe")
     node = Path(config["admission_node"])
     metadata = node.lstat()
     if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
             or metadata.st_mode & 0o022 or not metadata.st_mode & 0o111
             or hashlib.sha256(node.read_bytes()).hexdigest() != config["admission_node_sha256"]):
         raise RuntimeError("pinned admission Node bytes failed verification")
+    expected_paths: set[str] = set()
     for item in config["admission_helper_files"]:
         candidate = Path(item["path"])
+        if candidate.resolve(strict=True) != candidate:
+            raise RuntimeError("pinned admission helper file path contains a symlink or alias")
+        relative = candidate.relative_to(helper_root).as_posix()
+        if relative in expected_paths:
+            raise RuntimeError("pinned admission helper closure contains duplicate paths")
+        expected_paths.add(relative)
         metadata = candidate.lstat()
         if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
                 or metadata.st_mode & 0o022 or hashlib.sha256(candidate.read_bytes()).hexdigest() != item["sha256"]):
             raise RuntimeError("pinned admission helper closure failed verification")
+    actual_paths: set[str] = set()
+    for candidate in helper_root.rglob("*"):
+        metadata = candidate.lstat()
+        if stat.S_ISLNK(metadata.st_mode):
+            raise RuntimeError("pinned admission helper bundle contains a symlink")
+        if stat.S_ISDIR(metadata.st_mode):
+            continue
+        if not stat.S_ISREG(metadata.st_mode):
+            raise RuntimeError("pinned admission helper bundle contains a special file")
+        actual_paths.add(candidate.relative_to(helper_root).as_posix())
+    if actual_paths != expected_paths:
+        raise RuntimeError("pinned admission helper bundle contains unlisted or missing files")
 
 
 def admission_domain_environment(config: dict[str, Any]) -> dict[str, str]:
@@ -796,6 +1081,114 @@ def reserve_heartbeat(config: dict[str, Any], supervisor_id: str) -> dict[str, A
         "schemaVersion": 1, "action": "reserve", "repository": admission["repository"],
         "workspace": admission["workspace"], "supervisorId": supervisor_id,
     })
+
+
+def recover_heartbeat(config: dict[str, Any], pending: dict[str, Any]) -> dict[str, Any]:
+    admission = config["admission"]
+    return admission_call(config, {
+        "schemaVersion": 1, "action": "recover", "repository": admission["repository"],
+        "workspace": admission["workspace"], "supervisorId": pending["supervisor_id"],
+        "expectedGeneration": pending["generation"],
+    })
+
+
+def durable_host_boot_identity() -> tuple[str, str]:
+    if testing():
+        host = os.environ.get("SCD_HEARTBEAT_TEST_HOST_ID", "test-host")
+        boot = os.environ.get("SCD_HEARTBEAT_TEST_BOOT_ID", "test-boot")
+        return host, boot
+    if sys.platform == "darwin":
+        host_result = subprocess.run(
+            ["/usr/sbin/ioreg", "-rd1", "-c", "IOPlatformExpertDevice"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=5, check=False,
+        )
+        host_match = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', host_result.stdout)
+        boot_result = subprocess.run(
+            ["/usr/sbin/sysctl", "-n", "kern.bootsessionuuid"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=5, check=False,
+        )
+        host_raw = host_match.group(1) if host_result.returncode == 0 and host_match else ""
+        boot_raw = boot_result.stdout.strip() if boot_result.returncode == 0 else ""
+    elif sys.platform.startswith("linux"):
+        try:
+            host_raw = Path("/etc/machine-id").read_text(encoding="ascii").strip()
+            boot_raw = Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        except OSError as error:
+            raise RuntimeError("could not establish durable host and boot identity") from error
+    else:
+        raise RuntimeError("automatic heartbeat orphan reconciliation is unsupported on this platform")
+    if not host_raw or not boot_raw:
+        raise RuntimeError("could not establish durable host and boot identity")
+    return (hashlib.sha256(("tachiko-host\0" + host_raw).encode()).hexdigest(),
+            hashlib.sha256(("tachiko-boot\0" + boot_raw).encode()).hexdigest())
+
+
+def settle_heartbeat(config: dict[str, Any], supervisor_id: str, generation: int, receipt_id: str) -> dict[str, Any]:
+    admission = config["admission"]
+    return admission_call(config, {
+        "schemaVersion": 1, "action": "settle", "repository": admission["repository"],
+        "workspace": admission["workspace"], "supervisorId": supervisor_id,
+        "expectedGeneration": generation, "receiptId": receipt_id,
+        "stopProof": {"childrenStopped": True, "supervisorStopped": True,
+                      "observedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())},
+    })
+
+
+def pending_owner_is_proven_dead(pending: dict[str, Any], host_id: str, boot_id: str) -> bool:
+    if pending["host_id"] != host_id:
+        raise RuntimeError("heartbeat admission belongs to a different host; refusing automatic reconciliation")
+    if pending["boot_id"] != boot_id:
+        return True
+    if pending["phase"] != "reserved_pre_execution":
+        return False
+    current = process_identity(pending["pid"])
+    return current != pending["process_identity"]
+
+
+def reconcile_pending_admission(config: dict[str, Any], state: dict[str, Any]) -> bool:
+    """Settle only a generation whose owner/phase proves no target could remain."""
+    pending = state.get("pending_admission")
+    if pending is None:
+        return True
+    host_id, boot_id = durable_host_boot_identity()
+    if pending["host_id"] != host_id:
+        raise RuntimeError("heartbeat admission belongs to a different host; refusing automatic reconciliation")
+    recovery = recover_heartbeat(config, pending)
+    if recovery.get("outcome") == "already_settled":
+        if (pending["generation"] is None or recovery.get("generation") != pending["generation"]
+                or recovery.get("receiptId") != pending["receipt_id"]):
+            raise RuntimeError("settled registry receipt does not match durable heartbeat generation")
+        state["pending_admission"] = None
+        save_state(state)
+        log("cleared stale execution intent after registry proved its exact generation released")
+        return True
+    if recovery.get("outcome") == "absent":
+        if pending["generation"] is not None or not pending_owner_is_proven_dead(pending, host_id, boot_id):
+            raise RuntimeError("registry lane is absent without sufficient durable proof to clear its intent")
+        state["pending_admission"] = None
+        save_state(state)
+        log("cleared never-admitted heartbeat intent after exact owner death proof")
+        return True
+    if recovery.get("outcome") != "recoverable":
+        raise RuntimeError("heartbeat registry has ambiguous or mismatched owner evidence")
+    generation = recovery.get("generation")
+    receipt_id = recovery.get("receiptId")
+    if type(generation) is not int or not isinstance(receipt_id, str):
+        raise RuntimeError("recovery helper omitted the exact active receipt")
+    if pending["generation"] is not None and (pending["generation"] != generation or pending["receipt_id"] != receipt_id):
+        raise RuntimeError("recovery helper identity differs from durable heartbeat generation")
+    if not pending_owner_is_proven_dead(pending, host_id, boot_id):
+        log("admission re-entry is fenced: prior same-boot execution or live owner is ambiguous")
+        return False
+    result = settle_heartbeat(config, pending["supervisor_id"], generation, receipt_id)
+    if result.get("outcome") != "settled":
+        raise RuntimeError("prior heartbeat generation was not settled")
+    state["pending_admission"] = None
+    save_state(state)
+    log("settled exact prior heartbeat generation after durable dead-owner proof")
+    return True
 
 
 def write_all(fd: int, data: bytes) -> None:
@@ -947,7 +1340,12 @@ def spawn_lock_guard(lock_fd: int, timeout_seconds: int) -> tuple[int, int, int]
             time.sleep(60)
 
 
-def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], supervisor_id: str) -> tuple[int, bool]:
+class PreSpawnWakeFailure(RuntimeError):
+    """The guard confirmed cancellation before Popen was permitted."""
+
+
+def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], supervisor_id: str,
+             on_spawn_possible: Any) -> tuple[int, bool, bool]:
     verified_executable = verify_wake_target(config)
     child = None
     settlement = {
@@ -959,8 +1357,15 @@ def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], 
             "stopProof": {"childrenStopped": True, "supervisorStopped": True, "observedAt": "pending"},
         },
     }
-    guard_pid, guard_write_fd, guard_result_fd = spawn_lock_guard(lock_fd, config["wake_timeout_seconds"])
-    guard_started = False
+    environment = os.environ.copy()
+    environment.update(config.get("wake_env", {}))
+    # The model-capable child must observe the same admission authority
+    # that just granted this generation, even if launchd inherited stale
+    # domain variables or the owner supplied an explicit host path.
+    environment["HOME"] = config["admission"]["home"]
+    environment.update(admission_domain_environment(config))
+    if testing() and os.environ.get("SCD_HEARTBEAT_TEST_FAIL_GUARD_SETUP") == "1":
+        raise OSError("injected guard setup failure before fork")
     wake_deadline = time.monotonic() + config["wake_timeout_seconds"]
     guard_result_deadline = wake_deadline + 7
     output = bytearray()
@@ -991,22 +1396,61 @@ def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], 
         signal_group(signum)
 
     old_term = signal.signal(signal.SIGTERM, forward)
-    old_int = signal.signal(signal.SIGINT, forward)
     try:
-        environment = os.environ.copy()
-        environment.update(config.get("wake_env", {}))
-        # The model-capable child must observe the same admission authority
-        # that just granted this generation, even if launchd inherited stale
-        # domain variables or the owner supplied an explicit host path.
-        environment["HOME"] = config["admission"]["home"]
-        environment.update(admission_domain_environment(config))
+        old_int = signal.signal(signal.SIGINT, forward)
+    except BaseException:
+        signal.signal(signal.SIGTERM, old_term)
+        selector.close()
+        raise
+    try:
+        guard_pid, guard_write_fd, guard_result_fd = spawn_lock_guard(lock_fd, config["wake_timeout_seconds"])
+    except BaseException:
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGINT, old_int)
+        selector.close()
+        raise
+    guard_started = False
 
-        def publish_guard_pid() -> None:
-            frame = json.dumps({"target_pid": os.getpid(), "settlement": settlement}, separators=(",", ":")).encode()
+    try:
+        def publish_guard_message(metadata: dict[str, Any]) -> None:
+            frame = json.dumps(metadata, separators=(",", ":")).encode()
             if len(frame) > 64 * 1024:
                 raise RuntimeError("guard handoff exceeds bounded frame size")
             write_all(guard_write_fd, len(frame).to_bytes(4, "big") + frame)
             os.close(guard_write_fd)
+
+        def cancel_before_spawn() -> bool:
+            nonlocal guard_started
+            # A guard process exists from spawn_lock_guard's successful return.
+            # Never waitpid it unless it acknowledges settlement: it may
+            # deliberately retain custody after an ambiguous helper failure.
+            guard_started = True
+            try:
+                publish_guard_message({"cancelled_before_spawn": True, "settlement": settlement})
+            except OSError:
+                return False
+            os.set_blocking(guard_result_fd, False)
+            cancel_deadline = time.monotonic() + 15
+            while time.monotonic() < cancel_deadline:
+                readable, _, _ = select.select([guard_result_fd], [], [], min(0.1, cancel_deadline - time.monotonic()))
+                if readable and os.read(guard_result_fd, 64).strip() == b"settled":
+                    os.waitpid(guard_pid, 0)
+                    return True
+            return False
+
+        # The durable uncertainty marker must follow successful guard setup,
+        # but precede Popen. If it fails, the guard receives a framed
+        # cancellation and settles this exact generation before releasing the
+        # inherited lock.
+        try:
+            on_spawn_possible()
+        except BaseException as error:
+            if not cancel_before_spawn():
+                raise RuntimeError("pre-spawn cancellation could not be confirmed; guard retains custody") from error
+            raise PreSpawnWakeFailure("could not durably mark execution-possible phase") from error
+
+        def publish_guard_pid() -> None:
+            publish_guard_message({"target_pid": os.getpid(), "settlement": settlement})
 
         try:
             child = subprocess.Popen(
@@ -1106,7 +1550,7 @@ def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], 
                     if not chunk or b"\n" in chunk:
                         break
             atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
-            return 124, False
+            return 124, False, False
         code = child.wait()
         atomic_write(WAKE_LOG, bytes(output[-MAX_WAKE_LOG:]))
         nonempty_lines = [line for line in output.splitlines() if line.strip()]
@@ -1133,15 +1577,13 @@ def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], 
                     break
         clean_guard = bytes(acknowledgement).strip() == b"settled"
         if not clean_guard:
-            return code, False
-        return code, marker_settled
+            return code, False, False
+        return code, marker_settled, True
     finally:
         if not guard_started:
-            try:
-                os.write(guard_write_fd, b"0\n")
-            except OSError:
-                pass
-            os.close(guard_write_fd)
+            # Before Popen, every known failure is cancellation, never an
+            # invalid/truncated frame that strands the guard with the flock.
+            cancel_before_spawn()
         if child is None or child.poll() is not None:
             if not guard_started:
                 os.waitpid(guard_pid, 0)
@@ -1233,6 +1675,11 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
         if not state:
             prime(config, "initial")
             return 0
+        # Recover an interrupted exact generation before any unchanged-state
+        # early return. Only a verified reboot, or a dead owner that was still
+        # durably pre-execution, can release an orphan automatically.
+        if not reconcile_pending_admission(config, state):
+            return 0
         try:
             fingerprint = github_fingerprint(config, verbose)
         except Exception as error:
@@ -1249,33 +1696,97 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
         try:
             verify_wake_target(config)
             supervisor_id = str(uuid.uuid4())
-            reservation = reserve_heartbeat(config, supervisor_id)
+            host_id, boot_id = durable_host_boot_identity()
+            owner_identity = process_identity(os.getpid())
+            if owner_identity is None:
+                raise RuntimeError("could not establish current heartbeat supervisor identity")
         except Exception as error:
             log("admission error; no wake: " + str(error))
             return 1
-        # Only a newly committed generation authorizes a new model process.
-        # Existing receipts are reconciliation evidence, never a spawn permit.
-        if reservation.get("outcome") != "reserved":
-            log("no-op: mission admission did not grant a fresh generation")
-            return 0
         attempt = dict(state)
         attempt.update(last_attempt_at=now, last_attempt_fingerprint=fingerprint,
                        last_attempt_exit=-1, last_attempt_reason=reason)
+        pending = {
+            "supervisor_id": supervisor_id, "host_id": host_id, "boot_id": boot_id,
+            "pid": os.getpid(), "process_identity": owner_identity,
+            "phase": "reserved_pre_execution", "generation": None, "receipt_id": None,
+            "started_at": now,
+        }
+        attempt["pending_admission"] = pending
         save_state(attempt)
-        log("waking target: " + reason)
+        try:
+            reservation = reserve_heartbeat(config, supervisor_id)
+        except Exception:
+            # The durable pre-execution intent lets a later boot distinguish
+            # this owner from an execution-possible attempt. Do not erase it:
+            # reserve may have committed before its response was lost.
+            raise
+        if reservation.get("outcome") != "reserved":
+            if reservation.get("outcome") in {"waiting", "owned_elsewhere"}:
+                attempt["pending_admission"] = None
+                save_state(attempt)
+            log("no-op: mission admission did not grant a fresh generation")
+            return 0
+        generation = reservation.get("generation")
+        receipt_id = reservation.get("receiptId")
+        if type(generation) is not int or not isinstance(receipt_id, str):
+            raise RuntimeError("fresh admission omitted exact generation receipt")
+        pending["generation"] = generation
+        pending["receipt_id"] = receipt_id
+        try:
+            save_state(attempt)
+        except Exception:
+            # We know this process has not started a child. Settle the exact
+            # token now; if that fails, retain the original durable intent.
+            settle_heartbeat(config, supervisor_id, generation, receipt_id)
+            raise
+        def mark_spawn_possible() -> None:
+            previous_phase = pending["phase"]
+            pending["phase"] = "spawn_uncertain"
+            try:
+                save_state(attempt)
+            except BaseException:
+                pending["phase"] = previous_phase
+                raise
+
+        try:
+            log("waking target: " + reason)
+        except Exception:
+            settle_heartbeat(config, supervisor_id, generation, receipt_id)
+            attempt["pending_admission"] = None
+            save_state(attempt)
+            raise
         # The dedicated guard retains the flock if this supervisor is killed. A
         # replacement runner cannot overlap an orphaned wake target on this host.
-        code, settled = run_wake(config, lock_stream.fileno(), reservation, supervisor_id)
+        try:
+            code, marker_settled, guard_settled = run_wake(
+                config, lock_stream.fileno(), reservation, supervisor_id,
+                on_spawn_possible=mark_spawn_possible,
+            )
+        except Exception:
+            if pending["phase"] == "reserved_pre_execution":
+                # Verification/guard setup failed before Popen was permitted.
+                settle_heartbeat(config, supervisor_id, generation, receipt_id)
+                attempt["pending_admission"] = None
+                save_state(attempt)
+            raise
         attempt["last_attempt_exit"] = code
         if code:
+            if guard_settled:
+                attempt["pending_admission"] = None
             save_state(attempt)
             log(f"wake target failed with exit {code}; successful state not consumed")
             return code
-        if not settled:
+        if not guard_settled:
             save_state(attempt)
             log("wake target exited 0 without settled acknowledgement; successful state not consumed")
             return 0
-        attempt.update(successful_fingerprint=fingerprint, last_success_at=now_epoch())
+        if not marker_settled:
+            attempt["pending_admission"] = None
+            save_state(attempt)
+            log("wake target settled without terminal marker; successful state not consumed")
+            return 0
+        attempt.update(successful_fingerprint=fingerprint, last_success_at=now_epoch(), pending_admission=None)
         save_state(attempt)
         log("wake target acknowledged settled state; fingerprint and safety clock committed")
         return 0
@@ -1460,13 +1971,13 @@ def install(args: argparse.Namespace) -> int:
         gh_snapshot, gh_digest, gh_snapshot_created = pin_github_tool(gh_source)
         runner_snapshot, runner_digest, runner_snapshot_created = pin_runner_source(runner)
         node_snapshot, node_digest, node_snapshot_created = pin_admission_node(node_source)
-        helper_entry, helper_digest, helper_files, helper_created = pin_admission_helper(repo)
+        helper_entry, helper_digest, helper_files, helper_build, helper_created = pin_admission_helper(repo, node_source)
         config_values.update(
             gh=str(gh_snapshot), gh_sha256=gh_digest,
             runner=str(runner_snapshot), runner_sha256=runner_digest,
             admission_node=str(node_snapshot), admission_node_sha256=node_digest,
             admission_helper=str(helper_entry), admission_helper_sha256=helper_digest,
-            admission_helper_files=helper_files,
+            admission_helper_files=helper_files, admission_build=helper_build,
         )
         plist["ProgramArguments"] = ["/usr/bin/python3", str(runner_snapshot), "run"]
         config = validate_config(config_values)
@@ -1502,6 +2013,11 @@ def install(args: argparse.Namespace) -> int:
                 runner_snapshot.unlink()
             except OSError as rollback_error:
                 rollback_errors.append(f"remove {runner_snapshot}: {rollback_error}")
+        if helper_created and helper_entry is not None:
+            try:
+                shutil.rmtree(helper_entry.parents[1])
+            except OSError as rollback_error:
+                rollback_errors.append(f"remove {helper_entry.parents[1]}: {rollback_error}")
         if service_transitioned:
             try:
                 bootout_if_loaded(domain)
