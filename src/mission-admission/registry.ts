@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync, fsyncSync, realpathSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, fsyncSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../dispatch/invocation-lock.js';
@@ -97,6 +97,8 @@ export interface MissionAdmissionOptions {
   readonly beforeStaleTakeover?: () => void;
   /** Revalidate account-owned lexical roots before cached registry and lock I/O. */
   readonly validatePath?: () => void;
+  /** Deterministic durability fault seam; defaults to fsyncSync for file and parent directory. */
+  readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void;
 }
 
 export class AdmissionStateError extends Error {
@@ -330,12 +332,24 @@ function acquireLock(lockPath: string, timeoutMs: number, retryMs: number, befor
   }
 }
 
-function writeAtomic(filePath: string, state: RegistryState): void {
+function writeAtomic(filePath: string, state: RegistryState, syncForDurability: (fd: number, target: 'file' | 'directory') => void): void {
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   const fd = openSync(temporary, 'wx', 0o600);
-  try { writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`, 'utf8'); fsyncSync(fd); } finally { closeSync(fd); }
-  renameSync(temporary, filePath);
-  try { const directoryFd = openSync(path.dirname(filePath), 'r'); try { fsyncSync(directoryFd); } finally { closeSync(directoryFd); } } catch { /* directory fsync is unsupported on some platforms */ }
+  try {
+    writeFileSync(fd, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+    syncForDurability(fd, 'file');
+    closeSync(fd);
+  } catch (error) {
+    try { closeSync(fd); } catch { /* preserve the original write/sync failure */ }
+    try { unlinkSync(temporary); } catch { /* remove only this attempt's temp */ }
+    throw error;
+  }
+  try { renameSync(temporary, filePath); } catch (error) {
+    try { unlinkSync(temporary); } catch { /* remove only this attempt's temp */ }
+    throw error;
+  }
+  const directoryFd = openSync(path.dirname(filePath), 'r');
+  try { syncForDurability(directoryFd, 'directory'); } finally { closeSync(directoryFd); }
 }
 
 function tokenRecord(lane: LaneRecord): AdmissionToken {
@@ -353,6 +367,7 @@ export class MissionAdmissionRegistry {
   private readonly onPublishedTransition?: (projection: AdmissionProjection) => void;
   private readonly beforeStaleTakeover?: () => void;
   private readonly validatePath?: () => void;
+  private readonly syncForDurability: (fd: number, target: 'file' | 'directory') => void;
 
   constructor(options: MissionAdmissionOptions) {
     validateAdmissionConfig(options.config);
@@ -366,6 +381,7 @@ export class MissionAdmissionRegistry {
     this.onPublishedTransition = options.onPublishedTransition;
     this.beforeStaleTakeover = options.beforeStaleTakeover;
     this.validatePath = options.validatePath;
+    this.syncForDurability = options.syncForDurability ?? ((fd) => fsyncSync(fd));
   }
 
   private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void): T {
@@ -397,7 +413,7 @@ export class MissionAdmissionRegistry {
         beforeStatePublish?.(result);
         this.beforePublish?.();
         this.validatePath?.();
-        writeAtomic(this.filePath, state);
+        writeAtomic(this.filePath, state, this.syncForDurability);
         if (state.revision !== beforeRevision) {
           try { this.onPublishedTransition?.(project(state)); } catch { /* wake is a best-effort hint; publication remains authoritative */ }
         }

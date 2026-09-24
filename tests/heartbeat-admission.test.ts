@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -17,7 +17,7 @@ function heartbeatLaneId(repository: string, workspace: string): string {
   return 'heartbeat:' + createHash('sha256').update(`${repository}\0${realpathSync(workspace)}`).digest('hex').slice(0, 32);
 }
 
-function setup(overrides: { readonly beforePublish?: () => void; readonly limits?: AdmissionConfig['limits'] } = {}) {
+function setup(overrides: { readonly beforePublish?: () => void; readonly limits?: AdmissionConfig['limits']; readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-heartbeat-admission-'));
   const workspace = path.join(directory, 'workspace');
   mkdirSync(workspace);
@@ -26,6 +26,7 @@ function setup(overrides: { readonly beforePublish?: () => void; readonly limits
     filePath: registryPath,
     config: { ...config, limits: overrides.limits ?? config.limits },
     ...(overrides.beforePublish === undefined ? {} : { beforePublish: overrides.beforePublish }),
+    ...(overrides.syncForDurability === undefined ? {} : { syncForDurability: overrides.syncForDurability }),
   });
   const receiptPath = path.join(directory, 'private-receipts', 'heartbeat.json');
   const options: HeartbeatAdmissionOptions = { registry, receiptPath: () => receiptPath };
@@ -58,6 +59,29 @@ function setup(overrides: { readonly beforePublish?: () => void; readonly limits
 }
 
 describe('model-free heartbeat mission admission helper', () => {
+  it('does not grant a heartbeat reservation when parent sync fails after registry rename, and recovers it as already reserved', () => {
+    let failDirectorySync = true;
+    const f = setup({ syncForDurability: (fd, target) => {
+      if (target === 'directory' && failDirectorySync) throw new Error('injected registry parent sync failure');
+      fsyncSync(fd);
+    } });
+    try {
+      assert.throws(() => handleHeartbeatAdmission(f.request('reserve'), f.options), /registry parent sync failure/);
+      const laneId = heartbeatLaneId('acme/widgets', f.workspace);
+      const lane = f.registry.readLane(laneId);
+      assert.equal(lane?.status, 'active', 'post-rename uncertain publication remains visible for recovery');
+      const receipt = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { status: string; token: { generation: number } };
+      assert.equal(receipt.status, 'active');
+      assert.equal(receipt.token.generation, lane?.generation);
+
+      failDirectorySync = false;
+      const restarted = new MissionAdmissionRegistry({ filePath: f.registryPath, config });
+      const recovered = handleHeartbeatAdmission(f.request('reserve'), { registry: restarted, receiptPath: () => f.receiptPath });
+      assert.equal(recovered.outcome, 'already_reserved', 'restart recognizes the exact durable active owner without issuing a new spawn grant');
+      assert.equal(restarted.readLane(laneId)?.generation, receipt.token.generation);
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
   it('reserves a stable high-autonomy repository captain with a private receipt and model-free status', () => {
     const f = setup();
     let modelCalls = 0;

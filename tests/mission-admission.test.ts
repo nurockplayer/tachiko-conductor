@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -28,10 +28,10 @@ function createHashForTest(repository: string, workspace: string): string {
   return createHash('sha256').update(`${repository}\0${realpathSync(workspace)}`).digest('hex');
 }
 
-function fixture(overrides: { readonly config?: AdmissionConfig; readonly beforePublish?: () => void; readonly onPublishedTransition?: (projection: import('../src/mission-admission/registry.js').AdmissionProjection) => void } = {}): { directory: string; filePath: string; registry: MissionAdmissionRegistry } {
+function fixture(overrides: { readonly config?: AdmissionConfig; readonly beforePublish?: () => void; readonly onPublishedTransition?: (projection: import('../src/mission-admission/registry.js').AdmissionProjection) => void; readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void } = {}): { directory: string; filePath: string; registry: MissionAdmissionRegistry } {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-'));
   const filePath = path.join(directory, 'host', 'admission.json');
-  return { directory, filePath, registry: new MissionAdmissionRegistry({ filePath, config: overrides.config ?? config, lockTimeoutMs: 10_000, ...(overrides.beforePublish ? { beforePublish: overrides.beforePublish } : {}), ...(overrides.onPublishedTransition ? { onPublishedTransition: overrides.onPublishedTransition } : {}) }) };
+  return { directory, filePath, registry: new MissionAdmissionRegistry({ filePath, config: overrides.config ?? config, lockTimeoutMs: 10_000, ...(overrides.beforePublish ? { beforePublish: overrides.beforePublish } : {}), ...(overrides.onPublishedTransition ? { onPublishedTransition: overrides.onPublishedTransition } : {}), ...(overrides.syncForDurability ? { syncForDurability: overrides.syncForDurability } : {}) }) };
 }
 
 function evidence(issue: number, overrides: Partial<MissionEvidence> = {}): MissionEvidence {
@@ -95,6 +95,31 @@ function git(directory: string, ...args: string[]): void {
 }
 
 describe('provider-neutral durable mission admission', () => {
+  it('does not run publication callbacks after a registry parent-sync failure, while preserving the visible candidate', () => {
+    let failDirectorySync = false;
+    let transitionNotifications = 0;
+    let afterPublish = 0;
+    const { directory, registry } = fixture({
+      syncForDurability: (fd, target) => {
+        if (target === 'directory' && failDirectorySync) throw new Error('injected registry parent sync failure');
+        fsyncSync(fd);
+      },
+      onPublishedTransition: () => { transitionNotifications += 1; },
+    });
+    try {
+      const admitted = registry.admit({ laneId: 'durable-callback-lane', role: 'production_captain', evidence: evidence(89) });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') throw new Error('expected admitted lane');
+      const notificationsBeforeRelease = transitionNotifications;
+      failDirectorySync = true;
+      assert.throws(() => registry.release(admitted.token, true, undefined, () => { afterPublish += 1; }), /registry parent sync failure/);
+      assert.equal(afterPublish, 0, 'afterPublish must not run before parent-directory durability succeeds');
+      assert.equal(transitionNotifications, notificationsBeforeRelease, 'transition notification must not cross failed durability confirmation');
+      assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released', 'rename-visible candidate is retained for exact recovery');
+      assert.equal(registry.readLane(admitted.token.laneId)?.generation, admitted.token.generation + 1);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('signals only after atomic publication of meaningful revisions and never hides an admitted token on signal failure', () => {
     let signals = 0;
     const { directory, filePath, registry } = fixture({ onPublishedTransition: (projection) => {

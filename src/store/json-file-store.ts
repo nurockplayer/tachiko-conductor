@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '../dispatch/invocation-lock.js';
@@ -40,6 +41,8 @@ export interface JsonFileStoreOptions {
   readonly mutationLockRetryMs?: number;
   /** Test seam: runs after CAS comparison succeeds while the mutation fence is still held. */
   readonly beforeConditionalWrite?: () => void;
+  /** Deterministic durability fault seam; defaults to fsyncSync for both file and parent directory. */
+  readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void;
 }
 
 const ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -250,16 +253,31 @@ function isRun(value: unknown): value is Run {
   );
 }
 
-/** Write atomically: write to `<path>.tmp`, then rename over the target. */
+/** Write atomically and durably: sync the private temp before rename and its parent after rename. */
 function serializedJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-function writeJsonAtomic(filePath: string, value: unknown): string {
+function writeJsonAtomic(filePath: string, value: unknown, syncForDurability: (fd: number, target: 'file' | 'directory') => void): string {
   const serialized = serializedJson(value);
-  const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, serialized, 'utf8');
-  renameSync(tmpPath, filePath);
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined = openSync(tmpPath, 'wx');
+  try {
+    writeFileSync(fd, serialized, 'utf8');
+    syncForDurability(fd, 'file');
+    closeSync(fd);
+    fd = undefined;
+  } catch (error) {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* preserve the original write/sync failure */ }
+    try { unlinkSync(tmpPath); } catch { /* remove only this attempt's temp */ }
+    throw error;
+  }
+  try { renameSync(tmpPath, filePath); } catch (error) {
+    try { unlinkSync(tmpPath); } catch { /* remove only this attempt's temp */ }
+    throw error;
+  }
+  const directoryFd = openSync(path.dirname(filePath), 'r');
+  try { syncForDurability(directoryFd, 'directory'); } finally { closeSync(directoryFd); }
   return serialized;
 }
 
@@ -372,12 +390,14 @@ export class JsonFileStore implements RunStore {
   private readonly mutationLockTimeoutMs: number;
   private readonly mutationLockRetryMs: number;
   private readonly beforeConditionalWrite: (() => void) | undefined;
+  private readonly syncForDurability: (fd: number, target: 'file' | 'directory') => void;
 
   constructor(options: JsonFileStoreOptions) {
     this.dir = path.resolve(options.dir);
     this.mutationLockTimeoutMs = options.mutationLockTimeoutMs ?? DEFAULT_RUN_MUTATION_LOCK_TIMEOUT_MS;
     this.mutationLockRetryMs = options.mutationLockRetryMs ?? DEFAULT_RUN_MUTATION_LOCK_RETRY_MS;
     this.beforeConditionalWrite = options.beforeConditionalWrite;
+    this.syncForDurability = options.syncForDurability ?? ((fd) => fsyncSync(fd));
     if (!Number.isSafeInteger(this.mutationLockTimeoutMs) || this.mutationLockTimeoutMs < 0) {
       throw new Error('mutationLockTimeoutMs must be a non-negative safe integer.');
     }
@@ -427,7 +447,7 @@ export class JsonFileStore implements RunStore {
       if (existsSync(filePath)) {
         throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
       }
-      const serialized = writeJsonAtomic(filePath, run);
+      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability);
       writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
@@ -443,7 +463,7 @@ export class JsonFileStore implements RunStore {
       const filePath = this.filePathFor(run.id);
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
       assertRepairAdmissionsAppendOnly(current, run);
-      const serialized = writeJsonAtomic(filePath, run);
+      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability);
       writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
@@ -456,7 +476,7 @@ export class JsonFileStore implements RunStore {
       if (runFingerprint(current) !== runFingerprint(expected)) return false;
       assertRepairAdmissionsAppendOnly(current, next);
       this.beforeConditionalWrite?.();
-      const serialized = writeJsonAtomic(filePath, next);
+      const serialized = writeJsonAtomic(filePath, next, this.syncForDurability);
       writeOperationalProjectionBestEffort(this.dir, next, serialized);
       return true;
     });
