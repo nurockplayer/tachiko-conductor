@@ -1274,10 +1274,7 @@ def reconcile_pending_admission(config: dict[str, Any], state: dict[str, Any]) -
         expected_lane_id = "heartbeat:" + hashlib.sha256(
             (admission["repository"] + "\0" + canonical_workspace).encode("utf-8")
         ).hexdigest()[:32]
-        try:
-            valid_receipt_id = isinstance(receipt_id, str) and str(uuid.UUID(receipt_id)) == receipt_id
-        except (ValueError, AttributeError):
-            valid_receipt_id = False
+        valid_receipt_id = isinstance(receipt_id, str) and re.fullmatch(r"[0-9a-f-]{36}", receipt_id) is not None
         if (pending["generation"] is not None or pending["receipt_id"] is not None
                 or pending["phase"] != "reserved_pre_execution"
                 or not pending_owner_is_proven_dead(pending, host_id, boot_id)
@@ -1299,10 +1296,7 @@ def reconcile_pending_admission(config: dict[str, Any], state: dict[str, Any]) -
         expected_lane_id = "heartbeat:" + hashlib.sha256(
             (admission["repository"] + "\0" + canonical_workspace).encode("utf-8")
         ).hexdigest()[:32]
-        try:
-            valid_receipt_id = isinstance(receipt_id, str) and str(uuid.UUID(receipt_id)) == receipt_id
-        except (ValueError, AttributeError):
-            valid_receipt_id = False
+        valid_receipt_id = isinstance(receipt_id, str) and re.fullmatch(r"[0-9a-f-]{36}", receipt_id) is not None
         if (pending["generation"] is not None or pending["receipt_id"] is not None
                 or pending["phase"] != "reserved_pre_execution"
                 or not pending_owner_is_proven_dead(pending, host_id, boot_id)

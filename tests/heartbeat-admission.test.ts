@@ -530,7 +530,7 @@ describe('model-free heartbeat mission admission helper', () => {
     } finally { rmSync(f.directory, { recursive: true, force: true }); }
   });
 
-  it('preserves legacy active and settled receipt ID acceptance while requiring canonical marker UUIDs', () => {
+  it('preserves the legacy receipt ID grammar through active, settled, and discarded receipt states', () => {
     const f = setup();
     try {
       const reserved = handleHeartbeatAdmission(f.request('reserve'), f.options);
@@ -547,15 +547,27 @@ describe('model-free heartbeat mission admission helper', () => {
       const released = handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options);
       assert.equal(released.outcome, 'released_predecessor', 'legacy settled receipts retain their previous schema acceptance');
 
+      const settledReceipt = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { token: { laneId: string; generation: number; token: string } } & Record<string, unknown>;
+      const orphanGeneration = reserved.generation + 2;
+      writeFileSync(f.receiptPath, JSON.stringify({ ...settledReceipt, status: 'active', token: {
+        ...settledReceipt.token, generation: orphanGeneration, token: 'legacy-orphan-token',
+      } }), { mode: 0o600 });
+      const orphan = handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options);
+      assert.equal(orphan.outcome, 'uncommitted_receipt');
+      if (orphan.outcome !== 'uncommitted_receipt') throw new Error('expected legacy unpublished receipt');
+      const discarded = handleHeartbeatAdmission(f.discard('acme/widgets', orphan.generation, orphan.receiptId), f.options);
+      assert.equal(discarded.outcome, 'discarded_uncommitted');
       const marker = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as Record<string, unknown>;
-      marker.kind = 'discarded_uncommitted';
-      marker.generation = reserved.generation + 2;
-      marker.predecessor = { kind: 'released', generation: reserved.generation + 1 };
-      delete marker.status;
-      delete marker.token;
+      assert.equal(marker.receiptId, legacyReceiptId, 'the durable marker preserves its exact legacy identity');
+      assert.equal('token' in marker, false);
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'discarded_predecessor');
+      const markerText = readFileSync(f.receiptPath, 'utf8');
+      marker.receiptId = 'x'.repeat(36);
       writeFileSync(f.receiptPath, JSON.stringify(marker), { mode: 0o600 });
       assert.throws(() => handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options), /unsupported or ambiguous schema/,
-        'new discarded markers require canonical UUIDs even though legacy receipt IDs retain their prior rule');
+        'a 36-character nonlegacy receipt ID is rejected rather than reinterpreted as marker absence');
+      writeFileSync(f.receiptPath, markerText, { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'discarded_predecessor');
     } finally { rmSync(f.directory, { recursive: true, force: true }); }
   });
 

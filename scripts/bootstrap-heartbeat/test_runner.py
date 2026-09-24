@@ -705,7 +705,8 @@ class HeartbeatTest(unittest.TestCase):
             "laneId": lane_id,
         }), encoding="utf-8")
 
-    def _set_released_predecessor_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host", boot_id: str = "test-boot") -> None:
+    def _set_released_predecessor_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host",
+                                         boot_id: str = "test-boot", receipt_id: str = "00000000-0000-4000-8000-000000000006") -> None:
         state = self.state()
         state["pending_admission"] = {
             "supervisor_id": "new-supervisor", "host_id": host_id, "boot_id": boot_id,
@@ -719,7 +720,7 @@ class HeartbeatTest(unittest.TestCase):
         self.admission_state.write_text(json.dumps({
             "mode": "waiting", "releasedPredecessor": True, "active": False,
             "generation": 6, "releasedGeneration": 7,
-            "receiptId": "00000000-0000-4000-8000-000000000006", "supervisorId": "previous-supervisor",
+            "receiptId": receipt_id, "supervisorId": "previous-supervisor",
             "status": "settled", "laneId": lane_id,
         }), encoding="utf-8")
 
@@ -843,6 +844,7 @@ class HeartbeatTest(unittest.TestCase):
             {"phase": "spawn_uncertain"},
             {"host_id": "other-host"},
             {"receipt_id": "not-a-uuid"},
+            {"receipt_id": "x" * 36},
             {"lane_id": "heartbeat:foreign"},
         )
         for overrides in cases:
@@ -925,6 +927,22 @@ class HeartbeatTest(unittest.TestCase):
         repository = "nurockplayer/tachiko-conductor"
         workspace_text = str(workspace.resolve())
         self.invoke("run", "--prime")
+        runtime_config = {"admission": {"repository": repository, "workspace": workspace_text}}
+
+        def python_recovery(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            outcome = real_helper(request)[1]
+            assert outcome is not None
+            return outcome
+
+        def reconcile_state(state: dict[str, object], *, fail_save: bool = False) -> bool:
+            with mock.patch.object(module, "admission_call", side_effect=python_recovery), \
+                    mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                    mock.patch.object(module, "process_identity", return_value=None):
+                if fail_save:
+                    with mock.patch.object(module, "save_state", side_effect=OSError("simulated pending save failure")):
+                        return module.reconcile_pending_admission(runtime_config, state)
+                return module.reconcile_pending_admission(runtime_config, state)
+
         prior_supervisor = "prior-supervisor"
         reserved = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
                                 "workspace": workspace_text, "supervisorId": prior_supervisor})[1]
@@ -940,15 +958,36 @@ class HeartbeatTest(unittest.TestCase):
         assert settled is not None
         self.assertEqual(settled["outcome"], "settled")
         lane_id = reserved["laneId"]
+        legacy_receipt_id = "-" * 36
+        settled_receipt = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        settled_receipt["receiptId"] = legacy_receipt_id
+        helper_receipt.write_text(json.dumps(settled_receipt), encoding="utf-8")
         released_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
         assert released_lane is not None
         self.assertEqual((released_lane["status"], released_lane["generation"]), ("released", generation + 1))
+        released_recovery = real_helper({"schemaVersion": 1, "action": "recover", "repository": repository,
+                                         "workspace": workspace_text, "supervisorId": "released-reader",
+                                         "expectedGeneration": None})[1]
+        assert released_recovery is not None
+        self.assertEqual(released_recovery["outcome"], "released_predecessor")
+        self.assertEqual(released_recovery["receiptId"], legacy_receipt_id)
+        released_state = self.state()
+        released_state["pending_admission"] = {
+            "supervisor_id": "released-reader", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 999,
+        }
+        module.STATE.write_text(json.dumps(released_state), encoding="utf-8")
+        self.assertTrue(reconcile_state(released_state), "Python must accept the prior receipt grammar for released recovery")
+        self.assertIsNone(released_state["pending_admission"])
 
         failed, _ = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
                                  "workspace": workspace_text, "supervisorId": prior_supervisor,
                                  "injectPublicationFailure": True}, allow_failure=True)
         self.assertNotEqual(failed.returncode, 0)
         orphan = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        orphan["receiptId"] = legacy_receipt_id
+        helper_receipt.write_text(json.dumps(orphan), encoding="utf-8")
         self.assertEqual((orphan["status"], orphan["token"]["generation"]), ("active", generation + 2))
         unchanged_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
         assert unchanged_lane is not None
@@ -966,69 +1005,59 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(marker_result["outcome"], "discarded_uncommitted")
         marker = json.loads(helper_receipt.read_text(encoding="utf-8"))
         self.assertEqual(marker["kind"], "discarded_uncommitted")
+        self.assertEqual(marker["receiptId"], legacy_receipt_id, "marker retains exact accepted legacy identity")
         self.assertNotIn("token", marker)
 
-        runtime_config = {"admission": {"repository": repository, "workspace": workspace_text}}
         state = self.state()
         state["pending_admission"] = {
-            "supervisor_id": prior_supervisor, "host_id": "test-host", "boot_id": "test-boot",
+            "supervisor_id": "marker-reader", "host_id": "test-host", "boot_id": "test-boot",
             "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
             "generation": None, "receipt_id": None, "started_at": 1000,
         }
         module.STATE.write_text(json.dumps(state), encoding="utf-8")
+        with self.assertRaisesRegex(OSError, "simulated pending save failure"):
+            reconcile_state(state, fail_save=True)
+        self.assertIsNone(state["pending_admission"], "the failed save occurs after marker recovery, in memory only")
+        self.assertIsNotNone(self.state()["pending_admission"], "disk still retains the pending intent across simulated crash")
 
-        def python_recovery(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
-            outcome = real_helper(request)[1]
-            assert outcome is not None
-            return outcome
+        restarted_state = self.state()
+        self.assertTrue(reconcile_state(restarted_state))
+        self.assertIsNone(restarted_state["pending_admission"])
+        self.assertIsNone(self.state()["pending_admission"], "Python restart persists marker-backed pending clear")
 
-        with mock.patch.object(module, "admission_call", side_effect=python_recovery), \
-                mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
-                mock.patch.object(module, "process_identity", return_value=None):
-            with mock.patch.object(module, "save_state", side_effect=OSError("simulated pending save failure")):
-                with self.assertRaisesRegex(OSError, "simulated pending save failure"):
-                    module.reconcile_pending_admission(runtime_config, state)
-            self.assertIsNone(state["pending_admission"], "the failed save occurs after marker recovery, in memory only")
-            self.assertIsNotNone(self.state()["pending_admission"], "disk still retains the pending intent across simulated crash")
-
-            restarted_state = self.state()
-            self.assertTrue(module.reconcile_pending_admission(runtime_config, restarted_state))
-            self.assertIsNone(restarted_state["pending_admission"])
-            self.assertIsNone(self.state()["pending_admission"], "Python restart persists marker-backed pending clear")
-
-            # A later supervisor may recover the marker before reserve, then a
-            # subsequent crash may leave the same null-generation intent after
-            # capacity has parked generation G+2.
-            holder = real_helper({"bridgeAction": "occupy"})[1]
-            assert holder is not None
-            self.assertEqual(holder["outcome"], "admitted")
-            later_state = self.state()
-            later_state["pending_admission"] = {
-                "supervisor_id": "later-supervisor", "host_id": "test-host", "boot_id": "test-boot",
-                "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
-                "generation": None, "receipt_id": None, "started_at": 1001,
-            }
-            module.STATE.write_text(json.dumps(later_state), encoding="utf-8")
-            self.assertTrue(module.reconcile_pending_admission(runtime_config, later_state))
-            self.assertIsNone(later_state["pending_admission"])
-            capacity_wait = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
-                                         "workspace": workspace_text, "supervisorId": "later-supervisor"})[1]
-            assert capacity_wait is not None
-            self.assertEqual(capacity_wait["outcome"], "waiting")
-            parked_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
-            assert parked_lane is not None
-            self.assertEqual((parked_lane["status"], parked_lane["generation"]), ("parked", generation + 2))
-            after_capacity = self.state()
-            after_capacity["pending_admission"] = {
-                "supervisor_id": "another-later-supervisor", "host_id": "test-host", "boot_id": "test-boot",
-                "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
-                "generation": None, "receipt_id": None, "started_at": 1002,
-            }
-            module.STATE.write_text(json.dumps(after_capacity), encoding="utf-8")
-            self.assertTrue(module.reconcile_pending_admission(runtime_config, after_capacity))
-            self.assertIsNone(after_capacity["pending_admission"])
-            self.assertIsNone(self.state()["pending_admission"], "later capacity marker recovery also persists its clear")
-            self.assertEqual(self.records(), [], "real helper marker recovery and capacity denial never spawn")
+        # A later supervisor may recover the marker before reserve, then a
+        # subsequent crash may leave the same null-generation intent after
+        # capacity has parked generation G+2.
+        holder = real_helper({"bridgeAction": "occupy"})[1]
+        assert holder is not None
+        self.assertEqual(holder["outcome"], "admitted")
+        later_state = self.state()
+        later_state["pending_admission"] = {
+            "supervisor_id": "later-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1001,
+        }
+        module.STATE.write_text(json.dumps(later_state), encoding="utf-8")
+        self.assertTrue(reconcile_state(later_state))
+        self.assertIsNone(later_state["pending_admission"])
+        capacity_wait = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                     "workspace": workspace_text, "supervisorId": "later-supervisor"})[1]
+        assert capacity_wait is not None
+        self.assertEqual(capacity_wait["outcome"], "waiting")
+        parked_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
+        assert parked_lane is not None
+        self.assertEqual((parked_lane["status"], parked_lane["generation"]), ("parked", generation + 2))
+        after_capacity = self.state()
+        after_capacity["pending_admission"] = {
+            "supervisor_id": "another-later-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1002,
+        }
+        module.STATE.write_text(json.dumps(after_capacity), encoding="utf-8")
+        self.assertTrue(reconcile_state(after_capacity))
+        self.assertIsNone(after_capacity["pending_admission"])
+        self.assertIsNone(self.state()["pending_admission"], "later capacity marker recovery also persists its clear")
+        self.assertEqual(self.records(), [], "real helper marker recovery and capacity denial never spawn")
 
     def test_uncommitted_discard_retry_can_be_denied_by_capacity_again(self) -> None:
         self.invoke("run", "--prime")
@@ -1078,6 +1107,15 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(after, predecessor, "read-only classification and repeated capacity denial preserve the tombstone/lane")
         self.assertEqual(self.records(), [], "only a fresh reserved result may spawn")
 
+    def test_released_predecessor_accepts_legacy_receipt_id_grammar(self) -> None:
+        self.invoke("run", "--prime")
+        legacy_receipt_id = "-" * 36
+        self._set_released_predecessor_pending(receipt_id=legacy_receipt_id)
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "legacy released predecessor recovery cannot spawn")
+
     def test_released_predecessor_refuses_wrong_phase_or_host_after_reboot(self) -> None:
         for phase, host_id, boot_id, bad_tombstone in (
             ("spawn_uncertain", "test-host", "prior-boot", None),
@@ -1085,6 +1123,7 @@ class HeartbeatTest(unittest.TestCase):
             ("reserved_pre_execution", "test-host", "test-boot", {"releasedGeneration": 8}),
             ("reserved_pre_execution", "test-host", "test-boot", {"laneId": "heartbeat:foreign"}),
             ("reserved_pre_execution", "test-host", "test-boot", {"receiptId": "not-a-uuid"}),
+            ("reserved_pre_execution", "test-host", "test-boot", {"receiptId": "x" * 36}),
         ):
             with self.subTest(phase=phase, host_id=host_id, bad_tombstone=bad_tombstone):
                 self.invoke("run", "--prime")

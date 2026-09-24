@@ -157,8 +157,7 @@ function privateReceipt(filePath: string): PrivateHeartbeatReceipt | null {
     boundedString(parsed.missionId, 128) && boundedString(parsed.repository, 255) && boundedString(parsed.workspace, 2_048) &&
     path.isAbsolute(parsed.workspace) && boundedString(parsed.supervisorId, 128) && typeof parsed.receiptId === 'string' &&
     /^[0-9a-f-]{36}$/.test(parsed.receiptId);
-  const markerReceiptIdValid = typeof parsed.receiptId === 'string' &&
-    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(parsed.receiptId);
+  const markerReceiptIdValid = typeof parsed.receiptId === 'string' && /^[0-9a-f-]{36}$/.test(parsed.receiptId);
   const predecessorValid = (value: unknown): value is DiscardedPredecessor => {
     if (!isObject(value)) return false;
     if (value.kind === 'absent') return exactKeys(value, ['kind']);
