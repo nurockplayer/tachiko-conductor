@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-import { assertWorkspaceGuard, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import { assertWorkspaceGuard, qualifyGovernedPublicationAdapter, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessRunner, type ProcessRunOptions } from '../github/transport.js';
 import { providerTelemetry } from './provider-telemetry.js';
@@ -100,6 +100,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     this.containerEnvKeys = options.containerEnv ?? WORKER_ROUTER_CONTAINER_ENV_ALLOWLIST;
     // The real boundary is the only production path; there is no host fallback.
     this.container = options.container ?? new ContainerWorkerBoundary();
+    if (options.container === undefined) qualifyGovernedPublicationAdapter(this);
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {

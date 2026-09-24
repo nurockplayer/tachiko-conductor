@@ -1,6 +1,7 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
   assertWorkspaceGuard,
+  governedPublicationRefusal,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -112,6 +113,8 @@ export class CodexCliAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) return publicationRefusal;
     const executor = request.executor;
     if (executor !== undefined && !isUsableCodexExecutor(executor)) {
       return failureAgentResult(

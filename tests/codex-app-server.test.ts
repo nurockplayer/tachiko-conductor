@@ -16,7 +16,7 @@ import {
   type CodexAppServerClientFactory,
   type NativeThreadObservation,
 } from '../src/agents/codex-app-server.js';
-import { WorkspaceGuardFailure, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
+import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, WorkspaceGuardFailure, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
 import type { AgentResult } from '../src/domain/types.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
@@ -170,6 +170,26 @@ async function waitForCall(client: FakeClient, call: string): Promise<void> {
 }
 
 describe('CodexAppServerAdapter', () => {
+  it('refuses governed App Server and CLI-fallback execution before opening either transport', async () => {
+    const client = new FakeClient();
+    const factory = new Factory(client);
+    const fallback = new Fallback();
+    const executor = { provider: 'codex-app-server', sessionId: 'durable-thread', generation: 'run-generation' } as const;
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, fallback, runner: new HeadRunner() });
+
+    const result = await adapter.run({
+      ...request({ executor, runtimeOwnership: { runId: 'run-1', generation: 'run-generation' } }),
+      governedPublication: { required: true, continuation: true },
+    });
+
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', new RegExp(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED));
+    assert.deepEqual(result.executor, executor);
+    assert.equal(factory.opens, 0);
+    assert.equal(fallback.calls, 0);
+    assert.deepEqual(client.calls, []);
+  });
+
   it('uses initialize-capable native observation before terminal resume, then starts exactly one next turn', async () => {
     const client = new FakeClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner() });

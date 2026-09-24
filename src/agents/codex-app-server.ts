@@ -4,6 +4,7 @@ import { createInterface } from 'node:readline';
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
   assertWorkspaceGuard,
+  governedPublicationRefusal,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -167,6 +168,8 @@ export class CodexAppServerAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) return publicationRefusal;
     // Existing CLI continuations stay with the CLI; changing transport must
     // never silently change a durable executor identity.
     if (request.executor?.provider === CODEX_CLI_PROVIDER) return this.runFallback(request);

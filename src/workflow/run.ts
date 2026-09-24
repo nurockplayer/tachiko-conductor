@@ -1,8 +1,12 @@
 import {
+  GOVERNED_PUBLICATION_REENTRY_ACTION,
+  hasGovernedPublicationConfinement,
   humanTakeoverReason,
   isWorkspaceGuardFailure,
+  type GovernedInvocationPreparation,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
+  type ImplementationRequest,
   type WorkspaceGuard,
 } from '../adapters/agent.js';
 import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
@@ -621,6 +625,54 @@ export async function runWorkflow(
           : run.agentResult === undefined && run.executor === undefined
             ? 'initial'
             : 'resume';
+        const governedPublication = options.admissionFence === undefined
+          ? undefined
+          : Object.freeze({ required: true as const, continuation: workerAttemptKind !== 'initial' });
+        let preparedGovernedInvocation: GovernedInvocationPreparation | undefined;
+        if (governedPublication !== undefined) {
+          const preflightRequest = {
+            target,
+            baseSha,
+            ...(isIsolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(isIsolatedLuna || run.executor === undefined ? {} : { executor: run.executor }),
+            runtimeOwnership: {
+              runId: run.id,
+              generation: run.executor?.generation ?? run.id,
+              ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+            },
+            governedPublication,
+            ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
+          };
+          if (implementation.prepareGovernedInvocation === undefined) {
+            return park(
+              run,
+              `Governed implementation is on hold because no source-qualified publication preflight is available. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+              store,
+              now,
+              [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
+            );
+          }
+          preparedGovernedInvocation = implementation.prepareGovernedInvocation(preflightRequest);
+          if (preparedGovernedInvocation.status === 'held') {
+            return park(
+              run,
+              `Governed implementation is on hold: ${preparedGovernedInvocation.reason} No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+              store,
+              now,
+              [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
+            );
+          }
+          if (!preparedGovernedInvocation.agent || typeof preparedGovernedInvocation.agent !== 'object' ||
+              !hasGovernedPublicationConfinement(preparedGovernedInvocation.agent)) {
+            return park(
+              run,
+              `Governed implementation is on hold because the prepared runtime did not present a source-qualified publication boundary. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+              store,
+              now,
+              [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
+            );
+          }
+        }
         const workerSpawn = recordSpawnTelemetry(run, {
           role: 'worker',
           attemptKind: workerAttemptKind,
@@ -659,11 +711,12 @@ export async function runWorkflow(
           if (!updateIfCurrent(store, workerHandoff, workerHandoff)) {
             return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while implementation capabilities were resolving; preserving the newer Run.');
           }
-          result = await implementation.run({
+          const implementationRequest: ImplementationRequest = {
             target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target', instructions: boundedInstructions,
             ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
             ...(capabilities === undefined ? {} : { capabilities }),
+            ...(governedPublication === undefined ? {} : { governedPublication }),
             beforePublish: () => {
               if (!updateIfCurrent(store, workerHandoff, workerHandoff)) {
                 throw new Error('Run changed before worker-router implementation publication.');
@@ -683,7 +736,10 @@ export async function runWorkflow(
               ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
             },
             ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
-          });
+          };
+          result = await (preparedGovernedInvocation?.status === 'qualified'
+            ? preparedGovernedInvocation.agent.run(implementationRequest)
+            : implementation.run(implementationRequest));
         } catch (error) {
           if (isWorkspaceGuardFailure(error)) return bootstrapFailureAfterWorker(run, workerHandoff, error, store, now);
           const detail = error instanceof Error ? error.message : String(error);

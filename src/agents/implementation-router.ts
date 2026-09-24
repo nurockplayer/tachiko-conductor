@@ -1,4 +1,11 @@
-import type { ImplementationAgent, ImplementationRequest } from '../adapters/agent.js';
+import {
+  GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED,
+  GOVERNED_PUBLICATION_REENTRY_ACTION,
+  hasGovernedPublicationConfinement,
+  type GovernedInvocationPreparation,
+  type ImplementationAgent,
+  type ImplementationRequest,
+} from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { assertExecutionSupportedByProvider, type ResolvedExecutionConfiguration } from '../execution-profiles.js';
 
@@ -29,37 +36,71 @@ export class ImplementationAgentRegistry implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    if (request.governedPublication !== undefined && request.execution === undefined &&
+        request.executor === undefined && request.sessionId === undefined) {
+      return governedPublicationFailure(request, 'Governed invocation has no exact execution or session identity; a fresh default provider cannot be assumed.');
+    }
+    const selected = this.resolveAgent(request);
+    if ('failure' in selected) return selected.failure;
+    if (request.governedPublication !== undefined && !hasGovernedPublicationConfinement(selected.agent)) {
+      return governedPublicationFailure(request, 'The selected adapter has no source-qualified host publication boundary.');
+    }
+    return await selected.agent.run(request);
+  }
+
+  prepareGovernedInvocation(request: ImplementationRequest): GovernedInvocationPreparation {
+    if (request.governedPublication !== undefined && request.execution === undefined &&
+        request.executor === undefined && request.sessionId === undefined) {
+      return {
+        status: 'held',
+        reason: 'Governed invocation has no exact execution or session identity; a fresh default provider cannot be assumed.',
+      };
+    }
+    const selected = this.resolveAgent(request);
+    if ('failure' in selected) {
+      return { status: 'held', reason: selected.failure.summary };
+    }
+    if (!hasGovernedPublicationConfinement(selected.agent)) {
+      return { status: 'held', reason: 'The selected adapter has no source-qualified host publication boundary.' };
+    }
+    return {
+      status: 'qualified',
+      agent: selected.agent,
+    };
+  }
+
+  private resolveAgent(request: ImplementationRequest): { readonly agent: ImplementationAgent } | { readonly failure: AgentResult } {
     const selectedProvider = request.execution?.executor;
     if (request.executor !== undefined && selectedProvider !== undefined && !isCompatibleExecutorProvider(request.executor.provider, selectedProvider)) {
-      return routingFailure(
-        EXECUTOR_ROUTING_ERROR_CODE.RECONSTRUCTION_FAILED,
-        `Persisted executor provider "${request.executor.provider}" does not match selected execution executor "${selectedProvider}".`,
-        request,
-      );
+      return { failure: routingFailure(
+          EXECUTOR_ROUTING_ERROR_CODE.RECONSTRUCTION_FAILED,
+          `Persisted executor provider "${request.executor.provider}" does not match selected execution executor "${selectedProvider}".`,
+          request,
+        ) };
     }
     const provider = request.executor?.provider ?? selectedProvider ?? (
       request.sessionId === undefined ? this.defaultProvider : this.legacySessionProvider
     );
     if (provider === undefined || provider.trim() === '' || this.providers[provider] === undefined) {
       const requested = provider ?? '(legacy session provider not configured)';
-      return routingFailure(
-        EXECUTOR_ROUTING_ERROR_CODE.PROVIDER_UNAVAILABLE,
-        `Implementation executor provider "${requested}" is unavailable; continuity cannot be reconstructed.`,
-        request,
-      );
+      return { failure: routingFailure(
+          EXECUTOR_ROUTING_ERROR_CODE.PROVIDER_UNAVAILABLE,
+          `Implementation executor provider "${requested}" is unavailable; continuity cannot be reconstructed.`,
+          request,
+        ) };
     }
     let agent: ImplementationAgent;
     try {
       if (request.execution !== undefined) assertExecutionSupportedByProvider(request.execution);
       agent = this.providers[provider](request.execution);
     } catch (error) {
-      return routingFailure(
-        EXECUTOR_ROUTING_ERROR_CODE.RECONSTRUCTION_FAILED,
-        `Implementation executor provider "${provider}" could not be reconstructed: ${errorMessage(error)}`,
-        request,
-      );
+      return { failure: routingFailure(
+          EXECUTOR_ROUTING_ERROR_CODE.RECONSTRUCTION_FAILED,
+          `Implementation executor provider "${provider}" could not be reconstructed: ${errorMessage(error)}`,
+          request,
+        ) };
     }
-    return await agent.run(request);
+    return { agent };
   }
 }
 
@@ -79,6 +120,18 @@ function routingFailure(
     diagnostics: [`${code}: ${detail}`],
     ...(request.executor === undefined ? {} : { executor: request.executor }),
     ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+  };
+}
+
+function governedPublicationFailure(request: ImplementationRequest, detail: string): AgentResult {
+  const summary = `Governed mutation is held because ${detail} No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`;
+  return {
+    exitStatus: 'failure',
+    summary,
+    diagnostics: [`${GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED}: ${summary}`],
+    ...(request.executor === undefined ? {} : { executor: request.executor }),
+    ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+    durationMs: 0,
   };
 }
 

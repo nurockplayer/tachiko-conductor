@@ -1,6 +1,7 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
   assertWorkspaceGuard,
+  governedPublicationRefusal,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -102,6 +103,8 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) return publicationRefusal;
     if (
       request.executor !== undefined &&
       (request.executor.provider !== CLAUDE_CODE_PROVIDER || request.executor.sessionId.trim() === '')

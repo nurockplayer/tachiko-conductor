@@ -2,6 +2,20 @@ import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 
 export const HUMAN_TAKEOVER_DIAGNOSTIC = 'TACHIKO_NEEDS_HUMAN:';
+export const GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED = 'GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED' as const;
+export const GOVERNED_PUBLICATION_REENTRY_ACTION = 'Preserve this Run’s executor/session and retry only after its exact runtime has a source-qualified host publication boundary.';
+
+const confinedAgents = new WeakSet<object>();
+
+/** Mark a source-owned adapter whose runtime confines worker writes and host-owned publication. */
+export function qualifyGovernedPublicationAdapter<T extends object>(adapter: T): T {
+  confinedAgents.add(adapter);
+  return adapter;
+}
+
+export function hasGovernedPublicationConfinement(adapter: object): boolean {
+  return confinedAgents.has(adapter);
+}
 
 export function humanTakeoverReason(result: AgentResult): string | undefined {
   const diagnostic = result.diagnostics?.find((value) => value.startsWith(HUMAN_TAKEOVER_DIAGNOSTIC));
@@ -112,6 +126,8 @@ export interface ImplementationRequest {
     readonly generation: string;
     readonly dispatchClaimId?: string;
   };
+  /** Host-only governor requirement; never persisted or serialized into worker instructions. */
+  readonly governedPublication?: { readonly required: true; readonly continuation: boolean };
   /** Immutable Steward-selected execution snapshot; adapters never select it. */
   readonly execution?: ResolvedExecutionConfiguration;
   /** Cancels the active implementation process. */
@@ -126,4 +142,24 @@ export interface ImplementationRequest {
 export interface ImplementationAgent {
   readonly kind: 'implementation-agent';
   run(request: ImplementationRequest): Promise<AgentResult>;
+  /** Resolves and pins the exact source-owned adapter before a governed invocation is counted or started. */
+  prepareGovernedInvocation?(request: ImplementationRequest): GovernedInvocationPreparation;
+}
+
+export type GovernedInvocationPreparation =
+  | { readonly status: 'qualified'; readonly agent: ImplementationAgent }
+  | { readonly status: 'held'; readonly reason: string };
+
+/** Defense in depth for adapters called directly, outside the implementation registry. */
+export function governedPublicationRefusal(adapter: object, request: ImplementationRequest): AgentResult | undefined {
+  if (request.governedPublication === undefined || hasGovernedPublicationConfinement(adapter)) return undefined;
+  const detail = 'Governed mutation is held because this runtime has no source-qualified publication confinement; no model turn or worker process was started. ' + GOVERNED_PUBLICATION_REENTRY_ACTION;
+  return {
+    exitStatus: 'failure',
+    summary: detail,
+    diagnostics: [`${GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED}: ${detail}`],
+    ...(request.executor === undefined ? {} : { executor: request.executor }),
+    ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+    durationMs: 0,
+  };
 }

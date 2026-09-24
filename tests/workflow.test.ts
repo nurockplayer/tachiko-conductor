@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -19,6 +19,9 @@ import { EXECUTION_CONFIGURATION_ERROR_CODE, type ResolvedExecutionConfiguration
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
+import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
+import { AppServerUnavailableError, CodexAppServerAdapter } from '../src/agents/codex-app-server.js';
+import { qualifyGovernedPublicationAdapter } from '../src/adapters/agent.js';
 import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 import { createBootstrapGitFixture } from './bootstrap-fixture.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
@@ -124,7 +127,13 @@ class FakeImplementation implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
   readonly requests: ImplementationRequest[] = [];
 
-  constructor(private readonly outcomes: AgentResult[]) {}
+  constructor(private readonly outcomes: AgentResult[]) {
+    qualifyGovernedPublicationAdapter(this);
+  }
+
+  prepareGovernedInvocation(_request: ImplementationRequest) {
+    return { status: 'qualified' as const, agent: this };
+  }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
     this.requests.push(request);
@@ -200,6 +209,118 @@ function reviewingRun(store: RunStore, id = 'run-1', headSha = HEAD): Run {
 }
 
 describe('runWorkflow', () => {
+  it('durably holds unsupported governed fresh and continuation runs before spawn telemetry or provider fallback', async (t) => {
+    for (const mode of ['fresh', 'continuation', 'unknown-crash', 'forged-preparation'] as const) {
+      await t.test(mode, async () => {
+        const id = `publication-confinement-${mode}`;
+        const store = new MemoryStore();
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-publication-confinement-'));
+        const registry = new MissionAdmissionRegistry({
+          filePath: path.join(directory, 'registry.json'),
+          config: { schemaVersion: 1, revision: 'publication-confinement-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+        });
+        const admitted = registry.admit({
+          laneId: `run:${id}`, role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42, run: id },
+        });
+        assert.equal(admitted.outcome, 'admitted');
+        if (admitted.outcome !== 'admitted') return;
+        let run = createRun(TARGET, T0, id);
+        const codexExecution: ResolvedExecutionConfiguration = { profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 10_000 };
+        if (mode === 'unknown-crash') {
+          run = { ...run, state: 'IMPLEMENTING' };
+        } else if (mode !== 'continuation') {
+          run = { ...run, execution: codexExecution };
+        } else {
+          run = {
+            ...run,
+            state: 'IMPLEMENTING',
+            headSha: HEAD,
+            pullRequest: { number: 7, headSha: HEAD },
+            executor: { provider: 'codex-app-server', sessionId: 'durable-thread-7', generation: 'exact-run-generation' },
+            agentResult: { ...successResult(HEAD), sessionId: 'durable-thread-7' },
+          };
+        }
+        store.create(run);
+        let clientOpens = 0;
+        let fallbackCalls = 0;
+        let forgedInvocations = 0;
+        let pullRequestCreates = 0;
+        const fallback: ImplementationAgent = {
+          kind: 'implementation-agent',
+          async run() { fallbackCalls += 1; return successResult(HEAD); },
+        };
+        const implementation: ImplementationAgent = mode === 'forged-preparation'
+          ? {
+            kind: 'implementation-agent',
+            prepareGovernedInvocation() {
+              return {
+                status: 'qualified',
+                invoke: async () => { forgedInvocations += 1; return successResult(HEAD); },
+              } as never;
+            },
+            async run() { fallbackCalls += 1; return successResult(HEAD); },
+          }
+          : new ImplementationAgentRegistry({
+          defaultProvider: 'codex-cli', legacySessionProvider: 'claude-code',
+          providers: {
+            'codex-cli': () => new CodexAppServerAdapter({
+              clientFactory: { async open() { clientOpens += 1; throw new AppServerUnavailableError('unused'); } },
+              fallback,
+            }),
+            'codex-app-server': () => new CodexAppServerAdapter({
+              clientFactory: { async open() { clientOpens += 1; throw new AppServerUnavailableError('unused'); } },
+              fallback,
+            }),
+            'claude-code': () => fallback,
+          },
+          });
+        const github: GitHubAdapter = {
+          ...githubAdapter(mode === 'continuation' ? [HEAD] : [null]),
+          async createImplementationPullRequest() { pullRequestCreates += 1; return { number: 8 }; },
+        };
+        const beforeEvents = run.telemetry?.events.length ?? 0;
+        try {
+          const outcome = await runWorkflow({
+            store, github, implementation, reviewer: new FakeReviewer([]), bootstrap: new FakeBootstrap(),
+          }, id, {
+            maxReviewAttempts: 1, now: () => T0,
+            admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: '/tmp/confinement-workspace' },
+          });
+
+          assert.equal(outcome.outcome, 'needs_human');
+          assert.match(outcome.reason, /source-qualified host publication boundary|source-qualified publication preflight|prepared runtime did not present/i);
+          assert.equal(clientOpens, 0, 'unsupported App Server execution never opens a child or starts a turn');
+          assert.equal(fallbackCalls, 0, 'unsupported App Server does not fall back to a local CLI');
+          assert.equal(forgedInvocations, 0, 'workflow never executes a callback supplied by a forged preparation');
+          assert.equal(pullRequestCreates, 0, 'the model-free hold performs no host PR write');
+          const persisted = store.read(id)!;
+          assert.equal(persisted.state, 'NEEDS_HUMAN');
+          assert.equal(persisted.telemetry?.events.length ?? 0, beforeEvents, 'hold occurs before implementation spawn telemetry');
+          assert.match(persisted.interrupt?.reason ?? '', /No model turn or worker process was started/);
+          if (mode === 'continuation') {
+            assert.deepEqual(persisted.executor, run.executor, 'the exact persisted executor identity is retained');
+            assert.equal(persisted.agentResult?.sessionId, 'durable-thread-7', 'the exact persisted session identity is retained');
+          }
+          if (mode === 'unknown-crash') {
+            assert.equal(persisted.state, 'NEEDS_HUMAN', 'unknown pre-spawn crash becomes a durable Run hold');
+            assert.equal(persisted.execution, undefined, 'the hold does not invent an execution profile');
+            assert.equal(persisted.executor, undefined, 'the hold does not invent an executor');
+            assert.equal(persisted.agentResult, undefined, 'the hold does not invent worker result or session evidence');
+            const lane = registry.readLane(admitted.token.laneId);
+            assert.equal(lane?.missionId, admitted.missionId);
+            assert.equal(lane?.status, 'active');
+            assert.deepEqual(lane?.evidence, {
+              repository: 'acme/widgets', issue: 42, run: id,
+              workspace: path.join(realpathSync('/tmp'), 'tachiko-workspace'),
+            }, 'the durable admission identity remains exact while the Run is held');
+          }
+        } finally {
+          rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  });
+
   it('adopts an existing Luna PR from its authoritative base and head when default-branch fields are unavailable', async () => {
     const store = new MemoryStore();
     const execution: ResolvedExecutionConfiguration = {
@@ -1262,6 +1383,10 @@ describe('runWorkflow', () => {
           let escapedFailure: Error | undefined;
           const implementation: ImplementationAgent = {
             kind: 'implementation-agent',
+            prepareGovernedInvocation(request) {
+              qualifyGovernedPublicationAdapter(this);
+              return { status: 'qualified', agent: this };
+            },
             async run(request) {
               implementationCalls += 1;
               assert.equal(typeof request.beforePublish, 'function', 'runWorkflow passes a host-only synchronous publication fence');

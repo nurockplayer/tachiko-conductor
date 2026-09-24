@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
-import type { ImplementationAgent, ImplementationRequest } from '../adapters/agent.js';
+import { qualifyGovernedPublicationAdapter, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { CodexCliAdapter } from './codex-cli.js';
 
@@ -44,6 +44,7 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     this.runtimeConfig = parseTrustedLunaConfig(readFileSync(configPath, 'utf8'));
     this.timeoutMs = options.timeoutMs;
     this.executablePath = options.path;
+    qualifyGovernedPublicationAdapter(this);
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -57,11 +58,12 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     if (request.executor !== undefined || request.sessionId !== undefined) return failure(LUNA_ISOLATED_ERROR_CODE.CONTINUATION_FORBIDDEN, 'Isolated Luna repair/restart uses a fresh bounded worker; session continuation is forbidden.');
     if (request.workspacePath === undefined || request.branch === undefined) return failure(LUNA_ISOLATED_ERROR_CODE.RUNTIME_UNQUALIFIED, 'Isolated Luna requires a host-prepared standalone workspace and branch.');
     const env = isolatedLunaEnvironment(this.home, this.executablePath);
-    return await new CodexCliAdapter({
+    const isolatedCli = qualifyGovernedPublicationAdapter(new CodexCliAdapter({
       cwd: request.workspacePath, model: LUNA_ISOLATED_MODEL,
       reasoningEffort: request.execution.reasoningEffort, sandboxMode: 'workspace-write', approvalPolicy: 'never',
       timeoutMs: this.timeoutMs, env, requiredConfig: this.runtimeConfig,
-    }).run(request);
+    }));
+    return await isolatedCli.run(request);
   }
 }
 

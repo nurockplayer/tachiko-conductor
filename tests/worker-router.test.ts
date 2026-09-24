@@ -5,6 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import {
   WORKER_ROUTER_ERROR_CODE,
   WORKER_ROUTER_EXECUTABLE_ENV,
@@ -100,6 +101,29 @@ function requestFor(workspacePath: string): {
 }
 
 describe('WorkerRouterAdapter container boundary', () => {
+  it('preflights only the source-owned production container boundary as governed-capable', () => {
+    const request = {
+      target: TARGET,
+      baseSha: BASE,
+      execution: { profile: 'standard' as const, revision: 'profiles-v1', executor: 'worker-router', timeoutMs: 9_000 },
+      runtimeOwnership: { runId: 'run-qualified-router', generation: 'router-generation' },
+      governedPublication: { required: true as const, continuation: false },
+    };
+    const realBoundaryRegistry = new ImplementationAgentRegistry({
+      defaultProvider: 'worker-router',
+      providers: { 'worker-router': () => new WorkerRouterAdapter({ runner: new FakeRunner([]), image: IMAGE, executable: '/router', env: {} }) },
+    });
+    const productionBoundary = realBoundaryRegistry.prepareGovernedInvocation(request);
+    assert.equal(productionBoundary.status, 'qualified');
+
+    const injectedBoundaryRegistry = new ImplementationAgentRegistry({
+      defaultProvider: 'worker-router',
+      providers: { 'worker-router': () => new WorkerRouterAdapter({ runner: new FakeRunner([]), container: new FakeContainer([]), image: IMAGE, executable: '/router', env: {} }) },
+    });
+    const injectedBoundary = injectedBoundaryRegistry.prepareGovernedInvocation(request);
+    assert.equal(injectedBoundary.status, 'held', 'a mutable injected execution boundary is not assumed qualified');
+  });
+
   it('runs the containerized worker, then proves HEAD and publishes it only after container terminal', async () => {
     const events: string[] = [];
     const ws = workspace();
