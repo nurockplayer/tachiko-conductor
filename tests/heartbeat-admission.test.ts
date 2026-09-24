@@ -386,9 +386,13 @@ describe('model-free heartbeat mission admission helper', () => {
       assert.equal(f.registry.readLane(exact.laneId), null);
       const discarded = handleHeartbeatAdmission(f.discard('acme/widgets', exact.generation, exact.receiptId), restartedOptions);
       assert.equal(discarded.outcome, 'discarded_uncommitted');
-      assert.equal(existsSync(f.receiptPath), false);
+      assert.equal(existsSync(f.receiptPath), true, 'discard leaves a durable private marker in place of the orphan');
+      const marker = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as Record<string, unknown>;
+      assert.equal(marker.kind, 'discarded_uncommitted');
+      assert.equal('token' in marker, false, 'discard markers never retain a capability token');
       assert.equal(f.registry.readLane(exact.laneId), null, 'discard does not publish or release a lane');
-      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), restartedOptions).outcome, 'absent', 'crash after unlink is an idempotent retry state');
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), restartedOptions).outcome, 'discarded_predecessor', 'crash after marker publication is read-only recoverable');
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', exact.generation, exact.receiptId), restartedOptions).outcome, 'discarded_uncommitted', 'discard retry is idempotent for the exact marker');
       failCommit = false;
       const retried = handleHeartbeatAdmission(f.request('reserve'), f.options);
       assert.equal(retried.outcome, 'reserved');
@@ -444,7 +448,114 @@ describe('model-free heartbeat mission admission helper', () => {
       if (capacityRecovery.outcome !== 'uncommitted_receipt') throw new Error('expected candidate after capacity lane');
       assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', capacityRecovery.generation, capacityRecovery.receiptId), f.options).outcome, 'discarded_uncommitted');
       assert.equal(f.registry.readLane(lane.laneId)?.status, 'parked', 'discard preserves capacity predecessor');
-      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'capacity_wait');
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'discarded_predecessor');
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('recovers tokenless discard markers across later capacity denial for absent and released predecessors', () => {
+    let failFirstCommit = true;
+    const first = setup({ beforePublish: () => { if (failFirstCommit) throw new Error('injected registry publication failure'); } });
+    try {
+      assert.throws(() => handleHeartbeatAdmission(first.request('reserve'), first.options), /injected registry publication failure/);
+      failFirstCommit = false;
+      const orphan = JSON.parse(readFileSync(first.receiptPath, 'utf8')) as { receiptId: string; token: { generation: number } };
+      assert.equal(handleHeartbeatAdmission(first.discard('acme/widgets', orphan.token.generation, orphan.receiptId), first.options).outcome, 'discarded_uncommitted');
+      const holder = first.registry.admit({ laneId: 'capacity-holder', role: 'production_captain', highAutonomy: true,
+        evidence: { repository: 'acme/holder', issue: 7 } });
+      assert.equal(holder.outcome, 'admitted');
+      const denied = handleHeartbeatAdmission({ ...first.request('reserve'), supervisorId: 'later-supervisor' }, first.options);
+      assert.equal(denied.outcome, 'waiting');
+      if (denied.outcome !== 'waiting') throw new Error('expected exact capacity denial');
+      const revision = first.registry.snapshot().revision;
+      const recovered = handleHeartbeatAdmission(first.recover('acme/widgets', null, { supervisor: 'later-supervisor' }), first.options);
+      assert.equal(recovered.outcome, 'discarded_predecessor', 'absent marker baseline survives the first capacity-parked generation');
+      assert.equal(first.registry.snapshot().revision, revision, 'marker recovery is read-only');
+      const foreign = JSON.parse(readFileSync(first.receiptPath, 'utf8')) as Record<string, unknown>;
+      foreign.missionId = 'foreign-mission';
+      writeFileSync(first.receiptPath, JSON.stringify(foreign), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(first.recover('acme/widgets', null), first.options).outcome, 'not_owned', 'foreign markers cannot fall through to generic capacity recovery');
+      foreign.missionId = 'mission-restored';
+      foreign.kind = 'ambiguous_marker';
+      writeFileSync(first.receiptPath, JSON.stringify(foreign), { mode: 0o600 });
+      assert.throws(() => handleHeartbeatAdmission(first.recover('acme/widgets', null), first.options), /unsupported or ambiguous schema/);
+    } finally { rmSync(first.directory, { recursive: true, force: true }); }
+
+    let failCommit = false;
+    const later = setup({ beforePublish: () => { if (failCommit) throw new Error('injected registry publication failure'); } });
+    try {
+      const initial = handleHeartbeatAdmission(later.request('reserve'), later.options);
+      assert.equal(initial.outcome, 'reserved');
+      if (initial.outcome !== 'reserved') throw new Error('expected initial reservation');
+      handleHeartbeatAdmission(later.settle('acme/widgets', initial.generation, initial.receiptId), later.options);
+      const released = later.registry.readLane(initial.laneId)!;
+      failCommit = true;
+      assert.throws(() => handleHeartbeatAdmission(later.request('reserve'), later.options), /injected registry publication failure/);
+      failCommit = false;
+      const candidate = JSON.parse(readFileSync(later.receiptPath, 'utf8')) as { receiptId: string; token: { generation: number } };
+      assert.equal(candidate.token.generation, released.generation + 1);
+      assert.equal(handleHeartbeatAdmission(later.discard('acme/widgets', candidate.token.generation, candidate.receiptId), later.options).outcome, 'discarded_uncommitted');
+      const holder = later.registry.admit({ laneId: 'capacity-holder', role: 'production_captain', highAutonomy: true,
+        evidence: { repository: 'acme/holder', issue: 8 } });
+      assert.equal(holder.outcome, 'admitted');
+      const denied = handleHeartbeatAdmission({ ...later.request('reserve'), supervisorId: 'later-supervisor' }, later.options);
+      assert.equal(denied.outcome, 'waiting');
+      if (denied.outcome !== 'waiting') throw new Error('expected later capacity denial');
+      const recovered = handleHeartbeatAdmission(later.recover('acme/widgets', null, { supervisor: 'later-supervisor' }), later.options);
+      assert.equal(recovered.outcome, 'discarded_predecessor', 'released marker baseline survives its exact later capacity lane');
+      if (recovered.outcome !== 'discarded_predecessor') throw new Error('expected discarded predecessor');
+      assert.equal(recovered.supervisorId, supervisorId, 'the marker may belong to an earlier supervisor');
+      const nextReceipt = JSON.parse(readFileSync(later.receiptPath, 'utf8')) as Record<string, unknown>;
+      nextReceipt.predecessor = { kind: 'released', generation: 999 };
+      writeFileSync(later.receiptPath, JSON.stringify(nextReceipt), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(later.recover('acme/widgets', null), later.options).outcome, 'not_owned', 'incorrect predecessor generation is fenced');
+    } finally { rmSync(later.directory, { recursive: true, force: true }); }
+  });
+
+  it('keeps a reused unpublished generation fenced after a tokenless marker is replaced by a successor', () => {
+    let failCommit = true;
+    const f = setup({ beforePublish: () => { if (failCommit) throw new Error('injected registry publication failure'); } });
+    try {
+      assert.throws(() => handleHeartbeatAdmission(f.request('reserve'), f.options), /injected registry publication failure/);
+      failCommit = false;
+      const orphan = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { receiptId: string; token: { generation: number } };
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', orphan.token.generation, orphan.receiptId), f.options).outcome, 'discarded_uncommitted');
+      const successor = handleHeartbeatAdmission({ ...f.request('reserve'), supervisorId: 'new-supervisor' }, f.options);
+      assert.equal(successor.outcome, 'reserved');
+      if (successor.outcome !== 'reserved') throw new Error('expected successor reservation');
+      assert.equal(successor.generation, orphan.token.generation, 'discard leaves the unpublished registry generation reusable');
+      assert.notEqual(successor.receiptId, orphan.receiptId);
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'not_owned', 'the successor receipt is never reinterpreted as the stale marker');
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', orphan.token.generation, orphan.receiptId), f.options).outcome, 'not_owned');
+      assert.equal(f.registry.readLane(successor.laneId)?.status, 'active');
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('preserves legacy active and settled receipt ID acceptance while requiring canonical marker UUIDs', () => {
+    const f = setup();
+    try {
+      const reserved = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(reserved.outcome, 'reserved');
+      if (reserved.outcome !== 'reserved') throw new Error('expected reservation');
+      const legacyReceiptId = '-'.repeat(36);
+      const legacyReceipt = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as Record<string, unknown>;
+      legacyReceipt.receiptId = legacyReceiptId;
+      writeFileSync(f.receiptPath, JSON.stringify(legacyReceipt), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', reserved.generation), f.options).outcome, 'recoverable');
+
+      const settled = handleHeartbeatAdmission(f.settle('acme/widgets', reserved.generation, legacyReceiptId), f.options);
+      assert.equal(settled.outcome, 'settled', 'the legacy active receipt remains settleable');
+      const released = handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options);
+      assert.equal(released.outcome, 'released_predecessor', 'legacy settled receipts retain their previous schema acceptance');
+
+      const marker = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as Record<string, unknown>;
+      marker.kind = 'discarded_uncommitted';
+      marker.generation = reserved.generation + 2;
+      marker.predecessor = { kind: 'released', generation: reserved.generation + 1 };
+      delete marker.status;
+      delete marker.token;
+      writeFileSync(f.receiptPath, JSON.stringify(marker), { mode: 0o600 });
+      assert.throws(() => handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options), /unsupported or ambiguous schema/,
+        'new discarded markers require canonical UUIDs even though legacy receipt IDs retain their prior rule');
     } finally { rmSync(f.directory, { recursive: true, force: true }); }
   });
 

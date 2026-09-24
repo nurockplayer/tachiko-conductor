@@ -407,6 +407,7 @@ class HeartbeatTest(unittest.TestCase):
             "if (q.action === 'inspect') { console.log(JSON.stringify({schemaVersion:1,outcome:'inspected',lane:s.active?{status:'active',generation:s.generation}:{status:'released',generation:s.releasedGeneration||((s.generation||0)+1)}}));\n"
             "} else if (q.action === 'recover') {\n"
             " if (s.uncommittedReceipt && q.expectedGeneration === null && q.supervisorId === s.supervisorId) { console.log(JSON.stringify({schemaVersion:1,outcome:'uncommitted_receipt',generation:s.generation,receiptId:s.receiptId,supervisorId:s.supervisorId})); process.exit(0); }\n"
+            " if (s.discardedPredecessor && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'discarded_predecessor',laneId:s.laneId,generation:s.generation,receiptId:s.receiptId,supervisorId:s.markerSupervisorId})); process.exit(0); }\n"
             " if ((s.capacityWait || s.capacityWaitHistoricalReceipt) && !s.active && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'capacity_wait'})); process.exit(0); }\n"
             " if (s.releasedPredecessor && !s.active && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'released_predecessor',laneId:s.laneId,generation:s.generation,releasedGeneration:s.releasedGeneration,receiptId:s.receiptId,supervisorId:s.supervisorId})); process.exit(0); }\n"
             " if (s.active && s.settlementPending && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'settlement_pending',generation:s.generation,receiptId:s.receiptId}));\n"
@@ -415,7 +416,7 @@ class HeartbeatTest(unittest.TestCase):
             " else if (!s.active && q.expectedGeneration === null && (!s.generation || s.discardedUncommitted)) console.log(JSON.stringify({schemaVersion:1,outcome:'absent'}));\n"
             " else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
             "} else if (q.action === 'discard_uncommitted') {\n"
-            " if (s.uncommittedReceipt && q.supervisorId === s.supervisorId && q.expectedGeneration === s.generation && q.receiptId === s.receiptId) { s.uncommittedReceipt = false; s.discardedUncommitted = true; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'discarded_uncommitted',generation:q.expectedGeneration,receiptId:q.receiptId,supervisorId:q.supervisorId})); } else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
+            " if (s.uncommittedReceipt && q.supervisorId === s.supervisorId && q.expectedGeneration === s.generation && q.receiptId === s.receiptId) { s.uncommittedReceipt = false; s.discardedUncommitted = true; s.discardedPredecessor = true; s.markerSupervisorId = q.supervisorId; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'discarded_uncommitted',generation:q.expectedGeneration,receiptId:q.receiptId,supervisorId:q.supervisorId})); } else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
             "} else if (q.action === 'reserve') {\n"
             " if (s.mode === 'waiting') { console.log(JSON.stringify({schemaVersion:1,outcome:'waiting'})); process.exit(0); }\n"
             " if (s.mode === 'owned_elsewhere') { console.log(JSON.stringify({schemaVersion:1,outcome:'owned_elsewhere'})); process.exit(0); }\n"
@@ -694,9 +695,14 @@ class HeartbeatTest(unittest.TestCase):
             "generation": None, "receipt_id": None, "started_at": 1000,
         }
         (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        workspace = str(Path.cwd().resolve())
+        lane_id = "heartbeat:" + hashlib.sha256(
+            ("nurockplayer/tachiko-conductor" + "\0" + workspace).encode()
+        ).hexdigest()[:32]
         self.admission_state.write_text(json.dumps({
             "uncommittedReceipt": True, "generation": 7,
             "receiptId": "00000000-0000-4000-8000-000000000007", "supervisorId": receipt_owner or owner,
+            "laneId": lane_id,
         }), encoding="utf-8")
 
     def _set_released_predecessor_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host", boot_id: str = "test-boot") -> None:
@@ -715,6 +721,27 @@ class HeartbeatTest(unittest.TestCase):
             "generation": 6, "releasedGeneration": 7,
             "receiptId": "00000000-0000-4000-8000-000000000006", "supervisorId": "previous-supervisor",
             "status": "settled", "laneId": lane_id,
+        }), encoding="utf-8")
+
+    def _set_discarded_predecessor_pending(self, *, owner: str = "new-supervisor", marker_owner: str = "old-supervisor",
+                                           receipt_id: str = "00000000-0000-4000-8000-000000000006",
+                                           phase: str = "reserved_pre_execution", host_id: str = "test-host",
+                                           lane_id: str | None = None) -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": owner, "host_id": host_id, "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        workspace = str(Path.cwd().resolve())
+        exact_lane_id = "heartbeat:" + hashlib.sha256(
+            ("nurockplayer/tachiko-conductor" + "\0" + workspace).encode()
+        ).hexdigest()[:32]
+        self.admission_state.write_text(json.dumps({
+            "mode": "waiting", "discardedPredecessor": True, "generation": 6,
+            "receiptId": receipt_id, "markerSupervisorId": marker_owner,
+            "laneId": lane_id or exact_lane_id,
         }), encoding="utf-8")
 
     def test_capacity_wait_crash_clears_only_dead_generation_free_preexecution_intent(self) -> None:
@@ -794,6 +821,214 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(retried.returncode, 0, retried.stderr)
         self.assertIsNone(self.state()["pending_admission"])
         self.assertEqual(self.records(), [], "absent retry after discard cannot reuse stale execution intent")
+
+    def test_crash_after_marker_publication_reconciles_later_supervisor_without_spawning(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_discarded_predecessor_pending()
+        failed_save = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_CLEAR_PENDING="1",
+        ), check=False)
+        self.assertEqual(failed_save.returncode, 1)
+        self.assertIsNotNone(self.state()["pending_admission"], "the failed save retains the null-generation intent")
+        marker = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(marker["discardedPredecessor"], "the durable tokenless marker survives the failed state save")
+
+        retry = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "a later supervisor may clear only after dead-owner proof and marker recovery")
+
+    def test_discarded_marker_rejects_bad_owner_phase_host_and_uuid_without_traceback(self) -> None:
+        cases = (
+            {"phase": "spawn_uncertain"},
+            {"host_id": "other-host"},
+            {"receipt_id": "not-a-uuid"},
+            {"lane_id": "heartbeat:foreign"},
+        )
+        for overrides in cases:
+            with self.subTest(overrides=overrides):
+                self.invoke("run", "--prime")
+                self._set_discarded_predecessor_pending(**overrides)
+                before = json.loads(self.admission_state.read_text(encoding="utf-8"))
+                result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertNotIn("Traceback", result.stderr, "malformed marker UUID is handled as a fenced recovery result")
+                self.assertIsNotNone(self.state()["pending_admission"])
+                self.assertEqual(json.loads(self.admission_state.read_text(encoding="utf-8")), before)
+                self.assertEqual(self.records(), [])
+
+    def test_real_typescript_discard_marker_survives_python_restart(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_marker_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        workspace = self.root / "real-helper-workspace"
+        workspace.mkdir()
+        helper_registry = self.root / "real-helper-host" / "registry.json"
+        helper_receipt = self.root / "real-helper-receipts" / "heartbeat.json"
+        admission_config = {
+            "schemaVersion": 1, "revision": "discard-marker-cross-language-v1",
+            "limits": {"maxCaptains": 1, "maxWriters": 1, "maxHighAutonomy": 1},
+        }
+        registry_module = (Path.cwd() / "src/mission-admission/registry.ts").resolve().as_uri()
+        admission_module = (Path.cwd() / "src/mission-admission/heartbeat-admission.ts").resolve().as_uri()
+        bridge = self.state_root / "real-heartbeat-admission-bridge.mjs"
+        bridge.write_text(
+            "import fs from 'node:fs';\n"
+            "import { MissionAdmissionRegistry } from " + json.dumps(registry_module) + ";\n"
+            "import { handleHeartbeatAdmission } from " + json.dumps(admission_module) + ";\n"
+            "const q = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
+            "const config = JSON.parse(process.env.TEST_ADMISSION_CONFIG);\n"
+            "const options = { filePath: process.env.TEST_ADMISSION_REGISTRY, config, "
+            "...(q.injectPublicationFailure ? { beforePublish: () => { throw new Error('injected publication failure'); } } : {}) };\n"
+            "const registry = new MissionAdmissionRegistry(options);\n"
+            "if (q.bridgeAction === 'occupy') {\n"
+            " const result = registry.admit({laneId:'test-capacity-holder',role:'production_captain',highAutonomy:true,evidence:{repository:'acme/holder',issue:117}});\n"
+            " console.log(JSON.stringify(result));\n"
+            "} else if (q.bridgeAction === 'readLane') {\n"
+            " console.log(JSON.stringify(registry.readLane(q.laneId)));\n"
+            "} else {\n"
+            " delete q.injectPublicationFailure; delete q.bridgeAction; delete q.laneId;\n"
+            " console.log(JSON.stringify(handleHeartbeatAdmission(q,{registry,receiptPath:()=>process.env.TEST_ADMISSION_RECEIPT})));\n"
+            "}\n",
+            encoding="utf-8",
+        )
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        node_env = dict(os.environ, TEST_ADMISSION_REGISTRY=str(helper_registry),
+                        TEST_ADMISSION_RECEIPT=str(helper_receipt),
+                        TEST_ADMISSION_CONFIG=json.dumps(admission_config))
+
+        def real_helper(request: dict[str, object], *, allow_failure: bool = False) -> tuple[subprocess.CompletedProcess[str], dict[str, object] | None]:
+            result = subprocess.run([str(node), "--import", "tsx", str(bridge)], cwd=Path.cwd(), env=node_env,
+                                    input=json.dumps(request), text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, check=False)
+            if result.returncode != 0:
+                if allow_failure:
+                    return result, None
+                self.fail("real TypeScript helper failed: " + result.stderr)
+            if allow_failure:
+                self.fail("real TypeScript helper unexpectedly published the injected candidate")
+            return result, json.loads(result.stdout)
+
+        repository = "nurockplayer/tachiko-conductor"
+        workspace_text = str(workspace.resolve())
+        self.invoke("run", "--prime")
+        prior_supervisor = "prior-supervisor"
+        reserved = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                "workspace": workspace_text, "supervisorId": prior_supervisor})[1]
+        assert reserved is not None
+        self.assertEqual(reserved["outcome"], "reserved")
+        generation = reserved["generation"]
+        receipt_id = reserved["receiptId"]
+        settled = real_helper({
+            "schemaVersion": 1, "action": "settle", "repository": repository, "workspace": workspace_text,
+            "supervisorId": prior_supervisor, "expectedGeneration": generation, "receiptId": receipt_id,
+            "stopProof": {"childrenStopped": True, "supervisorStopped": True, "observedAt": "2026-09-24T00:00:00Z"},
+        })[1]
+        assert settled is not None
+        self.assertEqual(settled["outcome"], "settled")
+        lane_id = reserved["laneId"]
+        released_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
+        assert released_lane is not None
+        self.assertEqual((released_lane["status"], released_lane["generation"]), ("released", generation + 1))
+
+        failed, _ = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                 "workspace": workspace_text, "supervisorId": prior_supervisor,
+                                 "injectPublicationFailure": True}, allow_failure=True)
+        self.assertNotEqual(failed.returncode, 0)
+        orphan = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        self.assertEqual((orphan["status"], orphan["token"]["generation"]), ("active", generation + 2))
+        unchanged_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
+        assert unchanged_lane is not None
+        self.assertEqual((unchanged_lane["status"], unchanged_lane["generation"]), ("released", generation + 1))
+        orphan_recovery = real_helper({"schemaVersion": 1, "action": "recover", "repository": repository,
+                                       "workspace": workspace_text, "supervisorId": prior_supervisor,
+                                       "expectedGeneration": None})[1]
+        assert orphan_recovery is not None
+        self.assertEqual(orphan_recovery["outcome"], "uncommitted_receipt")
+        marker_result = real_helper({"schemaVersion": 1, "action": "discard_uncommitted", "repository": repository,
+                                     "workspace": workspace_text, "supervisorId": prior_supervisor,
+                                     "expectedGeneration": orphan_recovery["generation"],
+                                     "receiptId": orphan_recovery["receiptId"]})[1]
+        assert marker_result is not None
+        self.assertEqual(marker_result["outcome"], "discarded_uncommitted")
+        marker = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        self.assertEqual(marker["kind"], "discarded_uncommitted")
+        self.assertNotIn("token", marker)
+
+        runtime_config = {"admission": {"repository": repository, "workspace": workspace_text}}
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": prior_supervisor, "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        module.STATE.write_text(json.dumps(state), encoding="utf-8")
+
+        def python_recovery(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            outcome = real_helper(request)[1]
+            assert outcome is not None
+            return outcome
+
+        with mock.patch.object(module, "admission_call", side_effect=python_recovery), \
+                mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                mock.patch.object(module, "process_identity", return_value=None):
+            with mock.patch.object(module, "save_state", side_effect=OSError("simulated pending save failure")):
+                with self.assertRaisesRegex(OSError, "simulated pending save failure"):
+                    module.reconcile_pending_admission(runtime_config, state)
+            self.assertIsNone(state["pending_admission"], "the failed save occurs after marker recovery, in memory only")
+            self.assertIsNotNone(self.state()["pending_admission"], "disk still retains the pending intent across simulated crash")
+
+            restarted_state = self.state()
+            self.assertTrue(module.reconcile_pending_admission(runtime_config, restarted_state))
+            self.assertIsNone(restarted_state["pending_admission"])
+            self.assertIsNone(self.state()["pending_admission"], "Python restart persists marker-backed pending clear")
+
+            # A later supervisor may recover the marker before reserve, then a
+            # subsequent crash may leave the same null-generation intent after
+            # capacity has parked generation G+2.
+            holder = real_helper({"bridgeAction": "occupy"})[1]
+            assert holder is not None
+            self.assertEqual(holder["outcome"], "admitted")
+            later_state = self.state()
+            later_state["pending_admission"] = {
+                "supervisor_id": "later-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+                "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+                "generation": None, "receipt_id": None, "started_at": 1001,
+            }
+            module.STATE.write_text(json.dumps(later_state), encoding="utf-8")
+            self.assertTrue(module.reconcile_pending_admission(runtime_config, later_state))
+            self.assertIsNone(later_state["pending_admission"])
+            capacity_wait = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                         "workspace": workspace_text, "supervisorId": "later-supervisor"})[1]
+            assert capacity_wait is not None
+            self.assertEqual(capacity_wait["outcome"], "waiting")
+            parked_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})[1]
+            assert parked_lane is not None
+            self.assertEqual((parked_lane["status"], parked_lane["generation"]), ("parked", generation + 2))
+            after_capacity = self.state()
+            after_capacity["pending_admission"] = {
+                "supervisor_id": "another-later-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+                "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+                "generation": None, "receipt_id": None, "started_at": 1002,
+            }
+            module.STATE.write_text(json.dumps(after_capacity), encoding="utf-8")
+            self.assertTrue(module.reconcile_pending_admission(runtime_config, after_capacity))
+            self.assertIsNone(after_capacity["pending_admission"])
+            self.assertIsNone(self.state()["pending_admission"], "later capacity marker recovery also persists its clear")
+            self.assertEqual(self.records(), [], "real helper marker recovery and capacity denial never spawn")
 
     def test_uncommitted_discard_retry_can_be_denied_by_capacity_again(self) -> None:
         self.invoke("run", "--prime")

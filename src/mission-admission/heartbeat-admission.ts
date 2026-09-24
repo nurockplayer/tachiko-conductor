@@ -72,6 +72,26 @@ export interface HeartbeatAdmissionReceipt {
   readonly token: AdmissionToken;
 }
 
+type DiscardedPredecessor =
+  | { readonly kind: 'absent' }
+  | { readonly kind: 'released'; readonly generation: number }
+  | { readonly kind: 'capacity_parked'; readonly generation: number; readonly parkedReason: string };
+
+interface DiscardedHeartbeatReceipt {
+  readonly schemaVersion: 1;
+  readonly kind: 'discarded_uncommitted';
+  readonly laneId: string;
+  readonly missionId: string;
+  readonly repository: string;
+  readonly workspace: string;
+  readonly supervisorId: string;
+  readonly receiptId: string;
+  readonly generation: number;
+  readonly predecessor: DiscardedPredecessor;
+}
+
+type PrivateHeartbeatReceipt = HeartbeatAdmissionReceipt | DiscardedHeartbeatReceipt;
+
 export interface HeartbeatAdmissionOptions extends HostAdmissionResolverOptions {
   readonly registry?: MissionAdmissionRegistry;
   readonly receiptPath?: (repository: string, workspace: string) => string;
@@ -122,7 +142,7 @@ function laneForRepositoryWorkspace(repository: string, workspace: string): stri
   return `${HEARTBEAT_ADMISSION_LANE_PREFIX}${createHash('sha256').update(`${repository}\0${workspace}`).digest('hex').slice(0, 32)}`;
 }
 
-function privateReceipt(filePath: string): HeartbeatAdmissionReceipt | null {
+function privateReceipt(filePath: string): PrivateHeartbeatReceipt | null {
   assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   let stats;
   try { stats = lstatSync(filePath); } catch (error) {
@@ -132,16 +152,35 @@ function privateReceipt(filePath: string): HeartbeatAdmissionReceipt | null {
   if (!stats.isFile() || stats.isSymbolicLink() || (stats.mode & 0o777) !== 0o600 || (typeof process.getuid === 'function' && stats.uid !== process.getuid())) throw new Error('Heartbeat admission receipt is not a private owner-owned 0600 file.');
   let parsed: unknown;
   try { parsed = JSON.parse(readFileSync(filePath, 'utf8')); } catch { throw new Error('Heartbeat admission receipt is corrupt.'); }
-  if (!isObject(parsed) || !exactKeys(parsed, ['schemaVersion', 'laneId', 'missionId', 'repository', 'workspace', 'supervisorId', 'receiptId', 'status', 'token']) || parsed.schemaVersion !== 1 ||
-    !boundedString(parsed.laneId, 256) || !boundedString(parsed.missionId, 128) || !boundedString(parsed.repository, 255) || !boundedString(parsed.workspace, 2_048) || !path.isAbsolute(parsed.workspace) || !boundedString(parsed.supervisorId, 128) ||
-    typeof parsed.receiptId !== 'string' || !/^[0-9a-f-]{36}$/.test(parsed.receiptId) || !['active', 'settled'].includes(String(parsed.status)) ||
-    !isObject(parsed.token) || !exactKeys(parsed.token, ['laneId', 'generation', 'token']) || parsed.token.laneId !== parsed.laneId || !Number.isSafeInteger(parsed.token.generation) || (parsed.token.generation as number) <= 0 || !boundedString(parsed.token.token, 128)) {
+  if (!isObject(parsed)) throw new Error('Heartbeat admission receipt has an unsupported or ambiguous schema.');
+  const identityValid = parsed.schemaVersion === 1 && boundedString(parsed.laneId, 256) &&
+    boundedString(parsed.missionId, 128) && boundedString(parsed.repository, 255) && boundedString(parsed.workspace, 2_048) &&
+    path.isAbsolute(parsed.workspace) && boundedString(parsed.supervisorId, 128) && typeof parsed.receiptId === 'string' &&
+    /^[0-9a-f-]{36}$/.test(parsed.receiptId);
+  const markerReceiptIdValid = typeof parsed.receiptId === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(parsed.receiptId);
+  const predecessorValid = (value: unknown): value is DiscardedPredecessor => {
+    if (!isObject(value)) return false;
+    if (value.kind === 'absent') return exactKeys(value, ['kind']);
+    if (value.kind === 'released') return exactKeys(value, ['kind', 'generation']) && Number.isSafeInteger(value.generation) && (value.generation as number) > 0;
+    return value.kind === 'capacity_parked' && exactKeys(value, ['kind', 'generation', 'parkedReason']) &&
+      Number.isSafeInteger(value.generation) && (value.generation as number) > 0 &&
+      ['capacity_captains', 'capacity_writers', 'capacity_high_autonomy', 'capacity_repository'].includes(String(value.parkedReason));
+  };
+  const activeOrSettled = identityValid && exactKeys(parsed, ['schemaVersion', 'laneId', 'missionId', 'repository', 'workspace', 'supervisorId', 'receiptId', 'status', 'token']) &&
+    ['active', 'settled'].includes(String(parsed.status)) && isObject(parsed.token) &&
+    exactKeys(parsed.token, ['laneId', 'generation', 'token']) && parsed.token.laneId === parsed.laneId &&
+    Number.isSafeInteger(parsed.token.generation) && (parsed.token.generation as number) > 0 && boundedString(parsed.token.token, 128);
+  const discarded = identityValid && exactKeys(parsed, ['schemaVersion', 'kind', 'laneId', 'missionId', 'repository', 'workspace', 'supervisorId', 'receiptId', 'generation', 'predecessor']) &&
+    parsed.kind === 'discarded_uncommitted' && markerReceiptIdValid && Number.isSafeInteger(parsed.generation) && (parsed.generation as number) > 0 &&
+    predecessorValid(parsed.predecessor);
+  if (!activeOrSettled && !discarded) {
     throw new Error('Heartbeat admission receipt has an unsupported or ambiguous schema.');
   }
-  return parsed as unknown as HeartbeatAdmissionReceipt;
+  return parsed as unknown as PrivateHeartbeatReceipt;
 }
 
-function writeReceipt(filePath: string, receipt: HeartbeatAdmissionReceipt): void {
+function writePrivateReceipt(filePath: string, receipt: PrivateHeartbeatReceipt): void {
   assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   const directory = path.dirname(filePath);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -170,6 +209,10 @@ function writeReceipt(filePath: string, receipt: HeartbeatAdmissionReceipt): voi
   if (!written.isFile() || written.isSymbolicLink() || (written.mode & 0o777) !== 0o600 || (typeof process.getuid === 'function' && written.uid !== process.getuid())) throw new Error('Published heartbeat receipt failed owner-only permission checks.');
 }
 
+function writeReceipt(filePath: string, receipt: HeartbeatAdmissionReceipt): void {
+  writePrivateReceipt(filePath, receipt);
+}
+
 function statusProjection(registry: MissionAdmissionRegistry, laneId: string) {
   const snapshot = registry.snapshot();
   const lane = snapshot.lanes.find((record) => record.laneId === laneId);
@@ -192,6 +235,7 @@ export type HeartbeatAdmissionResult =
   | { readonly schemaVersion: 1; readonly outcome: 'recoverable' | 'settlement_pending' | 'already_settled'; readonly laneId: string; readonly generation: number; readonly receiptId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'uncommitted_receipt'; readonly laneId: string; readonly generation: number; readonly receiptId: string; readonly supervisorId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'released_predecessor'; readonly laneId: string; readonly generation: number; readonly releasedGeneration: number; readonly receiptId: string; readonly supervisorId: string }
+  | { readonly schemaVersion: 1; readonly outcome: 'discarded_predecessor'; readonly laneId: string; readonly generation: number; readonly receiptId: string; readonly supervisorId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'absent' | 'capacity_wait' | 'not_owned'; readonly laneId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'discarded_uncommitted'; readonly laneId: string; readonly generation: number; readonly receiptId: string; readonly supervisorId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'reserved' | 'already_reserved'; readonly laneId: string; readonly missionId: string; readonly generation: number; readonly receiptId: string; readonly revision: number }
@@ -220,22 +264,54 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
     return lane.status === 'released' || (lane.status === 'parked' && lane.parkedReason !== undefined && capacityReasons.includes(lane.parkedReason));
   };
 
+  const validDiscardMarkerBaseline = (marker: DiscardedHeartbeatReceipt, lane: ReturnType<MissionAdmissionRegistry['readLane']>): boolean => {
+    const exactIdentity = (candidate: NonNullable<typeof lane>) => candidate.laneId === laneId && candidate.role === 'production_captain' &&
+      candidate.highAutonomy === true && candidate.evidence.repositoryScope === true && candidate.evidence.repository === evidence.repository &&
+      candidate.evidence.workspace === evidence.workspace && Object.keys(candidate.evidence).every((key) => ['repository', 'repositoryScope', 'workspace'].includes(key)) &&
+      candidate.missionId === deterministicMissionId(evidence) && marker.missionId === candidate.missionId;
+    const generationIsCandidate = marker.predecessor.kind === 'absent'
+      ? marker.generation === 1
+      : marker.predecessor.generation + 1 === marker.generation;
+    if (!generationIsCandidate) return false;
+    if (marker.predecessor.kind === 'absent' && lane === null) return true;
+    if (lane === null || !exactIdentity(lane)) return false;
+    const exactCapacitySuccessor = lane.status === 'parked' && lane.parkedReason !== undefined && capacityReasons.includes(lane.parkedReason) &&
+      lane.generation >= marker.generation;
+    if (exactCapacitySuccessor) return true;
+    if (marker.predecessor.kind === 'released') {
+      return lane.status === 'released' && lane.generation === marker.predecessor.generation &&
+        lane.generation + 1 === marker.generation;
+    }
+    if (marker.predecessor.kind === 'absent') return false;
+    return marker.predecessor.kind === 'capacity_parked' && lane.status === 'parked' &&
+      lane.generation === marker.predecessor.generation && lane.parkedReason === marker.predecessor.parkedReason;
+  };
+
   if (request.action === 'discard_uncommitted') {
     const valid = registry.withLaneLock(laneId, (lane) => {
       const receipt = privateReceipt(receiptPath);
-      if (receipt === null || receipt.status !== 'active' || receipt.laneId !== laneId || receipt.repository !== evidence.repository ||
+      if (receipt !== null && 'kind' in receipt && receipt.kind === 'discarded_uncommitted') {
+        return receipt.laneId === laneId && receipt.repository === evidence.repository && receipt.workspace === evidence.workspace &&
+          receipt.missionId === deterministicMissionId(evidence) && receipt.supervisorId === request.supervisorId &&
+          receipt.receiptId === request.receiptId && receipt.generation === request.expectedGeneration && validDiscardMarkerBaseline(receipt, lane);
+      }
+      if (receipt === null || !('status' in receipt) || receipt.status !== 'active' || receipt.laneId !== laneId || receipt.repository !== evidence.repository ||
           receipt.workspace !== evidence.workspace || receipt.missionId !== deterministicMissionId(evidence) ||
           receipt.supervisorId !== request.supervisorId || receipt.receiptId !== request.receiptId ||
           receipt.token.generation !== request.expectedGeneration ||
           (lane === null ? receipt.token.generation !== 1 : !receiptMatchesPredecessor(receipt, lane))) return false;
-      const directory = path.dirname(receiptPath);
-      assertSafeCurrentAccountPathIfApplicable(receiptPath, 'file');
-      const directoryStats = lstatSync(directory);
-      if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || (directoryStats.mode & 0o777) !== 0o700 ||
-          (typeof process.getuid === 'function' && directoryStats.uid !== process.getuid())) throw new Error('Heartbeat receipt directory is not a private owner-owned directory.');
-      unlinkSync(receiptPath);
-      const directoryDescriptor = openSync(directory, 'r');
-      try { fsyncSync(directoryDescriptor); } finally { closeSync(directoryDescriptor); }
+      let predecessor: DiscardedPredecessor;
+      if (lane === null) predecessor = { kind: 'absent' };
+      else if (lane.status === 'released') predecessor = { kind: 'released', generation: lane.generation };
+      else if (lane.status === 'parked' && lane.parkedReason !== undefined && capacityReasons.includes(lane.parkedReason)) {
+        predecessor = { kind: 'capacity_parked', generation: lane.generation, parkedReason: lane.parkedReason };
+      } else return false;
+      const marker: DiscardedHeartbeatReceipt = {
+        schemaVersion: 1, kind: 'discarded_uncommitted', laneId, missionId: receipt.missionId,
+        repository: evidence.repository, workspace: evidence.workspace!, supervisorId: receipt.supervisorId,
+        receiptId: receipt.receiptId, generation: receipt.token.generation, predecessor,
+      };
+      writePrivateReceipt(receiptPath, marker);
       return true;
     });
     return valid
@@ -244,58 +320,68 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
   }
 
   if (request.action === 'recover') {
-    const lane = registry.readLane(laneId);
-    const receipt = privateReceipt(receiptPath);
-    if (lane === null && receipt === null) return { schemaVersion: 1, outcome: 'absent', laneId };
-    const exactCapacityWaitLane = request.expectedGeneration === null && lane?.status === 'parked' &&
-      lane.laneId === laneId && lane.role === 'production_captain' && lane.highAutonomy === true && lane.evidence.repositoryScope === true &&
-      lane.evidence.repository === evidence.repository && lane.evidence.workspace === evidence.workspace &&
-      lane.parkedReason !== undefined && capacityReasons.includes(lane.parkedReason);
-    const historicalSettledReceipt = receipt !== null && lane !== null && receipt.status === 'settled' &&
-      receipt.laneId === laneId && receipt.missionId === lane.missionId && receipt.repository === evidence.repository &&
-      receipt.workspace === evidence.workspace && lane.status === 'parked' &&
-      receipt.token.generation + 1 < lane.generation;
-    if (exactCapacityWaitLane && (receipt === null || historicalSettledReceipt)) {
-      return { schemaVersion: 1, outcome: 'capacity_wait', laneId };
-    }
-    if (request.expectedGeneration === null && receipt !== null && receipt.status === 'settled' && lane?.status === 'released' &&
-        lane.laneId === laneId && lane.role === 'production_captain' && lane.highAutonomy === true &&
-        lane.evidence.repositoryScope === true && lane.evidence.repository === evidence.repository && lane.evidence.workspace === evidence.workspace &&
+    let ownerToken: AdmissionToken | undefined;
+    const result = registry.withLaneLock(laneId, (lane) => {
+      const receipt = privateReceipt(receiptPath);
+      if (request.expectedGeneration === null && receipt !== null && 'kind' in receipt && receipt.kind === 'discarded_uncommitted') {
+        return receipt.laneId === laneId && receipt.repository === evidence.repository && receipt.workspace === evidence.workspace &&
+          receipt.missionId === deterministicMissionId(evidence) && validDiscardMarkerBaseline(receipt, lane)
+          ? { schemaVersion: 1 as const, outcome: 'discarded_predecessor' as const, laneId, generation: receipt.generation,
+            receiptId: receipt.receiptId, supervisorId: receipt.supervisorId }
+          : { schemaVersion: 1 as const, outcome: 'not_owned' as const, laneId };
+      }
+      if (lane === null && receipt === null) return { schemaVersion: 1 as const, outcome: 'absent' as const, laneId };
+      const heartbeat = receipt !== null && 'status' in receipt ? receipt : null;
+      const exactCapacityWaitLane = request.expectedGeneration === null && lane?.status === 'parked' &&
+        lane.laneId === laneId && lane.role === 'production_captain' && lane.highAutonomy === true && lane.evidence.repositoryScope === true &&
+        lane.evidence.repository === evidence.repository && lane.evidence.workspace === evidence.workspace &&
         Object.keys(lane.evidence).every((key) => ['repository', 'repositoryScope', 'workspace'].includes(key)) &&
-        lane.missionId === deterministicMissionId(evidence) && receipt.laneId === laneId && receipt.missionId === lane.missionId &&
-        receipt.repository === evidence.repository && receipt.workspace === evidence.workspace && receipt.token.generation + 1 === lane.generation) {
-      return { schemaVersion: 1, outcome: 'released_predecessor', laneId, generation: receipt.token.generation,
-        releasedGeneration: lane.generation, receiptId: receipt.receiptId, supervisorId: receipt.supervisorId };
-    }
-    if (request.expectedGeneration === null && receipt !== null && receipt.status === 'active' &&
-        receipt.laneId === laneId && receipt.repository === evidence.repository && receipt.workspace === evidence.workspace &&
-        receipt.supervisorId === request.supervisorId && receipt.missionId === deterministicMissionId(evidence) &&
-        (lane === null ? receipt.token.generation === 1 : receiptMatchesPredecessor(receipt, lane))) {
-      return { schemaVersion: 1, outcome: 'uncommitted_receipt', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId, supervisorId: receipt.supervisorId };
-    }
-    if (receipt === null || receipt.laneId !== laneId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace || receipt.supervisorId !== request.supervisorId) {
-      return { schemaVersion: 1, outcome: 'not_owned', laneId };
-    }
-    if (request.expectedGeneration !== null && receipt.token.generation !== request.expectedGeneration) return { schemaVersion: 1, outcome: 'not_owned', laneId };
-    if (lane?.status === 'active' && receipt.status === 'settled' && lane.missionId === receipt.missionId && lane.generation === receipt.token.generation) {
-      registry.assertCurrentOwner(receipt.token);
-      return { schemaVersion: 1, outcome: 'settlement_pending', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId };
-    }
-    if (lane?.status === 'active' && receipt.status === 'active' && lane.missionId === receipt.missionId && lane.generation === receipt.token.generation) {
-      registry.assertCurrentOwner(receipt.token);
-      return { schemaVersion: 1, outcome: 'recoverable', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId };
-    }
-    if (lane?.status === 'released' && receipt.status === 'settled' && lane.generation === receipt.token.generation + 1) {
-      return { schemaVersion: 1, outcome: 'already_settled', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId };
-    }
-    return { schemaVersion: 1, outcome: 'not_owned', laneId };
+        lane.missionId === deterministicMissionId(evidence) && lane.parkedReason !== undefined && capacityReasons.includes(lane.parkedReason);
+      const historicalSettledReceipt = heartbeat !== null && lane !== null && heartbeat.status === 'settled' &&
+        heartbeat.laneId === laneId && heartbeat.missionId === lane.missionId && heartbeat.repository === evidence.repository &&
+        heartbeat.workspace === evidence.workspace && lane.status === 'parked' && heartbeat.token.generation + 1 < lane.generation;
+      if (exactCapacityWaitLane && (heartbeat === null || historicalSettledReceipt)) return { schemaVersion: 1 as const, outcome: 'capacity_wait' as const, laneId };
+      if (request.expectedGeneration === null && heartbeat !== null && heartbeat.status === 'settled' && lane?.status === 'released' &&
+          lane.laneId === laneId && lane.role === 'production_captain' && lane.highAutonomy === true &&
+          lane.evidence.repositoryScope === true && lane.evidence.repository === evidence.repository && lane.evidence.workspace === evidence.workspace &&
+          Object.keys(lane.evidence).every((key) => ['repository', 'repositoryScope', 'workspace'].includes(key)) &&
+          lane.missionId === deterministicMissionId(evidence) && heartbeat.laneId === laneId && heartbeat.missionId === lane.missionId &&
+          heartbeat.repository === evidence.repository && heartbeat.workspace === evidence.workspace && heartbeat.token.generation + 1 === lane.generation) {
+        return { schemaVersion: 1 as const, outcome: 'released_predecessor' as const, laneId, generation: heartbeat.token.generation,
+          releasedGeneration: lane.generation, receiptId: heartbeat.receiptId, supervisorId: heartbeat.supervisorId };
+      }
+      if (request.expectedGeneration === null && heartbeat !== null && heartbeat.status === 'active' &&
+          heartbeat.laneId === laneId && heartbeat.repository === evidence.repository && heartbeat.workspace === evidence.workspace &&
+          heartbeat.supervisorId === request.supervisorId && heartbeat.missionId === deterministicMissionId(evidence) &&
+          (lane === null ? heartbeat.token.generation === 1 : receiptMatchesPredecessor(heartbeat, lane))) {
+        return { schemaVersion: 1 as const, outcome: 'uncommitted_receipt' as const, laneId, generation: heartbeat.token.generation, receiptId: heartbeat.receiptId, supervisorId: heartbeat.supervisorId };
+      }
+      if (heartbeat === null || heartbeat.laneId !== laneId || heartbeat.repository !== evidence.repository || heartbeat.workspace !== evidence.workspace || heartbeat.supervisorId !== request.supervisorId) {
+        return { schemaVersion: 1 as const, outcome: 'not_owned' as const, laneId };
+      }
+      if (request.expectedGeneration !== null && heartbeat.token.generation !== request.expectedGeneration) return { schemaVersion: 1 as const, outcome: 'not_owned' as const, laneId };
+      if (lane?.status === 'active' && heartbeat.status === 'settled' && lane.missionId === heartbeat.missionId && lane.generation === heartbeat.token.generation) {
+        ownerToken = heartbeat.token;
+        return { schemaVersion: 1 as const, outcome: 'settlement_pending' as const, laneId, generation: heartbeat.token.generation, receiptId: heartbeat.receiptId };
+      }
+      if (lane?.status === 'active' && heartbeat.status === 'active' && lane.missionId === heartbeat.missionId && lane.generation === heartbeat.token.generation) {
+        ownerToken = heartbeat.token;
+        return { schemaVersion: 1 as const, outcome: 'recoverable' as const, laneId, generation: heartbeat.token.generation, receiptId: heartbeat.receiptId };
+      }
+      if (lane?.status === 'released' && heartbeat.status === 'settled' && lane.generation === heartbeat.token.generation + 1) {
+        return { schemaVersion: 1 as const, outcome: 'already_settled' as const, laneId, generation: heartbeat.token.generation, receiptId: heartbeat.receiptId };
+      }
+      return { schemaVersion: 1 as const, outcome: 'not_owned' as const, laneId };
+    });
+    if (ownerToken !== undefined) registry.assertCurrentOwner(ownerToken);
+    return result;
   }
 
   if (request.action === 'reserve') {
     const prior = registry.readLane(laneId);
     if (prior?.status === 'active') {
       const receipt = privateReceipt(receiptPath);
-      if (receipt === null || receipt.status !== 'active' || receipt.laneId !== laneId || receipt.missionId !== prior.missionId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace || receipt.supervisorId !== request.supervisorId || receipt.token.generation !== prior.generation) throw new Error('Active heartbeat ownership has no matching private recovery receipt; refusing takeover.');
+      if (receipt === null || !('status' in receipt) || receipt.status !== 'active' || receipt.laneId !== laneId || receipt.missionId !== prior.missionId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace || receipt.supervisorId !== request.supervisorId || receipt.token.generation !== prior.generation) throw new Error('Active heartbeat ownership has no matching private recovery receipt; refusing takeover.');
       registry.assertCurrentOwner(receipt.token);
       return { schemaVersion: 1, outcome: 'already_reserved', laneId, missionId: prior.missionId, generation: prior.generation, receiptId: receipt.receiptId, revision: registry.snapshot().revision };
     }
@@ -314,7 +400,7 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
     });
     if (result.outcome === 'admitted') {
       const receipt = privateReceipt(receiptPath);
-      if (receipt === null || receipt.token.token !== result.token.token) throw new Error('Heartbeat reservation receipt was not durably published.');
+      if (receipt === null || !('status' in receipt) || receipt.token.token !== result.token.token) throw new Error('Heartbeat reservation receipt was not durably published.');
       return { schemaVersion: 1, outcome: 'reserved', laneId, missionId: result.missionId, generation: result.token.generation, receiptId: receipt.receiptId, revision: result.revision };
     }
     if (result.outcome === 'parked') return { schemaVersion: 1, outcome: 'waiting', laneId, missionId: result.missionId, reason: result.reason, revision: result.revision };
@@ -322,7 +408,7 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
   }
 
   const receipt = privateReceipt(receiptPath);
-  if (receipt === null || receipt.laneId !== laneId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace) throw new Error('Heartbeat admission receipt is missing or does not match this repository and workspace.');
+  if (receipt === null || !('status' in receipt) || receipt.laneId !== laneId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace) throw new Error('Heartbeat admission receipt is missing or does not match this repository and workspace.');
   if (request.expectedGeneration !== receipt.token.generation || request.receiptId !== receipt.receiptId || request.supervisorId !== receipt.supervisorId) throw new Error('Heartbeat admission settle receipt generation or supervisor identity does not match its private receipt.');
   const lane = registry.readLane(laneId);
   if (lane?.status === 'active' && lane.generation === receipt.token.generation) {
