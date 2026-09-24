@@ -83,7 +83,7 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
 import { preflightProductionPolicy } from './production-policy.js';
 import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
-import { resolveAccountHomeDirectory } from './account-home.js';
+import { assertSafeAccountOwnedPath, resolveAccountHomeDirectory } from './account-home.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -226,7 +226,9 @@ function canonicalDispatchLockPath(kind: 'once' | 'admission', homeDirectory: st
 
 function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
   const homeDirectory = resolveAccountHomeDirectory();
-  const canonical = canonicalPhysicalPath(canonicalDispatchLockPath('once', homeDirectory));
+  const lexicalCanonical = canonicalDispatchLockPath('once', homeDirectory);
+  assertSafeAccountOwnedPath(homeDirectory, lexicalCanonical, 'file');
+  const canonical = canonicalPhysicalPath(lexicalCanonical);
   const configured = env.TACHIKO_DISPATCH_LOCK_PATH;
   if (configured === undefined) return canonical;
   if (!path.isAbsolute(configured) || canonicalPhysicalPath(configured) !== canonical) {
@@ -247,7 +249,9 @@ function dispatchAdmissionLockPath(env: NodeJS.ProcessEnv = process.env): string
   // Validate both configurable aliases against the same account root even
   // when this caller needs only the short admission fence.
   dispatchLockPath(env);
-  const canonical = canonicalPhysicalPath(canonicalDispatchLockPath('admission', homeDirectory));
+  const lexicalCanonical = canonicalDispatchLockPath('admission', homeDirectory);
+  assertSafeAccountOwnedPath(homeDirectory, lexicalCanonical, 'file');
+  const canonical = canonicalPhysicalPath(lexicalCanonical);
   const configured = env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH;
   if (configured === undefined) return canonical;
   if (!path.isAbsolute(configured) || canonicalPhysicalPath(configured) !== canonical) {
@@ -259,7 +263,10 @@ function dispatchAdmissionLockPath(env: NodeJS.ProcessEnv = process.env): string
 async function withDispatchAdmissionLock<T>(operation: (release: () => void) => Promise<T> | T): Promise<T> {
   for (;;) {
     try {
-      const lock = acquireDispatchInvocationLock({ lockPath: dispatchAdmissionLockPath() });
+      const lockPath = dispatchAdmissionLockPath();
+      assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
+      const lock = acquireDispatchInvocationLock({ lockPath });
+      assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
       let released = false;
       const release = () => { if (!released) { released = true; lock.release(); } };
       try {
@@ -857,6 +864,7 @@ function writeParkedReleaseTransition(
   parkedGeneration: number,
   workspace: string | undefined,
   allowMissingWorkspaceBinding: boolean,
+  workflowSettledOrigin: boolean,
 ): void {
   const current = readRunOwnerReceipt(receiptPath);
   if (current === null || !sameRunReceiptIdentity(current, run, missionId) ||
@@ -870,8 +878,16 @@ function writeParkedReleaseTransition(
   if (!exactParkTransition && !exactParked && !exactReleaseRetry && !interruptedReadmission) {
     throw new Error(`Run owner receipt phase and generation do not match parked registry generation ${parkedGeneration}.`);
   }
+  if (current.settlementReason !== undefined && (!workflowSettledOrigin || current.settlementReason !== 'workflow_settled')) {
+    throw new Error(`Run owner receipt settlement provenance conflicts with parked generation ${parkedGeneration}.`);
+  }
   const { token: _token, ...withoutToken } = current;
-  writeRunOwnerReceipt(receiptPath, { ...withoutToken, ...(workspace === undefined ? {} : { workspace }), phase: 'parked_release_transition', generation: parkedGeneration });
+  writeRunOwnerReceipt(receiptPath, {
+    ...withoutToken,
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(workflowSettledOrigin ? { settlementReason: 'workflow_settled' as const } : {}),
+    phase: 'parked_release_transition', generation: parkedGeneration,
+  });
 }
 
 function finalizeParkedRunOwnerReceipt(receiptPath: string, run: Run, missionId: string, parkedGeneration: number, workspace: string | undefined): void {
@@ -1022,9 +1038,14 @@ export function recoverRunAdmission(
     if (!interruptedParkPublication && !normalizedParkRetry && !interruptedParkedReadmission && !exactParkedGeneration) throw new Error('Parked registry lane does not match the Run owner receipt phase and generation.');
     if (!operatorStopped) throw new Error('Parked Run recovery requires explicit --stopped operator attestation that the provider and children have stopped.');
     registry.releaseParked(laneId, lane.generation, true,
-      () => {
+      (lockedParkedLane) => {
+        if (lockedParkedLane.laneId !== lane.laneId || lockedParkedLane.missionId !== lane.missionId ||
+          lockedParkedLane.generation !== lane.generation || lockedParkedLane.status !== 'parked' ||
+          lockedParkedLane.parkedReason !== lane.parkedReason || JSON.stringify(lockedParkedLane.evidence) !== JSON.stringify(lane.evidence)) {
+          throw new Error('Locked parked Run lane changed identity, evidence, workspace, or settlement reason before stopped recovery.');
+        }
         writeParkedReleaseTransition(canonicalReceiptPath, run, lane.missionId, lane.generation, lane.evidence.workspace,
-          canBindMissingReceiptWorkspace(receipt, run, lane.evidence.workspace));
+          canBindMissingReceiptWorkspace(receipt, run, lane.evidence.workspace), lockedParkedLane.parkedReason === 'workflow_settled');
         if (interruptedParkPublication) crashAfter?.parkReceiptNormalization?.();
       },
       () => {
@@ -2227,7 +2248,10 @@ export async function main(argv: string[]): Promise<number> {
     }
     let lock;
     try {
-      lock = acquireDispatchInvocationLock({ lockPath: dispatchLockPath() });
+      const lockPath = dispatchLockPath();
+      assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
+      lock = acquireDispatchInvocationLock({ lockPath });
+      assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
     } catch (error) {
       if (error instanceof DispatchInvocationLockedError) {
         console.log(JSON.stringify({ outcome: 'already_running', reason: error.message }));

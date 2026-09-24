@@ -46,6 +46,38 @@ def account_home_directory() -> Path:
         raise RuntimeError("cannot resolve physical home for the effective OS account") from error
 
 
+def assert_safe_account_owned_path(home: Path, target: Path, endpoint: str) -> None:
+    """Reject symlink retargets below the physical account-owned conductor root."""
+    home = Path(home)
+    target = Path(target)
+    try:
+        relative = target.relative_to(home)
+    except ValueError as error:
+        raise RuntimeError("account-owned conductor path escapes the physical account home") from error
+    parts = relative.parts
+    if not parts or parts[0] != ".tachiko-conductor":
+        return
+    current = home
+    for index, component in enumerate(parts):
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        last = index == len(parts) - 1
+        if current.is_symlink() or (last and endpoint == "file" and not stat.S_ISREG(info.st_mode)) or (not last and not stat.S_ISDIR(info.st_mode)) or (last and endpoint == "directory" and not stat.S_ISDIR(info.st_mode)):
+            raise RuntimeError("account-owned conductor path contains a symlink or wrong filesystem type: " + str(current))
+
+
+def validate_account_admission_paths(home: Path) -> None:
+    root = home / ".tachiko-conductor"
+    assert_safe_account_owned_path(home, root / "runs", "directory")
+    registry = root / "mission-admission/registry.json"
+    assert_safe_account_owned_path(home, registry, "file")
+    assert_safe_account_owned_path(home, Path(str(registry) + ".lock"), "file")
+    assert_safe_account_owned_path(home, root / "mission-admission/heartbeat-receipts", "directory")
+
+
 ACCOUNT_HOME = account_home_directory()
 DEFAULT_ROOT = ACCOUNT_HOME / "Library/Application Support" / LABEL
 DEFAULT_PLIST = ACCOUNT_HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
@@ -359,9 +391,10 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or not isinstance(admission.get("config"), dict)):
         raise RuntimeError("invalid fixed heartbeat admission domain")
     account_home = account_home_directory()
-    canonical_registry = (account_home / ".tachiko-conductor/mission-admission/registry.json").resolve()
-    canonical_runs = (account_home / ".tachiko-conductor/runs").resolve()
-    canonical_receipts = (account_home / ".tachiko-conductor/mission-admission/heartbeat-receipts").resolve()
+    validate_account_admission_paths(account_home)
+    canonical_registry = account_home / ".tachiko-conductor/mission-admission/registry.json"
+    canonical_runs = account_home / ".tachiko-conductor/runs"
+    canonical_receipts = account_home / ".tachiko-conductor/mission-admission/heartbeat-receipts"
     if Path(admission["home"]).resolve() != account_home:
         raise RuntimeError("pinned heartbeat admission home does not match the effective OS account")
     if Path(admission["registry"]).resolve() != canonical_registry:
@@ -1068,6 +1101,7 @@ def verify_admission_helper(config: dict[str, Any]) -> None:
 
 def admission_domain_environment(config: dict[str, Any]) -> dict[str, str]:
     admission = config["admission"]
+    validate_account_admission_paths(account_home_directory())
     return {
         "TACHIKO_MISSION_ADMISSION_PATH": admission["registry"],
         "TACHIKO_MISSION_ADMISSION_CONFIG": json.dumps(admission["config"], sort_keys=True, separators=(",", ":")),
@@ -1917,13 +1951,14 @@ def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dic
 
 def admission_domain(repo: Path, registry_override: str | None, config_raw: str | None) -> dict[str, Any]:
     home = account_home_directory()
+    validate_account_admission_paths(home)
     repository = "nurockplayer/tachiko-conductor"
-    canonical_runs = (home / ".tachiko-conductor/runs").resolve()
+    canonical_runs = home / ".tachiko-conductor/runs"
     runs = Path(os.environ.get("TACHIKO_DATA_DIR", str(canonical_runs))).expanduser().resolve()
-    canonical_registry = (home / ".tachiko-conductor/mission-admission/registry.json").resolve()
+    canonical_registry = home / ".tachiko-conductor/mission-admission/registry.json"
     inherited_registry = os.environ.get("TACHIKO_MISSION_ADMISSION_PATH")
     registry = Path(registry_override or inherited_registry or canonical_registry).expanduser()
-    canonical_receipts = (home / ".tachiko-conductor/mission-admission/heartbeat-receipts").resolve()
+    canonical_receipts = home / ".tachiko-conductor/mission-admission/heartbeat-receipts"
     receipts = Path(os.environ.get("TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR", str(canonical_receipts))).expanduser()
     if not registry.is_absolute() or not receipts.is_absolute():
         raise RuntimeError("mission-admission registry and receipt paths must be absolute")

@@ -175,6 +175,48 @@ class HeartbeatTest(unittest.TestCase):
         self.assertIn("pinned heartbeat receipt directory does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
         self.assertEqual(self.records(), [])
 
+    def test_loaded_config_rejects_symlink_retargeted_account_admission_roots(self) -> None:
+        conductor = self.account_home / ".tachiko-conductor"
+        alternate = self.root / "alternate-account-root"
+        alternate.mkdir()
+        conductor.symlink_to(alternate, target_is_directory=True)
+        try:
+            result = self.invoke("run", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("symlink or wrong filesystem type", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+            self.assertEqual(self.records(), [], "retargeted account root is rejected before wake")
+            self.assertFalse((alternate / "mission-admission").exists())
+        finally:
+            conductor.unlink()
+
+        conductor.mkdir()
+        mission = conductor / "mission-admission"
+        alternate_mission = self.root / "alternate-mission-admission"
+        alternate_mission.mkdir()
+        mission.symlink_to(alternate_mission, target_is_directory=True)
+        try:
+            result = self.invoke("run", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("symlink or wrong filesystem type", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+            self.assertEqual(self.records(), [])
+            self.assertFalse((alternate_mission / "registry.json").exists())
+        finally:
+            mission.unlink()
+
+        mission.mkdir()
+        canonical_receipts = mission / "heartbeat-receipts"
+        alternate_receipts = self.root / "alternate-heartbeat-receipts"
+        alternate_receipts.mkdir()
+        canonical_receipts.symlink_to(alternate_receipts, target_is_directory=True)
+        try:
+            result = self.invoke("run", check=False)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("symlink or wrong filesystem type", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+            self.assertEqual(self.records(), [])
+            self.assertEqual(list(alternate_receipts.iterdir()), [])
+        finally:
+            canonical_receipts.unlink()
+
     def test_admission_domain_accepts_physical_canonical_aliases_and_rejects_divergent_roots(self) -> None:
         spec = importlib.util.spec_from_file_location("heartbeat_admission_domain_under_test", RUNNER)
         assert spec and spec.loader

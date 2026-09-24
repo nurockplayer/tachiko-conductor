@@ -753,13 +753,14 @@ describe('workflow run and resume commands', () => {
     branch: 'tachiko/issue-42-merge', workspacePath,
   });
 
-  function mergeReadyRun(id: string, workspacePath: string): Run {
+  function mergeReadyRun(id: string, workspacePath: string, dispatchClaimId?: string): Run {
     const workspace = path.join(workspacePath, 'workspace');
     mkdirSync(workspace, { recursive: true });
     const run = createRun(TARGET, T0, id);
     return {
       ...run,
       state: 'MERGE_READY',
+      ...(dispatchClaimId === undefined ? {} : { dispatchClaimId }),
       bootstrap: MERGE_BOOTSTRAP(workspace),
       pullRequest: { number: 7, headSha: MERGE_HEAD },
       headSha: MERGE_HEAD,
@@ -803,7 +804,7 @@ describe('workflow run and resume commands', () => {
     const registry = new MissionAdmissionRegistry({ filePath: registryPath, config, ...registryOptions });
     const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
     const workspace = realpathSync(run.bootstrap!.workspacePath);
-    const evidence = { repository, ...(run.target.kind === 'issue' ? { issue: run.target.issueNumber } : {}), run: run.id, pullRequest: run.pullRequest!.number, workspace };
+    const evidence = { repository, ...(run.target.kind === 'issue' ? { issue: run.target.issueNumber } : {}), ...(run.dispatchClaimId === undefined ? {} : { claim: run.dispatchClaimId }), run: run.id, pullRequest: run.pullRequest!.number, workspace };
     const admission = registry.admit({ laneId: `run:${run.id}`, role: 'production_captain', highAutonomy: true, evidence });
     assert.equal(admission.outcome, 'admitted');
     if (admission.outcome !== 'admitted') throw new Error('expected merge test admission');
@@ -811,6 +812,7 @@ describe('workflow run and resume commands', () => {
     const initialReceipt = {
       schemaVersion: 1 as const, laneId: admission.token.laneId, missionId: admission.missionId,
       repository, runId: run.id, issue: run.target.kind === 'issue' ? run.target.issueNumber : undefined,
+      ...(run.dispatchClaimId === undefined ? {} : { claimId: run.dispatchClaimId }),
       workspace, token: admission.token, generation: admission.token.generation, phase: 'park_transition' as const,
     };
     registry.park(admission.token, reason,
@@ -1072,11 +1074,42 @@ describe('workflow run and resume commands', () => {
       const unmarkedRun = mergeReadyRun('merge-stopped-recovery-unmarked', dir);
       const unmarkedSetup = setupParkedMerge(dir, store, unmarkedRun);
       recoverRunAdmission(store, unmarkedSetup.registry, unmarkedRun.id, unmarkedSetup.generation, true, unmarkedSetup.receiptPath);
+      const settledReceipt = readRunOwnerReceipt(unmarkedSetup.receiptPath)!;
+      assert.equal(settledReceipt.settlementReason, 'workflow_settled', 'locked stopped recovery preserves the actual parked origin');
+      const { settlementReason: _settlementReason, ...legacyUnmarkedReceipt } = settledReceipt;
+      writeRunOwnerReceipt(unmarkedSetup.receiptPath, legacyUnmarkedReceipt);
       const unmarkedReceipt = readFileSync(unmarkedSetup.receiptPath, 'utf8');
       await assert.rejects(runMergedTransitionForTest(store, unmarkedRun.id, mergeProofAdapter(), unmarkedSetup.registry), /exact workflow_settled merge transition receipt/);
       assert.equal(store.read(unmarkedRun.id)?.state, 'MERGE_READY');
       assert.equal(readFileSync(unmarkedSetup.receiptPath, 'utf8'), unmarkedReceipt);
       assert.equal(unmarkedSetup.registry.readLane(`run:${unmarkedRun.id}`)?.status, 'released');
+
+      const dispatchBoundRun = mergeReadyRun('merge-stopped-recovery-dispatch-bound', dir, 'claim-stopped-recovery-bound');
+      const dispatchBoundSetup = setupParkedMerge(dir, store, dispatchBoundRun);
+      assert.equal(readRunOwnerReceipt(dispatchBoundSetup.receiptPath)?.settlementReason, undefined);
+      assert.equal(recoverRunAdmission(store, dispatchBoundSetup.registry, dispatchBoundRun.id, dispatchBoundSetup.generation, true, dispatchBoundSetup.receiptPath), 'released');
+      const dispatchBoundReceipt = readRunOwnerReceipt(dispatchBoundSetup.receiptPath);
+      assert.equal(dispatchBoundReceipt?.claimId, dispatchBoundRun.dispatchClaimId);
+      assert.equal(dispatchBoundReceipt?.settlementReason, 'workflow_settled');
+      const settledRegistryBytes = readFileSync(path.join(dir, `merge-${dispatchBoundRun.id}.json`), 'utf8');
+      assert.equal((await runMergedTransitionForTest(store, dispatchBoundRun.id, mergeProofAdapter(), dispatchBoundSetup.registry)).state, 'MERGED');
+      assert.equal(dispatchBoundSetup.registry.readLane(`run:${dispatchBoundRun.id}`)?.generation, dispatchBoundSetup.generation + 1);
+      assert.equal(readFileSync(path.join(dir, `merge-${dispatchBoundRun.id}.json`), 'utf8'), settledRegistryBytes, 'merge retry consumes the exact released generation without another registry transition');
+
+      const conflictingRun = { ...mergeReadyRun('merge-stopped-recovery-conflicting-marker', dir), state: 'NEEDS_HUMAN' as const };
+      const conflictingSetup = setupParkedMerge(dir, store, conflictingRun, 'workflow_wait');
+      const parked = readRunOwnerReceipt(conflictingSetup.receiptPath)!;
+      writeRunOwnerReceipt(conflictingSetup.receiptPath, {
+        ...parked,
+        token: undefined,
+        phase: 'parked_release_transition',
+        generation: conflictingSetup.generation,
+        settlementReason: 'workflow_settled',
+      });
+      const beforeConflict = readFileSync(conflictingSetup.receiptPath, 'utf8');
+      assert.throws(() => recoverRunAdmission(store, conflictingSetup.registry, conflictingRun.id, conflictingSetup.generation, true, conflictingSetup.receiptPath), /settlement provenance conflicts/);
+      assert.equal(conflictingSetup.registry.readLane(`run:${conflictingRun.id}`)?.status, 'parked');
+      assert.equal(readFileSync(conflictingSetup.receiptPath, 'utf8'), beforeConflict);
     } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -2276,7 +2309,7 @@ describe('workflow run and resume commands', () => {
         const releaseParked = registry.releaseParked.bind(registry);
         if (crashPoint === 'before' || crashPoint === 'after') {
           registry.releaseParked = (laneId, generation, stopped, beforePublish) => {
-            beforePublish?.();
+            beforePublish?.(registry.readLane(laneId)!);
             if (crashPoint === 'before') throw new Error('injected crash before parked release publication');
             const result = releaseParked(laneId, generation, stopped);
             throw new Error(`injected crash after parked release publication ${result}`);

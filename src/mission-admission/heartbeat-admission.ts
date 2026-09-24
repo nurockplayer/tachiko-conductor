@@ -1,6 +1,7 @@
 import { closeSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { assertSafeCurrentAccountPathIfApplicable } from '../account-home.js';
 
 import { createHostAdmissionRegistry, resolveHeartbeatOwnerReceiptPath, type HostAdmissionResolverOptions } from './host-registry.js';
 import { canonicalizeMissionEvidence, MissionAdmissionRegistry, type AdmissionToken } from './registry.js';
@@ -107,6 +108,7 @@ function laneForRepositoryWorkspace(repository: string, workspace: string): stri
 }
 
 function privateReceipt(filePath: string): HeartbeatAdmissionReceipt | null {
+  assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   let stats;
   try { stats = lstatSync(filePath); } catch (error) {
     if (isObject(error) && error.code === 'ENOENT') return null;
@@ -125,8 +127,10 @@ function privateReceipt(filePath: string): HeartbeatAdmissionReceipt | null {
 }
 
 function writeReceipt(filePath: string, receipt: HeartbeatAdmissionReceipt): void {
+  assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   const directory = path.dirname(filePath);
   mkdirSync(directory, { recursive: true, mode: 0o700 });
+  assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   const dirStats = lstatSync(directory);
   if (!dirStats.isDirectory() || dirStats.isSymbolicLink() || (typeof process.getuid === 'function' && dirStats.uid !== process.getuid())) throw new Error('Heartbeat receipt directory is not a real owner-owned directory.');
   if ((dirStats.mode & 0o777) !== 0o700) throw new Error('Heartbeat receipt directory must have mode 0700.');

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -934,6 +934,81 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(home, { recursive: true, force: true }); }
   });
 
+  it('rejects symlink retargets in canonical account roots and rechecks a cached registry before I/O', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'admission-symlink-home-'));
+    const physicalHome = realpathSync(home);
+    const conductorRoot = path.join(physicalHome, '.tachiko-conductor');
+    const admissionRoot = path.join(conductorRoot, 'mission-admission');
+    const runs = path.join(conductorRoot, 'runs');
+    const registryPath = path.join(admissionRoot, 'registry.json');
+    const cached = createHostAdmissionRegistry({ homeDirectory: home, env: { TACHIKO_DATA_DIR: runs } });
+    const admitted = cached.admit({ laneId: 'issue:symlink-preservation', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 77 } });
+    assert.equal(admitted.outcome, 'admitted');
+    const populatedBytes = readFileSync(registryPath, 'utf8');
+    const alternate = path.join(physicalHome, 'alternate-canonical-root');
+    mkdirSync(alternate);
+    const preserved = path.join(physicalHome, 'preserved-conductor-root');
+    renameSync(conductorRoot, preserved);
+    symlinkSync(alternate, conductorRoot, 'dir');
+    try {
+      assert.throws(() => cached.snapshot(), /symlink.*wrong filesystem type/);
+      assert.throws(() => createHostAdmissionRegistry({ homeDirectory: home, env: { TACHIKO_DATA_DIR: runs } }), /symlink.*wrong filesystem type/);
+      assert.equal(readFileSync(path.join(preserved, 'mission-admission', 'registry.json'), 'utf8'), populatedBytes);
+      assert.equal(existsSync(path.join(alternate, 'mission-admission')), false, 'a retargeted root is rejected before replacement state is created');
+    } finally {
+      rmSync(conductorRoot, { force: true });
+      renameSync(preserved, conductorRoot);
+      rmSync(home, { recursive: true, force: true });
+    }
+
+    const hierarchyHome = mkdtempSync(path.join(os.tmpdir(), 'admission-symlink-hierarchy-'));
+    try {
+      const hierarchyRoot = path.join(realpathSync(hierarchyHome), '.tachiko-conductor');
+      mkdirSync(hierarchyRoot);
+      const alternateAdmission = path.join(realpathSync(hierarchyHome), 'alternate-admission');
+      mkdirSync(alternateAdmission);
+      symlinkSync(alternateAdmission, path.join(hierarchyRoot, 'mission-admission'), 'dir');
+      assert.throws(() => resolveHostAdmissionPath({ homeDirectory: hierarchyHome, env: { TACHIKO_DATA_DIR: path.join(hierarchyRoot, 'runs') } }), /symlink.*wrong filesystem type/);
+      assert.throws(() => resolveRunOwnerReceiptPath('acme/widgets', 'symlink-endpoint', { repository: 'acme/widgets' }, { homeDirectory: hierarchyHome, env: { TACHIKO_DATA_DIR: path.join(hierarchyRoot, 'runs') } }), /symlink.*wrong filesystem type/);
+      assert.equal(existsSync(path.join(alternateAdmission, 'registry.json')), false);
+    } finally { rmSync(hierarchyHome, { recursive: true, force: true }); }
+
+    const dispatchHome = mkdtempSync(path.join(os.tmpdir(), 'dispatch-symlink-home-'));
+    try {
+      const root = path.join(realpathSync(dispatchHome), '.tachiko-conductor');
+      mkdirSync(root);
+      const alternateDispatch = path.join(realpathSync(dispatchHome), 'alternate-dispatch');
+      mkdirSync(alternateDispatch);
+      symlinkSync(alternateDispatch, path.join(root, 'dispatch'), 'dir');
+      assert.throws(() => dispatchWakePath({}, dispatchHome), /symlink.*wrong filesystem type/);
+    } finally { rmSync(dispatchHome, { recursive: true, force: true }); }
+
+    const endpointHome = mkdtempSync(path.join(os.tmpdir(), 'admission-symlink-endpoints-'));
+    try {
+      const endpointRoot = path.join(realpathSync(endpointHome), '.tachiko-conductor');
+      const endpointAdmission = path.join(endpointRoot, 'mission-admission');
+      const endpointRuns = path.join(endpointRoot, 'runs');
+      mkdirSync(endpointAdmission, { recursive: true });
+      mkdirSync(endpointRuns);
+      const externalFile = path.join(realpathSync(endpointHome), 'external-registry.json');
+      writeFileSync(externalFile, '{"preserved":true}');
+      const endpointRegistry = path.join(endpointAdmission, 'registry.json');
+      const endpointLock = `${endpointRegistry}.lock`;
+      symlinkSync(externalFile, endpointRegistry);
+      assert.throws(() => resolveHostAdmissionPath({ homeDirectory: endpointHome, env: { TACHIKO_DATA_DIR: endpointRuns } }), /symlink.*wrong filesystem type/);
+      rmSync(endpointRegistry);
+      symlinkSync(path.join(realpathSync(endpointHome), 'missing-lock-target'), endpointLock);
+      assert.throws(() => resolveHostAdmissionPath({ homeDirectory: endpointHome, env: { TACHIKO_DATA_DIR: endpointRuns } }), /symlink.*wrong filesystem type/);
+      rmSync(endpointLock);
+      const receiptDirectory = path.join(endpointAdmission, 'run-receipts');
+      const alternateReceipts = path.join(realpathSync(endpointHome), 'alternate-receipts');
+      mkdirSync(alternateReceipts);
+      symlinkSync(alternateReceipts, receiptDirectory, 'dir');
+      assert.throws(() => resolveRunOwnerReceiptPath('acme/widgets', 'receipt-directory-link', undefined, { homeDirectory: endpointHome, env: { TACHIKO_DATA_DIR: endpointRuns } }), /symlink.*wrong filesystem type/);
+      assert.equal(readFileSync(externalFile, 'utf8'), '{"preserved":true}');
+    } finally { rmSync(endpointHome, { recursive: true, force: true }); }
+  });
+
   it('exposes read-only bounded admission status with owning Run/workspace evidence and no capability tokens', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-status-'));
     const workspace = path.join(directory, 'worktree');
@@ -1229,7 +1304,7 @@ describe('provider-neutral durable mission admission', () => {
       const failed = runCli(['dispatch', 'manual', 'register'], workspace, env);
       assert.notEqual(failed.status, 0);
       assert.equal(failed.stdout, '');
-      assert.match(failed.stderr, /receipt could not be durably published before admission/);
+      assert.match(failed.stderr, /receipt could not be durably published before admission|symlink \(symbolic link\) or wrong filesystem type/);
       assert.doesNotMatch(failed.stdout + failed.stderr, /"token"\s*:/);
       const registry = new MissionAdmissionRegistry({ filePath: registryPath, config: cliConfig });
       assert.equal(registry.snapshot().counts.captains, 0, 'receipt failure happens before registry publication');

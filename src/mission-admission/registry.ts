@@ -95,6 +95,8 @@ export interface MissionAdmissionOptions {
   readonly onPublishedTransition?: (projection: AdmissionProjection) => void;
   /** Deterministic same-process interleaving seam for stale-lock race tests. */
   readonly beforeStaleTakeover?: () => void;
+  /** Revalidate account-owned lexical roots before cached registry and lock I/O. */
+  readonly validatePath?: () => void;
 }
 
 export class AdmissionStateError extends Error {
@@ -350,6 +352,7 @@ export class MissionAdmissionRegistry {
   private readonly beforePublish?: () => void;
   private readonly onPublishedTransition?: (projection: AdmissionProjection) => void;
   private readonly beforeStaleTakeover?: () => void;
+  private readonly validatePath?: () => void;
 
   constructor(options: MissionAdmissionOptions) {
     validateAdmissionConfig(options.config);
@@ -362,12 +365,16 @@ export class MissionAdmissionRegistry {
     this.beforePublish = options.beforePublish;
     this.onPublishedTransition = options.onPublishedTransition;
     this.beforeStaleTakeover = options.beforeStaleTakeover;
+    this.validatePath = options.validatePath;
   }
 
   private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void): T {
+    this.validatePath?.();
     mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
+    this.validatePath?.();
     const unlock = acquireLock(`${this.filePath}.lock`, this.lockTimeoutMs, this.lockRetryMs, this.beforeStaleTakeover);
     try {
+      this.validatePath?.();
       let state: RegistryState;
       if (!existsSync(this.filePath)) state = initialState(this.config);
       else {
@@ -389,6 +396,7 @@ export class MissionAdmissionRegistry {
         validateState(state);
         beforeStatePublish?.(result);
         this.beforePublish?.();
+        this.validatePath?.();
         writeAtomic(this.filePath, state);
         if (state.revision !== beforeRevision) {
           try { this.onPublishedTransition?.(project(state)); } catch { /* wake is a best-effort hint; publication remains authoritative */ }
@@ -403,6 +411,7 @@ export class MissionAdmissionRegistry {
   }
 
   private readState(): RegistryState {
+    this.validatePath?.();
     if (!existsSync(this.filePath)) return initialState(this.config);
     let raw: unknown;
     try { raw = JSON.parse(readFileSync(this.filePath, 'utf8')); } catch { throw new AdmissionStateError('Admission registry is unreadable or corrupt; refusing to reset it.'); }
@@ -644,20 +653,25 @@ export class MissionAdmissionRegistry {
   }
 
   /** Exact-generation operator settlement for a parked production Run lane. */
-  releaseParked(laneId: string, expectedParkedGeneration: number, executionStopped: boolean, beforePublish?: () => void, afterPublish?: () => void): number {
+  releaseParked(laneId: string, expectedParkedGeneration: number, executionStopped: boolean, beforePublish?: (parkedLane: Readonly<AdmissionLaneView>) => void, afterPublish?: () => void): number {
     if (!nonEmpty(laneId) || !Number.isSafeInteger(expectedParkedGeneration) || expectedParkedGeneration <= 0 || executionStopped !== true) {
       throw new AdmissionStateError('Parked Run settlement requires its exact generation and explicit operator-stopped attestation.');
     }
-    return this.transact((state) => {
+    const result = this.transact((state) => {
       const lane = state.lanes.find((record) => record.laneId === laneId);
-      if (lane?.status === 'released' && lane.generation === expectedParkedGeneration + 1) return state.revision;
+      if (lane?.status === 'released' && lane.generation === expectedParkedGeneration + 1) return { revision: state.revision };
       if (!lane || lane.status !== 'parked' || lane.generation !== expectedParkedGeneration || lane.role !== 'production_captain' || lane.parkedReason === 'manual_checkpoint') {
         throw new AdmissionStateError('Parked Run settlement is stale or does not identify the expected production Run generation.');
       }
+      const { token: _token, ...parkedLane } = structuredClone(lane);
       lane.status = 'released'; lane.token = null; lane.generation += 1; lane.updatedAt = this.now(); delete (lane as { parkedReason?: ParkedReason }).parkedReason;
       state.revision += 1; state.lastTransition = { kind: 'operator_stopped_release', laneId: lane.laneId, at: lane.updatedAt };
-      return state.revision;
-    }, () => beforePublish?.(), () => afterPublish?.());
+      return { revision: state.revision, parkedLane };
+    }, (result) => {
+      if (result.parkedLane === undefined) throw new AdmissionStateError('Parked release transition has no locked parked-lane provenance.');
+      beforePublish?.(result.parkedLane);
+    }, () => afterPublish?.());
+    return result.revision;
   }
 
   /** Run receipt reconciliation only while the exact released generation still owns this lane. */
