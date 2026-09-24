@@ -664,6 +664,13 @@ export async function runWorkflow(
             ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
             ...(capabilities === undefined ? {} : { capabilities }),
+            beforePublish: () => {
+              if (!updateIfCurrent(store, workerHandoff, workerHandoff)) {
+                throw new Error('Run changed before worker-router implementation publication.');
+              }
+              assertCurrentMutationAdmission(options);
+              assertPublicationAdmission(options);
+            },
             // #92 deliberately qualifies fresh bounded Luna workers.  A
             // repair/re-entry therefore cannot pretend its prior CLI thread
             // is a durable continuation; its explicit exact-HEAD bootstrap

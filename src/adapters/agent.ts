@@ -88,6 +88,8 @@ export interface ImplementationRequest {
   /** Prepared linked worktree; providers use this as their process cwd. */
   readonly workspacePath?: string;
   readonly branch?: string;
+  /** Synchronous final authority check for host publication; never persisted or sent into an executor. */
+  readonly beforePublish?: () => void;
   /** Must be evaluated after capability resolution and directly before spawn. */
   readonly workspaceGuard?: WorkspaceGuard;
   /** Whether the executor should read target authority live instead of from copied prose. */

@@ -1091,6 +1091,81 @@ describe('runWorkflow', () => {
     assert.equal(publicationAttempts, 0);
   });
 
+  it('passes a synchronous worker publication fence that rejects stale Run and admission authority', async (t) => {
+    for (const mode of ['run-changed', 'admission-stale'] as const) {
+      await t.test(mode, async () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-worker-publish-fence-'));
+        const registry = new MissionAdmissionRegistry({
+          filePath: path.join(directory, 'registry.json'),
+          config: { schemaVersion: 1, revision: 'worker-publish-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+        });
+        const id = `worker-publish-fence-${mode}`;
+        const admitted = registry.admit({
+          laneId: 'captain', role: 'production_captain',
+          evidence: { repository: 'acme/widgets', issue: 42, run: id },
+        });
+        assert.equal(admitted.outcome, 'admitted');
+        if (admitted.outcome !== 'admitted') return;
+        try {
+          const store = new MemoryStore();
+          const run = createRun(TARGET, T0, id);
+          store.create(run);
+          let callbackCalls = 0;
+          let implementationCalls = 0;
+          let escapedFailure: Error | undefined;
+          const implementation: ImplementationAgent = {
+            kind: 'implementation-agent',
+            async run(request) {
+              implementationCalls += 1;
+              assert.equal(typeof request.beforePublish, 'function', 'runWorkflow passes a host-only synchronous publication fence');
+              if (mode === 'run-changed') {
+                const current = store.read(id)!;
+                store.update(applyTransition(current, { type: 'escalate', reason: 'operator cancellation while worker is running' }, T0));
+              } else {
+                registry.release(admitted.token, true);
+              }
+              try {
+                request.beforePublish!();
+                callbackCalls += 1;
+                return successResult(HEAD);
+              } catch (error) {
+                escapedFailure = error instanceof Error ? error : new Error(String(error));
+                return failureResult('worker publication authority rejected');
+              }
+            },
+          };
+          const github = githubAdapter([null, null]);
+          let pullRequestCreates = 0;
+          github.createImplementationPullRequest = async () => { pullRequestCreates += 1; return { number: 8 }; };
+          const outcome = await runWorkflow(
+            { store, github, implementation, bootstrap: new FakeBootstrap(), reviewer: new FakeReviewer([]) }, id,
+            {
+              maxReviewAttempts: 1, now: () => T0,
+              admissionFence: {
+                registry, token: admitted.token, productionMissionId: admitted.missionId,
+                executionWorkspace: '/tmp/tachiko-workspace',
+              },
+            },
+          );
+
+          assert.equal(callbackCalls, 0, 'a rejected fence cannot pass control to publication');
+          assert.ok(escapedFailure?.message.includes(mode === 'run-changed' ? 'Run changed' : 'Admission generation token is stale'),
+            `callback refusal should reach the worker: calls=${implementationCalls}, outcome=${JSON.stringify(outcome)}`);
+          assert.equal(pullRequestCreates, 0, 'no PR publication follows a refused worker publication fence');
+          if (mode === 'run-changed') {
+            assert.equal(outcome.outcome, 'needs_human');
+            assert.equal(store.read(id)?.state, 'NEEDS_HUMAN', 'the concurrent durable Run remains authoritative');
+          } else {
+            assert.equal(outcome.outcome, 'failed');
+            assert.equal(registry.snapshot().lanes.find((lane) => lane.laneId === admitted.token.laneId)?.status, 'released');
+          }
+        } finally {
+          rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  });
+
   it('rechecks publication admission after live review and before readiness is published', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-final-gate-fence-'));
     const registry = new MissionAdmissionRegistry({

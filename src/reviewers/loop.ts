@@ -579,6 +579,13 @@ export async function runReviewLoop(
           ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           ...(capabilities === undefined ? {} : { capabilities }),
+          beforePublish: () => {
+            if (!updateReviewRun(store, workerHandoff, workerHandoff)) {
+              throw new Error('Run changed before worker-router review-fix publication.');
+            }
+            deps.assertCurrentMutation?.();
+            deps.assertCanPublish?.();
+          },
           ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });

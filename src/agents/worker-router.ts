@@ -171,7 +171,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.BASE_ANCESTRY_FAILED}: ${ancestry.detail}`, ...diagnostics, ...ancestry.diagnostics],
       };
     }
-    const published = await this.publishHead(request.signal, cwd, head, branch);
+    const published = await this.publishHead(request.signal, cwd, head, branch, request.beforePublish);
     if (!published.ok) {
       const durationMs = elapsed(startedAt);
       if (published.cancelled) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router publication was cancelled.', durationMs);
@@ -265,7 +265,22 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     cwd: string,
     head: string,
     branch: string,
+    beforePublish: (() => void) | undefined,
   ): Promise<{ readonly ok: true } | { readonly ok: false; readonly cancelled: boolean; readonly detail: string; readonly diagnostics: string[] }> {
+    if (beforePublish === undefined) {
+      return {
+        ok: false, cancelled: false,
+        detail: 'A synchronous pre-publication authority check is required.', diagnostics: [],
+      };
+    }
+    try {
+      beforePublish();
+    } catch (error) {
+      return {
+        ok: false, cancelled: false,
+        detail: `Pre-publication authority check rejected: ${boundedMessage(error)}`, diagnostics: [],
+      };
+    }
     try {
       const result = await this.runner.run(
         'git',
