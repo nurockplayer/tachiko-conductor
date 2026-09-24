@@ -8,6 +8,7 @@ import type { ImplementationAgent, ImplementationRequest } from '../src/adapters
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
+import type { ProcessRunner } from '../src/github/transport.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition, type ActiveValidationConfiguration } from '../src/domain/state-machine.js';
 import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
@@ -17,6 +18,8 @@ import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { TARGET, failureResult, successResult, validationPassed } from './helpers.js';
+import { createBootstrapGitFixture } from './bootstrap-fixture.js';
+import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -25,6 +28,12 @@ const HEAD3 = 'cccccccccccccccccccccccccccccccccccccccc';
 const ROUTINE_REPAIR_EXECUTION: ResolvedExecutionConfiguration = {
   profile: 'routine', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 60_000,
 };
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
 
 function reviewAuthority() {
   return {
@@ -250,6 +259,83 @@ describe('runReviewLoop', () => {
     const persisted = store.read('run-1');
     assert.equal(persisted?.state, 'FINAL_GATE');
     assert.equal(persisted?.history.some((entry) => entry.type === 'final_gate_verified'), false);
+  });
+
+  it('preserves a concurrent durable Run change while the live GitHub snapshot is pending', async () => {
+    const initial = reviewingRun(HEAD, 'review-snapshot-race');
+    const concurrent = applyTransition(initial, {
+      type: 'escalate', reason: 'Operator cancellation during reviewer snapshot',
+      interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
+    }, T0);
+    const store = new CasMemoryStore();
+    store.create(initial);
+    const entered = deferred<void>();
+    const resultSnapshot = deferred<GitHubLiveSnapshot>();
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => { entered.resolve(undefined); return resultSnapshot.promise; };
+    const reviewer = new FakeReviewer([approve(HEAD)]);
+    const pending = runReviewLoop({ store, github, implementation: new FakeImplementation([]), reviewer, resolveValidationAuthority: reviewAuthority }, initial.id, { maxAttempts: 3, now: () => T0 });
+
+    await entered.promise;
+    store.update(concurrent);
+    resultSnapshot.resolve(snapshot(HEAD));
+    const result = await pending;
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.deepEqual(store.read(initial.id), concurrent, 'a stale snapshot result cannot overwrite the newer Run');
+    assert.equal(reviewer.requests.length, 0, 'the reviewer is not invoked after its Run snapshot becomes stale');
+  });
+
+  it('preserves a concurrent durable Run change while the reviewer is pending', async () => {
+    const initial = reviewingRun(HEAD, 'review-result-race');
+    const store = new CasMemoryStore();
+    store.create(initial);
+    const entered = deferred<void>();
+    const reviewResult = deferred<ReviewResult>();
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review() { entered.resolve(undefined); return reviewResult.promise; },
+    };
+    const pending = runReviewLoop({ store, github: githubAdapter([HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer, resolveValidationAuthority: reviewAuthority }, initial.id, { maxAttempts: 3, now: () => T0 });
+
+    await entered.promise;
+    const current = store.read(initial.id)!;
+    const concurrent = applyTransition(current, {
+      type: 'escalate', reason: 'Operator cancellation during independent review',
+      interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
+    }, T0);
+    store.update(concurrent);
+    reviewResult.resolve(approve(HEAD));
+    const result = await pending;
+
+    assert.equal(result.outcome, 'needs_human', 'a stale approval is never returned as approved');
+    assert.deepEqual(store.read(initial.id), concurrent, 'review completion telemetry and verdict cannot overwrite the newer Run');
+  });
+
+  it('does not persist stale reviewer failure telemetry over a concurrent Run change', async () => {
+    const initial = reviewingRun(HEAD, 'review-failure-race');
+    const store = new CasMemoryStore();
+    store.create(initial);
+    const entered = deferred<void>();
+    const finish = deferred<void>();
+    const reviewer: ReviewerAdapter = {
+      kind: 'reviewer',
+      async review() { entered.resolve(undefined); await finish.promise; throw new Error('review service failed'); },
+    };
+    const pending = runReviewLoop({ store, github: githubAdapter([HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer, resolveValidationAuthority: reviewAuthority }, initial.id, { maxAttempts: 3, now: () => T0 });
+
+    await entered.promise;
+    const current = store.read(initial.id)!;
+    const concurrent = applyTransition(current, {
+      type: 'escalate', reason: 'Operator cancellation during failed review',
+      interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
+    }, T0);
+    store.update(concurrent);
+    finish.resolve(undefined);
+    const result = await pending;
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.deepEqual(store.read(initial.id), concurrent, 'failure telemetry and escalation cannot overwrite the newer Run');
   });
 
   it('requires an authority resolver for direct public review-loop entry', async () => {
@@ -651,6 +737,98 @@ describe('runReviewLoop', () => {
     assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
     assert.equal(implementation.requests[0]?.branch, identity.branch);
     assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
+  });
+
+  it('fences standalone review-fix publication after awaited Git checks', async (t) => {
+    for (const mode of ['run-changed', 'publication-stale', 'current'] as const) {
+      await t.test(mode, async () => {
+        const fixture = createBootstrapGitFixture();
+        try {
+          const id = `review-fix-publish-${mode}`;
+          const store = new CasMemoryStore();
+          let shouldChangeRun = false;
+          let concurrent: Run | undefined;
+          const runner: ProcessRunner = {
+            async run(file, args, options) {
+              if (shouldChangeRun && args.includes('ls-remote') && args.includes('--heads')) {
+                shouldChangeRun = false;
+                const before = store.read(id)!;
+                concurrent = applyTransition(before, {
+                  type: 'escalate', reason: 'Operator cancellation during standalone pre-push Git checks',
+                  interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
+                }, T0);
+                store.update(concurrent);
+              }
+              return fixture.runner.run(file, args, options);
+            },
+          };
+          const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+          const luna: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000 };
+          const identity = await bootstrap.plan({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+          const initial = { ...reviewingRun(fixture.baseSha, id, undefined, luna), bootstrap: identity };
+          store.create(initial);
+          let repairedHead: string | undefined;
+          const implementation: ImplementationAgent = {
+            kind: 'implementation-agent',
+            async run(request) {
+              repairedHead = fixture.commit(request.workspacePath!, 'review-fix.txt', 'review repair\n');
+              shouldChangeRun = mode === 'run-changed';
+              return successResult(repairedHead);
+            },
+          };
+          const heads = [fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha];
+          const github = githubAdapter(heads);
+          github.readLiveSnapshot = async () => {
+            const live = snapshot(heads.shift() ?? repairedHead ?? fixture.baseSha);
+            return {
+              ...live,
+              pullRequest: live.pullRequest === null ? null : {
+                ...live.pullRequest,
+                headRef: identity.publicationBranch ?? identity.branch,
+                baseRef: fixture.branch,
+                headRepository: { owner: 'acme', repo: 'widgets' },
+              },
+            };
+          };
+          const reviewer = new FakeReviewer([requestChanges(fixture.baseSha)]);
+          let mutationChecks = 0;
+          let publicationChecks = 0;
+          const commandStart = fixture.commands.length;
+          const result = await runReviewLoop({
+            store, github, implementation, reviewer, resolveValidationAuthority: reviewAuthority,
+            bootstrapForExecution: () => bootstrap,
+            assertCurrentMutation: () => { mutationChecks += 1; },
+            assertCanPublish: () => {
+              publicationChecks += 1;
+              if (mode === 'publication-stale') throw new Error('publication admission became stale');
+            },
+          }, id, { maxAttempts: 3, now: () => T0 });
+
+          const published = fixture.git(fixture.remote, ['for-each-ref', `refs/heads/${identity.publicationBranch ?? identity.branch}`]);
+          if (mode === 'run-changed') {
+            assert.equal(result.outcome, 'needs_human');
+            assert.deepEqual(store.read(id), concurrent, 'the changed Run survives the pre-push CAS');
+            assert.equal(published, '', 'the standalone repair is not pushed after its Run becomes stale');
+            assert.equal(publicationChecks, 0, 'publication authority is not consulted after the Run CAS rejects');
+          } else if (mode === 'publication-stale') {
+            assert.equal(result.outcome, 'needs_human');
+            assert.equal(result.run.state, 'NEEDS_HUMAN', 'stale publication authority leaves a durable safe park');
+            assert.equal(store.read(id)?.state, 'NEEDS_HUMAN');
+            assert.equal(published, '', 'the standalone repair is not pushed when publication admission rejects');
+            assert.equal(fixture.commands.slice(commandStart).filter((command) => command.args.includes('push')).length, 0, 'no host push runs after publication admission rejects');
+            assert.equal(publicationChecks, 1, 'publication admission is rechecked after the awaited Git work');
+          } else {
+            assert.equal(result.outcome, 'revalidating');
+            assert.equal(store.read(id)?.headSha, repairedHead);
+            assert.equal(fixture.git(fixture.remote, ['rev-parse', `refs/heads/${identity.publicationBranch ?? identity.branch}`]), repairedHead);
+            assert.equal(publicationChecks, 1, 'the valid standalone repair checks publication authority immediately before push');
+            assert.ok(mutationChecks >= 2, 'mutation authority is checked before execution and again before push');
+          }
+        } finally {
+          fixture.cleanup();
+        }
+      });
+    }
   });
 
   it('does not spawn after a concurrent transition wins the post-admission telemetry fence', async () => {

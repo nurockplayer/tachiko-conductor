@@ -1047,6 +1047,7 @@ export async function runWorkflow(
               assertCurrentMutationAdmission(options);
             },
             assertCurrentMutation: () => assertCurrentMutationAdmission(options),
+            assertCanPublish: () => assertPublicationAdmission(options),
           },
           run.id,
           {
