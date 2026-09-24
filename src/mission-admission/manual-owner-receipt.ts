@@ -1,7 +1,8 @@
-import { closeSync, chmodSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, chmodSync, fchmodSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { assertSafeCurrentAccountPathIfApplicable } from '../account-home.js';
 import { randomUUID } from 'node:crypto';
+import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 
 import type { AdmissionToken } from './registry.js';
 
@@ -59,11 +60,11 @@ export function readManualOwnerReceipt(filePath: string): ManualOwnerReceipt | n
   return parsed;
 }
 
-export function writeManualOwnerReceipt(filePath: string, receipt: ManualOwnerReceipt): void {
+export function writeManualOwnerReceipt(filePath: string, receipt: ManualOwnerReceipt, options: { readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy } = {}): void {
   if (!path.isAbsolute(filePath) || !validateManualOwnerReceipt(receipt)) throw new Error('Manual owner receipt path or contents are invalid.');
   assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   const directory = path.dirname(filePath);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  ensureDurableDirectory(directory, { mode: 0o700, syncDirectoryHierarchy: options.syncDirectoryHierarchy });
   assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   const directoryStats = lstatSync(directory);
   if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || (typeof process.getuid === 'function' && directoryStats.uid !== process.getuid())) throw new Error('Manual owner receipt directory must be a real owner-owned directory.');

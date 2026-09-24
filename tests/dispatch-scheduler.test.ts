@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,7 @@ import { renderDispatchLaunchdPlist } from '../src/dispatch/launchd.js';
 import { parseDispatchConfiguration } from '../src/dispatch/config.js';
 import { main } from '../src/cli.js';
 import { readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
+import { syncDirectory } from '../src/durable-directory.js';
 
 async function withAccountHome<T>(home: string, operation: () => Promise<T>): Promise<T> {
   mkdirSync(home, { recursive: true });
@@ -20,6 +21,38 @@ async function withAccountHome<T>(home: string, operation: () => Promise<T>): Pr
 }
 
 describe('dispatch scheduler boundary', () => {
+  it('does not publish a dispatch lock until each visible lock-directory edge can be synced', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-hierarchy-'));
+    const lockDirectory = path.join(directory, 'dispatch', 'nested');
+    const lockPath = path.join(lockDirectory, 'once.lock');
+    const failedParent = path.join(directory, 'dispatch');
+    const seen: string[] = [];
+    let fail = true;
+    const syncHierarchy = (parent: string) => {
+      seen.push(parent);
+      if (fail && parent === failedParent) throw new Error('injected dispatch hierarchy sync failure');
+      syncDirectory(parent);
+    };
+    try {
+      assert.throws(() => acquireDispatchInvocationLock({ lockPath, syncDirectoryHierarchy: syncHierarchy }), /dispatch hierarchy sync failure/);
+      assert.equal(existsSync(lockDirectory), true, 'visible directory remains available for verified retry');
+      assert.equal(existsSync(lockPath), false, 'no canonical lock is published before hierarchy durability');
+      assert.equal(readdirSync(lockDirectory).length, 0, 'no private lock claim temp is created before the barrier');
+      assert.equal(seen.at(-1), failedParent);
+
+      seen.length = 0;
+      assert.throws(() => acquireDispatchInvocationLock({ lockPath, syncDirectoryHierarchy: syncHierarchy }), /dispatch hierarchy sync failure/);
+      assert.equal(seen.at(-1), failedParent, 'retry re-syncs the parent of the already visible directory');
+      assert.equal(existsSync(lockPath), false);
+
+      fail = false;
+      const lock = acquireDispatchInvocationLock({ lockPath, syncDirectoryHierarchy: syncHierarchy });
+      assert.equal(existsSync(lockPath), true);
+      lock.release();
+      assert.equal(existsSync(lockPath), false);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('keeps overlapping same-host invocations out and safely recovers a provably stale lock', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-'));
     const lockPath = path.join(directory, 'once.lock');

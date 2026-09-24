@@ -8,6 +8,7 @@ import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
+import { ensureDurableDirectory, syncDirectory } from '../src/durable-directory.js';
 import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, operationalRunProjection, sha256 } from '../src/operational/projection.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
@@ -98,6 +99,71 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(existsSync(path.join(dir, `${run.id}.json`)), false, 'failed pre-admission create leaves no Run destination');
     assert.equal(existsSync(operationalProjectionPath(dir, run.id)), false, 'failed pre-admission create emits no projection');
     assert.deepEqual(readdirSync(dir).filter((name) => name.startsWith(`${run.id}.json.`) && name.endsWith('.tmp')), [path.basename(unrelatedTemp)]);
+  });
+
+  it('does not make a fresh Run store available until each visible hierarchy edge can be synced', () => {
+    const { dir } = tempStore();
+    const runsDir = path.join(dir, 'runs', 'nested');
+    const failedParent = path.join(dir, 'runs');
+    const observedParents: string[] = [];
+    let fail = true;
+    const syncHierarchy = (parent: string) => {
+      observedParents.push(parent);
+      if (fail && parent === failedParent) throw new Error('injected Run hierarchy sync failure');
+      syncDirectory(parent);
+    };
+
+    assert.throws(() => new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy }), /Run hierarchy sync failure/);
+    assert.equal(existsSync(runsDir), true, 'created directories remain visible after uncertain parent sync');
+    assert.equal(existsSync(path.join(runsDir, 'run.json')), false);
+    assert.equal(observedParents.at(-1), failedParent);
+
+    observedParents.length = 0;
+    assert.throws(() => new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy }), /Run hierarchy sync failure/);
+    assert.equal(observedParents.at(-1), failedParent, 'retry re-syncs the parent even though the child is already visible');
+
+    fail = false;
+    const store = new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy });
+    store.create(newRun('durable-tree-run'));
+    assert.equal(store.read('durable-tree-run')?.id, 'durable-tree-run');
+  });
+
+  it('validates store options before hierarchy creation and rejects regular-file path components before Run publication', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-hierarchy-shape-'));
+    tmpDirs.push(directory);
+    const invalidOptionsDir = path.join(directory, 'invalid-options', 'runs');
+    let hierarchySyncs = 0;
+    assert.throws(() => new JsonFileStore({
+      dir: invalidOptionsDir,
+      mutationLockTimeoutMs: -1,
+      syncDirectoryHierarchy: () => { hierarchySyncs += 1; },
+    }), /mutationLockTimeoutMs/);
+    assert.equal(existsSync(path.dirname(invalidOptionsDir)), false, 'invalid options do not create a partial hierarchy');
+    assert.equal(hierarchySyncs, 0, 'invalid options do not sync hierarchy edges');
+
+    const blocker = path.join(directory, 'regular-file');
+    writeFileSync(blocker, 'preserve this file');
+    const blockedDir = path.join(blocker, 'nested-runs');
+    const run = newRun('blocked-hierarchy-run');
+    assert.throws(() => new JsonFileStore({ dir: blockedDir }));
+    assert.equal(readFileSync(blocker, 'utf8'), 'preserve this file', 'the existing regular file is preserved');
+    assert.equal(existsSync(path.join(blockedDir, `${run.id}.json`)), false, 'no Run destination is published');
+    assert.equal(existsSync(operationalProjectionPath(blockedDir, run.id)), false, 'no operational projection is published');
+  });
+
+  it('syncs the containing parent in order for every absolute directory component', () => {
+    const { dir } = tempStore();
+    const target = path.join(dir, 'outer', 'middle', 'leaf');
+    const parents: string[] = [];
+    const root = path.parse(target).root;
+    let componentPath = root;
+    const expectedParents = target.slice(root.length).split(path.sep).filter(Boolean).map((component) => {
+      const parent = componentPath;
+      componentPath = path.join(componentPath, component);
+      return parent;
+    });
+    ensureDurableDirectory(target, { syncDirectoryHierarchy: (parent) => { parents.push(parent); syncDirectory(parent); } });
+    assert.deepEqual(parents, expectedParents);
   });
 
   it('writes a secret-free operational projection bound to the committed raw bytes', () => {

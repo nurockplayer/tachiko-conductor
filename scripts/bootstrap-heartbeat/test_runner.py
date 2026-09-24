@@ -783,7 +783,7 @@ class HeartbeatTest(unittest.TestCase):
 
         with mock.patch.object(module.os, "fsync", side_effect=tracked_fsync), \
                 mock.patch.object(module.os, "replace", side_effect=tracked_replace):
-            module.atomic_write(target, b"durable-new-state")
+            module.atomic_write(target, b"durable-new-state", sync_hierarchy=lambda _directory: None)
         self.assertEqual(events, ["file-fsync", "replace", "directory-fsync"],
                          "the rename is durable only after the temp file and parent directory syncs")
         self.assertEqual(target.read_bytes(), b"durable-new-state")
@@ -800,7 +800,7 @@ class HeartbeatTest(unittest.TestCase):
 
         with mock.patch.object(module.os, "fsync", side_effect=fail_file_fsync):
             with self.assertRaisesRegex(OSError, "injected file fsync failure"):
-                module.atomic_write(target, b"must-not-replace")
+                module.atomic_write(target, b"must-not-replace", sync_hierarchy=lambda _directory: None)
         self.assertEqual(target.read_bytes(), b"old-state")
         self.assertEqual(list(target.parent.glob("state.json.tmp-*")), [], "failed temp publication removes its owned file")
 
@@ -811,9 +811,82 @@ class HeartbeatTest(unittest.TestCase):
 
         with mock.patch.object(module.os, "fsync", side_effect=fail_directory_fsync):
             with self.assertRaisesRegex(OSError, "injected parent fsync failure"):
-                module.atomic_write(target, b"renamed-but-not-durable")
+                module.atomic_write(target, b"renamed-but-not-durable", sync_hierarchy=lambda _directory: None)
         self.assertEqual(target.read_bytes(), b"renamed-but-not-durable",
                          "failure after replace is propagated while the visible exact state remains inspectable")
+
+    def test_durable_directory_hierarchy_failure_retries_visible_edges_and_blocks_state_and_lock(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_directory_durability_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        state_file = self.root / "fresh-authority" / "nested" / "state.json"
+        failed_parent = state_file.parent.parent
+        seen: list[Path] = []
+        fail = True
+
+        def sync_hierarchy(directory: Path) -> None:
+            seen.append(directory)
+            if fail and directory == failed_parent:
+                raise OSError("injected hierarchy parent fsync failure")
+            module.fsync_directory(directory)
+
+        with self.assertRaisesRegex(OSError, "hierarchy parent fsync failure"):
+            module.atomic_write(state_file, b"must-not-publish", sync_hierarchy=sync_hierarchy)
+        self.assertTrue(failed_parent.is_dir(), "a visible directory survives uncertain parent sync for retry")
+        self.assertFalse(state_file.exists())
+        self.assertEqual(list(state_file.parent.glob("state.json.tmp-*")), [])
+        self.assertEqual(seen[-1], failed_parent)
+
+        seen.clear()
+        with self.assertRaisesRegex(OSError, "hierarchy parent fsync failure"):
+            module.atomic_write(state_file, b"must-still-not-publish", sync_hierarchy=sync_hierarchy)
+        self.assertEqual(seen[-1], failed_parent, "a visible component's containing parent is re-synced on retry")
+        self.assertFalse(state_file.exists())
+
+        fail = False
+        seen.clear()
+        module.atomic_write(state_file, b"durable-after-retry", sync_hierarchy=sync_hierarchy)
+        self.assertEqual(state_file.read_bytes(), b"durable-after-retry")
+        self.assertIn(failed_parent, seen)
+
+        lock_seen: list[Path] = []
+        lock_fail = True
+
+        def sync_lock_hierarchy(directory: Path) -> None:
+            lock_seen.append(directory)
+            if lock_fail and directory == module.ROOT.parent:
+                raise OSError("injected ROOT lock hierarchy failure")
+            module.fsync_directory(directory)
+
+        with mock.patch.object(module, "sync_directory_hierarchy", side_effect=sync_lock_hierarchy):
+            with self.assertRaisesRegex(OSError, "ROOT lock hierarchy failure"):
+                module.acquire_lock(verbose=False)
+            self.assertTrue(module.ROOT.is_dir())
+            self.assertFalse(module.LOCK.exists(), "ROOT lock must not be opened before the hierarchy barrier")
+            self.assertEqual(lock_seen[-1], module.ROOT.parent)
+            with self.assertRaisesRegex(OSError, "ROOT lock hierarchy failure"):
+                module.acquire_lock(verbose=False)
+            self.assertEqual(lock_seen[-1], module.ROOT.parent, "visible ROOT is re-synced before each lock attempt")
+            lock_fail = False
+            stream = module.acquire_lock(verbose=False)
+            self.assertIsNotNone(stream)
+            stream.close()
 
     def test_prior_boot_spawn_uncertain_with_exact_bound_receipt_still_settles(self) -> None:
         saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")

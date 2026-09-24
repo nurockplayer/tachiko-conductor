@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
@@ -10,6 +10,7 @@ import { isValidationResultCoherent } from '../domain/validation.js';
 import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
 import { isRepairAdmissionSnapshot, isRepairTaskShapeAuthority } from '../domain/repair-admission.js';
+import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -43,6 +44,8 @@ export interface JsonFileStoreOptions {
   readonly beforeConditionalWrite?: () => void;
   /** Deterministic durability fault seam; defaults to fsyncSync for both file and parent directory. */
   readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void;
+  /** Path-aware fault seam for the Run directory hierarchy. */
+  readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
 }
 
 const ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -393,7 +396,6 @@ export class JsonFileStore implements RunStore {
   private readonly syncForDurability: (fd: number, target: 'file' | 'directory') => void;
 
   constructor(options: JsonFileStoreOptions) {
-    this.dir = path.resolve(options.dir);
     this.mutationLockTimeoutMs = options.mutationLockTimeoutMs ?? DEFAULT_RUN_MUTATION_LOCK_TIMEOUT_MS;
     this.mutationLockRetryMs = options.mutationLockRetryMs ?? DEFAULT_RUN_MUTATION_LOCK_RETRY_MS;
     this.beforeConditionalWrite = options.beforeConditionalWrite;
@@ -404,7 +406,7 @@ export class JsonFileStore implements RunStore {
     if (!Number.isSafeInteger(this.mutationLockRetryMs) || this.mutationLockRetryMs < 1) {
       throw new Error('mutationLockRetryMs must be a positive safe integer.');
     }
-    mkdirSync(this.dir, { recursive: true });
+    this.dir = ensureDurableDirectory(path.resolve(options.dir), { syncDirectoryHierarchy: options.syncDirectoryHierarchy });
   }
 
   private filePathFor(id: string): string {

@@ -1,10 +1,11 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
-  closeSync, constants, fchmodSync, fsyncSync, linkSync, lstatSync, mkdirSync, openSync,
+  closeSync, constants, fchmodSync, fsyncSync, linkSync, lstatSync, openSync,
   readFileSync, readlinkSync, symlinkSync, unlinkSync, writeSync,
 } from 'node:fs';
 import path from 'node:path';
+import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 
 export class DispatchInvocationLockedError extends Error {
   constructor(lockPath: string) {
@@ -42,6 +43,8 @@ export interface DispatchInvocationLockOptions {
   readonly processStartIdentity?: (pid: number) => string | null;
   readonly beforeCanonicalLink?: () => void;
   readonly syncDirectory?: (directory: string) => void;
+  /** Separate path-aware barrier for every component leading to the lock directory. */
+  readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
   readonly beforeStaleTakeover?: () => void;
 }
 
@@ -299,7 +302,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
   const fsyncParent = () => (options.syncDirectory ?? fsyncDirectory)(path.dirname(options.lockPath));
   const publish = (): boolean => {
     const directory = path.dirname(options.lockPath);
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    ensureDurableDirectory(directory, { mode: 0o700, syncDirectoryHierarchy: options.syncDirectoryHierarchy });
     const tempPath = `${options.lockPath}.tmp-${randomBytes(16).toString('hex')}`;
     let descriptor: number | undefined;
     let linked = false;

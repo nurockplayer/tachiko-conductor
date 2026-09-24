@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +9,7 @@ import { describe, it } from 'node:test';
 import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
 import { handleHeartbeatAdmission, handleHeartbeatAdmissionJson, type HeartbeatAdmissionOptions } from '../src/mission-admission/heartbeat-admission.js';
 import { resolveHeartbeatOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { syncDirectory } from '../src/durable-directory.js';
 
 const config: AdmissionConfig = { schemaVersion: 1, revision: 'heartbeat-admission-test-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
 const supervisorId = 'tachiko-heartbeat-service';
@@ -17,7 +18,7 @@ function heartbeatLaneId(repository: string, workspace: string): string {
   return 'heartbeat:' + createHash('sha256').update(`${repository}\0${realpathSync(workspace)}`).digest('hex').slice(0, 32);
 }
 
-function setup(overrides: { readonly beforePublish?: () => void; readonly limits?: AdmissionConfig['limits']; readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void } = {}) {
+function setup(overrides: { readonly beforePublish?: () => void; readonly limits?: AdmissionConfig['limits']; readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void; readonly syncDirectoryHierarchy?: (directory: string) => void } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-heartbeat-admission-'));
   const workspace = path.join(directory, 'workspace');
   mkdirSync(workspace);
@@ -29,7 +30,7 @@ function setup(overrides: { readonly beforePublish?: () => void; readonly limits
     ...(overrides.syncForDurability === undefined ? {} : { syncForDurability: overrides.syncForDurability }),
   });
   const receiptPath = path.join(directory, 'private-receipts', 'heartbeat.json');
-  const options: HeartbeatAdmissionOptions = { registry, receiptPath: () => receiptPath };
+  const options: HeartbeatAdmissionOptions = { registry, receiptPath: () => receiptPath, ...(overrides.syncDirectoryHierarchy === undefined ? {} : { syncDirectoryHierarchy: overrides.syncDirectoryHierarchy }) };
   const request = (action: 'reserve' | 'inspect', repository = 'acme/widgets') => action === 'reserve'
     ? { schemaVersion: 1, action, repository, workspace, supervisorId }
     : { schemaVersion: 1, action, repository, workspace };
@@ -59,6 +60,37 @@ function setup(overrides: { readonly beforePublish?: () => void; readonly limits
 }
 
 describe('model-free heartbeat mission admission helper', () => {
+  it('blocks heartbeat admission before receipt temp publication until visible receipt hierarchy edges are synced', () => {
+    let failedParent: string | undefined;
+    const seen: string[] = [];
+    let fail = true;
+    const f = setup({ syncDirectoryHierarchy: (parent) => {
+      seen.push(parent);
+      if (fail && parent === failedParent) throw new Error('injected heartbeat receipt hierarchy sync failure');
+      syncDirectory(parent);
+    } });
+    failedParent = f.directory;
+    try {
+      assert.throws(() => handleHeartbeatAdmission(f.request('reserve'), f.options), /heartbeat receipt hierarchy sync failure/);
+      assert.equal(existsSync(path.dirname(f.receiptPath)), true, 'visible receipt directory remains for retry');
+      assert.equal(existsSync(f.receiptPath), false);
+      assert.equal(readdirSync(path.dirname(f.receiptPath)).length, 0, 'no receipt temp exists before its parent hierarchy barrier');
+      assert.equal(f.registry.snapshot().revision, 0, 'no admission state publishes if receipt hierarchy durability fails');
+      assert.equal(seen.at(-1), failedParent);
+
+      seen.length = 0;
+      assert.throws(() => handleHeartbeatAdmission(f.request('reserve'), f.options), /heartbeat receipt hierarchy sync failure/);
+      assert.equal(seen.at(-1), failedParent, 'retry re-syncs the parent despite the receipt directory being visible');
+      assert.equal(f.registry.snapshot().revision, 0);
+
+      fail = false;
+      const reserved = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(reserved.outcome, 'reserved', 'only the successfully synced retry returns the spawn grant');
+      assert.equal(f.registry.snapshot().revision, 1);
+      assert.ok(existsSync(f.receiptPath));
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
   it('does not grant a heartbeat reservation when parent sync fails after registry rename, and recovers it as already reserved', () => {
     let failDirectorySync = true;
     const f = setup({ syncForDurability: (fd, target) => {

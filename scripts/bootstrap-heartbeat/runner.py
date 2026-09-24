@@ -25,7 +25,7 @@ import tarfile
 import tempfile
 import time
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 
 LABEL = "io.tachiko.conductor.scd-heartbeat"
@@ -189,8 +189,52 @@ def now_epoch() -> int:
     return int(os.environ["SCD_HEARTBEAT_TEST_NOW"]) if testing() and "SCD_HEARTBEAT_TEST_NOW" in os.environ else int(time.time())
 
 
-def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+def fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def sync_directory_hierarchy(directory: Path) -> None:
+    """Path-aware hierarchy barrier, separate from an atomic file's parent sync."""
+    fsync_directory(directory)
+
+
+def ensure_durable_directory(
+    directory: Path,
+    mode: int = 0o700,
+    sync_hierarchy: Callable[[Path], None] | None = None,
+) -> Path:
+    if not directory.is_absolute():
+        raise RuntimeError(f"durable directory path must be absolute: {directory}")
+    directory = Path(os.path.abspath(directory))
+    current = Path(directory.anchor)
+    sync = sync_hierarchy or sync_directory_hierarchy
+    if not current.is_dir():
+        raise RuntimeError(f"filesystem root is not a directory: {current}")
+    for component in directory.parts[1:]:
+        child = current / component
+        try:
+            child.mkdir(mode=mode)
+        except FileExistsError:
+            pass
+        if not child.is_dir():
+            raise RuntimeError(f"durable path component is not a directory: {child}")
+        sync(current)
+        current = child
+    return current
+
+
+def atomic_write(
+    path: Path,
+    data: bytes,
+    mode: int = 0o600,
+    *,
+    sync_hierarchy: Callable[[Path], None] | None = None,
+) -> None:
+    ensure_durable_directory(path.parent, mode=0o700, sync_hierarchy=sync_hierarchy)
     descriptor, temp_name = tempfile.mkstemp(prefix=path.name + ".tmp-", dir=path.parent)
     temp = Path(temp_name)
     descriptor_open = True
@@ -228,7 +272,7 @@ def trim(path: Path, limit: int) -> None:
 
 
 def log(message: str) -> None:
-    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_durable_directory(ROOT, mode=0o700)
     with HEARTBEAT_LOG.open("a", encoding="utf-8") as stream:
         stream.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + message + "\n")
     os.chmod(HEARTBEAT_LOG, 0o600)
@@ -938,7 +982,7 @@ def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list
         try:
             for relative, data in emitted.items():
                 target = temporary / relative
-                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                ensure_durable_directory(target.parent, mode=0o700)
                 atomic_write(target, data, 0o600)
             atomic_write(temporary / "build-manifest.json", manifest_bytes, 0o600)
             os.chmod(temporary, 0o700)
@@ -1803,7 +1847,7 @@ def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], 
 
 
 def acquire_lock(verbose: bool):
-    ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+    ensure_durable_directory(ROOT, mode=0o700)
     os.chmod(ROOT, 0o700)
     stream = LOCK.open("a+b")
     os.chmod(LOCK, 0o600)
@@ -2202,7 +2246,7 @@ def install(args: argparse.Namespace) -> int:
         verify_wake_target(config)
         prior = load_state() if STATE.exists() else {}
         atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())
-        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        ensure_durable_directory(target.parent, mode=0o700)
         atomic_write(target, plistlib.dumps(plist, fmt=plistlib.FMT_XML))
         if not args.no_load:
             previous_service_loaded = bootout_if_loaded(domain)

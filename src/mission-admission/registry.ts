@@ -1,7 +1,8 @@
-import { closeSync, existsSync, mkdirSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, fsyncSync, realpathSync } from 'node:fs';
+import { closeSync, existsSync, openSync, readFileSync, renameSync, unlinkSync, writeFileSync, fsyncSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../dispatch/invocation-lock.js';
+import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 
 export const MISSION_ADMISSION_SCHEMA_VERSION = 1 as const;
 export const MISSION_ADMISSION_ROLES = ['production_captain', 'delegated_mutation_writer', 'read_only_review', 'read_only_consultation', 'isolated_experiment'] as const;
@@ -99,6 +100,8 @@ export interface MissionAdmissionOptions {
   readonly validatePath?: () => void;
   /** Deterministic durability fault seam; defaults to fsyncSync for file and parent directory. */
   readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void;
+  /** Path-aware fault seam for the registry and lock directory hierarchy. */
+  readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
 }
 
 export class AdmissionStateError extends Error {
@@ -368,6 +371,7 @@ export class MissionAdmissionRegistry {
   private readonly beforeStaleTakeover?: () => void;
   private readonly validatePath?: () => void;
   private readonly syncForDurability: (fd: number, target: 'file' | 'directory') => void;
+  private readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
 
   constructor(options: MissionAdmissionOptions) {
     validateAdmissionConfig(options.config);
@@ -382,11 +386,12 @@ export class MissionAdmissionRegistry {
     this.beforeStaleTakeover = options.beforeStaleTakeover;
     this.validatePath = options.validatePath;
     this.syncForDurability = options.syncForDurability ?? ((fd) => fsyncSync(fd));
+    this.syncDirectoryHierarchy = options.syncDirectoryHierarchy;
   }
 
   private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void): T {
     this.validatePath?.();
-    mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
+    ensureDurableDirectory(path.dirname(this.filePath), { mode: 0o700, syncDirectoryHierarchy: this.syncDirectoryHierarchy });
     this.validatePath?.();
     const unlock = acquireLock(`${this.filePath}.lock`, this.lockTimeoutMs, this.lockRetryMs, this.beforeStaleTakeover);
     try {

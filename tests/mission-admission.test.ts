@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -13,9 +13,11 @@ import { acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.j
 import { createHostAdmissionRegistry, resolveHeartbeatOwnerReceiptPath, resolveHostAdmissionConfig, resolveHostAdmissionPath, resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 import { dispatchWakePath } from '../src/dispatch/wake.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
+import { syncDirectory } from '../src/durable-directory.js';
 import { createRun } from '../src/domain/run.js';
 import { findRunByTarget, parseGitHubRepositoryRemote, resolveRunsDir } from '../src/cli.js';
 import { readManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
+import { writeRunOwnerReceipt, type RunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { handleHeartbeatAdmission } from '../src/mission-admission/heartbeat-admission.js';
 import { T0, TARGET } from './helpers.js';
 
@@ -28,10 +30,10 @@ function createHashForTest(repository: string, workspace: string): string {
   return createHash('sha256').update(`${repository}\0${realpathSync(workspace)}`).digest('hex');
 }
 
-function fixture(overrides: { readonly config?: AdmissionConfig; readonly beforePublish?: () => void; readonly onPublishedTransition?: (projection: import('../src/mission-admission/registry.js').AdmissionProjection) => void; readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void } = {}): { directory: string; filePath: string; registry: MissionAdmissionRegistry } {
+function fixture(overrides: { readonly config?: AdmissionConfig; readonly beforePublish?: () => void; readonly onPublishedTransition?: (projection: import('../src/mission-admission/registry.js').AdmissionProjection) => void; readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void; readonly syncDirectoryHierarchy?: (directory: string) => void } = {}): { directory: string; filePath: string; registry: MissionAdmissionRegistry } {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-'));
   const filePath = path.join(directory, 'host', 'admission.json');
-  return { directory, filePath, registry: new MissionAdmissionRegistry({ filePath, config: overrides.config ?? config, lockTimeoutMs: 10_000, ...(overrides.beforePublish ? { beforePublish: overrides.beforePublish } : {}), ...(overrides.onPublishedTransition ? { onPublishedTransition: overrides.onPublishedTransition } : {}), ...(overrides.syncForDurability ? { syncForDurability: overrides.syncForDurability } : {}) }) };
+  return { directory, filePath, registry: new MissionAdmissionRegistry({ filePath, config: overrides.config ?? config, lockTimeoutMs: 10_000, ...(overrides.beforePublish ? { beforePublish: overrides.beforePublish } : {}), ...(overrides.onPublishedTransition ? { onPublishedTransition: overrides.onPublishedTransition } : {}), ...(overrides.syncForDurability ? { syncForDurability: overrides.syncForDurability } : {}), ...(overrides.syncDirectoryHierarchy ? { syncDirectoryHierarchy: overrides.syncDirectoryHierarchy } : {}) }) };
 }
 
 function evidence(issue: number, overrides: Partial<MissionEvidence> = {}): MissionEvidence {
@@ -95,6 +97,49 @@ function git(directory: string, ...args: string[]): void {
 }
 
 describe('provider-neutral durable mission admission', () => {
+  it('blocks registry lock and admission callbacks until every visible hierarchy edge is synced', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-hierarchy-'));
+    const canonicalDirectory = realpathSync(directory);
+    const filePath = path.join(canonicalDirectory, 'host', 'nested', 'admission.json');
+    const failedParent = path.join(canonicalDirectory, 'host');
+    const observedParents: string[] = [];
+    let fail = true;
+    let beforePublish = 0;
+    let notifications = 0;
+    const registry = new MissionAdmissionRegistry({
+      filePath,
+      config,
+      beforePublish: () => { beforePublish += 1; },
+      onPublishedTransition: () => { notifications += 1; },
+      syncDirectoryHierarchy: (parent) => {
+        observedParents.push(parent);
+        if (fail && parent === failedParent) throw new Error('injected registry hierarchy sync failure');
+        syncDirectory(parent);
+      },
+    });
+    const request = { laneId: 'hierarchy-captain', role: 'production_captain' as const, evidence: evidence(88) };
+    try {
+      assert.throws(() => registry.admit(request), /registry hierarchy sync failure/);
+      assert.equal(existsSync(path.dirname(filePath)), true, 'created directory remains for a positively re-synced retry');
+      assert.equal(existsSync(filePath), false);
+      assert.equal(existsSync(`${filePath}.lock`), false, 'lock ownership is attempted only after the hierarchy barrier');
+      assert.equal(beforePublish, 0);
+      assert.equal(notifications, 0);
+      assert.equal(observedParents.at(-1), failedParent);
+
+      observedParents.length = 0;
+      assert.throws(() => registry.admit(request), /registry hierarchy sync failure/);
+      assert.equal(observedParents.at(-1), failedParent, 'retry re-syncs a visible component parent');
+      assert.equal(beforePublish, 0);
+
+      fail = false;
+      const admitted = registry.admit(request);
+      assert.equal(admitted.outcome, 'admitted');
+      assert.equal(beforePublish, 1);
+      assert.equal(notifications, 1);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('does not run publication callbacks after a registry parent-sync failure, while preserving the visible candidate', () => {
     let failDirectorySync = false;
     let transitionNotifications = 0;
@@ -466,6 +511,47 @@ describe('provider-neutral durable mission admission', () => {
       const published = readManualOwnerReceipt(receiptPath);
       assert.deepEqual(published?.token, admitted.token);
       recoveredRegistry.assertCanMutate(published!.token!);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('requires durable parent hierarchy barriers before Run and manual receipt temps', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-receipt-hierarchy-'));
+    const workspace = path.join(directory, 'worktree');
+    mkdirSync(workspace);
+    const runDirectory = path.join(directory, 'run-receipts', 'nested');
+    const manualDirectory = path.join(directory, 'manual-receipts', 'nested');
+    const runPath = path.join(runDirectory, 'owner.json');
+    const manualPath = path.join(manualDirectory, 'owner.json');
+    const runToken: AdmissionToken = { laneId: 'run:receipt-hierarchy', generation: 1, token: 'run-hierarchy-token' };
+    const runReceipt: RunOwnerReceipt = { schemaVersion: 1, laneId: runToken.laneId, missionId: 'mission-run-hierarchy', repository: 'example/widgets', runId: 'receipt-hierarchy', issue: 88, workspace, token: runToken, generation: 1, phase: 'pre_execution' };
+    const manualToken: AdmissionToken = { laneId: 'manual:receipt-hierarchy', generation: 1, token: 'manual-hierarchy-token' };
+    const manualReceipt: ManualOwnerReceipt = { schemaVersion: 1, laneId: manualToken.laneId, missionId: 'mission-manual-hierarchy', repository: 'example/widgets', workspace, branch: 'main', checkpointSha: 'a'.repeat(40), status: 'active', generation: 1, token: manualToken };
+
+    const checkBarrier = (receiptPath: string, receipt: RunOwnerReceipt | ManualOwnerReceipt, write: (path: string, value: RunOwnerReceipt | ManualOwnerReceipt, sync: (parent: string) => void) => void) => {
+      const parent = path.dirname(path.dirname(receiptPath));
+      let fail = true;
+      const seen: string[] = [];
+      const syncHierarchy = (directoryPath: string) => {
+        seen.push(directoryPath);
+        if (fail && directoryPath === parent) throw new Error('injected receipt hierarchy sync failure');
+        syncDirectory(directoryPath);
+      };
+      assert.throws(() => write(receiptPath, receipt, syncHierarchy), /receipt hierarchy sync failure/);
+      assert.equal(existsSync(path.dirname(receiptPath)), true);
+      assert.equal(existsSync(receiptPath), false, 'receipt destination is untouched before hierarchy durability');
+      assert.equal(readdirSync(path.dirname(receiptPath)).length, 0, 'receipt temp is not created before the hierarchy barrier');
+      assert.equal(seen.at(-1), parent);
+      seen.length = 0;
+      assert.throws(() => write(receiptPath, receipt, syncHierarchy), /receipt hierarchy sync failure/);
+      assert.equal(seen.at(-1), parent, 'retry resyncs the visible parent edge');
+      fail = false;
+      write(receiptPath, receipt, syncHierarchy);
+      assert.equal(existsSync(receiptPath), true);
+    };
+
+    try {
+      checkBarrier(runPath, runReceipt, (receiptPath, receipt, syncHierarchy) => writeRunOwnerReceipt(receiptPath, receipt as RunOwnerReceipt, { syncDirectoryHierarchy: syncHierarchy }));
+      checkBarrier(manualPath, manualReceipt, (receiptPath, receipt, syncHierarchy) => writeManualOwnerReceipt(receiptPath, receipt as ManualOwnerReceipt, { syncDirectoryHierarchy: syncHierarchy }));
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

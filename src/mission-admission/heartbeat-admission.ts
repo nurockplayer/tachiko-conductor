@@ -1,7 +1,8 @@
-import { closeSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, fchmodSync, fsyncSync, lstatSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { assertSafeCurrentAccountPathIfApplicable } from '../account-home.js';
+import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 
 import { createHostAdmissionRegistry, resolveHeartbeatOwnerReceiptPath, type HostAdmissionResolverOptions } from './host-registry.js';
 import { canonicalizeMissionEvidence, deterministicMissionId, MissionAdmissionRegistry, type AdmissionToken } from './registry.js';
@@ -95,6 +96,8 @@ type PrivateHeartbeatReceipt = HeartbeatAdmissionReceipt | DiscardedHeartbeatRec
 export interface HeartbeatAdmissionOptions extends HostAdmissionResolverOptions {
   readonly registry?: MissionAdmissionRegistry;
   readonly receiptPath?: (repository: string, workspace: string) => string;
+  /** Path-aware barrier for private heartbeat receipt directory hierarchies. */
+  readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
 }
 
 function isObject(value: unknown): value is Record<string, unknown> {
@@ -179,10 +182,10 @@ function privateReceipt(filePath: string): PrivateHeartbeatReceipt | null {
   return parsed as unknown as PrivateHeartbeatReceipt;
 }
 
-function writePrivateReceipt(filePath: string, receipt: PrivateHeartbeatReceipt): void {
+function writePrivateReceipt(filePath: string, receipt: PrivateHeartbeatReceipt, syncDirectoryHierarchy?: SyncDirectoryHierarchy): void {
   assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   const directory = path.dirname(filePath);
-  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  ensureDurableDirectory(directory, { mode: 0o700, syncDirectoryHierarchy });
   assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   const dirStats = lstatSync(directory);
   if (!dirStats.isDirectory() || dirStats.isSymbolicLink() || (typeof process.getuid === 'function' && dirStats.uid !== process.getuid())) throw new Error('Heartbeat receipt directory is not a real owner-owned directory.');
@@ -208,8 +211,8 @@ function writePrivateReceipt(filePath: string, receipt: PrivateHeartbeatReceipt)
   if (!written.isFile() || written.isSymbolicLink() || (written.mode & 0o777) !== 0o600 || (typeof process.getuid === 'function' && written.uid !== process.getuid())) throw new Error('Published heartbeat receipt failed owner-only permission checks.');
 }
 
-function writeReceipt(filePath: string, receipt: HeartbeatAdmissionReceipt): void {
-  writePrivateReceipt(filePath, receipt);
+function writeReceipt(filePath: string, receipt: HeartbeatAdmissionReceipt, syncDirectoryHierarchy?: SyncDirectoryHierarchy): void {
+  writePrivateReceipt(filePath, receipt, syncDirectoryHierarchy);
 }
 
 function statusProjection(registry: MissionAdmissionRegistry, laneId: string) {
@@ -310,7 +313,7 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
         repository: evidence.repository, workspace: evidence.workspace!, supervisorId: receipt.supervisorId,
         receiptId: receipt.receiptId, generation: receipt.token.generation, predecessor,
       };
-      writePrivateReceipt(receiptPath, marker);
+      writePrivateReceipt(receiptPath, marker, options.syncDirectoryHierarchy);
       return true;
     });
     return valid
@@ -395,7 +398,7 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
         receiptId: randomUUID(),
         status: 'active',
         token: admitted.token,
-      }),
+      }, options.syncDirectoryHierarchy),
     });
     if (result.outcome === 'admitted') {
       const receipt = privateReceipt(receiptPath);
@@ -411,7 +414,7 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
   if (request.expectedGeneration !== receipt.token.generation || request.receiptId !== receipt.receiptId || request.supervisorId !== receipt.supervisorId) throw new Error('Heartbeat admission settle receipt generation or supervisor identity does not match its private receipt.');
   const lane = registry.readLane(laneId);
   if (lane?.status === 'active' && lane.generation === receipt.token.generation) {
-    registry.release(receipt.token, true, () => writeReceipt(receiptPath, { ...receipt, status: 'settled' }));
+    registry.release(receipt.token, true, () => writeReceipt(receiptPath, { ...receipt, status: 'settled' }, options.syncDirectoryHierarchy));
   } else if (!(lane?.status === 'released' && lane.generation === receipt.token.generation + 1 && receipt.status === 'settled')) {
     throw new Error('Heartbeat admission receipt is stale or no longer owns the active lane.');
   }
