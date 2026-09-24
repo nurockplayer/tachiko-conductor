@@ -32,13 +32,23 @@ class HeartbeatTest(unittest.TestCase):
         self.python_test_support = self.root / "python-test-support"
         self.python_test_support.mkdir()
         (self.python_test_support / "sitecustomize.py").write_text(
-            "import os, pwd\n"
+            "import os, pwd, subprocess\n"
             "_getpwuid = pwd.getpwuid\n"
             "def _test_getpwuid(uid):\n"
             "    record = _getpwuid(uid)\n"
             "    home = os.environ.get('SCD_HEARTBEAT_TEST_ACCOUNT_HOME')\n"
             "    return pwd.struct_passwd(record[:5] + (home,) + record[6:]) if home else record\n"
-            "pwd.getpwuid = _test_getpwuid\n",
+            "pwd.getpwuid = _test_getpwuid\n"
+            "_subprocess_run = subprocess.run\n"
+            "def _test_run(args, *pos, **kw):\n"
+            "    command = args[0] if isinstance(args, (list, tuple)) and args else ''\n"
+            "    preload = os.environ.get('SCD_HEARTBEAT_TEST_NODE_PRELOAD')\n"
+            "    if preload and os.path.basename(command).startswith('verified-node-'):\n"
+            "        child_env = dict(kw.get('env') or os.environ)\n"
+            "        child_env['NODE_OPTIONS'] = '--import ' + preload\n"
+            "        kw['env'] = child_env\n"
+            "    return _subprocess_run(args, *pos, **kw)\n"
+            "subprocess.run = _test_run\n",
             encoding="utf-8",
         )
         real_getpwuid = pwd.getpwuid
@@ -119,6 +129,7 @@ class HeartbeatTest(unittest.TestCase):
             "MOCK_LAUNCHCTL_FAIL_MARKER": str(self.root / "launchctl-failed-once"),
             "MOCK_ADMISSION_STATE": str(self.admission_state),
             "SCD_HEARTBEAT_TEST_ACCOUNT_HOME": str(self.account_home),
+            "SCD_HEARTBEAT_TEST_NODE_PRELOAD": str(HERE.parent.parent / "tests/fixtures/account-home-preload.mjs"),
             "PYTHONPATH": str(self.python_test_support),
         })
         self.env.pop("TACHIKO_MISSION_ADMISSION_PATH", None)
@@ -781,6 +792,7 @@ class HeartbeatTest(unittest.TestCase):
         finally:
             transitive.write_bytes(transitive_bytes)
         helper_env = module.admission_helper_environment(runtime_config)
+        node_preload = HERE.parent.parent / "tests/fixtures/account-home-preload.mjs"
         registry_js = Path(helper).parents[1] / "mission-admission/registry.js"
         host_registry_js = Path(helper).parents[1] / "mission-admission/host-registry.js"
         direct_source = (
@@ -789,7 +801,7 @@ class HeartbeatTest(unittest.TestCase):
             "const result = registry.admit({laneId:'native-direct-smoke',role:'production_captain',highAutonomy:true,evidence:{repository:'nurockplayer/tachiko-conductor',issue:117,workspace:" + json.dumps(admission["workspace"]) + "}});\n"
             "console.log(JSON.stringify(result));\n"
         )
-        direct = subprocess.run([str(node), "--input-type=module", "-e", direct_source], env=helper_env,
+        direct = subprocess.run([str(node), "--import", str(node_preload), "--input-type=module", "-e", direct_source], env=helper_env,
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         direct_result = json.loads(direct.stdout)
         self.assertEqual(direct_result["outcome"], "admitted")
@@ -806,7 +818,7 @@ class HeartbeatTest(unittest.TestCase):
             "const lane = registry.readLane('native-direct-smoke');\n"
             "registry.release({laneId:lane.laneId,generation:lane.generation,token:" + json.dumps(direct_result["token"]["token"]) + "},true);\n"
         )
-        subprocess.run([str(node), "--input-type=module", "-e", release_source], env=helper_env,
+        subprocess.run([str(node), "--import", str(node_preload), "--input-type=module", "-e", release_source], env=helper_env,
                        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
         resumed = self.invoke("run", env=dict(
             self.env, SCD_HEARTBEAT_TEST_NOW="1002",
@@ -816,10 +828,15 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(len(self.records()), 1)
         self.assertEqual(self.records()[0]["admission_path"], admission["registry"],
                          "native CLI in the wake must use the helper's fixed registry domain")
-        inspect = module.admission_call(runtime_config, {
-            "schemaVersion": 1, "action": "inspect", "repository": admission["repository"],
-            "workspace": admission["workspace"],
-        })
+        original_helper_environment = module.admission_helper_environment
+        with mock.patch.object(
+            module, "admission_helper_environment",
+            side_effect=lambda selected: {**original_helper_environment(selected), "NODE_OPTIONS": "--import " + str(node_preload)},
+        ):
+            inspect = module.admission_call(runtime_config, {
+                "schemaVersion": 1, "action": "inspect", "repository": admission["repository"],
+                "workspace": admission["workspace"],
+            })
         self.assertEqual(inspect["outcome"], "inspected")
         heartbeat_lane = inspect["lane"]
         self.assertIsNotNone(heartbeat_lane)
