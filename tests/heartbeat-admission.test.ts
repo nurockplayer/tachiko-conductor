@@ -146,6 +146,65 @@ describe('model-free heartbeat mission admission helper', () => {
     } finally { rmSync(f.directory, { recursive: true, force: true }); }
   });
 
+  it('read-only recovers only an exact released predecessor after failed capacity-park publication', () => {
+    const limits = { maxCaptains: 4, maxWriters: 4, maxHighAutonomy: 2 };
+    const f = setup({ limits });
+    try {
+      const first = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(first.outcome, 'reserved');
+      if (first.outcome !== 'reserved') throw new Error('expected initial reservation');
+      handleHeartbeatAdmission(f.settle('acme/widgets', first.generation, first.receiptId), f.options);
+      const oldReceipt = readFileSync(f.receiptPath, 'utf8');
+      const blockers: Array<{ laneId: string; generation: number; token: string }> = [];
+      for (const [index, repository] of ['acme/blocker-a', 'acme/blocker-b'].entries()) {
+        const workspace = path.join(f.directory, `blocker-${index}`);
+        mkdirSync(workspace);
+        const result = f.registry.admit({ laneId: `run:blocker-${index}`, role: 'production_captain', highAutonomy: true,
+          evidence: { repository, repositoryScope: true, workspace } });
+        assert.equal(result.outcome, 'admitted');
+        if (result.outcome !== 'admitted') throw new Error('expected high-autonomy capacity blocker');
+        blockers.push(result.token);
+      }
+
+      const before = f.registry.snapshot();
+      const failingRegistry = new MissionAdmissionRegistry({
+        filePath: f.registryPath, config: { ...config, limits }, beforePublish: () => { throw new Error('injected capacity-park publication failure'); },
+      });
+      const failedOptions: HeartbeatAdmissionOptions = { registry: failingRegistry, receiptPath: () => f.receiptPath };
+      assert.throws(() => handleHeartbeatAdmission({ ...f.request('reserve'), supervisorId: 'new-supervisor' }, failedOptions), /injected capacity-park publication failure/);
+      assert.deepEqual(f.registry.snapshot(), before, 'failed park publication leaves the released predecessor unchanged');
+      assert.equal(readFileSync(f.receiptPath, 'utf8'), oldReceipt, 'capacity denial does not overwrite the old settled tombstone');
+
+      const recovered = handleHeartbeatAdmission(f.recover('acme/widgets', null, { supervisor: 'new-supervisor' }), failedOptions);
+      assert.equal(recovered.outcome, 'released_predecessor');
+      if (recovered.outcome !== 'released_predecessor') throw new Error('expected exact released predecessor');
+      assert.equal(recovered.generation + 1, recovered.releasedGeneration);
+      assert.equal(recovered.generation, first.generation);
+      assert.equal(recovered.receiptId, first.receiptId);
+      assert.equal(recovered.supervisorId, supervisorId, 'historical supervisor need not own the new pending intent');
+      assert.deepEqual(failingRegistry.snapshot(), before, 'read-only classification leaves all lanes untouched');
+      assert.equal(readFileSync(f.receiptPath, 'utf8'), oldReceipt);
+
+      const receipt = JSON.parse(oldReceipt) as Record<string, unknown> & { token: { generation: number } };
+      receipt.token = { ...receipt.token, generation: receipt.token.generation + 1 };
+      writeFileSync(f.receiptPath, JSON.stringify(receipt), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null, { supervisor: 'new-supervisor' }), failedOptions).outcome, 'not_owned', 'incorrect tombstone generation is fenced');
+      receipt.token = { ...receipt.token, generation: first.generation };
+      receipt.workspace = '/tmp/foreign-heartbeat-workspace';
+      writeFileSync(f.receiptPath, JSON.stringify(receipt), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null, { supervisor: 'new-supervisor' }), failedOptions).outcome, 'not_owned', 'wrong workspace evidence is fenced');
+      writeFileSync(f.receiptPath, oldReceipt, { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', first.generation, { supervisor: 'new-supervisor' }), failedOptions).outcome, 'not_owned', 'the predecessor result is null-generation only');
+
+      for (const blocker of blockers) f.registry.release(blocker, true);
+      const successor = handleHeartbeatAdmission({ ...f.request('reserve'), supervisorId: 'new-supervisor' }, f.options);
+      assert.equal(successor.outcome, 'reserved');
+      const activeRecovery = handleHeartbeatAdmission(f.recover('acme/widgets', null, { supervisor: 'new-supervisor' }), f.options);
+      assert.equal(activeRecovery.outcome, 'recoverable', 'an active successor is never classified as a released predecessor');
+      if (successor.outcome === 'reserved') handleHeartbeatAdmission(f.settle('acme/widgets', successor.generation, successor.receiptId, { supervisor: 'new-supervisor' }), f.options);
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
   it('reports overlapping production ownership without exposing the owner capability', () => {
     const f = setup({ limits: { maxCaptains: 2, maxWriters: 1, maxHighAutonomy: 2 } });
     try {

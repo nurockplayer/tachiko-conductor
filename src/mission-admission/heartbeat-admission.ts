@@ -191,6 +191,7 @@ export type HeartbeatAdmissionResult =
   | ({ readonly schemaVersion: 1; readonly outcome: 'inspected' } & HeartbeatStatusProjection)
   | { readonly schemaVersion: 1; readonly outcome: 'recoverable' | 'settlement_pending' | 'already_settled'; readonly laneId: string; readonly generation: number; readonly receiptId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'uncommitted_receipt'; readonly laneId: string; readonly generation: number; readonly receiptId: string; readonly supervisorId: string }
+  | { readonly schemaVersion: 1; readonly outcome: 'released_predecessor'; readonly laneId: string; readonly generation: number; readonly releasedGeneration: number; readonly receiptId: string; readonly supervisorId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'absent' | 'capacity_wait' | 'not_owned'; readonly laneId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'discarded_uncommitted'; readonly laneId: string; readonly generation: number; readonly receiptId: string; readonly supervisorId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'reserved' | 'already_reserved'; readonly laneId: string; readonly missionId: string; readonly generation: number; readonly receiptId: string; readonly revision: number }
@@ -256,6 +257,15 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
       receipt.token.generation + 1 < lane.generation;
     if (exactCapacityWaitLane && (receipt === null || historicalSettledReceipt)) {
       return { schemaVersion: 1, outcome: 'capacity_wait', laneId };
+    }
+    if (request.expectedGeneration === null && receipt !== null && receipt.status === 'settled' && lane?.status === 'released' &&
+        lane.laneId === laneId && lane.role === 'production_captain' && lane.highAutonomy === true &&
+        lane.evidence.repositoryScope === true && lane.evidence.repository === evidence.repository && lane.evidence.workspace === evidence.workspace &&
+        Object.keys(lane.evidence).every((key) => ['repository', 'repositoryScope', 'workspace'].includes(key)) &&
+        lane.missionId === deterministicMissionId(evidence) && receipt.laneId === laneId && receipt.missionId === lane.missionId &&
+        receipt.repository === evidence.repository && receipt.workspace === evidence.workspace && receipt.token.generation + 1 === lane.generation) {
+      return { schemaVersion: 1, outcome: 'released_predecessor', laneId, generation: receipt.token.generation,
+        releasedGeneration: lane.generation, receiptId: receipt.receiptId, supervisorId: receipt.supervisorId };
     }
     if (request.expectedGeneration === null && receipt !== null && receipt.status === 'active' &&
         receipt.laneId === laneId && receipt.repository === evidence.repository && receipt.workspace === evidence.workspace &&

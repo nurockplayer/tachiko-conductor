@@ -1264,6 +1264,32 @@ def reconcile_pending_admission(config: dict[str, Any], state: dict[str, Any]) -
         save_state(state)
         log("cleared exact dead pre-execution intent while preserving the parked capacity lane")
         return True
+    if recovery.get("outcome") == "released_predecessor":
+        generation = recovery.get("generation")
+        released_generation = recovery.get("releasedGeneration")
+        receipt_id = recovery.get("receiptId")
+        predecessor_supervisor = recovery.get("supervisorId")
+        admission = config["admission"]
+        canonical_workspace = str(Path(admission["workspace"]).resolve(strict=True))
+        expected_lane_id = "heartbeat:" + hashlib.sha256(
+            (admission["repository"] + "\0" + canonical_workspace).encode("utf-8")
+        ).hexdigest()[:32]
+        try:
+            valid_receipt_id = isinstance(receipt_id, str) and str(uuid.UUID(receipt_id)) == receipt_id
+        except (ValueError, AttributeError):
+            valid_receipt_id = False
+        if (pending["generation"] is not None or pending["receipt_id"] is not None
+                or pending["phase"] != "reserved_pre_execution"
+                or not pending_owner_is_proven_dead(pending, host_id, boot_id)
+                or type(generation) is not int or generation <= 0
+                or type(released_generation) is not int or released_generation != generation + 1
+                or not valid_receipt_id or recovery.get("laneId") != expected_lane_id
+                or not isinstance(predecessor_supervisor, str) or not predecessor_supervisor):
+            raise RuntimeError("released heartbeat predecessor does not match a dead generation-free pre-execution intent")
+        state["pending_admission"] = None
+        save_state(state)
+        log("cleared exact dead pre-execution intent over its released heartbeat predecessor")
+        return True
     if recovery.get("outcome") == "uncommitted_receipt":
         generation = recovery.get("generation")
         receipt_id = recovery.get("receiptId")

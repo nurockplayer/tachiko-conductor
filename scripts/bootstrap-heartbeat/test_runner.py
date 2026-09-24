@@ -408,6 +408,7 @@ class HeartbeatTest(unittest.TestCase):
             "} else if (q.action === 'recover') {\n"
             " if (s.uncommittedReceipt && q.expectedGeneration === null && q.supervisorId === s.supervisorId) { console.log(JSON.stringify({schemaVersion:1,outcome:'uncommitted_receipt',generation:s.generation,receiptId:s.receiptId,supervisorId:s.supervisorId})); process.exit(0); }\n"
             " if ((s.capacityWait || s.capacityWaitHistoricalReceipt) && !s.active && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'capacity_wait'})); process.exit(0); }\n"
+            " if (s.releasedPredecessor && !s.active && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'released_predecessor',laneId:s.laneId,generation:s.generation,releasedGeneration:s.releasedGeneration,receiptId:s.receiptId,supervisorId:s.supervisorId})); process.exit(0); }\n"
             " if (s.active && s.settlementPending && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'settlement_pending',generation:s.generation,receiptId:s.receiptId}));\n"
             " else if (s.active && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'recoverable',generation:s.generation,receiptId:s.receiptId}));\n"
             " else if (!s.active && q.expectedGeneration !== null && s.releasedGeneration === q.expectedGeneration + 1) console.log(JSON.stringify({schemaVersion:1,outcome:'already_settled',generation:q.expectedGeneration,receiptId:s.receiptId}));\n"
@@ -417,6 +418,7 @@ class HeartbeatTest(unittest.TestCase):
             " if (s.uncommittedReceipt && q.supervisorId === s.supervisorId && q.expectedGeneration === s.generation && q.receiptId === s.receiptId) { s.uncommittedReceipt = false; s.discardedUncommitted = true; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'discarded_uncommitted',generation:q.expectedGeneration,receiptId:q.receiptId,supervisorId:q.supervisorId})); } else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
             "} else if (q.action === 'reserve') {\n"
             " if (s.mode === 'waiting') { console.log(JSON.stringify({schemaVersion:1,outcome:'waiting'})); process.exit(0); }\n"
+            " if (s.mode === 'owned_elsewhere') { console.log(JSON.stringify({schemaVersion:1,outcome:'owned_elsewhere'})); process.exit(0); }\n"
             " if (s.mode === 'corrupt') { process.exit(2); }\n"
             " if (s.active) { console.log(JSON.stringify({schemaVersion:1,outcome:'already_reserved',generation:s.generation,receiptId:s.receiptId,revision:s.generation})); process.exit(0); }\n"
             " s.generation = (s.generation || 0) + 1; s.receiptId = '00000000-0000-4000-8000-' + String(s.generation).padStart(12,'0');\n"
@@ -697,6 +699,24 @@ class HeartbeatTest(unittest.TestCase):
             "receiptId": "00000000-0000-4000-8000-000000000007", "supervisorId": receipt_owner or owner,
         }), encoding="utf-8")
 
+    def _set_released_predecessor_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host", boot_id: str = "test-boot") -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "new-supervisor", "host_id": host_id, "boot_id": boot_id,
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        repository = "nurockplayer/tachiko-conductor"
+        workspace = str(Path.cwd().resolve())
+        lane_id = "heartbeat:" + hashlib.sha256((repository + "\0" + workspace).encode()).hexdigest()[:32]
+        self.admission_state.write_text(json.dumps({
+            "mode": "waiting", "releasedPredecessor": True, "active": False,
+            "generation": 6, "releasedGeneration": 7,
+            "receiptId": "00000000-0000-4000-8000-000000000006", "supervisorId": "previous-supervisor",
+            "status": "settled", "laneId": lane_id,
+        }), encoding="utf-8")
+
     def test_capacity_wait_crash_clears_only_dead_generation_free_preexecution_intent(self) -> None:
         self.invoke("run", "--prime")
         self._set_capacity_wait_pending()
@@ -794,6 +814,55 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(restarted.returncode, 0, restarted.stderr)
         self.assertIsNone(self.state()["pending_admission"])
         self.assertEqual(self.records(), [], "a second capacity denial across restart remains no-spawn")
+
+    def test_released_predecessor_clears_crashed_owned_elsewhere_intent_then_retries_without_spawn(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self.admission_state.write_text(json.dumps({"mode": "owned_elsewhere"}), encoding="utf-8")
+        failed_clear = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_CLEAR_PENDING="1",
+        ), check=False)
+        self.assertEqual(failed_clear.returncode, 1)
+        pending = self.state()["pending_admission"]
+        self.assertIsNotNone(pending, "crash/failure after owned_elsewhere must preserve the null-generation intent")
+        self.assertEqual(pending["phase"], "reserved_pre_execution")
+        self.assertIsNone(pending["generation"])
+        self.assertIsNone(pending["receipt_id"])
+
+        predecessor = {
+            "mode": "waiting", "releasedPredecessor": True, "active": False,
+            "generation": 6, "releasedGeneration": 7,
+            "receiptId": "00000000-0000-4000-8000-000000000006", "supervisorId": "previous-supervisor",
+            "status": "settled", "laneId": "heartbeat:" + hashlib.sha256(("nurockplayer/tachiko-conductor\0" + str(Path.cwd().resolve())).encode()).hexdigest()[:32],
+        }
+        self.admission_state.write_text(json.dumps(predecessor), encoding="utf-8")
+        retried = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        after = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertEqual(after, predecessor, "read-only classification and repeated capacity denial preserve the tombstone/lane")
+        self.assertEqual(self.records(), [], "only a fresh reserved result may spawn")
+
+    def test_released_predecessor_refuses_wrong_phase_or_host_after_reboot(self) -> None:
+        for phase, host_id, boot_id, bad_tombstone in (
+            ("spawn_uncertain", "test-host", "prior-boot", None),
+            ("reserved_pre_execution", "other-host", "prior-boot", None),
+            ("reserved_pre_execution", "test-host", "test-boot", {"releasedGeneration": 8}),
+            ("reserved_pre_execution", "test-host", "test-boot", {"laneId": "heartbeat:foreign"}),
+            ("reserved_pre_execution", "test-host", "test-boot", {"receiptId": "not-a-uuid"}),
+        ):
+            with self.subTest(phase=phase, host_id=host_id, bad_tombstone=bad_tombstone):
+                self.invoke("run", "--prime")
+                self._set_released_predecessor_pending(phase=phase, host_id=host_id, boot_id=boot_id)
+                before = json.loads(self.admission_state.read_text(encoding="utf-8"))
+                if bad_tombstone is not None:
+                    before.update(bad_tombstone)
+                    self.admission_state.write_text(json.dumps(before), encoding="utf-8")
+                result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIsNotNone(self.state()["pending_admission"])
+                self.assertEqual(json.loads(self.admission_state.read_text(encoding="utf-8")), before)
+                self.assertEqual(self.records(), [])
 
     def test_same_boot_uncertain_intent_clears_only_after_registry_proves_exact_release(self) -> None:
         self.invoke("run", "--prime")
