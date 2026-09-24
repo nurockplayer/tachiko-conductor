@@ -1,6 +1,6 @@
 ---
 name: tachiko-project-steward
-description: Inspect a software project's live GitHub state, reconcile it with repository governance, explain status plainly, and choose or perform the smallest safe next action.
+description: Inspect a software project's live GitHub state, reconcile it with repository governance, explain status plainly, and choose or perform the smallest safe next action. Use when the user asks to 盤點專案, 看進度, 卡在哪, 下一步, 照固定流程, or asks ChatGPT to handle what it can before handing substantial implementation to Codex.
 ---
 
 # Repository discovery entrypoint
