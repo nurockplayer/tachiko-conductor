@@ -18,7 +18,7 @@ import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import { WORKER_ROUTER_PROVIDER, WorkerRouterAdapter } from './agents/worker-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
-import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
+import type { GitHubAdapter, GitHubLivePullRequestSnapshot, GitHubLiveSnapshot } from './adapters/github.js';
 import type { HostedCheckPolicyConfiguration, LocalValidationConfiguration } from './adapters/validation.js';
 import {
   ConfiguredLocalValidationAdapter,
@@ -103,7 +103,7 @@ import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
 import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
 import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, readOperationalRuntimeProjection, registerManualLane, retireManualLane, setMaintenanceHold, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
 import { createHostAdmissionRegistry, resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from './mission-admission/host-registry.js';
-import { canonicalizeMissionEvidence, type AdmissionResult, type AdmissionToken, type MissionAdmissionRegistry } from './mission-admission/registry.js';
+import { canonicalizeMissionEvidence, type AdmissionLaneView, type AdmissionResult, type AdmissionToken, type MissionAdmissionRegistry } from './mission-admission/registry.js';
 import { readManualOwnerReceipt, validateManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from './mission-admission/manual-owner-receipt.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt, type RunOwnerReceipt, type RunOwnerReceiptPhase } from './mission-admission/run-owner-receipt.js';
 import { selectDispatchRuntime, renderDispatchRuntime, type DispatchRuntimeClaim } from './dispatch/queue.js';
@@ -1520,6 +1520,9 @@ export function runTransitionCommand(store: RunStore, id: string, type: Transiti
     const current = store.read(id);
     if (current === null) throw new Error(`No run with id "${id}" found.`);
     const next = applyTransition(current, { type, reason });
+    if (type === 'merged') {
+      throw new Error('Transition "merged" requires an exact live GitHub merged pull-request proof; use the CLI merge reconciliation path.');
+    }
     if (store.updateIfUnchanged !== undefined) {
       if (!store.updateIfUnchanged(current, next)) throw new Error(`Run "${id}" changed concurrently; refusing to apply a stale transition.`);
     } else if (admission !== undefined) {
@@ -1530,6 +1533,181 @@ export function runTransitionCommand(store: RunStore, id: string, type: Transiti
     return next;
   };
   return admission === undefined ? transition() : admission.withRunTransitionFence(id, transition);
+}
+
+function assertExactMergedPullRequest(run: Run, pullRequest: GitHubLivePullRequestSnapshot): void {
+  const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  const bootstrap = run.bootstrap;
+  const persisted = run.pullRequest;
+  if (bootstrap === undefined || persisted === undefined || run.headSha === undefined || run.headSha === '' ||
+    pullRequest.state !== 'merged' || pullRequest.number !== persisted.number ||
+    pullRequest.headSha !== run.headSha || persisted.headSha !== run.headSha ||
+    bootstrap.owner.toLowerCase() !== run.target.owner.toLowerCase() || bootstrap.repo.toLowerCase() !== run.target.repo.toLowerCase() ||
+    (run.target.kind === 'issue' && bootstrap.issueNumber !== run.target.issueNumber) ||
+    pullRequest.headRef !== (bootstrap.publicationBranch ?? bootstrap.branch) ||
+    pullRequest.baseRef !== bootstrap.baseBranch ||
+    pullRequest.headRepository === undefined || pullRequest.headRepository === null ||
+    `${pullRequest.headRepository.owner}/${pullRequest.headRepository.repo}`.toLowerCase() !== repository ||
+    pullRequest.baseRepository === undefined || pullRequest.baseRepository === null ||
+    `${pullRequest.baseRepository.owner}/${pullRequest.baseRepository.repo}`.toLowerCase() !== repository) {
+    throw new Error(`Live pull request proof does not match Run "${run.id}" persisted PR, HEAD, branch, and base identity, or the PR is not merged.`);
+  }
+  // The base branch is mutable and may advance (including after a squash
+  // merge); repository and branch identity are the stable base proof.
+}
+
+function assertMergeLaneIdentity(run: Run, lane: AdmissionLaneView): string | undefined {
+  const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  if (lane.laneId !== `run:${run.id}` || lane.evidence.run !== run.id || lane.evidence.repository !== repository ||
+    lane.evidence.issue !== (run.target.kind === 'issue' ? run.target.issueNumber : undefined) ||
+    lane.evidence.claim !== run.dispatchClaimId || lane.evidence.pullRequest !== run.pullRequest?.number) {
+    throw new Error(`Admission lane identity for Run "${run.id}" does not match the persisted merge identity.`);
+  }
+  if (run.bootstrap === undefined) throw new Error(`Run "${run.id}" has no persisted bootstrap identity for merge reconciliation.`);
+  const persistedWorkspace = canonicalizeMissionEvidence({ repository, workspace: run.bootstrap.workspacePath }).workspace;
+  if (lane.evidence.workspace !== persistedWorkspace) {
+    throw new Error(`Admission lane workspace for Run "${run.id}" does not match its persisted bootstrap workspace.`);
+  }
+  return lane.evidence.workspace;
+}
+
+function readMergeReceipt(receiptPath: string, run: Run, missionId: string, workspace: string | undefined): RunOwnerReceipt {
+  const receipt = readRunOwnerReceipt(receiptPath);
+  if (receipt === null || !sameRunReceiptIdentity(receipt, run, missionId) ||
+    (receipt.workspace !== workspace && !(receipt.workspace === undefined && canBindMissingReceiptWorkspace(receipt, run, workspace)))) {
+    throw new Error(`Run owner receipt does not match exact merge lane identity for Run "${run.id}".`);
+  }
+  return receipt;
+}
+
+function writeMergeReleaseTransition(receiptPath: string, run: Run, missionId: string, lane: AdmissionLaneView): number {
+  const workspace = assertMergeLaneIdentity(run, lane);
+  const receipt = readMergeReceipt(receiptPath, run, missionId, workspace);
+  const generation = lane.generation;
+  const alreadyTransitioning = receipt.phase === 'parked_release_transition' && receipt.generation === generation && receipt.token === undefined;
+  if (alreadyTransitioning) {
+    if (receipt.settlementReason !== 'workflow_settled') throw new Error(`Run owner receipt lacks workflow_settled merge authority for Run "${run.id}".`);
+    return generation;
+  }
+  const initialParked = receipt.phase === 'parked' && receipt.generation === generation && receipt.token === undefined;
+  if (!initialParked) throw new Error(`Run owner receipt phase and generation do not match workflow_settled lane generation ${generation}.`);
+  const { token: _token, ...withoutToken } = receipt;
+  writeRunOwnerReceipt(receiptPath, {
+    ...withoutToken,
+    ...(workspace === undefined ? {} : { workspace }),
+    phase: 'parked_release_transition',
+    generation,
+    settlementReason: 'workflow_settled',
+  });
+  return generation;
+}
+
+function finalizeMergeReleaseReceipt(receiptPath: string, run: Run, missionId: string, workspace: string | undefined, parkedGeneration: number): void {
+  const receipt = readMergeReceipt(receiptPath, run, missionId, workspace);
+  const releasedGeneration = parkedGeneration + 1;
+  if (receipt.phase === 'released' && receipt.generation === releasedGeneration && receipt.token === undefined && receipt.settlementReason === 'workflow_settled') {
+    if (workspace !== undefined && receipt.workspace === undefined) writeRunOwnerReceipt(receiptPath, { ...receipt, workspace });
+    return;
+  }
+  if (receipt.phase !== 'parked_release_transition' || receipt.generation !== parkedGeneration || receipt.token !== undefined || receipt.settlementReason !== 'workflow_settled') {
+    throw new Error(`Run owner receipt does not match workflow_settled merge generation ${parkedGeneration}.`);
+  }
+  writeRunOwnerReceipt(receiptPath, { ...receipt, ...(workspace === undefined ? {} : { workspace }), phase: 'released', generation: releasedGeneration });
+}
+
+function casMergedRun(store: RunStore, current: Run): Run {
+  if (current.state === 'MERGED') return current;
+  if (current.state !== 'MERGE_READY') throw new Error(`Run "${current.id}" is ${current.state}; only MERGE_READY can be merged.`);
+  if (store.updateIfUnchanged === undefined) throw new Error(`Run store cannot compare-and-swap merged Run "${current.id}"; refusing an unfenced transition.`);
+  const next = applyTransition(current, { type: 'merged' });
+  if (!store.updateIfUnchanged(current, next)) throw new Error(`Run "${current.id}" changed concurrently; refusing to publish merge settlement.`);
+  return next;
+}
+
+/** Apply a normal merged transition only after exact live GitHub proof. Caller holds the canonical dispatch lock. */
+export async function runMergedTransitionCommand(
+  store: RunStore,
+  id: string,
+  github: GitHubAdapter,
+  admission: MissionAdmissionRegistry,
+  withDispatchAdmissionLock: <T>(operation: () => T | Promise<T>) => Promise<T>,
+): Promise<Run> {
+  const initial = store.read(id);
+  if (initial === null) throw new Error(`No run with id "${id}" found.`);
+  if (initial.state !== 'MERGE_READY' && initial.state !== 'MERGED') {
+    throw new Error(`Run "${id}" is ${initial.state}; only MERGE_READY or an exact merged retry may be reconciled.`);
+  }
+  if (initial.pullRequest === undefined) throw new Error(`Run "${id}" has no persisted pull request identity; refusing an operator-claimed merge.`);
+  if (github.readPullRequest === undefined) throw new Error('GitHub adapter cannot directly read the persisted pull request; refusing an operator-claimed merge.');
+  const proof = await github.readPullRequest(initial.target.owner, initial.target.repo, initial.pullRequest.number);
+  assertExactMergedPullRequest(initial, proof);
+
+  const reconcile = (): Run => {
+    let parkedGeneration: number | undefined;
+    let workspace: string | undefined;
+    let firstReconciliation = true;
+    const result = admission.reconcileMergedRun(id, (lane, phase) => {
+    const current = store.read(id);
+    if (current === null) throw new Error(`No run with id "${id}" found during merge reconciliation.`);
+    if (firstReconciliation) {
+      firstReconciliation = false;
+      if (JSON.stringify(current) !== JSON.stringify(initial)) {
+        throw new Error(`Run "${id}" changed after live merge proof and before locked reconciliation; refusing a stale transition.`);
+      }
+    }
+    assertExactMergedPullRequest(current, proof);
+    if (current.state !== 'MERGE_READY' && current.state !== 'MERGED') throw new Error(`Run "${id}" changed to ${current.state} during merge reconciliation.`);
+
+    if (lane === null) {
+      if (phase !== 'unadmitted') throw new Error('Admission lane disappeared during merge reconciliation.');
+      if (readRunOwnerReceipt(resolveRunOwnerReceiptPath(`${current.target.owner}/${current.target.repo}`.toLowerCase(), current.id, evidenceForRun(current))) !== null) {
+        throw new Error(`Run owner receipt exists without its admission lane for Run "${id}"; refusing merge reconciliation.`);
+      }
+      return casMergedRun(store, current);
+    }
+    const laneWorkspace = assertMergeLaneIdentity(current, lane);
+    workspace = laneWorkspace;
+    const repository = `${current.target.owner}/${current.target.repo}`.toLowerCase();
+    const receiptPath = resolveRunOwnerReceiptPath(repository, current.id, evidenceForRun(current, laneWorkspace === undefined ? {} : { workspace: laneWorkspace }));
+    const storedReceipt = readRunOwnerReceipt(receiptPath);
+    if (storedReceipt === null && current.state === 'MERGED' && phase === 'already_released') return current;
+    const receipt = readMergeReceipt(receiptPath, current, lane.missionId, laneWorkspace);
+    if (phase === 'before_publish') {
+      parkedGeneration = writeMergeReleaseTransition(receiptPath, current, lane.missionId, lane);
+      return casMergedRun(store, current);
+    }
+    if (phase === 'after_publish') {
+      const generation = parkedGeneration ?? lane.generation;
+      const settled = store.read(id);
+      if (settled === null || settled.state !== 'MERGED') throw new Error(`Run "${id}" was not durably merged before its lane release.`);
+      assertExactMergedPullRequest(settled, proof);
+      finalizeMergeReleaseReceipt(receiptPath, settled, lane.missionId, laneWorkspace, generation);
+      return settled;
+    }
+    if (phase !== 'already_released') throw new Error('Merge reconciliation reached an invalid admission phase.');
+
+    if (current.state === 'MERGE_READY') {
+      const exactPriorTransition = receipt.phase === 'parked_release_transition' && receipt.generation === lane.generation - 1 &&
+        receipt.token === undefined && receipt.settlementReason === 'workflow_settled';
+      if (!exactPriorTransition) throw new Error(`Released lane for Run "${id}" lacks the exact workflow_settled merge transition receipt.`);
+      parkedGeneration = lane.generation - 1;
+      const merged = casMergedRun(store, current);
+      finalizeMergeReleaseReceipt(receiptPath, merged, lane.missionId, laneWorkspace, parkedGeneration);
+      return merged;
+    }
+    const exactFinalReceipt = receipt.phase === 'released' && receipt.generation === lane.generation && receipt.token === undefined &&
+      receipt.settlementReason === 'workflow_settled';
+    const exactInterruptedTransition = receipt.phase === 'parked_release_transition' && receipt.generation === lane.generation - 1 &&
+      receipt.token === undefined && receipt.settlementReason === 'workflow_settled';
+    if (!exactFinalReceipt && !exactInterruptedTransition) {
+      throw new Error(`Released lane for merged Run "${id}" lacks its exact workflow_settled merge receipt.`);
+    }
+    if (exactInterruptedTransition) finalizeMergeReleaseReceipt(receiptPath, current, lane.missionId, laneWorkspace, lane.generation - 1);
+    return current;
+    });
+    return result;
+  };
+  return await withDispatchAdmissionLock(reconcile);
 }
 
 export function runListCommand(store: RunStore): Run[] {
@@ -2279,7 +2457,9 @@ export async function main(argv: string[]): Promise<number> {
     if (!TRANSITION_TYPES.includes(type as TransitionType)) {
       throw new Error(`Unknown transition "${type}". Valid transitions: ${TRANSITION_TYPES.join(', ')}.`);
     }
-    const next = await withDispatchAdmissionLock(() => runTransitionCommand(store, id, type as TransitionType, values.reason, createHostAdmissionRegistry()));
+    const next = type === 'merged'
+      ? await runMergedTransitionCommand(store, id, new LiveGitHubAdapter({ transport: new GhCliTransport() }), createHostAdmissionRegistry(), withDispatchAdmissionLock)
+      : await withDispatchAdmissionLock(() => runTransitionCommand(store, id, type as TransitionType, values.reason, createHostAdmissionRegistry()));
     console.log(`Run ${next.id}: ${next.state}.`);
     printRun(next);
     return 0;

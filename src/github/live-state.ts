@@ -214,6 +214,23 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     };
   }
 
+  /** Read the persisted PR identity directly; discovery endpoints intentionally omit closed PRs. */
+  async readPullRequest(owner: string, repo: string, number: number): Promise<GitHubLivePullRequestSnapshot> {
+    if (owner.trim() === '' || repo.trim() === '' || !Number.isSafeInteger(number) || number <= 0) {
+      throw new GitHubLiveStateError('GH_INVALID_RESPONSE', 'A direct pull-request read requires an exact owner, repository, and positive PR number.');
+    }
+    const path = `repos/${owner}/${repo}/pulls/${number}`;
+    const record = asRecordOrThrow(await this.transport.get(path), path);
+    if (requirePositiveInt(record, 'number', path) !== number) {
+      throw invalid(path, `pull request number ${String(record.number)} does not match the requested ${number}`);
+    }
+    if (record.merged_at !== null && record.merged_at !== undefined &&
+      (typeof record.merged_at !== 'string' || record.merged_at.trim() === '' || record.state !== 'closed')) {
+      throw invalid(path, 'merged_at and closed state are contradictory or malformed');
+    }
+    return this.normalizeLivePullRequest(record, path);
+  }
+
   async readBranch(target: RepositoryTarget): Promise<BranchSnapshot> {
     const path = `repos/${target.owner}/${target.repo}/branches/${encodeURIComponent(target.branch)}`;
     const record = asRecord(await this.transport.get(path));
@@ -525,6 +542,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       );
     }
     const headRepository = asRecord(head.repo);
+    const baseRepository = asRecord(base.repo);
     const headRef = typeof head.ref === 'string' && head.ref !== '' ? head.ref : undefined;
     const baseRef = typeof base.ref === 'string' && base.ref !== '' ? base.ref : undefined;
     const owner = headRepository === null ? undefined : asRecord(headRepository.owner);
@@ -533,6 +551,12 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       typeof headRepository?.name === 'string' && headRepository.name !== ''
       ? { owner: owner.login, repo: headRepository.name }
       : headRepository === null ? null : undefined;
+    const baseOwner = baseRepository === null ? undefined : asRecord(baseRepository.owner);
+    const baseRepositoryIdentity = baseOwner !== null && baseOwner !== undefined &&
+      typeof baseOwner.login === 'string' && baseOwner.login !== '' &&
+      typeof baseRepository?.name === 'string' && baseRepository.name !== ''
+      ? { owner: baseOwner.login, repo: baseRepository.name }
+      : baseRepository === null ? null : undefined;
     return {
       id: requireString(record, 'node_id', path),
       number: requirePositiveInt(record, 'number', path),
@@ -553,6 +577,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       ...(headRef === undefined ? {} : { headRef }),
       ...(headRepositoryIdentity === undefined ? {} : { headRepository: headRepositoryIdentity }),
       ...(baseRef === undefined ? {} : { baseRef }),
+      ...(baseRepositoryIdentity === undefined ? {} : { baseRepository: baseRepositoryIdentity }),
     };
   }
 

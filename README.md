@@ -496,6 +496,11 @@ non-zero exit code.
 require result payloads supplied by adapters; `run transition` rejects them
 explicitly. Drive those through the domain API (`applyTransition`).
 
+`run transition <id> merged` requires a direct live read of the Run's persisted
+pull request and exact head/branch/base identity. It settles only a
+`workflow_settled` parked admission; retries reconcile the matching private
+generation receipt under the dispatch and registry locks.
+
 ## Container-owned worker-router execution
 
 `WorkerRouterAdapter` is the one executor placed behind the container boundary

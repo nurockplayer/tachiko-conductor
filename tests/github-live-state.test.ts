@@ -859,6 +859,30 @@ PR: #7`;
     assert.equal(pulls[0]?.state, 'open');
   });
 
+  it('reads the exact persisted pull request directly, including merged state and repository branch identities', async () => {
+    const exact = pull(7, HEAD, {
+      state: 'closed',
+      merged_at: '2026-08-14T02:30:00.000Z',
+      head: { sha: HEAD, ref: 'feature/42', repo: { name: 'widgets', owner: { login: 'acme' } } },
+      base: { sha: BASE, ref: 'main', repo: { name: 'widgets', owner: { login: 'acme' } } },
+    });
+    const transport = new RouteTransport().queue('repos/acme/widgets/pulls/7', exact);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+    const live = await adapter.readPullRequest('acme', 'widgets', 7);
+    assert.equal(live.number, 7);
+    assert.equal(live.state, 'merged');
+    assert.equal(live.headSha, HEAD);
+    assert.equal(live.headRef, 'feature/42');
+    assert.deepEqual(live.headRepository, { owner: 'acme', repo: 'widgets' });
+    assert.equal(live.baseRef, 'main');
+    assert.deepEqual(live.baseRepository, { owner: 'acme', repo: 'widgets' });
+    assert.deepEqual(transport.calls, [{ kind: 'get', path: 'repos/acme/widgets/pulls/7' }]);
+
+    const malformedTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { state: 'closed', merged_at: '' }));
+    const malformedAdapter = new LiveGitHubAdapter({ transport: malformedTransport, now: () => OBSERVED_AT });
+    await assert.rejects(malformedAdapter.readPullRequest('acme', 'widgets', 7), /merged_at and closed state/);
+  });
+
   it('does not pick arbitrarily when multiple cross-references are all incidental', async () => {
     const transport = new RouteTransport()
       .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })

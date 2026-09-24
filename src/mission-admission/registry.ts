@@ -540,6 +540,49 @@ export class MissionAdmissionRegistry {
     });
   }
 
+  /**
+   * Reconcile an explicit GitHub-merged Run with its admission lane under one
+   * registry lock. Only a workflow_settled parked production Run may be
+   * released here; active lanes and every other parked reason stay fenced.
+   * The callback runs before publication and again after publication for a
+   * parked lane, allowing receipt transition + Run CAS before release and
+   * receipt finalization after it. An already released or legacy absent lane
+   * runs the callback once under the same lock for exact retry reconciliation.
+   */
+  reconcileMergedRun<T>(runId: string, reconcile: (lane: AdmissionLaneView | null, phase: 'before_publish' | 'after_publish' | 'already_released' | 'unadmitted') => T): T {
+    if (!nonEmpty(runId)) throw new AdmissionStateError('Merged Run reconciliation requires an exact Run id.');
+    let finalValue!: T;
+    this.transact((state) => {
+      const lane = state.lanes.find((record) => record.laneId === `run:${runId}`);
+      if (lane === undefined) return { kind: 'unadmitted' as const, lane: null };
+      if (lane.role !== 'production_captain' || lane.evidence.run !== runId) {
+        throw new AdmissionStateError(`Admission lane for Run "${runId}" has conflicting identity; refusing merge settlement.`);
+      }
+      const { token: _secret, ...view } = lane;
+      const laneView = structuredClone(view);
+      if (lane.status === 'active') {
+        throw new AdmissionStateError(`Run "${runId}" still has active mission admission ownership; merge settlement is fenced.`);
+      }
+      if (lane.status === 'parked') {
+        if (lane.parkedReason !== 'workflow_settled') {
+          throw new AdmissionStateError(`Run "${runId}" is parked for ${lane.parkedReason ?? 'an unknown reason'}; merge settlement requires workflow_settled.`);
+        }
+        assertNoActiveDelegates(state, lane);
+        lane.status = 'released'; lane.token = null; lane.generation += 1; lane.updatedAt = this.now();
+        delete (lane as { parkedReason?: ParkedReason }).parkedReason;
+        state.revision += 1;
+        state.lastTransition = { kind: 'merged_run_released', laneId: lane.laneId, at: lane.updatedAt };
+        return { kind: 'parked' as const, lane: laneView };
+      }
+      return { kind: 'released' as const, lane: laneView };
+    }, (result) => {
+      if (result.kind === 'parked') finalValue = reconcile(result.lane, 'before_publish');
+    }, (result) => {
+      finalValue = reconcile(result.lane, result.kind === 'parked' ? 'after_publish' : result.kind === 'released' ? 'already_released' : 'unadmitted');
+    });
+    return finalValue;
+  }
+
   park(token: AdmissionToken, reason: ParkedReason, beforePublish?: () => void, afterPublish?: () => void): number {
     return this.transact((state) => {
       const lane = requireCurrentToken(state, token);

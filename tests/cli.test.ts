@@ -24,6 +24,7 @@ import {
   resolveRunsDir,
   runCreateCommand,
   runIssueCommand,
+  runMergedTransitionCommand,
   resumeCommand,
   runShowCommand,
   runShowView,
@@ -39,6 +40,7 @@ import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
 import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
+import { resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { DispatchAdmissionWaitError } from '../src/dispatch/runner.js';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../src/dispatch/invocation-lock.js';
@@ -46,6 +48,15 @@ import type { DispatchRuntimeClaim } from '../src/dispatch/queue.js';
 import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+async function runMergedTransitionForTest(
+  store: RunStore,
+  id: string,
+  github: GitHubAdapter,
+  admission: MissionAdmissionRegistry,
+  lock: <T>(operation: () => T | Promise<T>) => Promise<T> = async <T>(operation: () => T | Promise<T>) => await operation(),
+): Promise<Run> {
+  return await runMergedTransitionCommand(store, id, github, admission, lock);
+}
 const REPAIR_AUTHORITY = { revision: 'task-shape-v1', shape: 'bounded' as const };
 
 function tempStore(): { store: JsonFileStore; dir: string } {
@@ -733,6 +744,375 @@ describe('workflow run and resume commands', () => {
       hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
     };
   }
+
+  const MERGE_HEAD = 'cccccccccccccccccccccccccccccccccccccccc';
+  const MERGE_BASE = 'dddddddddddddddddddddddddddddddddddddddd';
+  const MERGE_BOOTSTRAP = (workspacePath: string) => ({
+    bootstrapKind: 'linked-worktree' as const,
+    owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: MERGE_BASE,
+    branch: 'tachiko/issue-42-merge', workspacePath,
+  });
+
+  function mergeReadyRun(id: string, workspacePath: string): Run {
+    const workspace = path.join(workspacePath, 'workspace');
+    mkdirSync(workspace, { recursive: true });
+    const run = createRun(TARGET, T0, id);
+    return {
+      ...run,
+      state: 'MERGE_READY',
+      bootstrap: MERGE_BOOTSTRAP(workspace),
+      pullRequest: { number: 7, headSha: MERGE_HEAD },
+      headSha: MERGE_HEAD,
+    };
+  }
+
+  function mergedPullRequest(overrides: Partial<NonNullable<GitHubLiveSnapshot['pullRequest']>> = {}): NonNullable<GitHubLiveSnapshot['pullRequest']> {
+    return {
+      id: 'PR_7', number: 7, title: 'Merge test', url: 'https://github.test/acme/widgets/pull/7',
+      state: 'merged', isDraft: false, mergeable: true, mergeStateStatus: 'clean', updatedAt: T0,
+      headSha: MERGE_HEAD, baseSha: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee',
+      headRef: 'tachiko/issue-42-merge', headRepository: { owner: 'acme', repo: 'widgets' },
+      baseRef: 'main', baseRepository: { owner: 'acme', repo: 'widgets' },
+      ...overrides,
+    };
+  }
+
+  function mergeProofAdapter(pullRequest = mergedPullRequest()): GitHubAdapter {
+    return { kind: 'github', readPullRequest: async () => pullRequest } as unknown as GitHubAdapter;
+  }
+
+  function isolateMergeReceiptRoot(dir: string): () => void {
+    const oldReceiptRoot = process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR;
+    const oldRunsDir = process.env.TACHIKO_DATA_DIR;
+    process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR = path.join(dir, 'run-receipts');
+    process.env.TACHIKO_DATA_DIR = path.join(dir, 'run-data');
+    return () => {
+      if (oldReceiptRoot === undefined) delete process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR;
+      else process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR = oldReceiptRoot;
+      if (oldRunsDir === undefined) delete process.env.TACHIKO_DATA_DIR;
+      else process.env.TACHIKO_DATA_DIR = oldRunsDir;
+    };
+  }
+
+  function setupParkedMerge(dir: string, store: MemoryStore, run: Run, reason: 'workflow_settled' | 'workflow_wait' = 'workflow_settled', registryOptions: Partial<ConstructorParameters<typeof MissionAdmissionRegistry>[0]> = {}) {
+    const config: AdmissionConfig = { schemaVersion: 1, revision: `merge-${run.id}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+    const registryPath = path.join(dir, `merge-${run.id}.json`);
+    const registry = new MissionAdmissionRegistry({ filePath: registryPath, config, ...registryOptions });
+    const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+    const workspace = realpathSync(run.bootstrap!.workspacePath);
+    const evidence = { repository, ...(run.target.kind === 'issue' ? { issue: run.target.issueNumber } : {}), run: run.id, pullRequest: run.pullRequest!.number, workspace };
+    const admission = registry.admit({ laneId: `run:${run.id}`, role: 'production_captain', highAutonomy: true, evidence });
+    assert.equal(admission.outcome, 'admitted');
+    if (admission.outcome !== 'admitted') throw new Error('expected merge test admission');
+    const receiptPath = resolveRunOwnerReceiptPath(repository, run.id, evidence);
+    const initialReceipt = {
+      schemaVersion: 1 as const, laneId: admission.token.laneId, missionId: admission.missionId,
+      repository, runId: run.id, issue: run.target.kind === 'issue' ? run.target.issueNumber : undefined,
+      workspace, token: admission.token, generation: admission.token.generation, phase: 'park_transition' as const,
+    };
+    registry.park(admission.token, reason,
+      () => writeRunOwnerReceipt(receiptPath, initialReceipt),
+      () => writeRunOwnerReceipt(receiptPath, { ...initialReceipt, token: undefined, generation: admission.token.generation + 1, phase: 'parked' }));
+    store.create(run);
+    return { registry, receiptPath, workspace, generation: admission.token.generation + 1 };
+  }
+
+  it('requires exact live merged PR proof before any Run, registry, or receipt write', async () => {
+    const invalidProofs = [
+      mergedPullRequest({ state: 'open' as const }),
+      mergedPullRequest({ state: 'closed' as const }),
+      mergedPullRequest({ number: 8 }),
+      mergedPullRequest({ headSha: 'ffffffffffffffffffffffffffffffffffffffff' }),
+      mergedPullRequest({ headRef: 'other-branch' }),
+      mergedPullRequest({ baseRef: 'develop' }),
+      mergedPullRequest({ headRepository: { owner: 'forker', repo: 'widgets' } }),
+      mergedPullRequest({ baseRepository: { owner: 'acme', repo: 'other' } }),
+    ];
+    for (let index = 0; index < invalidProofs.length; index += 1) {
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-proof-'));
+      const restoreEnv = isolateMergeReceiptRoot(dir);
+      try {
+        const store = new MemoryStore();
+        const run = mergeReadyRun(`merge-proof-${index}`, dir);
+        const { registry, receiptPath } = setupParkedMerge(dir, store, run);
+        const beforeRun = store.read(run.id);
+        const beforeReceipt = readFileSync(receiptPath, 'utf8');
+      const beforeRegistry = readFileSync(path.join(dir, `merge-${run.id}.json`), 'utf8');
+        await assert.rejects(runMergedTransitionForTest(store, run.id, mergeProofAdapter(invalidProofs[index]!), registry), /does not match|not merged/);
+        assert.deepEqual(store.read(run.id), beforeRun);
+        assert.equal(readFileSync(receiptPath, 'utf8'), beforeReceipt);
+        assert.equal(readFileSync(path.join(dir, `merge-${run.id}.json`), 'utf8'), beforeRegistry);
+      } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+    }
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-unavailable-'));
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const store = new MemoryStore();
+      const run = mergeReadyRun('merge-proof-unavailable', dir);
+      const { registry, receiptPath } = setupParkedMerge(dir, store, run);
+      const before = readFileSync(receiptPath, 'utf8');
+      const unavailable = { kind: 'github', readPullRequest: async () => { throw new Error('GitHub unavailable'); } } as unknown as GitHubAdapter;
+      await assert.rejects(runMergedTransitionForTest(store, run.id, unavailable, registry), /GitHub unavailable/);
+      assert.equal(store.read(run.id)?.state, 'MERGE_READY');
+      assert.equal(readFileSync(receiptPath, 'utf8'), before);
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('reconciles workflow_settled merge and accepts squash/main advancement without comparing the old base SHA', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-success-'));
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const store = new MemoryStore();
+      const run = mergeReadyRun('merge-success', dir);
+      const { registry, receiptPath, generation } = setupParkedMerge(dir, store, run);
+      const parkedReceipt = readRunOwnerReceipt(receiptPath)!;
+      assert.throws(() => writeRunOwnerReceipt(receiptPath, { ...parkedReceipt, settlementReason: 'workflow_settled' }), /invalid/);
+      const result = await runMergedTransitionForTest(store, run.id, mergeProofAdapter(), registry);
+      assert.equal(result.state, 'MERGED');
+      assert.equal(store.read(run.id)?.state, 'MERGED');
+      const lane = registry.readLane(`run:${run.id}`);
+      assert.equal(lane?.status, 'released');
+      assert.equal(lane?.generation, generation + 1);
+      const receipt = readRunOwnerReceipt(receiptPath);
+      assert.equal(receipt?.phase, 'released');
+      assert.equal(receipt?.generation, generation + 1);
+      assert.equal(receipt?.settlementReason, 'workflow_settled');
+      const registryBytes = readFileSync(path.join(dir, 'merge-merge-success.json'), 'utf8');
+      const receiptBytes = readFileSync(receiptPath, 'utf8');
+      assert.equal((await runMergedTransitionForTest(store, run.id, mergeProofAdapter(), registry)).state, 'MERGED');
+      assert.equal(readFileSync(path.join(dir, 'merge-merge-success.json'), 'utf8'), registryBytes);
+      assert.equal(readFileSync(receiptPath, 'utf8'), receiptBytes);
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('recovers both Run-CAS-before-registry and registry-before-final-receipt merge crashes', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-crash-'));
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      let failPublish = false;
+      const store = new MemoryStore();
+      const run = mergeReadyRun('merge-crash', dir);
+      const setup = setupParkedMerge(dir, store, run, 'workflow_settled', {
+        filePath: path.join(dir, 'merge-crash.json'),
+        config: { schemaVersion: 1, revision: 'merge-crash-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+        beforePublish: () => { if (failPublish) throw new Error('injected registry publication failure'); },
+      });
+      failPublish = true;
+      await assert.rejects(runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry), /injected registry publication failure/);
+      assert.equal(store.read(run.id)?.state, 'MERGED');
+      assert.equal(setup.registry.readLane(`run:${run.id}`)?.status, 'parked');
+      assert.equal(readRunOwnerReceipt(setup.receiptPath)?.phase, 'parked_release_transition');
+      failPublish = false;
+      await runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry);
+      assert.equal(setup.registry.readLane(`run:${run.id}`)?.status, 'released');
+
+      const releasedBeforeRun = mergeReadyRun('merge-run-cas-after-release', dir);
+      const releasedBeforeRunSetup = setupParkedMerge(dir, store, releasedBeforeRun);
+      const beforeReleaseReceipt = readRunOwnerReceipt(releasedBeforeRunSetup.receiptPath)!;
+      const { token: _parkToken, ...tokenlessReceipt } = beforeReleaseReceipt;
+      writeRunOwnerReceipt(releasedBeforeRunSetup.receiptPath, {
+        ...tokenlessReceipt,
+        phase: 'parked_release_transition',
+        generation: releasedBeforeRunSetup.generation,
+        settlementReason: 'workflow_settled',
+      });
+      releasedBeforeRunSetup.registry.releaseParked(`run:${releasedBeforeRun.id}`, releasedBeforeRunSetup.generation, true);
+      assert.equal(store.read(releasedBeforeRun.id)?.state, 'MERGE_READY');
+      assert.equal(releasedBeforeRunSetup.registry.readLane(`run:${releasedBeforeRun.id}`)?.status, 'released');
+      await runMergedTransitionForTest(store, releasedBeforeRun.id, mergeProofAdapter(), releasedBeforeRunSetup.registry);
+      assert.equal(store.read(releasedBeforeRun.id)?.state, 'MERGED');
+      assert.equal(readRunOwnerReceipt(releasedBeforeRunSetup.receiptPath)?.phase, 'released');
+
+
+      let sabotageReceipt = false;
+      let receiptPath = '';
+      let savedTransition: ReturnType<typeof readRunOwnerReceipt> = null;
+      const finalReceiptRun = mergeReadyRun('merge-final-receipt-crash', dir);
+      const finalReceiptSetup = setupParkedMerge(dir, store, finalReceiptRun, 'workflow_settled', {
+        filePath: path.join(dir, 'merge-final-receipt-crash.json'),
+        config: { schemaVersion: 1, revision: 'merge-final-receipt-crash-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+        beforePublish: () => {
+          if (!sabotageReceipt) return;
+          savedTransition = readRunOwnerReceipt(receiptPath);
+          if (savedTransition === null) throw new Error('expected transition receipt before registry publication');
+          rmSync(receiptPath, { force: true });
+          symlinkSync('missing-receipt-target', receiptPath);
+        },
+      });
+      receiptPath = finalReceiptSetup.receiptPath;
+      sabotageReceipt = true;
+      await assert.rejects(runMergedTransitionForTest(store, finalReceiptRun.id, mergeProofAdapter(), finalReceiptSetup.registry), /private owner-owned|symbolic link/);
+      assert.equal(finalReceiptSetup.registry.readLane(`run:${finalReceiptRun.id}`)?.status, 'released');
+      assert.equal(store.read(finalReceiptRun.id)?.state, 'MERGED');
+      assert.ok(savedTransition);
+      rmSync(receiptPath, { force: true });
+      writeRunOwnerReceipt(receiptPath, savedTransition!);
+      sabotageReceipt = false;
+      await runMergedTransitionForTest(store, finalReceiptRun.id, mergeProofAdapter(), finalReceiptSetup.registry);
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'released');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.generation, finalReceiptSetup.generation + 1);
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('permits only the exact workflow_settled released retry, never a different parked reason', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-fence-'));
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const store = new MemoryStore();
+      const run = mergeReadyRun('merge-wrong-park', dir);
+      const setup = setupParkedMerge(dir, store, run, 'workflow_wait');
+      const beforeRun = store.read(run.id);
+      const beforeReceipt = readFileSync(setup.receiptPath, 'utf8');
+      const beforeRegistry = readFileSync(path.join(dir, 'merge-merge-wrong-park.json'), 'utf8');
+      await assert.rejects(runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry), /requires workflow_settled/);
+      assert.deepEqual(store.read(run.id), beforeRun);
+      assert.equal(readFileSync(setup.receiptPath, 'utf8'), beforeReceipt);
+      assert.equal(readFileSync(path.join(dir, 'merge-merge-wrong-park.json'), 'utf8'), beforeRegistry);
+
+      const interruptedRun = mergeReadyRun('merge-interrupted-park', dir);
+      const interruptedSetup = setupParkedMerge(dir, store, interruptedRun);
+      const parkedReceipt = readRunOwnerReceipt(interruptedSetup.receiptPath)!;
+      writeRunOwnerReceipt(interruptedSetup.receiptPath, {
+        ...parkedReceipt,
+        token: { laneId: parkedReceipt.laneId, generation: interruptedSetup.generation - 1, token: 'prior-capability' },
+        generation: interruptedSetup.generation - 1,
+        phase: 'park_transition',
+      });
+      const beforeInterrupted = readFileSync(interruptedSetup.receiptPath, 'utf8');
+      await assert.rejects(runMergedTransitionForTest(store, interruptedRun.id, mergeProofAdapter(), interruptedSetup.registry), /phase and generation do not match/);
+      assert.equal(store.read(interruptedRun.id)?.state, 'MERGE_READY');
+      assert.equal(readFileSync(interruptedSetup.receiptPath, 'utf8'), beforeInterrupted);
+      assert.equal(interruptedSetup.registry.readLane(`run:${interruptedRun.id}`)?.status, 'parked');
+
+      const wrongIdentityRun = mergeReadyRun('merge-wrong-receipt-identity', dir);
+      const wrongIdentitySetup = setupParkedMerge(dir, store, wrongIdentityRun);
+      const validReceipt = readRunOwnerReceipt(wrongIdentitySetup.receiptPath)!;
+      writeRunOwnerReceipt(wrongIdentitySetup.receiptPath, { ...validReceipt, issue: 43 });
+      const mismatchedReceipt = readFileSync(wrongIdentitySetup.receiptPath, 'utf8');
+      const mismatchedRegistry = readFileSync(path.join(dir, 'merge-merge-wrong-receipt-identity.json'), 'utf8');
+      await assert.rejects(runMergedTransitionForTest(store, wrongIdentityRun.id, mergeProofAdapter(), wrongIdentitySetup.registry), /receipt does not match exact merge lane identity/);
+      assert.equal(store.read(wrongIdentityRun.id)?.state, 'MERGE_READY');
+      assert.equal(readFileSync(wrongIdentitySetup.receiptPath, 'utf8'), mismatchedReceipt);
+      assert.equal(readFileSync(path.join(dir, 'merge-merge-wrong-receipt-identity.json'), 'utf8'), mismatchedRegistry);
+
+      const releasedRun = mergeReadyRun('merge-released-no-marker', dir);
+      const releasedSetup = setupParkedMerge(dir, store, releasedRun);
+      const receipt = readRunOwnerReceipt(releasedSetup.receiptPath)!;
+      releasedSetup.registry.releaseParked(`run:${releasedRun.id}`, releasedSetup.generation, true);
+      const { token: _parkedToken, ...receiptBase } = receipt;
+      writeRunOwnerReceipt(releasedSetup.receiptPath, { ...receiptBase, phase: 'parked_release_transition', generation: releasedSetup.generation, token: undefined });
+      await assert.rejects(runMergedTransitionForTest(store, releasedRun.id, mergeProofAdapter(), releasedSetup.registry), /exact workflow_settled merge transition receipt/);
+      assert.equal(store.read(releasedRun.id)?.state, 'MERGE_READY');
+
+      const wrongGenerationRun = mergeReadyRun('merge-released-wrong-generation', dir);
+      const wrongGenerationSetup = setupParkedMerge(dir, store, wrongGenerationRun);
+      const parkedForWrongGeneration = readRunOwnerReceipt(wrongGenerationSetup.receiptPath)!;
+      const { token: _wrongGenerationToken, ...wrongGenerationBase } = parkedForWrongGeneration;
+      writeRunOwnerReceipt(wrongGenerationSetup.receiptPath, {
+        ...wrongGenerationBase,
+        phase: 'parked_release_transition',
+        generation: wrongGenerationSetup.generation - 1,
+        settlementReason: 'workflow_settled',
+      });
+      wrongGenerationSetup.registry.releaseParked(`run:${wrongGenerationRun.id}`, wrongGenerationSetup.generation, true);
+      const badGenerationReceipt = readFileSync(wrongGenerationSetup.receiptPath, 'utf8');
+      await assert.rejects(runMergedTransitionForTest(store, wrongGenerationRun.id, mergeProofAdapter(), wrongGenerationSetup.registry), /exact workflow_settled merge transition receipt/);
+      assert.equal(store.read(wrongGenerationRun.id)?.state, 'MERGE_READY');
+      assert.equal(readFileSync(wrongGenerationSetup.receiptPath, 'utf8'), badGenerationReceipt);
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('does not release on Run CAS races and does not overwrite a successor receipt on stale retry', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-cas-'));
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const store = new MemoryStore();
+      const run = mergeReadyRun('merge-cas-race', dir);
+      const setup = setupParkedMerge(dir, store, run);
+      const cas = store.updateIfUnchanged.bind(store);
+      let race = true;
+      store.updateIfUnchanged = (expected, next) => {
+        if (race) {
+          race = false;
+          store.update({ ...expected, updatedAt: '2026-08-14T04:00:00.000Z' });
+          return false;
+        }
+        return cas(expected, next);
+      };
+      await assert.rejects(runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry), /changed concurrently/);
+      assert.equal(setup.registry.readLane(`run:${run.id}`)?.status, 'parked');
+      assert.equal(store.read(run.id)?.state, 'MERGE_READY');
+      assert.equal(readRunOwnerReceipt(setup.receiptPath)?.phase, 'parked_release_transition');
+      store.updateIfUnchanged = cas;
+      await runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry);
+
+      const prior = readRunOwnerReceipt(setup.receiptPath)!;
+      const successor = setup.registry.admit({ laneId: `run:${run.id}`, role: 'production_captain', highAutonomy: true,
+        evidence: { repository: 'acme/widgets', issue: 42, run: run.id, pullRequest: 7, workspace: setup.workspace } }, {
+        beforePublish: (candidate) => writeRunOwnerReceipt(setup.receiptPath, { ...prior, token: candidate.token, generation: candidate.token.generation, phase: 'pre_execution', settlementReason: undefined }),
+      });
+      assert.equal(successor.outcome, 'admitted');
+      const successorReceipt = readRunOwnerReceipt(setup.receiptPath);
+      await assert.rejects(runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry), /active mission admission ownership/);
+      assert.deepEqual(readRunOwnerReceipt(setup.receiptPath), successorReceipt);
+      assert.equal(setup.registry.readLane(`run:${run.id}`)?.status, 'active');
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('requires live proof for admission-free merged transitions and blocks direct operator claims', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-legacy-'));
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const store = new MemoryStore();
+      const run = mergeReadyRun('merge-no-admission', dir);
+      store.create(run);
+      const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config: { schemaVersion: 1, revision: 'merge-no-admission-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      assert.throws(() => runTransitionCommand(store, run.id, 'merged', undefined, admission), /exact live GitHub merged/);
+      await assert.rejects(runMergedTransitionForTest(store, run.id, mergeProofAdapter(mergedPullRequest({ state: 'closed' as const })), admission), /not merged/);
+      assert.equal(store.read(run.id)?.state, 'MERGE_READY');
+      const result = await runMergedTransitionForTest(store, run.id, mergeProofAdapter(), admission);
+      assert.equal(result.state, 'MERGED');
+
+      const legacyRun = mergeReadyRun('merge-released-legacy', dir);
+      const legacySetup = setupParkedMerge(dir, store, legacyRun);
+      const legacyMerged = applyTransition(legacyRun, { type: 'merged' }, T0);
+      store.update(legacyMerged);
+      legacySetup.registry.releaseParked(`run:${legacyRun.id}`, legacySetup.generation, true);
+      rmSync(legacySetup.receiptPath, { force: true });
+      const legacyResult = await runMergedTransitionForTest(store, legacyRun.id, mergeProofAdapter(), legacySetup.registry);
+      assert.equal(legacyResult.state, 'MERGED');
+      assert.equal(existsSync(legacySetup.receiptPath), false, 'a live-proven released legacy run remains a no-op without inventing a receipt');
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('fetches live proof before the short dispatch lock and rejects Run drift before locked writes', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-lock-order-'));
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const store = new MemoryStore();
+      const run = mergeReadyRun('merge-lock-drift', dir);
+      const setup = setupParkedMerge(dir, store, run);
+      const beforeReceipt = readFileSync(setup.receiptPath, 'utf8');
+      const beforeRegistry = readFileSync(path.join(dir, 'merge-merge-lock-drift.json'), 'utf8');
+      let held = false;
+      const github = {
+        kind: 'github' as const,
+        async readPullRequest() {
+          assert.equal(held, false, 'GitHub I/O stays outside the short lock');
+          return mergedPullRequest();
+        },
+      } as unknown as GitHubAdapter;
+      const withLock = async <T>(operation: () => T | Promise<T>): Promise<T> => {
+        held = true;
+        store.update({ ...run, updatedAt: '2026-08-14T05:00:00.000Z' });
+        try { return await operation(); } finally { held = false; }
+      };
+      await assert.rejects(runMergedTransitionForTest(store, run.id, github, setup.registry, withLock), /changed after live merge proof/);
+      assert.equal(store.read(run.id)?.state, 'MERGE_READY');
+      assert.equal(readFileSync(setup.receiptPath, 'utf8'), beforeReceipt);
+      assert.equal(readFileSync(path.join(dir, 'merge-merge-lock-drift.json'), 'utf8'), beforeRegistry);
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
 
   it('starts an issue end-to-end and reaches MERGE_READY through the fake adapters', async () => {
     const store = new MemoryStore();
@@ -2101,7 +2481,7 @@ describe('CLI end-to-end across processes', () => {
       // Invalid transition across a fresh process fails loudly and keeps state.
       const bad = runCli(['run', 'transition', id, 'merged']);
       assert.equal(bad.status, 1);
-      assert.match(bad.stderr, /error: Invalid transition "merged" from state IMPLEMENTING/);
+      assert.match(bad.stderr, /error: Run .* is IMPLEMENTING; only MERGE_READY or an exact merged retry may be reconciled/);
       const show4 = runCli(['run', 'show', id]);
       assert.match(show4.stdout, /"state": "IMPLEMENTING"/);
     } finally {
