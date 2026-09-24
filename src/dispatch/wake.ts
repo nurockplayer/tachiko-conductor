@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, watch, writeFileSync } from 'node:fs';
 import path from 'node:path';
+import { resolveAccountHomeDirectory } from '../account-home.js';
 
 /** A local, provider-neutral nudge for an already-supervised dispatch driver. */
-export function dispatchWakePath(env: NodeJS.ProcessEnv = process.env): string {
+export function dispatchWakePath(env: NodeJS.ProcessEnv = process.env, homeDirectory: string = resolveAccountHomeDirectory()): string {
   const configured = env.TACHIKO_DISPATCH_WAKE_PATH;
-  const value = configured ?? path.join(env.HOME ?? '', '.tachiko-conductor', 'dispatch', 'wake');
+  const value = configured ?? path.join(homeDirectory, '.tachiko-conductor', 'dispatch', 'wake');
   if (!path.isAbsolute(value) || value.includes('\0')) throw new Error('TACHIKO_DISPATCH_WAKE_PATH must be an absolute path.');
   return value;
 }

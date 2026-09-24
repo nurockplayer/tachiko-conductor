@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -707,6 +707,166 @@ describe('workflow run and resume commands', () => {
       assert.equal(lane.evidence.workspace, realpathSync(canonicalWorkspace));
       assert.notEqual(lane.evidence.workspace, process.cwd());
       assert.equal(lane.status, 'active', 'uncertain worker execution keeps the exact bound workspace fenced');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('binds a missing logical Run receipt workspace during exact parked recovery after prepared-worktree settlement', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-logical-park-recovery-'));
+    try {
+      const store = new MemoryStore();
+      const canonicalWorkspace = path.join(directory, 'prepared-worktree');
+      const workspace = path.join(directory, 'prepared-worktree-alias');
+      mkdirSync(canonicalWorkspace);
+      symlinkSync(canonicalWorkspace, workspace, 'dir');
+      const receiptPath = path.join(directory, 'owner.json');
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'logical-park-recovery-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } };
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: admissionConfig });
+      const identity = { bootstrapKind: 'linked-worktree' as const, owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: HEAD, branch: 'codex/run-42', workspacePath: workspace };
+      let logicalReservationSeen = false;
+      let prepareCalls = 0;
+      const bootstrap = {
+        kind: 'implementation-bootstrap' as const,
+        bootstrapKind: 'linked-worktree' as const,
+        async plan() {
+          const lane = registry.snapshot().lanes.find((candidate) => candidate.laneId.startsWith('run:'));
+          assert.ok(lane);
+          assert.equal(lane.evidence.workspace, undefined, 'admission is logical before bootstrap planning binds its workspace');
+          logicalReservationSeen = true;
+          return identity;
+        },
+        async prepare() {
+          prepareCalls += 1;
+          return identity;
+        },
+        guard() { return { assertValid() {} }; },
+        async verifyDurable() { return { headSha: HEAD, branch: identity.branch }; },
+      };
+      const live = githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD]);
+      const noPullRequestGithub: GitHubAdapter = {
+        ...live,
+        async readLiveSnapshot(target) {
+          const snapshot = await live.readLiveSnapshot(target);
+          return { ...snapshot, repository: { ...snapshot.repository, defaultBranch: 'main', defaultBranchHeadSha: HEAD }, pullRequest: null, headSha: null };
+        },
+      };
+      const originalPark = registry.park.bind(registry);
+      registry.park = (token, reason, beforePublish) => {
+        originalPark(token, reason, beforePublish);
+        throw new Error('simulated crash after prepared-workspace park publication');
+      };
+      const workflow = { ...deps(store, noPullRequestGithub, new FakeImplementation([successResult(HEAD)]), new FakeReviewer([{ verdict: 'approve', reviewerName: 'deepseek', headSha: HEAD, findings: [] }])), bootstrap };
+      await assert.rejects(runIssueCommand(workflow, 'acme/widgets#42', { admission: registry, runOwnerReceiptPath: receiptPath, now: () => T0 }), /simulated crash after prepared-workspace park publication/);
+      registry.park = originalPark;
+
+      const run = store.list()[0]!;
+      const lane = registry.readLane(`run:${run.id}`)!;
+      const parkReceipt = readRunOwnerReceipt(receiptPath)!;
+      assert.equal(logicalReservationSeen, true, JSON.stringify({ state: run.state, reason: run.interrupt?.evidence, bootstrap: run.bootstrap, receipt: parkReceipt }));
+      assert.equal(prepareCalls, 1, JSON.stringify({ state: run.state, reason: run.interrupt?.evidence }));
+      assert.equal(run.bootstrap?.workspacePath, workspace);
+      assert.equal(lane.evidence.workspace, realpathSync(canonicalWorkspace), 'prepared workspace strengthened the registry lane');
+      assert.equal(lane.status, 'parked');
+      assert.equal(parkReceipt.phase, 'park_transition', 'the injected crash left the normal park publication receipt');
+      assert.equal(parkReceipt.workspace, undefined, 'the logical pre-execution receipt has not yet recorded the later workspace');
+      const parkedGeneration = lane.generation;
+
+      writeRunOwnerReceipt(receiptPath, { ...parkReceipt, workspace: path.join(directory, 'wrong-worktree') });
+      assert.throws(() => recoverRunAdmission(store, registry, run.id, parkedGeneration, true, receiptPath), /phase and generation/,
+        'a receipt that names a conflicting workspace cannot recover this parked lane');
+      writeRunOwnerReceipt(receiptPath, { ...parkReceipt, missionId: 'different-mission' });
+      assert.throws(() => recoverRunAdmission(store, registry, run.id, parkedGeneration, true, receiptPath), /canonical registry owner/,
+        'a receipt with a different mission identity cannot authorize workspace binding');
+      writeRunOwnerReceipt(receiptPath, parkReceipt);
+
+      assert.throws(() => recoverRunAdmission(store, registry, run.id, parkedGeneration, true, receiptPath, {
+        parkReceiptNormalization: () => { throw new Error('simulated crash after locked workspace binding'); },
+      }), /simulated crash after locked workspace binding/);
+      assert.equal(registry.readLane(`run:${run.id}`)?.status, 'parked');
+      const transitionReceipt = readRunOwnerReceipt(receiptPath)!;
+      assert.equal(transitionReceipt.phase, 'parked_release_transition');
+      assert.equal(transitionReceipt.workspace, realpathSync(canonicalWorkspace), 'the transition receipt binds canonical W under the exact parked-lane lock');
+
+      const releaseParked = registry.releaseParked.bind(registry);
+      registry.releaseParked = (laneId, generation, stopped, beforePublish) => {
+        releaseParked(laneId, generation, stopped, beforePublish);
+        throw new Error('simulated crash after parked release publication');
+      };
+      assert.throws(() => recoverRunAdmission(store, registry, run.id, parkedGeneration, true, receiptPath), /simulated crash after parked release publication/);
+      registry.releaseParked = releaseParked;
+      assert.equal(registry.readLane(`run:${run.id}`)?.status, 'released');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked_release_transition');
+      assert.equal(recoverRunAdmission(store, registry, run.id, parkedGeneration, true, receiptPath), 'released', 'exact retry finalizes the postpublication receipt');
+      const finalReceipt = readRunOwnerReceipt(receiptPath);
+      assert.equal(finalReceipt?.phase, 'released');
+      assert.equal(finalReceipt?.workspace, realpathSync(canonicalWorkspace));
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('binds a missing logical Run workspace on exact active-release retry after publication crash', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-logical-release-recovery-'));
+    try {
+      const store = new MemoryStore();
+      const workspace = path.join(directory, 'prepared-worktree');
+      mkdirSync(workspace);
+      const receiptPath = path.join(directory, 'owner.json');
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'logical-release-recovery-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } };
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: admissionConfig });
+      const identity = { bootstrapKind: 'linked-worktree' as const, owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: HEAD, branch: 'codex/run-42', workspacePath: workspace };
+      let logicalReservationSeen = false;
+      const bootstrap = {
+        kind: 'implementation-bootstrap' as const,
+        bootstrapKind: 'linked-worktree' as const,
+        async plan() {
+          const lane = registry.snapshot().lanes.find((candidate) => candidate.laneId.startsWith('run:'));
+          assert.ok(lane);
+          assert.equal(lane.evidence.workspace, undefined);
+          logicalReservationSeen = true;
+          return identity;
+        },
+        async prepare() { return identity; },
+        guard() { return { assertValid() {} }; },
+        async verifyDurable() { return { headSha: HEAD, branch: identity.branch }; },
+      };
+      const live = githubAdapter([HEAD, HEAD]);
+      const noPullRequestGithub: GitHubAdapter = {
+        ...live,
+        async readLiveSnapshot(target) {
+          const snapshot = await live.readLiveSnapshot(target);
+          return { ...snapshot, repository: { ...snapshot.repository, defaultBranch: 'main', defaultBranchHeadSha: HEAD }, pullRequest: null, headSha: null };
+        },
+      };
+      class UncertainImplementation implements ImplementationAgent {
+        readonly kind = 'implementation-agent' as const;
+        async run(): Promise<AgentResult> { throw new Error('worker stopped with uncertain execution'); }
+      }
+      await assert.rejects(runIssueCommand({ ...deps(store, noPullRequestGithub, new UncertainImplementation(), new FakeReviewer([])), bootstrap },
+        'acme/widgets#42', { admission: registry, runOwnerReceiptPath: receiptPath, now: () => T0 }), /worker stopped with uncertain execution/);
+      const run = store.list()[0]!;
+      const lane = registry.readLane(`run:${run.id}`)!;
+      const activeReceipt = readRunOwnerReceipt(receiptPath)!;
+      assert.equal(logicalReservationSeen, true);
+      assert.equal(run.bootstrap?.workspacePath, workspace);
+      assert.equal(lane.status, 'active');
+      assert.equal(lane.evidence.workspace, realpathSync(workspace));
+      assert.equal(activeReceipt.phase, 'execution_possible');
+      assert.equal(activeReceipt.workspace, undefined, 'the execution receipt predates workspace strengthening');
+
+      const originalRelease = registry.release.bind(registry);
+      registry.release = (token, stopped, beforePublish) => {
+        originalRelease(token, stopped, beforePublish);
+        throw new Error('simulated crash after active release publication');
+      };
+      assert.throws(() => recoverRunAdmission(store, registry, run.id, activeReceipt.generation, true, receiptPath), /simulated crash after active release publication/);
+      registry.release = originalRelease;
+      assert.equal(registry.readLane(`run:${run.id}`)?.status, 'released');
+      const transition = readRunOwnerReceipt(receiptPath)!;
+      assert.equal(transition.phase, 'release_transition');
+      assert.equal(transition.workspace, undefined, 'the simulated postpublication crash retains the old logical receipt');
+
+      assert.equal(recoverRunAdmission(store, registry, run.id, activeReceipt.generation, true, receiptPath), 'released');
+      const finalReceipt = readRunOwnerReceipt(receiptPath);
+      assert.equal(finalReceipt?.phase, 'released');
+      assert.equal(finalReceipt?.workspace, realpathSync(workspace), 'exact released retry binds persisted canonical W under the registry lock');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

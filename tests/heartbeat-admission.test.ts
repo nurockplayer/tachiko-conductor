@@ -286,7 +286,7 @@ describe('model-free heartbeat mission admission helper', () => {
       TACHIKO_DISPATCH_WAKE_PATH: path.join(directory, 'dispatch', 'wake'),
     };
     try {
-      const child = spawnSync(process.execPath, [path.join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs'), path.join(ROOT, 'src', 'mission-admission', 'heartbeat-admission-cli.ts')], {
+      const child = spawnSync(process.execPath, ['--import', path.join(ROOT, 'node_modules/tsx/dist/loader.mjs'), '--import', path.join(ROOT, 'tests/fixtures/account-home-preload.mjs'), path.join(ROOT, 'src', 'mission-admission', 'heartbeat-admission-cli.ts')], {
         cwd: ROOT,
         env,
         encoding: 'utf8',
@@ -297,7 +297,7 @@ describe('model-free heartbeat mission admission helper', () => {
       assert.equal(response.outcome, 'reserved');
       assert.match(response.receiptId, /^[0-9a-f-]{36}$/);
       assert.equal(child.stdout.includes('token'), false);
-      const malformed = spawnSync(process.execPath, [path.join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs'), path.join(ROOT, 'src', 'mission-admission', 'heartbeat-admission-cli.ts')], {
+      const malformed = spawnSync(process.execPath, ['--import', path.join(ROOT, 'node_modules/tsx/dist/loader.mjs'), '--import', path.join(ROOT, 'tests/fixtures/account-home-preload.mjs'), path.join(ROOT, 'src', 'mission-admission', 'heartbeat-admission-cli.ts')], {
         cwd: ROOT, env, encoding: 'utf8', input: '{"schemaVersion":1,"action":"reserve","extra":true}',
       });
       assert.equal(malformed.status, 1);

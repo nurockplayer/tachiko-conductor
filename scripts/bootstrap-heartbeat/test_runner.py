@@ -9,6 +9,7 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import pwd
 import shutil
 import subprocess
 import sys
@@ -24,8 +25,28 @@ RUNNER = HERE / "runner.py"
 
 class HeartbeatTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(prefix=".tachiko-conductor-heartbeat-", dir=Path.home())
+        self.temp = tempfile.TemporaryDirectory(prefix="tachiko-conductor-heartbeat-", dir=Path(tempfile.gettempdir()).resolve())
         self.root = Path(self.temp.name)
+        self.account_home = self.root / "account-home"
+        self.account_home.mkdir()
+        self.python_test_support = self.root / "python-test-support"
+        self.python_test_support.mkdir()
+        (self.python_test_support / "sitecustomize.py").write_text(
+            "import os, pwd\n"
+            "_getpwuid = pwd.getpwuid\n"
+            "def _test_getpwuid(uid):\n"
+            "    record = _getpwuid(uid)\n"
+            "    home = os.environ.get('SCD_HEARTBEAT_TEST_ACCOUNT_HOME')\n"
+            "    return pwd.struct_passwd(record[:5] + (home,) + record[6:]) if home else record\n"
+            "pwd.getpwuid = _test_getpwuid\n",
+            encoding="utf-8",
+        )
+        real_getpwuid = pwd.getpwuid
+        self.account_lookup = mock.patch(
+            "pwd.getpwuid",
+            side_effect=lambda uid: pwd.struct_passwd(real_getpwuid(uid)[:5] + (str(self.account_home),) + real_getpwuid(uid)[6:]),
+        )
+        self.account_lookup.start()
         self.state_root = self.root / "state"
         self.payload = self.root / "payload.json"
         self.calls = self.root / "calls.jsonl"
@@ -97,17 +118,64 @@ class HeartbeatTest(unittest.TestCase):
             "MOCK_WAKE_BACKGROUND_PID": str(self.root / "background.pid"),
             "MOCK_LAUNCHCTL_FAIL_MARKER": str(self.root / "launchctl-failed-once"),
             "MOCK_ADMISSION_STATE": str(self.admission_state),
+            "SCD_HEARTBEAT_TEST_ACCOUNT_HOME": str(self.account_home),
+            "PYTHONPATH": str(self.python_test_support),
         })
         self.env.pop("TACHIKO_MISSION_ADMISSION_PATH", None)
         self.write_config()
 
     def tearDown(self) -> None:
+        self.account_lookup.stop()
         self.temp.cleanup()
 
     def test_query_budget_covers_long_lived_review_threads(self) -> None:
         source = RUNNER.read_text(encoding="utf-8")
         self.assertIn("reviewThreads(first: 100)", source)
         self.assertIn("MAX_POLL_QUERY_COST = 100", source)
+
+    def test_loaded_config_rejects_pinned_admission_from_another_home(self) -> None:
+        config_path = self.state_root / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["admission"]["home"] = str(self.root / "stale-home")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pinned heartbeat admission home does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+        self.assertEqual(self.records(), [], "stale pinned account root must be rejected before wake")
+        config["admission"]["home"] = str(self.account_home)
+        config["admission"]["registry"] = str(self.root / "stale-registry.json")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pinned heartbeat admission registry does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+        self.assertEqual(self.records(), [])
+
+    def test_account_home_lookup_ignores_divergent_ambient_home_values(self) -> None:
+        saved_home = self.env.get("HOME")
+        first = self.root / "ambient-home-a"
+        second = self.root / "ambient-home-b"
+        first.mkdir()
+        second.mkdir()
+        try:
+            with mock.patch.dict(os.environ, {"HOME": str(first)}):
+                module_a = importlib.util.spec_from_file_location("heartbeat_home_a", RUNNER)
+                assert module_a and module_a.loader
+                runner_a = importlib.util.module_from_spec(module_a)
+                module_a.loader.exec_module(runner_a)
+            with mock.patch.dict(os.environ, {"HOME": str(second)}):
+                module_b = importlib.util.spec_from_file_location("heartbeat_home_b", RUNNER)
+                assert module_b and module_b.loader
+                runner_b = importlib.util.module_from_spec(module_b)
+                module_b.loader.exec_module(runner_b)
+            self.assertEqual(runner_a.account_home_directory(), self.account_home.resolve())
+            self.assertEqual(runner_b.account_home_directory(), self.account_home.resolve())
+            self.assertFalse((first / ".tachiko-conductor").exists())
+            self.assertFalse((second / ".tachiko-conductor").exists())
+        finally:
+            if saved_home is None:
+                self.env.pop("HOME", None)
+            else:
+                self.env["HOME"] = saved_home
 
     def test_runtime_import_closure_rejects_dynamic_loaders_and_traversal(self) -> None:
         saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
@@ -290,8 +358,10 @@ class HeartbeatTest(unittest.TestCase):
             item["path"] = str(helper_root / relative)
         admission = {
             "repository": "nurockplayer/tachiko-conductor", "workspace": str(Path.cwd().resolve()),
-            "home": str(Path.home()), "registry": str(self.root / "host-registry.json"),
-            "runs": str(self.root / "runs"), "receipts": str(self.root / "receipts"),
+            "home": str(self.account_home),
+            "registry": str(self.account_home / ".tachiko-conductor/mission-admission/registry.json"),
+            "runs": str(self.account_home / ".tachiko-conductor/runs"),
+            "receipts": str(self.account_home / ".tachiko-conductor/mission-admission/heartbeat-receipts"),
             "config": {"schemaVersion": 1, "revision": "test-config-v2", "limits": {"maxCaptains": 2, "maxWriters": 2, "maxHighAutonomy": 1}},
         }
         config = {
@@ -661,9 +731,10 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(helper_build["typescript_version"], "5.9.3")
         admission = {
             "repository": "nurockplayer/tachiko-conductor", "workspace": str((self.root / "workspace").resolve()),
-            "home": str((self.root / "home").resolve()),
-            "registry": str((self.root / "home" / ".tachiko-conductor" / "mission-admission" / "registry.json").resolve()),
-            "runs": str(self.root / "runs"), "receipts": str(self.root / "receipts"),
+            "home": str(self.account_home.resolve()),
+            "registry": str((self.account_home / ".tachiko-conductor" / "mission-admission" / "registry.json").resolve()),
+            "runs": str(self.account_home / ".tachiko-conductor" / "runs"),
+            "receipts": str(self.account_home / ".tachiko-conductor" / "mission-admission" / "heartbeat-receipts"),
             "config": {"schemaVersion": 1, "revision": "cross-language-smoke-v1", "limits": {"maxCaptains": 2, "maxWriters": 2, "maxHighAutonomy": 1}},
         }
         Path(admission["workspace"]).mkdir()
@@ -1273,7 +1344,7 @@ class HeartbeatTest(unittest.TestCase):
         if (self.state_root / "state.json").exists():
             (self.state_root / "state.json").unlink()
         command = json.dumps([str(self.wake), "future-dispatch-once"])
-        home = self.root.resolve()
+        home = self.account_home.resolve()
         canonical_registry = home / ".tachiko-conductor" / "mission-admission" / "registry.json"
         canonical_registry.parent.mkdir(parents=True)
         canonical_registry.write_text("{}", encoding="utf-8")

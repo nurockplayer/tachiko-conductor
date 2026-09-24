@@ -1,5 +1,4 @@
 #!/usr/bin/env node
-import os from 'node:os';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -84,6 +83,7 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
 import { preflightProductionPolicy } from './production-policy.js';
 import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
+import { resolveAccountHomeDirectory } from './account-home.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -208,7 +208,7 @@ export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOn
 }
 
 function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(os.homedir(), '.tachiko-conductor', 'dispatch', 'once.lock');
+  return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'dispatch', 'once.lock');
 }
 
 /**
@@ -431,7 +431,7 @@ export function resolveHostedCheckPolicyConfiguration(
 
 /** Resolve the directory where run JSON files are stored. */
 export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
-  return env.TACHIKO_DATA_DIR ?? path.join(os.homedir(), '.tachiko-conductor', 'runs');
+  return env.TACHIKO_DATA_DIR ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'runs');
 }
 
 export interface BrowserRoots {
@@ -441,7 +441,7 @@ export interface BrowserRoots {
 
 export function resolveBrowserRoots(
   env: NodeJS.ProcessEnv = process.env,
-  homeDirectory: string = os.homedir(),
+  homeDirectory: string = resolveAccountHomeDirectory(),
 ): BrowserRoots {
   const root = path.join(homeDirectory, '.tachiko-conductor', 'browser');
   return {
@@ -808,6 +808,13 @@ function sameRunReceiptIdentity(receipt: RunOwnerReceipt, run: Run, missionId: s
     receipt.issue === (run.target.kind === 'issue' ? run.target.issueNumber : undefined) && receipt.claimId === run.dispatchClaimId && receipt.missionId === missionId;
 }
 
+function canBindMissingReceiptWorkspace(receipt: RunOwnerReceipt, run: Run, registryWorkspace: string | undefined): boolean {
+  if (receipt.workspace !== undefined || registryWorkspace === undefined || run.bootstrap === undefined) return false;
+  const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  const persistedWorkspace = canonicalizeMissionEvidence({ repository, workspace: run.bootstrap.workspacePath }).workspace;
+  return persistedWorkspace === registryWorkspace;
+}
+
 /** Re-read and reconcile only the exact parked generation while its registry lock is held. */
 function writeParkedReleaseTransition(
   receiptPath: string,
@@ -815,9 +822,11 @@ function writeParkedReleaseTransition(
   missionId: string,
   parkedGeneration: number,
   workspace: string | undefined,
+  allowMissingWorkspaceBinding: boolean,
 ): void {
   const current = readRunOwnerReceipt(receiptPath);
-  if (current === null || !sameRunReceiptIdentity(current, run, missionId) || current.workspace !== workspace) {
+  if (current === null || !sameRunReceiptIdentity(current, run, missionId) ||
+    (current.workspace !== workspace && !(allowMissingWorkspaceBinding && current.workspace === undefined && workspace !== undefined && current.phase !== 'pre_execution'))) {
     throw new Error(`Run owner receipt does not match parked generation ${parkedGeneration} under the registry transaction.`);
   }
   const exactParkTransition = current.phase === 'park_transition' && current.generation === parkedGeneration - 1 && current.token?.generation === parkedGeneration - 1;
@@ -828,7 +837,7 @@ function writeParkedReleaseTransition(
     throw new Error(`Run owner receipt phase and generation do not match parked registry generation ${parkedGeneration}.`);
   }
   const { token: _token, ...withoutToken } = current;
-  writeRunOwnerReceipt(receiptPath, { ...withoutToken, phase: 'parked_release_transition', generation: parkedGeneration });
+  writeRunOwnerReceipt(receiptPath, { ...withoutToken, ...(workspace === undefined ? {} : { workspace }), phase: 'parked_release_transition', generation: parkedGeneration });
 }
 
 function finalizeParkedRunOwnerReceipt(receiptPath: string, run: Run, missionId: string, parkedGeneration: number, workspace: string | undefined): void {
@@ -942,7 +951,12 @@ export function recoverRunAdmission(
     if (receipt.phase === 'release_transition' || receipt.phase === 'parked_release_transition') {
       registry.withExactReleasedLane(laneId, expectedGeneration + 1, () => {
         const current = readRunOwnerReceipt(canonicalReceiptPath);
-        if (current === null || !sameRunReceiptIdentity(current, run, lane.missionId) || current.generation !== expectedGeneration && current.generation !== expectedGeneration + 1) {
+        const canBindWorkspace = current !== null &&
+          (current.phase === 'release_transition' || current.phase === 'parked_release_transition') &&
+          canBindMissingReceiptWorkspace(current, run, lane.evidence.workspace);
+        const workspaceMatches = current !== null && (current.workspace === lane.evidence.workspace || canBindWorkspace);
+        if (current === null || !sameRunReceiptIdentity(current, run, lane.missionId) || !workspaceMatches ||
+          (current.generation !== expectedGeneration && current.generation !== expectedGeneration + 1)) {
           throw new Error(`Run owner receipt does not match exact released generation ${expectedGeneration + 1}.`);
         }
         if (current.phase === 'released' && current.generation === expectedGeneration + 1 && current.token === undefined) return;
@@ -951,28 +965,32 @@ export function recoverRunAdmission(
         const exactParkedTransition = current.phase === 'parked_release_transition' && current.generation === expectedGeneration && current.token === undefined;
         if (!exactActiveTransition && !exactParkedTransition) throw new Error('Run owner receipt transition does not match the exact released generation.');
         const { token: _token, ...withoutToken } = current;
-        writeRunOwnerReceipt(canonicalReceiptPath, { ...withoutToken, phase: 'released', generation: expectedGeneration + 1 });
+        writeRunOwnerReceipt(canonicalReceiptPath, { ...withoutToken, ...(canBindWorkspace ? { workspace: lane.evidence.workspace } : {}), phase: 'released', generation: expectedGeneration + 1 });
       });
       return 'released';
     }
   }
   if (lane.status === 'parked') {
     const expectedParkReason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
+    const workspaceMatches = receipt.workspace === lane.evidence.workspace ||
+      (receipt.workspace === undefined && ['park_transition', 'parked', 'parked_release_transition'].includes(receipt.phase) &&
+        canBindMissingReceiptWorkspace(receipt, run, lane.evidence.workspace));
     const interruptedParkPublication = receipt.phase === 'park_transition' && receipt.generation === expectedGeneration - 1 &&
       lane.generation === expectedGeneration && lane.parkedReason === expectedParkReason &&
-      receipt.workspace === lane.evidence.workspace;
+      workspaceMatches;
     const normalizedParkRetry = receipt.generation === expectedGeneration && lane.generation === expectedGeneration &&
       (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && lane.parkedReason === expectedParkReason &&
-      receipt.workspace === lane.evidence.workspace;
+      workspaceMatches;
     const interruptedParkedReadmission = lane.generation === expectedGeneration && receipt.generation === expectedGeneration + 1 &&
-      (receipt.phase === 'pre_execution' || receipt.phase === 'parked_release_transition');
+      (receipt.phase === 'pre_execution' || receipt.phase === 'parked_release_transition') && receipt.workspace === lane.evidence.workspace;
     const exactParkedGeneration = lane.generation === expectedGeneration && receipt.generation === expectedGeneration &&
-      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition');
+      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && workspaceMatches;
     if (!interruptedParkPublication && !normalizedParkRetry && !interruptedParkedReadmission && !exactParkedGeneration) throw new Error('Parked registry lane does not match the Run owner receipt phase and generation.');
     if (!operatorStopped) throw new Error('Parked Run recovery requires explicit --stopped operator attestation that the provider and children have stopped.');
     registry.releaseParked(laneId, lane.generation, true,
       () => {
-        writeParkedReleaseTransition(canonicalReceiptPath, run, lane.missionId, lane.generation, lane.evidence.workspace);
+        writeParkedReleaseTransition(canonicalReceiptPath, run, lane.missionId, lane.generation, lane.evidence.workspace,
+          canBindMissingReceiptWorkspace(receipt, run, lane.evidence.workspace));
         if (interruptedParkPublication) crashAfter?.parkReceiptNormalization?.();
       },
       () => {
@@ -1293,14 +1311,14 @@ function buildWorkflowDeps(
     plan: async (request) => {
       bootstrap ??= new GitWorktreeBootstrap({
         repositoryRoot: resolveRepositoryRoot(),
-        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'workspaces'),
       });
       return bootstrap.plan(request);
     },
     prepare: async (request) => {
       bootstrap ??= new GitWorktreeBootstrap({
         repositoryRoot: resolveRepositoryRoot(),
-        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'workspaces'),
       });
       return bootstrap.prepare(request);
     },
@@ -1388,7 +1406,7 @@ function buildWorkflowDeps(
       if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;
       lunaBootstrap ??= new StandaloneGitBootstrap({
         repositoryRoot: resolveRepositoryRoot(),
-        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'workspaces'),
       });
       return lunaBootstrap;
     },

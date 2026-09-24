@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import os
+import pwd
 from pathlib import Path
 import plistlib
 import platform
@@ -31,10 +32,25 @@ LABEL = "io.tachiko.conductor.scd-heartbeat"
 OWNER = "nurockplayer"
 REPOSITORY = "tachiko-conductor"
 DEFAULT_REPO = Path("/Users/tachikoma/Developer/tachiko-conductor")
-DEFAULT_ROOT = Path.home() / "Library/Application Support" / LABEL
-DEFAULT_PLIST = Path.home() / "Library/LaunchAgents" / f"{LABEL}.plist"
+def account_home_directory() -> Path:
+    """Return the physical home pinned to the effective OS account, ignoring HOME."""
+    try:
+        effective_uid = os.geteuid()
+        if os.getuid() != effective_uid:
+            raise OSError("real and effective account identities differ")
+        account = pwd.getpwuid(effective_uid)
+        if account.pw_uid != effective_uid or not Path(account.pw_dir).is_absolute():
+            raise OSError("effective account lookup returned inconsistent identity")
+        return Path(account.pw_dir).resolve(strict=True)
+    except (OSError, KeyError, RuntimeError) as error:
+        raise RuntimeError("cannot resolve physical home for the effective OS account") from error
+
+
+ACCOUNT_HOME = account_home_directory()
+DEFAULT_ROOT = ACCOUNT_HOME / "Library/Application Support" / LABEL
+DEFAULT_PLIST = ACCOUNT_HOME / "Library/LaunchAgents" / f"{LABEL}.plist"
 DEFAULT_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
-DEFAULT_PROFILE = Path.home() / ".codex/scd_mission_lead.config.toml"
+DEFAULT_PROFILE = ACCOUNT_HOME / ".codex/scd_mission_lead.config.toml"
 SETTLED_MARKER = "TACHIKO_HEARTBEAT_SETTLED_V1"
 DEFAULT_PROMPT = (
     "Continue SCD for nurockplayer/tachiko-conductor under the repository's live "
@@ -342,6 +358,12 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
                    for key in ("workspace", "home", "registry", "runs", "receipts"))
             or not isinstance(admission.get("config"), dict)):
         raise RuntimeError("invalid fixed heartbeat admission domain")
+    account_home = account_home_directory()
+    canonical_registry = account_home / ".tachiko-conductor/mission-admission/registry.json"
+    if Path(admission["home"]).resolve() != account_home:
+        raise RuntimeError("pinned heartbeat admission home does not match the effective OS account")
+    if Path(admission["registry"]).resolve() != canonical_registry:
+        raise RuntimeError("pinned heartbeat admission registry does not match the effective OS account")
     admission_config = admission["config"]
     if (set(admission_config) != {"schemaVersion", "revision", "limits"} or admission_config.get("schemaVersion") != 1
             or not isinstance(admission_config.get("revision"), str) or not admission_config["revision"]
@@ -777,7 +799,7 @@ def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list
     corepack_version = subprocess.run([str(corepack), "--version"], check=True, text=True,
                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
     tool_env = {"PATH": os.pathsep.join([str(node_source.parent), str(corepack.parent), "/usr/bin", "/bin"]),
-                "HOME": str(Path.home()), "CI": "1", "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+                "HOME": str(ACCOUNT_HOME), "CI": "1", "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
     with tempfile.TemporaryDirectory(prefix="admission-build-", dir=ROOT) as source_dir:
         staged_source = Path(source_dir)
         _checked_extract_git_archive(archive, staged_source)
@@ -1879,7 +1901,7 @@ def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dic
 
 
 def admission_domain(repo: Path, registry_override: str | None, config_raw: str | None) -> dict[str, Any]:
-    home = Path.home().resolve()
+    home = account_home_directory()
     repository = "nurockplayer/tachiko-conductor"
     runs = Path(os.environ.get("TACHIKO_DATA_DIR", str(home / ".tachiko-conductor/runs"))).expanduser().resolve()
     canonical_registry = (home / ".tachiko-conductor/mission-admission/registry.json").resolve()

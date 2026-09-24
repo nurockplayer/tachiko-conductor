@@ -1,10 +1,10 @@
-import os from 'node:os';
 import path from 'node:path';
 import { existsSync, realpathSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 
 import { AdmissionStateError, MissionAdmissionRegistry, validateAdmissionConfig, type AdmissionConfig } from './registry.js';
 import { dispatchWakePath, signalDispatchWake } from '../dispatch/wake.js';
+import { resolveAccountHomeDirectory } from '../account-home.js';
 
 export const DEFAULT_MISSION_ADMISSION_CONFIG: AdmissionConfig = {
   schemaVersion: 1,
@@ -35,7 +35,7 @@ function physicalPath(candidate: string): string {
   return path.resolve(realpathSync.native(cursor), ...suffix);
 }
 
-export function resolveHostAdmissionPath({ env = process.env, homeDirectory = os.homedir() }: HostAdmissionResolverOptions = {}): string {
+export function resolveHostAdmissionPath({ env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
   const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
   const canonicalPath = physicalPath(path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'registry.json'));
   const candidate = env[MISSION_ADMISSION_PATH_ENV] ?? canonicalPath;
@@ -62,12 +62,12 @@ export function resolveHostAdmissionConfig(env: NodeJS.ProcessEnv = process.env)
 
 export function createHostAdmissionRegistry(options: HostAdmissionResolverOptions = {}): MissionAdmissionRegistry {
   const env = options.env ?? process.env;
+  const homeDirectory = options.homeDirectory ?? resolveAccountHomeDirectory();
   return new MissionAdmissionRegistry({
-    filePath: resolveHostAdmissionPath(options),
+    filePath: resolveHostAdmissionPath({ ...options, homeDirectory }),
     config: resolveHostAdmissionConfig(env),
     onPublishedTransition: () => {
-      const wakeEnv = { ...env, HOME: env.HOME ?? options.homeDirectory ?? os.homedir() };
-      try { signalDispatchWake(dispatchWakePath(wakeEnv)); } catch { /* registry publication is authoritative; the safety poll recovers lost hints */ }
+      try { signalDispatchWake(dispatchWakePath(env, homeDirectory)); } catch { /* registry publication is authoritative; the safety poll recovers lost hints */ }
     },
   });
 }
@@ -77,7 +77,7 @@ function containsPath(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
-export function resolveManualOwnerReceiptPath(repository: string, workspace: string, { env = process.env, homeDirectory = os.homedir() }: HostAdmissionResolverOptions = {}): string {
+export function resolveManualOwnerReceiptPath(repository: string, workspace: string, { env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
   if (!path.isAbsolute(workspace) || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository)) throw new AdmissionStateError('Manual owner receipt requires canonical repository and absolute workspace identity.');
   const physicalWorkspace = physicalPath(workspace);
   const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
@@ -92,7 +92,7 @@ export function resolveManualOwnerReceiptPath(repository: string, workspace: str
   return receiptPath;
 }
 
-export function resolveHeartbeatOwnerReceiptPath(repository: string, workspace: string, { env = process.env, homeDirectory = os.homedir() }: HostAdmissionResolverOptions = {}): string {
+export function resolveHeartbeatOwnerReceiptPath(repository: string, workspace: string, { env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) || !path.isAbsolute(workspace)) throw new AdmissionStateError('Heartbeat admission receipt requires canonical repository and absolute workspace identity.');
   const physicalWorkspace = physicalPath(workspace);
   const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
@@ -107,7 +107,7 @@ export function resolveHeartbeatOwnerReceiptPath(repository: string, workspace: 
   return receiptPath;
 }
 
-export function resolveRunOwnerReceiptPath(repository: string, runId: string, evidence?: import('./registry.js').MissionEvidence, { env = process.env, homeDirectory = os.homedir() }: HostAdmissionResolverOptions = {}): string {
+export function resolveRunOwnerReceiptPath(repository: string, runId: string, evidence?: import('./registry.js').MissionEvidence, { env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new AdmissionStateError('Run owner receipt requires canonical repository and safe Run identity.');
   const configuredDirectory = env[RUN_OWNER_RECEIPTS_DIR_ENV] ?? path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'run-receipts');
   if (!path.isAbsolute(configuredDirectory)) throw new AdmissionStateError(`${RUN_OWNER_RECEIPTS_DIR_ENV} must be an absolute host path.`);

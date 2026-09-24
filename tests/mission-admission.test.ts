@@ -10,10 +10,11 @@ import { describe, it } from 'node:test';
 
 import { canonicalizeMissionEvidence, MissionAdmissionRegistry, type AdmissionConfig, type AdmissionResult, type AdmissionToken, type MissionEvidence } from '../src/mission-admission/registry.js';
 import { acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
-import { createHostAdmissionRegistry, resolveHostAdmissionConfig, resolveHostAdmissionPath } from '../src/mission-admission/host-registry.js';
+import { createHostAdmissionRegistry, resolveHeartbeatOwnerReceiptPath, resolveHostAdmissionConfig, resolveHostAdmissionPath, resolveManualOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { dispatchWakePath } from '../src/dispatch/wake.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { createRun } from '../src/domain/run.js';
-import { findRunByTarget, parseGitHubRepositoryRemote } from '../src/cli.js';
+import { findRunByTarget, parseGitHubRepositoryRemote, resolveRunsDir } from '../src/cli.js';
 import { readManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
 import { handleHeartbeatAdmission } from '../src/mission-admission/heartbeat-admission.js';
 import { T0, TARGET } from './helpers.js';
@@ -84,7 +85,7 @@ function childStrengthen(filePath: string, selectedConfig: AdmissionConfig, lane
 }
 
 function runCli(args: readonly string[], cwd: string, env: NodeJS.ProcessEnv, input?: string): { readonly status: number | null; readonly stdout: string; readonly stderr: string } {
-  const child = spawnSync(process.execPath, [path.join(ROOT, 'node_modules', 'tsx', 'dist', 'cli.mjs'), CLI_FILE, ...args], { cwd, env, encoding: 'utf8', ...(input === undefined ? {} : { input }) });
+  const child = spawnSync(process.execPath, ['--import', path.join(ROOT, 'node_modules/tsx/dist/loader.mjs'), '--import', path.join(ROOT, 'tests/fixtures/account-home-preload.mjs'), CLI_FILE, ...args], { cwd, env, encoding: 'utf8', ...(input === undefined ? {} : { input }) });
   return { status: child.status, stdout: child.stdout, stderr: child.stderr };
 }
 
@@ -821,6 +822,38 @@ describe('provider-neutral durable mission admission', () => {
         env: { TACHIKO_DATA_DIR: runs, TACHIKO_MISSION_ADMISSION_PATH: path.join(runsAlias, 'registry.json') },
       }), /canonical per-user/);
     } finally { rmSync(directory, { recursive: true, force: true }); rmSync(home, { recursive: true, force: true }); }
+  });
+
+  it('anchors default registry, receipt, CLI, and wake roots to the OS account despite divergent HOME values', () => {
+    const accountHome = mkdtempSync(path.join(os.tmpdir(), 'admission-account-home-'));
+    const alternateHomeA = mkdtempSync(path.join(os.tmpdir(), 'admission-ambient-home-a-'));
+    const alternateHomeB = mkdtempSync(path.join(os.tmpdir(), 'admission-ambient-home-b-'));
+    const workspace = path.join(accountHome, 'workspace');
+    mkdirSync(workspace);
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: accountHome })) as typeof os.userInfo;
+      const canonicalHome = realpathSync(accountHome);
+      const envA = { HOME: alternateHomeA };
+      const envB = { HOME: alternateHomeB };
+      const expectedRegistry = path.join(canonicalHome, '.tachiko-conductor', 'mission-admission', 'registry.json');
+      const expectedRuns = path.join(canonicalHome, '.tachiko-conductor', 'runs');
+      assert.equal(resolveHostAdmissionPath({ env: envA }), expectedRegistry);
+      assert.equal(resolveHostAdmissionPath({ env: envB }), expectedRegistry);
+      assert.equal(resolveRunsDir(envA), expectedRuns);
+      assert.equal(resolveRunsDir(envB), expectedRuns);
+      assert.equal(resolveManualOwnerReceiptPath('acme/widgets', workspace, { env: envA }), resolveManualOwnerReceiptPath('acme/widgets', workspace, { env: envB }));
+      assert.equal(resolveHeartbeatOwnerReceiptPath('acme/widgets', workspace, { env: envA }), resolveHeartbeatOwnerReceiptPath('acme/widgets', workspace, { env: envB }));
+      assert.equal(dispatchWakePath(envA), path.join(canonicalHome, '.tachiko-conductor', 'dispatch', 'wake'));
+      assert.equal(dispatchWakePath(envB), path.join(canonicalHome, '.tachiko-conductor', 'dispatch', 'wake'));
+      assert.equal(existsSync(path.join(alternateHomeA, '.tachiko-conductor')), false);
+      assert.equal(existsSync(path.join(alternateHomeB, '.tachiko-conductor')), false);
+    } finally {
+      os.userInfo = originalUserInfo;
+      rmSync(accountHome, { recursive: true, force: true });
+      rmSync(alternateHomeA, { recursive: true, force: true });
+      rmSync(alternateHomeB, { recursive: true, force: true });
+    }
   });
 
   it('exposes read-only bounded admission status with owning Run/workspace evidence and no capability tokens', () => {
