@@ -874,7 +874,17 @@ export async function runWorkflow(
               existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },
             });
             assertCurrentMutationAdmission(options);
-            await bootstrapAdapter.verifyDurable({ identity, expectedHeadSha: run.headSha });
+            await bootstrapAdapter.verifyDurable({
+              identity,
+              expectedHeadSha: run.headSha,
+              beforePublish: () => {
+                if (!updateIfCurrent(store, validationExpected, validationExpected)) {
+                  throw new Error('Run changed before owned-workspace validation publication.');
+                }
+                assertCurrentMutationAdmission(options);
+                assertPublicationAdmission(options);
+              },
+            });
             if (!updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while owned-workspace validation was being prepared; preserving the newer Run.');
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);

@@ -20,6 +20,8 @@ import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
+import { createBootstrapGitFixture } from './bootstrap-fixture.js';
+import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -1089,6 +1091,151 @@ describe('runWorkflow', () => {
     assert.equal(outcome.run.state, 'NEEDS_HUMAN');
     assert.equal(store.read(run.id)?.state, 'NEEDS_HUMAN');
     assert.equal(publicationAttempts, 0);
+  });
+
+  it('fences owned-workspace validation publication after awaited standalone Git checks', async (t) => {
+    for (const mode of ['run-changed', 'admission-stale', 'publication-stale', 'current'] as const) {
+      await t.test(mode, async () => {
+        const fixture = createBootstrapGitFixture();
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-publish-fence-'));
+        try {
+          const id = `validation-publish-${mode}`;
+          const store = new MemoryStore();
+          let interleave = false;
+          let armAfterPrepare = false;
+          let interleaved = false;
+          let concurrent: Run | undefined;
+          const runner = {
+            async run(file: string, args: readonly string[], options: Parameters<NonNullable<typeof fixture.runner.run>>[2]) {
+              const result = await fixture.runner.run(file, args, options);
+              if (interleave && file === 'git' && args.includes('ls-remote') && args.includes('refs/heads/existing-pr')) {
+                interleave = false;
+                interleaved = true;
+                if (mode === 'run-changed') {
+                  const current = store.read(id)!;
+                  concurrent = applyTransition(current, { type: 'escalate', reason: 'operator cancellation during validation publication checks' }, T0);
+                  store.update(concurrent);
+                } else if (mode === 'admission-stale') {
+                  if (registry === undefined || admittedToken === undefined) throw new Error('Admission fence was not initialized before validation publication.');
+                  registry.release(admittedToken, true);
+                }
+              }
+              return result;
+            },
+          };
+          const bootstrapImpl = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+          const bootstrap: ImplementationBootstrapAdapter = {
+            kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+            plan: (request) => bootstrapImpl.plan(request),
+            async prepare(request) {
+              const prepared = await bootstrapImpl.prepare(request);
+              if (armAfterPrepare) {
+                armAfterPrepare = false;
+                interleave = true;
+              }
+              return prepared;
+            },
+            guard: (identity) => bootstrapImpl.guard(identity),
+            verifyDurable: (request) => bootstrapImpl.verifyDurable(request),
+          };
+          const planned = await bootstrap.plan({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha, publicationBranch: 'existing-pr' });
+          const identity = await bootstrap.prepare({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha, existing: planned });
+          const head = fixture.commit(identity.workspacePath, 'validated-change.txt', 'validated change\n', 'validation candidate');
+          fixture.git(fixture.source, ['fetch', '--no-tags', '--no-recurse-submodules', identity.workspacePath, head]);
+          fixture.git(fixture.source, ['push', 'origin', `${head}:refs/heads/existing-pr`]);
+
+          let run = createRun(TARGET, T0, id, {
+            profile: 'routine', revision: 'validation-luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+          });
+          run = applyTransition(run, { type: 'start' }, T0);
+          run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+          run = applyTransition(run, {
+            type: 'agent_succeeded', agentResult: successResult(head), headSha: head, pullRequest: { number: 7, headSha: head },
+          }, T0);
+          store.create(run);
+
+          let registry: MissionAdmissionRegistry | undefined;
+          let admittedToken: import('../src/mission-admission/registry.js').AdmissionToken | undefined;
+          let productionMissionId = '';
+          if (mode === 'admission-stale' || mode === 'publication-stale' || mode === 'current') {
+            registry = new MissionAdmissionRegistry({
+              filePath: path.join(directory, 'registry.json'),
+              config: { schemaVersion: 1, revision: 'validation-publish-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+            });
+            const admitted = registry.admit({
+              laneId: 'captain', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42, run: id },
+            });
+            assert.equal(admitted.outcome, 'admitted');
+            if (admitted.outcome !== 'admitted') return;
+            admittedToken = admitted.token;
+            productionMissionId = mode === 'publication-stale' ? `${admitted.missionId}-stale` : admitted.missionId;
+          }
+
+          const github = githubAdapter([head, head, head]);
+          github.readLiveSnapshot = async () => {
+            const live = snapshot(head);
+            return {
+              ...live,
+              repository: { ...live.repository, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha },
+              pullRequest: {
+                ...live.pullRequest!, headSha: head, baseSha: fixture.baseSha,
+                headRef: 'existing-pr', baseRef: fixture.branch, headRepository: { owner: 'acme', repo: 'widgets' },
+              },
+            };
+          };
+          let validationCalls = 0;
+          const validation: ValidationAdapter = {
+            kind: 'validation', configRevision: 'owned-validation-v1', requiresOwnedWorkspace: true,
+            async validate(request) {
+              validationCalls += 1;
+              assert.equal(request.workspacePath, identity.workspacePath);
+              return { ...validationPassed(request.headSha).local, configRevision: 'owned-validation-v1' };
+            },
+          };
+          const commandsStart = fixture.commands.length;
+          armAfterPrepare = true;
+          const outcome = await runWorkflow(
+            {
+              store, github, implementation: new FakeImplementation([]), bootstrapForExecution: () => bootstrap,
+              reviewer: new FakeReviewer([approve(head)]), validation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+            }, id,
+            {
+              maxReviewAttempts: 1, now: () => T0,
+              ...(registry === undefined || admittedToken === undefined ? {} : {
+                admissionFence: {
+                  registry, token: admittedToken,
+                  productionMissionId: productionMissionId || 'unneeded', executionWorkspace: identity.workspacePath,
+                },
+              }),
+            },
+          );
+
+          const remoteHead = fixture.git(fixture.remote, ['for-each-ref', '--format=%(objectname)', 'refs/heads/existing-pr']);
+          const pushes = fixture.commands.slice(commandsStart).filter((command) => command.file === 'git' && command.args.includes('push'));
+          assert.equal(interleaved, true, 'the concurrent state change occurs during standalone Git verification before its push');
+          if (mode === 'run-changed') {
+            assert.equal(outcome.outcome, 'needs_human');
+            assert.deepEqual(store.read(id), concurrent, 'concurrent Run wins the pre-push CAS');
+            assert.equal(remoteHead, head, 'a stale Run cannot move the existing PR ref');
+            assert.equal(pushes.length, 0, 'no host push occurs after the stale Run is detected');
+            assert.equal(validationCalls, 0);
+          } else if (mode === 'admission-stale' || mode === 'publication-stale') {
+            assert.equal(outcome.outcome, 'needs_human');
+            assert.equal(remoteHead, head, 'stale admission cannot move the existing PR ref');
+            assert.equal(pushes.length, 0, 'no host push occurs after admission rejects');
+            assert.equal(validationCalls, 0);
+          } else {
+            assert.equal(outcome.outcome, 'merge_ready', outcome.outcome === 'needs_human' ? outcome.reason : undefined);
+            assert.equal(remoteHead, head, 'the unchanged owner verifies and retains its exact published HEAD');
+            assert.ok(pushes.length >= 1, 'the valid validation path reaches the host publication command');
+            assert.equal(validationCalls, 1);
+          }
+        } finally {
+          fixture.cleanup();
+          rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
   });
 
   it('passes a synchronous worker publication fence that rejects stale Run and admission authority', async (t) => {
