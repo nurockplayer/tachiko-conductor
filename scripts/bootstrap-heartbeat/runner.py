@@ -359,11 +359,17 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or not isinstance(admission.get("config"), dict)):
         raise RuntimeError("invalid fixed heartbeat admission domain")
     account_home = account_home_directory()
-    canonical_registry = account_home / ".tachiko-conductor/mission-admission/registry.json"
+    canonical_registry = (account_home / ".tachiko-conductor/mission-admission/registry.json").resolve()
+    canonical_runs = (account_home / ".tachiko-conductor/runs").resolve()
+    canonical_receipts = (account_home / ".tachiko-conductor/mission-admission/heartbeat-receipts").resolve()
     if Path(admission["home"]).resolve() != account_home:
         raise RuntimeError("pinned heartbeat admission home does not match the effective OS account")
     if Path(admission["registry"]).resolve() != canonical_registry:
         raise RuntimeError("pinned heartbeat admission registry does not match the effective OS account")
+    if Path(admission["runs"]).resolve() != canonical_runs:
+        raise RuntimeError("pinned heartbeat Run directory does not match the effective OS account")
+    if Path(admission["receipts"]).resolve() != canonical_receipts:
+        raise RuntimeError("pinned heartbeat receipt directory does not match the effective OS account")
     admission_config = admission["config"]
     if (set(admission_config) != {"schemaVersion", "revision", "limits"} or admission_config.get("schemaVersion") != 1
             or not isinstance(admission_config.get("revision"), str) or not admission_config["revision"]
@@ -1912,17 +1918,23 @@ def default_wake(repo: Path, codex: Path, profile: Path) -> tuple[list[str], dic
 def admission_domain(repo: Path, registry_override: str | None, config_raw: str | None) -> dict[str, Any]:
     home = account_home_directory()
     repository = "nurockplayer/tachiko-conductor"
-    runs = Path(os.environ.get("TACHIKO_DATA_DIR", str(home / ".tachiko-conductor/runs"))).expanduser().resolve()
+    canonical_runs = (home / ".tachiko-conductor/runs").resolve()
+    runs = Path(os.environ.get("TACHIKO_DATA_DIR", str(canonical_runs))).expanduser().resolve()
     canonical_registry = (home / ".tachiko-conductor/mission-admission/registry.json").resolve()
     inherited_registry = os.environ.get("TACHIKO_MISSION_ADMISSION_PATH")
     registry = Path(registry_override or inherited_registry or canonical_registry).expanduser()
-    receipts = Path(os.environ.get("TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR", str(home / ".tachiko-conductor/mission-admission/heartbeat-receipts"))).expanduser()
+    canonical_receipts = (home / ".tachiko-conductor/mission-admission/heartbeat-receipts").resolve()
+    receipts = Path(os.environ.get("TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR", str(canonical_receipts))).expanduser()
     if not registry.is_absolute() or not receipts.is_absolute():
         raise RuntimeError("mission-admission registry and receipt paths must be absolute")
     registry = registry.resolve()
     if registry != canonical_registry or (inherited_registry and Path(inherited_registry).expanduser().resolve() != canonical_registry):
         raise RuntimeError("heartbeat admission registry must resolve to the canonical per-user host path")
     receipts = receipts.resolve()
+    if runs != canonical_runs:
+        raise RuntimeError("heartbeat Run directory must resolve to the canonical per-user host path")
+    if receipts != canonical_receipts:
+        raise RuntimeError("heartbeat receipt directory must resolve to the canonical per-user host path")
     if registry == runs or runs in registry.parents or repo == registry or repo in registry.parents:
         raise RuntimeError("mission-admission registry must be host-global and outside Run/repository storage")
     default_config = {"schemaVersion": 1, "revision": "mission-admission-v1", "limits": {"maxCaptains": 1, "maxWriters": 1, "maxHighAutonomy": 1}}

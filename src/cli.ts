@@ -1137,12 +1137,13 @@ export async function runIssueCommand(
       throw new Error(`Run "${run.id}" already has an immutable repair task-shape authority; refusing to replace it.`);
     }
   }
-  // Persist the exact READY intent before admission for both direct and
-  // dispatch callers. Capacity denial and a crash after admission can then be
-  // retried against this same immutable Run id.
+  const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
+  // Resolve and validate the private owner root before persisting a new
+  // admission-backed Run, so a divergent root cannot leave a READY orphan.
+  // Persist the exact intent before admission for both direct and dispatch
+  // callers; capacity denial and a crash can retry this immutable Run id.
   const precreatedRun = isNewRun && (options.dispatchClaimId !== undefined || options.admission !== undefined);
   if (precreatedRun) deps.store.create(run);
-  const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
   const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
   let mayReleaseAsPreExecution = admissionToken !== undefined;
   try {

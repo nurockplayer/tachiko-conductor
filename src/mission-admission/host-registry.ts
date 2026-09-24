@@ -77,13 +77,20 @@ function containsPath(parent: string, child: string): boolean {
   return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
 }
 
+function canonicalReceiptDirectory(env: NodeJS.ProcessEnv, variable: string, canonicalPath: string): string {
+  const canonical = physicalPath(canonicalPath);
+  const candidate = env[variable] ?? canonicalPath;
+  if (!path.isAbsolute(candidate) || physicalPath(candidate) !== canonical) {
+    throw new AdmissionStateError(`${variable} must resolve to its canonical per-user private receipt directory.`);
+  }
+  return canonical;
+}
+
 export function resolveManualOwnerReceiptPath(repository: string, workspace: string, { env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
   if (!path.isAbsolute(workspace) || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository)) throw new AdmissionStateError('Manual owner receipt requires canonical repository and absolute workspace identity.');
   const physicalWorkspace = physicalPath(workspace);
   const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
-  const configuredDirectory = env[MANUAL_OWNER_RECEIPTS_DIR_ENV] ?? path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'manual-receipts');
-  if (!path.isAbsolute(configuredDirectory)) throw new AdmissionStateError(`${MANUAL_OWNER_RECEIPTS_DIR_ENV} must be an absolute host path.`);
-  const receiptDirectory = physicalPath(configuredDirectory);
+  const receiptDirectory = canonicalReceiptDirectory(env, MANUAL_OWNER_RECEIPTS_DIR_ENV, path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'manual-receipts'));
   const receiptId = createHash('sha256').update(`${repository}\0${physicalWorkspace}`).digest('hex');
   const receiptPath = path.join(receiptDirectory, `${receiptId}.json`);
   if (containsPath(physicalWorkspace, receiptPath) || containsPath(runsDirectory, receiptPath)) {
@@ -96,9 +103,7 @@ export function resolveHeartbeatOwnerReceiptPath(repository: string, workspace: 
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) || !path.isAbsolute(workspace)) throw new AdmissionStateError('Heartbeat admission receipt requires canonical repository and absolute workspace identity.');
   const physicalWorkspace = physicalPath(workspace);
   const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
-  const configuredDirectory = env[HEARTBEAT_OWNER_RECEIPTS_DIR_ENV] ?? path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'heartbeat-receipts');
-  if (!path.isAbsolute(configuredDirectory)) throw new AdmissionStateError(`${HEARTBEAT_OWNER_RECEIPTS_DIR_ENV} must be an absolute host path.`);
-  const receiptDirectory = physicalPath(configuredDirectory);
+  const receiptDirectory = canonicalReceiptDirectory(env, HEARTBEAT_OWNER_RECEIPTS_DIR_ENV, path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'heartbeat-receipts'));
   const receiptId = createHash('sha256').update(`${repository}\0${physicalWorkspace}`).digest('hex');
   const receiptPath = path.join(receiptDirectory, `${receiptId}.json`);
   if (containsPath(physicalWorkspace, receiptPath) || containsPath(runsDirectory, receiptPath)) {
@@ -109,9 +114,7 @@ export function resolveHeartbeatOwnerReceiptPath(repository: string, workspace: 
 
 export function resolveRunOwnerReceiptPath(repository: string, runId: string, evidence?: import('./registry.js').MissionEvidence, { env = process.env, homeDirectory = resolveAccountHomeDirectory() }: HostAdmissionResolverOptions = {}): string {
   if (!/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(repository) || !/^[A-Za-z0-9._-]+$/.test(runId)) throw new AdmissionStateError('Run owner receipt requires canonical repository and safe Run identity.');
-  const configuredDirectory = env[RUN_OWNER_RECEIPTS_DIR_ENV] ?? path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'run-receipts');
-  if (!path.isAbsolute(configuredDirectory)) throw new AdmissionStateError(`${RUN_OWNER_RECEIPTS_DIR_ENV} must be an absolute host path.`);
-  const receiptDirectory = physicalPath(configuredDirectory);
+  const receiptDirectory = canonicalReceiptDirectory(env, RUN_OWNER_RECEIPTS_DIR_ENV, path.join(homeDirectory, '.tachiko-conductor', 'mission-admission', 'run-receipts'));
   const runsDirectory = physicalPath(env.TACHIKO_DATA_DIR ?? path.join(homeDirectory, '.tachiko-conductor', 'runs'));
   const receiptPath = path.join(receiptDirectory, `${createHash('sha256').update(`${repository}\0${runId}`).digest('hex')}.json`);
   if (containsPath(runsDirectory, receiptPath) || (evidence?.workspace !== undefined && containsPath(physicalPath(evidence.workspace), receiptPath))) {

@@ -784,9 +784,12 @@ describe('workflow run and resume commands', () => {
   function isolateMergeReceiptRoot(dir: string): () => void {
     const oldReceiptRoot = process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR;
     const oldRunsDir = process.env.TACHIKO_DATA_DIR;
-    process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR = path.join(dir, 'run-receipts');
+    const oldUserInfo = os.userInfo;
+    os.userInfo = (() => ({ ...oldUserInfo(), homedir: dir })) as typeof os.userInfo;
+    process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR = path.join(dir, '.tachiko-conductor', 'mission-admission', 'run-receipts');
     process.env.TACHIKO_DATA_DIR = path.join(dir, 'run-data');
     return () => {
+      os.userInfo = oldUserInfo;
       if (oldReceiptRoot === undefined) delete process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR;
       else process.env.TACHIKO_RUN_OWNER_RECEIPTS_DIR = oldReceiptRoot;
       if (oldRunsDir === undefined) delete process.env.TACHIKO_DATA_DIR;
@@ -2684,6 +2687,7 @@ describe('CLI end-to-end across processes', () => {
       HOME: path.join(dir, 'ambient-home'),
       TACHIKO_TEST_ACCOUNT_HOME: accountHome,
       TACHIKO_DATA_DIR: path.join(dir, 'runs'),
+      TACHIKO_RUN_OWNER_RECEIPTS_DIR: path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'run-receipts'),
       TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify({ schemaVersion: 1, revision: 'direct-cli-capacity-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } }),
       TACHIKO_DISPATCH_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock'),
       TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock.admission'),
@@ -2710,6 +2714,19 @@ describe('CLI end-to-end across processes', () => {
       const rows = listing.stdout.trim().split('\n').filter(Boolean);
       assert.equal(rows.length, 1, 'production CLI lock keeps concurrent callers on one durable Run id');
       assert.match(rows[0]!, /^[a-f0-9-]+\tREADY\t/);
+
+      const registryFile = path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'registry.json');
+      const registryBefore = readFileSync(registryFile, 'utf8');
+      const divergentReceiptRoot = path.join(dir, 'divergent-run-receipts');
+      env.TACHIKO_RUN_OWNER_RECEIPTS_DIR = divergentReceiptRoot;
+      const rejected = await invoke(['run', 'acme/widgets#43', '--execution-profile', 'standard', '--repair-task-shape-authority', '{"revision":"test-shape-v1","shape":"bounded"}']);
+      assert.equal(rejected.status, 1);
+      assert.match(rejected.stderr, /TACHIKO_RUN_OWNER_RECEIPTS_DIR must resolve to its canonical per-user private receipt directory/);
+      assert.equal(readFileSync(registryFile, 'utf8'), registryBefore, 'divergent receipt root is rejected before registry admission');
+      assert.equal(existsSync(divergentReceiptRoot), false);
+      const afterReject = await invoke(['run', 'list']);
+      assert.equal(afterReject.status, 0, afterReject.stderr);
+      assert.equal(afterReject.stdout.trim().split('\n').filter(Boolean).length, 1, 'divergent receipt root is rejected before admission-backed Run creation');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

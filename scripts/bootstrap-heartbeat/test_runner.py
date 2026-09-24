@@ -160,6 +160,58 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("pinned heartbeat admission registry does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
         self.assertEqual(self.records(), [])
+        config["admission"]["registry"] = str(self.account_home / ".tachiko-conductor/mission-admission/registry.json")
+        config["admission"]["runs"] = str(self.root / "stale-runs")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pinned heartbeat Run directory does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+        self.assertEqual(self.records(), [])
+        config["admission"]["runs"] = str(self.account_home / ".tachiko-conductor/runs")
+        config["admission"]["receipts"] = str(self.root / "stale-receipts")
+        config_path.write_text(json.dumps(config), encoding="utf-8")
+        result = self.invoke("run", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pinned heartbeat receipt directory does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+        self.assertEqual(self.records(), [])
+
+    def test_admission_domain_accepts_physical_canonical_aliases_and_rejects_divergent_roots(self) -> None:
+        spec = importlib.util.spec_from_file_location("heartbeat_admission_domain_under_test", RUNNER)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        canonical_runs = self.account_home / ".tachiko-conductor/runs"
+        canonical_receipts = self.account_home / ".tachiko-conductor/mission-admission/heartbeat-receipts"
+        canonical_registry = self.account_home / ".tachiko-conductor/mission-admission/registry.json"
+        canonical_runs.mkdir(parents=True)
+        canonical_receipts.mkdir(parents=True)
+        canonical_registry.parent.mkdir(parents=True, exist_ok=True)
+        canonical_registry.write_text("{}", encoding="utf-8")
+        runs_alias = self.root / "runs-alias"
+        receipts_alias = self.root / "receipts-alias"
+        registry_alias = self.root / "registry-alias.json"
+        runs_alias.symlink_to(canonical_runs, target_is_directory=True)
+        receipts_alias.symlink_to(canonical_receipts, target_is_directory=True)
+        registry_alias.symlink_to(canonical_registry)
+        repo = Path.cwd().resolve()
+
+        with mock.patch.dict(os.environ, {
+            "TACHIKO_DATA_DIR": str(runs_alias),
+            "TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR": str(receipts_alias),
+            "TACHIKO_MISSION_ADMISSION_PATH": str(registry_alias),
+        }):
+            domain = module.admission_domain(repo, None, None)
+        self.assertEqual(Path(domain["runs"]), canonical_runs.resolve())
+        self.assertEqual(Path(domain["receipts"]), canonical_receipts.resolve())
+        self.assertEqual(Path(domain["registry"]), canonical_registry.resolve())
+
+        for variable, divergent, message in (
+            ("TACHIKO_DATA_DIR", self.root / "other-runs", "Run directory must resolve"),
+            ("TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR", self.root / "other-receipts", "receipt directory must resolve"),
+        ):
+            with mock.patch.dict(os.environ, {variable: str(divergent)}):
+                with self.assertRaisesRegex(RuntimeError, message):
+                    module.admission_domain(repo, None, None)
 
     def test_account_home_lookup_ignores_divergent_ambient_home_values(self) -> None:
         saved_home = self.env.get("HOME")

@@ -10,7 +10,7 @@ import { describe, it } from 'node:test';
 
 import { canonicalizeMissionEvidence, MissionAdmissionRegistry, type AdmissionConfig, type AdmissionResult, type AdmissionToken, type MissionEvidence } from '../src/mission-admission/registry.js';
 import { acquireDispatchInvocationLock } from '../src/dispatch/invocation-lock.js';
-import { createHostAdmissionRegistry, resolveHeartbeatOwnerReceiptPath, resolveHostAdmissionConfig, resolveHostAdmissionPath, resolveManualOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { createHostAdmissionRegistry, resolveHeartbeatOwnerReceiptPath, resolveHostAdmissionConfig, resolveHostAdmissionPath, resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 import { dispatchWakePath } from '../src/dispatch/wake.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { createRun } from '../src/domain/run.js';
@@ -905,6 +905,35 @@ describe('provider-neutral durable mission admission', () => {
     }
   });
 
+  it('accepts only canonical manual, heartbeat, and Run receipt roots, including physical aliases', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'admission-receipt-account-home-'));
+    const workspace = path.join(home, 'workspace');
+    mkdirSync(workspace);
+    const missionRoot = path.join(home, '.tachiko-conductor', 'mission-admission');
+    const runs = path.join(home, '.tachiko-conductor', 'runs');
+    mkdirSync(missionRoot, { recursive: true });
+    mkdirSync(runs, { recursive: true });
+    const cases = [
+      ['TACHIKO_MANUAL_OWNER_RECEIPTS_DIR', 'manual-receipts', (env: NodeJS.ProcessEnv) => resolveManualOwnerReceiptPath('acme/widgets', workspace, { homeDirectory: home, env })],
+      ['TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR', 'heartbeat-receipts', (env: NodeJS.ProcessEnv) => resolveHeartbeatOwnerReceiptPath('acme/widgets', workspace, { homeDirectory: home, env })],
+      ['TACHIKO_RUN_OWNER_RECEIPTS_DIR', 'run-receipts', (env: NodeJS.ProcessEnv) => resolveRunOwnerReceiptPath('acme/widgets', 'receipt-root-run', { repository: 'acme/widgets', workspace }, { homeDirectory: home, env })],
+    ] as const;
+    try {
+      for (const [variable, directoryName, resolve] of cases) {
+        const canonical = path.join(missionRoot, directoryName);
+        mkdirSync(canonical, { recursive: true });
+        const expected = resolve({ TACHIKO_DATA_DIR: runs });
+        assert.equal(path.dirname(expected), realpathSync(canonical));
+        const alias = path.join(home, `${directoryName}-alias`);
+        symlinkSync(canonical, alias, 'dir');
+        assert.equal(resolve({ TACHIKO_DATA_DIR: runs, [variable]: alias }), expected, `${variable} accepts a physical alias to its canonical directory`);
+        const divergent = path.join(home, `divergent-${directoryName}`);
+        assert.throws(() => resolve({ TACHIKO_DATA_DIR: runs, [variable]: divergent }), /canonical per-user private receipt directory/);
+        assert.equal(existsSync(divergent), false, `${variable} rejection creates no alternate root`);
+      }
+    } finally { rmSync(home, { recursive: true, force: true }); }
+  });
+
   it('exposes read-only bounded admission status with owning Run/workspace evidence and no capability tokens', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-status-'));
     const workspace = path.join(directory, 'worktree');
@@ -961,7 +990,7 @@ describe('provider-neutral durable mission admission', () => {
     const registryPath = path.join(directory, '.tachiko-conductor', 'mission-admission', 'registry.json');
     const cliConfig: AdmissionConfig = { schemaVersion: 1, revision: 'cli-test-v1', limits: { maxCaptains: 3, maxWriters: 2, maxHighAutonomy: 3 } };
     const registry = new MissionAdmissionRegistry({ filePath: registryPath, config: cliConfig });
-    const receipts = path.join(directory, 'private-receipts');
+    const receipts = path.join(directory, '.tachiko-conductor', 'mission-admission', 'manual-receipts');
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: directory, TACHIKO_DATA_DIR: runsDirectory, TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: receipts, TACHIKO_MISSION_ADMISSION_PATH: registryPath, TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify(cliConfig) };
     try {
       const store = new JsonFileStore({ dir: runsDirectory });
@@ -994,6 +1023,36 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('rejects a divergent manual receipt root before registry or projection publication', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-manual-root-fence-'));
+    const workspace = path.join(directory, 'worktree');
+    mkdirSync(workspace);
+    git(workspace, 'init', '-q', '--initial-branch=main');
+    git(workspace, 'config', 'user.email', 'captain@example.invalid');
+    git(workspace, 'config', 'user.name', 'Captain Test');
+    writeFileSync(path.join(workspace, 'tracked.txt'), 'checkpoint\n');
+    git(workspace, 'add', 'tracked.txt');
+    git(workspace, 'commit', '-q', '-m', 'checkpoint');
+    git(workspace, 'remote', 'add', 'origin', 'https://github.com/Acme/Widgets.git');
+    const registryPath = path.join(directory, '.tachiko-conductor', 'mission-admission', 'registry.json');
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      HOME: directory,
+      TACHIKO_DATA_DIR: path.join(directory, 'runs'),
+      TACHIKO_MISSION_ADMISSION_PATH: registryPath,
+      TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify(config),
+      TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: path.join(directory, 'divergent-receipts'),
+    };
+    try {
+      const result = runCli(['dispatch', 'manual', 'register'], workspace, env);
+      assert.notEqual(result.status, 0);
+      assert.match(result.stderr, /TACHIKO_MANUAL_OWNER_RECEIPTS_DIR must resolve to its canonical per-user private receipt directory/);
+      assert.equal(existsSync(registryPath), false, 'divergent receipt root rejects before registry admission');
+      assert.equal(existsSync(path.join(directory, 'divergent-receipts')), false);
+      assert.equal(existsSync(path.join(directory, 'runs', '.operational', 'v1', 'runtime.json')), false);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('fails closed when multiple active Runs match a direct target', () => {
     const { directory } = fixture();
     try {
@@ -1017,7 +1076,7 @@ describe('provider-neutral durable mission admission', () => {
     const workspace = path.join(directory, 'worktree');
     const runsDirectory = path.join(directory, 'runs');
     const registryPath = path.join(directory, '.tachiko-conductor', 'mission-admission', 'registry.json');
-    const receipts = path.join(directory, 'private-receipts');
+    const receipts = path.join(directory, '.tachiko-conductor', 'mission-admission', 'manual-receipts');
     const cliConfig: AdmissionConfig = { schemaVersion: 1, revision: 'manual-cli-v1', limits: { maxCaptains: 2, maxWriters: 1, maxHighAutonomy: 2 } };
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: directory, TACHIKO_DATA_DIR: runsDirectory, TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: receipts, TACHIKO_MISSION_ADMISSION_PATH: registryPath, TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify(cliConfig) };
     try {
@@ -1119,7 +1178,7 @@ describe('provider-neutral durable mission admission', () => {
     const runsPath = path.join(directory, 'runs');
     const registryPath = path.join(directory, '.tachiko-conductor', 'mission-admission', 'registry.json');
     const cliConfig: AdmissionConfig = { schemaVersion: 1, revision: 'manual-projection-failure-v1', limits: { maxCaptains: 2, maxWriters: 1, maxHighAutonomy: 2 } };
-    const receipts = path.join(directory, 'private-receipts');
+    const receipts = path.join(directory, '.tachiko-conductor', 'mission-admission', 'manual-receipts');
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: directory, TACHIKO_DATA_DIR: runsPath, TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: receipts, TACHIKO_MISSION_ADMISSION_PATH: registryPath, TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify(cliConfig) };
     const registry = new MissionAdmissionRegistry({ filePath: registryPath, config: cliConfig });
     try {
@@ -1156,7 +1215,7 @@ describe('provider-neutral durable mission admission', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-manual-receipt-failure-'));
     const workspace = path.join(directory, 'worktree');
     const runs = path.join(directory, 'runs');
-    const receipts = path.join(directory, 'receipt-blocker');
+    const receipts = path.join(directory, '.tachiko-conductor', 'mission-admission', 'manual-receipts');
     const registryPath = path.join(directory, '.tachiko-conductor', 'mission-admission', 'registry.json');
     const cliConfig: AdmissionConfig = { schemaVersion: 1, revision: 'manual-recovery-v1', limits: { maxCaptains: 2, maxWriters: 1, maxHighAutonomy: 2 } };
     const env: NodeJS.ProcessEnv = { ...process.env, HOME: directory, TACHIKO_DATA_DIR: runs, TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: receipts, TACHIKO_MISSION_ADMISSION_PATH: registryPath, TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify(cliConfig) };
@@ -1165,6 +1224,7 @@ describe('provider-neutral durable mission admission', () => {
       git(workspace, 'init', '-q', '--initial-branch=main'); git(workspace, 'config', 'user.email', 'captain@example.invalid'); git(workspace, 'config', 'user.name', 'Captain Test');
       writeFileSync(path.join(workspace, 'tracked.txt'), 'checkpoint\n'); git(workspace, 'add', 'tracked.txt'); git(workspace, 'commit', '-q', '-m', 'checkpoint');
       git(workspace, 'remote', 'add', 'origin', 'https://github.com/Acme/Widgets.git');
+      mkdirSync(path.dirname(receipts), { recursive: true });
       writeFileSync(receipts, 'block receipt directory creation');
       const failed = runCli(['dispatch', 'manual', 'register'], workspace, env);
       assert.notEqual(failed.status, 0);
