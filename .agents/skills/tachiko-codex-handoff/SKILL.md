@@ -1,6 +1,6 @@
 ---
 name: tachiko-codex-handoff
-description: Prepare or refresh a GitHub-grounded implementation handoff for Codex with an executable Issue contract, appropriate model/effort, and concise non-duplicative prompt.
+description: Prepare or refresh a GitHub-grounded implementation handoff for Codex, including an executable Issue contract, an appropriate model and reasoning effort, and a concise non-duplicative prompt. Use when the user says 給我 prompt, 交給 Codex, 串行長任務, 照固定流程給我實作 prompt, or asks which Luna, Terra, Sol, or Astra level should run the work.
 ---
 
 # Repository discovery entrypoint
