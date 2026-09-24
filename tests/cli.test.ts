@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -633,6 +633,84 @@ describe('workflow run and resume commands', () => {
     assert.equal(outcome.outcome, 'merge_ready');
     assert.equal(outcome.run.state, 'MERGE_READY');
     assert.equal(store.list().length, 1);
+  });
+
+  it('serializes concurrent direct Run intent creation and releases the short lock before provider work', async () => {
+    const { dir } = tempStore();
+    try {
+      const store = new MemoryStore();
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config: { schemaVersion: 1, revision: 'direct-run-lock-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      let tail = Promise.resolve();
+      let admissionLockHeld = false;
+      const withRunAdmissionLock = async <T>(operation: (release: () => void) => T | Promise<T>): Promise<T> => {
+        const previous = tail;
+        let unlock!: () => void;
+        tail = new Promise<void>((resolve) => { unlock = resolve; });
+        await previous;
+        admissionLockHeld = true;
+        let released = false;
+        const release = () => { if (!released) { released = true; admissionLockHeld = false; unlock(); } };
+        try { return await operation(release); } finally { release(); }
+      };
+      let markEntered!: () => void;
+      const entered = new Promise<void>((resolve) => { markEntered = resolve; });
+      let allowFailure!: () => void;
+      const failureGate = new Promise<void>((resolve) => { allowFailure = resolve; });
+      let providerSawReleasedLock = false;
+      class BlockingImplementation implements ImplementationAgent {
+        readonly kind = 'implementation-agent' as const;
+        async run(): Promise<AgentResult> {
+          providerSawReleasedLock = !admissionLockHeld;
+          markEntered();
+          await failureGate;
+          throw new Error('injected uncertain workflow stop');
+        }
+      }
+      const options = {
+        admission: registry,
+        admissionWorkspace: dir,
+        runOwnerReceiptPath: path.join(dir, 'owner.json'),
+        withRunAdmissionLock,
+      };
+      const workflowDeps = deps(store, githubAdapter([HEAD]), new BlockingImplementation(), new FakeReviewer([]));
+      const first = runIssueCommand(workflowDeps, 'acme/widgets#42', options);
+      await entered;
+      await assert.rejects(runIssueCommand(workflowDeps, 'acme/widgets#42', options), /Lane already has active ownership|active or parked lane/);
+      assert.equal(store.list().length, 1, 'concurrent callers share the persisted READY Run id');
+      assert.equal(providerSawReleasedLock, true, 'provider execution begins only after the direct admission lock is released');
+      allowFailure();
+      await assert.rejects(first, /injected uncertain workflow stop/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('persists direct capacity-wait Run before admission and retries the same id after capacity release', async () => {
+    const { dir } = tempStore();
+    try {
+      const store = new MemoryStore();
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config: { schemaVersion: 1, revision: 'direct-capacity-retry-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const holder = registry.admit({ laneId: 'other-mission', role: 'production_captain', highAutonomy: true, evidence: { repository: 'other/repo', issue: 9 } });
+      assert.equal(holder.outcome, 'admitted');
+      await assert.rejects(runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', {
+        admission: registry, runOwnerReceiptPath: path.join(dir, 'owner.json'), now: () => T0,
+      }), /cannot enter mission admission: Run .*waiting for mission admission capacity/);
+      const persisted = store.list();
+      assert.equal(persisted.length, 1, 'capacity denial leaves the exact READY Run durable');
+      assert.equal(persisted[0]?.state, 'READY');
+      const parked = registry.readLane(`run:${persisted[0]!.id}`);
+      assert.equal(parked?.status, 'parked');
+      if (holder.outcome !== 'admitted') return;
+      registry.release(holder.token, true);
+      class StopAfterAdmission implements ImplementationAgent {
+        readonly kind = 'implementation-agent' as const;
+        async run(): Promise<AgentResult> { throw new Error('stopped after retry admission'); }
+      }
+      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), new StopAfterAdmission(), new FakeReviewer([])), 'acme/widgets#42', {
+        admission: registry, admissionWorkspace: dir, runOwnerReceiptPath: path.join(dir, 'owner.json'), now: () => T0,
+      }), /stopped after retry admission/);
+      assert.equal(store.list().length, 1, 'retry does not construct a second random Run id');
+      assert.equal(store.list()[0]?.id, persisted[0]?.id);
+      assert.equal(registry.readLane(`run:${persisted[0]!.id}`)?.status, 'active');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('keeps initial admission logical until a workspace is actually prepared', async () => {
@@ -1431,7 +1509,7 @@ describe('workflow run and resume commands', () => {
         runIssueCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', { admission, runOwnerReceiptPath: path.join(dir, 'run-owner-create-failure.json') }),
         /injected durable create failure/,
       );
-      assert.equal(admission.readLane(`run:${store.createdId}`)?.status, 'released');
+      assert.equal(admission.readLane(`run:${store.createdId}`), null, 'durable intent failure happens before any reservation');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -1945,5 +2023,143 @@ describe('CLI end-to-end across processes', () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it('retries only a capacity-parked manual lane and preserves the manual checkpoint fence', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-manual-capacity-'));
+    const accountHome = path.join(dir, 'account-home');
+    const runs = path.join(dir, 'runs');
+    mkdirSync(accountHome);
+    const preload = path.join(dir, 'account-home-preload.mjs');
+    writeFileSync(preload, [
+      "import os from 'node:os';",
+      'const original = os.userInfo.bind(os);',
+      "Object.defineProperty(os, 'userInfo', { configurable: true, value: (...args) => ({ ...original(...args), homedir: process.env.TACHIKO_TEST_ACCOUNT_HOME }) });",
+      '',
+    ].join('\n'));
+    const helper = path.join(dir, 'registry-fixture.mjs');
+    const hostRegistryUrl = pathToFileURL(path.join(REPO_ROOT, 'src/mission-admission/host-registry.js')).href;
+    writeFileSync(helper, [
+      "import { readFileSync, readdirSync, writeFileSync } from 'node:fs';",
+      `import { createHostAdmissionRegistry } from ${JSON.stringify(hostRegistryUrl)};`,
+      "const registry = createHostAdmissionRegistry();",
+      "if (process.argv[2] === 'hold') { const result = registry.admit({ laneId: 'manual-test-capacity-holder', role: 'production_captain', evidence: { repository: 'other/repo', issue: 9 }, highAutonomy: true }); if (result.outcome !== 'admitted') throw new Error('could not create capacity holder'); writeFileSync(process.env.TACHIKO_TEST_TOKEN_PATH, JSON.stringify(result.token)); }",
+      "if (process.argv[2] === 'release') { const token = JSON.parse(readFileSync(process.env.TACHIKO_TEST_TOKEN_PATH, 'utf8')); registry.release(token, true); }",
+      "if (process.argv[2] === 'checkpoint') { const files = readdirSync(process.env.TACHIKO_MANUAL_OWNER_RECEIPTS_DIR); const receipt = JSON.parse(readFileSync(process.env.TACHIKO_MANUAL_OWNER_RECEIPTS_DIR + '/' + files[0], 'utf8')); registry.parkManual(receipt.token, { worktree: process.cwd(), branch: process.env.TACHIKO_TEST_BRANCH, checkpointSha: process.env.TACHIKO_TEST_HEAD, clean: true, stopped: true }); }",
+      '',
+    ].join('\n'));
+    const admissionConfig = JSON.stringify({ schemaVersion: 1, revision: 'manual-capacity-test-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } });
+    const env = {
+      ...process.env,
+      HOME: path.join(dir, 'ambient-home'),
+      TACHIKO_TEST_ACCOUNT_HOME: accountHome,
+      TACHIKO_DATA_DIR: runs,
+      TACHIKO_MISSION_ADMISSION_CONFIG: admissionConfig,
+      TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'manual-receipts'),
+      TACHIKO_DISPATCH_LOCK_PATH: path.join(dir, 'dispatch.lock'),
+      TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(dir, 'dispatch.lock.admission'),
+      TACHIKO_TEST_BRANCH: spawnSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout.trim(),
+      TACHIKO_TEST_HEAD: spawnSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout.trim(),
+      TACHIKO_TEST_TOKEN_PATH: path.join(dir, 'holder-token.json'),
+    };
+    const invoke = (args: string[]): Promise<CliResult> => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--import', preload, '--import', 'tsx', path.join(REPO_ROOT, 'src/cli.ts'), ...args], { cwd: REPO_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+      child.on('error', reject);
+      child.on('close', (status) => resolve({ stdout, stderr, status }));
+    });
+    const fixture = (action: string) => spawnSync(process.execPath, ['--import', preload, '--import', 'tsx', helper, action], { cwd: REPO_ROOT, env, encoding: 'utf8' });
+    const registryFile = path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'registry.json');
+    const manualArgs = ['dispatch', 'manual', 'register'];
+    try {
+      assert.equal(fixture('hold').status, 0);
+      const firstWait = await invoke(manualArgs);
+      assert.equal(firstWait.status, 1);
+      assert.match(firstWait.stderr, /parked by capacity_captains/);
+      const revisionAfterFirstWait = JSON.parse(readFileSync(registryFile, 'utf8')).revision;
+      const secondWait = await invoke(manualArgs);
+      assert.equal(secondWait.status, 1);
+      assert.match(secondWait.stderr, /parked by capacity_captains/);
+      const stateWhileBlocked = JSON.parse(readFileSync(registryFile, 'utf8'));
+      assert.equal(stateWhileBlocked.revision, revisionAfterFirstWait, 'repeated capacity denial does not churn the exact parked lane');
+      const parkedManual = stateWhileBlocked.lanes.find((lane: { laneId: string }) => lane.laneId.startsWith('manual:'));
+      assert.equal(parkedManual.status, 'parked');
+      assert.equal(parkedManual.generation, 1);
+
+      const releasedHolder = fixture('release');
+      assert.equal(releasedHolder.status, 0, releasedHolder.stderr || releasedHolder.stdout);
+      const racing = await Promise.all([invoke(manualArgs), invoke(manualArgs)]);
+      assert.equal(racing.filter((result) => result.status === 0).length, 1, 'the admission lock and registry transaction allow one promotion');
+      assert.equal(racing.filter((result) => result.status === 1).length, 1);
+      const activeState = JSON.parse(readFileSync(registryFile, 'utf8'));
+      const activeManual = activeState.lanes.find((lane: { laneId: string }) => lane.laneId.startsWith('manual:'));
+      assert.equal(activeManual.status, 'active');
+      assert.equal(activeManual.generation, 2);
+      assert.ok(existsSync(path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'manual-receipts')));
+
+      assert.equal(fixture('checkpoint').status, 0);
+      const checkpointRetry = await invoke(manualArgs);
+      assert.equal(checkpointRetry.status, 1);
+      assert.match(checkpointRetry.stderr, /manual_checkpoint/);
+      const checkpointState = JSON.parse(readFileSync(registryFile, 'utf8'));
+      const checkpointManual = checkpointState.lanes.find((lane: { laneId: string }) => lane.laneId.startsWith('manual:'));
+      assert.equal(checkpointManual.parkedReason, 'manual_checkpoint');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('production direct CLI serializes concurrent lookup, profile validation, READY create, and capacity reservation', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-direct-cli-admission-'));
+    const accountHome = path.join(dir, 'account-home');
+    mkdirSync(accountHome);
+    const preload = path.join(dir, 'account-home-preload.mjs');
+    writeFileSync(preload, [
+      "import os from 'node:os';",
+      'const original = os.userInfo.bind(os);',
+      "Object.defineProperty(os, 'userInfo', { configurable: true, value: (...args) => ({ ...original(...args), homedir: process.env.TACHIKO_TEST_ACCOUNT_HOME }) });",
+      '',
+    ].join('\n'));
+    const helper = path.join(dir, 'registry-fixture.mjs');
+    const hostRegistryUrl = pathToFileURL(path.join(REPO_ROOT, 'src/mission-admission/host-registry.js')).href;
+    writeFileSync(helper, [
+      `import { createHostAdmissionRegistry } from ${JSON.stringify(hostRegistryUrl)};`,
+      "const result = createHostAdmissionRegistry().admit({ laneId: 'direct-cli-capacity-holder', role: 'production_captain', evidence: { repository: 'other/repo', issue: 8 }, highAutonomy: true });",
+      "if (result.outcome !== 'admitted') throw new Error('could not seed capacity holder');",
+      '',
+    ].join('\n'));
+    const env = {
+      ...process.env,
+      HOME: path.join(dir, 'ambient-home'),
+      TACHIKO_TEST_ACCOUNT_HOME: accountHome,
+      TACHIKO_DATA_DIR: path.join(dir, 'runs'),
+      TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify({ schemaVersion: 1, revision: 'direct-cli-capacity-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } }),
+      TACHIKO_DISPATCH_LOCK_PATH: path.join(dir, 'dispatch.lock'),
+      TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(dir, 'dispatch.lock.admission'),
+      TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify({ revision: 'direct-cli-profile-v1', profiles: { routine: { executor: 'codex-cli', timeoutMs: 1 }, standard: { executor: 'codex-cli', timeoutMs: 2 }, complex: { executor: 'codex-cli', timeoutMs: 3 }, critical: { executor: 'claude-code', timeoutMs: 4 } } }),
+    };
+    const invoke = (args: string[]): Promise<CliResult> => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--import', preload, '--import', 'tsx', path.join(REPO_ROOT, 'src/cli.ts'), ...args], { cwd: REPO_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
+      let stdout = '';
+      let stderr = '';
+      child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+      child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+      child.on('error', reject);
+      child.on('close', (status) => resolve({ stdout, stderr, status }));
+    });
+    try {
+      const holder = spawnSync(process.execPath, ['--import', preload, '--import', 'tsx', helper], { cwd: REPO_ROOT, env, encoding: 'utf8' });
+      assert.equal(holder.status, 0, holder.stderr);
+      const args = ['run', 'acme/widgets#42', '--execution-profile', 'standard', '--repair-task-shape-authority', '{"revision":"test-shape-v1","shape":"bounded"}'];
+      const callers = await Promise.all([invoke(args), invoke(args)]);
+      assert.deepEqual(callers.map((result) => result.status), [1, 1]);
+      assert.ok(callers.every((result) => /waiting for mission admission capacity/.test(result.stderr)));
+      const listing = await invoke(['run', 'list']);
+      assert.equal(listing.status, 0, listing.stderr);
+      const rows = listing.stdout.trim().split('\n').filter(Boolean);
+      assert.equal(rows.length, 1, 'production CLI lock keeps concurrent callers on one durable Run id');
+      assert.match(rows[0]!, /^[a-f0-9-]+\tREADY\t/);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

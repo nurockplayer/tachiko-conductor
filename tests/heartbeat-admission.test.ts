@@ -38,7 +38,7 @@ function setup(overrides: { readonly beforePublish?: () => void; readonly limits
     receiptId,
     stopProof: { childrenStopped: true, supervisorStopped: overrides.stopped ?? true, observedAt: '2026-09-23T00:00:00.000Z' },
   });
-  const recover = (repository: string, generation: number, overrides: { readonly supervisor?: string } = {}) => ({
+  const recover = (repository: string, generation: number | null, overrides: { readonly supervisor?: string } = {}) => ({
     schemaVersion: 1,
     action: 'recover',
     repository,
@@ -85,6 +85,56 @@ describe('model-free heartbeat mission admission helper', () => {
       assert.equal(denied.reason, 'capacity_captains');
       assert.equal(existsSync(f.receiptPath), false);
       assert.equal(modelCalls, 0);
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('read-only recovers an exact capacity-parked lane with no receipt and reuses that lane after release', () => {
+    const f = setup();
+    try {
+      const holder = f.registry.admit({ laneId: 'capacity-holder', role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/holder', issue: 3 } });
+      assert.equal(holder.outcome, 'admitted');
+      const denied = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(denied.outcome, 'waiting');
+      if (denied.outcome !== 'waiting') return;
+      const recovery = handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options);
+      assert.deepEqual(recovery, { schemaVersion: 1, outcome: 'capacity_wait', laneId: denied.laneId });
+      assert.equal(existsSync(f.receiptPath), false);
+      const laneBefore = f.registry.readLane(denied.laneId)!;
+      assert.equal(laneBefore.status, 'parked');
+      assert.equal(laneBefore.role, 'production_captain');
+      if (holder.outcome !== 'admitted') return;
+      f.registry.release(holder.token, true);
+      const retry = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(retry.outcome, 'reserved');
+      if (retry.outcome !== 'reserved') return;
+      assert.equal(retry.laneId, denied.laneId, 'capacity retry promotes its deterministic parked lane');
+      assert.equal(f.registry.readLane(denied.laneId)?.status, 'active');
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('recovers capacity wait with only an older matching settled receipt and rejects current or future evidence', () => {
+    const f = setup();
+    try {
+      const first = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(first.outcome, 'reserved');
+      if (first.outcome !== 'reserved') return;
+      handleHeartbeatAdmission(f.settle('acme/widgets', first.generation, first.receiptId), f.options);
+      const holder = f.registry.admit({ laneId: 'later-capacity-holder', role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/holder', issue: 4 } });
+      assert.equal(holder.outcome, 'admitted');
+      const denied = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(denied.outcome, 'waiting');
+      if (denied.outcome !== 'waiting') return;
+      const parked = f.registry.readLane(denied.laneId)!;
+      assert.equal(parked.generation, 3);
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'capacity_wait');
+
+      const settledReceipt = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { token: { generation: number } };
+      writeFileSync(f.receiptPath, JSON.stringify({ ...JSON.parse(readFileSync(f.receiptPath, 'utf8')), status: 'active' }), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'not_owned', 'an active receipt cannot justify capacity wait');
+      writeFileSync(f.receiptPath, JSON.stringify({ ...JSON.parse(readFileSync(f.receiptPath, 'utf8')), status: 'settled', token: { ...settledReceipt.token, generation: parked.generation - 1 } }), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'not_owned', 'receipt generation+1 equal to parked generation is not historical enough');
+      writeFileSync(f.receiptPath, JSON.stringify({ ...JSON.parse(readFileSync(f.receiptPath, 'utf8')), workspace: '/tmp/foreign-workspace', token: { ...settledReceipt.token, generation: first.generation } }), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'not_owned', 'a settled receipt for another workspace cannot authorize capacity recovery');
     } finally { rmSync(f.directory, { recursive: true, force: true }); }
   });
 

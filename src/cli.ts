@@ -1062,6 +1062,8 @@ export interface WorkflowCommandOptions {
   /** Release a surrounding short dispatch admission lock after durable admission/Run transition, before workflow execution. */
   readonly releaseDispatchAdmissionLock?: () => void;
   readonly withDispatchAdmissionLock?: <T>(operation: () => T | Promise<T>) => Promise<T>;
+  /** Serialize the direct Run lookup/profile/create/admit boundary and hand its short-lock release to the admission path. */
+  readonly withRunAdmissionLock?: <T>(operation: (release: () => void) => T | Promise<T>) => Promise<T>;
   /** Atomic short-lock bridge for a canonical live dispatch claim plus Run CAS. */
   readonly commitDispatchResumeTransition?: (expected: Run, next: Run, commitRun: () => void) => Promise<void>;
 }
@@ -1076,6 +1078,13 @@ export async function runIssueCommand(
   ref: string,
   options: WorkflowCommandOptions = {},
 ): Promise<WorkflowOutcome> {
+  if (options.withRunAdmissionLock !== undefined && options.releaseDispatchAdmissionLock === undefined) {
+    return options.withRunAdmissionLock((release) => runIssueCommand(deps, ref, {
+      ...options,
+      withRunAdmissionLock: undefined,
+      releaseDispatchAdmissionLock: release,
+    }));
+  }
   const target = parseIssueRef(ref);
   let run = findRunByTarget(deps.store, target);
   if (run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
@@ -1094,16 +1103,16 @@ export async function runIssueCommand(
       throw new Error(`Run "${run.id}" already has an immutable repair task-shape authority; refusing to replace it.`);
     }
   }
-  // Dispatch runs are the durable intent attached to the runtime claim. Write
-  // that READY Run before admission so a capacity wait can be recovered by
-  // claim id without reconstructing profile or repair authority.
-  const precreatedClaimRun = isNewRun && options.dispatchClaimId !== undefined;
-  if (precreatedClaimRun) deps.store.create(run);
+  // Persist the exact READY intent before admission for both direct and
+  // dispatch callers. Capacity denial and a crash after admission can then be
+  // retried against this same immutable Run id.
+  const precreatedRun = isNewRun && (options.dispatchClaimId !== undefined || options.admission !== undefined);
+  if (precreatedRun) deps.store.create(run);
   const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
   const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
   let mayReleaseAsPreExecution = admissionToken !== undefined;
   try {
-    if (isNewRun && !precreatedClaimRun) deps.store.create(run);
+    if (isNewRun && !precreatedRun) deps.store.create(run);
     options.releaseDispatchAdmissionLock?.();
     const outcome = await runWorkflow(deps, run.id, {
       maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
@@ -1834,7 +1843,7 @@ export async function main(argv: string[]): Promise<number> {
         let token: AdmissionToken;
         if (prior?.status === 'active') {
           throw new Error(`Manual lane already has active ownership at generation ${prior.generation}; a second registration cannot reuse that capability.`);
-        } else if (prior?.status === 'parked') {
+        } else if (prior?.status === 'parked' && (prior.parkedReason === undefined || !['capacity_captains', 'capacity_writers', 'capacity_high_autonomy', 'capacity_repository'].includes(prior.parkedReason))) {
           throw new Error(`Manual lane remains reserved at parked generation ${prior.generation} (${prior.parkedReason}); retire its exact clean checkpoint before registering again.`);
         } else {
           const admission = registry.admit({ laneId, role: 'production_captain', evidence: identity, highAutonomy: true }, {
@@ -2325,22 +2334,28 @@ export async function main(argv: string[]): Promise<number> {
   if (ref === undefined || extra !== undefined) {
     throw new Error('run requires exactly one owner/repo#123 reference.');
   }
-  const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
-  const target = parseIssueRef(ref);
-  const existing = findRunByTarget(store, target);
-  if (existing === null && values['execution-profile'] === undefined) {
-    throw new Error('run owner/repo#123 requires --execution-profile <routine|standard|complex|critical> for a new run.');
-  }
-  if (existing === null && values['repair-task-shape-authority'] === undefined) {
-    throw new Error('run owner/repo#123 requires --repair-task-shape-authority <strict-json> for a new run.');
-  }
-  const execution = values['execution-profile'] === undefined
-    ? undefined
-    : resolveSelectedExecutionProfile(values['execution-profile']);
-  const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
-    ? undefined
-    : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry() });
+  const outcome = await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
+    const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
+    const target = parseIssueRef(ref);
+    const existing = findRunByTarget(store, target);
+    if (existing === null && values['execution-profile'] === undefined) {
+      throw new Error('run owner/repo#123 requires --execution-profile <routine|standard|complex|critical> for a new run.');
+    }
+    if (existing === null && values['repair-task-shape-authority'] === undefined) {
+      throw new Error('run owner/repo#123 requires --repair-task-shape-authority <strict-json> for a new run.');
+    }
+    const execution = values['execution-profile'] === undefined
+      ? undefined
+      : resolveSelectedExecutionProfile(values['execution-profile']);
+    const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
+      ? undefined
+      : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
+    return runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, {
+      execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(),
+      releaseDispatchAdmissionLock: releaseAdmissionLock,
+      withDispatchAdmissionLock: async <T>(operation: () => T | Promise<T>) => await withDispatchAdmissionLock(operation),
+    });
+  });
   printOutcome(outcome, values['browser-profile']);
   return outcome.outcome === 'failed' ? 1 : 0;
 }

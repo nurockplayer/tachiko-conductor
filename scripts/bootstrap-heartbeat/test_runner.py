@@ -312,6 +312,7 @@ class HeartbeatTest(unittest.TestCase):
             "const q = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
             "if (q.action === 'inspect') { console.log(JSON.stringify({schemaVersion:1,outcome:'inspected',lane:s.active?{status:'active',generation:s.generation}:{status:'released',generation:s.releasedGeneration||((s.generation||0)+1)}}));\n"
             "} else if (q.action === 'recover') {\n"
+            " if ((s.capacityWait || s.capacityWaitHistoricalReceipt) && !s.active && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'capacity_wait'})); process.exit(0); }\n"
             " if (s.active && s.settlementPending && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'settlement_pending',generation:s.generation,receiptId:s.receiptId}));\n"
             " else if (s.active && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'recoverable',generation:s.generation,receiptId:s.receiptId}));\n"
             " else if (!s.active && q.expectedGeneration !== null && s.releasedGeneration === q.expectedGeneration + 1) console.log(JSON.stringify({schemaVersion:1,outcome:'already_settled',generation:q.expectedGeneration,receiptId:s.receiptId}));\n"
@@ -575,6 +576,46 @@ class HeartbeatTest(unittest.TestCase):
         self.assertFalse(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
         self.assertIsNone(self.state()["pending_admission"])
         self.assertEqual(self.records(), [])
+
+    def _set_capacity_wait_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host", historical_receipt: bool = False) -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "old-supervisor", "host_id": host_id, "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        self.admission_state.write_text(json.dumps({"capacityWait": not historical_receipt, "capacityWaitHistoricalReceipt": historical_receipt, "mode": "waiting"}), encoding="utf-8")
+
+    def test_capacity_wait_crash_clears_only_dead_generation_free_preexecution_intent(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_capacity_wait_pending()
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["capacityWait"],
+                        "capacity reconciliation preserves the parked lane and never releases it")
+        self.assertEqual(self.records(), [], "capacity recovery never spawns")
+
+    def test_later_cycle_capacity_wait_crash_accepts_prior_settled_tombstone_without_spawning(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_capacity_wait_pending(historical_receipt=True)
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        receipt_evidence = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(receipt_evidence["capacityWaitHistoricalReceipt"], "the historical receipt remains evidence only; the parked lane is not retired")
+        self.assertEqual(self.records(), [])
+
+    def test_capacity_wait_refuses_wrong_host_or_execution_possible_intent(self) -> None:
+        for phase, host_id in (("reserved_pre_execution", "other-host"), ("spawn_uncertain", "test-host")):
+            with self.subTest(phase=phase, host_id=host_id):
+                self.invoke("run", "--prime")
+                self._set_capacity_wait_pending(phase=phase, host_id=host_id)
+                result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIsNotNone(self.state()["pending_admission"])
+                self.assertEqual(self.records(), [])
 
     def test_same_boot_uncertain_intent_clears_only_after_registry_proves_exact_release(self) -> None:
         self.invoke("run", "--prime")

@@ -171,7 +171,7 @@ type HeartbeatStatusProjection = ReturnType<typeof statusProjection>;
 export type HeartbeatAdmissionResult =
   | ({ readonly schemaVersion: 1; readonly outcome: 'inspected' } & HeartbeatStatusProjection)
   | { readonly schemaVersion: 1; readonly outcome: 'recoverable' | 'settlement_pending' | 'already_settled'; readonly laneId: string; readonly generation: number; readonly receiptId: string }
-  | { readonly schemaVersion: 1; readonly outcome: 'absent' | 'not_owned'; readonly laneId: string }
+  | { readonly schemaVersion: 1; readonly outcome: 'absent' | 'capacity_wait' | 'not_owned'; readonly laneId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'reserved' | 'already_reserved'; readonly laneId: string; readonly missionId: string; readonly generation: number; readonly receiptId: string; readonly revision: number }
   | { readonly schemaVersion: 1; readonly outcome: 'waiting'; readonly laneId: string; readonly missionId: string; readonly reason: string; readonly revision: number }
   | { readonly schemaVersion: 1; readonly outcome: 'owned_elsewhere'; readonly laneId: string; readonly missionId: string; readonly reason: 'overlapping_production_lane'; readonly revision: number }
@@ -193,6 +193,18 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
     const lane = registry.readLane(laneId);
     const receipt = privateReceipt(receiptPath);
     if (lane === null && receipt === null) return { schemaVersion: 1, outcome: 'absent', laneId };
+    const capacityReasons = ['capacity_captains', 'capacity_writers', 'capacity_high_autonomy', 'capacity_repository'];
+    const exactCapacityWaitLane = request.expectedGeneration === null && lane?.status === 'parked' &&
+      lane.laneId === laneId && lane.role === 'production_captain' && lane.highAutonomy === true && lane.evidence.repositoryScope === true &&
+      lane.evidence.repository === evidence.repository && lane.evidence.workspace === evidence.workspace &&
+      lane.parkedReason !== undefined && capacityReasons.includes(lane.parkedReason);
+    const historicalSettledReceipt = receipt !== null && lane !== null && receipt.status === 'settled' &&
+      receipt.laneId === laneId && receipt.missionId === lane.missionId && receipt.repository === evidence.repository &&
+      receipt.workspace === evidence.workspace && lane.status === 'parked' &&
+      receipt.token.generation + 1 < lane.generation;
+    if (exactCapacityWaitLane && (receipt === null || historicalSettledReceipt)) {
+      return { schemaVersion: 1, outcome: 'capacity_wait', laneId };
+    }
     if (receipt === null || receipt.laneId !== laneId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace || receipt.supervisorId !== request.supervisorId) {
       return { schemaVersion: 1, outcome: 'not_owned', laneId };
     }

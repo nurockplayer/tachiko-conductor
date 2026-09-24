@@ -1203,6 +1203,15 @@ def reconcile_pending_admission(config: dict[str, Any], state: dict[str, Any]) -
         save_state(state)
         log("cleared stale execution intent after registry proved its exact generation released")
         return True
+    if recovery.get("outcome") == "capacity_wait":
+        if (pending["generation"] is not None or pending["receipt_id"] is not None
+                or pending["phase"] != "reserved_pre_execution"
+                or not pending_owner_is_proven_dead(pending, host_id, boot_id)):
+            raise RuntimeError("capacity-wait receipt does not match a dead generation-free pre-execution intent")
+        state["pending_admission"] = None
+        save_state(state)
+        log("cleared exact dead pre-execution intent while preserving the parked capacity lane")
+        return True
     if recovery.get("outcome") == "absent":
         if pending["generation"] is not None or not pending_owner_is_proven_dead(pending, host_id, boot_id):
             raise RuntimeError("registry lane is absent without sufficient durable proof to clear its intent")
