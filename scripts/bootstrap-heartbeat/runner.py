@@ -191,13 +191,32 @@ def now_epoch() -> int:
 
 def atomic_write(path: Path, data: bytes, mode: int = 0o600) -> None:
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temp = path.with_name(path.name + ".tmp")
-    with temp.open("wb") as stream:
-        stream.write(data)
-        stream.flush()
-        os.fsync(stream.fileno())
-    os.chmod(temp, mode)
-    os.replace(temp, path)
+    descriptor, temp_name = tempfile.mkstemp(prefix=path.name + ".tmp-", dir=path.parent)
+    temp = Path(temp_name)
+    descriptor_open = True
+    try:
+        os.fchmod(descriptor, mode)
+        stream = os.fdopen(descriptor, "wb")
+        descriptor_open = False
+        with stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    finally:
+        if descriptor_open:
+            os.close(descriptor)
 
 
 def trim(path: Path, limit: int) -> None:
@@ -557,6 +576,11 @@ def save_state(state: dict[str, Any]) -> None:
     if (testing() and isinstance(state.get("pending_admission"), dict)
             and os.environ.get("SCD_HEARTBEAT_TEST_FAIL_PHASE_SAVE") == state["pending_admission"].get("phase")):
         raise OSError("injected heartbeat phase save failure")
+    if (testing() and isinstance(state.get("pending_admission"), dict)
+            and state["pending_admission"].get("generation") is not None
+            and state["pending_admission"].get("receipt_id") is not None
+            and os.environ.get("SCD_HEARTBEAT_TEST_FAIL_BOUND_ADMISSION_SAVE") == "1"):
+        raise OSError("injected heartbeat bound-admission save failure")
     atomic_write(STATE, (json.dumps(state, sort_keys=True) + "\n").encode())
 
 
@@ -1921,9 +1945,11 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
         try:
             save_state(attempt)
         except Exception:
-            # We know this process has not started a child. Settle the exact
-            # token now; if that fails, retain the original durable intent.
-            settle_heartbeat(config, supervisor_id, generation, receipt_id)
+            # The exact generation is not durably bound to the pre-execution
+            # intent. Preserve the active reservation for restart recovery;
+            # settling here would make a failed write look like safe release.
+            pending["generation"] = None
+            pending["receipt_id"] = None
             raise
         def mark_spawn_possible() -> None:
             previous_phase = pending["phase"]

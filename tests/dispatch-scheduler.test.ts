@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -29,7 +29,158 @@ describe('dispatch scheduler boundary', () => {
       first.release();
       writeFileSync(lockPath, JSON.stringify({ nonce: 'crashed', pid: 41 }));
       const recovered = acquireDispatchInvocationLock({ lockPath, nonce: () => 'recovered', isProcessAlive: () => false });
+      const owner = JSON.parse(readFileSync(lockPath, 'utf8')) as { schemaVersion: number; nonce: string; pid: number; hostId: string; bootId: string; processStartId: string };
+      assert.deepEqual(Object.keys(owner).sort(), ['bootId', 'hostId', 'nonce', 'pid', 'processStartId', 'schemaVersion']);
+      assert.equal(owner.schemaVersion, 1);
+      assert.equal(owner.nonce, 'recovered');
+      assert.equal(statSync(lockPath).mode & 0o777, 0o600);
       recovered.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('writes and fsyncs a complete private sibling before atomically linking the canonical lock', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-publish-'));
+    const lockPath = path.join(directory, 'once.lock');
+    try {
+      let observedTemp: string | undefined;
+      const lock = acquireDispatchInvocationLock({
+        lockPath,
+        nonce: () => 'complete-owner',
+        hostBootIdentity: () => ({ hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) }),
+        processStartIdentity: () => 'test-process-start',
+        beforeCanonicalLink: () => {
+          assert.throws(() => readFileSync(lockPath), { code: 'ENOENT' });
+          const temporary = readdirSync(directory).find((entry) => entry.startsWith('once.lock.tmp-'));
+          assert.ok(temporary, 'the fully written sibling exists before canonical publication');
+          observedTemp = path.join(directory, temporary);
+          const stats = statSync(observedTemp);
+          assert.equal(stats.isFile(), true);
+          assert.equal(stats.mode & 0o777, 0o600);
+          const staged = JSON.parse(readFileSync(observedTemp, 'utf8')) as { schemaVersion: number; nonce: string };
+          assert.equal(staged.schemaVersion, 1);
+          assert.equal(staged.nonce, 'complete-owner');
+        },
+      });
+      assert.ok(observedTemp);
+      const canonical = JSON.parse(readFileSync(lockPath, 'utf8')) as { schemaVersion: number; nonce: string };
+      assert.equal(canonical.schemaVersion, 1);
+      assert.equal(canonical.nonce, 'complete-owner');
+      assert.equal(readdirSync(directory).some((entry) => entry.startsWith('once.lock.tmp-')), false,
+        'the owned staging link is removed after durable publication');
+      lock.release();
+
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath,
+        nonce: () => 'failed-before-link',
+        hostBootIdentity: () => ({ hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) }),
+        processStartIdentity: () => 'test-process-start',
+        beforeCanonicalLink: () => { throw new Error('injected pre-link failure'); },
+      }), /injected pre-link failure/);
+      assert.throws(() => readFileSync(lockPath), { code: 'ENOENT' });
+      assert.equal(readdirSync(directory).some((entry) => entry.startsWith('once.lock.tmp-')), false,
+        'an interrupted owner removes only its own unlinked temporary file');
+
+      let directorySyncs = 0;
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath,
+        nonce: () => 'failed-after-link',
+        hostBootIdentity: () => ({ hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) }),
+        processStartIdentity: () => 'test-process-start',
+        syncDirectory: () => {
+          directorySyncs += 1;
+          if (directorySyncs === 1) throw new Error('injected parent fsync failure');
+        },
+      }), /injected parent fsync failure/);
+      assert.equal(directorySyncs, 2, 'the failed publication attempts a parent sync after exact owned-link cleanup');
+      assert.throws(() => readFileSync(lockPath), { code: 'ENOENT' },
+        'failed post-link durability does not leave an unreleaseable live owner lock');
+      assert.equal(readdirSync(directory).some((entry) => entry.startsWith('once.lock.tmp-')), false);
+      const retry = acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'retry-after-failed-fsync',
+        hostBootIdentity: () => ({ hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) }),
+        processStartIdentity: () => 'test-process-start',
+      });
+      retry.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('reclaims versioned same-host locks only across reboot or process-start mismatch', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-incarnation-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const hostId = 'a'.repeat(64);
+    const oldBoot = 'b'.repeat(64);
+    const currentBoot = 'c'.repeat(64);
+    const staleRecord = {
+      schemaVersion: 1, nonce: 'prior-owner', pid: 41, hostId, bootId: oldBoot, processStartId: 'old-start',
+    };
+    try {
+      writeFileSync(lockPath, JSON.stringify(staleRecord), { mode: 0o600 });
+      const afterReboot = acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'after-reboot',
+        hostBootIdentity: () => ({ hostId, bootId: currentBoot }),
+        processStartIdentity: () => 'new-start',
+        isProcessAlive: () => true,
+      });
+      assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string }).nonce, 'after-reboot',
+        'same host with a different boot incarnation is stale even if the numeric PID exists');
+      afterReboot.release();
+
+      writeFileSync(lockPath, JSON.stringify({ ...staleRecord, bootId: currentBoot }), { mode: 0o600 });
+      const afterPidReuse = acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'after-pid-reuse',
+        hostBootIdentity: () => ({ hostId, bootId: currentBoot }),
+        processStartIdentity: () => 'new-start',
+        isProcessAlive: () => true,
+      });
+      assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string }).nonce, 'after-pid-reuse',
+        'a live reused PID cannot inherit the previous process incarnation lock');
+      afterPidReuse.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('fences foreign, malformed, symlink and ambiguous live legacy lock records', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-fenced-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const identity = { hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) };
+    const acquire = () => acquireDispatchInvocationLock({
+      lockPath, nonce: () => 'must-not-acquire', hostBootIdentity: () => identity,
+      processStartIdentity: () => 'current-start', isProcessAlive: () => false,
+    });
+    try {
+      const foreign = {
+        schemaVersion: 1, nonce: 'foreign-owner', pid: 41, hostId: 'd'.repeat(64),
+        bootId: 'b'.repeat(64), processStartId: 'foreign-start',
+      };
+      writeFileSync(lockPath, JSON.stringify(foreign), { mode: 0o600 });
+      assert.throws(acquire, DispatchInvocationLockedError);
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), foreign,
+        'a PID absent on this host cannot prove a foreign owner is dead');
+
+      writeFileSync(lockPath, JSON.stringify({ schemaVersion: 1, nonce: 'ambiguous', pid: 41, hostId: 'a'.repeat(64) }), { mode: 0o600 });
+      const malformed = readFileSync(lockPath, 'utf8');
+      assert.throws(acquire, DispatchInvocationLockedError);
+      assert.equal(readFileSync(lockPath, 'utf8'), malformed);
+
+      writeFileSync(lockPath, JSON.stringify({ nonce: 'legacy-live', pid: 41 }), { mode: 0o600 });
+      const legacy = readFileSync(lockPath, 'utf8');
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'must-not-acquire', isProcessAlive: () => true,
+        hostBootIdentity: () => identity, processStartIdentity: () => 'current-start',
+      }), DispatchInvocationLockedError);
+      assert.equal(readFileSync(lockPath, 'utf8'), legacy, 'live legacy PID-only records remain fenced');
+
+      unlinkSync(lockPath);
+      const target = path.join(directory, 'target.json');
+      writeFileSync(target, JSON.stringify({ nonce: 'legacy-dead', pid: 41 }), { mode: 0o600 });
+      symlinkSync(target, lockPath);
+      assert.throws(acquire, DispatchInvocationLockedError);
+      assert.equal(readlinkSync(lockPath), target, 'a symlink canonical path is never reclaimed or replaced');
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
@@ -56,7 +207,9 @@ describe('dispatch scheduler boundary', () => {
         }),
         DispatchInvocationLockedError,
       );
-      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), { nonce: 'replacement', pid: process.pid });
+      const replacementRecord = JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string; pid: number; schemaVersion: number };
+      assert.deepEqual({ nonce: replacementRecord.nonce, pid: replacementRecord.pid }, { nonce: 'replacement', pid: process.pid });
+      assert.equal(replacementRecord.schemaVersion, 1);
       replacement?.release();
     } finally {
       rmSync(directory, { recursive: true, force: true });
@@ -76,10 +229,11 @@ describe('dispatch scheduler boundary', () => {
         nonce: () => 'recovered-after-abandoned-claim',
         isProcessAlive: () => false,
       });
-      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), {
-        nonce: 'recovered-after-abandoned-claim',
-        pid: process.pid,
+      const owner = JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string; pid: number; schemaVersion: number };
+      assert.deepEqual({ nonce: owner.nonce, pid: owner.pid }, {
+        nonce: 'recovered-after-abandoned-claim', pid: process.pid,
       });
+      assert.equal(owner.schemaVersion, 1);
       assert.equal(readlinkSync(takeoverPath, 'utf8'), JSON.stringify({ nonce: 'dead-takeover', pid: 42 }));
       recovered.release();
     } finally {
@@ -100,10 +254,11 @@ describe('dispatch scheduler boundary', () => {
         nonce: () => 'recovered-after-legacy-hard-link',
         isProcessAlive: () => false,
       });
-      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), {
-        nonce: 'recovered-after-legacy-hard-link',
-        pid: process.pid,
+      const owner = JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string; pid: number; schemaVersion: number };
+      assert.deepEqual({ nonce: owner.nonce, pid: owner.pid }, {
+        nonce: 'recovered-after-legacy-hard-link', pid: process.pid,
       });
+      assert.equal(owner.schemaVersion, 1);
       assert.deepEqual(JSON.parse(readFileSync(takeoverPath, 'utf8')), stale);
       recovered.release();
     } finally {

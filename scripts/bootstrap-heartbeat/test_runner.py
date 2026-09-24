@@ -13,6 +13,7 @@ import pwd
 import shutil
 import subprocess
 import sys
+import stat
 import tempfile
 import time
 import unittest
@@ -747,6 +748,73 @@ class HeartbeatTest(unittest.TestCase):
         save.assert_not_called()
         self.assertEqual(live_state["pending_admission"], live_pending)
 
+    def test_atomic_write_fsyncs_temp_then_rename_then_parent_and_propagates_failures(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_atomic_write_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        target = self.root / "durable-state" / "state.json"
+        events: list[str] = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def tracked_fsync(descriptor: int) -> None:
+            events.append("directory-fsync" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file-fsync")
+            real_fsync(descriptor)
+
+        def tracked_replace(source: str | os.PathLike[str], destination: str | os.PathLike[str]) -> None:
+            events.append("replace")
+            real_replace(source, destination)
+
+        with mock.patch.object(module.os, "fsync", side_effect=tracked_fsync), \
+                mock.patch.object(module.os, "replace", side_effect=tracked_replace):
+            module.atomic_write(target, b"durable-new-state")
+        self.assertEqual(events, ["file-fsync", "replace", "directory-fsync"],
+                         "the rename is durable only after the temp file and parent directory syncs")
+        self.assertEqual(target.read_bytes(), b"durable-new-state")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+        target.write_bytes(b"old-state")
+        real_fsync = os.fsync
+
+        def fail_file_fsync(descriptor: int) -> None:
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                real_fsync(descriptor)
+                return
+            raise OSError("injected file fsync failure")
+
+        with mock.patch.object(module.os, "fsync", side_effect=fail_file_fsync):
+            with self.assertRaisesRegex(OSError, "injected file fsync failure"):
+                module.atomic_write(target, b"must-not-replace")
+        self.assertEqual(target.read_bytes(), b"old-state")
+        self.assertEqual(list(target.parent.glob("state.json.tmp-*")), [], "failed temp publication removes its owned file")
+
+        def fail_directory_fsync(descriptor: int) -> None:
+            if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise OSError("injected parent fsync failure")
+            real_fsync(descriptor)
+
+        with mock.patch.object(module.os, "fsync", side_effect=fail_directory_fsync):
+            with self.assertRaisesRegex(OSError, "injected parent fsync failure"):
+                module.atomic_write(target, b"renamed-but-not-durable")
+        self.assertEqual(target.read_bytes(), b"renamed-but-not-durable",
+                         "failure after replace is propagated while the visible exact state remains inspectable")
+
     def test_prior_boot_spawn_uncertain_with_exact_bound_receipt_still_settles(self) -> None:
         saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
         saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
@@ -1421,6 +1489,34 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertFalse(json.loads(self.admission_state.read_text(encoding="utf-8"))["active"])
         self.assertEqual(self.records(), [], "known pre-spawn failure settles the exact generation")
+
+    def test_initial_generation_binding_save_failure_keeps_active_reservation_for_restart_recovery(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        failed = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_BOUND_ADMISSION_SAVE="1",
+        ), check=False)
+        self.assertEqual(failed.returncode, 1)
+        pending = self.state()["pending_admission"]
+        self.assertEqual(pending["phase"], "reserved_pre_execution")
+        self.assertIsNone(pending["generation"], "failed write-ahead binding preserves the durable null generation")
+        self.assertIsNone(pending["receipt_id"])
+        admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(admission["active"], "the failed write must not settle or release the active reservation")
+        self.assertEqual(admission["generation"], 1)
+        self.assertEqual(self.records(), [])
+
+        # Restore the primed input so restart reconciliation is the only
+        # admission action; otherwise the changed B payload would immediately
+        # authorize a second generation after the exact orphan is settled.
+        self.write_payload("A")
+        restarted = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        settled = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertFalse(settled["active"])
+        self.assertEqual(settled["releasedGeneration"], 2)
+        self.assertEqual(self.records(), [], "restart binds then settles the exact prior generation without spawning")
 
     def test_guard_setup_failure_settles_exact_generation_and_releases_runner_lock(self) -> None:
         self.invoke("run", "--prime")
