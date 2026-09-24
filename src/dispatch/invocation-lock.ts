@@ -102,7 +102,7 @@ function commandOutput(command: string, args: string[]): string {
   const result = spawnSync(command, args, {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],
     timeout: 2_000, maxBuffer: 64 * 1024,
-    env: { ...process.env, LC_ALL: 'C', LANG: 'C' },
+    env: { ...process.env, LC_ALL: 'C', LANG: 'C', TZ: 'UTC0' },
   });
   if (result.status !== 0 || typeof result.stdout !== 'string') return '';
   return result.stdout.trim();
@@ -146,7 +146,7 @@ function currentProcessStartIdentity(pid: number): string | null {
   }
   if (process.platform === 'darwin') {
     const started = commandOutput('/bin/ps', ['-o', 'lstart=', '-p', String(pid)]);
-    return started ? `darwin-ps-start:${started}` : null;
+    return started ? `darwin-ps-start-utc:${started}` : null;
   }
   return null;
 }
@@ -243,17 +243,6 @@ function createTakeoverClaim(takeoverPath: string, claim: TakeoverClaim): boolea
   }
 }
 
-function removeOwnedTakeoverClaim(takeoverPath: string, claim: TakeoverClaim): boolean {
-  const current = readSymlinkTakeoverClaim(takeoverPath);
-  if (current === null || !sameTakeoverClaim(current, claim)) return false;
-  try {
-    unlinkSync(takeoverPath);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 function fsyncDirectory(directory: string): void {
   const descriptor = openSync(directory, constants.O_RDONLY);
   try { fsyncSync(descriptor); }
@@ -272,12 +261,19 @@ function definitelyStale(
     if (record.hostId !== current.hostId) return false;
     if (record.bootId !== current.bootId) return true;
     const currentStart = processStart(record.pid);
-    if (currentStart !== null && currentStart !== record.processStartId) return true;
-    if (currentStart === null) return !alive(record.pid);
+    if (currentStart !== null && currentStart !== record.processStartId &&
+        compatibleProcessStartSchemes(record.processStartId, currentStart)) return true;
     return !alive(record.pid);
   } catch {
     return false;
   }
+}
+
+function compatibleProcessStartSchemes(recorded: string, current: string): boolean {
+  const trustedSchemes = ['linux-start-ticks:', 'darwin-ps-start-utc:'];
+  const recordedScheme = trustedSchemes.find((scheme) => recorded.startsWith(scheme));
+  const currentScheme = trustedSchemes.find((scheme) => current.startsWith(scheme));
+  return recordedScheme !== undefined && recordedScheme === currentScheme;
 }
 
 /** Acquire the small same-host fence that complements the GitHub claim lease. */
@@ -374,7 +370,12 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
     const takeoverRootPath = staleTakeoverPath(options.lockPath, existing);
     let takeoverPath = takeoverRootPath;
     const claim = owner;
-    for (let attempt = 0; attempt < 16; attempt += 1) {
+    const visitedTakeoverPaths = new Set<string>();
+    while (true) {
+      if (visitedTakeoverPaths.has(takeoverPath)) {
+        throw new DispatchInvocationLockedError(options.lockPath);
+      }
+      visitedTakeoverPaths.add(takeoverPath);
       if (!createTakeoverClaim(takeoverPath, claim)) {
         const previousClaim = readTakeoverClaim(takeoverPath, options.lockPath, existing);
         if (previousClaim === null || !definitelyStale(previousClaim, alive, identity, processStart)) {
@@ -383,23 +384,19 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
         takeoverPath = staleTakeoverRecoveryPath(takeoverRootPath, previousClaim);
         continue;
       }
-      try {
-        const current = readLock(options.lockPath);
-        if (current === null || !sameLockRecord(current, existing) ||
-            !definitelyStale(current, alive, identity, processStart)) {
-          throw new DispatchInvocationLockedError(options.lockPath);
-        }
-        try {
-          unlinkSync(options.lockPath);
-          fsyncParent();
-        } catch {
-          throw new DispatchInvocationLockedError(options.lockPath);
-        }
-        if (!publish()) throw new DispatchInvocationLockedError(options.lockPath);
-        break;
-      } finally {
-        removeOwnedTakeoverClaim(takeoverPath, claim);
+      const current = readLock(options.lockPath);
+      if (current === null || !sameLockRecord(current, existing) ||
+          !definitelyStale(current, alive, identity, processStart)) {
+        throw new DispatchInvocationLockedError(options.lockPath);
       }
+      try {
+        unlinkSync(options.lockPath);
+        fsyncParent();
+      } catch {
+        throw new DispatchInvocationLockedError(options.lockPath);
+      }
+      if (!publish()) throw new DispatchInvocationLockedError(options.lockPath);
+      break;
     }
     if (!sameLockRecord(readLock(options.lockPath) ?? { nonce: '', pid: 0 }, owner)) {
       throw new DispatchInvocationLockedError(options.lockPath);

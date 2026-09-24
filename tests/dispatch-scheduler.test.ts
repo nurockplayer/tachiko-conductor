@@ -115,14 +115,15 @@ describe('dispatch scheduler boundary', () => {
     const oldBoot = 'b'.repeat(64);
     const currentBoot = 'c'.repeat(64);
     const staleRecord = {
-      schemaVersion: 1, nonce: 'prior-owner', pid: 41, hostId, bootId: oldBoot, processStartId: 'old-start',
+      schemaVersion: 1, nonce: 'prior-owner', pid: 41, hostId, bootId: oldBoot,
+      processStartId: 'linux-start-ticks:100',
     };
     try {
       writeFileSync(lockPath, JSON.stringify(staleRecord), { mode: 0o600 });
       const afterReboot = acquireDispatchInvocationLock({
         lockPath, nonce: () => 'after-reboot',
         hostBootIdentity: () => ({ hostId, bootId: currentBoot }),
-        processStartIdentity: () => 'new-start',
+        processStartIdentity: () => 'linux-start-ticks:200',
         isProcessAlive: () => true,
       });
       assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string }).nonce, 'after-reboot',
@@ -133,12 +134,159 @@ describe('dispatch scheduler boundary', () => {
       const afterPidReuse = acquireDispatchInvocationLock({
         lockPath, nonce: () => 'after-pid-reuse',
         hostBootIdentity: () => ({ hostId, bootId: currentBoot }),
-        processStartIdentity: () => 'new-start',
+        processStartIdentity: () => 'linux-start-ticks:200',
         isProcessAlive: () => true,
       });
       assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string }).nonce, 'after-pid-reuse',
         'a live reused PID cannot inherit the previous process incarnation lock');
       afterPidReuse.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('fences historical macOS start strings across timezone changes and migrates only after death proof', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-darwin-tz-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const identity = { hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) };
+    const historical = {
+      schemaVersion: 1, nonce: 'old-macos-owner', pid: 41, hostId: identity.hostId, bootId: identity.bootId,
+      processStartId: 'darwin-ps-start:Wed Jan  1 00:00:00 JST 2025',
+    };
+    try {
+      writeFileSync(lockPath, JSON.stringify(historical), { mode: 0o600 });
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'live-tz-mismatch',
+        hostBootIdentity: () => identity,
+        processStartIdentity: () => 'darwin-ps-start-utc:Wed Jan  1 00:00:00 UTC 2025',
+        isProcessAlive: () => true,
+      }), DispatchInvocationLockedError,
+      'an incomparable historical local-time string cannot classify a live same-boot process as reused');
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), historical);
+
+      const recovered = acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'dead-historical-owner',
+        hostBootIdentity: () => identity,
+        processStartIdentity: () => 'darwin-ps-start-utc:Wed Jan  1 00:00:00 UTC 2025',
+        isProcessAlive: () => false,
+      });
+      assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string }).nonce, 'dead-historical-owner',
+        'legacy localized identity migrates only after confirmed PID death');
+      recovered.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a live native macOS owner fenced when only the caller timezone changes', (t) => {
+    if (process.platform !== 'darwin') {
+      t.skip('native macOS ps timezone regression');
+      return;
+    }
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-native-tz-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const priorTimezone = process.env.TZ;
+    let first: ReturnType<typeof acquireDispatchInvocationLock> | undefined;
+    try {
+      process.env.TZ = 'Asia/Tokyo';
+      first = acquireDispatchInvocationLock({ lockPath, nonce: () => 'native-tokyo-owner' });
+      const originalOwner = readFileSync(lockPath, 'utf8');
+
+      process.env.TZ = 'UTC0';
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'native-utc-contender',
+      }), DispatchInvocationLockedError);
+      assert.equal(readFileSync(lockPath, 'utf8'), originalOwner,
+        'a TZ-only environment change cannot reclaim or replace the live canonical owner');
+    } finally {
+      if (priorTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = priorTimezone;
+      first?.release();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('traverses more than sixteen immutable dead claims to acquire a fresh takeover claim', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-deep-claims-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const stale = { nonce: 'crashed-root', pid: 41 };
+    const root = `${lockPath}.${createHash('sha256').update(JSON.stringify(stale)).digest('hex')}.stale-takeover`;
+    const oldClaims: string[] = [];
+    try {
+      writeFileSync(lockPath, JSON.stringify(stale));
+      let takeoverPath = root;
+      for (let index = 0; index < 20; index += 1) {
+        const previousClaim = { nonce: `dead-claim-${index}`, pid: 50 + index };
+        symlinkSync(JSON.stringify(previousClaim), takeoverPath);
+        oldClaims.push(takeoverPath);
+        takeoverPath = `${root}.${createHash('sha256').update(JSON.stringify(previousClaim)).digest('hex')}.recovery`;
+      }
+      const recovered = acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'after-twenty-crashes', isProcessAlive: () => false,
+      });
+      assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { nonce: string }).nonce, 'after-twenty-crashes');
+      for (const oldClaim of oldClaims) assert.equal(readlinkSync(oldClaim).length > 0, true,
+        'dead immutable claim records are traversed, never deleted');
+      assert.equal((JSON.parse(readlinkSync(takeoverPath)) as { nonce: string }).nonce, 'after-twenty-crashes',
+        'the successful takeover claim remains as immutable recovery history');
+      recovered.release();
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed on a deep live claim and on a repeated recovery path', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-deep-fenced-'));
+    const makePaths = (lockPath: string, stale: { nonce: string; pid: number }, count: number, final?: string) => {
+      const root = `${lockPath}.${createHash('sha256').update(JSON.stringify(stale)).digest('hex')}.stale-takeover`;
+      const paths: string[] = [];
+      let current = root;
+      for (let index = 0; index < count; index += 1) {
+        const claim = { nonce: `dead-prefix-${index}`, pid: 70 + index };
+        symlinkSync(JSON.stringify(claim), current);
+        paths.push(current);
+        current = `${root}.${createHash('sha256').update(JSON.stringify(claim)).digest('hex')}.recovery`;
+      }
+      if (final !== undefined) symlinkSync(final, current);
+      return { root, current, paths };
+    };
+    try {
+      const liveLockPath = path.join(directory, 'live.lock');
+      const liveStale = { nonce: 'live-stale-root', pid: 41 };
+      writeFileSync(liveLockPath, JSON.stringify(liveStale));
+      const liveChain = makePaths(liveLockPath, liveStale, 20, JSON.stringify({ nonce: 'deep-live-claim', pid: 999 }));
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath: liveLockPath, nonce: () => 'must-not-pass-live-claim',
+        isProcessAlive: (pid) => pid === 999,
+      }), DispatchInvocationLockedError);
+      assert.equal(readFileSync(liveLockPath, 'utf8'), JSON.stringify(liveStale));
+      assert.equal(readlinkSync(liveChain.current), JSON.stringify({ nonce: 'deep-live-claim', pid: 999 }));
+
+      const malformedLockPath = path.join(directory, 'malformed.lock');
+      const malformedStale = { nonce: 'malformed-stale-root', pid: 41 };
+      writeFileSync(malformedLockPath, JSON.stringify(malformedStale));
+      const malformedChain = makePaths(malformedLockPath, malformedStale, 20, 'not-json');
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath: malformedLockPath, nonce: () => 'must-not-pass-malformed-claim', isProcessAlive: () => false,
+      }), DispatchInvocationLockedError);
+      assert.equal(readFileSync(malformedLockPath, 'utf8'), JSON.stringify(malformedStale));
+      assert.equal(readlinkSync(malformedChain.current), 'not-json',
+        'a malformed claim beyond sixteen proven-dead claims remains fenced and immutable');
+
+      const cyclicLockPath = path.join(directory, 'cycle.lock');
+      const cyclicStale = { nonce: 'cycle-root', pid: 41 };
+      writeFileSync(cyclicLockPath, JSON.stringify(cyclicStale));
+      const cycleRoot = `${cyclicLockPath}.${createHash('sha256').update(JSON.stringify(cyclicStale)).digest('hex')}.stale-takeover`;
+      const repeatedClaim = { nonce: 'same-dead-claim', pid: 42 };
+      const repeatedRecovery = `${cycleRoot}.${createHash('sha256').update(JSON.stringify(repeatedClaim)).digest('hex')}.recovery`;
+      symlinkSync(JSON.stringify(repeatedClaim), cycleRoot);
+      symlinkSync(JSON.stringify(repeatedClaim), repeatedRecovery);
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath: cyclicLockPath, nonce: () => 'must-not-loop-on-cycle', isProcessAlive: () => false,
+      }), DispatchInvocationLockedError);
+      assert.equal(readFileSync(cyclicLockPath, 'utf8'), JSON.stringify(cyclicStale));
+      assert.equal(readlinkSync(cycleRoot), JSON.stringify(repeatedClaim));
+      assert.equal(readlinkSync(repeatedRecovery), JSON.stringify(repeatedClaim));
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
