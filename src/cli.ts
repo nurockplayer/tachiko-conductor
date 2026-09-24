@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
@@ -207,8 +207,32 @@ export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOn
   if (settled) console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
 }
 
+function canonicalPhysicalPath(candidate: string): string {
+  let cursor = path.resolve(candidate);
+  const suffix: string[] = [];
+  while (!existsSync(cursor)) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) throw new Error('Cannot resolve a physical dispatch lock path.');
+    suffix.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+  return path.resolve(realpathSync.native(cursor), ...suffix);
+}
+
+function canonicalDispatchLockPath(kind: 'once' | 'admission', homeDirectory: string): string {
+  const base = path.join(homeDirectory, '.tachiko-conductor', 'dispatch');
+  return path.join(base, kind === 'once' ? 'once.lock' : 'once.lock.admission');
+}
+
 function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'dispatch', 'once.lock');
+  const homeDirectory = resolveAccountHomeDirectory();
+  const canonical = canonicalPhysicalPath(canonicalDispatchLockPath('once', homeDirectory));
+  const configured = env.TACHIKO_DISPATCH_LOCK_PATH;
+  if (configured === undefined) return canonical;
+  if (!path.isAbsolute(configured) || canonicalPhysicalPath(configured) !== canonical) {
+    throw new Error('TACHIKO_DISPATCH_LOCK_PATH must resolve to the canonical per-account dispatch lock.');
+  }
+  return canonical;
 }
 
 /**
@@ -219,7 +243,17 @@ function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
  * boundary; hold/release serializes with that interval.
  */
 function dispatchAdmissionLockPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH ?? `${dispatchLockPath(env)}.admission`;
+  const homeDirectory = resolveAccountHomeDirectory();
+  // Validate both configurable aliases against the same account root even
+  // when this caller needs only the short admission fence.
+  dispatchLockPath(env);
+  const canonical = canonicalPhysicalPath(canonicalDispatchLockPath('admission', homeDirectory));
+  const configured = env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH;
+  if (configured === undefined) return canonical;
+  if (!path.isAbsolute(configured) || canonicalPhysicalPath(configured) !== canonical) {
+    throw new Error('TACHIKO_DISPATCH_ADMISSION_LOCK_PATH must resolve to the canonical per-account admission lock.');
+  }
+  return canonical;
 }
 
 async function withDispatchAdmissionLock<T>(operation: (release: () => void) => Promise<T> | T): Promise<T> {
@@ -1471,7 +1505,7 @@ export function runShowCommand(store: RunStore, id: string): Run {
   return run;
 }
 
-export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string): Run {
+export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string, admission?: MissionAdmissionRegistry): Run {
   if (type === 'bootstrap_prepared') {
     throw new Error('Transition "bootstrap_prepared" requires durable bootstrap identity that this CLI cannot supply. Drive it through the workflow.');
   }
@@ -1482,11 +1516,20 @@ export function runTransitionCommand(store: RunStore, id: string, type: Transiti
         `Drive it through the domain API (applyTransition) instead.`,
     );
   }
-  const current = store.read(id);
-  if (current === null) throw new Error(`No run with id "${id}" found.`);
-  const next = applyTransition(current, { type, reason });
-  store.update(next);
-  return next;
+  const transition = (): Run => {
+    const current = store.read(id);
+    if (current === null) throw new Error(`No run with id "${id}" found.`);
+    const next = applyTransition(current, { type, reason });
+    if (store.updateIfUnchanged !== undefined) {
+      if (!store.updateIfUnchanged(current, next)) throw new Error(`Run "${id}" changed concurrently; refusing to apply a stale transition.`);
+    } else if (admission !== undefined) {
+      throw new Error('Admission-backed Run transitions require compare-and-swap Run storage; refusing an unfenced write.');
+    } else {
+      store.update(next);
+    }
+    return next;
+  };
+  return admission === undefined ? transition() : admission.withRunTransitionFence(id, transition);
 }
 
 export function runListCommand(store: RunStore): Run[] {
@@ -2236,7 +2279,7 @@ export async function main(argv: string[]): Promise<number> {
     if (!TRANSITION_TYPES.includes(type as TransitionType)) {
       throw new Error(`Unknown transition "${type}". Valid transitions: ${TRANSITION_TYPES.join(', ')}.`);
     }
-    const next = runTransitionCommand(store, id, type as TransitionType, values.reason);
+    const next = await withDispatchAdmissionLock(() => runTransitionCommand(store, id, type as TransitionType, values.reason, createHostAdmissionRegistry()));
     console.log(`Run ${next.id}: ${next.state}.`);
     printRun(next);
     return 0;

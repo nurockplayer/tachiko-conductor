@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { linkSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -10,6 +10,14 @@ import { renderDispatchLaunchdPlist } from '../src/dispatch/launchd.js';
 import { parseDispatchConfiguration } from '../src/dispatch/config.js';
 import { main } from '../src/cli.js';
 import { readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
+
+async function withAccountHome<T>(home: string, operation: () => Promise<T>): Promise<T> {
+  mkdirSync(home, { recursive: true });
+  const original = os.userInfo;
+  Object.defineProperty(os, 'userInfo', { configurable: true, value: (...args: Parameters<typeof original>) => ({ ...original(...args), homedir: home }) });
+  try { return await operation(); }
+  finally { Object.defineProperty(os, 'userInfo', { configurable: true, value: original }); }
+}
 
 describe('dispatch scheduler boundary', () => {
   it('keeps overlapping same-host invocations out and safely recovers a provably stale lock', () => {
@@ -186,7 +194,8 @@ describe('dispatch scheduler boundary', () => {
 
   it('leaves a concurrent dispatch at a safe re-entry boundary without reading configuration or GitHub', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-main-lock-'));
-    const lockPath = path.join(directory, 'once.lock');
+    const accountHome = path.join(directory, 'account-home');
+    const lockPath = path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock');
     const previous = process.env.TACHIKO_DISPATCH_LOCK_PATH;
     const printed: string[] = [];
     const original = console.log;
@@ -194,7 +203,7 @@ describe('dispatch scheduler boundary', () => {
       const lock = acquireDispatchInvocationLock({ lockPath, nonce: () => 'first' });
       process.env.TACHIKO_DISPATCH_LOCK_PATH = lockPath;
       console.log = (value?: unknown) => { printed.push(String(value)); };
-      assert.equal(await main(['dispatch', 'once']), 0);
+      await withAccountHome(accountHome, async () => assert.equal(await main(['dispatch', 'once']), 0));
       assert.match(printed.at(-1) ?? '', /"outcome":"already_running"/);
       assert.doesNotMatch(printed.at(-1) ?? '', /TACHIKO_HEARTBEAT_SETTLED_V1/);
       lock.release();
@@ -208,6 +217,7 @@ describe('dispatch scheduler boundary', () => {
 
   it('keeps serve parked across held restart/re-entry without configuration, queue, worker, or model admission', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-held-serve-'));
+    const accountHome = path.join(directory, 'account-home');
     const previous = {
       data: process.env.TACHIKO_DATA_DIR,
       lock: process.env.TACHIKO_DISPATCH_LOCK_PATH,
@@ -218,7 +228,7 @@ describe('dispatch scheduler boundary', () => {
     const original = console.log;
     try {
       process.env.TACHIKO_DATA_DIR = path.join(directory, 'runs');
-      process.env.TACHIKO_DISPATCH_LOCK_PATH = path.join(directory, 'dispatch.lock');
+      process.env.TACHIKO_DISPATCH_LOCK_PATH = path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock');
       process.env.TACHIKO_DISPATCH_WAKE_PATH = path.join(directory, 'wake');
       delete process.env.TACHIKO_EXECUTION_PROFILE_CONFIG;
       writeOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR, {
@@ -227,10 +237,10 @@ describe('dispatch scheduler boundary', () => {
         manualLane: { repository: 'repo', worktree: '/worktree', branch: 'branch', checkpointSha: 'a'.repeat(40), clean: true, state: 'parked', recoverable: true },
       });
       console.log = (value?: unknown) => { printed.push(String(value)); };
-      assert.equal(await main(['dispatch', 'once']), 0);
+      await withAccountHome(accountHome, async () => assert.equal(await main(['dispatch', 'once']), 0));
       assert.match(printed.at(-1) ?? '', /"outcome": "maintenance_hold"/);
       printed.length = 0;
-      assert.equal(await main(['dispatch', 'serve', '--idle-poll-ms', '1', '--max-cycles', '2']), 0);
+      await withAccountHome(accountHome, async () => assert.equal(await main(['dispatch', 'serve', '--idle-poll-ms', '1', '--max-cycles', '2']), 0));
       assert.match(printed.at(-1) ?? '', /"cycles": 2/);
       assert.match(printed.at(-1) ?? '', /"maintenance_hold"/);
       const first = readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR);
@@ -239,7 +249,7 @@ describe('dispatch scheduler boundary', () => {
       });
       // A fresh supervised process sees the identical durable held state and
       // cannot manufacture another writer or claim.
-      assert.equal(await main(['dispatch', 'serve', '--idle-poll-ms', '1', '--max-cycles', '1']), 0);
+      await withAccountHome(accountHome, async () => assert.equal(await main(['dispatch', 'serve', '--idle-poll-ms', '1', '--max-cycles', '1']), 0));
       const second = readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR);
       const { updatedAt: _firstUpdatedAt, ...firstStable } = first!;
       const { updatedAt: _secondUpdatedAt, ...secondStable } = second!;
@@ -256,6 +266,7 @@ describe('dispatch scheduler boundary', () => {
 
   it('serializes maintenance transitions with admission and wakes only a meaningful release', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-maintenance-transition-'));
+    const accountHome = path.join(directory, 'account-home');
     const previous = {
       data: process.env.TACHIKO_DATA_DIR,
       lock: process.env.TACHIKO_DISPATCH_LOCK_PATH,
@@ -264,7 +275,7 @@ describe('dispatch scheduler boundary', () => {
     const printed: string[] = [];
     const original = console.log;
     try {
-      const lockPath = path.join(directory, 'dispatch.lock');
+      const lockPath = path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock');
       const wakePath = path.join(directory, 'wake');
       process.env.TACHIKO_DATA_DIR = path.join(directory, 'runs');
       process.env.TACHIKO_DISPATCH_LOCK_PATH = lockPath;
@@ -278,7 +289,7 @@ describe('dispatch scheduler boundary', () => {
       // A hold waits for the active reconciliation/admission interval. It
       // cannot rewrite the projection underneath that owner.
       const admission = acquireDispatchInvocationLock({ lockPath: `${lockPath}.admission`, nonce: () => 'active-reconcile' });
-      const holding = main(['dispatch', 'maintenance', 'hold']);
+      const holding = withAccountHome(accountHome, () => main(['dispatch', 'maintenance', 'hold']));
       await new Promise<void>((resolve) => setTimeout(resolve, 25));
       assert.equal(readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR)?.maintenanceHold.active, false);
       admission.release();
@@ -286,12 +297,12 @@ describe('dispatch scheduler boundary', () => {
       assert.equal(readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR)?.maintenanceHold.active, true);
 
       printed.length = 0;
-      assert.equal(await main(['dispatch', 'maintenance', 'release']), 0);
+      await withAccountHome(accountHome, async () => assert.equal(await main(['dispatch', 'maintenance', 'release']), 0));
       const firstRelease = JSON.parse(printed.at(-1) ?? '{}') as { wake?: string };
       assert.match(firstRelease.wake ?? '', /^[0-9a-f-]{36}$/);
       const firstToken = readFileSync(wakePath, 'utf8');
       printed.length = 0;
-      assert.equal(await main(['dispatch', 'maintenance', 'release']), 0);
+      await withAccountHome(accountHome, async () => assert.equal(await main(['dispatch', 'maintenance', 'release']), 0));
       const repeatedRelease = JSON.parse(printed.at(-1) ?? '{}') as { wake?: string };
       assert.equal(repeatedRelease.wake, undefined);
       assert.equal(readFileSync(wakePath, 'utf8'), firstToken);

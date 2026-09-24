@@ -428,6 +428,7 @@ export class MissionAdmissionRegistry {
       if (prior?.status === 'active') throw new AdmissionStateError('Lane already has active ownership; reconcile its generation instead of admitting it twice.');
       if (prior?.status === 'parked' && prior.parkedReason === 'manual_checkpoint') throw new AdmissionStateError('Manual checkpoint reservations must be retired with their exact parked generation before this lane can be admitted again.');
       if (prior && prior.role !== request.role) throw new AdmissionStateError('A lane identifier cannot change roles across generations.');
+      if (prior?.highAutonomy === true && request.highAutonomy === false) throw new AdmissionStateError('High-autonomy lane classification cannot be downgraded across generations.');
       const owner = request.role === 'delegated_mutation_writer' ? state.lanes.find((lane) => lane.laneId === request.delegatedFromLaneId && lane.status === 'active' && lane.role === 'production_captain') : undefined;
       if (request.role === 'delegated_mutation_writer' && (!owner || request.delegatedFromToken?.laneId !== owner.laneId || request.delegatedFromToken.generation !== owner.generation || request.delegatedFromToken.token !== owner.token || (prior !== undefined && prior.missionId !== owner.missionId))) throw new AdmissionStateError('Delegated writer requires the exact active capability of its production captain.');
       if (owner && state.lanes.some((lane) => lane.status === 'active' && lane.role === 'delegated_mutation_writer' && lane.delegatedFromLaneId === owner.laneId && lane.delegatedFromGeneration === owner.generation)) throw new AdmissionStateError(`Captain ${owner.laneId} already has an active delegated writer for this mission.`);
@@ -439,7 +440,7 @@ export class MissionAdmissionRegistry {
         laneId: request.laneId, missionId,
         evidence: owner ? mergeEvidence(mergeEvidence(owner.evidence, prior?.evidence ?? owner.evidence), evidence) : prior ? mergeEvidence(prior.evidence, evidence) : evidence,
         role: request.role, status: 'active', generation: (prior?.generation ?? 0) + 1, token: randomUUID(),
-        highAutonomy: request.highAutonomy ?? false,
+        highAutonomy: request.highAutonomy ?? prior?.highAutonomy ?? false,
         ...(request.delegatedFromLaneId ? { delegatedFromLaneId: request.delegatedFromLaneId } : {}),
         ...(owner ? { delegatedFromGeneration: owner.generation } : {}),
         ...(request.experimentOfMissionId ? { experimentOfMissionId: request.experimentOfMissionId } : {}), updatedAt: now,
@@ -515,6 +516,28 @@ export class MissionAdmissionRegistry {
     if (lane === undefined) return null;
     const { token: _secret, ...view } = lane;
     return structuredClone(view);
+  }
+
+  /**
+   * Serialize a public Run state transition with admission of that Run lane.
+   * The callback is intentionally synchronous: callers hold this transaction
+   * while applying their Run-store CAS, so a concurrent admission cannot slip
+   * between the ownership check and the durable Run update.
+   */
+  withRunTransitionFence<T>(runId: string, operation: () => T): T {
+    if (!nonEmpty(runId)) throw new AdmissionStateError('Run transition fence requires an exact Run id.');
+    return this.transact((state) => {
+      const lane = state.lanes.find((record) => record.laneId === `run:${runId}`);
+      if (lane !== undefined) {
+        if (lane.role !== 'production_captain' || lane.evidence.run !== runId) {
+          throw new AdmissionStateError(`Admission lane for Run "${runId}" has conflicting identity; refusing public transition.`);
+        }
+        if (lane.status === 'active' || lane.status === 'parked') {
+          throw new AdmissionStateError(`Run "${runId}" has ${lane.status} mission admission ownership; public transitions are fenced.`);
+        }
+      }
+      return operation();
+    });
   }
 
   park(token: AdmissionToken, reason: ParkedReason, beforePublish?: () => void, afterPublish?: () => void): number {

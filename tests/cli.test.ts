@@ -134,6 +134,121 @@ describe('CLI command layer', () => {
     }
   });
 
+  it('fences public transitions while a Run admission lane is active or parked', () => {
+    const { store, dir } = tempStore();
+    const admissionDir = path.join(dir, 'admission');
+    mkdirSync(admissionDir);
+    const registry = new MissionAdmissionRegistry({ filePath: path.join(admissionDir, 'registry.json'), config: { schemaVersion: 1, revision: 'transition-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+    try {
+      const activeRun = createRun(TARGET, T0, 'transition-active');
+      store.create(activeRun);
+      const activeReceiptPath = path.join(dir, 'run-owner.json');
+      const active = registry.admit({ laneId: `run:${activeRun.id}`, role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42, run: activeRun.id } }, {
+        beforePublish: (candidate) => writeRunOwnerReceipt(activeReceiptPath, {
+          schemaVersion: 1, laneId: candidate.token.laneId, missionId: candidate.missionId, repository: 'acme/widgets', runId: activeRun.id,
+          issue: 42, token: candidate.token, generation: candidate.token.generation, phase: 'pre_execution',
+        }),
+      });
+      assert.equal(active.outcome, 'admitted');
+      const activeBefore = runShowCommand(store, activeRun.id);
+      const activeRegistryBefore = registry.snapshot();
+      const activeReceiptBefore = readFileSync(activeReceiptPath, 'utf8');
+      assert.throws(() => runTransitionCommand(store, activeRun.id, 'start', undefined, registry), /active mission admission ownership/);
+      assert.deepEqual(runShowCommand(store, activeRun.id), activeBefore);
+      assert.deepEqual(registry.snapshot(), activeRegistryBefore);
+      assert.equal(readFileSync(activeReceiptPath, 'utf8'), activeReceiptBefore);
+
+      const parkedRun = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 43 }, T0, 'transition-parked');
+      store.create(parkedRun);
+      const blocker = registry.admit({ laneId: 'transition-capacity-blocker', role: 'production_captain', evidence: { repository: 'other/repo', issue: 9 } });
+      assert.equal(blocker.outcome, 'parked');
+      const parked = registry.admit({ laneId: `run:${parkedRun.id}`, role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 43, run: parkedRun.id } });
+      assert.equal(parked.outcome, 'parked');
+      const parkedBefore = runShowCommand(store, parkedRun.id);
+      const parkedRegistryBefore = registry.snapshot();
+      const parkedReceiptPath = path.join(dir, 'parked-run-owner.json');
+      assert.throws(() => runTransitionCommand(store, parkedRun.id, 'fail', 'manual override', registry), /parked mission admission ownership/);
+      assert.deepEqual(runShowCommand(store, parkedRun.id), parkedBefore);
+      assert.deepEqual(registry.snapshot(), parkedRegistryBefore);
+      assert.equal(existsSync(parkedReceiptPath), false, 'receiptless capacity reservation remains intact');
+
+      const unadmitted = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 44 }, T0, 'transition-unadmitted');
+      store.create(unadmitted);
+      assert.equal(runTransitionCommand(store, unadmitted.id, 'start', undefined, registry).state, 'IMPLEMENTING');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('holds the registry fence across the Run CAS so a concurrent admission waits', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-transition-race-'));
+    const marker = path.join(dir, 'admission-attempted');
+    const completed = path.join(dir, 'admission-completed');
+    const admissionPath = path.join(dir, 'registry.json');
+    const registry = new MissionAdmissionRegistry({ filePath: admissionPath, config: { schemaVersion: 1, revision: 'transition-race-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } }, lockTimeoutMs: 10_000 });
+    const run = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 45 }, T0, 'transition-race');
+    let child: ReturnType<typeof spawn> | undefined;
+    try {
+      const store = new JsonFileStore({ dir: path.join(dir, 'runs'), beforeConditionalWrite: () => {
+        const module = pathToFileURL(path.join(REPO_ROOT, 'src/mission-admission/registry.ts')).href;
+        const source = `import { writeFileSync } from 'node:fs'; import { MissionAdmissionRegistry } from ${JSON.stringify(module)}; writeFileSync(${JSON.stringify(marker)}, 'attempted'); const registry = new MissionAdmissionRegistry({ filePath: ${JSON.stringify(admissionPath)}, config: { schemaVersion: 1, revision: 'transition-race-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } }, lockTimeoutMs: 10000 }); registry.admit({ laneId: ${JSON.stringify(`run:${run.id}`)}, role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 45, run: ${JSON.stringify(run.id)} } }); writeFileSync(${JSON.stringify(completed)}, 'done');`;
+        child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', source], { cwd: REPO_ROOT, stdio: ['ignore', 'ignore', 'pipe'] });
+        waitForMarker(marker);
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 75);
+        assert.equal(existsSync(completed), false, 'concurrent admission remains blocked while Run CAS executes');
+      } });
+      store.create(run);
+      assert.equal(runTransitionCommand(store, run.id, 'start', undefined, registry).state, 'IMPLEMENTING');
+      assert.ok(child);
+      await new Promise<void>((resolve, reject) => {
+        let stderr = '';
+        child!.stderr?.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+        child!.on('error', reject);
+        child!.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Concurrent admission exited ${code}: ${stderr}`)));
+      });
+      assert.equal(existsSync(completed), true);
+    } finally { child?.kill(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('accepts only canonical physical dispatch lock aliases before a Run transition', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-canonical-dispatch-lock-'));
+    const store = new JsonFileStore({ dir: path.join(dir, 'runs') });
+    const accountHome = path.join(dir, 'account-home');
+    const dispatchDir = path.join(accountHome, '.tachiko-conductor', 'dispatch');
+    const dispatchAlias = path.join(dir, 'dispatch-alias');
+    mkdirSync(dispatchDir, { recursive: true });
+    symlinkSync(dispatchDir, dispatchAlias, 'dir');
+    const run = createRun(TARGET, T0, 'canonical-lock-alias');
+    store.create(run);
+    const previousEnv = { data: process.env.TACHIKO_DATA_DIR, once: process.env.TACHIKO_DISPATCH_LOCK_PATH, admission: process.env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH };
+    const originalUserInfo = os.userInfo;
+    try {
+      Object.defineProperty(os, 'userInfo', { configurable: true, value: (...args: Parameters<typeof originalUserInfo>) => ({ ...originalUserInfo(...args), homedir: accountHome }) });
+      process.env.TACHIKO_DATA_DIR = path.join(dir, 'runs');
+      process.env.TACHIKO_DISPATCH_LOCK_PATH = path.join(dispatchAlias, 'once.lock');
+      process.env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH = path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock.admission');
+      assert.equal(await main(['run', 'transition', run.id, 'start']), 0, 'physical directory alias resolves to the account-owned canonical lock');
+      assert.equal(runShowCommand(store, run.id).state, 'IMPLEMENTING');
+
+      const rejectedRun = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 46 }, T0, 'noncanonical-lock');
+      store.create(rejectedRun);
+      process.env.TACHIKO_DISPATCH_LOCK_PATH = path.join(dir, 'unrelated.lock');
+      const before = runShowCommand(store, rejectedRun.id);
+      await assert.rejects(main(['run', 'transition', rejectedRun.id, 'start']), /TACHIKO_DISPATCH_LOCK_PATH must resolve to the canonical/);
+      assert.deepEqual(runShowCommand(store, rejectedRun.id), before, 'noncanonical alias is rejected before Run write');
+
+      process.env.TACHIKO_DISPATCH_LOCK_PATH = path.join(dispatchAlias, 'once.lock');
+      process.env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH = path.join(dir, 'unrelated-admission.lock');
+      await assert.rejects(main(['run', 'transition', rejectedRun.id, 'start']), /TACHIKO_DISPATCH_ADMISSION_LOCK_PATH must resolve to the canonical/);
+      assert.deepEqual(runShowCommand(store, rejectedRun.id), before, 'divergent admission-lock alias is rejected before Run write');
+    } finally {
+      Object.defineProperty(os, 'userInfo', { configurable: true, value: originalUserInfo });
+      for (const [name, value] of Object.entries(previousEnv)) {
+        const key = name === 'data' ? 'TACHIKO_DATA_DIR' : name === 'once' ? 'TACHIKO_DISPATCH_LOCK_PATH' : 'TACHIKO_DISPATCH_ADMISSION_LOCK_PATH';
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('requires an execution profile when terminal history means run starts fresh', async () => {
     const { store, dir } = tempStore();
     const previousRunsDir = process.env.TACHIKO_DATA_DIR;
@@ -2056,8 +2171,8 @@ describe('CLI end-to-end across processes', () => {
       TACHIKO_DATA_DIR: runs,
       TACHIKO_MISSION_ADMISSION_CONFIG: admissionConfig,
       TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'manual-receipts'),
-      TACHIKO_DISPATCH_LOCK_PATH: path.join(dir, 'dispatch.lock'),
-      TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(dir, 'dispatch.lock.admission'),
+      TACHIKO_DISPATCH_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock'),
+      TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock.admission'),
       TACHIKO_TEST_BRANCH: spawnSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout.trim(),
       TACHIKO_TEST_HEAD: spawnSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout.trim(),
       TACHIKO_TEST_TOKEN_PATH: path.join(dir, 'holder-token.json'),
@@ -2135,8 +2250,8 @@ describe('CLI end-to-end across processes', () => {
       TACHIKO_TEST_ACCOUNT_HOME: accountHome,
       TACHIKO_DATA_DIR: path.join(dir, 'runs'),
       TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify({ schemaVersion: 1, revision: 'direct-cli-capacity-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } }),
-      TACHIKO_DISPATCH_LOCK_PATH: path.join(dir, 'dispatch.lock'),
-      TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(dir, 'dispatch.lock.admission'),
+      TACHIKO_DISPATCH_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock'),
+      TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock.admission'),
       TACHIKO_EXECUTION_PROFILE_CONFIG: JSON.stringify({ revision: 'direct-cli-profile-v1', profiles: { routine: { executor: 'codex-cli', timeoutMs: 1 }, standard: { executor: 'codex-cli', timeoutMs: 2 }, complex: { executor: 'codex-cli', timeoutMs: 3 }, critical: { executor: 'claude-code', timeoutMs: 4 } } }),
     };
     const invoke = (args: string[]): Promise<CliResult> => new Promise((resolve, reject) => {

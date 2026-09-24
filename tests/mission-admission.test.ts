@@ -486,6 +486,55 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('preserves high-autonomy classification across retries and rejects downgrades before publication', () => {
+    let writes = 0;
+    const { directory, registry } = fixture({ beforePublish: () => { writes += 1; } });
+    try {
+      const owner = registry.admit({ laneId: 'autonomy-owner', role: 'production_captain', highAutonomy: true, evidence: evidence(601) });
+      const parked = registry.admit({ laneId: 'autonomy-waiting', role: 'production_captain', highAutonomy: true, evidence: evidence(602) });
+      assert.equal(owner.outcome, 'admitted');
+      assert.equal(parked.outcome, 'parked');
+      const beforeDowngrade = registry.snapshot();
+      const beforeWrites = writes;
+      assert.throws(() => registry.admit({ laneId: 'autonomy-waiting', role: 'production_captain', highAutonomy: false, evidence: evidence(602) }), /cannot be downgraded/);
+      assert.deepEqual(registry.snapshot(), beforeDowngrade);
+      assert.equal(writes, beforeWrites, 'rejected downgrade does not invoke publication callbacks');
+      const omittedRetry = registry.admit({ laneId: 'autonomy-waiting', role: 'production_captain', evidence: evidence(602) });
+      assert.equal(omittedRetry.outcome, 'parked');
+      assert.equal(registry.readLane('autonomy-waiting')?.highAutonomy, true);
+
+      if (owner.outcome === 'admitted') registry.release(owner.token, true);
+      const beforeReleasedDowngrade = registry.snapshot();
+      const writesBeforeReleasedDowngrade = writes;
+      assert.throws(() => registry.admit({ laneId: 'autonomy-owner', role: 'production_captain', highAutonomy: false, evidence: evidence(601) }), /cannot be downgraded/);
+      assert.deepEqual(registry.snapshot(), beforeReleasedDowngrade);
+      assert.equal(writes, writesBeforeReleasedDowngrade);
+      const inherited = registry.admit({ laneId: 'autonomy-owner', role: 'production_captain', evidence: evidence(601) });
+      assert.equal(inherited.outcome, 'admitted', 'released lane retains its high-autonomy class when retried');
+      assert.equal(registry.readLane('autonomy-owner')?.highAutonomy, true);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('rechecks high-autonomy capacity when a prior false lane is strengthened', () => {
+    const { directory, registry } = fixture({ config: { ...config, revision: 'test-autonomy-strengthen-v1', limits: { ...config.limits, maxCaptains: 3, maxWriters: 3, maxPerRepository: 1 } } });
+    try {
+      const repositoryHolder = registry.admit({ laneId: 'repository-holder', role: 'production_captain', highAutonomy: false, evidence: evidence(603) });
+      assert.equal(repositoryHolder.outcome, 'admitted');
+      const holder = registry.admit({ laneId: 'high-holder', role: 'production_captain', highAutonomy: true, evidence: { repository: 'other/repo', issue: 604 } });
+      assert.equal(holder.outcome, 'admitted');
+      const low = registry.admit({ laneId: 'low-then-high', role: 'production_captain', highAutonomy: false, evidence: evidence(605) });
+      assert.equal(low.outcome === 'parked' ? low.reason : null, 'capacity_repository');
+      const omittedLowRetry = registry.admit({ laneId: 'low-then-high', role: 'production_captain', evidence: evidence(605) });
+      assert.equal(omittedLowRetry.outcome === 'parked' ? omittedLowRetry.reason : null, 'capacity_repository');
+      assert.equal(registry.readLane('low-then-high')?.highAutonomy, false, 'omission preserves a prior low-autonomy class too');
+      if (repositoryHolder.outcome === 'admitted') registry.release(repositoryHolder.token, true);
+      const strengthened = registry.admit({ laneId: 'low-then-high', role: 'production_captain', highAutonomy: true, evidence: evidence(605) });
+      assert.equal(strengthened.outcome, 'parked');
+      assert.equal(strengthened.outcome === 'parked' ? strengthened.reason : null, 'capacity_high_autonomy');
+      assert.equal(registry.readLane('low-then-high')?.highAutonomy, true);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('canonicalizes symlink aliases before overlap admission', () => {
     const { directory, registry } = fixture();
     try {
