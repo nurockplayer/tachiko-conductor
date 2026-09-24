@@ -1,6 +1,6 @@
 ---
 name: tachiko-pr-steward
-description: Review an active GitHub pull request at exact HEAD, inspect checks and handoff state, and distinguish blocking findings from follow-up work.
+description: Review an active GitHub pull request at exact HEAD, inspect code, checks, review threads, and the canonical handoff, then decide whether findings block the current contract or belong in follow-up work. Use when the user asks to 看 PR, 審查進度, 看有沒有走歪, 處理 Review comment, or periodically guard Codex implementation.
 ---
 
 # Repository discovery entrypoint
