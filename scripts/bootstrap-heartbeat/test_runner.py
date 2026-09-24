@@ -668,6 +668,131 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(settled["releasedGeneration"], 2)
         self.assertEqual(self.records(), [], "recovery precedes polling and never spawns a wake")
 
+    def test_recoverable_active_rejects_partial_wrong_phase_and_mismatched_bindings(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_binding_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        exact_receipt_id = "00000000-0000-4000-8000-000000000001"
+        config = {"admission": {"repository": "nurockplayer/tachiko-conductor", "workspace": str(Path.cwd())}}
+        cases = (
+            ("partial null generation", {"generation": None, "receipt_id": exact_receipt_id}, "reserved_pre_execution", "test-host", "test-boot"),
+            ("partial null receipt", {"generation": 1, "receipt_id": None}, "reserved_pre_execution", "test-host", "test-boot"),
+            ("mismatched generation", {"generation": 2, "receipt_id": exact_receipt_id}, "reserved_pre_execution", "test-host", "test-boot"),
+            ("mismatched receipt", {"generation": 1, "receipt_id": "00000000-0000-4000-8000-000000000002"}, "reserved_pre_execution", "test-host", "test-boot"),
+            ("uncertain phase after reboot", {"generation": None, "receipt_id": None}, "spawn_uncertain", "test-host", "prior-boot"),
+            ("wrong host", {"generation": None, "receipt_id": None}, "reserved_pre_execution", "other-host", "prior-boot"),
+        )
+        for label, identity, phase, host_id, boot_id in cases:
+            with self.subTest(case=label):
+                pending = {
+                    "supervisor_id": "old-supervisor", "host_id": host_id, "boot_id": boot_id,
+                    "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+                    **identity, "started_at": 1000,
+                }
+                state = {"pending_admission": pending}
+                calls: list[str] = []
+
+                def admission_call(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+                    calls.append(str(request["action"]))
+                    if request["action"] == "recover":
+                        return {"schemaVersion": 1, "outcome": "recoverable", "generation": 1,
+                                "receiptId": exact_receipt_id}
+                    return {"schemaVersion": 1, "outcome": "settled"}
+
+                with mock.patch.object(module, "admission_call", side_effect=admission_call), \
+                        mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                        mock.patch.object(module, "process_identity", return_value=None), \
+                        mock.patch.object(module, "save_state") as save:
+                    with self.assertRaises(RuntimeError):
+                        module.reconcile_pending_admission(config, state)
+                self.assertEqual(calls, [] if label == "wrong host" else ["recover"],
+                                 "fenced recovery must not settle")
+                save.assert_not_called()
+                self.assertEqual(state["pending_admission"], pending)
+
+        live_pending = {
+            "supervisor_id": "old-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 123, "process_identity": "live-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        live_state = {"pending_admission": dict(live_pending)}
+        live_calls: list[str] = []
+
+        def live_admission_call(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            live_calls.append(str(request["action"]))
+            return {"schemaVersion": 1, "outcome": "recoverable", "generation": 1, "receiptId": exact_receipt_id}
+
+        with mock.patch.object(module, "admission_call", side_effect=live_admission_call), \
+                mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                mock.patch.object(module, "process_identity", return_value="live-owner-identity"), \
+                mock.patch.object(module, "save_state") as save:
+            self.assertFalse(module.reconcile_pending_admission(config, live_state))
+        self.assertEqual(live_calls, ["recover"])
+        save.assert_not_called()
+        self.assertEqual(live_state["pending_admission"], live_pending)
+
+    def test_prior_boot_spawn_uncertain_with_exact_bound_receipt_still_settles(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_bound_uncertain_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        receipt_id = "00000000-0000-4000-8000-000000000001"
+        pending = {
+            "supervisor_id": "old-supervisor", "host_id": "test-host", "boot_id": "prior-boot",
+            "pid": 999999, "process_identity": "old-owner-identity", "phase": "spawn_uncertain",
+            "generation": 1, "receipt_id": receipt_id, "started_at": 1000,
+        }
+        state = {"pending_admission": dict(pending)}
+        calls: list[str] = []
+
+        def admission_call(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            calls.append(str(request["action"]))
+            if request["action"] == "recover":
+                return {"schemaVersion": 1, "outcome": "recoverable", "generation": 1, "receiptId": receipt_id}
+            return {"schemaVersion": 1, "outcome": "settled"}
+
+        config = {"admission": {"repository": "nurockplayer/tachiko-conductor", "workspace": str(Path.cwd())}}
+        with mock.patch.object(module, "admission_call", side_effect=admission_call), \
+                mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")), \
+                mock.patch.object(module, "process_identity") as process_identity, \
+                mock.patch.object(module, "save_state") as save:
+            self.assertTrue(module.reconcile_pending_admission(config, state))
+        self.assertEqual(calls, ["recover", "settle"])
+        process_identity.assert_not_called()
+        save.assert_called_once_with(state)
+        self.assertIsNone(state["pending_admission"])
+
     def test_same_boot_dead_preexecution_owner_can_settle_exact_generation(self) -> None:
         self.invoke("run", "--prime")
         self._set_pending_admission("reserved_pre_execution")
@@ -1058,6 +1183,143 @@ class HeartbeatTest(unittest.TestCase):
         self.assertIsNone(after_capacity["pending_admission"])
         self.assertIsNone(self.state()["pending_admission"], "later capacity marker recovery also persists its clear")
         self.assertEqual(self.records(), [], "real helper marker recovery and capacity denial never spawn")
+
+    def test_real_helper_recovery_binds_null_pending_before_settlement_and_retries_both_crashes(self) -> None:
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_recoverable_runner_under_test", RUNNER)
+            assert spec and spec.loader
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+
+        workspace = self.root / "real-recovery-workspace"
+        workspace.mkdir()
+        helper_registry = self.root / "real-recovery-host" / "registry.json"
+        helper_receipt = self.root / "real-recovery-receipts" / "heartbeat.json"
+        admission_config = {
+            "schemaVersion": 1, "revision": "recoverable-restart-v1",
+            "limits": {"maxCaptains": 1, "maxWriters": 1, "maxHighAutonomy": 1},
+        }
+        registry_module = (Path.cwd() / "src/mission-admission/registry.ts").resolve().as_uri()
+        admission_module = (Path.cwd() / "src/mission-admission/heartbeat-admission.ts").resolve().as_uri()
+        bridge = self.state_root / "real-recoverable-admission-bridge.mjs"
+        bridge.write_text(
+            "import fs from 'node:fs';\n"
+            "import { MissionAdmissionRegistry } from " + json.dumps(registry_module) + ";\n"
+            "import { handleHeartbeatAdmission } from " + json.dumps(admission_module) + ";\n"
+            "const q=JSON.parse(fs.readFileSync(0,'utf8'));\n"
+            "const config=JSON.parse(process.env.TEST_ADMISSION_CONFIG);\n"
+            "const options={filePath:process.env.TEST_ADMISSION_REGISTRY,config,"
+            "...(q.injectPublicationFailure?{beforePublish:()=>{throw new Error('injected registry publication failure')}}:{})};\n"
+            "const registry=new MissionAdmissionRegistry(options);\n"
+            "if(q.bridgeAction==='readLane') console.log(JSON.stringify(registry.readLane(q.laneId)));\n"
+            "else {delete q.injectPublicationFailure;delete q.bridgeAction;delete q.laneId;"
+            "console.log(JSON.stringify(handleHeartbeatAdmission(q,{registry,receiptPath:()=>process.env.TEST_ADMISSION_RECEIPT})));}\n",
+            encoding="utf-8",
+        )
+        node = shutil.which("node")
+        self.assertIsNotNone(node)
+        node_env = dict(os.environ, TEST_ADMISSION_REGISTRY=str(helper_registry),
+                        TEST_ADMISSION_RECEIPT=str(helper_receipt),
+                        TEST_ADMISSION_CONFIG=json.dumps(admission_config))
+
+        def real_helper(request: dict[str, object]) -> dict[str, object]:
+            result = subprocess.run([str(node), "--import", "tsx", str(bridge)], cwd=Path.cwd(), env=node_env,
+                                    input=json.dumps(request), text=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, check=False)
+            if result.returncode != 0:
+                raise RuntimeError("pinned admission helper rejected the ownership transaction")
+            return json.loads(result.stdout)
+
+        repository = "nurockplayer/tachiko-conductor"
+        workspace_text = str(workspace.resolve())
+        reserved = real_helper({"schemaVersion": 1, "action": "reserve", "repository": repository,
+                                "workspace": workspace_text, "supervisorId": "restarting-supervisor"})
+        self.assertEqual(reserved["outcome"], "reserved")
+        generation = reserved["generation"]
+        receipt_id = reserved["receiptId"]
+        lane_id = reserved["laneId"]
+        runtime_config = {"admission": {"repository": repository, "workspace": workspace_text}}
+
+        self.invoke("run", "--prime")
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": "restarting-supervisor", "host_id": "test-host", "boot_id": "test-boot",
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": "reserved_pre_execution",
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        module.STATE.write_text(json.dumps(state), encoding="utf-8")
+        calls: list[str] = []
+        inject_settle_failure = False
+
+        def python_admission_call(_config: dict[str, object], request: dict[str, object]) -> dict[str, object]:
+            nonlocal inject_settle_failure
+            action = str(request["action"])
+            calls.append(action)
+            call = dict(request)
+            if action == "settle" and inject_settle_failure:
+                call["injectPublicationFailure"] = True
+                inject_settle_failure = False
+            return real_helper(call)
+
+        def patch_reconcile():
+            return (
+                mock.patch.object(module, "admission_call", side_effect=python_admission_call),
+                mock.patch.object(module, "durable_host_boot_identity", return_value=("test-host", "test-boot")),
+                mock.patch.object(module, "process_identity", return_value=None),
+            )
+
+        patches = patch_reconcile()
+        with patches[0], patches[1], patches[2], \
+                mock.patch.object(module, "save_state", side_effect=OSError("simulated pre-bind save failure")):
+            with self.assertRaisesRegex(OSError, "simulated pre-bind save failure"):
+                module.reconcile_pending_admission(runtime_config, state)
+        self.assertEqual(calls, ["recover"], "failed exact-generation binding must not issue settle")
+        self.assertEqual((state["pending_admission"]["generation"], state["pending_admission"]["receipt_id"]), (None, None))
+        durable = self.state()["pending_admission"]
+        self.assertEqual((durable["generation"], durable["receipt_id"]), (None, None))
+        active_receipt = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        self.assertEqual((active_receipt["status"], active_receipt["token"]["generation"]), ("active", generation))
+        active_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})
+        self.assertEqual((active_lane["status"], active_lane["generation"]), ("active", generation))
+
+        inject_settle_failure = True
+        patches = patch_reconcile()
+        with patches[0], patches[1], patches[2]:
+            with self.assertRaisesRegex(RuntimeError, "pinned admission helper rejected"):
+                module.reconcile_pending_admission(runtime_config, state)
+        durable = self.state()["pending_admission"]
+        self.assertEqual((durable["generation"], durable["receipt_id"]), (generation, receipt_id),
+                         "exact registry identity is durably bound before the settlement request")
+        self.assertEqual((state["pending_admission"]["generation"], state["pending_admission"]["receipt_id"]),
+                         (generation, receipt_id))
+        settled_receipt = json.loads(helper_receipt.read_text(encoding="utf-8"))
+        self.assertEqual((settled_receipt["status"], settled_receipt["token"]["generation"]), ("settled", generation))
+        active_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})
+        self.assertEqual((active_lane["status"], active_lane["generation"]), ("active", generation),
+                         "second interruption is after settled receipt publication but before registry release")
+
+        restarted = self.state()
+        patches = patch_reconcile()
+        with patches[0], patches[1], patches[2]:
+            self.assertTrue(module.reconcile_pending_admission(runtime_config, restarted))
+        self.assertIsNone(restarted["pending_admission"])
+        self.assertIsNone(self.state()["pending_admission"])
+        released_lane = real_helper({"bridgeAction": "readLane", "laneId": lane_id})
+        self.assertEqual((released_lane["status"], released_lane["generation"]), ("released", generation + 1))
+        self.assertEqual(self.records(), [], "both restart recoveries settle exact ownership without spawning")
 
     def test_uncommitted_discard_retry_can_be_denied_by_capacity_again(self) -> None:
         self.invoke("run", "--prime")

@@ -1342,11 +1342,31 @@ def reconcile_pending_admission(config: dict[str, Any], state: dict[str, Any]) -
     receipt_id = recovery.get("receiptId")
     if type(generation) is not int or not isinstance(receipt_id, str):
         raise RuntimeError("recovery helper omitted the exact active receipt")
-    if pending["generation"] is not None and (pending["generation"] != generation or pending["receipt_id"] != receipt_id):
+    if re.fullmatch(r"[0-9a-f-]{36}", receipt_id) is None:
+        raise RuntimeError("recovery helper returned an invalid active receipt identity")
+    pending_generation = pending["generation"]
+    pending_receipt_id = pending["receipt_id"]
+    if (pending_generation is None) != (pending_receipt_id is None):
+        raise RuntimeError("durable heartbeat generation and receipt identity are only partially bound")
+    if pending_generation is not None and (pending_generation != generation or pending_receipt_id != receipt_id):
         raise RuntimeError("recovery helper identity differs from durable heartbeat generation")
+    if pending_generation is None and pending["phase"] != "reserved_pre_execution":
+        raise RuntimeError("unbound recoverable heartbeat may be bound only from a reserved pre-execution intent")
     if not pending_owner_is_proven_dead(pending, host_id, boot_id):
         log("admission re-entry is fenced: prior same-boot execution or live owner is ambiguous")
         return False
+    if pending_generation is None:
+        # Bind the owner proof to the exact registry generation before settling.
+        # If this durable write fails, the active reservation remains recoverable
+        # and the next restart can repeat the same transition safely.
+        pending["generation"] = generation
+        pending["receipt_id"] = receipt_id
+        try:
+            save_state(state)
+        except Exception:
+            pending["generation"] = None
+            pending["receipt_id"] = None
+            raise
     result = settle_heartbeat(config, pending["supervisor_id"], generation, receipt_id)
     if result.get("outcome") != "settled":
         raise RuntimeError("prior heartbeat generation was not settled")
