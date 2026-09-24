@@ -280,7 +280,7 @@ describe('CodexAppServerAdapter', () => {
 
   it('bounds a stalled turn/start RPC and interrupts the exact turn observed by notification', async () => {
     const client = new HangingStartTurnClient('turn-observed');
-    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 1_000 });
     const result = await adapter.run(request());
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);

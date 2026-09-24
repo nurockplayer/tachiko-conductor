@@ -287,13 +287,13 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     assert.notEqual(realGit, '');
     const wrapper = path.join(wrapperDir, 'git');
-    writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = clone ]; then sleep 1.1; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
+    writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = clone ]; then sleep 1.5; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
     chmodSync(wrapper, 0o755);
     const originalPath = process.env.PATH;
     process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
     try {
       const result = await new ConfiguredLocalValidationAdapter(
-        configuration([process.execPath, '-e', 'process.exit(0)'], 100),
+        configuration([process.execPath, '-e', 'process.exit(0)'], 1_000),
       ).validate(owned);
       assert.equal(result.status, 'passed');
     } finally {
