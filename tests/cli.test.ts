@@ -30,7 +30,7 @@ import {
   runShowView,
   runTransitionCommand,
 } from '../src/cli.js';
-import type { ImplementationAgent } from '../src/adapters/agent.js';
+import { qualifyGovernedPublicationAdapter, type ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
@@ -58,6 +58,16 @@ async function runMergedTransitionForTest(
   return await runMergedTransitionCommand(store, id, github, admission, lock);
 }
 const REPAIR_AUTHORITY = { revision: 'task-shape-v1', shape: 'bounded' as const };
+
+/** Mark one CLI test fake as the host-confined implementation boundary it models. */
+function qualifyGovernedFake<T extends ImplementationAgent>(agent: T): T {
+  qualifyGovernedPublicationAdapter(agent);
+  Object.defineProperty(agent, 'prepareGovernedInvocation', {
+    configurable: true,
+    value: () => ({ status: 'qualified' as const, agent }),
+  });
+  return agent;
+}
 
 function tempStore(): { store: JsonFileStore; dir: string } {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-'));
@@ -1258,7 +1268,7 @@ describe('workflow run and resume commands', () => {
         runOwnerReceiptPath: path.join(dir, 'owner.json'),
         withRunAdmissionLock,
       };
-      const workflowDeps = deps(store, githubAdapter([HEAD]), new BlockingImplementation(), new FakeReviewer([]));
+      const workflowDeps = deps(store, githubAdapter([HEAD]), qualifyGovernedFake(new BlockingImplementation()), new FakeReviewer([]));
       const first = runIssueCommand(workflowDeps, 'acme/widgets#42', options);
       await entered;
       await assert.rejects(runIssueCommand(workflowDeps, 'acme/widgets#42', options), /Lane already has active ownership|active or parked lane/);
@@ -1290,7 +1300,7 @@ describe('workflow run and resume commands', () => {
         readonly kind = 'implementation-agent' as const;
         async run(): Promise<AgentResult> { throw new Error('stopped after retry admission'); }
       }
-      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), new StopAfterAdmission(), new FakeReviewer([])), 'acme/widgets#42', {
+      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), qualifyGovernedFake(new StopAfterAdmission()), new FakeReviewer([])), 'acme/widgets#42', {
         admission: registry, admissionWorkspace: dir, runOwnerReceiptPath: path.join(dir, 'owner.json'), now: () => T0,
       }), /stopped after retry admission/);
       assert.equal(store.list().length, 1, 'retry does not construct a second random Run id');
@@ -1305,7 +1315,7 @@ describe('workflow run and resume commands', () => {
       const store = new MemoryStore();
       const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: { schemaVersion: 1, revision: 'logical-admission-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } } });
       registry.admit({ laneId: 'ambient-cwd-owner', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 99, workspace: process.cwd() } });
-      const implementation = new FakeImplementation([]);
+      const implementation = qualifyGovernedFake(new FakeImplementation([]));
       await assert.rejects(runIssueCommand(
         deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])),
         'acme/widgets#42',
@@ -1344,7 +1354,7 @@ describe('workflow run and resume commands', () => {
           throw new Error('stop after observing prepared workspace');
         }
       }
-      const implementation = new UncertainImplementation();
+      const implementation = qualifyGovernedFake(new UncertainImplementation());
       const live = githubAdapter([HEAD, HEAD]);
       const noPullRequestGithub: GitHubAdapter = {
         ...live,
@@ -1503,7 +1513,7 @@ describe('workflow run and resume commands', () => {
         readonly kind = 'implementation-agent' as const;
         async run(): Promise<AgentResult> { throw new Error('worker stopped with uncertain execution'); }
       }
-      await assert.rejects(runIssueCommand({ ...deps(store, noPullRequestGithub, new UncertainImplementation(), new FakeReviewer([])), bootstrap },
+      await assert.rejects(runIssueCommand({ ...deps(store, noPullRequestGithub, qualifyGovernedFake(new UncertainImplementation()), new FakeReviewer([])), bootstrap },
         'acme/widgets#42', { admission: registry, runOwnerReceiptPath: receiptPath, now: () => T0 }), /worker stopped with uncertain execution/);
       const run = store.list()[0]!;
       const lane = registry.readLane(`run:${run.id}`)!;
@@ -2109,7 +2119,7 @@ describe('workflow run and resume commands', () => {
         override async run(): Promise<AgentResult> { throw new Error('provider invocation settlement is uncertain'); }
       }
       await assert.rejects(
-        runIssueCommand(deps(store, githubAdapter([HEAD]), new UncertainImplementation([]), new FakeReviewer([])), 'acme/widgets#42', { admission, admissionWorkspace: process.cwd(), runOwnerReceiptPath: path.join(dir, 'run-owner-uncertain.json') }),
+        runIssueCommand(deps(store, githubAdapter([HEAD]), qualifyGovernedFake(new UncertainImplementation([])), new FakeReviewer([])), 'acme/widgets#42', { admission, admissionWorkspace: process.cwd(), runOwnerReceiptPath: path.join(dir, 'run-owner-uncertain.json') }),
         /provider invocation settlement is uncertain/,
       );
       const run = store.list()[0];
@@ -2125,7 +2135,7 @@ describe('workflow run and resume commands', () => {
       const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: { schemaVersion: 1, revision: 'run-recovery-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
       const receiptPath = path.join(dir, 'owner-receipt.json');
       class UncertainImplementation extends FakeImplementation { override async run(): Promise<AgentResult> { throw new Error('worker settlement uncertain'); } }
-      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), new UncertainImplementation([]), new FakeReviewer([])), 'acme/widgets#42', {
+      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), qualifyGovernedFake(new UncertainImplementation([])), new FakeReviewer([])), 'acme/widgets#42', {
         admission, admissionWorkspace: process.cwd(), runOwnerReceiptPath: receiptPath,
       }), /worker settlement uncertain/);
       const run = store.list()[0]!;
