@@ -364,7 +364,7 @@ export class MissionAdmissionRegistry {
     this.beforeStaleTakeover = options.beforeStaleTakeover;
   }
 
-  private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void): T {
+  private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void): T {
     mkdirSync(path.dirname(this.filePath), { recursive: true, mode: 0o700 });
     const unlock = acquireLock(`${this.filePath}.lock`, this.lockTimeoutMs, this.lockRetryMs, this.beforeStaleTakeover);
     try {
@@ -394,6 +394,10 @@ export class MissionAdmissionRegistry {
           try { this.onPublishedTransition?.(project(state)); } catch { /* wake is a best-effort hint; publication remains authoritative */ }
         }
       }
+      // Receipt finalization belongs to the same host-global transaction as
+      // the registry publication. Same-lane admission cannot publish its
+      // successor receipt until this callback has finished and the lock exits.
+      afterPublish?.(result);
       return result;
     } finally { unlock(); }
   }
@@ -513,7 +517,7 @@ export class MissionAdmissionRegistry {
     return structuredClone(view);
   }
 
-  park(token: AdmissionToken, reason: ParkedReason, beforePublish?: () => void): number {
+  park(token: AdmissionToken, reason: ParkedReason, beforePublish?: () => void, afterPublish?: () => void): number {
     return this.transact((state) => {
       const lane = requireCurrentToken(state, token);
       if (lane.role === 'delegated_mutation_writer') throw new AdmissionStateError('Delegated writer cannot park; retain its active generation until stopped proof permits release.');
@@ -522,7 +526,7 @@ export class MissionAdmissionRegistry {
       lane.status = 'parked'; lane.token = null; lane.generation += 1; lane.parkedReason = reason; lane.updatedAt = this.now();
       state.revision += 1; state.lastTransition = { kind: reason, laneId: lane.laneId, at: lane.updatedAt };
       return state.revision;
-    }, () => beforePublish?.());
+    }, () => beforePublish?.(), () => afterPublish?.());
   }
 
   parkManual(token: AdmissionToken, proof: { readonly worktree: string; readonly branch: string; readonly checkpointSha: string; readonly clean: boolean; readonly stopped: boolean }): number {
@@ -562,7 +566,7 @@ export class MissionAdmissionRegistry {
     });
   }
 
-  release(token: AdmissionToken, executionStopped: boolean, beforePublish?: () => void): number {
+  release(token: AdmissionToken, executionStopped: boolean, beforePublish?: () => void, afterPublish?: () => void): number {
     if (executionStopped !== true) throw new AdmissionStateError('Release requires explicit evidence that execution and children have stopped.');
     return this.transact((state) => {
       const lane = requireCurrentToken(state, token);
@@ -570,11 +574,11 @@ export class MissionAdmissionRegistry {
       lane.status = 'released'; lane.token = null; lane.generation += 1; lane.updatedAt = this.now(); delete (lane as { parkedReason?: ParkedReason }).parkedReason;
       state.revision += 1; state.lastTransition = { kind: 'released', laneId: lane.laneId, at: lane.updatedAt };
       return state.revision;
-    }, () => beforePublish?.());
+    }, () => beforePublish?.(), () => afterPublish?.());
   }
 
   /** Exact-generation operator settlement for a parked production Run lane. */
-  releaseParked(laneId: string, expectedParkedGeneration: number, executionStopped: boolean, beforePublish?: () => void): number {
+  releaseParked(laneId: string, expectedParkedGeneration: number, executionStopped: boolean, beforePublish?: () => void, afterPublish?: () => void): number {
     if (!nonEmpty(laneId) || !Number.isSafeInteger(expectedParkedGeneration) || expectedParkedGeneration <= 0 || executionStopped !== true) {
       throw new AdmissionStateError('Parked Run settlement requires its exact generation and explicit operator-stopped attestation.');
     }
@@ -587,7 +591,20 @@ export class MissionAdmissionRegistry {
       lane.status = 'released'; lane.token = null; lane.generation += 1; lane.updatedAt = this.now(); delete (lane as { parkedReason?: ParkedReason }).parkedReason;
       state.revision += 1; state.lastTransition = { kind: 'operator_stopped_release', laneId: lane.laneId, at: lane.updatedAt };
       return state.revision;
-    }, () => beforePublish?.());
+    }, () => beforePublish?.(), () => afterPublish?.());
+  }
+
+  /** Run receipt reconciliation only while the exact released generation still owns this lane. */
+  withExactReleasedLane(laneId: string, expectedGeneration: number, reconcile: () => void): void {
+    if (!nonEmpty(laneId) || !Number.isSafeInteger(expectedGeneration) || expectedGeneration <= 0) {
+      throw new AdmissionStateError('Released-lane receipt reconciliation requires its exact generation.');
+    }
+    this.transact((state) => {
+      const lane = state.lanes.find((record) => record.laneId === laneId);
+      if (lane?.status !== 'released' || lane.generation !== expectedGeneration) {
+        throw new AdmissionStateError('Released-lane receipt reconciliation is stale or does not identify the exact released generation.');
+      }
+    }, undefined, () => reconcile());
   }
 
   /** Verify the exact live capability without granting physical mutation rights. */

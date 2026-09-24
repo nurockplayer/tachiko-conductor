@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { spawnSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { describe, it } from 'node:test';
 
 import {
@@ -51,6 +51,37 @@ const REPAIR_AUTHORITY = { revision: 'task-shape-v1', shape: 'bounded' as const 
 function tempStore(): { store: JsonFileStore; dir: string } {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-'));
   return { store: new JsonFileStore({ dir }), dir };
+}
+
+function startSuccessorAdmission(filePath: string, receiptPath: string, laneId: string, runId: string, workspace: string, marker: string, config: AdmissionConfig): Promise<void> {
+  const registryModule = pathToFileURL(path.join(REPO_ROOT, 'src/mission-admission/registry.ts')).href;
+  const receiptModule = pathToFileURL(path.join(REPO_ROOT, 'src/mission-admission/run-owner-receipt.ts')).href;
+  const source = `import { writeFileSync } from 'node:fs'; import { MissionAdmissionRegistry } from ${JSON.stringify(registryModule)}; import { readRunOwnerReceipt, writeRunOwnerReceipt } from ${JSON.stringify(receiptModule)}; writeFileSync(${JSON.stringify(marker)}, 'ready'); const registry = new MissionAdmissionRegistry({ filePath: ${JSON.stringify(filePath)}, config: ${JSON.stringify(config)}, lockTimeoutMs: 10000 }); const prior = readRunOwnerReceipt(${JSON.stringify(receiptPath)}); if (!prior) throw new Error('missing prior receipt'); const { token: _oldToken, ...base } = prior; const result = registry.admit({ laneId: ${JSON.stringify(laneId)}, role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: ${JSON.stringify(runId)}, workspace: ${JSON.stringify(workspace)} } }, { beforePublish: (candidate) => writeRunOwnerReceipt(${JSON.stringify(receiptPath)}, { ...base, token: candidate.token, generation: candidate.token.generation, phase: 'pre_execution' }) }); if (result.outcome !== 'admitted') throw new Error('successor was not admitted');`;
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', source], { cwd: REPO_ROOT, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stderr = '';
+    child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+    child.on('error', reject);
+    child.on('close', (code) => code === 0 ? resolve() : reject(new Error(`Successor admission child exited ${code}: ${stderr}`)));
+  });
+}
+
+function waitForMarker(marker: string): void {
+  const deadline = Date.now() + 5_000;
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  while (!existsSync(marker) && Date.now() < deadline) Atomics.wait(cell, 0, 0, 10);
+  assert.ok(existsSync(marker), 'successor process reached its admission attempt');
+  Atomics.wait(cell, 0, 0, 75);
+}
+
+function admitSuccessorWithReceipt(registry: MissionAdmissionRegistry, receiptPath: string, runId: string, workspace: string): void {
+  const prior = readRunOwnerReceipt(receiptPath);
+  assert.ok(prior);
+  const result = registry.admit({ laneId: `run:${runId}`, role: 'production_captain', highAutonomy: true,
+    evidence: { repository: 'acme/widgets', issue: 42, run: runId, workspace } }, {
+    beforePublish: (candidate) => writeRunOwnerReceipt(receiptPath, { ...prior, token: candidate.token, generation: candidate.token.generation, phase: 'pre_execution' }),
+  });
+  assert.equal(result.outcome, 'admitted');
 }
 
 describe('CLI command layer', () => {
@@ -1306,6 +1337,73 @@ describe('workflow run and resume commands', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('does not finalize an already-released receipt after a same-lane successor has published', () => {
+    const { dir } = tempStore();
+    try {
+      const runId = 'released-retry-successor';
+      const run = createRun(TARGET, T0, runId);
+      const store = new MemoryStore(); store.create(run);
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'released-retry-successor-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
+      const receiptPath = path.join(dir, 'owner-receipt.json');
+      const workspace = realpathSync(dir);
+      const admitted = registry.admit({ laneId: `run:${runId}`, role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: runId, workspace } });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') throw new Error('expected Run admission');
+      const transition = { schemaVersion: 1 as const, laneId: admitted.token.laneId, missionId: admitted.missionId, repository: 'acme/widgets', runId, issue: 42, workspace, token: admitted.token, generation: admitted.token.generation, phase: 'release_transition' as const };
+      writeRunOwnerReceipt(receiptPath, transition);
+      registry.release(admitted.token, true);
+
+      const withExactReleasedLane = registry.withExactReleasedLane.bind(registry);
+      registry.withExactReleasedLane = (laneId, generation, reconcile) => {
+        admitSuccessorWithReceipt(registry, receiptPath, runId, workspace);
+        return withExactReleasedLane(laneId, generation, reconcile);
+      };
+      assert.throws(() => recoverRunAdmission(store, registry, runId, admitted.token.generation, true, receiptPath), /exact released generation/);
+      const successorReceipt = readRunOwnerReceipt(receiptPath);
+      assert.equal(successorReceipt?.phase, 'pre_execution');
+      assert.equal(successorReceipt?.generation, admitted.token.generation + 2);
+      assert.equal(registry.readLane(admitted.token.laneId)?.status, 'active');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps a competing stale parked recovery from overwriting a successor receipt', () => {
+    const { dir } = tempStore();
+    try {
+      const runId = 'parked-retry-successor';
+      const run = createRun(TARGET, T0, runId);
+      const store = new MemoryStore(); store.create(run);
+      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'parked-retry-successor-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
+      const receiptPath = path.join(dir, 'owner-receipt.json');
+      const workspace = realpathSync(dir);
+      const admitted = registry.admit({ laneId: `run:${runId}`, role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: runId, workspace } });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') throw new Error('expected Run admission');
+      const parkReceipt = { schemaVersion: 1 as const, laneId: admitted.token.laneId, missionId: admitted.missionId, repository: 'acme/widgets', runId, issue: 42, workspace, token: admitted.token, generation: admitted.token.generation, phase: 'park_transition' as const };
+      writeRunOwnerReceipt(receiptPath, parkReceipt);
+      registry.park(admitted.token, 'workflow_settled');
+      const parkedGeneration = admitted.token.generation + 1;
+
+      const releaseParked = registry.releaseParked.bind(registry);
+      registry.releaseParked = (laneId, generation, stopped, beforePublish, afterPublish) => {
+        // An earlier recovery wins after this caller's unlocked branch reads,
+        // then the lane is readmitted before the stale caller reaches its fence.
+        releaseParked(laneId, generation, stopped, () => {
+          const { token: _token, ...withoutToken } = parkReceipt;
+          writeRunOwnerReceipt(receiptPath, { ...withoutToken, phase: 'parked_release_transition', generation: parkedGeneration });
+        });
+        admitSuccessorWithReceipt(registry, receiptPath, runId, workspace);
+        return releaseParked(laneId, generation, stopped, beforePublish, afterPublish);
+      };
+      assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath), /stale|expected production Run generation/);
+      const successorReceipt = readRunOwnerReceipt(receiptPath);
+      assert.equal(successorReceipt?.phase, 'pre_execution');
+      assert.equal(successorReceipt?.generation, parkedGeneration + 2);
+      assert.equal(registry.readLane(admitted.token.laneId)?.status, 'active');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('retires a parked Run after receipt prepublication wins but re-admission registry publication fails', async () => {
     const { dir } = tempStore();
     try {
@@ -1351,8 +1449,8 @@ describe('workflow run and resume commands', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('recovers a parked Run across each private park-release receipt crash boundary', () => {
-    for (const crashPoint of ['normalize', 'before', 'after', 'finalize'] as const) {
+  it('recovers a parked Run across each private park-release receipt crash boundary and serializes successor receipts', async () => {
+    for (const crashPoint of ['normalize', 'before', 'after', 'finalize', 'successor'] as const) {
       const { dir } = tempStore();
       try {
         const runId = `park-publish-${crashPoint}`;
@@ -1363,7 +1461,8 @@ describe('workflow run and resume commands', () => {
         run = applyTransition(run, { type: 'escalate', reason: 'operator input', interrupt: { evidence: 'decision required', choices: ['A'] } }, T0);
         const store = new MemoryStore();
         store.create(run);
-        const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: { schemaVersion: 1, revision: `park-publish-${crashPoint}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+        const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: `park-publish-${crashPoint}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+        const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
         const receiptPath = path.join(dir, 'owner-receipt.json');
         const canonicalWorkspace = realpathSync(dir);
         const admitted = registry.admit({ laneId: `run:${runId}`, role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: runId, workspace: canonicalWorkspace } });
@@ -1392,12 +1491,21 @@ describe('workflow run and resume commands', () => {
             throw new Error(`injected crash after parked release publication ${result}`);
           };
         }
+        let successorAdmission: Promise<void> | undefined;
+        if (crashPoint === 'successor') {
+          registry.releaseParked = (laneId, generation, stopped, beforePublish, afterPublish) => releaseParked(laneId, generation, stopped, beforePublish, () => {
+            const marker = path.join(dir, 'successor-ready');
+            successorAdmission = startSuccessorAdmission(path.join(dir, 'admission.json'), receiptPath, laneId, runId, canonicalWorkspace, marker, admissionConfig);
+            waitForMarker(marker);
+            afterPublish?.();
+          });
+        }
         if (crashPoint === 'normalize') {
           assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath, {
             parkReceiptNormalization: () => { throw new Error('injected crash after park receipt normalization'); },
           }), /injected crash after park receipt normalization/);
           assert.equal(registry.readLane(admitted.token.laneId)?.status, 'parked');
-          assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked_release_transition', 'park receipt normalization and release transition are one locked write');
           assert.equal(readRunOwnerReceipt(receiptPath)?.generation, parkedGeneration);
         } else if (crashPoint === 'finalize') {
           assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath, {
@@ -1406,6 +1514,8 @@ describe('workflow run and resume commands', () => {
           assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released');
           assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'released');
           assert.equal(readRunOwnerReceipt(receiptPath)?.generation, parkedGeneration + 1);
+        } else if (crashPoint === 'successor') {
+          assert.equal(recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath), 'released');
         } else {
           assert.throws(() => recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath), /injected crash/);
         }
@@ -1418,6 +1528,13 @@ describe('workflow run and resume commands', () => {
           assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked_release_transition');
         }
         registry.releaseParked = releaseParked;
+        if (successorAdmission !== undefined) await successorAdmission;
+        if (crashPoint === 'successor') {
+          assert.equal(registry.readLane(admitted.token.laneId)?.status, 'active', 'same-lane successor admits after settlement releases its transaction lock');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'pre_execution', 'the old parked finalizer cannot overwrite the successor receipt');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.generation, parkedGeneration + 2);
+          continue;
+        }
         assert.equal(recoverRunAdmission(store, registry, runId, parkedGeneration, true, receiptPath), 'released');
         assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'released');
         assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released');
