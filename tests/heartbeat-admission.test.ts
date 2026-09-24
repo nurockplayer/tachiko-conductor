@@ -225,6 +225,7 @@ describe('model-free heartbeat mission admission helper', () => {
     const alias = path.join(f.directory, 'workspace-alias');
     symlinkSync(f.workspace, alias, 'dir');
     const home = path.join(f.directory, 'home');
+    mkdirSync(home);
     const env = { HOME: home, TACHIKO_DATA_DIR: path.join(home, 'runs') };
     try {
       const receiptA = resolveHeartbeatOwnerReceiptPath('acme/widgets', f.workspace, { env, homeDirectory: home });
