@@ -1687,6 +1687,9 @@ export async function runMergedTransitionCommand(
     if (phase !== 'already_released') throw new Error('Merge reconciliation reached an invalid admission phase.');
 
     if (current.state === 'MERGE_READY') {
+      const exactFinalizedTransition = receipt.phase === 'released' && receipt.generation === lane.generation &&
+        receipt.token === undefined && receipt.settlementReason === 'workflow_settled';
+      if (exactFinalizedTransition) return casMergedRun(store, current);
       const exactPriorTransition = receipt.phase === 'parked_release_transition' && receipt.generation === lane.generation - 1 &&
         receipt.token === undefined && receipt.settlementReason === 'workflow_settled';
       if (!exactPriorTransition) throw new Error(`Released lane for Run "${id}" lacks the exact workflow_settled merge transition receipt.`);

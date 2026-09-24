@@ -1022,6 +1022,61 @@ describe('workflow run and resume commands', () => {
     } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('reconciles MERGE_READY after stopped recovery finalized the marked merge receipt', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-stopped-recovery-'));
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const store = new MemoryStore();
+      const run = mergeReadyRun('merge-stopped-recovery-finalized', dir);
+      const setup = setupParkedMerge(dir, store, run);
+      const cas = store.updateIfUnchanged.bind(store);
+      let race = true;
+      store.updateIfUnchanged = (expected, next) => {
+        if (race) {
+          race = false;
+          store.update({ ...expected, updatedAt: '2026-08-14T04:30:00.000Z' });
+          return false;
+        }
+        return cas(expected, next);
+      };
+      await assert.rejects(runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry), /changed concurrently/);
+      assert.equal(store.read(run.id)?.state, 'MERGE_READY');
+      assert.equal(setup.registry.readLane(`run:${run.id}`)?.status, 'parked');
+      const interrupted = readRunOwnerReceipt(setup.receiptPath);
+      assert.equal(interrupted?.phase, 'parked_release_transition');
+      assert.equal(interrupted?.generation, setup.generation);
+      assert.equal(interrupted?.settlementReason, 'workflow_settled');
+      store.updateIfUnchanged = cas;
+
+      assert.equal(recoverRunAdmission(store, setup.registry, run.id, setup.generation, true, setup.receiptPath), 'released');
+      assert.equal(store.read(run.id)?.state, 'MERGE_READY');
+      assert.equal(setup.registry.readLane(`run:${run.id}`)?.generation, setup.generation + 1);
+      const finalized = readRunOwnerReceipt(setup.receiptPath);
+      assert.equal(finalized?.phase, 'released');
+      assert.equal(finalized?.generation, setup.generation + 1);
+      assert.equal(finalized?.settlementReason, 'workflow_settled');
+
+      const registryBytes = readFileSync(path.join(dir, `merge-${run.id}.json`), 'utf8');
+      const receiptBytes = readFileSync(setup.receiptPath, 'utf8');
+      assert.equal((await runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry)).state, 'MERGED');
+      assert.equal(setup.registry.readLane(`run:${run.id}`)?.generation, setup.generation + 1);
+      assert.equal(readFileSync(path.join(dir, `merge-${run.id}.json`), 'utf8'), registryBytes);
+      assert.equal(readFileSync(setup.receiptPath, 'utf8'), receiptBytes);
+      assert.equal((await runMergedTransitionForTest(store, run.id, mergeProofAdapter(), setup.registry)).state, 'MERGED');
+      assert.equal(readFileSync(path.join(dir, `merge-${run.id}.json`), 'utf8'), registryBytes);
+      assert.equal(readFileSync(setup.receiptPath, 'utf8'), receiptBytes);
+
+      const unmarkedRun = mergeReadyRun('merge-stopped-recovery-unmarked', dir);
+      const unmarkedSetup = setupParkedMerge(dir, store, unmarkedRun);
+      recoverRunAdmission(store, unmarkedSetup.registry, unmarkedRun.id, unmarkedSetup.generation, true, unmarkedSetup.receiptPath);
+      const unmarkedReceipt = readFileSync(unmarkedSetup.receiptPath, 'utf8');
+      await assert.rejects(runMergedTransitionForTest(store, unmarkedRun.id, mergeProofAdapter(), unmarkedSetup.registry), /exact workflow_settled merge transition receipt/);
+      assert.equal(store.read(unmarkedRun.id)?.state, 'MERGE_READY');
+      assert.equal(readFileSync(unmarkedSetup.receiptPath, 'utf8'), unmarkedReceipt);
+      assert.equal(unmarkedSetup.registry.readLane(`run:${unmarkedRun.id}`)?.status, 'released');
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('does not release on Run CAS races and does not overwrite a successor receipt on stale retry', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-merge-cas-'));
     const restoreEnv = isolateMergeReceiptRoot(dir);
