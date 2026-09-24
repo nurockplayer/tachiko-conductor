@@ -1,10 +1,10 @@
-import { closeSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, fchmodSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, renameSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { assertSafeCurrentAccountPathIfApplicable } from '../account-home.js';
 
 import { createHostAdmissionRegistry, resolveHeartbeatOwnerReceiptPath, type HostAdmissionResolverOptions } from './host-registry.js';
-import { canonicalizeMissionEvidence, MissionAdmissionRegistry, type AdmissionToken } from './registry.js';
+import { canonicalizeMissionEvidence, deterministicMissionId, MissionAdmissionRegistry, type AdmissionToken } from './registry.js';
 
 export const HEARTBEAT_ADMISSION_REQUEST_MAX_BYTES = 8_192;
 export const HEARTBEAT_ADMISSION_LANE_PREFIX = 'heartbeat:';
@@ -48,7 +48,17 @@ interface SettleRequest {
   };
 }
 
-type HeartbeatAdmissionRequest = ReserveRequest | InspectRequest | RecoverRequest | SettleRequest;
+interface DiscardUncommittedRequest {
+  readonly schemaVersion: 1;
+  readonly action: 'discard_uncommitted';
+  readonly repository: string;
+  readonly workspace: string;
+  readonly supervisorId: string;
+  readonly expectedGeneration: number;
+  readonly receiptId: string;
+}
+
+type HeartbeatAdmissionRequest = ReserveRequest | InspectRequest | RecoverRequest | SettleRequest | DiscardUncommittedRequest;
 
 export interface HeartbeatAdmissionReceipt {
   readonly schemaVersion: 1;
@@ -80,7 +90,7 @@ function boundedString(value: unknown, max: number): value is string {
 }
 
 function parseRequest(input: unknown): HeartbeatAdmissionRequest {
-  if (!isObject(input) || input.schemaVersion !== 1 || !boundedString(input.action, 16)) throw new Error('Heartbeat admission request has an unsupported version or shape.');
+  if (!isObject(input) || input.schemaVersion !== 1 || !boundedString(input.action, 32)) throw new Error('Heartbeat admission request has an unsupported version or shape.');
   if (input.action === 'reserve' && exactKeys(input, ['schemaVersion', 'action', 'repository', 'workspace', 'supervisorId']) &&
     boundedString(input.repository, 255) && /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(input.repository) && path.isAbsolute(String(input.workspace)) && boundedString(input.workspace, 2_048) && boundedString(input.supervisorId, 128)) {
     return input as unknown as ReserveRequest;
@@ -99,6 +109,11 @@ function parseRequest(input: unknown): HeartbeatAdmissionRequest {
     boundedString(input.supervisorId, 128) && Number.isSafeInteger(input.expectedGeneration) && (input.expectedGeneration as number) > 0 && typeof input.receiptId === 'string' && /^[0-9a-f-]{36}$/.test(input.receiptId) && isObject(input.stopProof) &&
     exactKeys(input.stopProof, ['childrenStopped', 'supervisorStopped', 'observedAt']) && input.stopProof.childrenStopped === true && input.stopProof.supervisorStopped === true && boundedString(input.stopProof.observedAt, 64) && Number.isFinite(Date.parse(input.stopProof.observedAt))) {
     return input as unknown as SettleRequest;
+  }
+  if (input.action === 'discard_uncommitted' && exactKeys(input, ['schemaVersion', 'action', 'repository', 'workspace', 'supervisorId', 'expectedGeneration', 'receiptId']) &&
+    boundedString(input.repository, 255) && /^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(input.repository) && path.isAbsolute(String(input.workspace)) && boundedString(input.workspace, 2_048) &&
+    boundedString(input.supervisorId, 128) && Number.isSafeInteger(input.expectedGeneration) && (input.expectedGeneration as number) > 0 && typeof input.receiptId === 'string' && /^[0-9a-f-]{36}$/.test(input.receiptId)) {
+    return input as unknown as DiscardUncommittedRequest;
   }
   throw new Error('Heartbeat admission request is malformed or contains unsupported fields.');
 }
@@ -175,7 +190,9 @@ type HeartbeatStatusProjection = ReturnType<typeof statusProjection>;
 export type HeartbeatAdmissionResult =
   | ({ readonly schemaVersion: 1; readonly outcome: 'inspected' } & HeartbeatStatusProjection)
   | { readonly schemaVersion: 1; readonly outcome: 'recoverable' | 'settlement_pending' | 'already_settled'; readonly laneId: string; readonly generation: number; readonly receiptId: string }
+  | { readonly schemaVersion: 1; readonly outcome: 'uncommitted_receipt'; readonly laneId: string; readonly generation: number; readonly receiptId: string; readonly supervisorId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'absent' | 'capacity_wait' | 'not_owned'; readonly laneId: string }
+  | { readonly schemaVersion: 1; readonly outcome: 'discarded_uncommitted'; readonly laneId: string; readonly generation: number; readonly receiptId: string; readonly supervisorId: string }
   | { readonly schemaVersion: 1; readonly outcome: 'reserved' | 'already_reserved'; readonly laneId: string; readonly missionId: string; readonly generation: number; readonly receiptId: string; readonly revision: number }
   | { readonly schemaVersion: 1; readonly outcome: 'waiting'; readonly laneId: string; readonly missionId: string; readonly reason: string; readonly revision: number }
   | { readonly schemaVersion: 1; readonly outcome: 'owned_elsewhere'; readonly laneId: string; readonly missionId: string; readonly reason: 'overlapping_production_lane'; readonly revision: number }
@@ -193,11 +210,42 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
 
   if (request.action === 'inspect') return { schemaVersion: 1, outcome: 'inspected', ...statusProjection(registry, laneId) };
 
+  const capacityReasons = ['capacity_captains', 'capacity_writers', 'capacity_high_autonomy', 'capacity_repository'];
+  const receiptMatchesPredecessor = (receipt: HeartbeatAdmissionReceipt, lane: ReturnType<MissionAdmissionRegistry['readLane']>): boolean => {
+    if (lane === null || lane.laneId !== laneId || lane.role !== 'production_captain' || lane.highAutonomy !== true ||
+        lane.evidence.repositoryScope !== true || lane.evidence.repository !== evidence.repository || lane.evidence.workspace !== evidence.workspace ||
+        Object.keys(lane.evidence).some((key) => !['repository', 'repositoryScope', 'workspace'].includes(key)) ||
+        lane.missionId !== deterministicMissionId(evidence) || receipt.missionId !== lane.missionId || receipt.token.generation !== lane.generation + 1) return false;
+    return lane.status === 'released' || (lane.status === 'parked' && lane.parkedReason !== undefined && capacityReasons.includes(lane.parkedReason));
+  };
+
+  if (request.action === 'discard_uncommitted') {
+    const valid = registry.withLaneLock(laneId, (lane) => {
+      const receipt = privateReceipt(receiptPath);
+      if (receipt === null || receipt.status !== 'active' || receipt.laneId !== laneId || receipt.repository !== evidence.repository ||
+          receipt.workspace !== evidence.workspace || receipt.missionId !== deterministicMissionId(evidence) ||
+          receipt.supervisorId !== request.supervisorId || receipt.receiptId !== request.receiptId ||
+          receipt.token.generation !== request.expectedGeneration ||
+          (lane === null ? receipt.token.generation !== 1 : !receiptMatchesPredecessor(receipt, lane))) return false;
+      const directory = path.dirname(receiptPath);
+      assertSafeCurrentAccountPathIfApplicable(receiptPath, 'file');
+      const directoryStats = lstatSync(directory);
+      if (!directoryStats.isDirectory() || directoryStats.isSymbolicLink() || (directoryStats.mode & 0o777) !== 0o700 ||
+          (typeof process.getuid === 'function' && directoryStats.uid !== process.getuid())) throw new Error('Heartbeat receipt directory is not a private owner-owned directory.');
+      unlinkSync(receiptPath);
+      const directoryDescriptor = openSync(directory, 'r');
+      try { fsyncSync(directoryDescriptor); } finally { closeSync(directoryDescriptor); }
+      return true;
+    });
+    return valid
+      ? { schemaVersion: 1, outcome: 'discarded_uncommitted', laneId, generation: request.expectedGeneration, receiptId: request.receiptId, supervisorId: request.supervisorId }
+      : { schemaVersion: 1, outcome: 'not_owned', laneId };
+  }
+
   if (request.action === 'recover') {
     const lane = registry.readLane(laneId);
     const receipt = privateReceipt(receiptPath);
     if (lane === null && receipt === null) return { schemaVersion: 1, outcome: 'absent', laneId };
-    const capacityReasons = ['capacity_captains', 'capacity_writers', 'capacity_high_autonomy', 'capacity_repository'];
     const exactCapacityWaitLane = request.expectedGeneration === null && lane?.status === 'parked' &&
       lane.laneId === laneId && lane.role === 'production_captain' && lane.highAutonomy === true && lane.evidence.repositoryScope === true &&
       lane.evidence.repository === evidence.repository && lane.evidence.workspace === evidence.workspace &&
@@ -208,6 +256,12 @@ export function handleHeartbeatAdmission(input: unknown, options: HeartbeatAdmis
       receipt.token.generation + 1 < lane.generation;
     if (exactCapacityWaitLane && (receipt === null || historicalSettledReceipt)) {
       return { schemaVersion: 1, outcome: 'capacity_wait', laneId };
+    }
+    if (request.expectedGeneration === null && receipt !== null && receipt.status === 'active' &&
+        receipt.laneId === laneId && receipt.repository === evidence.repository && receipt.workspace === evidence.workspace &&
+        receipt.supervisorId === request.supervisorId && receipt.missionId === deterministicMissionId(evidence) &&
+        (lane === null ? receipt.token.generation === 1 : receiptMatchesPredecessor(receipt, lane))) {
+      return { schemaVersion: 1, outcome: 'uncommitted_receipt', laneId, generation: receipt.token.generation, receiptId: receipt.receiptId, supervisorId: receipt.supervisorId };
     }
     if (receipt === null || receipt.laneId !== laneId || receipt.repository !== evidence.repository || receipt.workspace !== evidence.workspace || receipt.supervisorId !== request.supervisorId) {
       return { schemaVersion: 1, outcome: 'not_owned', laneId };

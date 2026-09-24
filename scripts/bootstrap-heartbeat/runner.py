@@ -551,6 +551,9 @@ def load_state() -> dict[str, Any]:
 
 
 def save_state(state: dict[str, Any]) -> None:
+    if (testing() and os.environ.get("SCD_HEARTBEAT_TEST_FAIL_CLEAR_PENDING") == "1"
+            and state.get("pending_admission") is None):
+        raise OSError("injected heartbeat pending-clear save failure")
     if (testing() and isinstance(state.get("pending_admission"), dict)
             and os.environ.get("SCD_HEARTBEAT_TEST_FAIL_PHASE_SAVE") == state["pending_admission"].get("phase")):
         raise OSError("injected heartbeat phase save failure")
@@ -1154,6 +1157,15 @@ def recover_heartbeat(config: dict[str, Any], pending: dict[str, Any]) -> dict[s
     })
 
 
+def discard_uncommitted_heartbeat(config: dict[str, Any], supervisor_id: str, generation: int, receipt_id: str) -> dict[str, Any]:
+    admission = config["admission"]
+    return admission_call(config, {
+        "schemaVersion": 1, "action": "discard_uncommitted", "repository": admission["repository"],
+        "workspace": admission["workspace"], "supervisorId": supervisor_id,
+        "expectedGeneration": generation, "receiptId": receipt_id,
+    })
+
+
 def durable_host_boot_identity() -> tuple[str, str]:
     if testing():
         host = os.environ.get("SCD_HEARTBEAT_TEST_HOST_ID", "test-host")
@@ -1252,8 +1264,28 @@ def reconcile_pending_admission(config: dict[str, Any], state: dict[str, Any]) -
         save_state(state)
         log("cleared exact dead pre-execution intent while preserving the parked capacity lane")
         return True
+    if recovery.get("outcome") == "uncommitted_receipt":
+        generation = recovery.get("generation")
+        receipt_id = recovery.get("receiptId")
+        if (pending["generation"] is not None or pending["receipt_id"] is not None
+                or pending["phase"] != "reserved_pre_execution"
+                or not pending_owner_is_proven_dead(pending, host_id, boot_id)
+                or type(generation) is not int or generation <= 0
+                or not isinstance(receipt_id, str) or recovery.get("supervisorId") != pending["supervisor_id"]):
+            raise RuntimeError("uncommitted heartbeat receipt does not match a dead generation-free pre-execution intent")
+        discarded = discard_uncommitted_heartbeat(config, pending["supervisor_id"], generation, receipt_id)
+        if (discarded.get("outcome") != "discarded_uncommitted"
+                or discarded.get("generation") != generation or discarded.get("receiptId") != receipt_id
+                or discarded.get("supervisorId") != pending["supervisor_id"]):
+            raise RuntimeError("exact uncommitted heartbeat receipt was not discarded")
+        state["pending_admission"] = None
+        save_state(state)
+        log("discarded exact prepublication heartbeat receipt after durable dead-owner proof")
+        return True
     if recovery.get("outcome") == "absent":
-        if pending["generation"] is not None or not pending_owner_is_proven_dead(pending, host_id, boot_id):
+        if (pending["generation"] is not None or pending["receipt_id"] is not None
+                or pending["phase"] != "reserved_pre_execution"
+                or not pending_owner_is_proven_dead(pending, host_id, boot_id)):
             raise RuntimeError("registry lane is absent without sufficient durable proof to clear its intent")
         state["pending_admission"] = None
         save_state(state)

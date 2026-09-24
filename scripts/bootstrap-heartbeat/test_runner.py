@@ -406,12 +406,15 @@ class HeartbeatTest(unittest.TestCase):
             "const q = JSON.parse(fs.readFileSync(0, 'utf8'));\n"
             "if (q.action === 'inspect') { console.log(JSON.stringify({schemaVersion:1,outcome:'inspected',lane:s.active?{status:'active',generation:s.generation}:{status:'released',generation:s.releasedGeneration||((s.generation||0)+1)}}));\n"
             "} else if (q.action === 'recover') {\n"
+            " if (s.uncommittedReceipt && q.expectedGeneration === null && q.supervisorId === s.supervisorId) { console.log(JSON.stringify({schemaVersion:1,outcome:'uncommitted_receipt',generation:s.generation,receiptId:s.receiptId,supervisorId:s.supervisorId})); process.exit(0); }\n"
             " if ((s.capacityWait || s.capacityWaitHistoricalReceipt) && !s.active && q.expectedGeneration === null) { console.log(JSON.stringify({schemaVersion:1,outcome:'capacity_wait'})); process.exit(0); }\n"
             " if (s.active && s.settlementPending && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'settlement_pending',generation:s.generation,receiptId:s.receiptId}));\n"
             " else if (s.active && s.supervisorId === q.supervisorId && (q.expectedGeneration === null || q.expectedGeneration === s.generation)) console.log(JSON.stringify({schemaVersion:1,outcome:'recoverable',generation:s.generation,receiptId:s.receiptId}));\n"
             " else if (!s.active && q.expectedGeneration !== null && s.releasedGeneration === q.expectedGeneration + 1) console.log(JSON.stringify({schemaVersion:1,outcome:'already_settled',generation:q.expectedGeneration,receiptId:s.receiptId}));\n"
-            " else if (!s.active && q.expectedGeneration === null && !s.generation) console.log(JSON.stringify({schemaVersion:1,outcome:'absent'}));\n"
+            " else if (!s.active && q.expectedGeneration === null && (!s.generation || s.discardedUncommitted)) console.log(JSON.stringify({schemaVersion:1,outcome:'absent'}));\n"
             " else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
+            "} else if (q.action === 'discard_uncommitted') {\n"
+            " if (s.uncommittedReceipt && q.supervisorId === s.supervisorId && q.expectedGeneration === s.generation && q.receiptId === s.receiptId) { s.uncommittedReceipt = false; s.discardedUncommitted = true; fs.writeFileSync(statePath, JSON.stringify(s)); console.log(JSON.stringify({schemaVersion:1,outcome:'discarded_uncommitted',generation:q.expectedGeneration,receiptId:q.receiptId,supervisorId:q.supervisorId})); } else console.log(JSON.stringify({schemaVersion:1,outcome:'not_owned'}));\n"
             "} else if (q.action === 'reserve') {\n"
             " if (s.mode === 'waiting') { console.log(JSON.stringify({schemaVersion:1,outcome:'waiting'})); process.exit(0); }\n"
             " if (s.mode === 'corrupt') { process.exit(2); }\n"
@@ -681,6 +684,19 @@ class HeartbeatTest(unittest.TestCase):
         (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
         self.admission_state.write_text(json.dumps({"capacityWait": not historical_receipt, "capacityWaitHistoricalReceipt": historical_receipt, "mode": "waiting"}), encoding="utf-8")
 
+    def _set_uncommitted_receipt_pending(self, *, phase: str = "reserved_pre_execution", host_id: str = "test-host", owner: str = "old-supervisor", receipt_owner: str | None = None, boot_id: str = "test-boot") -> None:
+        state = self.state()
+        state["pending_admission"] = {
+            "supervisor_id": owner, "host_id": host_id, "boot_id": boot_id,
+            "pid": 999999, "process_identity": "dead-owner-identity", "phase": phase,
+            "generation": None, "receipt_id": None, "started_at": 1000,
+        }
+        (self.state_root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        self.admission_state.write_text(json.dumps({
+            "uncommittedReceipt": True, "generation": 7,
+            "receiptId": "00000000-0000-4000-8000-000000000007", "supervisorId": receipt_owner or owner,
+        }), encoding="utf-8")
+
     def test_capacity_wait_crash_clears_only_dead_generation_free_preexecution_intent(self) -> None:
         self.invoke("run", "--prime")
         self._set_capacity_wait_pending()
@@ -710,6 +726,74 @@ class HeartbeatTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 1)
                 self.assertIsNotNone(self.state()["pending_admission"])
                 self.assertEqual(self.records(), [])
+
+    def test_uncommitted_candidate_is_discarded_only_for_dead_generation_free_preexecution_owner(self) -> None:
+        for phase, host_id, owner, receipt_owner in (
+            ("reserved_pre_execution", "test-host", "old-supervisor", "other-supervisor"),
+            ("spawn_uncertain", "test-host", "old-supervisor", "old-supervisor"),
+            ("reserved_pre_execution", "other-host", "old-supervisor", "old-supervisor"),
+        ):
+            with self.subTest(phase=phase, host_id=host_id, owner=owner, receipt_owner=receipt_owner):
+                self.invoke("run", "--prime")
+                self._set_uncommitted_receipt_pending(phase=phase, host_id=host_id, owner=owner, receipt_owner=receipt_owner)
+                result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIsNotNone(self.state()["pending_admission"])
+                self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["uncommittedReceipt"])
+                self.assertEqual(self.records(), [])
+
+        self.invoke("run", "--prime")
+        self._set_uncommitted_receipt_pending(phase="spawn_uncertain", boot_id="prior-boot")
+        rebooted_uncertain = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"), check=False)
+        self.assertEqual(rebooted_uncertain.returncode, 1, "a reboot alone cannot clear an absent spawn-uncertain intent")
+        self.assertIsNotNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [])
+
+        self.invoke("run", "--prime")
+        self._set_uncommitted_receipt_pending()
+        result = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        self.assertTrue(admission["discardedUncommitted"])
+        self.assertEqual(admission["generation"], 7, "discard does not consume or release a registry generation")
+        self.assertEqual(self.records(), [], "clearing a prepublication candidate is never itself spawn authority")
+
+    def test_crash_after_uncommitted_receipt_discard_retries_absent_without_spawning(self) -> None:
+        self.invoke("run", "--prime")
+        self._set_uncommitted_receipt_pending()
+        failed = self.invoke("run", env=dict(
+            self.env, SCD_HEARTBEAT_TEST_NOW="1001", SCD_HEARTBEAT_TEST_FAIL_CLEAR_PENDING="1",
+        ), check=False)
+        self.assertEqual(failed.returncode, 1)
+        self.assertIsNotNone(self.state()["pending_admission"], "failed pending-state save must preserve intent")
+        self.assertTrue(json.loads(self.admission_state.read_text(encoding="utf-8"))["discardedUncommitted"],
+                        "the exact private orphan was durably removed before the failed state save")
+
+        retried = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(retried.returncode, 0, retried.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "absent retry after discard cannot reuse stale execution intent")
+
+    def test_uncommitted_discard_retry_can_be_denied_by_capacity_again(self) -> None:
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        self._set_uncommitted_receipt_pending()
+        admission = json.loads(self.admission_state.read_text(encoding="utf-8"))
+        admission["mode"] = "waiting"
+        self.admission_state.write_text(json.dumps(admission), encoding="utf-8")
+
+        first = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001"))
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.state()["last_attempt_reason"], "normalized GitHub state changed")
+        self.assertEqual(self.records(), [])
+
+        self.write_payload("C")
+        restarted = self.invoke("run", env=dict(self.env, SCD_HEARTBEAT_TEST_NOW="1002"))
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertIsNone(self.state()["pending_admission"])
+        self.assertEqual(self.records(), [], "a second capacity denial across restart remains no-spawn")
 
     def test_same_boot_uncertain_intent_clears_only_after_registry_proves_exact_release(self) -> None:
         self.invoke("run", "--prime")

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import os from 'node:os';
@@ -12,6 +13,9 @@ import { resolveHeartbeatOwnerReceiptPath } from '../src/mission-admission/host-
 const config: AdmissionConfig = { schemaVersion: 1, revision: 'heartbeat-admission-test-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
 const supervisorId = 'tachiko-heartbeat-service';
 const ROOT = path.resolve(import.meta.dirname, '..');
+function heartbeatLaneId(repository: string, workspace: string): string {
+  return 'heartbeat:' + createHash('sha256').update(`${repository}\0${realpathSync(workspace)}`).digest('hex').slice(0, 32);
+}
 
 function setup(overrides: { readonly beforePublish?: () => void; readonly limits?: AdmissionConfig['limits'] } = {}) {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-heartbeat-admission-'));
@@ -46,7 +50,11 @@ function setup(overrides: { readonly beforePublish?: () => void; readonly limits
     supervisorId: overrides.supervisor ?? supervisorId,
     expectedGeneration: generation,
   });
-  return { directory, workspace, registry, registryPath, receiptPath, options, request, settle, recover };
+  const discard = (repository: string, generation: number, receiptId: string, overrides: { readonly supervisor?: string } = {}) => ({
+    schemaVersion: 1, action: 'discard_uncommitted', repository, workspace,
+    supervisorId: overrides.supervisor ?? supervisorId, expectedGeneration: generation, receiptId,
+  });
+  return { directory, workspace, registry, registryPath, receiptPath, options, request, settle, recover, discard };
 }
 
 describe('model-free heartbeat mission admission helper', () => {
@@ -281,6 +289,128 @@ describe('model-free heartbeat mission admission helper', () => {
       assert.throws(() => handleHeartbeatAdmission(f.settle('acme/widgets', stale.token.generation, stale.receiptId), f.options), /generation or supervisor/);
       assert.equal(f.registry.readLane(successor.laneId)?.status, 'active');
       handleHeartbeatAdmission(f.settle('acme/widgets', successor.generation, successor.receiptId), f.options);
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('recovers and durably discards only an exact unpublished first-generation receipt', () => {
+    let failCommit = true;
+    const f = setup({ beforePublish: () => { if (failCommit) throw new Error('injected registry publication failure'); } });
+    try {
+      assert.throws(() => handleHeartbeatAdmission(f.request('reserve'), f.options), /injected registry publication failure/);
+      const orphan = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { generation?: number; receiptId: string; token: { generation: number } };
+      const restartedOptions: HeartbeatAdmissionOptions = {
+        registry: new MissionAdmissionRegistry({ filePath: f.registryPath, config }),
+        receiptPath: () => f.receiptPath,
+      };
+      const exact = handleHeartbeatAdmission(f.recover('acme/widgets', null), restartedOptions);
+      assert.equal(exact.outcome, 'uncommitted_receipt');
+      if (exact.outcome !== 'uncommitted_receipt') throw new Error('expected unpublished first candidate');
+      assert.deepEqual(exact, {
+        schemaVersion: 1, outcome: 'uncommitted_receipt', laneId: heartbeatLaneId('acme/widgets', f.workspace),
+        generation: 1, receiptId: orphan.receiptId, supervisorId,
+      });
+      const originalReceipt = readFileSync(f.receiptPath, 'utf8');
+      const wrongMission = JSON.parse(originalReceipt) as Record<string, unknown>;
+      wrongMission.missionId = 'mission-wrong';
+      writeFileSync(f.receiptPath, JSON.stringify(wrongMission), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), restartedOptions).outcome, 'not_owned', 'wrong deterministic mission identity is fenced');
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', 1, orphan.receiptId), restartedOptions).outcome, 'not_owned', 'locked deletion also verifies deterministic mission identity');
+      assert.equal(existsSync(f.receiptPath), true);
+      const settledReceipt = JSON.parse(originalReceipt) as Record<string, unknown>;
+      settledReceipt.status = 'settled';
+      writeFileSync(f.receiptPath, JSON.stringify(settledReceipt), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', 1, orphan.receiptId), restartedOptions).outcome, 'not_owned', 'settled receipts are not prepublication candidates');
+      writeFileSync(f.receiptPath, originalReceipt, { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null, { supervisor: 'other-supervisor' }), restartedOptions).outcome, 'not_owned');
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', 1, '00000000-0000-4000-8000-000000000099'), restartedOptions).outcome, 'not_owned');
+      assert.equal(existsSync(f.receiptPath), true, 'wrong receipt identity cannot delete the orphan');
+      assert.equal(f.registry.readLane(exact.laneId), null);
+      const discarded = handleHeartbeatAdmission(f.discard('acme/widgets', exact.generation, exact.receiptId), restartedOptions);
+      assert.equal(discarded.outcome, 'discarded_uncommitted');
+      assert.equal(existsSync(f.receiptPath), false);
+      assert.equal(f.registry.readLane(exact.laneId), null, 'discard does not publish or release a lane');
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), restartedOptions).outcome, 'absent', 'crash after unlink is an idempotent retry state');
+      failCommit = false;
+      const retried = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(retried.outcome, 'reserved');
+      if (retried.outcome === 'reserved') assert.equal(retried.generation, 1, 'the unpublished candidate consumed no generation');
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('discards later-generation orphan only over its exact released or capacity predecessor', () => {
+    let failCommit = false;
+    const f = setup({ beforePublish: () => { if (failCommit) throw new Error('injected registry publication failure'); } });
+    try {
+      const first = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(first.outcome, 'reserved');
+      if (first.outcome !== 'reserved') throw new Error('expected initial reservation');
+      handleHeartbeatAdmission(f.settle('acme/widgets', first.generation, first.receiptId), f.options);
+      const released = f.registry.readLane(first.laneId)!;
+      assert.equal(released.status, 'released');
+      failCommit = true;
+      assert.throws(() => handleHeartbeatAdmission(f.request('reserve'), f.options), /injected registry publication failure/);
+      failCommit = false;
+      const orphan = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { receiptId: string; token: { generation: number } };
+      assert.equal(orphan.token.generation, released.generation + 1);
+      const recovery = handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options);
+      assert.equal(recovery.outcome, 'uncommitted_receipt');
+      if (recovery.outcome !== 'uncommitted_receipt') throw new Error('expected exact unpublished receipt');
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', recovery.generation + 1, recovery.receiptId), f.options).outcome, 'not_owned');
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', recovery.generation, recovery.receiptId, { supervisor: 'wrong' }), f.options).outcome, 'not_owned');
+      assert.equal(existsSync(f.receiptPath), true);
+      const successor = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(successor.outcome, 'reserved');
+      if (successor.outcome !== 'reserved') throw new Error('expected successor admission');
+      assert.equal(f.registry.readLane(successor.laneId)?.generation, successor.generation);
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', recovery.generation, recovery.receiptId), f.options).outcome, 'not_owned', 'a changed active lane fences stale discard');
+      assert.equal(existsSync(f.receiptPath), true, 'stale discard does not unlink successor state');
+      handleHeartbeatAdmission(f.settle('acme/widgets', successor.generation, successor.receiptId), f.options);
+
+      // A capacity-parked predecessor is retained and may authorize only its next exact candidate.
+      const parked = f.registry.admit({ laneId: heartbeatLaneId('acme/widgets', f.workspace), role: 'production_captain', highAutonomy: true,
+        evidence: { repository: 'acme/widgets', repositoryScope: true, workspace: f.workspace } });
+      assert.equal(parked.outcome, 'admitted');
+      if (parked.outcome !== 'admitted') throw new Error('expected capacity predecessor setup lane');
+      const token = parked.token;
+      f.registry.park(token, 'capacity_high_autonomy');
+      const lane = f.registry.readLane(token.laneId)!;
+      const nextGeneration = lane.generation + 1;
+      const mission = lane.missionId;
+      mkdirSync(path.dirname(f.receiptPath), { recursive: true, mode: 0o700 });
+      writeFileSync(f.receiptPath, JSON.stringify({ schemaVersion: 1, laneId: heartbeatLaneId('acme/widgets', f.workspace),
+        missionId: mission, repository: 'acme/widgets', workspace: realpathSync(f.workspace), supervisorId, receiptId: '00000000-0000-4000-8000-000000000042', status: 'active',
+        token: { laneId: heartbeatLaneId('acme/widgets', f.workspace), generation: nextGeneration, token: 'orphan-token' } }), { mode: 0o600 });
+      const capacityRecovery = handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options);
+      assert.equal(capacityRecovery.outcome, 'uncommitted_receipt');
+      if (capacityRecovery.outcome !== 'uncommitted_receipt') throw new Error('expected candidate after capacity lane');
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', capacityRecovery.generation, capacityRecovery.receiptId), f.options).outcome, 'discarded_uncommitted');
+      assert.equal(f.registry.readLane(lane.laneId)?.status, 'parked', 'discard preserves capacity predecessor');
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'capacity_wait');
+    } finally { rmSync(f.directory, { recursive: true, force: true }); }
+  });
+
+  it('does not classify or discard an orphan over a manual-checkpoint predecessor', () => {
+    const f = setup();
+    try {
+      const reserved = handleHeartbeatAdmission(f.request('reserve'), f.options);
+      assert.equal(reserved.outcome, 'reserved');
+      if (reserved.outcome !== 'reserved') throw new Error('expected reservation');
+      const activeReceipt = JSON.parse(readFileSync(f.receiptPath, 'utf8')) as { token: { laneId: string; generation: number; token: string } };
+      f.registry.parkManual(activeReceipt.token, {
+        worktree: f.workspace, branch: 'main', checkpointSha: 'a'.repeat(40), clean: true, stopped: true,
+      });
+      const parked = f.registry.readLane(reserved.laneId)!;
+      assert.equal(parked.parkedReason, 'manual_checkpoint');
+      const generation = parked.generation + 1;
+      const receiptId = '00000000-0000-4000-8000-000000000043';
+      const laneId = heartbeatLaneId('acme/widgets', f.workspace);
+      writeFileSync(f.receiptPath, JSON.stringify({ schemaVersion: 1, laneId, missionId: parked.missionId,
+        repository: 'acme/widgets', workspace: realpathSync(f.workspace), supervisorId, receiptId, status: 'active',
+        token: { laneId, generation, token: 'orphan-token' } }), { mode: 0o600 });
+      assert.equal(handleHeartbeatAdmission(f.recover('acme/widgets', null), f.options).outcome, 'not_owned');
+      assert.equal(handleHeartbeatAdmission(f.discard('acme/widgets', generation, receiptId), f.options).outcome, 'not_owned');
+      assert.equal(existsSync(f.receiptPath), true);
+      assert.equal(f.registry.readLane(reserved.laneId)?.parkedReason, 'manual_checkpoint');
     } finally { rmSync(f.directory, { recursive: true, force: true }); }
   });
 

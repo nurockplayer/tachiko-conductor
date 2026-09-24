@@ -210,7 +210,7 @@ function overlaps(a: MissionEvidence, b: MissionEvidence): boolean {
   return fields.some((field) => a[field] !== undefined && b[field] !== undefined && a[field] === b[field]);
 }
 
-function deterministicMissionId(evidence: MissionEvidence): string {
+export function deterministicMissionId(evidence: MissionEvidence): string {
   const anchor: readonly (keyof MissionEvidence)[] = ['repositoryScope', 'issue', 'pullRequest', 'run', 'claim', 'workspace', 'stateSurface'];
   const key = anchor.find((field) => evidence[field] !== undefined);
   if (!key) throw new AdmissionStateError('Mission identity is ambiguous without canonical mission evidence.');
@@ -525,6 +525,17 @@ export class MissionAdmissionRegistry {
     if (lane === undefined) return null;
     const { token: _secret, ...view } = lane;
     return structuredClone(view);
+  }
+
+  /** Run a synchronous lane-scoped reconciliation while admission is locked. */
+  withLaneLock<T>(laneId: string, operation: (lane: AdmissionLaneView | null) => T): T {
+    if (!nonEmpty(laneId)) throw new AdmissionStateError('Lane lock requires an exact lane id.');
+    return this.transact((state) => {
+      const lane = state.lanes.find((record) => record.laneId === laneId);
+      if (lane === undefined) return operation(null);
+      const { token: _secret, ...view } = lane;
+      return operation(structuredClone(view));
+    });
   }
 
   /**
