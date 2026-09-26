@@ -26,7 +26,7 @@ import {
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
-import type { RepairAdmissionSnapshot } from '../domain/repair-admission.js';
+import { activeRepairAdmission, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { createBootstrapFailureRun } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
@@ -119,6 +119,7 @@ export type WorkflowOutcome =
   | { readonly outcome: 'merged'; readonly run: Run }
   | { readonly outcome: 'waiting_dependency'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
+  | { readonly outcome: 'unsupported_cas'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
 function formatTarget(target: Target): string {
@@ -197,16 +198,36 @@ function park(run: Run, reason: string, store: RunStore, now: () => string, choi
 }
 
 function admittedRepairExecution(run: Run, deps: WorkflowDependencies): ResolvedExecutionConfiguration | null {
+  if (deps.resolveRepairExecutionProfile === undefined) return null;
+  const active = activeRepairAdmission(run);
   const authority = run.repairTaskShapeAuthority;
-  if (authority === undefined || run.headSha === undefined || run.pullRequest === undefined) return null;
-  const receipt = [...(run.repairAdmissions ?? [])].reverse().find((candidate): candidate is RepairAdmissionSnapshot =>
-    candidate.authorityRevision === authority.revision && candidate.taskShape === authority.shape &&
-    candidate.headSha === run.headSha && candidate.pullRequestNumber === run.pullRequest!.number,
-  );
-  if (receipt === undefined || deps.resolveRepairExecutionProfile === undefined) return null;
+  const latestStartFix = [...run.history].map((entry, index) => ({ entry, index })).reverse().find(({ entry }) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
+  // A new-format marker is authority in its own right for deciding that this
+  // history entry must resolve as bound. Deleting or corrupting its receipt
+  // must never make the same attempt eligible for legacy receipt fallback.
+  const boundAttemptExists = latestStartFix !== undefined &&
+    (latestStartFix.entry.repairAdmissionIndex !== undefined ||
+      (run.repairAdmissions ?? []).some((candidate) => candidate.attemptBinding?.startFixHistoryIndex === latestStartFix.index));
+  const legacy = active === null && !boundAttemptExists && run.state === 'IMPLEMENTING' && authority !== undefined && run.headSha !== undefined && run.pullRequest !== undefined
+    ? [...(run.repairAdmissions ?? [])].reverse().find((candidate) => candidate.attemptBinding === undefined &&
+      candidate.authorityRevision === authority.revision && candidate.taskShape === authority.shape &&
+      candidate.headSha === run.headSha && candidate.pullRequestNumber === run.pullRequest!.number)
+    : undefined;
+  const receipt = active?.snapshot ?? legacy;
+  if (receipt === undefined) return null;
   let resolved: ResolvedExecutionConfiguration | undefined;
   try { resolved = deps.resolveRepairExecutionProfile(receipt.executionProfile); } catch { return null; }
-  return resolved !== undefined && JSON.stringify(resolved) === JSON.stringify(receipt.execution) ? resolved : null;
+  if (resolved === undefined || JSON.stringify(resolved) !== JSON.stringify(receipt.execution)) return null;
+  if (active === null) {
+    const legacySession = run.agentResult?.sessionId !== undefined;
+    const knownPriorProvider = run.executor?.provider ?? run.execution?.executor;
+    if (run.executor !== undefined && run.executor.provider !== resolved.executor &&
+        !(resolved.executor === 'codex-cli' && run.executor.provider === 'codex-app-server')) return null;
+    if (legacySession && knownPriorProvider !== undefined && knownPriorProvider !== resolved.executor &&
+        !(resolved.executor === 'codex-cli' && knownPriorProvider === 'codex-app-server')) return null;
+    if (legacySession && knownPriorProvider === undefined) return null;
+  }
+  return resolved;
 }
 
 /** The persisted workspace boundary, not the initial provider, selects its later validation/review bootstrap. */
@@ -403,6 +424,9 @@ export async function runWorkflow(
           run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
           run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
         const pendingRepair = pendingReviewFix || pendingValidationRepair;
+        const repairAttempt = pendingRepair ? activeRepairAdmission(run) : null;
+        const repairFreshStart = repairAttempt?.snapshot.attemptBinding?.freshExecutor === true && repairAttempt.handoff === undefined;
+        const repairRuntimeGeneration = repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id;
         // A restarted repair may execute only from its append-only admission
         // receipt. It must not inherit the initial run profile as a fallback.
         const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
@@ -633,11 +657,11 @@ export async function runWorkflow(
           const preflightRequest = {
             target,
             baseSha,
-            ...(isIsolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-            ...(isIsolatedLuna || run.executor === undefined ? {} : { executor: run.executor }),
+            ...(isIsolatedLuna || repairFreshStart || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(isIsolatedLuna || repairFreshStart || run.executor === undefined ? {} : { executor: run.executor }),
             runtimeOwnership: {
               runId: run.id,
-              generation: run.executor?.generation ?? run.id,
+              generation: repairRuntimeGeneration,
               ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
             },
             governedPublication,
@@ -728,11 +752,11 @@ export async function runWorkflow(
             // repair/re-entry therefore cannot pretend its prior CLI thread
             // is a durable continuation; its explicit exact-HEAD bootstrap
             // and newly copied bounded packet are the continuity authority.
-            ...(isIsolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-            ...(isIsolatedLuna || run.executor === undefined ? {} : { executor: run.executor }),
+            ...(isIsolatedLuna || repairFreshStart || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(isIsolatedLuna || repairFreshStart || run.executor === undefined ? {} : { executor: run.executor }),
             runtimeOwnership: {
               runId: run.id,
-              generation: run.executor?.generation ?? run.id,
+              generation: repairRuntimeGeneration,
               ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
             },
             ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
@@ -741,7 +765,28 @@ export async function runWorkflow(
             ? preparedGovernedInvocation.agent.run(implementationRequest)
             : implementation.run(implementationRequest));
         } catch (error) {
-          if (isWorkspaceGuardFailure(error)) return bootstrapFailureAfterWorker(run, workerHandoff, error, store, now);
+          if (isWorkspaceGuardFailure(error)) {
+            if (error.executor !== undefined && repairAttempt?.snapshot.attemptBinding !== undefined) {
+              const failedResult: AgentResult = { exitStatus: 'failure', summary: error.message, executor: error.executor, sessionId: error.executor.sessionId };
+              let captured = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(failedResult, {
+                ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
+                ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
+                ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
+              }, 'worker', workerSpawn.invocationId), now());
+              try {
+                captured = applyTransition(captured, {
+                  type: repairAttempt.handoff === undefined ? 'repair_executor_handoff' : 'repair_executor_continued',
+                  repairAgentResult: failedResult,
+                }, now());
+              } catch { /* A typed post-execution identity that fails admission cannot replace the predecessor. */ }
+              const parked = createBootstrapFailureRun(captured, error, now);
+              if (!updateIfCurrent(store, workerHandoff, parked.run)) {
+                return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while the post-execution workspace identity was being captured; preserving the newer Run.');
+              }
+              return { outcome: 'needs_human', ...parked };
+            }
+            return bootstrapFailureAfterWorker(run, workerHandoff, error, store, now);
+          }
           const detail = error instanceof Error ? error.message : String(error);
           const failedInvocation = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult({
             exitStatus: 'failure',
@@ -758,11 +803,27 @@ export async function runWorkflow(
           run = failedInvocation;
           throw error;
         }
-        const completedInvocation = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(result, {
+        let completedInvocation = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(result, {
           ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
           ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
           ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
         }, 'worker', workerSpawn.invocationId), now());
+        if (repairAttempt !== null && repairAttempt.snapshot.attemptBinding !== undefined) {
+          try {
+            if (repairAttempt.handoff === undefined) {
+              completedInvocation = applyTransition(completedInvocation, { type: 'repair_executor_handoff', repairAgentResult: result }, now());
+            } else {
+              completedInvocation = applyTransition(completedInvocation, { type: 'repair_executor_continued', repairAgentResult: result }, now());
+            }
+          } catch (error) {
+            const persistedTelemetry = completedInvocation;
+            if (!updateIfCurrent(store, workerHandoff, persistedTelemetry)) {
+              return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while repair identity was being recorded; preserving the newer Run.');
+            }
+            run = persistedTelemetry;
+            return park(run, `Repair executor handoff is unqualified: ${error instanceof Error ? error.message : String(error)} No provider identity was adopted.`, store, now);
+          }
+        }
         if (!updateIfCurrent(store, workerHandoff, completedInvocation)) {
           return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while implementation result was being recorded; preserving the newer Run.');
         }
@@ -1132,6 +1193,7 @@ export async function runWorkflow(
         );
         run = loop.run;
         if (loop.outcome === 'needs_human') return { outcome: 'needs_human', run, reason: loop.reason };
+        if (loop.outcome === 'unsupported_cas') return { outcome: 'unsupported_cas', run: loop.run, reason: loop.reason };
         if (loop.outcome === 'failed') return { outcome: 'failed', run, reason: loop.reason };
         break;
       }

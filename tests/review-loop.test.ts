@@ -13,6 +13,7 @@ import { WorkerRouterAdapter } from '../src/agents/worker-router.js';
 import type { ContainerWorkerExecution } from '../src/agents/worker-router-container.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition, type ActiveValidationConfiguration } from '../src/domain/state-machine.js';
+import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import type { RunTelemetryCompletionEvent, RunTelemetrySpawnEvent } from '../src/domain/telemetry.js';
 import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import type { AgentResult, ImplementationBootstrapIdentity, ReviewResult, Run } from '../src/domain/types.js';
@@ -251,7 +252,7 @@ describe('runReviewLoop', () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
     const reviewer = new FakeReviewer([approve(HEAD)]);
-    const implementation = new FakeImplementation([]);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
 
     const result = await runReviewLoop(
       { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority },
@@ -571,7 +572,7 @@ describe('runReviewLoop', () => {
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD, pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD) }, T0);
     store.create(run);
-    const implementation = new FakeImplementation([]);
+    const implementation = new FakeImplementation([successResult(HEAD2)]);
     const github = githubAdapter([HEAD, HEAD, HEAD, HEAD]);
     const readLive = github.readLiveSnapshot.bind(github);
     github.readLiveSnapshot = async (target) => {
@@ -687,7 +688,7 @@ describe('runReviewLoop', () => {
       agentResult: { ...run.agentResult!, sessionId: 'legacy-session', executor: { provider: 'worker-router', sessionId: 'legacy-session' } },
     };
     store.create(run);
-    const implementation = new FakeImplementation([successResult(HEAD2)]);
+    const implementation = new FakeImplementation([{ ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'promoted-thread' }, sessionId: 'promoted-thread' }]);
     const complex = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 60_000 };
 
     const result = await runReviewLoop(
@@ -700,6 +701,74 @@ describe('runReviewLoop', () => {
     assert.equal(implementation.requests[0]?.executor, undefined);
     assert.equal(implementation.requests[0]?.sessionId, undefined);
     assert.deepEqual(implementation.requests[0]?.execution, complex);
+  });
+
+  it('binds App Server continuation to the exact request generation and permits same-provider session rotation only', () => {
+    let run = repairChangesRun('same-provider-continuation');
+    const prior = { provider: 'codex-app-server', sessionId: 'old-session', generation: 'run-generation' } as const;
+    run = { ...run, executor: prior, agentResult: { ...run.agentResult!, sessionId: prior.sessionId, executor: prior } };
+    const execution: ResolvedExecutionConfiguration = { ...ROUTINE_REPAIR_EXECUTION, executor: 'codex-cli' };
+    const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+    const binding = createRepairAttemptBinding(run, execution);
+    assert.equal(binding.freshExecutor, false, 'the established App Server-to-CLI transport remains a compatible continuation');
+    assert.equal(binding.runtimeGeneration, prior.generation);
+    run = applyTransition(run, {
+      type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding },
+    }, T0);
+    const initialResult: AgentResult = {
+      ...successResult(HEAD2), executor: { ...prior, sessionId: 'first-session' }, sessionId: 'first-session',
+    };
+    assert.throws(() => applyTransition(run, {
+      type: 'repair_executor_handoff',
+      repairAgentResult: { ...initialResult, executor: { ...initialResult.executor!, generation: '' } },
+    }, T0), /Repair executor result does not prove the admitted provider identity/);
+    run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: initialResult }, T0);
+    const rotated: AgentResult = {
+      ...successResult(HEAD2), executor: { ...prior, sessionId: 'rotated-session' }, sessionId: 'rotated-session',
+    };
+    const continued = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: rotated }, T0);
+    assert.equal(continued.executor?.sessionId, 'rotated-session');
+    assert.equal(continued.history.at(-1)?.type, 'repair_executor_continued');
+    assert.throws(() => applyTransition(continued, {
+      type: 'repair_executor_continued',
+      repairAgentResult: { ...rotated, executor: { provider: 'claude-code', sessionId: 'other-provider' }, sessionId: 'other-provider' },
+    }, T0), /Repair executor result does not prove the admitted provider identity/);
+    const laterStartFix = {
+      ...continued,
+      history: [...continued.history, { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }],
+    };
+    assert.throws(() => applyTransition(laterStartFix, { type: 'repair_executor_continued', repairAgentResult: rotated }, T0),
+      /Repair executor result does not prove the admitted provider identity/,
+    'same HEAD/PR and timestamp on an older receipt cannot authorize a newer start_fix');
+    assert.throws(() => applyTransition({ ...run, repairTaskShapeAuthority: { revision: 'new-authority', shape: 'bounded' } }, {
+      type: 'repair_executor_handoff', repairAgentResult: initialResult,
+    }, T0), /Repair executor result does not prove the admitted provider identity/);
+    assert.throws(() => applyTransition({
+      ...run, validationResult: validationFailed(HEAD),
+    }, { type: 'repair_executor_handoff', repairAgentResult: initialResult }, T0),
+    /Repair executor result does not prove the admitted provider identity/,
+    'a review-blocking receipt cannot be replayed for the current validation finding');
+    const badRevision = { ...run, repairAdmissions: [{ ...receipt, attemptBinding: binding, executionRevision: 'rewritten' }] };
+    assert.throws(() => applyTransition(badRevision, { type: 'repair_executor_handoff', repairAgentResult: initialResult }, T0),
+      /Repair executor result does not prove the admitted provider identity/);
+  });
+
+  it('rejects a forged or missing captured predecessor before authorizing start_fix', () => {
+    for (const alter of [
+      (binding: NonNullable<ReturnType<typeof createRepairAttemptBinding>>) => ({ ...binding, predecessorExecutor: { provider: 'codex-cli', sessionId: 'forged' } }),
+      (binding: NonNullable<ReturnType<typeof createRepairAttemptBinding>>) => ({ ...binding, predecessorExecutor: undefined }),
+      (binding: NonNullable<ReturnType<typeof createRepairAttemptBinding>>) => ({ ...binding, predecessorSessionId: 'forged-session' }),
+      (binding: NonNullable<ReturnType<typeof createRepairAttemptBinding>>) => ({ ...binding, predecessorSessionId: undefined }),
+    ]) {
+      let run = repairChangesRun('forged-repair-predecessor');
+      const prior = { provider: 'claude-code', sessionId: 'durable-predecessor' } as const;
+      run = { ...run, executor: prior, agentResult: { ...run.agentResult!, executor: prior, sessionId: prior.sessionId } };
+      const execution = ROUTINE_REPAIR_EXECUTION;
+      const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+      const binding = alter(createRepairAttemptBinding(run, execution));
+      assert.throws(() => applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0),
+        /Repair admission must match current authority/);
+    }
   });
 
   it('plans and prepares a standalone workspace for a promoted existing-PR Luna repair', async () => {
@@ -728,7 +797,7 @@ describe('runReviewLoop', () => {
       const live = await readLive(target);
       return { ...live, pullRequest: { ...live.pullRequest!, headRef: 'existing-pr', baseRef: 'main', headRepository: { owner: 'acme', repo: 'widgets' } } };
     };
-    const implementation = new FakeImplementation([successResult(HEAD2)]);
+    const implementation = new FakeImplementation([{ ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'fresh-luna-thread' }, sessionId: 'fresh-luna-thread' }]);
 
     const result = await runReviewLoop(
       { store, github, implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
@@ -940,13 +1009,13 @@ describe('runReviewLoop', () => {
             assert.equal(pushes.length, 0);
             assert.equal(publicationChecks, 0, 'Run CAS rejection precedes mutation/publication admission checks');
           } else if (mode === 'mutation-stale') {
-            assert.equal(result.outcome, 'failed', JSON.stringify(result));
+            assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
             assert.equal(remoteHead, fixture.baseSha, 'a stale mutation generation cannot move the existing PR branch');
             assert.equal(pushes.length, 0);
             assert.equal(mutationChecks, 2, 'mutation ownership is checked again at the host push boundary');
             assert.equal(publicationChecks, 0, 'publication is not checked after mutation admission rejects');
           } else if (mode === 'publication-stale') {
-            assert.equal(result.outcome, 'failed', JSON.stringify(result));
+            assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
             assert.equal(remoteHead, fixture.baseSha, 'stale publication admission cannot move the existing PR branch');
             assert.equal(pushes.length, 0);
             assert.equal(publicationChecks, 1);
@@ -973,7 +1042,8 @@ describe('runReviewLoop', () => {
 
   it('does not spawn after a concurrent transition wins the post-admission telemetry fence', async () => {
     const initial = repairChangesRun('post-admission-race');
-    const started = applyTransition(initial, { type: 'start_fix' }, T0);
+    const started = { ...initial, state: 'IMPLEMENTING' as const, history: [...initial.history,
+      { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }] };
     const concurrent = applyTransition(started, { type: 'escalate', reason: 'concurrent cancellation' }, T0);
     const store = new SpawnRaceStore(concurrent);
     store.create(initial);
@@ -1328,33 +1398,61 @@ describe('runReviewLoop', () => {
     assert.deepEqual(reviewer.requests.map((reviewRequest) => reviewRequest.headSha), []);
   });
 
-  it('durably parks stale repair admission when CAS is unavailable without calling a writer or reviewer', async () => {
+  it('reports unsupported CAS without writing or calling a writer or reviewer', async () => {
     const backing = new MemoryStore();
+    let explicitWrites = 0;
     const store: RunStore = {
       name: 'no-cas', create: (run) => backing.create(run), read: (id) => backing.read(id),
-      update: (run) => backing.update(run), list: () => backing.list(), delete: (id) => backing.delete(id),
+      update: (run) => { explicitWrites += 1; backing.update(run); }, list: () => backing.list(), delete: (id) => backing.delete(id),
     };
     const run = repairChangesRun('repair-no-cas');
     store.create(run);
-    const implementation = new FakeImplementation([]);
+    const writesBeforeAdmission = explicitWrites;
+    const concurrent = applyTransition(run, {
+      type: 'escalate', reason: 'concurrent human hold',
+      interrupt: { evidence: 'concurrent human hold', choices: ['Resolve identity'] },
+    }, T0);
+    let liveReads = 0;
+    const github = githubAdapter([HEAD]);
+    github.readLiveSnapshot = async (target) => {
+      liveReads += 1;
+      backing.update(concurrent); // Simulate a concurrent durable writer while preflight is awaited.
+      return await githubAdapter([HEAD]).readLiveSnapshot(target);
+    };
+    let workerEffects = 0;
+    let publicationEffects = 0;
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run(request) {
+        workerEffects += 1;
+        if (request.beforePublish !== undefined) { request.beforePublish(); publicationEffects += 1; }
+        return successResult(HEAD2);
+      },
+    };
     const reviewer = new FakeReviewer([]);
 
     const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority,
+      { store, github, implementation, reviewer, resolveValidationAuthority: reviewAuthority,
         resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
       run.id, { maxAttempts: 3, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'needs_human');
-    assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.equal(store.read(run.id)?.interrupt?.reason, 'Repair admission parked: admission_stale.');
-    assert.equal(implementation.requests.length, 0);
+    assert.equal(result.outcome, 'unsupported_cas');
+    assert.deepEqual(result.run, concurrent);
+    assert.deepEqual(store.read(run.id), concurrent);
+    assert.equal(concurrent.state, 'NEEDS_HUMAN');
+    assert.equal(liveReads, 1);
+    assert.equal(explicitWrites, writesBeforeAdmission, 'unsupported CAS performs no write through the adapter');
+    assert.match(result.reason, /compare-and-swap is unavailable/);
+    assert.equal(workerEffects, 0);
+    assert.equal(publicationEffects, 0);
     assert.equal(reviewer.requests.length, 0);
   });
 
   it('retries stale admission parking from a concurrent nonterminal snapshot without calling a writer or reviewer', async () => {
     const run = repairChangesRun('repair-cas-race');
-    const concurrent = applyTransition(run, { type: 'start_fix' }, T0);
+    const concurrent = { ...run, state: 'IMPLEMENTING' as const, history: [...run.history,
+      { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }] };
     const store = new ConcurrentAdmissionStore(concurrent);
     store.create(run);
     const implementation = new FakeImplementation([]);

@@ -13,8 +13,10 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
-import type { ReviewResult, Run, Target } from '../domain/types.js';
+import type { AgentResult, ReviewResult, Run, Target } from '../domain/types.js';
 import {
+  activeRepairAdmission,
+  createRepairAttemptBinding,
   createRepairAdmissionSnapshot,
   decideRepairAdmission,
   type RepairFindingKind,
@@ -67,6 +69,7 @@ export type ReviewLoopResult =
   | { readonly outcome: 'approved'; readonly run: Run }
   | { readonly outcome: 'revalidating'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
+  | { readonly outcome: 'unsupported_cas'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
 function formatTarget(target: Target): string {
@@ -225,6 +228,10 @@ function parkRepairAuthority(
 function parkStaleRepairAdmission(runId: string, fallback: Run, store: RunStore, now: () => string): ReviewLoopResult {
   const reason = 'Repair admission parked: admission_stale.';
   let current = store.read(runId) ?? fallback;
+  if (store.updateIfUnchanged === undefined) {
+    return { outcome: 'unsupported_cas', run: store.read(runId) ?? current,
+      reason: 'Repair admission is held because durable compare-and-swap is unavailable; no Run write was attempted.' };
+  }
   // Keep the established repair-admission behavior: if a concurrent writer
   // wins, reconcile the freshest active snapshot rather than applying a stale
   // repair transition. Reviewer-result paths use staleReviewOutcome and never
@@ -236,9 +243,7 @@ function parkStaleRepairAdmission(runId: string, fallback: Run, store: RunStore,
       type: 'escalate', reason,
       interrupt: { evidence: reason, choices: ['Re-admit the exact repair authority and execution profile', CANCEL_RUN_DECISION] },
     }, now());
-    if (store.updateIfUnchanged === undefined) {
-      store.update(parked);
-    } else if (!store.updateIfUnchanged(current, parked)) {
+    if (!store.updateIfUnchanged(current, parked)) {
       current = store.read(runId) ?? current;
       continue;
     }
@@ -398,6 +403,7 @@ export async function runReviewLoop(
       // such field and intentionally follows the pre-existing generic path.
       let repairExecution = run.execution;
       let repairStartsWithFreshExecutor = false;
+      let repairAttempt = activeRepairAdmission(run);
       const authority = run.repairTaskShapeAuthority;
       if (authority !== undefined) {
         const decision = decideRepairAdmission(authority);
@@ -421,15 +427,15 @@ export async function runReviewLoop(
         // A promoted repair may be assigned to another provider. Continuing a
         // prior provider's session across that boundary is not valid executor
         // continuity; intentionally start the selected profile fresh.
-        repairStartsWithFreshExecutor = run.executor !== undefined && run.executor.provider !== repairExecution.executor;
+        const attemptBinding = createRepairAttemptBinding(run, repairExecution);
+        repairStartsWithFreshExecutor = attemptBinding.freshExecutor;
         const finding: RepairFindingKind = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
           ? 'validation_failed'
           : 'review_blocking';
-        const admission = createRepairAdmissionSnapshot(
+        const admission = { ...createRepairAdmissionSnapshot(
           authority, finding, run.headSha, run.pullRequest.number, repairExecution, now(),
-        );
-        const admittedRun: Run = { ...run, repairAdmissions: [...(run.repairAdmissions ?? []), admission] };
-        const startedFix = applyTransition(admittedRun, { type: 'start_fix' }, now());
+        ), attemptBinding };
+        const startedFix = applyTransition(run, { type: 'start_fix', repairAdmission: admission }, now());
         // An authority snapshot is useful only if it was appended against the
         // exact durable Run that was preflighted. Never invoke a worker after a
         // stale CAS, because another writer may have replaced its HEAD or PR.
@@ -437,8 +443,15 @@ export async function runReviewLoop(
           return parkStaleRepairAdmission(run.id, run, store, now);
         }
         run = startedFix;
+        repairAttempt = activeRepairAdmission(run);
+        if (repairAttempt === null) {
+          return parkRepairAuthority(run, 'Repair admission history does not bind this exact unfinished start_fix.', store, now);
+        }
         const admissionPreflight = await checkOwnedFix();
         if (admissionPreflight !== null) return admissionPreflight;
+      }
+      if (repairAttempt !== null) {
+        repairStartsWithFreshExecutor = repairAttempt.snapshot.attemptBinding?.freshExecutor === true && repairAttempt.handoff === undefined;
       }
       if (authority === undefined) {
         const startedFix = applyTransition(run, { type: 'start_fix' }, now());
@@ -525,7 +538,7 @@ export async function runReviewLoop(
           ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.executor !== undefined ? { executor: run.executor } : {}),
           runtimeOwnership: {
             runId: run.id,
-            generation: run.executor?.generation ?? run.id,
+            generation: repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id,
             ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
           },
           governedPublication,
@@ -565,7 +578,29 @@ export async function runReviewLoop(
       }
       const workerHandoff = run;
       const recordWorkerInvocationFailure = (error: unknown): ReviewLoopResult | null => {
-        if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now, workerHandoff);
+        if (isWorkspaceGuardFailure(error)) {
+          if (error.executor !== undefined && repairAttempt !== null && repairAttempt.snapshot.attemptBinding !== undefined) {
+            const failedResult: AgentResult = { exitStatus: 'failure', summary: error.message, executor: error.executor, sessionId: error.executor.sessionId };
+            let captured = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(failedResult, {
+              ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
+              ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
+              ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
+            }, 'worker', workerSpawn.invocationId), now());
+            try {
+              captured = applyTransition(captured, {
+                type: repairAttempt.handoff === undefined ? 'repair_executor_handoff' : 'repair_executor_continued',
+                repairAgentResult: failedResult,
+              }, now());
+            } catch { /* An unqualified post-execution identity cannot replace the predecessor. */ }
+            const parked = createBootstrapFailureRun(captured, error, now);
+            if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, parked.run)) {
+              return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+            }
+            run = parked.run;
+            return { outcome: 'needs_human', ...parked };
+          }
+          return parkBootstrap(run, error, store, now, workerHandoff);
+        }
         const detail = error instanceof Error ? error.message : String(error);
         const failed = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult({
           exitStatus: 'failure',
@@ -622,13 +657,13 @@ export async function runReviewLoop(
             deps.assertCanPublish?.();
           },
           ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
+          runtimeOwnership: {
+            runId: run.id,
+            generation: repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id,
+            ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+          },
           ...(deps.governedPublicationRequired === true ? {
             governedPublication: Object.freeze({ required: true as const, continuation: true }),
-            runtimeOwnership: {
-              runId: run.id,
-              generation: run.executor?.generation ?? run.id,
-              ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
-            },
           } : {}),
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
@@ -637,11 +672,26 @@ export async function runReviewLoop(
         if (outcome !== null) return outcome;
         throw error;
       }
-      const completed = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(fixResult, {
+      let completed = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(fixResult, {
         ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
         ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
         ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
       }, 'worker', workerSpawn.invocationId), now());
+      if (repairAttempt !== null && repairAttempt.snapshot.attemptBinding !== undefined) {
+        try {
+          completed = applyTransition(completed, {
+            type: repairAttempt.handoff === undefined ? 'repair_executor_handoff' : 'repair_executor_continued',
+            repairAgentResult: fixResult,
+          }, now());
+        } catch (error) {
+          const persistedTelemetry = completed;
+          if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, persistedTelemetry)) {
+            return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+          }
+          run = persistedTelemetry;
+          return parkRepairAuthority(run, `Repair executor handoff is unqualified: ${errorMessage(error)} No provider identity was adopted.`, store, now);
+        }
+      }
       if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, completed)) {
         return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
       }

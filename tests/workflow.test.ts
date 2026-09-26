@@ -12,9 +12,10 @@ import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js
 import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
+import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
-import type { RunStore } from '../src/store/json-file-store.js';
+import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE, type ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
@@ -1880,7 +1881,8 @@ describe('runWorkflow', () => {
     const store = new MemoryStore();
     let run = reviewingRun(store, 'run-1', HEAD);
     run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
-    run = applyTransition(run, { type: 'start_fix' }, T0);
+    run = { ...run, state: 'IMPLEMENTING', history: [...run.history,
+      { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0 }] };
     store.update(run);
     const implementation = new FakeImplementation([successResult(HEAD2, 'fixed after restart')]);
     const reviewer = new FakeReviewer([approve(HEAD2)]);
@@ -1894,6 +1896,97 @@ describe('runWorkflow', () => {
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(implementation.requests[0]?.baseSha, HEAD);
     assert.equal(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
+  });
+
+  it('restarts a Luna repair after durable identity capture and accepts its new codex-cli session', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-repair-handoff-restart-'));
+    try {
+      const store = new JsonFileStore({ dir: directory });
+      const id = 'repair-handoff-restart';
+      let run = reviewingRun(store, id, HEAD);
+      run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+      run = {
+        ...run,
+        repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' },
+        executor: { provider: 'claude-code', sessionId: 'old-claude-session' },
+        agentResult: { ...run.agentResult!, sessionId: 'old-claude-session', executor: { provider: 'claude-code', sessionId: 'old-claude-session' } },
+      };
+      const execution: ResolvedExecutionConfiguration = {
+        profile: 'routine', revision: 'repair-profiles-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+      };
+      const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+      const binding = createRepairAttemptBinding(run, execution);
+      assert.equal(binding.freshExecutor, true);
+      run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+      store.update(run);
+
+      let implementationStarted = false;
+      let firstPostWorkerRead = true;
+      let secondInvocationStarted = false;
+      const github = githubAdapter(Array(20).fill(HEAD));
+      const readLiveSnapshot = github.readLiveSnapshot.bind(github);
+      github.readLiveSnapshot = async (target) => {
+        if (implementationStarted && firstPostWorkerRead) {
+          firstPostWorkerRead = false;
+          const independentlyLoaded = new JsonFileStore({ dir: directory }).read(id);
+          assert.equal(independentlyLoaded?.history.at(-1)?.type, 'repair_executor_handoff');
+          assert.equal(independentlyLoaded?.executor?.provider, 'codex-cli');
+          assert.equal(independentlyLoaded?.executor?.sessionId, 'captured-session');
+          throw new Error('simulated process interruption after durable handoff, before GitHub verification');
+        }
+        const live = secondInvocationStarted ? snapshot(HEAD2) : await readLiveSnapshot(target);
+        return { ...live, pullRequest: { ...live.pullRequest!, headRef: 'existing-pr', baseRef: 'main', headRepository: { owner: 'acme', repo: 'widgets' } } };
+      };
+      const implementation = new FakeImplementation([
+        { ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'captured-session' }, sessionId: 'captured-session' },
+        { ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'fresh-luna-session-after-restart' }, sessionId: 'fresh-luna-session-after-restart' },
+      ]);
+      const invoke = implementation.run.bind(implementation);
+      let invocationCount = 0;
+      implementation.run = async (request) => {
+        invocationCount += 1;
+        implementationStarted = true;
+        if (invocationCount === 2) secondInvocationStarted = true;
+        return await invoke(request);
+      };
+      const bootstrapIdentity = {
+        bootstrapKind: 'standalone-isolated' as const, owner: 'acme', repo: 'widgets', issueNumber: 42,
+        baseBranch: 'main', baseSha: 'base', branch: `tachiko/${id}`, publicationBranch: 'existing-pr', workspacePath: `/tmp/${id}`,
+      };
+      const bootstrap: ImplementationBootstrapAdapter = {
+        kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+        async plan() { return bootstrapIdentity; },
+        async prepare() { return bootstrapIdentity; },
+        guard() { return { assertValid: () => undefined }; },
+        async verifyDurable(request) { return { headSha: request.expectedHeadSha, branch: bootstrapIdentity.branch }; },
+      };
+      const deps = {
+        store, github, implementation, reviewer: new FakeReviewer([approve(HEAD2)]),
+        validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+        resolveRepairExecutionProfile: () => execution,
+        bootstrapForExecution: () => bootstrap,
+      };
+      const first = await runWorkflow(deps, id, { maxReviewAttempts: 2, now: () => T0 });
+      assert.equal(first.outcome, 'needs_human');
+      assert.equal(implementation.requests.length, 1, first.outcome === 'needs_human' ? first.reason : 'worker was not invoked');
+      assert.equal(implementation.requests[0]?.executor, undefined);
+      assert.equal(implementation.requests[0]?.sessionId, undefined);
+      const parked = new JsonFileStore({ dir: directory }).read(id);
+      assert.equal(parked?.state, 'NEEDS_HUMAN');
+      assert.equal(parked?.history.some((event) => event.type === 'repair_executor_handoff'), true);
+      const resumed = applyTransition(parked!, { type: 'human_resolved', reason: 'Retry after interrupted GitHub verification' }, T0);
+      store.update(resumed);
+
+      const restartedStore = new JsonFileStore({ dir: directory });
+      const second = await runWorkflow({ ...deps, store: restartedStore }, id, { maxReviewAttempts: 2, now: () => T0 });
+      assert.equal(second.outcome, 'merge_ready', second.outcome === 'needs_human' ? second.reason : undefined);
+      assert.equal(implementation.requests[1]?.executor, undefined, 'Luna remains isolated after restart');
+      assert.equal(implementation.requests[1]?.sessionId, undefined, 'the prior codex-cli identity is never injected into Luna');
+      assert.equal(implementation.requests[1]?.runtimeOwnership?.generation, implementation.requests[0]?.runtimeOwnership?.generation);
+      assert.equal(second.run.executor?.sessionId, 'fresh-luna-session-after-restart');
+      assert.equal(second.run.history.filter((event) => event.type === 'repair_executor_handoff').length, 1);
+      assert.equal(second.run.history.filter((event) => event.type === 'repair_executor_continued').length, 1);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('reconstructs a standalone workspace before resuming a promoted Luna repair', async () => {
@@ -1912,7 +2005,8 @@ describe('runWorkflow', () => {
         executionRevision: 'luna-v1', execution: luna, admittedAt: T0,
       }],
     };
-    run = applyTransition(run, { type: 'start_fix' }, T0);
+    run = { ...run, state: 'IMPLEMENTING', history: [...run.history,
+      { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0 }] };
     store.update(run);
     const identity = {
       bootstrapKind: 'standalone-isolated' as const, owner: 'acme', repo: 'widgets', issueNumber: 42,
@@ -1948,6 +2042,155 @@ describe('runWorkflow', () => {
     assert.match(implementation.requests[0]?.instructions ?? '', /Task requirements:\nDoR-ready\./);
     assert.match(implementation.requests[0]?.instructions ?? '', /Repair requirements:\n1\. \[blocking\] the diff has a bug/);
     assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
+  });
+
+  it('does not reuse a legacy session for a promoted provider when its original provider is unknown', async () => {
+    const store = new MemoryStore();
+    const id = 'legacy-session-unknown-provider';
+    const execution: ResolvedExecutionConfiguration = { profile: 'complex', revision: 'legacy-repair-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+    let run = reviewingRun(store, id, HEAD);
+    run = {
+      ...run,
+      repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'interacting' },
+      agentResult: { ...run.agentResult!, sessionId: 'unqualified-legacy-session' },
+    };
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    run = {
+      ...run,
+      repairAdmissions: [{
+        authorityRevision: 'task-shape-v1', taskShape: 'interacting', taxonomyRevision: 'repair-finding-taxonomy-v1',
+        finding: 'review_blocking', headSha: HEAD, pullRequestNumber: 7, executionProfile: 'complex',
+        executionRevision: execution.revision, execution, admittedAt: T0,
+      }],
+    };
+    run = { ...run, state: 'IMPLEMENTING', history: [...run.history,
+      { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0 }] };
+    store.update(run);
+    const implementation = new FakeImplementation([{ ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'new-session' }, sessionId: 'new-session' }]);
+    const result = await runWorkflow({
+      store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]),
+      resolveRepairExecutionProfile: () => execution,
+    }, id, { maxReviewAttempts: 1, now: () => T0 });
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /missing, stale, or its exact execution profile can no longer be resolved/);
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(store.read(id)?.agentResult?.sessionId, 'unqualified-legacy-session');
+  });
+
+  it('does not treat a marked attempt with missing binding as legacy authority', async () => {
+    const store = new MemoryStore();
+    const id = 'marked-attempt-missing-binding';
+    const execution: ResolvedExecutionConfiguration = { profile: 'complex', revision: 'legacy-repair-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+    let run = reviewingRun(store, id, HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    const identity = { provider: 'codex-cli', sessionId: 'same-provider-session' } as const;
+    run = {
+      ...run,
+      repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'interacting' },
+      executor: identity,
+      agentResult: { ...run.agentResult!, executor: identity, sessionId: identity.sessionId },
+      repairAdmissions: [{
+        authorityRevision: 'task-shape-v1', taskShape: 'interacting', taxonomyRevision: 'repair-finding-taxonomy-v1',
+        finding: 'review_blocking', headSha: HEAD, pullRequestNumber: 7, executionProfile: 'complex',
+        executionRevision: execution.revision, execution, admittedAt: T0,
+      }],
+      state: 'IMPLEMENTING',
+      history: [...run.history, { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0, repairAdmissionIndex: 0 }],
+    };
+    store.update(run);
+    let invocationEffects = 0;
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run() { invocationEffects += 1; return { ...successResult(HEAD2), executor: identity, sessionId: identity.sessionId }; },
+    };
+    const outcome = await runWorkflow({
+      store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]),
+      resolveRepairExecutionProfile: () => execution,
+    }, id, { maxReviewAttempts: 1, now: () => T0 });
+
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.equal(invocationEffects, 0);
+    assert.equal(outcome.run.executor?.sessionId, identity.sessionId);
+  });
+
+  it('holds consumed repair evidence when the durable adopted identity no longer matches history', async () => {
+    const store = new MemoryStore();
+    const id = 'consumed-adopted-identity-mismatch';
+    const execution: ResolvedExecutionConfiguration = { profile: 'complex', revision: 'repair-profile-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+    let run = reviewingRun(store, id, HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    run = {
+      ...run,
+      repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'interacting' },
+      executor: { provider: 'codex-cli', sessionId: 'predecessor-session' },
+      agentResult: { ...run.agentResult!, sessionId: 'predecessor-session', executor: { provider: 'codex-cli', sessionId: 'predecessor-session' } },
+    };
+    const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+    const binding = createRepairAttemptBinding(run, execution);
+    run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+    const adopted = { provider: 'codex-cli', sessionId: 'adopted-session' } as const;
+    run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: { ...successResult(HEAD2), executor: adopted, sessionId: adopted.sessionId } }, T0);
+    run = { ...run, executor: { provider: 'claude-code', sessionId: 'forged-current-session' } };
+    store.create(run);
+    let invocationEffects = 0;
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run() { invocationEffects += 1; return successResult(HEAD2); },
+    };
+    const outcome = await runWorkflow({
+      store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]),
+      resolveRepairExecutionProfile: () => execution,
+    }, id, { maxReviewAttempts: 1, now: () => T0 });
+
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.equal(invocationEffects, 0);
+    assert.equal(outcome.run.executor?.provider, 'claude-code');
+  });
+
+  it('holds before provider effects when bound repair provenance, predecessor, finding, or execution snapshot drifts', async (t) => {
+    const cases = ['authority', 'finding', 'admission-index', 'profile-revision', 'full-execution', 'resolved-execution', 'predecessor-session', 'predecessor-executor'] as const;
+    for (const scenario of cases) {
+      await t.test(scenario, async () => {
+        const store = new MemoryStore();
+        const id = `repair-provenance-${scenario}`;
+        const execution: ResolvedExecutionConfiguration = { profile: 'complex', revision: 'repair-profile-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+        let run = reviewingRun(store, id, HEAD);
+        run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+        run = {
+          ...run,
+          repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'interacting' },
+          executor: { provider: 'claude-code', sessionId: 'predecessor-session' },
+          agentResult: { ...run.agentResult!, sessionId: 'predecessor-session', executor: { provider: 'claude-code', sessionId: 'predecessor-session' } },
+        };
+        const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+        const binding = createRepairAttemptBinding(run, execution);
+        run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+        if (scenario === 'authority') run = { ...run, repairTaskShapeAuthority: { revision: 'changed-authority', shape: 'interacting' } };
+        if (scenario === 'finding') run = { ...run, validationResult: validationFailed(HEAD), reviewResult: approve(HEAD) };
+        if (scenario === 'admission-index') run = { ...run, repairAdmissions: [{ ...receipt, attemptBinding: { ...binding, startFixHistoryIndex: binding.startFixHistoryIndex + 1 } }] };
+        if (scenario === 'profile-revision') run = { ...run, repairAdmissions: [{ ...receipt, attemptBinding: binding, executionRevision: 'rewritten-revision' }] };
+        if (scenario === 'full-execution') run = { ...run, repairAdmissions: [{ ...receipt, attemptBinding: binding, execution: { ...execution, timeoutMs: 30_000 } }] };
+        if (scenario === 'predecessor-session') run = { ...run, agentResult: { ...run.agentResult!, sessionId: 'changed-current-session' } };
+        if (scenario === 'predecessor-executor') run = { ...run, executor: { provider: 'codex-cli', sessionId: 'changed-current-executor' } };
+        store.create(run);
+        let invocationEffects = 0;
+        const implementation: ImplementationAgent = {
+          kind: 'implementation-agent',
+          async run() { invocationEffects += 1; return successResult(HEAD2); },
+        };
+        const resolved = scenario === 'resolved-execution' ? { ...execution, timeoutMs: 30_000 } : execution;
+        const outcome = await runWorkflow({
+          store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]),
+          resolveRepairExecutionProfile: () => resolved,
+        }, id, { maxReviewAttempts: 1, now: () => T0 });
+
+        assert.equal(outcome.outcome, 'needs_human');
+        assert.equal(invocationEffects, 0);
+        assert.deepEqual(outcome.run.executor, run.executor);
+        assert.equal(outcome.run.agentResult?.sessionId, run.agentResult?.sessionId);
+      });
+    }
   });
 
   it('never passes the final gate when live HEAD drifted after approval', async () => {

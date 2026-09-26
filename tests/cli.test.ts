@@ -12,6 +12,8 @@ import {
   findRunByTarget,
   LIVE_HEAD_SYNC_DECISION,
   main,
+  outcomeExitCode,
+  printOutcome,
   parseIssueNumber,
   parseIssueRef,
   printDispatchResult,
@@ -39,6 +41,7 @@ import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/doma
 import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
+import type { WorkflowOutcome } from '../src/workflow/run.js';
 import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
 import { resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
@@ -58,6 +61,24 @@ async function runMergedTransitionForTest(
   return await runMergedTransitionCommand(store, id, github, admission, lock);
 }
 const REPAIR_AUTHORITY = { revision: 'task-shape-v1', shape: 'bounded' as const };
+
+describe('CLI held workflow outcomes', () => {
+  it('prints unchanged durable state and exits unsuccessfully when CAS is unsupported', () => {
+    const run = { ...createRun(TARGET, T0, 'unsupported-cas-cli'), state: 'CHANGES_REQUESTED' as const };
+    const outcome: WorkflowOutcome = { outcome: 'unsupported_cas', run, reason: 'Run store does not support compare-and-swap.' };
+    const lines: string[] = [];
+    const originalError = console.error;
+    console.error = (...args: unknown[]) => { lines.push(args.map(String).join(' ')); };
+    try {
+      printOutcome(outcome);
+    } finally {
+      console.error = originalError;
+    }
+    assert.match(lines.join('\n'), /HELD/);
+    assert.match(lines.join('\n'), /Durable state remains CHANGES_REQUESTED; no park was written/);
+    assert.equal(outcomeExitCode(outcome), 2);
+  });
+});
 
 /** Mark one CLI test fake as the host-confined implementation boundary it models. */
 function qualifyGovernedFake<T extends ImplementationAgent>(agent: T): T {

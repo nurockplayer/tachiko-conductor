@@ -1330,7 +1330,7 @@ export function resumeCommandHint(runId: string, browserProfile?: string): strin
   }`;
 }
 
-function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
+export function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
   const { run } = outcome;
   if (outcome.outcome === 'merge_ready') {
     console.log(
@@ -1350,12 +1350,20 @@ function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
     console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
     return;
   }
+  if (outcome.outcome === 'unsupported_cas') {
+    console.error(`Run ${run.id}: HELD — ${outcome.reason} Durable state remains ${run.state}; no park was written.`);
+    return;
+  }
   if (outcome.outcome === 'waiting_dependency') {
     console.log(`Run ${run.id}: WAITING_DEPENDENCY — ${outcome.reason}`);
     console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
     return;
   }
   console.error(`Run ${run.id}: FAILED — ${outcome.reason}`);
+}
+
+export function outcomeExitCode(outcome: WorkflowOutcome): number {
+  return outcome.outcome === 'failed' ? 1 : outcome.outcome === 'unsupported_cas' ? 2 : 0;
 }
 
 /** Production wiring: durable implementation routing, local gh, and independent review. */
@@ -2566,7 +2574,7 @@ export async function main(argv: string[]): Promise<number> {
       });
     });
     printOutcome(outcome, values['browser-profile']);
-    return outcome.outcome === 'failed' ? 1 : 0;
+    return outcomeExitCode(outcome);
   }
 
   if (subcommand === undefined) {
@@ -2608,7 +2616,7 @@ export async function main(argv: string[]): Promise<number> {
     });
   });
   printOutcome(outcome, values['browser-profile']);
-  return outcome.outcome === 'failed' ? 1 : 0;
+  return outcomeExitCode(outcome);
 }
 
 // Run directly (`node dist/cli.js ...` or `node --import tsx src/cli.ts ...`)

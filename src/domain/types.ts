@@ -9,7 +9,7 @@
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
-import type { RepairAdmissionSnapshot, RepairTaskShapeAuthority } from './repair-admission.js';
+import type { RepairAdmissionSnapshot, RepairExecutorHandoff, RepairHandoffRecord, RepairTaskShapeAuthority } from './repair-admission.js';
 
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;
@@ -60,6 +60,8 @@ export const TRANSITION_TYPES = [
   'review_approved',
   'changes_requested',
   'start_fix',
+  'repair_executor_handoff',
+  'repair_executor_continued',
   'revalidate',
   'gate_blocked',
   'merged',
@@ -211,6 +213,10 @@ export interface TransitionRecord {
   readonly to: WorkflowState;
   readonly at: string;
   readonly reason?: string;
+  /** Typed one-time executor handoff evidence recorded with repair completion telemetry. */
+  readonly repairHandoff?: RepairHandoffRecord;
+  /** Receipt ordinal atomically appended with this start_fix event. */
+  readonly repairAdmissionIndex?: number;
 }
 
 /** Payload for a single transition application. */
@@ -227,6 +233,10 @@ export interface TransitionInput {
   readonly headSha?: string;
   /** Executor identity captured while an implementation is interrupted for human takeover. */
   readonly executor?: ExecutorIdentity;
+  /** New append-only admission receipt atomically bound to this exact start_fix event. */
+  readonly repairAdmission?: RepairAdmissionSnapshot;
+  /** Provider-qualified executor identity, or an explicit worker-router sessionless result. */
+  readonly repairAgentResult?: AgentResult;
   /** Durable branch/worktree identity produced before an issue starts without a PR. */
   readonly bootstrap?: ImplementationBootstrapIdentity;
   /** Live PR identity captured with a successful implementation or validation. */

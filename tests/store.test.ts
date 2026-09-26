@@ -7,7 +7,9 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
+import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
+import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { ensureDurableDirectory, syncDirectory } from '../src/durable-directory.js';
 import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, operationalRunProjection, sha256 } from '../src/operational/projection.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
@@ -53,6 +55,20 @@ describe('JsonFileStore — persistence round-trips', () => {
     const { store } = tempStore();
     store.create(newRun('r1'));
     assert.deepEqual(store.read('r1'), newRun('r1'));
+  });
+
+  it('rejects rewriting an existing history record even when its length is unchanged', () => {
+    const { store } = tempStore();
+    const initial = newRun('history-immutable');
+    store.create(initial);
+    const started = applyTransition(initial, { type: 'start' }, T0);
+    store.update(started);
+    const rewritten = {
+      ...started,
+      history: started.history.map((event, index) => index === 0 ? { ...event, reason: 'forged same-length history' } : event),
+    };
+    assert.throws(() => store.update(rewritten), /Run history is append-only/);
+    assert.equal(store.read(initial.id)?.history[0]?.reason, undefined);
   });
 
   it('syncs Run files before rename and reports uncertain parent-sync failures without rolling back visible bytes', () => {
@@ -203,6 +219,35 @@ describe('JsonFileStore — persistence round-trips', () => {
     };
     assert.equal(operationalRunProjection(run, '{}').reviewFixActive, true);
     assert.equal(operationalRunProjection(newRun('not-a-review-fix'), '{}').reviewFixActive, undefined);
+  });
+
+  it('rejects orphaned or mismatched new-format repair admission markers on JSON read', () => {
+    const { store, dir } = tempStore();
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const predecessor = {
+      ...newRun('orphan-repair-marker'), state: 'IMPLEMENTING' as const, headSha: 'head-sha',
+      pullRequest: { number: 7, headSha: 'head-sha' }, repairTaskShapeAuthority: authority,
+    };
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+    const binding = createRepairAttemptBinding(predecessor, execution);
+    const valid = {
+      ...predecessor,
+      history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0, repairAdmissionIndex: 0 }],
+      repairAdmissions: [{ ...receipt, attemptBinding: binding }],
+    };
+    store.create(valid);
+    const file = path.join(dir, 'orphan-repair-marker.json');
+    for (const damage of [
+      (json: Record<string, any>) => { delete json.repairAdmissions[0].attemptBinding; },
+      (json: Record<string, any>) => { json.history[0].repairAdmissionIndex = 1; },
+    ]) {
+      const json = JSON.parse(readFileSync(file, 'utf8')) as Record<string, any>;
+      damage(json);
+      writeFileSync(file, JSON.stringify(json), 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(valid.id), /corrupt or incompatible/);
+      writeFileSync(file, JSON.stringify(valid), 'utf8');
+    }
   });
 
   it('projects the selected provider and profile before an agent session exists', () => {

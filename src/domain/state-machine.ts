@@ -8,6 +8,7 @@ import {
 import { recordWaitTelemetry } from './telemetry.js';
 import type { ReviewResult, Run, TransitionInput, TransitionType, ValidationResult, WorkflowState } from './types.js';
 import { isValidationResultCoherent } from './validation.js';
+import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairExecutorIdentity, type RepairHandoffRecord } from './repair-admission.js';
 
 /** Why a transition was rejected. */
 export type InvalidTransitionCode =
@@ -32,7 +33,9 @@ export type InvalidTransitionCode =
   | 'stale-validation'
   | 'invalid-validation-result'
   | 'fresh-review'
-  | 'no-interrupt-context';
+  | 'no-interrupt-context'
+  | 'invalid-repair-admission'
+  | 'invalid-repair-handoff';
 
 /**
  * Thrown when a transition cannot be applied. The message is actionable: it
@@ -77,6 +80,8 @@ export const TRANSITION_TABLE: Readonly<
   },
   IMPLEMENTING: {
     bootstrap_prepared: 'IMPLEMENTING',
+    repair_executor_handoff: 'IMPLEMENTING',
+    repair_executor_continued: 'IMPLEMENTING',
     agent_succeeded: 'VALIDATING',
     agent_failed: 'FAILED',
     wait_dependency: 'WAITING_DEPENDENCY',
@@ -336,6 +341,36 @@ function sameBootstrap(a: NonNullable<Run['bootstrap']>, b: NonNullable<Run['boo
     a.workspacePath === b.workspacePath;
 }
 
+function validateRepairHandoff(run: Run, result: NonNullable<TransitionInput['repairAgentResult']>, continued: boolean): RepairHandoffRecord {
+  const active = activeRepairAdmission(run);
+  const hold = (): never => { throw new InvalidTransitionError('invalid-repair-handoff', run.state, 'repair_executor_handoff', 'Repair executor result does not prove the admitted provider identity; predecessor executor remains authoritative.'); };
+  if (active === null || (continued ? active.handoff === undefined : active.handoff !== undefined)) return hold();
+  const { snapshot, admissionHistoryIndex, startFixHistoryIndex } = active;
+  const provider = snapshot.execution.executor;
+  if (provider === 'worker-router') {
+    if (result.exitStatus !== 'success' || result.executor !== undefined || result.sessionId !== undefined ||
+        result.diagnostics?.some((diagnostic) => /EXECUTOR_PROVIDER_|EXECUTOR_RECONSTRUCTION_FAILED/.test(diagnostic))) return hold();
+    if (continued && active.handoff?.outcome.kind !== 'sessionless') return hold();
+    return { admissionHistoryIndex, startFixHistoryIndex, outcome: { kind: 'sessionless', provider: 'worker-router' } };
+  }
+  const identity = result.executor;
+  if (!isRepairExecutorIdentity(identity) || identity.sessionId.trim() === '' ||
+      (result.sessionId !== undefined && result.sessionId !== identity.sessionId)) return hold();
+  const providerMatches = provider === 'luna-isolated'
+    ? identity.provider === 'codex-cli'
+    : provider === 'codex-cli'
+      ? identity.provider === 'codex-cli' || identity.provider === 'codex-app-server'
+      : identity.provider === provider;
+  if (!providerMatches) return hold();
+  const predecessorProvider = snapshot.attemptBinding?.predecessorExecutor?.provider;
+  if (!snapshot.attemptBinding?.freshExecutor && predecessorProvider !== undefined && identity.provider !== predecessorProvider &&
+      !(predecessorProvider === 'codex-app-server' && provider === 'codex-cli' && identity.provider === 'codex-cli')) return hold();
+  if (continued && (active.handoff?.outcome.kind !== 'executor' || active.handoff.outcome.identity.provider !== identity.provider)) return hold();
+  const expectedGeneration = snapshot.attemptBinding?.runtimeGeneration;
+  if (identity.provider === 'codex-app-server' && (expectedGeneration === undefined || expectedGeneration !== identity.generation)) return hold();
+  return { admissionHistoryIndex, startFixHistoryIndex, outcome: { kind: 'executor', identity: { ...identity } } };
+}
+
 function assertPayload(
   run: Run,
   input: TransitionInput,
@@ -364,6 +399,32 @@ function assertPayload(
   if (input.type === 'bootstrap_prepared' && input.bootstrap === undefined) {
     throw new InvalidTransitionError('missing-payload', from, input.type, 'Transition "bootstrap_prepared" requires durable bootstrap identity.');
   }
+  if (input.repairAdmission !== undefined && input.type !== 'start_fix') {
+    throw new InvalidTransitionError('unexpected-payload', from, input.type, 'Repair admission is only accepted atomically with start_fix.');
+  }
+  if (input.type === 'start_fix' && input.repairAdmission !== undefined) {
+    const admission = input.repairAdmission;
+    const authority = run.repairTaskShapeAuthority;
+    const binding = admission.attemptBinding;
+    const sameExecutor = (a: Run['executor'], b: Run['executor']): boolean => a?.provider === b?.provider &&
+      a?.sessionId === b?.sessionId && a?.generation === b?.generation && (a === undefined) === (b === undefined);
+    if (from !== 'CHANGES_REQUESTED' || authority === undefined || run.headSha === undefined || run.pullRequest === undefined ||
+        !isRepairAdmissionSnapshot(admission) || admission.attemptBinding?.admissionIndex !== (run.repairAdmissions?.length ?? 0) ||
+        admission.attemptBinding.startFixHistoryIndex !== run.history.length || admission.authorityRevision !== authority.revision ||
+        !sameExecutor(binding?.predecessorExecutor, run.executor) ||
+        (run.agentResult?.executor !== undefined && !sameExecutor(binding?.predecessorExecutor, run.agentResult.executor)) ||
+        binding?.predecessorSessionId !== run.agentResult?.sessionId ||
+        admission.taskShape !== authority.shape || admission.headSha !== run.headSha || admission.pullRequestNumber !== run.pullRequest.number ||
+        admission.finding !== (run.validationResult?.status === 'failed' && run.reviewResult?.verdict !== 'request_changes' ? 'validation_failed' : 'review_blocking')) {
+      throw new InvalidTransitionError('invalid-repair-admission', from, input.type, 'Repair admission must match current authority, finding, exact HEAD/PR, predecessor identity, and this start_fix history index.');
+    }
+  } else if (input.type === 'start_fix' && run.repairTaskShapeAuthority !== undefined) {
+    throw new InvalidTransitionError('invalid-repair-admission', from, input.type, 'A new authority-bearing repair attempt requires an atomically bound admission.');
+  }
+  if ((input.type === 'repair_executor_handoff' || input.type === 'repair_executor_continued') !== (input.repairAgentResult !== undefined)) {
+    throw new InvalidTransitionError(input.repairAgentResult === undefined ? 'missing-payload' : 'unexpected-payload', from, input.type, 'Repair handoff requires exactly one returned AgentResult.');
+  }
+  if (input.repairAgentResult !== undefined) validateRepairHandoff(run, input.repairAgentResult, input.type === 'repair_executor_continued');
   // Payloads are bound to the transitions that produce them; carrying one on
   // an unrelated transition is rejected rather than silently ignored.
   if (!REQUIRES_AGENT_RESULT.has(input.type) && input.agentResult !== undefined) {
@@ -728,7 +789,11 @@ export function applyTransition(
     ...(invalidatesValidation ? runWithoutStaleEvidence : input.type === 'revalidate' ? runWithoutStaleReview : run),
     state: to,
     updatedAt: now,
-    history: [...run.history, { type: input.type, from, to, at: now, reason: input.reason }],
+    history: [...run.history, {
+      type: input.type, from, to, at: now, reason: input.reason,
+      ...(input.type === 'start_fix' && input.repairAdmission !== undefined ? { repairAdmissionIndex: input.repairAdmission.attemptBinding!.admissionIndex } : {}),
+      ...(input.repairAgentResult === undefined ? {} : { repairHandoff: validateRepairHandoff(run, input.repairAgentResult, input.type === 'repair_executor_continued') }),
+    }],
     ...(persistedAgentResult === undefined ? {} : { agentResult: persistedAgentResult }),
     ...(input.agentResult?.executor === undefined ? {} : { executor: { ...input.agentResult.executor } }),
     ...(input.executor === undefined ? {} : { executor: { ...input.executor } }),
@@ -736,6 +801,9 @@ export function applyTransition(
     ...(input.pullRequest === undefined ? {} : { pullRequest: { ...input.pullRequest } }),
     ...(persistedReviewResult === undefined ? {} : { reviewResult: persistedReviewResult }),
     ...(input.validationResult !== undefined ? { validationResult: input.validationResult } : {}),
+    ...(input.type === 'start_fix' && input.repairAdmission !== undefined
+      ? { repairAdmissions: [...(run.repairAdmissions ?? []), input.repairAdmission] }
+      : {}),
     ...(headSha !== undefined && headSha !== '' ? { headSha } : {}),
     ...(enteringInterrupt
       ? {
@@ -759,5 +827,21 @@ export function applyTransition(
       : {}),
   };
 
-  return recordWaitTelemetry(next, now);
+  const recorded = recordWaitTelemetry(next, now);
+  if (input.repairAgentResult === undefined) return recorded;
+  const handoff = recorded.history.at(-1)?.repairHandoff;
+  const { executor: _previousExecutor, agentResult: previousAgentResult, ...withoutPriorExecutor } = recorded;
+  const identity = handoff?.outcome.kind === 'executor' ? handoff.outcome.identity : undefined;
+  if (previousAgentResult === undefined) {
+    return { ...withoutPriorExecutor, ...(identity === undefined ? {} : { executor: identity }) };
+  }
+  const { executor: _staleResultExecutor, sessionId: _staleResultSession, ...resultWithoutPriorIdentity } = previousAgentResult;
+  return {
+    ...withoutPriorExecutor,
+    ...(identity === undefined ? {} : { executor: identity }),
+    agentResult: {
+      ...resultWithoutPriorIdentity,
+      ...(identity === undefined ? {} : { executor: identity, sessionId: identity.sessionId }),
+    },
+  };
 }
