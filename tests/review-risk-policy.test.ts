@@ -28,11 +28,45 @@ describe('classifyReviewRisk', () => {
   });
 
   it('recognizes Conductor persistence, workflow, lock, heartbeat, admission, and Oracle policy paths', () => {
-    for (const [path, floor] of [['src/store/json-file-store.ts', 'R3'], ['src/dispatch/invocation-lock.ts', 'R4'], ['src/workflow/run.ts', 'R5'], ['scripts/bootstrap-heartbeat/runner.py', 'R4'], ['src/domain/repair-admission.ts', 'R5'], ['src/mission-admission/registry.ts', 'R5'], ['src/oracle/reviewer.ts', 'R4'],
+    for (const [path, floor] of [['src/store/json-file-store.ts', 'R3'], ['src/dispatch/invocation-lock.ts', 'R4'], ['src/workflow/run.ts', 'R5'], ['scripts/bootstrap-heartbeat/runner.py', 'R5'], ['src/domain/repair-admission.ts', 'R5'], ['src/mission-admission/registry.ts', 'R5'], ['src/oracle/reviewer.ts', 'R4'],
       ['src/workspace/git-worktree-bootstrap.ts', 'R5'], ['src/workspace/standalone-git-bootstrap.ts', 'R5'], ['src/agents/worker-router.ts', 'R5'], ['src/agents/worker-router-container.ts', 'R5'], ['src/agents/luna-isolated.ts', 'R5'], ['src/github/live-state.ts', 'R5'], ['src/reviewers/loop.ts', 'R5']] as const) {
       const decision = classifyReviewRisk(evidence({ changedPaths: [path] }));
       assert.equal(decision.outcome === 'review' ? decision.floor : 'hold', floor, path);
       if (floor === 'R5') assert.ok(decision.outcome === 'review' && decision.criticalReason?.includes(path));
+    }
+  });
+
+  it('assigns exact execution and validation authorities R5 without declared signals', () => {
+    const paths = [
+      'src/cli.ts', 'src/execution-profiles.ts', 'src/agents/implementation-router.ts',
+      'src/agents/claude-code.ts', 'src/agents/codex-cli.ts', 'src/agents/codex-app-server.ts',
+      'src/adapters/agent.ts', 'src/dispatch/command.ts', 'src/dispatch/config.ts',
+      'src/dispatch/github-runtime.ts', 'src/dispatch/queue.ts', 'src/dispatch/runner.ts',
+      'src/dispatch/launchd.ts', 'scripts/bootstrap-heartbeat/runner.py',
+      'src/reviewers/deepseek.ts', 'src/validation/local-command.ts',
+      'src/validation/hosted-policy.ts', 'src/domain/validation.ts',
+      'src/domain/state-machine.ts', 'src/domain/decisions.ts',
+      'src/browser/playwright-mcp-runtime.ts', 'src/browser/agent-config.ts',
+    ];
+    for (const path of paths) {
+      const decision = classifyReviewRisk(evidence({ changedPaths: [path], riskSignals: [] }));
+      assert.equal(decision.outcome === 'review' ? decision.floor : 'hold', 'R5', path);
+      const reason = path === 'src/reviewers/deepseek.ts' ? 'reviewer_policy_or_qualification' :
+        path.startsWith('src/browser/') ? 'security_or_release_authority' : 'admission_or_release_authority';
+      assert.ok(decision.outcome === 'review' && decision.reasons.includes(reason) && decision.criticalReason === `path:${path}:${reason}`, path);
+    }
+  });
+
+  it('keeps qualification and browser session lifecycle paths at R4 without declared signals', () => {
+    const expectedReasons = new Map([
+      ['src/dispatch/continuous.ts', 'workflow_or_recovery_state'],
+      ['src/agents/model-capability.ts', 'reviewer_policy_or_qualification'],
+      ['src/browser/mcp-client.ts', 'concurrency_or_recovery'],
+    ] as const);
+    for (const [path, reason] of expectedReasons) {
+      const decision = classifyReviewRisk(evidence({ changedPaths: [path], riskSignals: [] }));
+      assert.equal(decision.outcome === 'review' ? decision.floor : 'hold', 'R4', path);
+      assert.ok(decision.outcome === 'review' && decision.reasons.includes(reason), path);
     }
   });
 

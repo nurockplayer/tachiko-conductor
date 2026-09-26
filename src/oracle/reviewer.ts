@@ -91,6 +91,20 @@ function safeArray(value: unknown, maximum: number): unknown[] | null {
   } catch { return null; }
 }
 
+const REVIEW_IDENTITY_IGNORED_PROBLEMS = new Set([
+  'MALFORMED_HANDOFF', 'MALFORMED_HANDOFF_NEWER_THAN_SELECTED', 'AMBIGUOUS_HANDOFF',
+  'DUPLICATE_HANDOFFS', 'STALE_HANDOFF', 'STALE_REVIEW', 'CHECKS_UNAVAILABLE', 'UNKNOWN_CHECK_STATE',
+]);
+
+function reviewIdentityDiagnosticsAreKnown(value: unknown): boolean {
+  const problems = safeArray(value, 100);
+  if (problems === null) return false;
+  return problems.every((problem) => {
+    const item = asRecord(problem);
+    return item !== null && typeof item.code === 'string' && REVIEW_IDENTITY_IGNORED_PROBLEMS.has(item.code);
+  });
+}
+
 function snapshotTransportResult(value: unknown): OracleTransportResult {
   const result = asRecord(value);
   if (result === null) throw new Error('malformed transport result');
@@ -225,20 +239,16 @@ export class OracleReviewer implements ReviewerAdapter {
       this.options.receipts?.record({ ...this.failureReceipt(id, request, 'transport_failed', now()), policy: policyReceipt(decision, effort, binding, null, null, requestCorrelationId, false, before.pullRequestNumber) });
       throw new OracleReviewerError('ORACLE_TRANSPORT_FAILED', 'Oracle transport threw while consulting.', true);
     }
-    let response: OracleTransportResult;
-    try { response = snapshotTransportResult(rawResponse); } catch {
-      this.options.receipts?.record({ ...this.failureReceipt(id, request, 'invalid_response', now()), policy: policyReceipt(decision, effort, binding, null, null, requestCorrelationId, false, before.pullRequestNumber) });
-      throw new OracleReviewerError('ORACLE_POLICY_HOLD', 'Oracle transport returned a malformed or unbounded result.');
-    }
-    const responseRecord = asRecord(response);
-    if (responseRecord === null || (responseRecord.outcome !== 'success' && responseRecord.outcome !== 'failure')) {
-      this.options.receipts?.record({ ...this.failureReceipt(id, request, 'invalid_response', now()), policy: policyReceipt(decision, effort, binding, null, null, requestCorrelationId, false, before.pullRequestNumber) });
-      throw new OracleReviewerError('ORACLE_POLICY_HOLD', 'Oracle transport returned a malformed result.');
-    }
+    let response: OracleTransportResult | null = null;
+    try { response = snapshotTransportResult(rawResponse); } catch { /* Recheck live identity before recording a malformed response. */ }
     const after = await this.identity(request.target);
     if (after === null || before.headSha !== after.headSha || before.baseSha !== after.baseSha || before.pullRequestNumber !== after.pullRequestNumber) {
       this.options.receipts?.record({ ...this.failureReceipt(id, request, 'stale_head', now()), observedHeadSha: after?.headSha ?? null, policy: policyReceipt(decision, effort, binding, null, null, requestCorrelationId, false, before.pullRequestNumber) });
       throw new OracleReviewerError('ORACLE_STALE_HEAD', 'Live HEAD/base or associated PR identity moved during Oracle consultation.', true);
+    }
+    if (response === null) {
+      this.options.receipts?.record({ ...this.failureReceipt(id, request, 'invalid_response', now()), observedHeadSha: after.headSha, policy: policyReceipt(decision, effort, binding, null, null, requestCorrelationId, false, before.pullRequestNumber) });
+      throw new OracleReviewerError('ORACLE_POLICY_HOLD', 'Oracle transport returned a malformed or unbounded result.');
     }
     if (response.outcome === 'failure') {
       this.options.receipts?.record({ ...this.failureReceipt(id, request, response.code, now()), policy: policyReceipt(decision, effort, binding, null, null, requestCorrelationId, false, before.pullRequestNumber) });
@@ -273,8 +283,18 @@ export class OracleReviewer implements ReviewerAdapter {
     try {
       if (target.kind === 'issue') {
         const snapshot: GitHubLiveSnapshot = await this.options.github.readLiveSnapshot(target);
-        if (snapshot.repository.owner !== target.owner || snapshot.repository.repo !== target.repo || snapshot.issue.number !== target.issueNumber || snapshot.issue.state !== 'open' || snapshot.problems.length > 0 || snapshot.pullRequest === null || snapshot.pullRequest.state !== 'open' || !Number.isSafeInteger(snapshot.pullRequest.number) || snapshot.pullRequest.number < 1 || snapshot.pullRequest.headSha !== snapshot.headSha || !/^[0-9a-f]{40}$/i.test(snapshot.pullRequest.baseSha)) return null;
-        return { headSha: snapshot.headSha ?? '', baseSha: snapshot.pullRequest.baseSha, pullRequestNumber: snapshot.pullRequest.number };
+        const live = asRecord(snapshot);
+        const repository = live === null ? null : asRecord(live.repository);
+        const issue = live === null ? null : asRecord(live.issue);
+        const pullRequest = live === null || live.pullRequest === null ? null : asRecord(live.pullRequest);
+        if (live === null || repository === null || issue === null || pullRequest === null ||
+          repository.owner !== target.owner || repository.repo !== target.repo ||
+          issue.number !== target.issueNumber || issue.state !== 'open' ||
+          !reviewIdentityDiagnosticsAreKnown(live.problems) ||
+          !Number.isSafeInteger(pullRequest.number) || Number(pullRequest.number) < 1 || pullRequest.state !== 'open' ||
+          typeof live.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(live.headSha) || pullRequest.headSha !== live.headSha ||
+          typeof pullRequest.baseSha !== 'string' || !/^[0-9a-f]{40}$/i.test(pullRequest.baseSha)) return null;
+        return { headSha: live.headSha, baseSha: pullRequest.baseSha, pullRequestNumber: Number(pullRequest.number) };
       }
       const [branchValue, prsValue] = await Promise.all([this.options.github.readBranch(target), this.options.github.listPullRequests(target)]);
       const branch = asRecord(branchValue);

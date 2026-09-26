@@ -1,15 +1,10 @@
 import { mkdirSync, readdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { OracleReceipt, OracleReceiptStore } from './types.js';
-import { isReviewRiskReason } from '../reviewers/risk-policy.js';
+import { canonicalReviewTarget, isReviewRiskReason } from '../reviewers/risk-policy.js';
 
 function validTarget(value: unknown): boolean {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const target = value as Record<string, unknown>;
-  if (typeof target.owner !== 'string' || !/^[A-Za-z0-9_.-]{1,100}$/.test(target.owner) || typeof target.repo !== 'string' || !/^[A-Za-z0-9_.-]{1,100}$/.test(target.repo)) return false;
-  if (target.kind === 'issue') return Number.isSafeInteger(target.issueNumber) && Number(target.issueNumber) > 0 && Object.keys(target).every((key) => ['kind', 'owner', 'repo', 'issueNumber'].includes(key));
-  if (target.kind === 'repository') return typeof target.branch === 'string' && target.branch.length > 0 && target.branch.length <= 240 && !target.branch.startsWith('/') && !target.branch.includes('\\') && !target.branch.split('/').some((part) => part === '' || part === '.' || part === '..') && Object.keys(target).every((key) => ['kind', 'owner', 'repo', 'branch', 'publicationBranch'].includes(key)) && (target.publicationBranch === undefined || typeof target.publicationBranch === 'string' && target.publicationBranch.length > 0 && target.publicationBranch.length <= 240 && !target.publicationBranch.startsWith('/') && !target.publicationBranch.includes('\\') && !target.publicationBranch.split('/').some((part) => part === '' || part === '.' || part === '..'));
-  return false;
+  return canonicalReviewTarget(value) !== null;
 }
 
 function valid(value: unknown): value is OracleReceipt {
@@ -35,8 +30,8 @@ function valid(value: unknown): value is OracleReceipt {
     policy.version === 'risk-policy/v1' && ['R1', 'R2', 'R3', 'R4', 'R5'].includes(String(policy.floor)) &&
     policy.selectedSemanticTier === semanticTier && policy.requestedEffort === expectedEffort &&
     (policy.effectiveEffort === 'Medium' || policy.effectiveEffort === 'High' || policy.effectiveEffort === 'Extra High' || policy.effectiveEffort === null) &&
-    Array.isArray(policy.reasons) && policy.reasons.length > 0 && policy.reasons.length <= 20 && policy.reasons.every(isReviewRiskReason) &&
-    (typeof policy.criticalReason === 'string' && policy.criticalReason.length > 0 && policy.criticalReason.length <= 500 || policy.criticalReason === null) && (policy.floor !== 'R5' || typeof policy.criticalReason === 'string') &&
+    Array.isArray(policy.reasons) && policy.reasons.length > 0 && policy.reasons.length <= 20 && policy.reasons.every(isReviewRiskReason) && new Set(policy.reasons).size === policy.reasons.length &&
+    (typeof policy.criticalReason === 'string' && policy.criticalReason.trim().length > 0 && policy.criticalReason.length <= 500 || policy.criticalReason === null) && (policy.floor !== 'R5' || typeof policy.criticalReason === 'string' && policy.criticalReason.trim().length > 0) &&
     typeof policy.baseSha === 'string' && /^[0-9a-f]{40}$/i.test(policy.baseSha) && (Number.isSafeInteger(policy.pullRequestNumber) && Number(policy.pullRequestNumber) > 0 || policy.pullRequestNumber === null) &&
     Number.isSafeInteger(policy.changedPathCount) && Number(policy.changedPathCount) > 0 && Number(policy.changedPathCount) <= 200 && typeof policy.coverageSha256 === 'string' && /^[0-9a-f]{64}$/.test(policy.coverageSha256) &&
     typeof policy.requestCorrelationId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(policy.requestCorrelationId) &&

@@ -50,6 +50,18 @@ function pathValid(path: string): boolean {
 
 function pathTier(path: string): { tier: ReviewRiskTier; reason: ReviewRiskReason } {
   const p = path.toLowerCase();
+  // Exact repository-owned execution authorities are reviewed at the highest
+  // floor even when callers provide no risk signals. Keep these paths ahead of
+  // the broader workflow, agent, and API patterns below.
+  if (/^src\/(cli|execution-profiles)\.ts$/.test(p) || /^src\/agents\/(implementation-router|claude-code|codex-cli|codex-app-server)\.ts$/.test(p) || p === 'src/adapters/agent.ts' || /^src\/dispatch\/(command|config|github-runtime|queue|runner|launchd)\.ts$/.test(p) || p === 'scripts/bootstrap-heartbeat/runner.py') return { tier: 'R5', reason: 'admission_or_release_authority' };
+  if (/^src\/validation\/(local-command|hosted-policy)\.ts$/.test(p) || /^src\/domain\/(validation|state-machine|decisions)\.ts$/.test(p)) return { tier: 'R5', reason: 'admission_or_release_authority' };
+  if (p === 'src/reviewers/deepseek.ts') return { tier: 'R5', reason: 'reviewer_policy_or_qualification' };
+  if (/^src\/browser\/(playwright-mcp-runtime|agent-config)\.ts$/.test(p)) return { tier: 'R5', reason: 'security_or_release_authority' };
+  // These paths affect qualification/session lifecycle but do not themselves
+  // admit, publish, or execute work.
+  if (p === 'src/dispatch/continuous.ts') return { tier: 'R4', reason: 'workflow_or_recovery_state' };
+  if (p === 'src/agents/model-capability.ts') return { tier: 'R4', reason: 'reviewer_policy_or_qualification' };
+  if (p === 'src/browser/mcp-client.ts') return { tier: 'R4', reason: 'concurrency_or_recovery' };
   if (/^src\/(mission-admission|domain\/repair-admission)(\/|\.)/.test(p) || /^src\/production-policy\.ts$/.test(p)) return { tier: 'R5', reason: 'admission_or_release_authority' };
   if (/^src\/workspace\/(git-worktree-bootstrap|standalone-git-bootstrap)\.ts$/.test(p) || /^src\/agents\/(worker-router|worker-router-container|luna-isolated)\.ts$/.test(p) || /^src\/github\/live-state\.ts$/.test(p) || /^src\/workflow\/run\.ts$/.test(p) || /^src\/reviewers\/loop\.ts$/.test(p)) return { tier: 'R5', reason: 'publication_or_isolation_authority' };
   if (/^src\/(workflow|dispatch\/invocation-lock)(\/|\.)/.test(p) || /^scripts\/bootstrap-heartbeat\//.test(p)) return { tier: 'R4', reason: 'workflow_or_recovery_state' };

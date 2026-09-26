@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import type { GitHubAdapter, PullRequestSnapshot } from '../src/adapters/github.js';
+import type { GitHubAdapter, GitHubLiveSnapshot, PullRequestSnapshot } from '../src/adapters/github.js';
 import { OracleReviewer, OracleReviewerError } from '../src/oracle/reviewer.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import type { OracleReceipt, OracleReviewTransport, OracleTransportRequest, OracleTransportResult } from '../src/oracle/types.js';
@@ -16,6 +16,7 @@ const OTHER = 'c'.repeat(40);
 const BASE = 'b'.repeat(40);
 const OTHER_BASE = 'd'.repeat(40);
 const target = { kind: 'repository' as const, owner: 'acme', repo: 'widgets', branch: 'feature' };
+const issueTarget = { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 42 };
 const changedPaths = ['src/feature.ts'];
 const binding = { bindingId: 'oracle-test-v1', model: 'oracle-reviewed-model', supportedEfforts: ['Medium', 'High', 'Extra High'] as const, independentReadOnly: true as const, available: true as const };
 
@@ -36,6 +37,30 @@ function github(heads: string[], bases: string[] = [BASE], branchTarget: typeof 
 
 function githubAssociations(numbers: number[], pullRequests: PullRequestSnapshot[], branchTarget: typeof target = target): GitHubAdapter {
   return { kind: 'github', async readIssue() { throw new Error('unused'); }, async listPullRequests() { return pullRequests; }, async readLiveSnapshot() { throw new Error('unused'); }, async readBranch() { return { target: branchTarget, headSha: HEAD, pullRequestNumbers: numbers }; } };
+}
+
+function issueSnapshot(overrides: Record<string, unknown> = {}): GitHubLiveSnapshot {
+  return {
+    repository: { owner: issueTarget.owner, repo: issueTarget.repo, defaultBranch: 'main', defaultBranchHeadSha: BASE },
+    issue: { id: 'issue-node-id', number: issueTarget.issueNumber, title: 'Issue', body: '', state: 'open', url: 'https://example.invalid/issues/42', createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' },
+    pullRequest: { id: 'pr-node-id', number: 7, headSha: HEAD, baseSha: BASE, state: 'open', title: 'PR', url: 'https://example.invalid/pull/7', isDraft: false, mergeable: true, mergeStateStatus: 'clean', updatedAt: '2026-01-01T00:00:00Z' },
+    headSha: HEAD, checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
+    reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: null }, conversations: [], handoff: null,
+    problems: [], observedAt: '2026-01-01T00:00:00Z', ...overrides,
+  } as unknown as GitHubLiveSnapshot;
+}
+
+function issueGithub(snapshots: readonly GitHubLiveSnapshot[]): GitHubAdapter {
+  let index = 0;
+  return {
+    kind: 'github', async readIssue() { throw new Error('unused'); }, async readBranch() { throw new Error('unused'); },
+    async listPullRequests() { throw new Error('unused'); },
+    async readLiveSnapshot() { return snapshots[Math.min(index++, snapshots.length - 1)]!; },
+  };
+}
+
+function issueReviewer(githubAdapter: GitHubAdapter, transport: OracleReviewTransport = verifiedTransport(), receipts?: { record(receipt: OracleReceipt): void; list(): readonly OracleReceipt[] }) {
+  return new OracleReviewer({ github: githubAdapter, transport, receipts, candidateEvidence: () => evidence({ target: issueTarget }), binding });
 }
 
 function output(verdict: 'PASS' | 'REQUEST_CHANGES' = 'PASS'): string {
@@ -157,6 +182,9 @@ describe('OracleReviewer policy binding', () => {
       { ...approved, id: 'failure-flag', failureCode: 'invalid_response' },
       { ...approved, id: 'r5-reason', policy: { ...policy, floor: 'R5', selectedSemanticTier: 'R5', requestedEffort: 'Extra High', effectiveEffort: 'Extra High', criticalReason: null } },
       { ...approved, id: 'unknown-reason', policy: { ...policy, reasons: ['future_unrecognized_reason'] } as unknown as OracleReceipt['policy'] },
+      { ...approved, id: 'duplicate-reason', policy: { ...policy, reasons: ['ordinary_implementation', 'ordinary_implementation'] } as unknown as OracleReceipt['policy'] },
+      { ...approved, id: 'blank-critical-reason', policy: { ...policy, criticalReason: ' \t ' } },
+      { ...approved, id: 'noncanonical-target', target: { ...approved.target, unexpected: true } as unknown as OracleReceipt['target'] },
     ];
     for (const receipt of invalid) {
       const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-oracle-invalid-'));
@@ -235,6 +263,94 @@ describe('OracleReviewer policy binding', () => {
     await assert.rejects(() => reviewer({ githubAdapter: githubAssociations([7, 8], [{ number: 7, headSha: HEAD, baseSha: BASE, state: 'open' }, second]), transport: noConsult }).review({ target, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
     await assert.rejects(() => reviewer({ githubAdapter: githubAssociations([7], [{ number: 8, headSha: HEAD, baseSha: BASE, state: 'open' }]), transport: noConsult }).review({ target, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
     assert.equal(consults, 0);
+  });
+
+  it('uses exact live Issue identity while ignoring only known handoff, review, and check diagnostics', async () => {
+    const diagnosticSnapshot = issueSnapshot({ problems: [
+      { code: 'STALE_HANDOFF', message: 'The handoff is old.' },
+      { code: 'STALE_REVIEW', message: 'A review is old.' },
+      { code: 'CHECKS_UNAVAILABLE', message: 'Checks could not be read. '.repeat(300), details: { stderr: 'bounded by the adapter, but irrelevant to review identity' } },
+    ] });
+    const result = await issueReviewer(issueGithub([diagnosticSnapshot, diagnosticSnapshot])).review({ target: issueTarget, headSha: HEAD });
+    assert.equal(result.verdict, 'approve');
+  });
+
+  it('holds contradictory, malformed, and unknown Issue diagnostics and mismatched Issue or PR fields', async () => {
+    let consults = 0;
+    const noConsult: OracleReviewTransport = { async consult() { consults++; return { outcome: 'failure', code: 'unavailable', retryable: false }; } };
+    const diagnostics = [
+      [{ code: 'CONTRADICTORY_STATE', message: 'Live state conflicts.' }],
+      [{ message: 'Missing diagnostic code.' }],
+      [{ code: 'FUTURE_DIAGNOSTIC', message: 'Unknown code.' }],
+      null,
+    ];
+    for (const problems of diagnostics) {
+      await assert.rejects(() => issueReviewer(issueGithub([issueSnapshot({ problems } as Record<string, unknown>)]), noConsult).review({ target: issueTarget, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
+    }
+    const original = issueSnapshot();
+    const originalIssue = original.issue;
+    const originalPullRequest = original.pullRequest!;
+    const mismatches = [
+      { repository: { ...original.repository, repo: 'other' } },
+      { issue: { ...originalIssue, number: 43 } },
+      { issue: { ...originalIssue, state: 'closed' } },
+      { pullRequest: null },
+      { pullRequest: { ...originalPullRequest, number: 0 } },
+      { pullRequest: { ...originalPullRequest, state: 'closed' } },
+      { headSha: 'malformed' },
+      { pullRequest: { ...originalPullRequest, headSha: OTHER } },
+      { pullRequest: { ...originalPullRequest, baseSha: 'malformed' } },
+    ];
+    for (const mismatch of mismatches) {
+      await assert.rejects(() => issueReviewer(issueGithub([issueSnapshot(mismatch)]), noConsult).review({ target: issueTarget, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
+    }
+    assert.equal(consults, 0);
+  });
+
+  it('detects Issue PR number, HEAD, or base movement across consultation', async () => {
+    const original = issueSnapshot();
+    const originalPullRequest = original.pullRequest!;
+    const moved = [
+      { pullRequest: { ...originalPullRequest, number: 8 } },
+      { headSha: OTHER, pullRequest: { ...originalPullRequest, headSha: OTHER } },
+      { pullRequest: { ...originalPullRequest, baseSha: OTHER_BASE } },
+    ];
+    for (const movement of moved) {
+      const receipts: OracleReceipt[] = [];
+      await assert.rejects(() => issueReviewer(issueGithub([original, issueSnapshot(movement)]), verifiedTransport(), { record: (receipt) => receipts.push(receipt), list: () => receipts }).review({ target: issueTarget, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
+      assert.equal(receipts[0]?.outcome, 'stale_head');
+      assert.equal(receipts[0]?.failureCode, 'stale_head');
+      assert.equal(receipts[0]?.observedHeadSha, movement.headSha === OTHER ? OTHER : HEAD);
+      assert.equal(receipts[0]?.policyQualified, false);
+    }
+  });
+
+  it('detects repository and Issue target movement across consultation', async () => {
+    const original = issueSnapshot();
+    const movements = [
+      issueSnapshot({ repository: { ...original.repository, owner: 'other' } }),
+      issueSnapshot({ repository: { ...original.repository, repo: 'other' } }),
+      issueSnapshot({ issue: { ...original.issue, number: issueTarget.issueNumber + 1 } }),
+    ];
+    for (const after of movements) {
+      const receipts: OracleReceipt[] = [];
+      await assert.rejects(() => issueReviewer(issueGithub([original, after]), verifiedTransport(), { record: (receipt) => receipts.push(receipt), list: () => receipts }).review({ target: issueTarget, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
+      assert.equal(receipts[0]?.outcome, 'stale_head');
+      assert.equal(receipts[0]?.observedHeadSha, null);
+      assert.equal(receipts[0]?.policyQualified, false);
+    }
+  });
+
+  it('rechecks live Issue identity after malformed transport and records movement accurately', async () => {
+    const receipts: OracleReceipt[] = [];
+    const malformed: OracleReviewTransport = { async consult() { return { outcome: 'success', output: 'malformed' } as unknown as OracleTransportResult; } };
+    const original = issueSnapshot();
+    const moved = issueSnapshot({ headSha: OTHER, pullRequest: { ...original.pullRequest!, headSha: OTHER } });
+    await assert.rejects(() => issueReviewer(issueGithub([original, moved]), malformed, { record: (receipt) => receipts.push(receipt), list: () => receipts }).review({ target: issueTarget, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
+    assert.equal(receipts[0]?.outcome, 'stale_head');
+    assert.equal(receipts[0]?.failureCode, 'stale_head');
+    assert.equal(receipts[0]?.observedHeadSha, OTHER);
+    assert.equal(receipts[0]?.policyQualified, false);
   });
 
   it('pins caller request and binding before the first await, and snapshots observation before postcheck awaits', async () => {
