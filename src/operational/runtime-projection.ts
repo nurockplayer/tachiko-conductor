@@ -15,7 +15,7 @@ export interface OperationalRuntimeProjectionV1 {
   readonly ownership: 'none' | 'active' | 'ambiguous';
   readonly checkpoint: 'durable' | 'in_progress' | 'unknown';
   readonly activeWriter?: { readonly issue?: number; readonly runId: string; readonly worker?: string; readonly worktree: string };
-  readonly manualLane?: { readonly repository: string; readonly worktree: string; readonly branch: string; readonly checkpointSha: string; readonly clean: boolean; readonly state: 'active' | 'parked'; readonly recoverable: boolean };
+  readonly manualLane?: { readonly repository: string; readonly worktree: string; readonly branch: string; readonly checkpointSha: string; readonly clean: boolean; readonly state: 'active' | 'parked'; readonly recoverable: boolean; readonly laneId?: string; readonly missionId?: string; readonly admissionRevision?: number };
 }
 
 export function operationalRuntimeProjectionPath(runsDir: string): string {
@@ -63,4 +63,23 @@ export function registerManualLane(runsDir: string, lane: NonNullable<Operationa
   const active = lane.state === 'active';
   const next: OperationalRuntimeProjectionV1 = { schemaVersion: 1, updatedAt: now, supervisor: prior?.supervisor ?? 'parked', stage: active ? 'manual_implementation' : 'manual_parked', eventWakeEligible: false, maintenanceHold: prior?.maintenanceHold ?? { active: false }, ownership: active ? 'active' : lane.recoverable && lane.clean ? 'none' : 'ambiguous', checkpoint: lane.recoverable && lane.clean ? 'durable' : 'unknown', manualLane: lane, ...(prior?.nextPollAt === undefined ? {} : { nextPollAt: prior.nextPollAt }) };
   writeOperationalRuntimeProjection(runsDir, next); return next;
+}
+
+/** Clear a retired manual owner only after the admission registry released it. */
+export function retireManualLane(runsDir: string, laneId: string, now: string): OperationalRuntimeProjectionV1 {
+  const prior = readOperationalRuntimeProjection(runsDir);
+  if (prior?.manualLane === undefined && prior?.ownership === 'none' && prior.checkpoint === 'durable') return prior;
+  if (prior?.manualLane?.laneId !== laneId) throw new Error('Operational projection does not identify the manual lane being retired.');
+  const next: OperationalRuntimeProjectionV1 = {
+    ...prior,
+    updatedAt: now,
+    supervisor: 'parked',
+    stage: 'idle',
+    eventWakeEligible: false,
+    ownership: 'none',
+    checkpoint: 'durable',
+  };
+  const { manualLane: _retired, ...withoutManualLane } = next;
+  writeOperationalRuntimeProjection(runsDir, withoutManualLane);
+  return withoutManualLane;
 }

@@ -1,15 +1,19 @@
 import {
+  GOVERNED_PUBLICATION_REENTRY_ACTION,
+  hasGovernedPublicationConfinement,
   humanTakeoverReason,
   isWorkspaceGuardFailure,
+  type GovernedInvocationPreparation,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
+  type ImplementationRequest,
   type WorkspaceGuard,
 } from '../adapters/agent.js';
 import type { BootstrapRecoveryAuthority, ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
-import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
+import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
 import type { AgentResult, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import {
@@ -22,11 +26,12 @@ import {
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
-import type { RepairAdmissionSnapshot } from '../domain/repair-admission.js';
+import { activeRepairAdmission, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
-import { parkBootstrapFailure } from './bootstrap-failure.js';
+import { createBootstrapFailureRun } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
 import { evaluateHostedCheckPolicy } from '../validation/hosted-policy.js';
+import { canonicalizeMissionEvidence, type AdmissionToken, type MissionAdmissionRegistry, type MissionEvidence } from '../mission-admission/registry.js';
 
 export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
@@ -54,6 +59,59 @@ export interface WorkflowOptions {
   readonly now?: () => string;
   /** Optional run-scoped thresholds for deterministic efficiency warnings. */
   readonly telemetryThresholds?: Partial<Omit<EfficiencyThresholds, 'revision'>> & { readonly revision?: string };
+  /** Called immediately before a model, reviewer, or other delegated execution boundary. */
+  readonly onExecutionStart?: () => void;
+  /** Host admission capability enforced at mutation and publication boundaries. */
+  readonly admissionFence?: { readonly registry: MissionAdmissionRegistry; readonly token: AdmissionToken; readonly productionMissionId: string; readonly executionWorkspace?: string };
+}
+
+function runAdmissionEvidence(run: Run, additional: { readonly pullRequest?: number; readonly workspace?: string } = {}): MissionEvidence {
+  const base = {
+    repository: `${run.target.owner}/${run.target.repo}`,
+    run: run.id,
+    ...(run.dispatchClaimId === undefined ? {} : { claim: run.dispatchClaimId }),
+    ...(run.pullRequest === undefined ? {} : { pullRequest: run.pullRequest.number }),
+    ...(run.bootstrap === undefined ? {} : { workspace: run.bootstrap.workspacePath }),
+    ...(additional.pullRequest === undefined ? {} : { pullRequest: additional.pullRequest }),
+    ...(additional.workspace === undefined ? {} : { workspace: additional.workspace }),
+  };
+  return canonicalizeMissionEvidence(run.target.kind === 'issue'
+    ? { ...base, issue: run.target.issueNumber }
+    : { ...base, claim: `branch:${run.target.branch}` });
+}
+
+function strengthenAdmissionEvidence(options: WorkflowOptions, run: Run, additional: { readonly pullRequest?: number; readonly workspace?: string } = {}): void {
+  const fence = options.admissionFence;
+  if (fence !== undefined) fence.registry.strengthen(fence.token, runAdmissionEvidence(run, additional));
+}
+
+function assertMutationAdmission(options: WorkflowOptions, run?: Run, workspace?: string): void {
+  const fence = options.admissionFence;
+  if (fence === undefined) return;
+  if (run !== undefined) strengthenAdmissionEvidence(options, run, workspace === undefined ? {} : { workspace });
+  fence.registry.assertCanMutate(fence.token);
+}
+
+function assertCurrentMutationAdmission(options: WorkflowOptions): void {
+  options.admissionFence?.registry.assertCanMutate(options.admissionFence.token);
+}
+
+function staleWorkflowOutcome(runId: string, fallback: Run, store: RunStore, reason: string): WorkflowOutcome {
+  const run = store.read(runId) ?? fallback;
+  if (run.state === 'MERGE_READY') return { outcome: 'merge_ready', run };
+  if (run.state === 'MERGED') return { outcome: 'merged', run };
+  if (run.state === 'WAITING_DEPENDENCY') return { outcome: 'waiting_dependency', run, reason: run.interrupt?.reason ?? reason };
+  if (run.state === 'FAILED' || isTerminal(run.state)) return { outcome: 'failed', run, reason };
+  return { outcome: 'needs_human', run, reason };
+}
+
+function updateIfCurrent(store: RunStore, expected: Run, next: Run): boolean {
+  return store.updateIfUnchanged?.(expected, next) ?? false;
+}
+
+function assertPublicationAdmission(options: WorkflowOptions): void {
+  const fence = options.admissionFence;
+  if (fence !== undefined) fence.registry.assertCanPublish(fence.token, fence.productionMissionId);
 }
 
 export type WorkflowOutcome =
@@ -61,6 +119,7 @@ export type WorkflowOutcome =
   | { readonly outcome: 'merged'; readonly run: Run }
   | { readonly outcome: 'waiting_dependency'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
+  | { readonly outcome: 'unsupported_cas'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
 function formatTarget(target: Target): string {
@@ -98,33 +157,77 @@ function githubFailureOutcome(run: Run, error: unknown, store: RunStore, now: ()
     },
     now(),
   );
-  store.update(parked);
+  if (!updateIfCurrent(store, run, parked)) {
+    return staleWorkflowOutcome(run.id, run, store, 'Run changed while GitHub failure was being recorded; preserving the newer Run.');
+  }
   return { outcome: 'needs_human', run: parked, reason };
 }
 
 function bootstrapFailureOutcome(run: Run, error: unknown, store: RunStore, now: () => string): WorkflowOutcome {
   const executor = isWorkspaceGuardFailure(error) ? error.executor : undefined;
-  const parked = parkBootstrapFailure(run, error, store, now, executor);
+  const parked = createBootstrapFailureRun(run, error, now, executor);
+  if (!updateIfCurrent(store, run, parked.run)) {
+    return staleWorkflowOutcome(run.id, run, store, 'Run changed while bootstrap failure was being reconciled; preserving the newer Run.');
+  }
   return { outcome: 'needs_human', ...parked };
+}
+
+function bootstrapFailureAfterWorker(run: Run, expected: Run, error: unknown, store: RunStore, now: () => string): WorkflowOutcome {
+  const executor = isWorkspaceGuardFailure(error) ? error.executor : undefined;
+  const parked = createBootstrapFailureRun(run, error, now, executor);
+  if (!updateIfCurrent(store, expected, parked.run)) {
+    return staleWorkflowOutcome(run.id, expected, store, 'Run changed while the implementation result was being reconciled; preserving the newer Run.');
+  }
+  return { outcome: 'needs_human', ...parked };
+}
+
+function parkAfterWorker(run: Run, expected: Run, reason: string, store: RunStore, now: () => string): WorkflowOutcome {
+  const next = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the live implementation identity and retry', CANCEL_RUN_DECISION] } }, now());
+  if (!updateIfCurrent(store, expected, next)) {
+    return staleWorkflowOutcome(run.id, expected, store, 'Run changed while the implementation result was being reconciled; preserving the newer Run.');
+  }
+  return { outcome: 'needs_human', run: next, reason };
 }
 
 function park(run: Run, reason: string, store: RunStore, now: () => string, choices = ['Resolve the identity conflict and retry', CANCEL_RUN_DECISION]): WorkflowOutcome {
   const next = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices } }, now());
-  store.update(next);
+  if (!updateIfCurrent(store, run, next)) {
+    return staleWorkflowOutcome(run.id, run, store, 'Run changed while workflow escalation was being recorded; preserving the newer Run.');
+  }
   return { outcome: 'needs_human', run: next, reason };
 }
 
 function admittedRepairExecution(run: Run, deps: WorkflowDependencies): ResolvedExecutionConfiguration | null {
+  if (deps.resolveRepairExecutionProfile === undefined) return null;
+  const active = activeRepairAdmission(run);
   const authority = run.repairTaskShapeAuthority;
-  if (authority === undefined || run.headSha === undefined || run.pullRequest === undefined) return null;
-  const receipt = [...(run.repairAdmissions ?? [])].reverse().find((candidate): candidate is RepairAdmissionSnapshot =>
-    candidate.authorityRevision === authority.revision && candidate.taskShape === authority.shape &&
-    candidate.headSha === run.headSha && candidate.pullRequestNumber === run.pullRequest!.number,
-  );
-  if (receipt === undefined || deps.resolveRepairExecutionProfile === undefined) return null;
+  const latestStartFix = [...run.history].map((entry, index) => ({ entry, index })).reverse().find(({ entry }) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
+  // A new-format marker is authority in its own right for deciding that this
+  // history entry must resolve as bound. Deleting or corrupting its receipt
+  // must never make the same attempt eligible for legacy receipt fallback.
+  const boundAttemptExists = latestStartFix !== undefined &&
+    (latestStartFix.entry.repairAdmissionIndex !== undefined ||
+      (run.repairAdmissions ?? []).some((candidate) => candidate.attemptBinding?.startFixHistoryIndex === latestStartFix.index));
+  const legacy = active === null && !boundAttemptExists && run.state === 'IMPLEMENTING' && authority !== undefined && run.headSha !== undefined && run.pullRequest !== undefined
+    ? [...(run.repairAdmissions ?? [])].reverse().find((candidate) => candidate.attemptBinding === undefined &&
+      candidate.authorityRevision === authority.revision && candidate.taskShape === authority.shape &&
+      candidate.headSha === run.headSha && candidate.pullRequestNumber === run.pullRequest!.number)
+    : undefined;
+  const receipt = active?.snapshot ?? legacy;
+  if (receipt === undefined) return null;
   let resolved: ResolvedExecutionConfiguration | undefined;
   try { resolved = deps.resolveRepairExecutionProfile(receipt.executionProfile); } catch { return null; }
-  return resolved !== undefined && JSON.stringify(resolved) === JSON.stringify(receipt.execution) ? resolved : null;
+  if (resolved === undefined || JSON.stringify(resolved) !== JSON.stringify(receipt.execution)) return null;
+  if (active === null) {
+    const legacySession = run.agentResult?.sessionId !== undefined;
+    const knownPriorProvider = run.executor?.provider ?? run.execution?.executor;
+    if (run.executor !== undefined && run.executor.provider !== resolved.executor &&
+        !(resolved.executor === 'codex-cli' && run.executor.provider === 'codex-app-server')) return null;
+    if (legacySession && knownPriorProvider !== undefined && knownPriorProvider !== resolved.executor &&
+        !(resolved.executor === 'codex-cli' && knownPriorProvider === 'codex-app-server')) return null;
+    if (legacySession && knownPriorProvider === undefined) return null;
+  }
+  return resolved;
 }
 
 /** The persisted workspace boundary, not the initial provider, selects its later validation/review bootstrap. */
@@ -192,15 +295,20 @@ async function validateExactHead(
   snapshot: GitHubLiveSnapshot,
   validation: ValidationAdapter | undefined,
   hostedPolicy: HostedCheckPolicyConfiguration | undefined,
+  onExecutionStart?: () => void,
 ): Promise<ValidationResult> {
   if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
   const reusable = run.validationResult;
-  const local = reusable?.headSha === run.headSha && reusable.local.status === 'passed' &&
+  let local = reusable?.headSha === run.headSha && reusable.local.status === 'passed' &&
     validation !== undefined && validation.configRevision.trim() !== '' && reusable.local.configRevision === validation.configRevision
     ? reusable.local
     : validation === undefined
       ? unavailableLocalValidation()
-      : await validation.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+      : undefined;
+  if (local === undefined) {
+    onExecutionStart?.();
+    local = await validation!.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+  }
   return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
 }
 
@@ -279,8 +387,11 @@ export async function runWorkflow(
 
   let run = store.read(runId);
   if (run === null) throw new Error(`No run with id "${runId}" found.`);
+  const loaded = run;
   run = withRunTelemetryThresholds(run, options.telemetryThresholds ?? {});
-  store.update(run);
+  if (!updateIfCurrent(store, loaded, run)) {
+    return staleWorkflowOutcome(run.id, loaded, store, 'Run changed while workflow telemetry was being initialized; preserving the newer Run.');
+  }
   if (run.target.kind !== 'issue') {
     throw new Error('runWorkflow currently supports issue-target runs only.');
   }
@@ -289,8 +400,11 @@ export async function runWorkflow(
   for (;;) {
     switch (run.state) {
       case 'READY':
-        run = applyTransition(run, { type: 'start' }, now());
-        store.update(run);
+        {
+          const previous = run;
+          run = applyTransition(previous, { type: 'start' }, now());
+          if (!updateIfCurrent(store, previous, run)) return staleWorkflowOutcome(run.id, previous, store, 'Run changed while implementation was starting; preserving the newer Run.');
+        }
         break;
 
       case 'IMPLEMENTING': {
@@ -300,6 +414,7 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed during implementation live-state reconciliation; preserving the newer Run.');
         if (snapshot.issue.state !== 'open') {
           return park(run, `Issue ${formatTarget(target)} is closed; refusing implementation.`, store, now, [CANCEL_RUN_DECISION]);
         }
@@ -309,6 +424,9 @@ export async function runWorkflow(
           run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
           run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
         const pendingRepair = pendingReviewFix || pendingValidationRepair;
+        const repairAttempt = pendingRepair ? activeRepairAdmission(run) : null;
+        const repairFreshStart = repairAttempt?.snapshot.attemptBinding?.freshExecutor === true && repairAttempt.handoff === undefined;
+        const repairRuntimeGeneration = repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id;
         // A restarted repair may execute only from its append-only admission
         // receipt. It must not inherit the initial run profile as a fallback.
         const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
@@ -367,10 +485,15 @@ export async function runWorkflow(
             initialRecoveryCandidate = { number: snapshot.pullRequest!.number, baseSha: snapshot.pullRequest!.baseSha, headSha: snapshot.headSha! };
           }
         }
+        if (bootstrap === undefined && (run.pullRequest !== undefined || run.headSha !== undefined)) {
+          const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
+          if (conflict !== null) return park(run, conflict, store, now);
+        }
         if (pendingRepair && snapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD ${snapshot.headSha} does not match the interrupted review-fix HEAD ${run.headSha ?? '(none)'}.`;
+          const previous = run;
           run = applyTransition(
-            run,
+            previous,
             {
               type: 'escalate',
               reason,
@@ -381,9 +504,10 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, previous, run)) return staleWorkflowOutcome(run.id, previous, store, 'Run changed while repair identity was being reconciled; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
+        if (snapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number });
 
         if ((
           !pendingRepair && (snapshot.pullRequest === null || effectiveExecution?.executor === 'luna-isolated') ||
@@ -404,11 +528,17 @@ export async function runWorkflow(
             return bootstrapFailureOutcome(run, new Error('Existing Luna PR has no safe same-repository publication branch.'), store, now);
           }
           try {
+            const plannedFrom = run;
             bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: authoritativeBaseBranch,
               baseSha: authoritativeBaseSha, ...(publicationBranch === undefined ? {} : { publicationBranch }) });
             assertBootstrapBoundary(bootstrap, bootstrapAdapter);
-            run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
-            store.update(run);
+            const plannedRun = applyTransition(plannedFrom, { type: 'bootstrap_prepared', bootstrap }, now());
+            if (!updateIfCurrent(store, plannedFrom, plannedRun)) return staleWorkflowOutcome(run.id, plannedFrom, store, 'Run changed while bootstrap planning was in flight; preserving the newer Run.');
+            run = plannedRun;
+            strengthenAdmissionEvidence(options, run, {
+              ...(snapshot.pullRequest === null ? {} : { pullRequest: snapshot.pullRequest.number }),
+              workspace: bootstrap.workspacePath,
+            });
             if (pendingRepair) recoveryAuthority = { expectedHeadSha: run.headSha! };
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
@@ -418,12 +548,16 @@ export async function runWorkflow(
           if (bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
           try {
             assertBootstrapBoundary(bootstrap, bootstrapAdapter);
+            assertMutationAdmission(options, run, bootstrap.workspacePath);
+            options.onExecutionStart?.();
+            assertCurrentMutationAdmission(options);
             bootstrap = await bootstrapAdapter.prepare({
               runId: run.id, target, baseBranch: bootstrap.baseBranch, baseSha: bootstrap.baseSha,
               existing: bootstrap, ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
             });
             workspaceGuard = bootstrapAdapter.guard(bootstrap);
             snapshot = await github.readLiveSnapshot(target);
+            if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed while bootstrap preparation and live recovery were in flight; preserving the newer Run.');
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
           }
@@ -431,6 +565,7 @@ export async function runWorkflow(
           if (snapshot.pullRequest !== null) {
             const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
             if (conflict !== null) return park(run, conflict, store, now);
+            strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number, workspace: bootstrap.workspacePath });
             if (run.headSha === undefined) {
               if (initialRecoveryCandidate !== undefined &&
                   (snapshot.pullRequest.number !== initialRecoveryCandidate.number ||
@@ -439,14 +574,18 @@ export async function runWorkflow(
                 return park(run, 'Initial recovery PR or HEAD changed after preparation; refusing candidate adoption.', store, now);
               }
               try {
+                options.onExecutionStart?.();
+                assertCurrentMutationAdmission(options);
                 await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: snapshot.headSha!, workspaceGuard,
                   ...(bootstrap.bootstrapKind === 'standalone-isolated' ? { adoptExistingHead: true, progressBaseSha: bootstrap.baseSha } : {}) });
               } catch (error) {
                 return bootstrapFailureOutcome(run, error, store, now);
               }
+              const recoveryFrom = run;
               const recovered = { exitStatus: 'success' as const, summary: `Recovered durable implementation from pull request #${snapshot.pullRequest.number}.`, headSha: snapshot.headSha! };
-              run = applyTransition(run, { type: 'agent_succeeded', agentResult: recovered, headSha: snapshot.headSha!, pullRequest: { number: snapshot.pullRequest.number, headSha: snapshot.headSha! } }, now());
-              store.update(run);
+              const recoveredRun = applyTransition(recoveryFrom, { type: 'agent_succeeded', agentResult: recovered, headSha: snapshot.headSha!, pullRequest: { number: snapshot.pullRequest.number, headSha: snapshot.headSha! } }, now());
+              if (!updateIfCurrent(store, recoveryFrom, recoveredRun)) return staleWorkflowOutcome(run.id, recoveryFrom, store, 'Run changed during durable bootstrap recovery; preserving the newer Run.');
+              run = recoveredRun;
               break;
             }
             if (snapshot.headSha !== run.headSha) return park(run, `Live GitHub HEAD changed during bootstrap recovery.`, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
@@ -466,8 +605,9 @@ export async function runWorkflow(
           : snapshot.pullRequest?.baseSha ?? snapshot.repository.defaultBranchHeadSha;
         if (baseSha === null || baseSha === undefined || baseSha === '') {
           const reason = `No authoritative implementation base is available for ${formatTarget(target)}.`;
+          const previous = run;
           run = applyTransition(
-            run,
+            previous,
             {
               type: 'escalate',
               reason,
@@ -478,7 +618,7 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, previous, run)) return staleWorkflowOutcome(run.id, previous, store, 'Run changed while implementation base was being reconciled; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
         const isIsolatedLuna = effectiveExecution?.executor === 'luna-isolated';
@@ -509,6 +649,54 @@ export async function runWorkflow(
           : run.agentResult === undefined && run.executor === undefined
             ? 'initial'
             : 'resume';
+        const governedPublication = options.admissionFence === undefined
+          ? undefined
+          : Object.freeze({ required: true as const, continuation: workerAttemptKind !== 'initial' });
+        let preparedGovernedInvocation: GovernedInvocationPreparation | undefined;
+        if (governedPublication !== undefined) {
+          const preflightRequest = {
+            target,
+            baseSha,
+            ...(isIsolatedLuna || repairFreshStart || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(isIsolatedLuna || repairFreshStart || run.executor === undefined ? {} : { executor: run.executor }),
+            runtimeOwnership: {
+              runId: run.id,
+              generation: repairRuntimeGeneration,
+              ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+            },
+            governedPublication,
+            ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
+          };
+          if (implementation.prepareGovernedInvocation === undefined) {
+            return park(
+              run,
+              `Governed implementation is on hold because no source-qualified publication preflight is available. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+              store,
+              now,
+              [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
+            );
+          }
+          preparedGovernedInvocation = implementation.prepareGovernedInvocation(preflightRequest);
+          if (preparedGovernedInvocation.status === 'held') {
+            return park(
+              run,
+              `Governed implementation is on hold: ${preparedGovernedInvocation.reason} No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+              store,
+              now,
+              [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
+            );
+          }
+          if (!preparedGovernedInvocation.agent || typeof preparedGovernedInvocation.agent !== 'object' ||
+              !hasGovernedPublicationConfinement(preparedGovernedInvocation.agent)) {
+            return park(
+              run,
+              `Governed implementation is on hold because the prepared runtime did not present a source-qualified publication boundary. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+              store,
+              now,
+              [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
+            );
+          }
+        }
         const workerSpawn = recordSpawnTelemetry(run, {
           role: 'worker',
           attemptKind: workerAttemptKind,
@@ -520,32 +708,87 @@ export async function runWorkflow(
           contextMode: 'bounded',
           contextJustification: 'live-target-bounded',
         }, now());
+        const beforeSpawn = run;
         run = workerSpawn.run;
-        store.update(run);
+        if (!updateIfCurrent(store, beforeSpawn, run)) {
+          return staleWorkflowOutcome(run.id, beforeSpawn, store, 'Run changed before the implementation invocation could be admitted; preserving the newer Run.');
+        }
+        let workerHandoff = run;
         let result: AgentResult;
         try {
-          result = await implementation.run({
+          const capabilities = isIsolatedLuna ? undefined : await deps.resolveImplementationCapabilities?.();
+          const executionWorkspace = bootstrap?.workspacePath ?? options.admissionFence?.executionWorkspace;
+          if (options.admissionFence !== undefined && executionWorkspace === undefined) {
+            throw new Error('Mission admission cannot authorize an unbootstrapped worker without an explicit execution workspace.');
+          }
+          strengthenAdmissionEvidence(options, run, {
+            ...(snapshot.pullRequest === null ? {} : { pullRequest: snapshot.pullRequest.number }),
+            ...(executionWorkspace === undefined ? {} : { workspace: executionWorkspace }),
+          });
+          // The path is now fully strengthened while CLI ownership is still
+          // provably pre-execution. The uncertainty marker must not precede
+          // an ordinary overlap rejection.
+          options.onExecutionStart?.();
+          assertCurrentMutationAdmission(options);
+          // This synchronous CAS is the final durable Run fence after every
+          // awaited capability lookup. No await occurs before implementation.run.
+          if (!updateIfCurrent(store, workerHandoff, workerHandoff)) {
+            return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while implementation capabilities were resolving; preserving the newer Run.');
+          }
+          const implementationRequest: ImplementationRequest = {
             target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target', instructions: boundedInstructions,
             ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
-            ...(isIsolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
+            ...(capabilities === undefined ? {} : { capabilities }),
+            ...(governedPublication === undefined ? {} : { governedPublication }),
+            beforePublish: () => {
+              if (!updateIfCurrent(store, workerHandoff, workerHandoff)) {
+                throw new Error('Run changed before worker-router implementation publication.');
+              }
+              assertCurrentMutationAdmission(options);
+              assertPublicationAdmission(options);
+            },
             // #92 deliberately qualifies fresh bounded Luna workers.  A
             // repair/re-entry therefore cannot pretend its prior CLI thread
             // is a durable continuation; its explicit exact-HEAD bootstrap
             // and newly copied bounded packet are the continuity authority.
-            ...(isIsolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-            ...(isIsolatedLuna || run.executor === undefined ? {} : { executor: run.executor }),
+            ...(isIsolatedLuna || repairFreshStart || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+            ...(isIsolatedLuna || repairFreshStart || run.executor === undefined ? {} : { executor: run.executor }),
             runtimeOwnership: {
               runId: run.id,
-              generation: run.executor?.generation ?? run.id,
+              generation: repairRuntimeGeneration,
               ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
             },
             ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
-          });
+          };
+          result = await (preparedGovernedInvocation?.status === 'qualified'
+            ? preparedGovernedInvocation.agent.run(implementationRequest)
+            : implementation.run(implementationRequest));
         } catch (error) {
-          if (isWorkspaceGuardFailure(error)) return bootstrapFailureOutcome(run, error, store, now);
+          if (isWorkspaceGuardFailure(error)) {
+            if (error.executor !== undefined && repairAttempt?.snapshot.attemptBinding !== undefined) {
+              const failedResult: AgentResult = { exitStatus: 'failure', summary: error.message, executor: error.executor, sessionId: error.executor.sessionId };
+              let captured = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(failedResult, {
+                ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
+                ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
+                ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
+              }, 'worker', workerSpawn.invocationId), now());
+              try {
+                captured = applyTransition(captured, {
+                  type: repairAttempt.handoff === undefined ? 'repair_executor_handoff' : 'repair_executor_continued',
+                  repairAgentResult: failedResult,
+                }, now());
+              } catch { /* A typed post-execution identity that fails admission cannot replace the predecessor. */ }
+              const parked = createBootstrapFailureRun(captured, error, now);
+              if (!updateIfCurrent(store, workerHandoff, parked.run)) {
+                return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while the post-execution workspace identity was being captured; preserving the newer Run.');
+              }
+              return { outcome: 'needs_human', ...parked };
+            }
+            return bootstrapFailureAfterWorker(run, workerHandoff, error, store, now);
+          }
           const detail = error instanceof Error ? error.message : String(error);
-          run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+          const failedInvocation = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult({
             exitStatus: 'failure',
             summary: detail,
             diagnostics: ['AGENT_RUNTIME_INVOCATION_FAILED: provider invocation threw before returning an AgentResult'],
@@ -554,19 +797,41 @@ export async function runWorkflow(
             ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
             ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
           }, 'worker', workerSpawn.invocationId), now());
-          store.update(run);
+          if (!updateIfCurrent(store, workerHandoff, failedInvocation)) {
+            return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while implementation failure was being recorded; preserving the newer Run.');
+          }
+          run = failedInvocation;
           throw error;
         }
-        run = recordCompletionTelemetry(run, createCompletionInputFromResult(result, {
+        let completedInvocation = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(result, {
           ...(effectiveExecution?.executor === undefined ? {} : { provider: effectiveExecution.executor }),
           ...(effectiveExecution?.model === undefined ? {} : { model: effectiveExecution.model }),
           ...(effectiveExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: effectiveExecution.reasoningEffort }),
         }, 'worker', workerSpawn.invocationId), now());
-        store.update(run);
+        if (repairAttempt !== null && repairAttempt.snapshot.attemptBinding !== undefined) {
+          try {
+            if (repairAttempt.handoff === undefined) {
+              completedInvocation = applyTransition(completedInvocation, { type: 'repair_executor_handoff', repairAgentResult: result }, now());
+            } else {
+              completedInvocation = applyTransition(completedInvocation, { type: 'repair_executor_continued', repairAgentResult: result }, now());
+            }
+          } catch (error) {
+            const persistedTelemetry = completedInvocation;
+            if (!updateIfCurrent(store, workerHandoff, persistedTelemetry)) {
+              return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while repair identity was being recorded; preserving the newer Run.');
+            }
+            run = persistedTelemetry;
+            return park(run, `Repair executor handoff is unqualified: ${error instanceof Error ? error.message : String(error)} No provider identity was adopted.`, store, now);
+          }
+        }
+        if (!updateIfCurrent(store, workerHandoff, completedInvocation)) {
+          return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while implementation result was being recorded; preserving the newer Run.');
+        }
+        run = completedInvocation;
         if (result.exitStatus === 'failure') {
           const takeoverReason = humanTakeoverReason(result);
           if (takeoverReason !== undefined) {
-            run = applyTransition(
+            const takeover = applyTransition(
               run,
               {
                 type: 'escalate',
@@ -579,21 +844,40 @@ export async function runWorkflow(
               },
               now(),
             );
-            store.update(run);
+            if (!updateIfCurrent(store, completedInvocation, takeover)) {
+              return staleWorkflowOutcome(run.id, completedInvocation, store, 'Run changed while implementation failure was being reconciled; preserving the newer Run.');
+            }
+            run = takeover;
             return { outcome: 'needs_human', run, reason: takeoverReason };
           }
-          run = applyTransition(run, { type: 'agent_failed', agentResult: result, headSha: result.headSha }, now());
-          store.update(run);
+          const failed = applyTransition(run, { type: 'agent_failed', agentResult: result, headSha: result.headSha }, now());
+          if (!updateIfCurrent(store, completedInvocation, failed)) {
+            return staleWorkflowOutcome(run.id, completedInvocation, store, 'Run changed while implementation failure was being reconciled; preserving the newer Run.');
+          }
+          run = failed;
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
         }
         if (bootstrap !== undefined) {
-          if (result.headSha === undefined || bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
+          if (result.headSha === undefined || bootstrapAdapter === undefined) return bootstrapFailureAfterWorker(run, run, new Error('Implementation did not report an exact durable HEAD.'), store, now);
+          const publicationRun = run;
           try {
-            await bootstrapAdapter.verifyDurable({ identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard });
+            options.onExecutionStart?.();
+            assertCurrentMutationAdmission(options);
+            await bootstrapAdapter.verifyDurable({
+              identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard,
+              beforePublish: () => {
+                if (!updateIfCurrent(store, publicationRun, publicationRun)) throw new Error('Run changed before standalone implementation publication.');
+                assertCurrentMutationAdmission(options);
+                assertPublicationAdmission(options);
+              },
+            });
             if ((run.execution?.executor === 'worker-router' || run.execution?.executor === 'luna-isolated') && snapshot.pullRequest === null) {
               if (deps.github.createImplementationPullRequest === undefined) {
-                return bootstrapFailureOutcome(run, new Error('Isolated implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
+                return bootstrapFailureAfterWorker(run, run, new Error('Isolated implementation requires Conductor GitHub write capability to create and associate the implementation pull request.'), store, now);
               }
+              options.onExecutionStart?.();
+              if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before implementation publication; preserving the newer Run.');
+              assertPublicationAdmission(options);
               await deps.github.createImplementationPullRequest({
                 target,
                 headBranch: bootstrap.branch,
@@ -604,12 +888,13 @@ export async function runWorkflow(
             }
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
-            return bootstrapFailureOutcome(run, error, store, now);
+            return bootstrapFailureAfterWorker(run, run, error, store, now);
           }
           const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
           if (conflict !== null || snapshot.pullRequest === null || snapshot.headSha !== result.headSha) {
-            return park(run, conflict ?? 'Live pull request does not prove the implementation exact HEAD.', store, now);
+            return parkAfterWorker(run, run, conflict ?? 'Live pull request does not prove the implementation exact HEAD.', store, now);
           }
+          strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number, workspace: bootstrap.workspacePath });
           run = applyTransition(run, { type: 'agent_succeeded', agentResult: result, headSha: result.headSha, pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha } }, now());
         } else {
           // An implementation result is only a claim.  Re-read the live PR
@@ -619,22 +904,30 @@ export async function runWorkflow(
           try {
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
-            return githubFailureOutcome(run, error, store, now);
+            const detail = error instanceof Error ? error.message : String(error);
+            return parkAfterWorker(run, run, `GitHub live state could not be read safely: ${detail}`, store, now);
           }
           if (result.headSha === undefined || snapshot.pullRequest === null || snapshot.headSha !== result.headSha ||
             pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true }) !== null) {
-            return park(run, 'Live pull request does not prove the implementation exact HEAD and accepted PR identity.', store, now);
+            return parkAfterWorker(run, run, 'Live pull request does not prove the implementation exact HEAD and accepted PR identity.', store, now);
           }
+          strengthenAdmissionEvidence(options, run, {
+            pullRequest: snapshot.pullRequest.number,
+            ...(options.admissionFence?.executionWorkspace === undefined ? {} : { workspace: options.admissionFence.executionWorkspace }),
+          });
           run = applyTransition(run, {
             type: 'agent_succeeded', agentResult: result, headSha: result.headSha,
             pullRequest: { number: snapshot.pullRequest.number, headSha: result.headSha },
           }, now());
         }
-        store.update(run);
+        if (!updateIfCurrent(store, completedInvocation, run)) {
+          return staleWorkflowOutcome(run.id, completedInvocation, store, 'Run changed while the implementation result was being associated with live GitHub state; preserving the newer Run.');
+        }
         break;
       }
 
       case 'VALIDATING': {
+        const validationExpected = run;
         const bootstrapAdapter = deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap;
         const activeValidation = activeValidationConfiguration(deps);
         const invalidAuthority = invalidValidationAuthority(activeValidation);
@@ -653,15 +946,17 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed during validation live-state reconciliation; preserving the newer Run.');
         const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
         if (conflict !== null) return park(run, conflict, store, now);
+        if (snapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number });
         if (snapshot.pullRequest === null || snapshot.headSha === null || snapshot.headSha !== run.headSha) {
           const reason =
             snapshot.pullRequest === null || snapshot.headSha === null
               ? `Implementation completed, but ${formatTarget(target)} still has no associated open pull request.`
               : `Live GitHub HEAD ${snapshot.headSha} does not match the implementation HEAD ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
-            run,
+            validationExpected,
             {
               type: 'escalate',
               reason,
@@ -675,7 +970,7 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed during validation admission; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
         // Validation must execute against the owned checkout for this exact
@@ -688,25 +983,40 @@ export async function runWorkflow(
           }
           try {
             assertBootstrapBoundary(run.bootstrap, bootstrapAdapter);
+            assertMutationAdmission(options, run, run.bootstrap.workspacePath);
+            options.onExecutionStart?.();
+            assertCurrentMutationAdmission(options);
             const identity = await bootstrapAdapter.prepare({
               runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
               existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },
             });
-            await bootstrapAdapter.verifyDurable({ identity, expectedHeadSha: run.headSha });
+            assertCurrentMutationAdmission(options);
+            await bootstrapAdapter.verifyDurable({
+              identity,
+              expectedHeadSha: run.headSha,
+              beforePublish: () => {
+                if (!updateIfCurrent(store, validationExpected, validationExpected)) {
+                  throw new Error('Run changed before owned-workspace validation publication.');
+                }
+                assertCurrentMutationAdmission(options);
+                assertPublicationAdmission(options);
+              },
+            });
+            if (!updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while owned-workspace validation was being prepared; preserving the newer Run.');
           } catch (error) {
             return bootstrapFailureOutcome(run, error, store, now);
           }
         }
         let validationResult: ValidationResult;
         try {
-          validationResult = await validateExactHead(run, target, snapshot, deps.validation, deps.hostedCheckPolicy);
+          validationResult = await validateExactHead(run, target, snapshot, deps.validation, deps.hostedCheckPolicy, options.onExecutionStart);
         } catch (error) {
           const reason = `Local validation could not be observed safely: ${error instanceof Error ? error.message : String(error)}`;
           validationResult = combineValidation(
             run.headSha ?? '', unavailableLocalValidation(), hostedValidation(snapshot, deps.hostedCheckPolicy),
           );
           run = applyTransition(
-            run,
+            validationExpected,
             {
               type: 'escalate', reason, validationResult,
               pullRequest: { number: snapshot.pullRequest.number, headSha: run.headSha! },
@@ -714,7 +1024,7 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation failure was being recorded; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
         const currentValidation = activeValidationConfiguration(deps);
@@ -731,8 +1041,10 @@ export async function runWorkflow(
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        if (!updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed during the post-validation live read; preserving the newer Run.');
         const postValidationConflict = pullRequestIdentityConflict(run, postValidationSnapshot);
         if (postValidationConflict !== null) return park(run, postValidationConflict, store, now);
+        if (postValidationSnapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: postValidationSnapshot.pullRequest.number });
         if (postValidationSnapshot.headSha !== run.headSha) {
           const reason = `Live GitHub HEAD changed during validation from ${run.headSha ?? '(none)'} to ${postValidationSnapshot.headSha ?? '(none)'}.`;
           return park(run, reason, store, now, [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]);
@@ -763,7 +1075,7 @@ export async function runWorkflow(
             run.headSha!, unavailableLocalValidation(), hostedValidation(postValidationSnapshot, deps.hostedCheckPolicy),
           );
           run = applyTransition(
-            run,
+            validationExpected,
             {
               type: 'escalate', reason, validationResult,
               pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
@@ -771,13 +1083,13 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation evidence was being recorded; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
         if (!validationEvidenceMatchesActive(validationResult, postReadValidation)) {
           const reason = `Validation evidence for ${run.headSha} does not match the active validation-policy identity.`;
           run = applyTransition(
-            run,
+            validationExpected,
             {
               type: 'escalate', reason, validationResult,
               pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
@@ -785,21 +1097,21 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation evidence was being recorded; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
         if (validationResult.status === 'failed') {
-          run = applyTransition(run, {
+          run = applyTransition(validationExpected, {
             type: 'validation_failed', validationResult,
             pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
           }, now());
-          store.update(run);
+          if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation outcome was being recorded; preserving the newer Run.');
           break;
         }
         if (validationResult.status === 'waiting') {
           const reason = `Validation for ${run.headSha} is waiting for required hosted checks.`;
           run = applyTransition(
-            run,
+            validationExpected,
             {
               type: 'wait_dependency', reason, validationResult,
               pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
@@ -807,13 +1119,13 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation outcome was being recorded; preserving the newer Run.');
           return { outcome: 'waiting_dependency', run, reason };
         }
         if (validationResult.status === 'unknown') {
           const reason = `Validation for ${run.headSha} lacks required local or hosted evidence.`;
           run = applyTransition(
-            run,
+            validationExpected,
             {
               type: 'escalate', reason, validationResult,
               pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
@@ -821,18 +1133,18 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation outcome was being recorded; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
         run = applyTransition(
-          run,
+          validationExpected,
           {
             type: 'validation_passed', validationResult,
             pullRequest: { number: postValidationSnapshot.pullRequest.number, headSha: run.headSha! },
           },
           now(),
         );
-        store.update(run);
+        if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation success was being recorded; preserving the newer Run.');
         break;
       }
 
@@ -848,6 +1160,7 @@ export async function runWorkflow(
             ['Configure a stable validation-policy identity and retry', CANCEL_RUN_DECISION],
           );
         }
+        const reviewRun = run;
         const loop = await runReviewLoop(
           {
             store,
@@ -859,15 +1172,28 @@ export async function runWorkflow(
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
             resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,
+            governedPublicationRequired: options.admissionFence !== undefined,
+            assertCanMutate: (workspacePath) => {
+              const executionWorkspace = workspacePath ?? reviewRun.bootstrap?.workspacePath ?? options.admissionFence?.executionWorkspace;
+              if (options.admissionFence !== undefined && executionWorkspace === undefined) {
+                throw new Error('Mission admission cannot authorize an unbootstrapped repair without an explicit execution workspace.');
+              }
+              strengthenAdmissionEvidence(options, reviewRun, executionWorkspace === undefined ? {} : { workspace: executionWorkspace });
+              assertCurrentMutationAdmission(options);
+            },
+            assertCurrentMutation: () => assertCurrentMutationAdmission(options),
+            assertCanPublish: () => assertPublicationAdmission(options),
           },
           run.id,
           {
           maxAttempts: options.maxReviewAttempts,
           now,
+          onExecutionStart: options.onExecutionStart,
           },
         );
         run = loop.run;
         if (loop.outcome === 'needs_human') return { outcome: 'needs_human', run, reason: loop.reason };
+        if (loop.outcome === 'unsupported_cas') return { outcome: 'unsupported_cas', run: loop.run, reason: loop.reason };
         if (loop.outcome === 'failed') return { outcome: 'failed', run, reason: loop.reason };
         break;
       }
@@ -884,20 +1210,22 @@ export async function runWorkflow(
           );
         }
         if (!isReviewFresh(run)) {
-          run = applyTransition(run, { type: 'gate_blocked' }, now());
-          store.update(run);
+          const previous = run;
+          run = applyTransition(previous, { type: 'gate_blocked' }, now());
+          if (!updateIfCurrent(store, previous, run)) return staleWorkflowOutcome(run.id, previous, store, 'Run changed while final-gate review freshness was being checked; preserving the newer Run.');
           break;
         }
         if (!isValidationFresh(run, activeValidationConfiguration(deps))) {
           const reason = `Final gate requires validation at current HEAD ${run.headSha ?? '(none)'} under the active repository/run configuration.`;
+          const previous = run;
           run = applyTransition(
-            run,
+            previous,
             {
               type: 'revalidate', reason,
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, previous, run)) return staleWorkflowOutcome(run.id, previous, store, 'Run changed while final-gate validation freshness was being checked; preserving the newer Run.');
           break;
         }
 
@@ -905,18 +1233,20 @@ export async function runWorkflow(
         // live GitHub readiness data immediately before MERGE_READY so a push,
         // draft conversion, failing check, unresolved thread, or mergeability
         // change after review can never slip through the final gate.
+        const finalGateExpected = run;
         let snapshot: GitHubLiveSnapshot;
         try {
           snapshot = await github.readLiveSnapshot(target);
         } catch (error) {
           return githubFailureOutcome(run, error, store, now);
         }
+        if (!updateIfCurrent(store, finalGateExpected, finalGateExpected)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
         const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
         if (conflict !== null) return park(run, conflict, store, now);
         if (snapshot.headSha !== run.headSha) {
           const reason = `Final gate observed live GitHub HEAD ${snapshot.headSha ?? '(none)'} but the approved run HEAD is ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
-            run,
+            finalGateExpected,
             {
               type: 'escalate',
               reason,
@@ -927,15 +1257,16 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, finalGateExpected, run)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
+        if (snapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number });
 
         const currentValidationAuthority = activeValidationConfiguration(deps);
         if (!isValidationFresh(run, currentValidationAuthority)) {
           const reason = 'Final gate observed a changed or invalid validation-policy identity while rereading live GitHub state.';
-          run = applyTransition(run, { type: 'revalidate', reason }, now());
-          store.update(run);
+          run = applyTransition(finalGateExpected, { type: 'revalidate', reason }, now());
+          if (!updateIfCurrent(store, finalGateExpected, run)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
           break;
         }
 
@@ -944,8 +1275,8 @@ export async function runWorkflow(
           persistedValidation.hosted.pullRequestNumber !== snapshot.pullRequest?.number ||
           persistedValidation.hosted.policyRevision !== (deps.hostedCheckPolicy?.revision ?? null)) {
           const reason = 'Final gate observed hosted validation evidence that does not match the current pull request or active policy configuration.';
-          run = applyTransition(run, { type: 'revalidate', reason }, now());
-          store.update(run);
+          run = applyTransition(finalGateExpected, { type: 'revalidate', reason }, now());
+          if (!updateIfCurrent(store, finalGateExpected, run)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
           break;
         }
 
@@ -966,14 +1297,14 @@ export async function runWorkflow(
         if (currentHosted.status === 'waiting') {
           const reason = `Final GitHub readiness gate is waiting for required hosted checks at ${run.headSha ?? '(none)'}.`;
           run = applyTransition(
-            run,
+            finalGateExpected,
             {
               type: 'wait_dependency', reason,
               interrupt: { evidence: reason, choices: [RETRY_READINESS_DECISION, CANCEL_RUN_DECISION] },
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, finalGateExpected, run)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
           return { outcome: 'waiting_dependency', run, reason };
         }
         const readinessProblems = [
@@ -1002,7 +1333,7 @@ export async function runWorkflow(
         if (readinessProblems.length > 0) {
           const reason = `Final GitHub readiness gate is blocked: ${readinessProblems.join('; ')}.`;
           run = applyTransition(
-            run,
+            finalGateExpected,
             {
               type: 'escalate',
               reason,
@@ -1013,12 +1344,13 @@ export async function runWorkflow(
             },
             now(),
           );
-          store.update(run);
+          if (!updateIfCurrent(store, finalGateExpected, run)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
 
-        run = completeLiveFinalGate(run, now(), activeValidationConfiguration(deps));
-        store.update(run);
+        assertPublicationAdmission(options);
+        run = completeLiveFinalGate(finalGateExpected, now(), activeValidationConfiguration(deps));
+        if (!updateIfCurrent(store, finalGateExpected, run)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed before final-gate readiness publication; preserving the newer Run.');
         break;
       }
 

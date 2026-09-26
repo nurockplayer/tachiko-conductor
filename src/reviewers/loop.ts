@@ -1,4 +1,6 @@
 import {
+  GOVERNED_PUBLICATION_REENTRY_ACTION,
+  hasGovernedPublicationConfinement,
   humanTakeoverReason,
   isWorkspaceGuardFailure,
   type ImplementationAgent,
@@ -11,8 +13,10 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
-import type { ReviewResult, Run, Target } from '../domain/types.js';
+import type { AgentResult, ReviewResult, Run, Target } from '../domain/types.js';
 import {
+  activeRepairAdmission,
+  createRepairAttemptBinding,
   createRepairAdmissionSnapshot,
   decideRepairAdmission,
   type RepairFindingKind,
@@ -20,7 +24,7 @@ import {
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUEST_DECISION } from '../domain/decisions.js';
-import { parkBootstrapFailure } from '../workflow/bootstrap-failure.js';
+import { createBootstrapFailureRun } from '../workflow/bootstrap-failure.js';
 import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 
 export interface ReviewLoopDependencies {
@@ -37,6 +41,14 @@ export interface ReviewLoopDependencies {
    */
   readonly resolveValidationAuthority: () => ActiveValidationConfiguration;
   readonly resolveImplementationCapabilities?: ImplementationCapabilityResolver;
+  /** Provider-neutral mutation fence rechecked immediately before a repair worker starts. */
+  readonly assertCanMutate?: (workspacePath?: string) => void;
+  /** Generation-only recheck after uncertainty is marked; must not strengthen evidence. */
+  readonly assertCurrentMutation?: () => void;
+  /** Rechecks publication authority immediately before standalone host push. */
+  readonly assertCanPublish?: () => void;
+  /** Admission-backed workflow repairs require source-qualified host publication confinement. */
+  readonly governedPublicationRequired?: boolean;
   /**
    * Resolves only the provider-neutral profile selected by explicit repair
    * authority. It is intentionally absent for legacy runs, which have no
@@ -49,12 +61,15 @@ export interface ReviewLoopOptions {
   /** Maximum review attempts before the loop escalates to NEEDS_HUMAN. */
   readonly maxAttempts: number;
   readonly now?: () => string;
+  /** Called before a repair worker or reviewer execution boundary. */
+  readonly onExecutionStart?: () => void;
 }
 
 export type ReviewLoopResult =
   | { readonly outcome: 'approved'; readonly run: Run }
   | { readonly outcome: 'revalidating'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
+  | { readonly outcome: 'unsupported_cas'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
 function formatTarget(target: Target): string {
@@ -108,9 +123,22 @@ function renderFailure(prefix: string, error: unknown): string {
   return `${prefix}${code === null ? '' : ` (${code})`}: ${errorMessage(error)}`;
 }
 
-function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => string): ReviewLoopResult {
+function staleReviewOutcome(runId: string, fallback: Run, store: RunStore): ReviewLoopResult {
+  const current = store.read(runId) ?? fallback;
+  const reason = 'Review stopped because the durable Run changed; preserving the newer Run.';
+  return isTerminal(current.state)
+    ? { outcome: 'failed', run: current, reason }
+    : { outcome: 'needs_human', run: current, reason };
+}
+
+function updateReviewRun(store: RunStore, expected: Run, next: Run): boolean {
+  return store.updateIfUnchanged?.(expected, next) ?? false;
+}
+
+function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => string, expected: Run = run): ReviewLoopResult {
   const executor = isWorkspaceGuardFailure(error) ? error.executor ?? run.executor : run.executor;
-  const parked = parkBootstrapFailure(run, error, store, now, executor);
+  const parked = createBootstrapFailureRun(run, error, now, executor);
+  if (!updateReviewRun(store, expected, parked.run)) return staleReviewOutcome(run.id, run, store);
   return { outcome: 'needs_human', ...parked };
 }
 
@@ -166,7 +194,7 @@ function reviewAdmission(
 
 function persistRevalidation(run: Run, reason: string, store: RunStore, now: () => string): ReviewLoopResult {
   const revalidating = applyTransition(run, { type: 'revalidate', reason }, now());
-  store.update(revalidating);
+  if (!updateReviewRun(store, run, revalidating)) return staleReviewOutcome(run.id, run, store);
   return { outcome: 'revalidating', run: revalidating, reason };
 }
 
@@ -180,7 +208,7 @@ function parkAdmission(run: Run, reason: string, store: RunStore, now: () => str
       choices: liveHeadMoved ? [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION] : ['Resolve the GitHub identity conflict and retry', CANCEL_RUN_DECISION],
     },
   }, now());
-  store.update(parked);
+  if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
   return { outcome: 'needs_human', run: parked, reason };
 }
 
@@ -192,7 +220,7 @@ function parkRepairAuthority(
     type: 'escalate', reason,
     interrupt: { evidence: reason, choices },
   }, now());
-  store.update(parked);
+  if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
   return { outcome: 'needs_human', run: parked, reason };
 }
 
@@ -200,9 +228,14 @@ function parkRepairAuthority(
 function parkStaleRepairAdmission(runId: string, fallback: Run, store: RunStore, now: () => string): ReviewLoopResult {
   const reason = 'Repair admission parked: admission_stale.';
   let current = store.read(runId) ?? fallback;
-  // A concurrent writer may win between read and escalation. Keep fencing the
-  // freshest active snapshot; only an already parked or terminal snapshot is
-  // preserved without an overwrite.
+  if (store.updateIfUnchanged === undefined) {
+    return { outcome: 'unsupported_cas', run: store.read(runId) ?? current,
+      reason: 'Repair admission is held because durable compare-and-swap is unavailable; no Run write was attempted.' };
+  }
+  // Keep the established repair-admission behavior: if a concurrent writer
+  // wins, reconcile the freshest active snapshot rather than applying a stale
+  // repair transition. Reviewer-result paths use staleReviewOutcome and never
+  // mutate the newer durable Run.
   for (;;) {
     if (current.state === 'NEEDS_HUMAN') return { outcome: 'needs_human', run: current, reason };
     if (isTerminal(current.state)) return { outcome: 'failed', run: current, reason };
@@ -210,9 +243,7 @@ function parkStaleRepairAdmission(runId: string, fallback: Run, store: RunStore,
       type: 'escalate', reason,
       interrupt: { evidence: reason, choices: ['Re-admit the exact repair authority and execution profile', CANCEL_RUN_DECISION] },
     }, now());
-    if (store.updateIfUnchanged === undefined) {
-      store.update(parked);
-    } else if (!store.updateIfUnchanged(current, parked)) {
+    if (!store.updateIfUnchanged(current, parked)) {
       current = store.read(runId) ?? current;
       continue;
     }
@@ -289,7 +320,7 @@ export async function runReviewLoop(
       }
       if (durableRepairAttempts(run) >= options.maxAttempts) {
         const reason = `Review did not converge after ${options.maxAttempts} attempt(s); the shared post-implementation repair budget was exhausted.`;
-        run = applyTransition(
+        const escalated = applyTransition(
           run,
           {
             type: 'escalate',
@@ -301,14 +332,16 @@ export async function runReviewLoop(
           },
           now(),
         );
-        store.update(run);
+        if (!updateReviewRun(store, run, escalated)) return staleReviewOutcome(run.id, run, store);
+        run = escalated;
         return { outcome: 'needs_human', run, reason };
       }
       const pendingReview = run.reviewResult;
       if ((pendingReview === undefined || pendingReview.verdict !== 'request_changes') && !validationFailure) {
         const reason = 'Persisted CHANGES_REQUESTED run has no actionable review or validation failure.';
-        run = applyTransition(run, { type: 'fail', reason }, now());
-        store.update(run);
+        const failed = applyTransition(run, { type: 'fail', reason }, now());
+        if (!updateReviewRun(store, run, failed)) return staleReviewOutcome(run.id, run, store);
+        run = failed;
         return { outcome: 'failed', run, reason };
       }
 
@@ -318,7 +351,7 @@ export async function runReviewLoop(
       // implementation agent.
       if (run.pullRequest === undefined || run.headSha === undefined || run.pullRequest.headSha !== run.headSha) {
         const reason = 'Failed validation evidence is not bound to an accepted pull request and exact HEAD; refusing to authorize a repair.';
-        run = applyTransition(
+        const escalated = applyTransition(
           run,
           {
             type: 'escalate', reason,
@@ -329,7 +362,8 @@ export async function runReviewLoop(
           },
           now(),
         );
-        store.update(run);
+        if (!updateReviewRun(store, run, escalated)) return staleReviewOutcome(run.id, run, store);
+        run = escalated;
         return { outcome: 'needs_human', run, reason };
       }
 
@@ -337,24 +371,27 @@ export async function runReviewLoop(
       // live PR. Re-read before preparation and again after local recovery.
       let repairSnapshot: GitHubLiveSnapshot | undefined;
       const checkOwnedFix = async (): Promise<ReviewLoopResult | null> => {
+        const expected = run;
         try {
           const live = await github.readLiveSnapshot(target);
+          if (!updateReviewRun(store, expected, expected)) return parkStaleRepairAdmission(run.id, expected, store, now);
           const conflict = pullRequestIdentityConflict(run, live, { allowHeadAdvance: true });
           if (conflict === null && live.headSha === run.headSha) {
             repairSnapshot = live;
             return null;
           }
           const reason = conflict ?? 'Live GitHub HEAD changed before the review fix.';
-          run = applyTransition(run, {
+          const escalated = applyTransition(run, {
             type: 'escalate', reason,
             interrupt: { evidence: reason, choices: conflict === null
               ? [LIVE_HEAD_SYNC_DECISION, CANCEL_RUN_DECISION]
               : ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] },
           }, now());
-          store.update(run);
+          if (!updateReviewRun(store, expected, escalated)) return staleReviewOutcome(run.id, expected, store);
+          run = escalated;
           return { outcome: 'needs_human', run, reason };
         } catch (error) {
-          return parkBootstrap(run, error, store, now);
+          return parkBootstrap(expected, error, store, now, expected);
         }
       };
       const preflight = await checkOwnedFix();
@@ -366,6 +403,7 @@ export async function runReviewLoop(
       // such field and intentionally follows the pre-existing generic path.
       let repairExecution = run.execution;
       let repairStartsWithFreshExecutor = false;
+      let repairAttempt = activeRepairAdmission(run);
       const authority = run.repairTaskShapeAuthority;
       if (authority !== undefined) {
         const decision = decideRepairAdmission(authority);
@@ -389,28 +427,36 @@ export async function runReviewLoop(
         // A promoted repair may be assigned to another provider. Continuing a
         // prior provider's session across that boundary is not valid executor
         // continuity; intentionally start the selected profile fresh.
-        repairStartsWithFreshExecutor = run.executor !== undefined && run.executor.provider !== repairExecution.executor;
+        const attemptBinding = createRepairAttemptBinding(run, repairExecution);
+        repairStartsWithFreshExecutor = attemptBinding.freshExecutor;
         const finding: RepairFindingKind = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
           ? 'validation_failed'
           : 'review_blocking';
-        const admission = createRepairAdmissionSnapshot(
+        const admission = { ...createRepairAdmissionSnapshot(
           authority, finding, run.headSha, run.pullRequest.number, repairExecution, now(),
-        );
-        const admittedRun: Run = { ...run, repairAdmissions: [...(run.repairAdmissions ?? []), admission] };
-        const startedFix = applyTransition(admittedRun, { type: 'start_fix' }, now());
+        ), attemptBinding };
+        const startedFix = applyTransition(run, { type: 'start_fix', repairAdmission: admission }, now());
         // An authority snapshot is useful only if it was appended against the
         // exact durable Run that was preflighted. Never invoke a worker after a
         // stale CAS, because another writer may have replaced its HEAD or PR.
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, startedFix)) {
+        if (!updateReviewRun(store, run, startedFix)) {
           return parkStaleRepairAdmission(run.id, run, store, now);
         }
         run = startedFix;
+        repairAttempt = activeRepairAdmission(run);
+        if (repairAttempt === null) {
+          return parkRepairAuthority(run, 'Repair admission history does not bind this exact unfinished start_fix.', store, now);
+        }
         const admissionPreflight = await checkOwnedFix();
         if (admissionPreflight !== null) return admissionPreflight;
       }
+      if (repairAttempt !== null) {
+        repairStartsWithFreshExecutor = repairAttempt.snapshot.attemptBinding?.freshExecutor === true && repairAttempt.handoff === undefined;
+      }
       if (authority === undefined) {
-        run = applyTransition(run, { type: 'start_fix' }, now());
-        store.update(run);
+        const startedFix = applyTransition(run, { type: 'start_fix' }, now());
+        if (!updateReviewRun(store, run, startedFix)) return staleReviewOutcome(run.id, run, store);
+        run = startedFix;
       }
 
       const blockingFindings = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
@@ -445,14 +491,18 @@ export async function runReviewLoop(
           return parkBootstrap(run, new Error('Promoted isolated Luna repair has no safe same-repository standalone workspace authority.'), store, now);
         }
         try {
+          const expected = run;
           const bootstrap = await repairBootstrap.plan({
             runId: run.id, target, baseBranch, baseSha, publicationBranch,
           });
+          if (!updateReviewRun(store, expected, expected)) return staleReviewOutcome(run.id, expected, store);
+          deps.assertCanMutate?.(bootstrap.workspacePath);
           if (bootstrap.bootstrapKind !== repairBootstrap.bootstrapKind) {
             return parkBootstrap(run, new Error('Promoted isolated Luna repair bootstrap boundary does not match its transport.'), store, now);
           }
-          run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
-          store.update(run);
+          const prepared = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
+          if (!updateReviewRun(store, expected, prepared)) return staleReviewOutcome(run.id, expected, store);
+          run = prepared;
         } catch (error) {
           return parkBootstrap(run, error, store, now);
         }
@@ -465,6 +515,7 @@ export async function runReviewLoop(
           return parkBootstrap(run, new Error('Repair transport is incompatible with the persisted workspace boundary.'), store, now);
         }
         try {
+          deps.assertCanMutate?.(run.bootstrap.workspacePath);
           await repairBootstrap.prepare({
             runId: run.id, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
             existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: progressBaseSha },
@@ -475,6 +526,37 @@ export async function runReviewLoop(
         }
         const recovered = await checkOwnedFix();
         if (recovered !== null) return recovered;
+      }
+      let governedRepairAgent: ImplementationAgent | undefined;
+      if (deps.governedPublicationRequired === true) {
+        const governedPublication = Object.freeze({ required: true as const, continuation: true });
+        const request = {
+          target,
+          baseSha: progressBaseSha ?? '',
+          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch }),
+          ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.agentResult?.sessionId !== undefined ? { sessionId: run.agentResult.sessionId } : {}),
+          ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.executor !== undefined ? { executor: run.executor } : {}),
+          runtimeOwnership: {
+            runId: run.id,
+            generation: repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id,
+            ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+          },
+          governedPublication,
+          ...(repairExecution === undefined ? {} : { execution: repairExecution }),
+        };
+        let prepared;
+        try {
+          prepared = implementation.prepareGovernedInvocation?.(request);
+        } catch (error) {
+          const reason = `Governed review repair is on hold because source-qualified publication preflight failed: ${errorMessage(error)} No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`;
+          return parkRepairAuthority(run, reason, store, now, [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION]);
+        }
+        if (prepared?.status !== 'qualified' || !prepared.agent || typeof prepared.agent !== 'object' ||
+            !hasGovernedPublicationConfinement(prepared.agent)) {
+          const reason = `Governed review repair is on hold because no source-qualified publication boundary is available. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`;
+          return parkRepairAuthority(run, reason, store, now, [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION]);
+        }
+        governedRepairAgent = prepared.agent;
       }
       const workerSpawn = recordSpawnTelemetry(run, {
         role: 'worker',
@@ -489,30 +571,38 @@ export async function runReviewLoop(
       }, now());
       const beforeSpawn = run;
       run = workerSpawn.run;
-      // Admission's CAS also fenced IMPLEMENTING, but telemetry is another
-      // durable transition before the side effect. Re-fence it so a later
-      // cancellation/park cannot be overwritten or followed by a worker.
-      if (authority !== undefined) {
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(beforeSpawn, run)) {
-          return parkStaleRepairAdmission(run.id, beforeSpawn, store, now);
-        }
-      } else {
-        store.update(run);
+      // Fence the telemetry handoff in every mode, then fence it again after
+      // awaited capability resolution immediately before entering the worker.
+      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(beforeSpawn, run)) {
+        return parkStaleRepairAdmission(run.id, beforeSpawn, store, now);
       }
-      let fixResult;
-      try {
-        fixResult = await implementation.run({
-          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: repairInstructions,
-          ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
-          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
-          ...(isolatedLuna ? {} : { capabilities: await deps.resolveImplementationCapabilities?.() }),
-          ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
-          ...(repairExecution === undefined ? {} : { execution: repairExecution }),
-        });
-      } catch (error) {
-        if (isWorkspaceGuardFailure(error)) return parkBootstrap(run, error, store, now);
+      const workerHandoff = run;
+      const recordWorkerInvocationFailure = (error: unknown): ReviewLoopResult | null => {
+        if (isWorkspaceGuardFailure(error)) {
+          if (error.executor !== undefined && repairAttempt !== null && repairAttempt.snapshot.attemptBinding !== undefined) {
+            const failedResult: AgentResult = { exitStatus: 'failure', summary: error.message, executor: error.executor, sessionId: error.executor.sessionId };
+            let captured = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(failedResult, {
+              ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
+              ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
+              ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
+            }, 'worker', workerSpawn.invocationId), now());
+            try {
+              captured = applyTransition(captured, {
+                type: repairAttempt.handoff === undefined ? 'repair_executor_handoff' : 'repair_executor_continued',
+                repairAgentResult: failedResult,
+              }, now());
+            } catch { /* An unqualified post-execution identity cannot replace the predecessor. */ }
+            const parked = createBootstrapFailureRun(captured, error, now);
+            if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, parked.run)) {
+              return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+            }
+            run = parked.run;
+            return { outcome: 'needs_human', ...parked };
+          }
+          return parkBootstrap(run, error, store, now, workerHandoff);
+        }
         const detail = error instanceof Error ? error.message : String(error);
-        run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+        const failed = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult({
           exitStatus: 'failure',
           summary: detail,
           diagnostics: ['AGENT_RUNTIME_INVOCATION_FAILED: provider invocation threw before returning an AgentResult'],
@@ -521,19 +611,95 @@ export async function runReviewLoop(
           ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
           ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
         }, 'worker', workerSpawn.invocationId), now());
-        store.update(run);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, failed)) {
+          return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+        }
+        run = failed;
+        return null;
+      };
+      let capabilities;
+      try {
+        capabilities = isolatedLuna ? undefined : await deps.resolveImplementationCapabilities?.();
+      } catch (error) {
+        const outcome = recordWorkerInvocationFailure(error);
+        if (outcome !== null) return outcome;
         throw error;
       }
-      run = recordCompletionTelemetry(run, createCompletionInputFromResult(fixResult, {
+      // Strengthen physical workspace evidence while execution is still
+      // provably pre-worker, so a normal overlap rejection can release the
+      // admission generation through the CLI pre-execution path.
+      try {
+        deps.assertCanMutate?.(run.bootstrap?.workspacePath);
+        options.onExecutionStart?.();
+        // The callback marks uncertainty and can race with ownership changes.
+        // Recheck only the generation now; evidence is already strengthened.
+        deps.assertCurrentMutation?.();
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, workerHandoff)) {
+          return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+        }
+      } catch (error) {
+        const outcome = recordWorkerInvocationFailure(error);
+        if (outcome !== null) return outcome;
+        throw error;
+      }
+      let fixResult;
+      try {
+        fixResult = await (governedRepairAgent ?? implementation).run({
+          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: repairInstructions,
+          ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
+          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
+          ...(capabilities === undefined ? {} : { capabilities }),
+          beforePublish: () => {
+            if (!updateReviewRun(store, workerHandoff, workerHandoff)) {
+              throw new Error('Run changed before worker-router review-fix publication.');
+            }
+            deps.assertCurrentMutation?.();
+            deps.assertCanPublish?.();
+          },
+          ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
+          runtimeOwnership: {
+            runId: run.id,
+            generation: repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id,
+            ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+          },
+          ...(deps.governedPublicationRequired === true ? {
+            governedPublication: Object.freeze({ required: true as const, continuation: true }),
+          } : {}),
+          ...(repairExecution === undefined ? {} : { execution: repairExecution }),
+        });
+      } catch (error) {
+        const outcome = recordWorkerInvocationFailure(error);
+        if (outcome !== null) return outcome;
+        throw error;
+      }
+      let completed = recordCompletionTelemetry(workerHandoff, createCompletionInputFromResult(fixResult, {
         ...(repairExecution?.executor === undefined ? {} : { provider: repairExecution.executor }),
         ...(repairExecution?.model === undefined ? {} : { model: repairExecution.model }),
         ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
       }, 'worker', workerSpawn.invocationId), now());
-      store.update(run);
+      if (repairAttempt !== null && repairAttempt.snapshot.attemptBinding !== undefined) {
+        try {
+          completed = applyTransition(completed, {
+            type: repairAttempt.handoff === undefined ? 'repair_executor_handoff' : 'repair_executor_continued',
+            repairAgentResult: fixResult,
+          }, now());
+        } catch (error) {
+          const persistedTelemetry = completed;
+          if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, persistedTelemetry)) {
+            return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+          }
+          run = persistedTelemetry;
+          return parkRepairAuthority(run, `Repair executor handoff is unqualified: ${errorMessage(error)} No provider identity was adopted.`, store, now);
+        }
+      }
+      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, completed)) {
+        return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+      }
+      run = completed;
       if (fixResult.exitStatus === 'failure') {
         const takeoverReason = humanTakeoverReason(fixResult);
         if (takeoverReason !== undefined) {
-          run = applyTransition(
+          const takeover = applyTransition(
             run,
             {
               type: 'escalate',
@@ -546,16 +712,18 @@ export async function runReviewLoop(
             },
             now(),
           );
-          store.update(run);
+          if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, takeover)) return parkStaleRepairAdmission(run.id, completed, store, now);
+          run = takeover;
           return { outcome: 'needs_human', run, reason: takeoverReason };
         }
-        run = applyTransition(run, { type: 'agent_failed', agentResult: fixResult, headSha: fixResult.headSha }, now());
-        store.update(run);
+        const failed = applyTransition(run, { type: 'agent_failed', agentResult: fixResult, headSha: fixResult.headSha }, now());
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, failed)) return parkStaleRepairAdmission(run.id, completed, store, now);
+        run = failed;
         return { outcome: 'failed', run, reason: `Implementation failed while fixing review findings: ${fixResult.summary}` };
       }
       if (fixResult.headSha === undefined || fixResult.headSha === run.headSha) {
         const reason = 'Implementation did not produce a new exact HEAD after review changes.';
-        run = applyTransition(
+        const noHead = applyTransition(
           run,
           {
             type: 'escalate',
@@ -567,20 +735,29 @@ export async function runReviewLoop(
           },
           now(),
         );
-        store.update(run);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, noHead)) return parkStaleRepairAdmission(run.id, completed, store, now);
+        run = noHead;
         return { outcome: 'needs_human', run, reason };
       }
 
       if (run.bootstrap !== undefined) {
         if (repairBootstrap === undefined || progressBaseSha === undefined) {
-          return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now);
+          return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now, run);
         }
         try {
+          const publicationRun = run;
           await repairBootstrap.verifyDurable({
             identity: run.bootstrap, expectedHeadSha: fixResult.headSha, progressBaseSha, workspaceGuard,
+            beforePublish: () => {
+              if (!updateReviewRun(store, publicationRun, publicationRun)) {
+                throw new Error('Run changed before standalone review-fix publication.');
+              }
+              deps.assertCurrentMutation?.();
+              deps.assertCanPublish?.();
+            },
           });
         } catch (error) {
-          return parkBootstrap(run, error, store, now);
+          return parkBootstrap(run, error, store, now, run);
         }
       }
 
@@ -591,7 +768,7 @@ export async function runReviewLoop(
         validatedHead = validatedSnapshot.headSha;
       } catch (error) {
         const reason = renderFailure('GitHub live-state validation failed after the fix', error);
-        run = applyTransition(
+        const failedValidation = applyTransition(
           run,
           {
             type: 'escalate',
@@ -603,12 +780,13 @@ export async function runReviewLoop(
           },
           now(),
         );
-        store.update(run);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, failedValidation)) return parkStaleRepairAdmission(run.id, run, store, now);
+        run = failedValidation;
         return { outcome: 'needs_human', run, reason };
       }
       if (validatedHead !== fixResult.headSha) {
         const reason = `Live GitHub HEAD ${validatedHead ?? '(none)'} does not match the fix HEAD ${fixResult.headSha}.`;
-        run = applyTransition(
+        const movedHead = applyTransition(
           run,
           {
             type: 'escalate',
@@ -622,22 +800,25 @@ export async function runReviewLoop(
           },
           now(),
         );
-        store.update(run);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, movedHead)) return parkStaleRepairAdmission(run.id, run, store, now);
+        run = movedHead;
         return { outcome: 'needs_human', run, reason };
       }
       const conflict = pullRequestIdentityConflict(run, validatedSnapshot!, { allowHeadAdvance: true });
       if (conflict !== null || validatedSnapshot!.pullRequest === null ||
         (run.pullRequest !== undefined && validatedSnapshot!.pullRequest.number !== run.pullRequest.number)) {
         const reason = conflict ?? 'Live pull request disappeared or changed after the review fix.';
-        run = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] } }, now());
-        store.update(run);
+        const identityConflict = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] } }, now());
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, identityConflict)) return parkStaleRepairAdmission(run.id, run, store, now);
+        run = identityConflict;
         return { outcome: 'needs_human', run, reason };
       }
-      run = applyTransition(run, {
+      const fixed = applyTransition(run, {
         type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha,
         pullRequest: { number: validatedSnapshot!.pullRequest.number, headSha: fixResult.headSha },
       }, now());
-      store.update(run);
+      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, fixed)) return parkStaleRepairAdmission(run.id, run, store, now);
+      run = fixed;
       // A new fix creates a new exact HEAD. Validation is owned by the outer
       // workflow so it must collect fresh local and hosted evidence before a
       // reviewer can see that HEAD.
@@ -650,7 +831,7 @@ export async function runReviewLoop(
 
     if (durableRepairAttempts(run) >= options.maxAttempts) {
       const reason = `Post-implementation repair budget of ${options.maxAttempts} attempt(s) was already reached.`;
-      run = applyTransition(
+      const escalated = applyTransition(
         run,
         {
           type: 'escalate',
@@ -662,7 +843,8 @@ export async function runReviewLoop(
         },
         now(),
       );
-      store.update(run);
+      if (!updateReviewRun(store, run, escalated)) return staleReviewOutcome(run.id, run, store);
+      run = escalated;
       return { outcome: 'needs_human', run, reason };
     }
 
@@ -670,11 +852,12 @@ export async function runReviewLoop(
     let liveSnapshot: GitHubLiveSnapshot;
     try {
       liveSnapshot = await github.readLiveSnapshot(target);
+      if (!updateReviewRun(store, run, run)) return staleReviewOutcome(run.id, run, store);
       liveHead = liveSnapshot.headSha;
     } catch (error) {
       const reason = renderFailure('GitHub live-state validation failed', error);
       const type = isRetryable(error) ? 'escalate' : 'fail';
-      run = applyTransition(
+      const failure = applyTransition(
         run,
         type === 'escalate'
           ? {
@@ -688,7 +871,8 @@ export async function runReviewLoop(
           : { type, reason },
         now(),
       );
-      store.update(run);
+      if (!updateReviewRun(store, run, failure)) return staleReviewOutcome(run.id, run, store);
+      run = failure;
       return type === 'escalate'
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
@@ -698,7 +882,7 @@ export async function runReviewLoop(
         liveHead === null
           ? `No live PR HEAD for ${formatTarget(target)}.`
           : `Live GitHub HEAD ${liveHead} does not match the run HEAD ${run.headSha ?? '(none)'}.`;
-      run = applyTransition(
+      const escalated = applyTransition(
         run,
         {
           type: 'escalate',
@@ -712,7 +896,8 @@ export async function runReviewLoop(
         },
         now(),
       );
-      store.update(run);
+      if (!updateReviewRun(store, run, escalated)) return staleReviewOutcome(run.id, run, store);
+      run = escalated;
       return { outcome: 'needs_human', run, reason };
     }
     const identityConflict = pullRequestIdentityConflict(run, liveSnapshot, { allowHeadAdvance: true });
@@ -724,6 +909,7 @@ export async function runReviewLoop(
 
     const reviewHeadSha = run.headSha;
     if (reviewHeadSha === undefined) return parkBootstrap(run, new Error('Reviewer admission requires an exact candidate HEAD.'), store, now);
+    if (!updateReviewRun(store, run, run)) return staleReviewOutcome(run.id, run, store);
     const reviewerSpawnsForHead = (run.telemetry?.events ?? []).filter(
       (event) => event.kind === 'spawn' && event.role === 'reviewer' && event.headSha === reviewHeadSha,
     ).length;
@@ -734,10 +920,13 @@ export async function runReviewLoop(
       contextMode: 'bounded',
       contextJustification: 'live-target-bounded',
     }, now());
+    if (!updateReviewRun(store, run, reviewerSpawn.run)) return staleReviewOutcome(run.id, run, store);
     run = reviewerSpawn.run;
-    store.update(run);
+    const reviewerRun = run;
     let reviewResult: ReviewResult;
     try {
+      options.onExecutionStart?.();
+      if (!updateReviewRun(store, reviewerRun, reviewerRun)) return staleReviewOutcome(run.id, reviewerRun, store);
       reviewResult = await reviewer.review({
         target,
         headSha: reviewHeadSha,
@@ -747,13 +936,13 @@ export async function runReviewLoop(
       });
     } catch (error) {
       const reason = renderFailure('Reviewer failed', error);
-      run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+      const failedTelemetry = recordCompletionTelemetry(reviewerRun, createCompletionInputFromResult({
         exitStatus: 'failure',
         diagnostics: ['REVIEWER_INVOCATION_FAILED: reviewer adapter threw before returning a ReviewResult'],
       }, {}, 'reviewer', reviewerSpawn.invocationId), now());
       const type = isRetryable(error) ? 'escalate' : 'fail';
-      run = applyTransition(
-        run,
+      const failed = applyTransition(
+        failedTelemetry,
         type === 'escalate'
           ? {
               type,
@@ -766,20 +955,23 @@ export async function runReviewLoop(
           : { type, reason },
         now(),
       );
-      store.update(run);
+      if (!updateReviewRun(store, reviewerRun, failed)) return staleReviewOutcome(run.id, reviewerRun, store);
+      run = failed;
       return type === 'escalate'
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
     }
-    run = recordCompletionTelemetry(run, createCompletionInputFromResult({
+    const completedReview = recordCompletionTelemetry(reviewerRun, createCompletionInputFromResult({
       exitStatus: 'success',
       ...(reviewResult.telemetry === undefined ? {} : { telemetry: reviewResult.telemetry }),
     }, {}, 'reviewer', reviewerSpawn.invocationId), now());
-    store.update(run);
+    if (!updateReviewRun(store, reviewerRun, completedReview)) return staleReviewOutcome(run.id, reviewerRun, store);
+    run = completedReview;
 
     let postReviewSnapshot: GitHubLiveSnapshot;
     try {
       postReviewSnapshot = await github.readLiveSnapshot(target);
+      if (!updateReviewRun(store, run, run)) return staleReviewOutcome(run.id, run, store);
     } catch (error) {
       const reason = renderFailure('GitHub live-state validation failed after reviewer completion', error);
       return parkAdmission(run, reason, store, now);
@@ -790,7 +982,7 @@ export async function runReviewLoop(
 
     if (reviewResult.headSha !== run.headSha) {
       const reason = `Reviewer returned HEAD ${reviewResult.headSha} for run HEAD ${run.headSha ?? '(none)'}.`;
-      run = applyTransition(
+      const escalated = applyTransition(
         run,
         {
           type: 'escalate',
@@ -802,17 +994,20 @@ export async function runReviewLoop(
         },
         now(),
       );
-      store.update(run);
+      if (!updateReviewRun(store, run, escalated)) return staleReviewOutcome(run.id, run, store);
+      run = escalated;
       return { outcome: 'needs_human', run, reason };
     }
 
     if (reviewResult.verdict === 'approve') {
-      run = applyTransition(run, { type: 'review_approved', reviewResult }, now(), afterReview.activeValidation);
-      store.update(run);
+      const approved = applyTransition(run, { type: 'review_approved', reviewResult }, now(), afterReview.activeValidation);
+      if (!updateReviewRun(store, run, approved)) return staleReviewOutcome(run.id, run, store);
+      run = approved;
       return { outcome: 'approved', run };
     }
 
-    run = applyTransition(run, { type: 'changes_requested', reviewResult }, now(), afterReview.activeValidation);
-    store.update(run);
+    const changesRequested = applyTransition(run, { type: 'changes_requested', reviewResult }, now(), afterReview.activeValidation);
+    if (!updateReviewRun(store, run, changesRequested)) return staleReviewOutcome(run.id, run, store);
+    run = changesRequested;
   }
 }

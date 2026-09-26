@@ -60,6 +60,25 @@ describe('standalone Luna bootstrap', () => {
     assert.equal(fixture.git(fixture.remote, ['rev-parse', `refs/heads/${identity.branch}`]).trim(), head);
   });
 
+  it('runs the synchronous durable publication fence immediately before push and never pushes when it fails', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-pre-push-fence', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request);
+    await bootstrap.prepare({ ...request, existing: identity });
+    const head = fixture.commit(identity.workspacePath, 'luna.txt', 'candidate\n');
+    const before = fixture.commands.length;
+    const ordered: string[] = [];
+    await assert.rejects(() => bootstrap.verifyDurable({
+      identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha,
+      beforePublish: () => { ordered.push('fence'); throw new Error('stale durable Run'); },
+    }), /stale durable Run/);
+    const publicationCommands = fixture.commands.slice(before).filter((command) => command.args[0] === 'push');
+    assert.deepEqual(ordered, ['fence']);
+    assert.equal(publicationCommands.length, 0);
+    assert.equal(fixture.git(fixture.remote, ['for-each-ref', 'refs/heads/tachiko/luna-pre-push-fence']).trim(), '');
+  });
+
   it('rejects an initial no-progress result before host publication', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });

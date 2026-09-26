@@ -7,7 +7,10 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
+import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
+import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
+import { ensureDurableDirectory, syncDirectory } from '../src/durable-directory.js';
 import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, operationalRunProjection, sha256 } from '../src/operational/projection.js';
 import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
 
@@ -54,6 +57,131 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.deepEqual(store.read('r1'), newRun('r1'));
   });
 
+  it('rejects rewriting an existing history record even when its length is unchanged', () => {
+    const { store } = tempStore();
+    const initial = newRun('history-immutable');
+    store.create(initial);
+    const started = applyTransition(initial, { type: 'start' }, T0);
+    store.update(started);
+    const rewritten = {
+      ...started,
+      history: started.history.map((event, index) => index === 0 ? { ...event, reason: 'forged same-length history' } : event),
+    };
+    assert.throws(() => store.update(rewritten), /Run history is append-only/);
+    assert.equal(store.read(initial.id)?.history[0]?.reason, undefined);
+  });
+
+  it('syncs Run files before rename and reports uncertain parent-sync failures without rolling back visible bytes', () => {
+    const { dir } = tempStore();
+    const initial = newRun('durability-run');
+    new JsonFileStore({ dir }).create(initial);
+    const filePath = path.join(dir, `${initial.id}.json`);
+    const originalBytes = readFileSync(filePath, 'utf8');
+    const next = applyTransition(initial, { type: 'start' }, T0);
+
+    const preRenameFailure = new JsonFileStore({ dir, syncForDurability: (_fd, target) => {
+      if (target === 'file') throw new Error('injected Run file sync failure');
+    } });
+    assert.throws(() => preRenameFailure.update(next), /Run file sync failure/);
+    assert.equal(readFileSync(filePath, 'utf8'), originalBytes, 'pre-rename failure preserves destination bytes');
+    assert.equal(readdirSync(dir).some((name) => name.startsWith(`${initial.id}.json.`) && name.endsWith('.tmp')), false, 'pre-rename failure removes only the attempt temp');
+
+    const postRenameFailure = new JsonFileStore({ dir, syncForDurability: (_fd, target) => {
+      if (target === 'directory') throw new Error('injected Run parent sync failure');
+    } });
+    assert.throws(() => postRenameFailure.update(next), /Run parent sync failure/);
+    const durableNext = new JsonFileStore({ dir }).read(initial.id);
+    assert.equal(durableNext?.state, next.state, 'post-rename failure preserves the visible committed candidate');
+    assert.equal(durableNext?.history.at(-1)?.type, 'start');
+    const projection = JSON.parse(readFileSync(operationalProjectionPath(dir, initial.id), 'utf8')) as { sourceDigest: string };
+    assert.equal(projection.sourceDigest, sha256(originalBytes), 'projection remains at the last confirmed durable Run write');
+
+    if (durableNext === null) throw new Error('expected durable Run after rename');
+    const casNext = { ...durableNext, updatedAt: '2026-09-24T00:00:01.000Z' };
+    assert.throws(() => postRenameFailure.updateIfUnchanged(durableNext, casNext), /Run parent sync failure/);
+    assert.equal(new JsonFileStore({ dir }).read(initial.id)?.updatedAt, casNext.updatedAt, 'CAS durability uncertainty is thrown, never reported as mismatch');
+  });
+
+  it('does not admit or project a Run when create file sync fails, and preserves unrelated temp files', () => {
+    const { dir } = tempStore();
+    const run = newRun('create-sync-failure');
+    const unrelatedTemp = path.join(dir, `${run.id}.json.other-attempt.tmp`);
+    writeFileSync(unrelatedTemp, 'preserve this unrelated temp');
+    const store = new JsonFileStore({ dir, syncForDurability: (_fd, target) => {
+      if (target === 'file') throw new Error('injected create file sync failure');
+    } });
+
+    assert.throws(() => store.create(run), /create file sync failure/);
+    assert.equal(existsSync(path.join(dir, `${run.id}.json`)), false, 'failed pre-admission create leaves no Run destination');
+    assert.equal(existsSync(operationalProjectionPath(dir, run.id)), false, 'failed pre-admission create emits no projection');
+    assert.deepEqual(readdirSync(dir).filter((name) => name.startsWith(`${run.id}.json.`) && name.endsWith('.tmp')), [path.basename(unrelatedTemp)]);
+  });
+
+  it('does not make a fresh Run store available until each visible hierarchy edge can be synced', () => {
+    const { dir } = tempStore();
+    const runsDir = path.join(dir, 'runs', 'nested');
+    const failedParent = path.join(dir, 'runs');
+    const observedParents: string[] = [];
+    let fail = true;
+    const syncHierarchy = (parent: string) => {
+      observedParents.push(parent);
+      if (fail && parent === failedParent) throw new Error('injected Run hierarchy sync failure');
+      syncDirectory(parent);
+    };
+
+    assert.throws(() => new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy }), /Run hierarchy sync failure/);
+    assert.equal(existsSync(runsDir), true, 'created directories remain visible after uncertain parent sync');
+    assert.equal(existsSync(path.join(runsDir, 'run.json')), false);
+    assert.equal(observedParents.at(-1), failedParent);
+
+    observedParents.length = 0;
+    assert.throws(() => new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy }), /Run hierarchy sync failure/);
+    assert.equal(observedParents.at(-1), failedParent, 'retry re-syncs the parent even though the child is already visible');
+
+    fail = false;
+    const store = new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy });
+    store.create(newRun('durable-tree-run'));
+    assert.equal(store.read('durable-tree-run')?.id, 'durable-tree-run');
+  });
+
+  it('validates store options before hierarchy creation and rejects regular-file path components before Run publication', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-hierarchy-shape-'));
+    tmpDirs.push(directory);
+    const invalidOptionsDir = path.join(directory, 'invalid-options', 'runs');
+    let hierarchySyncs = 0;
+    assert.throws(() => new JsonFileStore({
+      dir: invalidOptionsDir,
+      mutationLockTimeoutMs: -1,
+      syncDirectoryHierarchy: () => { hierarchySyncs += 1; },
+    }), /mutationLockTimeoutMs/);
+    assert.equal(existsSync(path.dirname(invalidOptionsDir)), false, 'invalid options do not create a partial hierarchy');
+    assert.equal(hierarchySyncs, 0, 'invalid options do not sync hierarchy edges');
+
+    const blocker = path.join(directory, 'regular-file');
+    writeFileSync(blocker, 'preserve this file');
+    const blockedDir = path.join(blocker, 'nested-runs');
+    const run = newRun('blocked-hierarchy-run');
+    assert.throws(() => new JsonFileStore({ dir: blockedDir }));
+    assert.equal(readFileSync(blocker, 'utf8'), 'preserve this file', 'the existing regular file is preserved');
+    assert.equal(existsSync(path.join(blockedDir, `${run.id}.json`)), false, 'no Run destination is published');
+    assert.equal(existsSync(operationalProjectionPath(blockedDir, run.id)), false, 'no operational projection is published');
+  });
+
+  it('syncs the containing parent in order for every absolute directory component', () => {
+    const { dir } = tempStore();
+    const target = path.join(dir, 'outer', 'middle', 'leaf');
+    const parents: string[] = [];
+    const root = path.parse(target).root;
+    let componentPath = root;
+    const expectedParents = target.slice(root.length).split(path.sep).filter(Boolean).map((component) => {
+      const parent = componentPath;
+      componentPath = path.join(componentPath, component);
+      return parent;
+    });
+    ensureDurableDirectory(target, { syncDirectoryHierarchy: (parent) => { parents.push(parent); syncDirectory(parent); } });
+    assert.deepEqual(parents, expectedParents);
+  });
+
   it('writes a secret-free operational projection bound to the committed raw bytes', () => {
     const { store, dir } = tempStore();
     let run = applyTransition(newRun('projected'), { type: 'start' }, T0);
@@ -91,6 +219,35 @@ describe('JsonFileStore — persistence round-trips', () => {
     };
     assert.equal(operationalRunProjection(run, '{}').reviewFixActive, true);
     assert.equal(operationalRunProjection(newRun('not-a-review-fix'), '{}').reviewFixActive, undefined);
+  });
+
+  it('rejects orphaned or mismatched new-format repair admission markers on JSON read', () => {
+    const { store, dir } = tempStore();
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const predecessor = {
+      ...newRun('orphan-repair-marker'), state: 'IMPLEMENTING' as const, headSha: 'head-sha',
+      pullRequest: { number: 7, headSha: 'head-sha' }, repairTaskShapeAuthority: authority,
+    };
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+    const binding = createRepairAttemptBinding(predecessor, execution);
+    const valid = {
+      ...predecessor,
+      history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0, repairAdmissionIndex: 0 }],
+      repairAdmissions: [{ ...receipt, attemptBinding: binding }],
+    };
+    store.create(valid);
+    const file = path.join(dir, 'orphan-repair-marker.json');
+    for (const damage of [
+      (json: Record<string, any>) => { delete json.repairAdmissions[0].attemptBinding; },
+      (json: Record<string, any>) => { json.history[0].repairAdmissionIndex = 1; },
+    ]) {
+      const json = JSON.parse(readFileSync(file, 'utf8')) as Record<string, any>;
+      damage(json);
+      writeFileSync(file, JSON.stringify(json), 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(valid.id), /corrupt or incompatible/);
+      writeFileSync(file, JSON.stringify(valid), 'utf8');
+    }
   });
 
   it('projects the selected provider and profile before an agent session exists', () => {

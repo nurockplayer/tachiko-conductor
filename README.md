@@ -185,10 +185,14 @@ bounded model-free safety poll.
 `tachiko dispatch once` now takes a small local lock before reading GitHub. It
 complements (but never replaces) the GitHub claim lease: a concurrent same-host
 invocation returns `{ "outcome": "already_running" }` without changing GitHub
-or starting a second executor. The default lock lives outside the repository at
-`~/.tachiko-conductor/dispatch/once.lock`; override it only with an absolute
-`TACHIKO_DISPATCH_LOCK_PATH`. A malformed or live lock fails closed; a lock for
-a provably absent PID is retried once.
+or starting a second executor. The singleton lock and short admission lock
+both live outside the repository under the effective OS account's physical
+home at `~/.tachiko-conductor/dispatch/once.lock` and
+`~/.tachiko-conductor/dispatch/once.lock.admission`. The optional
+`TACHIKO_DISPATCH_LOCK_PATH` and `TACHIKO_DISPATCH_ADMISSION_LOCK_PATH` values
+may alias those canonical physical paths; divergent values fail closed. A
+malformed or live lock fails closed; a lock for a provably absent PID is
+retried once.
 
 For macOS, use `launchd` to supervise the continuous driver. First create a
 private, absolute-path wrapper that supplies the explicitly selected dispatch,
@@ -491,6 +495,11 @@ non-zero exit code.
 `agent_succeeded`, `agent_failed`, `review_approved` and `changes_requested`
 require result payloads supplied by adapters; `run transition` rejects them
 explicitly. Drive those through the domain API (`applyTransition`).
+
+`run transition <id> merged` requires a direct live read of the Run's persisted
+pull request and exact head/branch/base identity. It settles only a
+`workflow_settled` parked admission; retries reconcile the matching private
+generation receipt under the dispatch and registry locks.
 
 ## Container-owned worker-router execution
 

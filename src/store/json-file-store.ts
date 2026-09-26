@@ -1,4 +1,5 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '../dispatch/invocation-lock.js';
@@ -8,7 +9,8 @@ import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetr
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
-import { isRepairAdmissionSnapshot, isRepairTaskShapeAuthority } from '../domain/repair-admission.js';
+import { isRepairAdmissionSnapshot, isRepairHandoffRecord, isRepairTaskShapeAuthority } from '../domain/repair-admission.js';
+import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -40,6 +42,10 @@ export interface JsonFileStoreOptions {
   readonly mutationLockRetryMs?: number;
   /** Test seam: runs after CAS comparison succeeds while the mutation fence is still held. */
   readonly beforeConditionalWrite?: () => void;
+  /** Deterministic durability fault seam; defaults to fsyncSync for both file and parent directory. */
+  readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void;
+  /** Path-aware fault seam for the Run directory hierarchy. */
+  readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
 }
 
 const ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -190,8 +196,74 @@ function isTransitionRecord(value: unknown): boolean {
     typeof record.to === 'string' &&
     WORKFLOW_STATES.includes(record.to as WorkflowState) &&
     typeof record.at === 'string' &&
-    isOptionalString(record.reason)
+    isOptionalString(record.reason) &&
+    (record.repairAdmissionIndex === undefined || (record.type === 'start_fix' && Number.isSafeInteger(record.repairAdmissionIndex) && (record.repairAdmissionIndex as number) >= 0)) &&
+    (record.repairHandoff === undefined
+      ? record.type !== 'repair_executor_handoff' && record.type !== 'repair_executor_continued'
+      : (record.type === 'repair_executor_handoff' || record.type === 'repair_executor_continued') && isRepairHandoffRecord(record.repairHandoff) && record.from === 'IMPLEMENTING' && record.to === 'IMPLEMENTING')
   );
+}
+
+function isRepairHistoryCoherent(run: Record<string, unknown>): boolean {
+  const history = run.history as readonly Record<string, unknown>[];
+  const admissions = (run.repairAdmissions ?? []) as readonly Record<string, unknown>[];
+  const handoffs = history.flatMap((entry, index) => entry.repairHandoff === undefined ? [] : [{ entry, index, handoff: entry.repairHandoff as Record<string, unknown> }]);
+  const markers = new Map<number, number>();
+  for (const [historyIndex, event] of history.entries()) {
+    if (event.repairAdmissionIndex === undefined) continue;
+    if (event.type !== 'start_fix' || event.from !== 'CHANGES_REQUESTED' || event.to !== 'IMPLEMENTING' || !Number.isSafeInteger(event.repairAdmissionIndex) ||
+        (event.repairAdmissionIndex as number) < 0 || markers.has(event.repairAdmissionIndex as number)) return false;
+    markers.set(event.repairAdmissionIndex as number, historyIndex);
+    const admission = admissions[event.repairAdmissionIndex as number];
+    const binding = admission?.attemptBinding as Record<string, unknown> | undefined;
+    if (admission === undefined || binding === undefined || binding.admissionIndex !== event.repairAdmissionIndex || binding.startFixHistoryIndex !== historyIndex) return false;
+  }
+  for (const [admissionIndex, admission] of admissions.entries()) {
+    const binding = admission.attemptBinding as Record<string, unknown> | undefined;
+    if (binding === undefined) continue;
+    if (binding.admissionIndex !== admissionIndex || !Number.isSafeInteger(binding.startFixHistoryIndex)) return false;
+    const event = history[binding.startFixHistoryIndex as number];
+    if (event?.type !== 'start_fix' || event.from !== 'CHANGES_REQUESTED' || event.to !== 'IMPLEMENTING' || event.repairAdmissionIndex !== admissionIndex ||
+        markers.get(admissionIndex) !== binding.startFixHistoryIndex) return false;
+  }
+  const consumed = new Map<string, Record<string, unknown>>();
+  for (const { handoff, index: eventIndex, entry } of handoffs) {
+    const key = `${String(handoff.admissionHistoryIndex)}:${String(handoff.startFixHistoryIndex)}`;
+    const prior = consumed.get(key);
+    if (entry.type === 'repair_executor_handoff' ? prior !== undefined : prior === undefined) return false;
+    consumed.set(key, handoff);
+    const admission = admissions[handoff.admissionHistoryIndex as number];
+    const binding = admission?.attemptBinding as Record<string, unknown> | undefined;
+    if (admission === undefined || binding === undefined || binding.admissionIndex !== handoff.admissionHistoryIndex || binding.startFixHistoryIndex !== handoff.startFixHistoryIndex ||
+        entry.from !== 'IMPLEMENTING' || entry.to !== 'IMPLEMENTING' || eventIndex <= (binding.startFixHistoryIndex as number)) return false;
+    const nextBoundary = history.findIndex((event, index) => index > (binding.startFixHistoryIndex as number) &&
+      (event.type === 'start_fix' || event.type === 'agent_succeeded' || event.type === 'agent_failed'));
+    if (nextBoundary >= 0 && eventIndex >= nextBoundary) return false;
+    const execution = (admission.execution ?? {}) as Record<string, unknown>;
+    const provider = execution.executor;
+    const outcome = handoff.outcome as Record<string, unknown>;
+    if (outcome.kind === 'sessionless') {
+      if (provider !== 'worker-router' || outcome.provider !== 'worker-router') return false;
+    } else {
+      const identity = outcome.identity as Record<string, unknown>;
+      const matches = provider === 'luna-isolated' ? identity.provider === 'codex-cli' :
+        provider === 'codex-cli' ? identity.provider === 'codex-cli' || identity.provider === 'codex-app-server' : identity.provider === provider;
+      if (!matches) return false;
+      const expectedGeneration = binding.runtimeGeneration;
+      if (identity.provider === 'codex-app-server' && (expectedGeneration === undefined || identity.generation !== expectedGeneration)) return false;
+    }
+    if (prior !== undefined) {
+      const previousOutcome = prior.outcome as Record<string, unknown>;
+      const nextOutcome = handoff.outcome as Record<string, unknown>;
+      if (previousOutcome.kind !== nextOutcome.kind) return false;
+      if (previousOutcome.kind === 'executor') {
+        const previousIdentity = previousOutcome.identity as Record<string, unknown>;
+        const nextIdentity = nextOutcome.identity as Record<string, unknown>;
+        if (previousIdentity.provider !== nextIdentity.provider) return false;
+      } else if (previousOutcome.provider !== nextOutcome.provider) return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -245,21 +317,37 @@ function isRun(value: unknown): value is Run {
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
     (v.validationResult === undefined || isValidationResultCoherent(v.validationResult)) &&
     (v.telemetry === undefined || isRunTelemetry(v.telemetry)) &&
+    isRepairHistoryCoherent(v) &&
     (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );
 }
 
-/** Write atomically: write to `<path>.tmp`, then rename over the target. */
+/** Write atomically and durably: sync the private temp before rename and its parent after rename. */
 function serializedJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-function writeJsonAtomic(filePath: string, value: unknown): string {
+function writeJsonAtomic(filePath: string, value: unknown, syncForDurability: (fd: number, target: 'file' | 'directory') => void): string {
   const serialized = serializedJson(value);
-  const tmpPath = `${filePath}.tmp`;
-  writeFileSync(tmpPath, serialized, 'utf8');
-  renameSync(tmpPath, filePath);
+  const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+  let fd: number | undefined = openSync(tmpPath, 'wx');
+  try {
+    writeFileSync(fd, serialized, 'utf8');
+    syncForDurability(fd, 'file');
+    closeSync(fd);
+    fd = undefined;
+  } catch (error) {
+    if (fd !== undefined) try { closeSync(fd); } catch { /* preserve the original write/sync failure */ }
+    try { unlinkSync(tmpPath); } catch { /* remove only this attempt's temp */ }
+    throw error;
+  }
+  try { renameSync(tmpPath, filePath); } catch (error) {
+    try { unlinkSync(tmpPath); } catch { /* remove only this attempt's temp */ }
+    throw error;
+  }
+  const directoryFd = openSync(path.dirname(filePath), 'r');
+  try { syncForDurability(directoryFd, 'directory'); } finally { closeSync(directoryFd); }
   return serialized;
 }
 
@@ -326,7 +414,7 @@ function runFingerprint(run: Run | null): string {
     state: run.state,
     updatedAt: run.updatedAt,
     headSha: run.headSha ?? null,
-    history: run.history.length,
+    history: run.history,
     agentResult: run.agentResult ?? null,
     reviewResult: run.reviewResult ?? null,
     validationResult: run.validationResult ?? null,
@@ -347,6 +435,13 @@ function assertRepairAdmissionsAppendOnly(previous: Run | null, next: Run): void
   const proposed = next.repairAdmissions ?? [];
   if (proposed.length < prior.length || prior.some((entry, index) => JSON.stringify(entry) !== JSON.stringify(proposed[index]))) {
     throw new Error('Repair admission snapshots are append-only; existing entries cannot be changed or removed.');
+  }
+}
+
+function assertHistoryAppendOnly(previous: Run | null, next: Run): void {
+  const prior = previous?.history ?? [];
+  if (next.history.length < prior.length || prior.some((event, index) => JSON.stringify(event) !== JSON.stringify(next.history[index]))) {
+    throw new Error('Run history is append-only; existing transition and repair handoff evidence cannot be changed or removed.');
   }
 }
 
@@ -372,19 +467,20 @@ export class JsonFileStore implements RunStore {
   private readonly mutationLockTimeoutMs: number;
   private readonly mutationLockRetryMs: number;
   private readonly beforeConditionalWrite: (() => void) | undefined;
+  private readonly syncForDurability: (fd: number, target: 'file' | 'directory') => void;
 
   constructor(options: JsonFileStoreOptions) {
-    this.dir = path.resolve(options.dir);
     this.mutationLockTimeoutMs = options.mutationLockTimeoutMs ?? DEFAULT_RUN_MUTATION_LOCK_TIMEOUT_MS;
     this.mutationLockRetryMs = options.mutationLockRetryMs ?? DEFAULT_RUN_MUTATION_LOCK_RETRY_MS;
     this.beforeConditionalWrite = options.beforeConditionalWrite;
+    this.syncForDurability = options.syncForDurability ?? ((fd) => fsyncSync(fd));
     if (!Number.isSafeInteger(this.mutationLockTimeoutMs) || this.mutationLockTimeoutMs < 0) {
       throw new Error('mutationLockTimeoutMs must be a non-negative safe integer.');
     }
     if (!Number.isSafeInteger(this.mutationLockRetryMs) || this.mutationLockRetryMs < 1) {
       throw new Error('mutationLockRetryMs must be a positive safe integer.');
     }
-    mkdirSync(this.dir, { recursive: true });
+    this.dir = ensureDurableDirectory(path.resolve(options.dir), { syncDirectoryHierarchy: options.syncDirectoryHierarchy });
   }
 
   private filePathFor(id: string): string {
@@ -427,7 +523,7 @@ export class JsonFileStore implements RunStore {
       if (existsSync(filePath)) {
         throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
       }
-      const serialized = writeJsonAtomic(filePath, run);
+      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability);
       writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
@@ -443,7 +539,8 @@ export class JsonFileStore implements RunStore {
       const filePath = this.filePathFor(run.id);
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
       assertRepairAdmissionsAppendOnly(current, run);
-      const serialized = writeJsonAtomic(filePath, run);
+      assertHistoryAppendOnly(current, run);
+      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability);
       writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
@@ -455,8 +552,9 @@ export class JsonFileStore implements RunStore {
       const current = readRun(filePath, expected.id);
       if (runFingerprint(current) !== runFingerprint(expected)) return false;
       assertRepairAdmissionsAppendOnly(current, next);
+      assertHistoryAppendOnly(current, next);
       this.beforeConditionalWrite?.();
-      const serialized = writeJsonAtomic(filePath, next);
+      const serialized = writeJsonAtomic(filePath, next, this.syncForDurability);
       writeOperationalProjectionBestEffort(this.dir, next, serialized);
       return true;
     });

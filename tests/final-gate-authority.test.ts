@@ -37,6 +37,13 @@ class MemoryStore implements RunStore {
     this.runs.set(run.id, run);
   }
 
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    const current = this.read(expected.id);
+    if (current === null || JSON.stringify(current) !== JSON.stringify(expected)) return false;
+    this.update(next);
+    return true;
+  }
+
   list(): Run[] {
     return [...this.runs.values()];
   }

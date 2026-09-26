@@ -5,6 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import {
   WORKER_ROUTER_ERROR_CODE,
   WORKER_ROUTER_EXECUTABLE_ENV,
@@ -94,11 +95,35 @@ function requestFor(workspacePath: string): {
   readonly baseSha: string;
   readonly workspacePath: string;
   readonly branch: string;
+  readonly beforePublish: () => void;
 } {
-  return { target: TARGET, baseSha: BASE, workspacePath, branch: 'worker-router-test' };
+  return { target: TARGET, baseSha: BASE, workspacePath, branch: 'worker-router-test', beforePublish: () => undefined };
 }
 
 describe('WorkerRouterAdapter container boundary', () => {
+  it('preflights only the source-owned production container boundary as governed-capable', () => {
+    const request = {
+      target: TARGET,
+      baseSha: BASE,
+      execution: { profile: 'standard' as const, revision: 'profiles-v1', executor: 'worker-router', timeoutMs: 9_000 },
+      runtimeOwnership: { runId: 'run-qualified-router', generation: 'router-generation' },
+      governedPublication: { required: true as const, continuation: false },
+    };
+    const realBoundaryRegistry = new ImplementationAgentRegistry({
+      defaultProvider: 'worker-router',
+      providers: { 'worker-router': () => new WorkerRouterAdapter({ runner: new FakeRunner([]), image: IMAGE, executable: '/router', env: {} }) },
+    });
+    const productionBoundary = realBoundaryRegistry.prepareGovernedInvocation(request);
+    assert.equal(productionBoundary.status, 'qualified');
+
+    const injectedBoundaryRegistry = new ImplementationAgentRegistry({
+      defaultProvider: 'worker-router',
+      providers: { 'worker-router': () => new WorkerRouterAdapter({ runner: new FakeRunner([]), container: new FakeContainer([]), image: IMAGE, executable: '/router', env: {} }) },
+    });
+    const injectedBoundary = injectedBoundaryRegistry.prepareGovernedInvocation(request);
+    assert.equal(injectedBoundary.status, 'held', 'a mutable injected execution boundary is not assumed qualified');
+  });
+
   it('runs the containerized worker, then proves HEAD and publishes it only after container terminal', async () => {
     const events: string[] = [];
     const ws = workspace();
@@ -109,6 +134,7 @@ describe('WorkerRouterAdapter container boundary', () => {
       ...requestFor(ws.workspacePath),
       authority: 'live-target',
       supplementalInstructions: 'Focus on the acceptance tests.',
+      beforePublish: () => { events.push('before-publish'); },
       workspaceGuard: { assertValid: (phase) => { events.push(`guard:${phase ?? 'before-execution'}`); if (phase === 'after-execution') after++; else before++; } },
     });
 
@@ -124,6 +150,8 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.ok(terminal < events.indexOf('guard:after-execution'), 'guard(after) must follow container terminal');
     assert.ok(terminal < events.indexOf('git:rev-parse'));
     assert.ok(terminal < events.indexOf('git:merge-base'));
+    assert.ok(events.indexOf('git:merge-base') < events.indexOf('before-publish'));
+    assert.ok(events.indexOf('before-publish') < events.indexOf('git:push'));
     assert.ok(terminal < events.indexOf('git:push'));
 
     // The exact container terminal is awaited exactly once; no replay/fallback.
@@ -416,6 +444,16 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED));
     assert.equal(response.diagnostics?.join('\n').includes('rejected'), false);
+  });
+
+  it('fails closed before host push when direct callers omit the publication authority callback', async () => {
+    const ws = workspace();
+    const { beforePublish: _ignored, ...request } = requestFor(ws.workspacePath);
+    const runner = new FakeRunner([result(HEAD), result()]);
+    const response = await new WorkerRouterAdapter({ runner, container: new FakeContainer([containerResult()]), image: IMAGE }).run(request);
+    assert.equal(response.exitStatus, 'failure');
+    assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED));
+    assert.equal(runner.calls.some((call) => call.args[0] === 'push'), false);
   });
 
   it('returns cancellation when HEAD verification is aborted after the container is terminal', async () => {

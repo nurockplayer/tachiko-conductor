@@ -7,7 +7,7 @@ import {
   runtimeCapabilityCatalog,
 } from '../src/agents/model-capability.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
-import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
 
@@ -43,6 +43,23 @@ function codexJsonl(
 }
 
 describe('CodexCliAdapter', () => {
+  it('refuses a governed ambient invocation before any CLI or Git child process', async () => {
+    const runner = new FakeRunner([]);
+    const executor = { provider: 'codex-cli', sessionId: 'durable-thread', generation: 'run-generation' } as const;
+    const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });
+
+    const result = await adapter.run({
+      target: TARGET, baseSha: 'base', executor,
+      runtimeOwnership: { runId: 'run-1', generation: 'run-generation' },
+      governedPublication: { required: true, continuation: true },
+    });
+
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', new RegExp(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED));
+    assert.deepEqual(result.executor, executor);
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('revalidates a prepared workspace immediately before spawn and never invokes Codex after guard failure', async () => {
     const runner = new FakeRunner([]);
     const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo' });

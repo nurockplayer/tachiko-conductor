@@ -79,6 +79,11 @@ class RecordingJsonStore implements RunStore {
   create(run: Run): void { this.store.create(run); }
   read(id: string): Run | null { return this.store.read(id); }
   update(run: Run): void { this.updates.push(run); this.store.update(run); }
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    if (!this.store.updateIfUnchanged(expected, next)) return false;
+    this.updates.push(next);
+    return true;
+  }
   list(): Run[] { return this.store.list(); }
   delete(id: string): void { this.store.delete(id); }
 }

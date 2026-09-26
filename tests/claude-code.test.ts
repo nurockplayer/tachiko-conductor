@@ -4,7 +4,7 @@ import { describe, it } from 'node:test';
 import { ClaudeCodeAdapter, NodeClaudeProcessRunner } from '../src/agents/claude-code.js';
 import type { ClaudeProcessRunner, ClaudeRunOptions } from '../src/agents/claude-code.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
-import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ProcessResult } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
 
@@ -32,6 +32,24 @@ function claudeJson(resultText: string, extra: Record<string, unknown> = {}): st
 
 describe('ClaudeCodeAdapter', () => {
   const HEAD = '9d9cc7d210960f3c81d7d7498a36f65c67b9f4a9';
+
+  it('refuses governed linked-worktree execution before any Claude or Git child process', async () => {
+    const runner = new FakeRunner([]);
+    const executor = { provider: 'claude-code', sessionId: 'durable-session' } as const;
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+
+    const result = await adapter.run({
+      target: TARGET, baseSha: 'base', executor, sessionId: executor.sessionId,
+      runtimeOwnership: { runId: 'run-1', generation: 'run-generation' },
+      governedPublication: { required: true, continuation: true },
+    });
+
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', new RegExp(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED));
+    assert.deepEqual(result.executor, executor);
+    assert.equal(result.sessionId, executor.sessionId);
+    assert.equal(runner.calls.length, 0);
+  });
 
   it('revalidates a prepared workspace immediately before spawn and never invokes Claude after guard failure', async () => {
     const runner = new FakeRunner([]);

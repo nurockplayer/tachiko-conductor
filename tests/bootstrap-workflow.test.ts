@@ -77,6 +77,23 @@ function snapshot(headSha: string, pull: ReturnType<typeof pr> | null = pr(7, he
   };
 }
 
+function memoryStore(initial: Run) {
+  let current: Run | null = initial;
+  return {
+    name: 'test',
+    read: (id: string) => current?.id === id ? current : null,
+    update: (next: Run) => { current = next; },
+    updateIfUnchanged: (expected: Run, next: Run) => {
+      if (current === null || current.id !== expected.id || JSON.stringify(current) !== JSON.stringify(expected)) return false;
+      current = next;
+      return true;
+    },
+    create: (next: Run) => { current = next; },
+    list: () => current === null ? [] : [current],
+    delete: (id: string) => { if (current?.id === id) current = null; },
+  };
+}
+
 class QueueGithub implements GitHubAdapter {
   readonly kind = 'github' as const;
   private latest: GitHubLiveSnapshot | undefined;
@@ -188,7 +205,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
 
   it('E2 rejects same-SHA ownership mutation during recovery before implementation execution', async () => {
     const run = { ...withBootstrap(createRun(TARGET, T0, 'run-2')), state: 'IMPLEMENTING' as const };
-    const store = { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined };
+    const store = memoryStore(run);
     const implementation = new NoopImplementation();
     const result = await runWorkflow({
       store,
@@ -234,7 +251,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       let run = withBootstrap(createRun(TARGET, T0, `final-${label.replace(/\W+/g, '-')}`));
       run = applyTransition(run, { type: 'review_approved', reviewResult: { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] } }, T0, TEST_VALIDATION_AUTHORITY);
       const result = await runWorkflow({
-        store: { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined },
+        store: memoryStore(run),
         github: new QueueGithub([snapshot(OLD, pr(7, OLD, mutation))]),
         implementation: new NoopImplementation(),
         reviewer: new ApprovingReviewer(),
@@ -340,7 +357,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       if (state === 'CHANGES_REQUESTED') run = applyTransition(run, { type: 'changes_requested', reviewResult: { verdict: 'request_changes', reviewerName: 'reviewer', headSha: OLD, findings: [{ severity: 'blocking', summary: 'fix' }] } }, T0, TEST_VALIDATION_AUTHORITY);
       const calls: string[] = [];
       const result = await runWorkflow({
-        store: { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined },
+        store: memoryStore(run),
         github: new QueueGithub([snapshot(OLD, pr(8, OLD))]),
         implementation: { kind: 'implementation-agent', run: async () => { calls.push('agent'); return successResult(NEW); } },
         reviewer: { kind: 'reviewer', review: async () => { calls.push('reviewer'); return { verdict: 'approve', reviewerName: 'reviewer', headSha: OLD, findings: [] }; } },
@@ -355,7 +372,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
 
   it('E2 offers exact live-head synchronization for same-tuple G advancement while preserving H', async () => {
     const run = withBootstrap(createRun(TARGET, T0, 'offer-advance'));
-    const store = { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined };
+    const store = memoryStore(run);
     const result = await runWorkflow({
       store,
       github: new QueueGithub([snapshot(NEW, pr(7, NEW))]),
@@ -380,7 +397,7 @@ describe('bootstrap lifecycle acceptance coverage', () => {
     })();
     const calls: string[] = [];
     const result = await runWorkflow({
-      store: { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined },
+      store: memoryStore(run),
       github: new QueueGithub([snapshot(OLD, pr(99, OLD, { headRef: 'foreign-branch' }))]),
       implementation: { kind: 'implementation-agent', run: async () => { calls.push('agent'); return successResult(OLD); } },
       reviewer: new ApprovingReviewer(),
@@ -584,7 +601,7 @@ for (const state of ['IMPLEMENTING', 'CHANGES_REQUESTED'] as const) {
       const calls: string[] = [];
       const live = drift === 'head' ? snapshot(NEW) : drift === 'disappeared' ? snapshot(OLD, null, { headSha: null }) : snapshot(OLD, pr(8, OLD));
       const result = await runWorkflow({
-        store: { name: 'test', read: () => run, update: () => undefined, create: () => undefined, list: () => [run], delete: () => undefined },
+        store: memoryStore(run),
         github: new QueueGithub(drift === 'post-tuple' ? [snapshot(OLD), live] : [live]),
         implementation: { kind: 'implementation-agent', run: async () => { calls.push('agent'); return successResult(NEW); } },
         reviewer: new ApprovingReviewer(),
