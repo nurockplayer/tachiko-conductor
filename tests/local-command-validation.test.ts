@@ -292,10 +292,12 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const originalPath = process.env.PATH;
     process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
     try {
+      const nativeTrue = '/usr/bin/true';
+      assert.ok(existsSync(nativeTrue), `expected local absolute native no-op at ${nativeTrue}`);
       const result = await new ConfiguredLocalValidationAdapter(
-        configuration([process.execPath, '-e', 'process.exit(0)'], 1_000),
+        configuration([nativeTrue], 100),
       ).validate(owned);
-      assert.equal(result.status, 'passed');
+      assert.equal(result.status, 'passed', JSON.stringify(result.commands));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
@@ -314,10 +316,12 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const originalPath = process.env.PATH;
     process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
     try {
+      const nativeTrue = '/usr/bin/true';
+      assert.ok(existsSync(nativeTrue), `expected local absolute native no-op at ${nativeTrue}`);
       const result = await new ConfiguredLocalValidationAdapter(
-        configuration([process.execPath, '-e', 'process.exit(0)'], 100),
+        configuration([nativeTrue], 100),
       ).validate(owned);
-      assert.equal(result.status, 'passed');
+      assert.equal(result.status, 'passed', JSON.stringify(result.commands));
     } finally {
       if (originalPath === undefined) delete process.env.PATH;
       else process.env.PATH = originalPath;
