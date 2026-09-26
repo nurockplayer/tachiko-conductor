@@ -631,6 +631,23 @@ sidecar is unknown/unlinked rather than an authority to reconstruct a run.
 Use `tachiko run projections rebuild` only to backfill sidecars from runs that
 `JsonFileStore` has successfully validated.
 
+## Oracle review policy
+
+The exported Oracle reviewer applies the versioned provider-neutral R1–R5 risk
+floor before transport. It requires trusted, complete candidate evidence and a
+qualified binding whose separate transport observation verifies the model,
+effort, exact HEAD/base, associated pull request, and complete changed-path
+coverage. Missing or mismatched evidence holds the review without approval.
+Floors R1–R3 currently bind to selected Oracle semantic tier R3 at Medium;
+R4 uses High and R5 uses Extra High with a recorded critical reason. Legacy
+receipts remain readable but do not contain policy qualification.
+
+This module policy does not activate a native production Oracle factory or
+unattended browser transport. Native dispatch, durable pending receipts, and
+transport qualification remain separate work. The selected Medium/High/Extra
+High effort is an observed configuration; account quota economics are not
+established here.
+
 ## Layout
 
 ```
