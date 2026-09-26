@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { realpathSync } from 'node:fs';
+import { execFileSync, spawn } from 'node:child_process';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
@@ -78,6 +79,7 @@ import { dispatchOnceCommand } from './dispatch/command.js';
 import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/continuous.js';
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
+import { ExternalMissionStore, parseArgvJson, startExternalMission, superviseExternalMissionAsync, validateExternalMissionConfig } from './mission/external-wait.js';
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
 import { preflightProductionPolicy } from './production-policy.js';
 import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
@@ -118,6 +120,8 @@ Usage:
   tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --pnpm-program <absolute-pnpm> --dependency-artifact-path <absolute-lockfile-bound-store> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
+  tachiko mission wait start <id> --owner <owner> --session-id <id> --probe-argv '<JSON string[]>' [--wake-argv '<JSON string[]>'] [--worktree <path>] [--cwd <path>] [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
+  tachiko mission wait status <id>
   tachiko github snapshot owner/repo#123
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
@@ -153,6 +157,15 @@ orchestrator must reconcile. They never start a model turn. One ledger is
 written per run at <wait ledger dir>/<runId>.wait.json, where the directory is
 $TACHIKO_WAIT_LEDGER_DIR (or the directory of $TACHIKO_WAIT_LEDGER_PATH) and
 defaults to <TACHIKO_DATA_DIR>/../wait.
+mission wait start runs a detached model-free supervisor with a standalone
+mission identity bound to owner, session, worktree, and cwd. Probe and wake callback are argv arrays executed without
+a shell. The probe prints JSON with status running|active|completed|failed|blocked
+and optional items, turns, activeItemId, lastCompletedTurnId fields. A durable
+receipt is written before the wake callback runs; callbacks receive its stable
+id in TACHIKO_MISSION_RECEIPT_ID and must deduplicate that key durably. Callback
+delivery is retried after a crash/failure, so delivery is at-least-once. Timeout
+continue advances the model-free observation deadline; policy-action stores one
+timeout receipt. status only reads durable state and never invokes a probe or model.
 Browser profiles and runtime metadata are stored outside the repository under
 ~/.tachiko-conductor/browser by default. start/bootstrap own the child process
 in the foreground; use status/stop from another terminal.
@@ -1202,6 +1215,12 @@ export function resolveWaitLedgerFile(runId: string, env: NodeJS.ProcessEnv = pr
   return path.join(resolveWaitLedgerDirectory(env), `${runId}.wait.json`);
 }
 
+export function resolveMissionWaitDirectory(env: NodeJS.ProcessEnv = process.env): string {
+  const directory = env.TACHIKO_MISSION_WAIT_DIR?.trim() || path.join(path.dirname(resolveRunsDir(env)), 'missions');
+  if (!path.isAbsolute(directory)) throw new Error('TACHIKO_MISSION_WAIT_DIR must be an absolute path.');
+  return directory;
+}
+
 /**
  * Build the deterministic wait dependencies for one run. A native #35 observer
  * is only wired for App Server executors; otherwise the runtime fallback path
@@ -1511,6 +1530,122 @@ export async function main(argv: string[]): Promise<number> {
       return 1;
     }
     console.log(JSON.stringify({ ok: true, preflight: preflightProductionPolicy(process.env) }, null, 2));
+    return 0;
+  }
+
+  if (command === 'mission') {
+    if (subcommand !== 'wait') {
+      console.error(`Unknown command: mission ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const [action, ...args] = rest;
+    if (action !== 'start' && action !== 'status' && action !== 'supervise') {
+      console.error(`Unknown command: mission wait ${action ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    if (action === 'status' || action === 'supervise') {
+      const [id, extra] = args;
+      if (id === undefined || extra !== undefined) throw new Error(`mission wait ${action} requires exactly one mission id.`);
+      const missionStore = new ExternalMissionStore(resolveMissionWaitDirectory(), id);
+      if (action === 'status') {
+        const state = missionStore.read();
+        if (state === null) throw new Error(`Mission wait ${id} was not found.`);
+        console.log(JSON.stringify({
+          missionId: id,
+          status: state.status,
+          probeCount: state.probeCount,
+          receipt: state.receipt,
+          callback: state.callback,
+          deadlineAt: state.deadlineAt,
+          timeoutCount: state.timeoutCount,
+          ...(state.error === undefined ? {} : { error: state.error }),
+          updatedAt: state.updatedAt,
+        }, null, 2));
+        return 0;
+      }
+      const state = missionStore.read();
+      if (state === null) throw new Error(`Mission wait ${id} was not found.`);
+      const currentCwd = realpathSync(process.cwd());
+      const currentWorktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', cwd: currentCwd, timeout: 5_000 }).trim();
+      if (currentCwd !== state.config.cwd || currentWorktree !== state.config.worktree) {
+        throw new Error(`Mission ${id} owner/worktree/cwd binding changed; refusing supervisor restart.`);
+      }
+      try {
+        let acquired = false;
+        for (let attempt = 0; attempt < 20; attempt += 1) {
+          try { await superviseExternalMissionAsync(missionStore); acquired = true; break; }
+          catch (error) {
+            if (!(error instanceof DispatchInvocationLockedError) || attempt === 19) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 50));
+          }
+        }
+        if (!acquired) return 0;
+        return 0;
+      } catch (error) {
+        if (error instanceof DispatchInvocationLockedError) return 0;
+        throw error;
+      }
+    }
+
+    const { values, positionals } = parseArgs({
+      args,
+      allowPositionals: true,
+      options: {
+        'probe-argv': { type: 'string' },
+        'wake-argv': { type: 'string' },
+        'poll-interval-ms': { type: 'string' },
+        'probe-timeout-ms': { type: 'string' },
+        owner: { type: 'string' },
+        'session-id': { type: 'string' },
+        worktree: { type: 'string' },
+        cwd: { type: 'string' },
+        'timeout-ms': { type: 'string' },
+        'on-timeout': { type: 'string' },
+      },
+    });
+    const [id, extra] = positionals;
+    if (id === undefined || extra !== undefined) throw new Error('mission wait start requires exactly one mission id.');
+    if (values['probe-argv'] === undefined) throw new Error('mission wait start requires --probe-argv <JSON string[]> .');
+    const probeArgv = parseArgvJson(values['probe-argv'], '--probe-argv');
+    const wakeArgv = values['wake-argv'] === undefined ? [] : parseArgvJson(values['wake-argv'], '--wake-argv');
+    const pollIntervalMs = values['poll-interval-ms'] === undefined ? 5_000 : Number(values['poll-interval-ms']);
+    const probeTimeoutMs = values['probe-timeout-ms'] === undefined ? 30_000 : Number(values['probe-timeout-ms']);
+    if (values.owner === undefined) throw new Error('mission wait start requires --owner <owner>.');
+    if (values['session-id'] === undefined) throw new Error('mission wait start requires --session-id <id>.');
+    const currentCwd = realpathSync(process.cwd());
+    const currentWorktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8', cwd: currentCwd, timeout: 5_000 }).trim();
+    const cwd = realpathSync(values.cwd ?? currentCwd);
+    const worktree = realpathSync(values.worktree ?? currentWorktree);
+    if (cwd !== currentCwd || worktree !== currentWorktree) throw new Error('--cwd and --worktree must identify the current working directory and its Git worktree.');
+    const overallTimeoutMs = values['timeout-ms'] === undefined ? 24 * 60 * 60_000 : Number(values['timeout-ms']);
+    const onTimeout = values['on-timeout'] ?? 'continue';
+    if (onTimeout !== 'continue' && onTimeout !== 'policy-action') throw new Error('--on-timeout must be continue or policy-action.');
+    const proposed = validateExternalMissionConfig({ id, owner: values.owner, sessionId: values['session-id'], worktree, cwd, probeArgv, wakeArgv, pollIntervalMs, probeTimeoutMs, overallTimeoutMs, onTimeout });
+    const missionStore = new ExternalMissionStore(resolveMissionWaitDirectory(), id);
+    let supervisorPid: number | undefined;
+    const result = startExternalMission(missionStore, proposed, () => {
+      const entry = process.argv[1];
+      if (entry === undefined) throw new Error('Cannot locate the tachiko CLI entry point to start the detached supervisor.');
+      const child = spawn(process.execPath, [path.resolve(entry), 'mission', 'wait', 'supervise', id], {
+        detached: true,
+        cwd: proposed.cwd,
+        stdio: 'ignore',
+        env: { ...process.env, TACHIKO_MISSION_WAIT_DIR: resolveMissionWaitDirectory() },
+      });
+      if (child.pid === undefined) throw new Error('Could not start the detached mission wait supervisor.');
+      supervisorPid = child.pid;
+      child.unref();
+    });
+    console.log(JSON.stringify({
+      missionId: id,
+      status: result.state.status,
+      ...(supervisorPid === undefined ? {} : { supervisorPid }),
+      ...(result.alreadyRunning ? { alreadyRunning: true } : {}),
+      receipt: result.state.receipt,
+      callback: result.state.callback,
+    }, null, 2));
     return 0;
   }
 
