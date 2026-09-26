@@ -81,9 +81,9 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   } catch { return null; }
 }
 
-function safeArray(value: unknown, maximum: number): unknown[] | null {
+function safeArray(value: unknown, maximum?: number): unknown[] | null {
   try {
-    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || value.length > maximum) return null;
+    if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype || (maximum !== undefined && value.length > maximum)) return null;
     const descriptors = Object.getOwnPropertyDescriptors(value);
     for (let index = 0; index < value.length; index++) if (!descriptors[String(index)] || !('value' in descriptors[String(index)]!)) return null;
     if (Object.keys(descriptors).some((key) => key !== 'length' && !/^\d+$/.test(key))) return null;
@@ -97,7 +97,7 @@ const REVIEW_IDENTITY_IGNORED_PROBLEMS = new Set([
 ]);
 
 function reviewIdentityDiagnosticsAreKnown(value: unknown): boolean {
-  const problems = safeArray(value, 100);
+  const problems = safeArray(value);
   if (problems === null) return false;
   return problems.every((problem) => {
     const item = asRecord(problem);

@@ -275,13 +275,32 @@ describe('OracleReviewer policy binding', () => {
     assert.equal(result.verdict, 'approve');
   });
 
+  it('does not let more than 100 known diagnostics block exact Issue identity', async () => {
+    const problems = Array.from({ length: 101 }, (_, index) => ({ code: 'STALE_REVIEW', message: `Historical review ${index} is stale.` }));
+    const snapshot = issueSnapshot({ problems });
+    const result = await issueReviewer(issueGithub([snapshot, snapshot])).review({ target: issueTarget, headSha: HEAD });
+    assert.equal(result.verdict, 'approve');
+  });
+
+  it('checks diagnostics beyond 100 and holds on an unknown code before transport', async () => {
+    let consults = 0;
+    const noConsult: OracleReviewTransport = { async consult() { consults++; return { outcome: 'failure', code: 'unavailable', retryable: false }; } };
+    const problems = Array.from({ length: 100 }, () => ({ code: 'STALE_REVIEW' }));
+    problems.push({ code: 'FUTURE_DIAGNOSTIC' });
+    await assert.rejects(() => issueReviewer(issueGithub([issueSnapshot({ problems })]), noConsult).review({ target: issueTarget, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
+    assert.equal(consults, 0);
+  });
+
   it('holds contradictory, malformed, and unknown Issue diagnostics and mismatched Issue or PR fields', async () => {
     let consults = 0;
     const noConsult: OracleReviewTransport = { async consult() { consults++; return { outcome: 'failure', code: 'unavailable', retryable: false }; } };
+    const sparseProblems: unknown[] = [];
+    sparseProblems.length = 1;
     const diagnostics = [
       [{ code: 'CONTRADICTORY_STATE', message: 'Live state conflicts.' }],
       [{ message: 'Missing diagnostic code.' }],
       [{ code: 'FUTURE_DIAGNOSTIC', message: 'Unknown code.' }],
+      sparseProblems,
       null,
     ];
     for (const problems of diagnostics) {
