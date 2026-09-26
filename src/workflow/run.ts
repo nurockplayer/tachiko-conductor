@@ -1111,6 +1111,7 @@ export async function runWorkflow(
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
             resolveImplementationCapabilities: deps.resolveImplementationCapabilities,
             resolveRepairExecutionProfile: deps.resolveRepairExecutionProfile,
+            governedPublicationRequired: options.admissionFence !== undefined,
             assertCanMutate: (workspacePath) => {
               const executionWorkspace = workspacePath ?? reviewRun.bootstrap?.workspacePath ?? options.admissionFence?.executionWorkspace;
               if (options.admissionFence !== undefined && executionWorkspace === undefined) {

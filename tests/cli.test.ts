@@ -808,7 +808,7 @@ describe('workflow run and resume commands', () => {
     };
   }
 
-  function setupParkedMerge(dir: string, store: MemoryStore, run: Run, reason: 'workflow_settled' | 'workflow_wait' = 'workflow_settled', registryOptions: Partial<ConstructorParameters<typeof MissionAdmissionRegistry>[0]> = {}) {
+  function setupParkedMerge(dir: string, store: RunStore, run: Run, reason: 'workflow_settled' | 'workflow_wait' = 'workflow_settled', registryOptions: Partial<ConstructorParameters<typeof MissionAdmissionRegistry>[0]> = {}) {
     const config: AdmissionConfig = { schemaVersion: 1, revision: `merge-${run.id}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
     const registryPath = path.join(dir, `merge-${run.id}.json`);
     const registry = new MissionAdmissionRegistry({ filePath: registryPath, config, ...registryOptions });
@@ -1121,6 +1121,62 @@ describe('workflow run and resume commands', () => {
       assert.equal(conflictingSetup.registry.readLane(`run:${conflictingRun.id}`)?.status, 'parked');
       assert.equal(readFileSync(conflictingSetup.receiptPath, 'utf8'), beforeConflict);
     } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('preserves a workflow parked receipt across denied re-admission and recovers its exact generation after restart', () => {
+    for (const reason of ['workflow_wait', 'workflow_settled'] as const) {
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-capacity-parked-recovery-'));
+      const restoreEnv = isolateMergeReceiptRoot(dir);
+      try {
+        const runsDirectory = path.join(dir, 'runs');
+        const store = new JsonFileStore({ dir: runsDirectory });
+        const run = mergeReadyRun(`capacity-parked-${reason}`, dir);
+        const setup = setupParkedMerge(dir, store, run, reason);
+        const registryFile = path.join(dir, `merge-${run.id}.json`);
+        const beforeLane = setup.registry.readLane(`run:${run.id}`)!;
+        const beforeReceipt = readFileSync(setup.receiptPath, 'utf8');
+        const holder = setup.registry.admit({ laneId: `capacity-holder-${reason}`, role: 'production_captain', highAutonomy: true, evidence: { repository: 'elsewhere/widgets', issue: 9 } });
+        assert.equal(holder.outcome, 'admitted');
+        if (holder.outcome !== 'admitted') continue;
+        const beforeDenied = readFileSync(registryFile, 'utf8');
+        const request = {
+          laneId: beforeLane.laneId, role: 'production_captain' as const, highAutonomy: true,
+          evidence: { ...beforeLane.evidence, stateSurface: `${setup.workspace}/stronger-state` },
+        };
+        const firstDenied = setup.registry.admit(request);
+        assert.equal(firstDenied.outcome, 'parked');
+        assert.equal(firstDenied.outcome === 'parked' ? firstDenied.reason : null, 'capacity_captains');
+        assert.equal(readFileSync(registryFile, 'utf8'), beforeDenied, 'capacity denial does not replace the parked lane generation or evidence');
+        assert.equal(readFileSync(setup.receiptPath, 'utf8'), beforeReceipt, 'capacity denial does not rewrite the finalized parked receipt');
+        const repeated = setup.registry.admit(request);
+        assert.equal(repeated.outcome, 'parked');
+        assert.equal(readFileSync(registryFile, 'utf8'), beforeDenied);
+        assert.equal(readFileSync(setup.receiptPath, 'utf8'), beforeReceipt);
+
+        const restarted = new MissionAdmissionRegistry({ filePath: registryFile, config: { schemaVersion: 1, revision: `merge-${run.id}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+        assert.deepEqual(restarted.readLane(beforeLane.laneId), beforeLane);
+        const restartedStore = new JsonFileStore({ dir: runsDirectory });
+        assert.deepEqual(restartedStore.read(run.id), run, 'fresh Run-store instance reloads the exact durable Run before recovery');
+        assert.equal(recoverRunAdmission(restartedStore, restarted, run.id, setup.generation, true, setup.receiptPath), 'released', 'operator-stopped recovery accepts the exact original parked generation after both stores restart');
+        assert.equal(restarted.readLane(holder.token.laneId)?.status, 'active', 'recovery leaves the unrelated capacity holder active');
+        assert.equal(readRunOwnerReceipt(setup.receiptPath)?.phase, 'released');
+
+        restarted.release(holder.token, true);
+        const reentryPrior = readRunOwnerReceipt(setup.receiptPath)!;
+        const { settlementReason: _settlementReason, ...reentryReceipt } = reentryPrior;
+        const readmitted = restarted.admit(request, {
+          beforePublish: (candidate) => writeRunOwnerReceipt(setup.receiptPath, {
+            ...reentryReceipt, token: candidate.token, generation: candidate.token.generation, phase: 'pre_execution',
+          }),
+        });
+        assert.equal(readmitted.outcome, 'admitted');
+        if (readmitted.outcome === 'admitted') {
+          assert.equal(readmitted.token.generation, setup.generation + 2, 'successful re-entry advances beyond exact stopped recovery monotonically');
+          assert.equal(restarted.readLane(beforeLane.laneId)?.evidence.stateSurface, `${setup.workspace}/stronger-state`);
+          assert.equal(readRunOwnerReceipt(setup.receiptPath)?.generation, readmitted.token.generation);
+        }
+      } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+    }
   });
 
   it('does not release on Run CAS races and does not overwrite a successor receipt on stale retry', async () => {

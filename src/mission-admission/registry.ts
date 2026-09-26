@@ -493,6 +493,13 @@ export class MissionAdmissionRegistry {
       }
       const reason = capacityReason(state, candidate);
       if (reason) {
+        // A workflow-parked lane already has a tokenless receipt naming its
+        // current generation and settlement provenance. Capacity denial does
+        // not acquire ownership, so it must not publish a replacement lane
+        // generation (or evidence) that the receipt cannot recover.
+        if (prior?.status === 'parked') {
+          return { outcome: 'parked', missionId: prior.missionId, reason, revision: state.revision };
+        }
         const parked: LaneRecord = { ...candidate, status: 'parked', token: null, generation: candidate.generation, parkedReason: reason };
         replaceLane(state, parked); state.revision += 1; state.lastTransition = { kind: reason, laneId: request.laneId, at: now };
         return { outcome: 'parked', missionId, reason, revision: state.revision };

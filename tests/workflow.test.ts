@@ -709,6 +709,139 @@ describe('runWorkflow', () => {
     assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'final_gate_verified'));
   });
 
+  it('propagates the host publication requirement into admission-backed review repair preflight', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-review-repair-governed-'));
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'review-repair-governed-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, 'workflow-governed-review-repair'));
+    const admitted = registry.admit({ laneId: 'run:workflow-governed-review-repair', role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: 'workflow-governed-review-repair' } });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') return;
+    try {
+      const implementation = new FakeImplementation([successResult(HEAD), successResult(HEAD2, 'repair')]);
+      const result = await runWorkflow(
+        { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer: new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+        'workflow-governed-review-repair',
+        { maxReviewAttempts: 3, now: () => T0, admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: '/tmp/governed-review-repair' } },
+      );
+      assert.equal(result.outcome, 'merge_ready');
+      assert.equal(implementation.requests.length, 2);
+      assert.deepEqual(implementation.requests.map((request) => request.governedPublication), [
+        { required: true, continuation: false },
+        { required: true, continuation: true },
+      ], 'review repair receives its own explicit host confinement preflight requirement');
+      assert.equal(implementation.requests[1]?.runtimeOwnership?.runId, result.run.id);
+      assert.equal(implementation.requests[1]?.sessionId, result.run.agentResult?.sessionId);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('holds admission-backed review and validation repairs before any ambient provider or publication effect', async (t) => {
+    for (const repairKind of ['review', 'validation'] as const) {
+      for (const provider of ['codex-cli', 'codex-app-server', 'claude-code'] as const) {
+        await t.test(`${repairKind}/${provider}`, async () => {
+          const id = `workflow-governed-hold-${repairKind}-${provider}`;
+          const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-governed-hold-'));
+          const registry = new MissionAdmissionRegistry({
+            filePath: path.join(directory, 'registry.json'),
+            config: { schemaVersion: 1, revision: `governed-hold-${repairKind}-${provider}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+          });
+          const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'profiles-v1', executor: provider, timeoutMs: 10_000 };
+          const store = new MemoryStore();
+          let run: Run;
+          if (repairKind === 'review') {
+            run = reviewingRun(store, id, HEAD);
+            run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+          } else {
+            run = createRun(TARGET, T0, id, execution);
+            run = applyTransition(run, { type: 'start' }, T0);
+            run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD, pullRequest: { number: 7, headSha: HEAD } }, T0);
+            run = applyTransition(run, { type: 'validation_failed', validationResult: validationFailed(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+          }
+          run = {
+            ...run,
+            execution,
+            executor: { provider, sessionId: `thread-${provider}`, generation: `generation-${id}` },
+            agentResult: { ...run.agentResult!, sessionId: `session-${provider}` },
+            repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' },
+          };
+          store.create(run);
+          const admitted = registry.admit({
+            laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
+            evidence: { repository: 'acme/widgets', issue: 42, run: id, pullRequest: 7 },
+          });
+          assert.equal(admitted.outcome, 'admitted');
+          if (admitted.outcome !== 'admitted') return;
+          const admissionBefore = registry.snapshot();
+          let modelCalls = 0;
+          let processCalls = 0;
+          let fallbackCalls = 0;
+          let pushCalls = 0;
+          let pullRequestWrites = 0;
+          const ambient: ImplementationAgent = {
+            kind: 'implementation-agent',
+            async run(request) {
+              modelCalls += 1;
+              processCalls += 1;
+              request.beforePublish?.();
+              pushCalls += 1;
+              return successResult(HEAD2);
+            },
+          };
+          const fallback: ImplementationAgent = {
+            kind: 'implementation-agent',
+            async run(request) {
+              fallbackCalls += 1;
+              return ambient.run(request);
+            },
+          };
+          const appServerAmbient: ImplementationAgent = {
+            kind: 'implementation-agent',
+            async run(request) {
+              processCalls += 1;
+              return fallback.run(request);
+            },
+          };
+          const implementation = new ImplementationAgentRegistry({
+            defaultProvider: 'codex-cli', legacySessionProvider: 'claude-code',
+            providers: {
+              'codex-cli': () => ambient,
+              'codex-app-server': () => appServerAmbient,
+              'claude-code': () => ambient,
+            },
+          });
+          const github: GitHubAdapter = {
+            ...githubAdapter([HEAD, HEAD]),
+            async createImplementationPullRequest() { pullRequestWrites += 1; return { number: 8 }; },
+          };
+          try {
+            const outcome = await runWorkflow({
+              store, github, implementation, reviewer: new FakeReviewer([]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+              resolveRepairExecutionProfile: () => execution,
+            }, id, {
+              maxReviewAttempts: 2, now: () => T0,
+              admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: '/tmp/governed-repair-hold' },
+            });
+            assert.equal(outcome.outcome, 'needs_human');
+            assert.match(outcome.reason, /No model turn or worker process was started/);
+            assert.equal(modelCalls, 0);
+            assert.equal(processCalls, 0);
+            assert.equal(fallbackCalls, 0, 'App Server fallback is not called');
+            assert.equal(pushCalls, 0);
+            assert.equal(pullRequestWrites, 0);
+            assert.equal((outcome.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
+            assert.deepEqual(outcome.run.executor, run.executor);
+            assert.equal(outcome.run.agentResult?.sessionId, run.agentResult?.sessionId);
+            assert.deepEqual(registry.snapshot(), admissionBefore, 'the exact admission generation and evidence remain unchanged');
+            assert.equal(outcome.run.repairAdmissions?.[0]?.execution.executor, provider, 'trusted repair-profile promotion is retained durably');
+          } finally { rmSync(directory, { recursive: true, force: true }); }
+        });
+      }
+    }
+  });
+
   it('persists structured run telemetry and does not double-count on terminal re-entry', async () => {
     const store = new MemoryStore();
     store.create(createRun(TARGET, T0, 'run-telemetry'));

@@ -597,6 +597,55 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('keeps workflow-parked generations and evidence intact across capacity-only denial and restart', () => {
+    for (const parkedReason of ['workflow_wait', 'workflow_settled'] as const) {
+      const { directory, filePath, registry } = fixture();
+      try {
+        const laneId = `workflow-parked-${parkedReason}`;
+        const admitted = registry.admit({ laneId, role: 'production_captain', evidence: evidence(611) });
+        assert.equal(admitted.outcome, 'admitted');
+        if (admitted.outcome !== 'admitted') continue;
+        registry.park(admitted.token, parkedReason);
+        const exactBefore = readFileSync(filePath, 'utf8');
+        const before = JSON.parse(exactBefore) as { revision: number; lanes: Array<{ laneId: string; generation: number; evidence: MissionEvidence; parkedReason?: string; status: string }> };
+        const laneBefore = before.lanes.find((lane) => lane.laneId === laneId)!;
+        assert.equal(laneBefore.parkedReason, parkedReason);
+
+        const holder = registry.admit({ laneId: `holder-${parkedReason}`, role: 'production_captain', evidence: evidence(612) });
+        assert.equal(holder.outcome, 'admitted');
+        if (holder.outcome !== 'admitted') continue;
+        const exactWithHolder = readFileSync(filePath, 'utf8');
+        const beforeDenied = JSON.parse(exactWithHolder) as typeof before;
+        const deniedLane = beforeDenied.lanes.find((lane) => lane.laneId === laneId)!;
+        const denied = registry.admit({ laneId, role: 'production_captain', evidence: { ...evidence(611), pullRequest: 99 } });
+        assert.equal(denied.outcome, 'parked');
+        assert.equal(denied.outcome === 'parked' ? denied.reason : null, 'capacity_captains');
+        assert.equal(denied.revision, beforeDenied.revision, 'denial does not publish a registry revision');
+        assert.equal(readFileSync(filePath, 'utf8'), exactWithHolder, 'denial preserves the full durable lane and registry bytes');
+        const repeated = registry.admit({ laneId, role: 'production_captain', evidence: { ...evidence(611), pullRequest: 99 } });
+        assert.equal(repeated.outcome, 'parked');
+        assert.equal(repeated.revision, beforeDenied.revision);
+        assert.equal(readFileSync(filePath, 'utf8'), exactWithHolder, 'repeated denial also preserves the durable receipt identity');
+
+        const restarted = new MissionAdmissionRegistry({ filePath, config, lockTimeoutMs: 10_000 });
+        assert.equal(restarted.readLane(laneId)?.generation, deniedLane.generation, 'restart reads the exact prior parked generation');
+        assert.deepEqual(restarted.readLane(laneId)?.evidence, deniedLane.evidence, 'restart preserves the parked evidence');
+        assert.equal(restarted.readLane(laneId)?.parkedReason, deniedLane.parkedReason, 'restart preserves original settlement provenance');
+        assert.deepEqual(restarted.readLane(laneId)?.evidence, laneBefore.evidence, 'stronger retry evidence is not persisted on denial');
+        assert.equal(restarted.readLane(laneId)?.generation, laneBefore.generation);
+        assert.equal(restarted.readLane(laneId)?.parkedReason, parkedReason);
+
+        restarted.release(holder.token, true);
+        const readmitted = restarted.admit({ laneId, role: 'production_captain', evidence: { ...evidence(611), pullRequest: 99 } });
+        assert.equal(readmitted.outcome, 'admitted');
+        if (readmitted.outcome === 'admitted') {
+          assert.equal(readmitted.token.generation, laneBefore.generation + 1, 'successful readmission advances monotonically');
+          assert.equal(restarted.readLane(laneId)?.evidence.pullRequest, 99);
+        }
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    }
+  });
+
   it('preserves high-autonomy classification across retries and rejects downgrades before publication', () => {
     let writes = 0;
     const { directory, registry } = fixture({ beforePublish: () => { writes += 1; } });
@@ -642,7 +691,7 @@ describe('provider-neutral durable mission admission', () => {
       const strengthened = registry.admit({ laneId: 'low-then-high', role: 'production_captain', highAutonomy: true, evidence: evidence(605) });
       assert.equal(strengthened.outcome, 'parked');
       assert.equal(strengthened.outcome === 'parked' ? strengthened.reason : null, 'capacity_high_autonomy');
-      assert.equal(registry.readLane('low-then-high')?.highAutonomy, true);
+      assert.equal(registry.readLane('low-then-high')?.highAutonomy, false, 'capacity denial preserves the existing parked lane classification');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

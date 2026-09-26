@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
+import { qualifyGovernedPublicationAdapter, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
@@ -20,10 +20,11 @@ import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
-import { TARGET, failureResult, successResult, validationPassed } from './helpers.js';
+import { TARGET, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 import { createBootstrapGitFixture } from './bootstrap-fixture.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
+import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -878,6 +879,13 @@ describe('runReviewLoop', () => {
           const implementation = new WorkerRouterAdapter({
             runner: fixture.runner, container, image: `tachiko/worker-router-test@sha256:${'a'.repeat(64)}`,
           });
+          const governedRequests: ImplementationRequest[] = [];
+          const governedImplementation: ImplementationAgent = {
+            kind: 'implementation-agent',
+            prepareGovernedInvocation() { return { status: 'qualified', agent: governedImplementation }; },
+            run(request) { governedRequests.push(request); return implementation.run(request); },
+          };
+          qualifyGovernedPublicationAdapter(governedImplementation);
           let mutationChecks = 0;
           let publicationChecks = 0;
           const liveHeads: Array<string | null> = [fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha];
@@ -904,10 +912,11 @@ describe('runReviewLoop', () => {
           };
           const commandStart = fixture.commands.length;
           const result = await runReviewLoop({
-            store, github, implementation, reviewer: new FakeReviewer([requestChanges(fixture.baseSha)]),
+            store, github, implementation: governedImplementation, reviewer: new FakeReviewer([requestChanges(fixture.baseSha)]),
             resolveValidationAuthority: reviewAuthority,
             bootstrapForExecution: () => bootstrap,
             resolveRepairExecutionProfile: () => repairExecution,
+            governedPublicationRequired: true,
             assertCanMutate: () => undefined,
             assertCurrentMutation: () => {
               mutationChecks += 1;
@@ -918,6 +927,8 @@ describe('runReviewLoop', () => {
               if (mode === 'publication-stale') throw new Error('publication admission became stale');
             },
           }, id, { maxAttempts: 3, now: () => T0 });
+          assert.deepEqual(governedRequests[0]?.governedPublication, { required: true, continuation: true });
+          assert.equal(governedRequests[0]?.runtimeOwnership?.runId, id);
 
           const publicationBranch = result.run.bootstrap?.publicationBranch ?? result.run.bootstrap?.branch ?? 'existing-pr';
           const remoteHead = fixture.git(fixture.remote, ['for-each-ref', '--format=%(objectname)', `refs/heads/${publicationBranch}`]);
@@ -977,6 +988,89 @@ describe('runReviewLoop', () => {
     assert.equal(result.outcome, 'needs_human');
     assert.equal(store.read(initial.id)?.state, 'NEEDS_HUMAN');
     assert.equal(implementation.requests.length, 0);
+  });
+
+  it('durably holds governed review repairs before worker telemetry or ambient provider execution', async () => {
+    for (const repairKind of ['review', 'validation'] as const) {
+      for (const provider of ['codex-cli', 'codex-app-server', 'claude-code'] as const) {
+      const id = `governed-${repairKind}-${provider}`;
+      const base = repairKind === 'review'
+        ? repairChangesRun(id)
+        : (() => {
+          let run = createRun(TARGET, T0, id);
+          run = applyTransition(run, { type: 'start' }, T0);
+          run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD, pullRequest: { number: 7, headSha: HEAD } }, T0);
+          return applyTransition(run, { type: 'validation_failed', validationResult: validationFailed(HEAD) }, T0, reviewAuthority());
+        })();
+      const execution: ResolvedExecutionConfiguration = { ...ROUTINE_REPAIR_EXECUTION, executor: provider };
+      const sessionId = `session-${provider}`;
+      const original: Run = {
+        ...base,
+        executor: { provider, sessionId: `thread-${provider}` },
+        agentResult: { ...base.agentResult!, sessionId },
+      };
+      const store = new CasMemoryStore();
+      store.create(original);
+      let childOrModelCalls = 0;
+      let fallbackCalls = 0;
+      const ambient: ImplementationAgent = {
+        kind: 'implementation-agent',
+        async run() { childOrModelCalls += 1; fallbackCalls += provider === 'codex-app-server' ? 1 : 0; return successResult(HEAD2); },
+      };
+      const implementation = new ImplementationAgentRegistry({
+        defaultProvider: 'codex-cli',
+        legacySessionProvider: 'claude-code',
+        providers: { [provider]: () => ambient },
+      });
+      let capabilityResolutions = 0;
+      let spawnMarkers = 0;
+      const result = await runReviewLoop({
+        store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]),
+        resolveValidationAuthority: reviewAuthority,
+        resolveImplementationCapabilities: async () => { capabilityResolutions += 1; return []; },
+        resolveRepairExecutionProfile: () => execution,
+        governedPublicationRequired: true,
+      }, id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { spawnMarkers += 1; } });
+
+      assert.equal(result.outcome, 'needs_human', `${provider} must fail closed before a model or child process`);
+      assert.match(result.reason, /No model turn or worker process was started/);
+      assert.match(result.run.interrupt?.reason ?? '', /source-qualified publication boundary/);
+      assert.equal(childOrModelCalls, 0);
+      assert.equal(fallbackCalls, 0, 'App Server fallback is not entered during governed preflight');
+      assert.equal(capabilityResolutions, 0, 'preflight precedes capability lookup');
+      assert.equal(spawnMarkers, 0, 'preflight hold precedes worker uncertainty telemetry');
+      assert.deepEqual(result.run.executor, original.executor, 'the exact executor remains on the held Run');
+      assert.equal(result.run.agentResult?.sessionId, sessionId, 'the exact session remains on the held Run');
+      assert.equal(store.read(id)?.id, original.id, 'the same durable Run remains parked');
+      assert.equal((result.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
+      }
+    }
+  });
+
+  it('rejects a forged qualified repair adapter before spawn telemetry', async () => {
+    const original = repairChangesRun('governed-review-forged-preflight');
+    const store = new CasMemoryStore();
+    store.create(original);
+    let modelCalls = 0;
+    let markers = 0;
+    const forged: ImplementationAgent = {
+      kind: 'implementation-agent',
+      prepareGovernedInvocation() {
+        return { status: 'qualified', agent: { kind: 'implementation-agent', async run() { modelCalls += 1; return successResult(HEAD2); } } as ImplementationAgent };
+      },
+      async run() { modelCalls += 1; return successResult(HEAD2); },
+    };
+    const result = await runReviewLoop({
+      store, github: githubAdapter([HEAD, HEAD]), implementation: forged, reviewer: new FakeReviewer([]),
+      resolveValidationAuthority: reviewAuthority,
+      resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+      governedPublicationRequired: true,
+    }, original.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { markers += 1; } });
+    assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason, /source-qualified publication boundary/);
+    assert.equal(modelCalls, 0);
+    assert.equal(markers, 0);
+    assert.equal((result.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
   });
 
   it('rechecks mutation admission after capability resolution and before a repair worker starts', async () => {

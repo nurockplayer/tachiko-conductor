@@ -1,4 +1,6 @@
 import {
+  GOVERNED_PUBLICATION_REENTRY_ACTION,
+  hasGovernedPublicationConfinement,
   humanTakeoverReason,
   isWorkspaceGuardFailure,
   type ImplementationAgent,
@@ -43,6 +45,8 @@ export interface ReviewLoopDependencies {
   readonly assertCurrentMutation?: () => void;
   /** Rechecks publication authority immediately before standalone host push. */
   readonly assertCanPublish?: () => void;
+  /** Admission-backed workflow repairs require source-qualified host publication confinement. */
+  readonly governedPublicationRequired?: boolean;
   /**
    * Resolves only the provider-neutral profile selected by explicit repair
    * authority. It is intentionally absent for legacy runs, which have no
@@ -510,6 +514,37 @@ export async function runReviewLoop(
         const recovered = await checkOwnedFix();
         if (recovered !== null) return recovered;
       }
+      let governedRepairAgent: ImplementationAgent | undefined;
+      if (deps.governedPublicationRequired === true) {
+        const governedPublication = Object.freeze({ required: true as const, continuation: true });
+        const request = {
+          target,
+          baseSha: progressBaseSha ?? '',
+          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch }),
+          ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.agentResult?.sessionId !== undefined ? { sessionId: run.agentResult.sessionId } : {}),
+          ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.executor !== undefined ? { executor: run.executor } : {}),
+          runtimeOwnership: {
+            runId: run.id,
+            generation: run.executor?.generation ?? run.id,
+            ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+          },
+          governedPublication,
+          ...(repairExecution === undefined ? {} : { execution: repairExecution }),
+        };
+        let prepared;
+        try {
+          prepared = implementation.prepareGovernedInvocation?.(request);
+        } catch (error) {
+          const reason = `Governed review repair is on hold because source-qualified publication preflight failed: ${errorMessage(error)} No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`;
+          return parkRepairAuthority(run, reason, store, now, [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION]);
+        }
+        if (prepared?.status !== 'qualified' || !prepared.agent || typeof prepared.agent !== 'object' ||
+            !hasGovernedPublicationConfinement(prepared.agent)) {
+          const reason = `Governed review repair is on hold because no source-qualified publication boundary is available. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`;
+          return parkRepairAuthority(run, reason, store, now, [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION]);
+        }
+        governedRepairAgent = prepared.agent;
+      }
       const workerSpawn = recordSpawnTelemetry(run, {
         role: 'worker',
         attemptKind: 'repair',
@@ -574,7 +609,7 @@ export async function runReviewLoop(
       }
       let fixResult;
       try {
-        fixResult = await implementation.run({
+        fixResult = await (governedRepairAgent ?? implementation).run({
           target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: repairInstructions,
           ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
@@ -587,6 +622,14 @@ export async function runReviewLoop(
             deps.assertCanPublish?.();
           },
           ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
+          ...(deps.governedPublicationRequired === true ? {
+            governedPublication: Object.freeze({ required: true as const, continuation: true }),
+            runtimeOwnership: {
+              runId: run.id,
+              generation: run.executor?.generation ?? run.id,
+              ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
+            },
+          } : {}),
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
       } catch (error) {
