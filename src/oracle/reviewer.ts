@@ -1,7 +1,7 @@
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../adapters/reviewer.js';
 import type { ReviewResult, Target } from '../domain/types.js';
-import { classifyReviewRisk, type ReviewRiskDecision } from '../reviewers/risk-policy.js';
+import { canonicalReviewTarget, classifyReviewRisk, type ReviewRiskDecision } from '../reviewers/risk-policy.js';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   ORACLE_LIMITS,
@@ -67,14 +67,6 @@ function validBinding(value: OracleReviewerBinding | undefined): value is Oracle
   return binding.available === true && binding.independentReadOnly === true && typeof binding.bindingId === 'string' && /^[A-Za-z0-9._:-]{1,120}$/.test(binding.bindingId) && typeof binding.model === 'string' && /^[A-Za-z0-9._:/-]{1,160}$/.test(binding.model) && efforts !== null && efforts.length > 0 && efforts.every((effort) => effort === 'Medium' || effort === 'High' || effort === 'Extra High') && new Set(efforts).size === efforts.length;
 }
 
-function targetKey(value: unknown): string | null {
-  const target = asRecord(value);
-  if (target === null || typeof target.owner !== 'string' || !/^[A-Za-z0-9_.-]{1,100}$/.test(target.owner) || typeof target.repo !== 'string' || !/^[A-Za-z0-9_.-]{1,100}$/.test(target.repo)) return null;
-  if (target.kind === 'issue' && Number.isSafeInteger(target.issueNumber) && Number(target.issueNumber) > 0 && Object.keys(target).every((key) => ['kind', 'owner', 'repo', 'issueNumber'].includes(key))) return `${target.owner}/${target.repo}#${target.issueNumber}`;
-  if (target.kind === 'repository' && typeof target.branch === 'string' && target.branch.length > 0 && target.branch.length <= 240 && !target.branch.startsWith('/') && !target.branch.includes('\\') && !target.branch.split('/').some((part) => part === '' || part === '.' || part === '..') && Object.keys(target).every((key) => ['kind', 'owner', 'repo', 'branch', 'publicationBranch'].includes(key)) && (target.publicationBranch === undefined || typeof target.publicationBranch === 'string' && target.publicationBranch.length > 0 && target.publicationBranch.length <= 240 && !target.publicationBranch.startsWith('/') && !target.publicationBranch.includes('\\') && !target.publicationBranch.split('/').some((part) => part === '' || part === '.' || part === '..'))) return `${target.owner}/${target.repo}@${target.branch}${target.publicationBranch === undefined ? '' : `#publication=${target.publicationBranch}`}`;
-  return null;
-}
-
 function policyReceipt(decision: Extract<ReviewRiskDecision, { outcome: 'review' }>, effort: OracleEffort, binding: OracleReviewerBinding, effectiveModel: string | null, effectiveEffort: OracleEffort | null, requestCorrelationId: string, coverageComplete: boolean, pullRequestNumber: number | null = null) {
   const coverage = createHash('sha256').update(JSON.stringify([...decision.changedPaths].sort())).digest('hex');
   return { version: decision.policyVersion, floor: decision.floor, selectedSemanticTier: selectSemanticTier(decision), requestedEffort: effort, effectiveEffort, reasons: decision.reasons, criticalReason: decision.criticalReason ?? null, baseSha: decision.baseSha, pullRequestNumber, changedPathCount: decision.changedPaths.length, coverageSha256: coverage, requestCorrelationId, requestedModel: binding.model, effectiveModel, bindingId: binding.bindingId, coverageComplete } as const;
@@ -115,13 +107,14 @@ function snapshotTransportResult(value: unknown): OracleTransportResult {
 }
 
 function targetText(target: Target): string {
-  return target.kind === 'issue' ? `${target.owner}/${target.repo}#${target.issueNumber}` : `${target.owner}/${target.repo}@${target.branch}`;
+  return target.kind === 'issue' ? `${target.owner}/${target.repo}#${target.issueNumber}` : `${target.owner}/${target.repo}@${target.branch}${target.publicationBranch === undefined ? '' : `#publication=${target.publicationBranch}`}`;
 }
 
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
-function makeReceiptId(target: Target, headSha: string, now: string): string {
-  return `oracle-${targetText(target).replace(/[^A-Za-z0-9._-]/g, '-')}-${headSha.slice(0, 12)}-${now.replace(/[^0-9]/g, '').slice(-14)}-${randomUUID()}`;
+function makeReceiptId(targetKey: string, headSha: string, requestCorrelationId: string): string {
+  const digest = createHash('sha256').update(JSON.stringify(['oracle-receipt/v1', targetKey, headSha])).digest('hex');
+  return `oracle-${digest}-${requestCorrelationId}`;
 }
 
 function parseOutput(raw: string, headSha: string, reviewerName: string): ReviewResult {
@@ -177,12 +170,13 @@ export class OracleReviewer implements ReviewerAdapter {
 
   async review(request: ReviewRequest): Promise<ReviewResult> {
     const input = asRecord(request);
-    if (input === null || Object.keys(input).some((key) => !['target', 'headSha', 'instructions'].includes(key)) || typeof input.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(input.headSha) || targetKey(input.target) === null || (input.instructions !== undefined && (typeof input.instructions !== 'string' || input.instructions.length > ORACLE_LIMITS.instructions))) throw new OracleReviewerError('ORACLE_POLICY_HOLD', 'Oracle review request identity or shape is invalid.');
+    const requestTarget = input === null ? null : canonicalReviewTarget(input.target);
+    if (input === null || Object.keys(input).some((key) => !['target', 'headSha', 'instructions'].includes(key)) || typeof input.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(input.headSha) || requestTarget === null || (input.instructions !== undefined && (typeof input.instructions !== 'string' || input.instructions.length > ORACLE_LIMITS.instructions))) throw new OracleReviewerError('ORACLE_POLICY_HOLD', 'Oracle review request identity or shape is invalid.');
     request = freezeCopy(request);
-    const requestedTargetKey = targetKey(request.target)!;
+    const requestedTargetKey = requestTarget.key;
     const now = this.options.now ?? (() => new Date().toISOString());
     const requestCorrelationId = randomUUID();
-    const id = makeReceiptId(request.target, request.headSha, now());
+    const id = makeReceiptId(requestedTargetKey, request.headSha, requestCorrelationId);
     // Resolve and freeze all trusted decision inputs synchronously before any await.
     if (this.options.candidateEvidence === undefined || this.options.binding === undefined) {
       this.options.receipts?.record(this.failureReceipt(id, request, 'invalid_response', now()));
@@ -251,8 +245,9 @@ export class OracleReviewer implements ReviewerAdapter {
       throw new OracleReviewerError('ORACLE_TRANSPORT_FAILED', `Oracle transport failed: ${response.code}.`, response.retryable);
     }
     const observed = asRecord(response.observation);
-    if (observed === null || observed.verified !== true || observed.bindingId !== binding.bindingId || observed.effectiveModel !== binding.model || observed.effectiveEffort !== effort || observed.requestCorrelationId !== requestCorrelationId || observed.targetKey !== requestedTargetKey || observed.pullRequestNumber !== before.pullRequestNumber || observed.headSha !== request.headSha || observed.baseSha !== before.baseSha || observed.coverageComplete !== true || JSON.stringify(observed.changedPaths) !== JSON.stringify(decision.changedPaths)) {
-      this.options.receipts?.record({ ...this.failureReceipt(id, request, 'invalid_response', now()), observedHeadSha: request.headSha, policy: policyReceipt(decision, effort, binding, typeof observed?.effectiveModel === 'string' ? observed.effectiveModel : null, observed?.effectiveEffort === 'Medium' || observed?.effectiveEffort === 'High' || observed?.effectiveEffort === 'Extra High' ? observed.effectiveEffort : null, requestCorrelationId, observed?.coverageComplete === true, before.pullRequestNumber) });
+    const coverageMatches = observed?.coverageComplete === true && Array.isArray(observed.changedPaths) && JSON.stringify(observed.changedPaths) === JSON.stringify(decision.changedPaths);
+    if (observed === null || observed.verified !== true || observed.bindingId !== binding.bindingId || observed.effectiveModel !== binding.model || observed.effectiveEffort !== effort || observed.requestCorrelationId !== requestCorrelationId || observed.targetKey !== requestedTargetKey || observed.pullRequestNumber !== before.pullRequestNumber || observed.headSha !== request.headSha || observed.baseSha !== before.baseSha || !coverageMatches) {
+      this.options.receipts?.record({ ...this.failureReceipt(id, request, 'invalid_response', now()), observedHeadSha: request.headSha, policy: policyReceipt(decision, effort, binding, typeof observed?.effectiveModel === 'string' ? observed.effectiveModel : null, observed?.effectiveEffort === 'Medium' || observed?.effectiveEffort === 'High' || observed?.effectiveEffort === 'Extra High' ? observed.effectiveEffort : null, requestCorrelationId, coverageMatches, before.pullRequestNumber) });
       throw new OracleReviewerError('ORACLE_POLICY_HOLD', 'Oracle transport observation did not verify the configured binding and complete candidate coverage.');
     }
     let result: ReviewResult;
@@ -285,7 +280,7 @@ export class OracleReviewer implements ReviewerAdapter {
       const branch = asRecord(branchValue);
       const associatedNumbers = branch === null ? null : safeArray(branch.pullRequestNumbers, 200);
       const listedPullRequests = safeArray(prsValue, 200);
-      if (branch === null || targetKey(branch.target) !== targetKey(target) || typeof branch.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(branch.headSha) || associatedNumbers === null || associatedNumbers.length === 0 || !associatedNumbers.every((number) => Number.isSafeInteger(number) && Number(number) > 0) || new Set(associatedNumbers).size !== associatedNumbers.length || listedPullRequests === null) return null;
+      if (branch === null || canonicalReviewTarget(branch.target)?.key !== canonicalReviewTarget(target)?.key || typeof branch.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(branch.headSha) || associatedNumbers === null || associatedNumbers.length === 0 || !associatedNumbers.every((number) => Number.isSafeInteger(number) && Number(number) > 0) || new Set(associatedNumbers).size !== associatedNumbers.length || listedPullRequests === null) return null;
       const parsedPullRequests = listedPullRequests.map((item) => {
         const pr = asRecord(item);
         if (pr === null || !Number.isSafeInteger(pr.number) || Number(pr.number) <= 0 || typeof pr.headSha !== 'string' || !/^[0-9a-f]{40}$/i.test(pr.headSha) || typeof pr.baseSha !== 'string' || !/^[0-9a-f]{40}$/i.test(pr.baseSha) || !['open', 'closed', 'merged'].includes(String(pr.state))) return null;

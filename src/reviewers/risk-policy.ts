@@ -1,4 +1,5 @@
 import type { Target } from '../domain/types.js';
+import { createHash } from 'node:crypto';
 
 /** Provider neutral, fail closed review risk classification. */
 
@@ -6,11 +7,17 @@ export const REVIEW_RISK_POLICY_VERSION = 'risk-policy/v1' as const;
 export const REVIEW_RISK_LIMITS = { paths: 200, pathLength: 240, signalCount: 20, signalLength: 240, criticalQuestionLength: 500 } as const;
 
 export type ReviewRiskTier = 'R1' | 'R2' | 'R3' | 'R4' | 'R5';
-export type ReviewRiskReason =
-  | 'tiny_safe_documentation' | 'ordinary_implementation' | 'public_api_or_persistence'
-  | 'concurrency_or_recovery' | 'security_or_release_authority'
-  | 'workflow_or_recovery_state' | 'reviewer_policy_or_qualification' | 'admission_or_release_authority'
-  | 'declared_risk_signal' | 'critical_escalation';
+export const REVIEW_RISK_REASONS = [
+  'tiny_safe_documentation', 'ordinary_implementation', 'public_api_or_persistence',
+  'concurrency_or_recovery', 'security_or_release_authority', 'workflow_or_recovery_state',
+  'reviewer_policy_or_qualification', 'admission_or_release_authority',
+  'publication_or_isolation_authority', 'declared_risk_signal', 'critical_escalation',
+] as const;
+export type ReviewRiskReason = typeof REVIEW_RISK_REASONS[number];
+const REVIEW_RISK_REASON_SET: ReadonlySet<string> = new Set(REVIEW_RISK_REASONS);
+export function isReviewRiskReason(value: unknown): value is ReviewRiskReason {
+  return typeof value === 'string' && REVIEW_RISK_REASON_SET.has(value);
+}
 
 export interface ReviewRiskEvidence {
   readonly target: Target;
@@ -44,6 +51,7 @@ function pathValid(path: string): boolean {
 function pathTier(path: string): { tier: ReviewRiskTier; reason: ReviewRiskReason } {
   const p = path.toLowerCase();
   if (/^src\/(mission-admission|domain\/repair-admission)(\/|\.)/.test(p) || /^src\/production-policy\.ts$/.test(p)) return { tier: 'R5', reason: 'admission_or_release_authority' };
+  if (/^src\/workspace\/(git-worktree-bootstrap|standalone-git-bootstrap)\.ts$/.test(p) || /^src\/agents\/(worker-router|worker-router-container|luna-isolated)\.ts$/.test(p) || /^src\/github\/live-state\.ts$/.test(p) || /^src\/workflow\/run\.ts$/.test(p) || /^src\/reviewers\/loop\.ts$/.test(p)) return { tier: 'R5', reason: 'publication_or_isolation_authority' };
   if (/^src\/(workflow|dispatch\/invocation-lock)(\/|\.)/.test(p) || /^scripts\/bootstrap-heartbeat\//.test(p)) return { tier: 'R4', reason: 'workflow_or_recovery_state' };
   if (/^src\/oracle\//.test(p) || /^src\/reviewers\/risk-policy\.ts$/.test(p)) return { tier: 'R4', reason: 'reviewer_policy_or_qualification' };
   if (/^src\/store\//.test(p) || /^src\/domain\/types\.ts$/.test(p) || /^src\/adapters\//.test(p)) return { tier: 'R3', reason: 'public_api_or_persistence' };
@@ -72,19 +80,23 @@ function array(value: unknown, maximum: number): unknown[] | null {
     return Array.from({ length: value.length }, (_, index) => descriptors[String(index)]!.value as unknown);
   } catch { return null; }
 }
-function canonicalTarget(value: unknown): { target: Target; key: string } | null {
+export function canonicalReviewTarget(value: unknown): { readonly target: Target; readonly key: string } | null {
   const t = record(value);
   if (t === null || typeof t.kind !== 'string' || typeof t.owner !== 'string' || typeof t.repo !== 'string' || !/^[A-Za-z0-9_.-]{1,100}$/.test(t.owner) || !/^[A-Za-z0-9_.-]{1,100}$/.test(t.repo)) return null;
   if (t.kind === 'issue' && Number.isSafeInteger(t.issueNumber) && Number(t.issueNumber) > 0 && Object.keys(t).every((key) => ['kind', 'owner', 'repo', 'issueNumber'].includes(key))) {
     const target = { kind: 'issue' as const, owner: t.owner, repo: t.repo, issueNumber: Number(t.issueNumber) };
-    return { target, key: `${target.owner}/${target.repo}#${target.issueNumber}` };
+    return { target, key: targetDigest(['review-target/v1', 'issue', target.owner, target.repo, target.issueNumber]) };
   }
   if (t.kind === 'repository' && typeof t.branch === 'string' && t.branch.length > 0 && t.branch.length <= 240 && !t.branch.startsWith('/') && !t.branch.includes('\\') && !t.branch.split('/').some((part) => part === '' || part === '.' || part === '..') && Object.keys(t).every((key) => ['kind', 'owner', 'repo', 'branch', 'publicationBranch'].includes(key))) {
     if (t.publicationBranch !== undefined && (typeof t.publicationBranch !== 'string' || t.publicationBranch.length === 0 || t.publicationBranch.length > 240 || t.publicationBranch.startsWith('/') || t.publicationBranch.includes('\\') || t.publicationBranch.split('/').some((part) => part === '' || part === '.' || part === '..'))) return null;
     const target = { kind: 'repository' as const, owner: t.owner, repo: t.repo, branch: t.branch, ...(typeof t.publicationBranch === 'string' ? { publicationBranch: t.publicationBranch } : {}) };
-    return { target, key: `${target.owner}/${target.repo}@${target.branch}${target.publicationBranch === undefined ? '' : `#publication=${target.publicationBranch}`}` };
+    return { target, key: targetDigest(['review-target/v1', 'repository', target.owner, target.repo, target.branch, target.publicationBranch ?? null]) };
   }
   return null;
+}
+
+function targetDigest(fields: readonly (string | number | null)[]): string {
+  return `review-target/v1:${createHash('sha256').update(JSON.stringify(fields)).digest('hex')}`;
 }
 
 /** Classifies already-observed trusted candidate evidence. Malformed or incomplete evidence never becomes a low tier. */
@@ -92,7 +104,7 @@ export function classifyReviewRisk(input: unknown): ReviewRiskDecision {
   const e = record(input);
   if (e === null) return { outcome: 'hold', reasons: ['missing_evidence'] };
   if (Object.keys(e).some((key) => !['target', 'headSha', 'baseSha', 'changedPaths', 'manifestComplete', 'deterministicValidation', 'riskSignals', 'riskEvidenceComplete', 'establishedSafePattern', 'criticalQuestion'].includes(key))) return { outcome: 'hold', reasons: ['invalid_risk_evidence'] };
-  const candidateTarget = canonicalTarget(e.target);
+  const candidateTarget = canonicalReviewTarget(e.target);
   if (candidateTarget === null || typeof e.headSha !== 'string' || !SHA.test(e.headSha) || typeof e.baseSha !== 'string' || !SHA.test(e.baseSha)) return { outcome: 'hold', reasons: ['invalid_identity'] };
   const headSha = e.headSha;
   const baseSha = e.baseSha;

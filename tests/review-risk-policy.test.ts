@@ -28,7 +28,8 @@ describe('classifyReviewRisk', () => {
   });
 
   it('recognizes Conductor persistence, workflow, lock, heartbeat, admission, and Oracle policy paths', () => {
-    for (const [path, floor] of [['src/store/json-file-store.ts', 'R3'], ['src/dispatch/invocation-lock.ts', 'R4'], ['src/workflow/run.ts', 'R4'], ['scripts/bootstrap-heartbeat/runner.py', 'R4'], ['src/domain/repair-admission.ts', 'R5'], ['src/mission-admission/registry.ts', 'R5'], ['src/oracle/reviewer.ts', 'R4']] as const) {
+    for (const [path, floor] of [['src/store/json-file-store.ts', 'R3'], ['src/dispatch/invocation-lock.ts', 'R4'], ['src/workflow/run.ts', 'R5'], ['scripts/bootstrap-heartbeat/runner.py', 'R4'], ['src/domain/repair-admission.ts', 'R5'], ['src/mission-admission/registry.ts', 'R5'], ['src/oracle/reviewer.ts', 'R4'],
+      ['src/workspace/git-worktree-bootstrap.ts', 'R5'], ['src/workspace/standalone-git-bootstrap.ts', 'R5'], ['src/agents/worker-router.ts', 'R5'], ['src/agents/worker-router-container.ts', 'R5'], ['src/agents/luna-isolated.ts', 'R5'], ['src/github/live-state.ts', 'R5'], ['src/reviewers/loop.ts', 'R5']] as const) {
       const decision = classifyReviewRisk(evidence({ changedPaths: [path] }));
       assert.equal(decision.outcome === 'review' ? decision.floor : 'hold', floor, path);
       if (floor === 'R5') assert.ok(decision.outcome === 'review' && decision.criticalReason?.includes(path));

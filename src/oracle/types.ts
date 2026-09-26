@@ -1,5 +1,5 @@
 import type { ReviewResult, Target } from '../domain/types.js';
-import type { ReviewRiskDecision, ReviewRiskTier } from '../reviewers/risk-policy.js';
+import type { ReviewRiskDecision, ReviewRiskReason, ReviewRiskTier } from '../reviewers/risk-policy.js';
 
 export const ORACLE_LIMITS = {
   instructions: 4_000,
@@ -80,7 +80,7 @@ export type OracleReceipt = {
     readonly selectedSemanticTier: ReviewRiskTier;
     readonly requestedEffort: OracleEffort;
     readonly effectiveEffort: OracleEffort | null;
-    readonly reasons: readonly string[];
+    readonly reasons: readonly ReviewRiskReason[];
     readonly criticalReason: string | null;
     readonly baseSha: string;
     readonly pullRequestNumber: number | null;

@@ -9,7 +9,7 @@ import type { GitHubAdapter, PullRequestSnapshot } from '../src/adapters/github.
 import { OracleReviewer, OracleReviewerError } from '../src/oracle/reviewer.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import type { OracleReceipt, OracleReviewTransport, OracleTransportRequest, OracleTransportResult } from '../src/oracle/types.js';
-import type { ReviewRiskEvidence } from '../src/reviewers/risk-policy.js';
+import { canonicalReviewTarget, type ReviewRiskEvidence } from '../src/reviewers/risk-policy.js';
 
 const HEAD = 'a'.repeat(40);
 const OTHER = 'c'.repeat(40);
@@ -23,19 +23,19 @@ function evidence(overrides: Partial<ReviewRiskEvidence> = {}): ReviewRiskEviden
   return { target, headSha: HEAD, baseSha: BASE, changedPaths, manifestComplete: true, deterministicValidation: { passed: true, headSha: HEAD, baseSha: BASE }, riskSignals: [], riskEvidenceComplete: true, ...overrides };
 }
 
-function github(heads: string[], bases: string[] = [BASE]): GitHubAdapter {
+function github(heads: string[], bases: string[] = [BASE], branchTarget: typeof target = target): GitHubAdapter {
   let index = 0;
   const pr = (headSha: string, baseSha: string): PullRequestSnapshot => ({ number: 7, headSha, baseSha, state: 'open' });
   return {
     kind: 'github', async readIssue() { throw new Error('unused'); },
     async listPullRequests() { const n = Math.min(Math.max(0, index - 1), heads.length - 1); return [pr(heads[n]!, bases[Math.min(n, bases.length - 1)]!)]; },
     async readLiveSnapshot() { throw new Error('unused'); },
-    async readBranch() { const n = Math.min(index++, heads.length - 1); return { target, headSha: heads[n]!, pullRequestNumbers: [7] }; },
+    async readBranch() { const n = Math.min(index++, heads.length - 1); return { target: branchTarget, headSha: heads[n]!, pullRequestNumbers: [7] }; },
   };
 }
 
-function githubAssociations(numbers: number[], pullRequests: PullRequestSnapshot[]): GitHubAdapter {
-  return { kind: 'github', async readIssue() { throw new Error('unused'); }, async listPullRequests() { return pullRequests; }, async readLiveSnapshot() { throw new Error('unused'); }, async readBranch() { return { target, headSha: HEAD, pullRequestNumbers: numbers }; } };
+function githubAssociations(numbers: number[], pullRequests: PullRequestSnapshot[], branchTarget: typeof target = target): GitHubAdapter {
+  return { kind: 'github', async readIssue() { throw new Error('unused'); }, async listPullRequests() { return pullRequests; }, async readLiveSnapshot() { throw new Error('unused'); }, async readBranch() { return { target: branchTarget, headSha: HEAD, pullRequestNumbers: numbers }; } };
 }
 
 function output(verdict: 'PASS' | 'REQUEST_CHANGES' = 'PASS'): string {
@@ -47,15 +47,15 @@ function verifiedTransport(raw = output(), overrides: Record<string, unknown> = 
     return { outcome: 'success', output: raw, observation: {
       verified: true, bindingId: request.binding.bindingId, effectiveModel: request.binding.model,
       effectiveEffort: request.requestedEffort, requestCorrelationId: request.requestCorrelationId,
-      targetKey: `${target.owner}/${target.repo}@${target.branch}`, pullRequestNumber: request.pullRequest.number,
+      targetKey: canonicalReviewTarget(request.target)?.key ?? '', pullRequestNumber: request.pullRequest.number,
       headSha: request.headSha, baseSha: request.pullRequest.baseSha, coverageComplete: true,
       changedPaths: [...request.policy.changedPaths], ...overrides,
     } };
   } };
 }
 
-function reviewer(options: { heads?: string[]; bases?: string[]; githubAdapter?: GitHubAdapter; transport?: OracleReviewTransport; receipts?: { record(receipt: OracleReceipt): void; list(): readonly OracleReceipt[] }; candidateMissing?: boolean; evidence?: unknown; supported?: readonly ('Medium' | 'High' | 'Extra High')[] } = {}) {
-  return new OracleReviewer({ github: options.githubAdapter ?? github(options.heads ?? [HEAD, HEAD], options.bases), transport: options.transport ?? verifiedTransport(), receipts: options.receipts,
+function reviewer(options: { heads?: string[]; bases?: string[]; requestTarget?: typeof target; githubAdapter?: GitHubAdapter; transport?: OracleReviewTransport; receipts?: { record(receipt: OracleReceipt): void; list(): readonly OracleReceipt[] }; candidateMissing?: boolean; evidence?: unknown; supported?: readonly ('Medium' | 'High' | 'Extra High')[]; now?: () => string } = {}) {
+  return new OracleReviewer({ github: options.githubAdapter ?? github(options.heads ?? [HEAD, HEAD], options.bases, options.requestTarget), transport: options.transport ?? verifiedTransport(), receipts: options.receipts, now: options.now,
     ...(options.candidateMissing ? {} : { candidateEvidence: () => options.evidence ?? evidence() }), binding: { ...binding, supportedEfforts: options.supported ?? binding.supportedEfforts } });
 }
 
@@ -106,7 +106,7 @@ describe('OracleReviewer policy binding', () => {
     const mismatchReceipts = mkdtempSync(path.join(os.tmpdir(), 'tachiko-oracle-effort-'));
     try {
       const highStore = new JsonFileOracleReceiptStore(highReceipts);
-      const approved = await reviewer({ evidence: evidence({ changedPaths: ['src/workflow/run.ts'] }), receipts: highStore }).review({ target, headSha: HEAD });
+      const approved = await reviewer({ evidence: evidence({ changedPaths: ['src/workflow/recovery.ts'] }), receipts: highStore }).review({ target, headSha: HEAD });
       const highReceipt = highStore.list()[0]!;
       assert.equal(approved.verdict, 'approve');
       assert.equal(highReceipt.policy?.floor, 'R4');
@@ -115,7 +115,7 @@ describe('OracleReviewer policy binding', () => {
       assert.equal(highReceipt.policyQualified, true);
 
       const mismatchStore = new JsonFileOracleReceiptStore(mismatchReceipts);
-      await assert.rejects(() => reviewer({ evidence: evidence({ changedPaths: ['src/workflow/run.ts'] }), transport: verifiedTransport(output(), { effectiveEffort: 'Medium' }), receipts: mismatchStore }).review({ target, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_POLICY_HOLD');
+      await assert.rejects(() => reviewer({ evidence: evidence({ changedPaths: ['src/workflow/recovery.ts'] }), transport: verifiedTransport(output(), { effectiveEffort: 'Medium' }), receipts: mismatchStore }).review({ target, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_POLICY_HOLD');
       const failed = mismatchStore.list()[0]!;
       assert.equal(failed.outcome, 'failed');
       assert.equal(failed.failureCode, 'invalid_response');
@@ -156,6 +156,7 @@ describe('OracleReviewer policy binding', () => {
       { ...approved, id: 'model', policy: { ...policy, effectiveModel: 'other-model' } },
       { ...approved, id: 'failure-flag', failureCode: 'invalid_response' },
       { ...approved, id: 'r5-reason', policy: { ...policy, floor: 'R5', selectedSemanticTier: 'R5', requestedEffort: 'Extra High', effectiveEffort: 'Extra High', criticalReason: null } },
+      { ...approved, id: 'unknown-reason', policy: { ...policy, reasons: ['future_unrecognized_reason'] } as unknown as OracleReceipt['policy'] },
     ];
     for (const receipt of invalid) {
       const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-oracle-invalid-'));
@@ -172,6 +173,17 @@ describe('OracleReviewer policy binding', () => {
     }
   });
 
+  it('marks failure receipt coverage complete only when the observed manifest matches', async () => {
+    for (const [overrides, expected] of [[{ changedPaths: [] }, false], [{ coverageComplete: false }, false], [{ effectiveEffort: 'High' }, true]] as const) {
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-oracle-coverage-'));
+      try {
+        const receipts = new JsonFileOracleReceiptStore(dir);
+        await assert.rejects(() => reviewer({ transport: verifiedTransport(output(), overrides), receipts }).review({ target, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_POLICY_HOLD');
+        assert.equal(receipts.list()[0]?.policy?.coverageComplete, expected);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+
   it('rejects base movement, stale HEAD, and forged model output identity', async () => {
     await assert.rejects(() => reviewer({ bases: [BASE, OTHER_BASE] }).review({ target, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
     await assert.rejects(() => reviewer({ heads: [HEAD, OTHER] }).review({ target, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_STALE_HEAD');
@@ -183,6 +195,37 @@ describe('OracleReviewer policy binding', () => {
     const noConsult: OracleReviewTransport = { async consult() { consults++; return { outcome: 'failure', code: 'unavailable', retryable: false }; } };
     await assert.rejects(() => reviewer({ evidence: evidence({ target: { ...target, repo: 'other' } }), transport: noConsult }).review({ target, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_POLICY_HOLD');
     assert.equal(consults, 0);
+  });
+
+  it('separates delimiter-colliding structured targets before transport', async () => {
+    let consults = 0;
+    const requested = { ...target, branch: 'feature#publication=release' };
+    const collidingCandidate = { ...target, publicationBranch: 'release' };
+    assert.notEqual(canonicalReviewTarget(requested)?.key, canonicalReviewTarget(collidingCandidate)?.key);
+    const noConsult: OracleReviewTransport = { async consult() { consults++; return { outcome: 'failure', code: 'unavailable', retryable: false }; } };
+    await assert.rejects(() => reviewer({ requestTarget: requested, evidence: evidence({ target: collidingCandidate }), transport: noConsult }).review({ target: requested, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_POLICY_HOLD');
+    assert.equal(consults, 0);
+  });
+
+  it('persists bounded unique receipts for maximum-size targets at a fixed time', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-oracle-max-target-'));
+    try {
+      const maxTarget = { kind: 'repository' as const, owner: 'o'.repeat(100), repo: 'r'.repeat(100), branch: 'b'.repeat(240), publicationBranch: 'p'.repeat(240) };
+      const receipts = new JsonFileOracleReceiptStore(dir);
+      const now = () => '2026-09-26T12:34:56.000Z';
+      const successful = reviewer({ requestTarget: maxTarget, evidence: evidence({ target: maxTarget }), receipts, now });
+      await successful.review({ target: maxTarget, headSha: HEAD });
+      await successful.review({ target: maxTarget, headSha: HEAD });
+      const failed = reviewer({ requestTarget: maxTarget, evidence: evidence({ target: maxTarget }), receipts, now, transport: { async consult() { return { outcome: 'failure', code: 'unavailable', retryable: false }; } } });
+      await assert.rejects(() => failed.review({ target: maxTarget, headSha: HEAD }), (e: unknown) => e instanceof OracleReviewerError && e.code === 'ORACLE_TRANSPORT_FAILED');
+      const stored = receipts.list();
+      assert.equal(stored.length, 3);
+      assert.equal(new Set(stored.map((receipt) => receipt.id)).size, 3);
+      assert.ok(stored.every((receipt) => receipt.id.length <= 120));
+      assert.ok(stored.every((receipt) => `${receipt.id}.json`.length < 255));
+      assert.equal(stored.filter((receipt) => receipt.outcome === 'approved').length, 2);
+      assert.equal(stored.filter((receipt) => receipt.outcome === 'failed').length, 1);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('holds ambiguous open PR associations, including a second PR with another HEAD and a replaced PR number', async () => {
