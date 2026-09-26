@@ -1,0 +1,50 @@
+name: Decision
+description: Product, architecture, security, authority, or scope decision that must start zero implementation writers.
+title: "[Decision] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Decision Issues are a Steward/Oracle boundary. They never become implementation dispatch-ready until a separate/revised implementation contract exists.
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - decision
+    validations:
+      required: true
+  - type: textarea
+    id: decision
+    attributes:
+      label: Decision required
+    validations:
+      required: true
+  - type: textarea
+    id: options
+    attributes:
+      label: Options and constraints
+      description: Known alternatives, invariants, and constraints. Do not force a recommendation when evidence is incomplete.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Required evidence
+      description: Facts or observations needed before authority can be resolved.
+    validations:
+      required: true
+  - type: textarea
+    id: downstream
+    attributes:
+      label: Downstream effect
+      description: What implementation/operational work becomes authorized after the decision.
+    validations:
+      required: true
+  - type: textarea
+    id: stop_conditions
+    attributes:
+      label: Stop conditions
+      description: Conditions under which no decision should be fabricated.
+    validations:
+      required: true
