@@ -862,11 +862,134 @@ function sameRunReceiptIdentity(receipt: RunOwnerReceipt, run: Run, missionId: s
     receipt.issue === (run.target.kind === 'issue' ? run.target.issueNumber : undefined) && receipt.claimId === run.dispatchClaimId && receipt.missionId === missionId;
 }
 
+const MISSION_EVIDENCE_FIELDS = ['repository', 'issue', 'pullRequest', 'run', 'claim', 'workspace', 'stateSurface', 'repositoryScope'] as const;
+
+function isLogicalBootstrapPlanningReservation(run: Run, receipt: RunOwnerReceipt, lane: AdmissionLaneView, generation: number): boolean {
+  const targetIssue = run.target.kind === 'issue' ? run.target.issueNumber : undefined;
+  const bootstrapMatchesRun = run.bootstrap !== undefined && run.target.kind === 'issue' &&
+    run.bootstrap.owner.toLowerCase() === run.target.owner.toLowerCase() && run.bootstrap.repo.toLowerCase() === run.target.repo.toLowerCase() &&
+    run.bootstrap.issueNumber === targetIssue;
+  const noExecutionEvidence = run.state === 'IMPLEMENTING' && run.interruptedFrom === undefined && run.interrupt === undefined &&
+    run.pullRequest === undefined && run.headSha === undefined && run.executor === undefined && run.agentResult === undefined &&
+    run.reviewResult === undefined && run.validationResult === undefined && (run.repairAdmissions?.length ?? 0) === 0 &&
+    !(run.telemetry?.events.some((event) => (event.kind === 'spawn' || event.kind === 'completion') && event.role === 'worker') ?? false) &&
+    run.history.some((record) => record.type === 'start') && run.history.some((record) => record.type === 'bootstrap_prepared') &&
+    run.history.every((record) => (record.type === 'start' || record.type === 'bootstrap_prepared') && record.repairHandoff === undefined);
+  if (!bootstrapMatchesRun || !noExecutionEvidence || lane.evidence.workspace !== undefined || receipt.workspace !== undefined ||
+    lane.evidence.stateSurface !== undefined || lane.evidence.repositoryScope !== undefined) return false;
+  if (receipt.phase === 'pre_execution') {
+    return lane.status === 'active' && lane.generation === generation && receipt.generation === generation &&
+      receipt.token?.laneId === lane.laneId && receipt.token.generation === generation;
+  }
+  if (receipt.phase === 'release_transition') {
+    return receipt.generation === generation && receipt.token?.laneId === lane.laneId && receipt.token.generation === generation &&
+      ((lane.status === 'active' && lane.generation === generation) || (lane.status === 'released' && lane.generation === generation + 1));
+  }
+  if (receipt.phase === 'released') {
+    return lane.status === 'released' && lane.generation === generation + 1 && receipt.generation === generation + 1 && receipt.token === undefined;
+  }
+  return false;
+}
+
+function assertRecoveryOwnerEvidence(run: Run, receipt: RunOwnerReceipt, lane: AdmissionLaneView, missionId: string, generation: number): void {
+  if (!sameRunReceiptIdentity(receipt, run, missionId) || lane.laneId !== `run:${run.id}` || lane.missionId !== missionId ||
+    lane.role !== 'production_captain' || lane.evidence.repositoryScope === true) {
+    throw new Error(`Run owner receipt and locked lane do not match exact Run owner identity for "${run.id}".`);
+  }
+  const expected = evidenceForRun(run);
+  let observed: ReturnType<typeof canonicalizeMissionEvidence>;
+  try { observed = canonicalizeMissionEvidence(lane.evidence); } catch {
+    throw new Error(`Locked registry evidence for Run "${run.id}" is not canonical.`);
+  }
+  const expectedWorkspace = expected.workspace;
+  const observedWorkspace = observed.workspace;
+  const logicalBootstrapGap = expectedWorkspace !== undefined && observedWorkspace === undefined && receipt.workspace === undefined &&
+    isLogicalBootstrapPlanningReservation(run, receipt, lane, generation);
+  const receiptWorkspace = receipt.workspace === undefined
+    ? undefined
+    : canonicalizeMissionEvidence({ repository: expected.repository, workspace: receipt.workspace }).workspace;
+
+  for (const field of MISSION_EVIDENCE_FIELDS) {
+    if (field === 'workspace') continue;
+    if (observed[field] !== expected[field]) {
+      throw new Error(`Locked registry ${field} evidence does not match durable Run "${run.id}".`);
+    }
+  }
+
+  if (expectedWorkspace !== undefined) {
+    if (observedWorkspace !== undefined && observedWorkspace !== expectedWorkspace) {
+      throw new Error(`Locked registry workspace conflicts with durable bootstrap for Run "${run.id}".`);
+    }
+    if (observedWorkspace === undefined && !logicalBootstrapGap) {
+      throw new Error(`Locked registry workspace is missing outside the exact logical pre-execution phase for Run "${run.id}".`);
+    }
+    if (receiptWorkspace !== undefined && receiptWorkspace !== expectedWorkspace) {
+      throw new Error(`Run owner receipt workspace conflicts with durable bootstrap for Run "${run.id}".`);
+    }
+    if (receiptWorkspace === undefined && !logicalBootstrapGap && !canBindMissingReceiptWorkspace(receipt, run, observedWorkspace)) {
+      throw new Error(`Run owner receipt has no supported workspace provenance for Run "${run.id}".`);
+    }
+  } else if (receiptWorkspace !== observedWorkspace) {
+    throw new Error(`Explicit workspace requires the exact canonical Run receipt and locked lane for Run "${run.id}".`);
+  }
+}
+
+function readRecoveryEvidence(
+  store: RunStore,
+  receiptPath: string,
+  lockedLane: AdmissionLaneView,
+  runId: string,
+  missionId: string,
+  generation: number,
+): { readonly run: Run; readonly receipt: RunOwnerReceipt } {
+  const run = store.read(runId);
+  const receipt = readRunOwnerReceipt(receiptPath);
+  if (run === null || receipt === null) throw new Error(`Run owner evidence disappeared while recovering Run "${runId}".`);
+  assertRecoveryOwnerEvidence(run, receipt, lockedLane, missionId, generation);
+  return { run, receipt };
+}
+
+function assertLockedLaneUnchanged(expected: AdmissionLaneView, observed: AdmissionLaneView, status: 'active' | 'parked'): void {
+  if (observed.laneId !== expected.laneId || observed.missionId !== expected.missionId || observed.role !== 'production_captain' ||
+    observed.status !== status || observed.generation !== expected.generation || observed.parkedReason !== expected.parkedReason ||
+    JSON.stringify(observed.evidence) !== JSON.stringify(expected.evidence)) {
+    throw new Error(`Locked ${status} Run lane changed identity, evidence, generation, or settlement reason before stopped recovery.`);
+  }
+}
+
+function assertActiveReceiptGeneration(receipt: RunOwnerReceipt, laneId: string, generation: number, tokenSecret: string): void {
+  if (!['pre_execution', 'execution_possible', 'park_transition', 'release_transition'].includes(receipt.phase) ||
+    receipt.laneId !== laneId || receipt.generation !== generation || receipt.token?.laneId !== laneId || receipt.token.generation !== generation || receipt.token.token !== tokenSecret) {
+    throw new Error('Run owner receipt does not identify the exact active capability generation.');
+  }
+}
+
+function assertActiveReleaseTransition(receipt: RunOwnerReceipt, laneId: string, generation: number, tokenSecret: string): void {
+  if (receipt.phase !== 'release_transition' || receipt.laneId !== laneId || receipt.generation !== generation ||
+    receipt.token?.laneId !== laneId || receipt.token.generation !== generation || receipt.token.token !== tokenSecret) {
+    throw new Error('Run owner receipt transition does not match the exact active generation.');
+  }
+}
+
+function assertParkedReleaseTransition(receipt: RunOwnerReceipt, run: Run, missionId: string, generation: number, workflowSettledOrigin: boolean): void {
+  if (!sameRunReceiptIdentity(receipt, run, missionId) || receipt.phase !== 'parked_release_transition' ||
+    receipt.generation !== generation || receipt.token !== undefined ||
+    (receipt.settlementReason !== undefined && (!workflowSettledOrigin || receipt.settlementReason !== 'workflow_settled'))) {
+    throw new Error(`Run owner receipt does not identify the exact parked release transition for generation ${generation}.`);
+  }
+}
+
 function canBindMissingReceiptWorkspace(receipt: RunOwnerReceipt, run: Run, registryWorkspace: string | undefined): boolean {
   if (receipt.workspace !== undefined || registryWorkspace === undefined || run.bootstrap === undefined) return false;
   const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
   const persistedWorkspace = canonicalizeMissionEvidence({ repository, workspace: run.bootstrap.workspacePath }).workspace;
   return persistedWorkspace === registryWorkspace;
+}
+
+function canonicalReceiptWorkspace(receipt: RunOwnerReceipt): string | undefined {
+  return receipt.workspace === undefined
+    ? undefined
+    : canonicalizeMissionEvidence({ repository: receipt.repository, workspace: receipt.workspace }).workspace;
 }
 
 /** Re-read and reconcile only the exact parked generation while its registry lock is held. */
@@ -880,14 +1003,17 @@ function writeParkedReleaseTransition(
   workflowSettledOrigin: boolean,
 ): void {
   const current = readRunOwnerReceipt(receiptPath);
+  const currentWorkspace = current === null ? undefined : canonicalReceiptWorkspace(current);
   if (current === null || !sameRunReceiptIdentity(current, run, missionId) ||
-    (current.workspace !== workspace && !(allowMissingWorkspaceBinding && current.workspace === undefined && workspace !== undefined && current.phase !== 'pre_execution'))) {
+    (currentWorkspace !== workspace && !(allowMissingWorkspaceBinding && currentWorkspace === undefined && workspace !== undefined && current.phase !== 'pre_execution'))) {
     throw new Error(`Run owner receipt does not match parked generation ${parkedGeneration} under the registry transaction.`);
   }
-  const exactParkTransition = current.phase === 'park_transition' && current.generation === parkedGeneration - 1 && current.token?.generation === parkedGeneration - 1;
+  const exactParkTransition = current.phase === 'park_transition' && current.generation === parkedGeneration - 1 &&
+    current.token?.laneId === current.laneId && current.token.generation === parkedGeneration - 1;
   const exactParked = current.phase === 'parked' && current.generation === parkedGeneration && current.token === undefined;
   const exactReleaseRetry = current.phase === 'parked_release_transition' && current.generation === parkedGeneration && current.token === undefined;
-  const interruptedReadmission = current.phase === 'pre_execution' && current.generation === parkedGeneration + 1 && current.token?.generation === parkedGeneration + 1;
+  const interruptedReadmission = current.phase === 'pre_execution' && current.generation === parkedGeneration + 1 &&
+    current.token?.laneId === current.laneId && current.token.generation === parkedGeneration + 1;
   if (!exactParkTransition && !exactParked && !exactReleaseRetry && !interruptedReadmission) {
     throw new Error(`Run owner receipt phase and generation do not match parked registry generation ${parkedGeneration}.`);
   }
@@ -905,7 +1031,7 @@ function writeParkedReleaseTransition(
 
 function finalizeParkedRunOwnerReceipt(receiptPath: string, run: Run, missionId: string, parkedGeneration: number, workspace: string | undefined): void {
   const current = readRunOwnerReceipt(receiptPath);
-  if (current === null || !sameRunReceiptIdentity(current, run, missionId) || current.workspace !== workspace) {
+  if (current === null || !sameRunReceiptIdentity(current, run, missionId) || canonicalReceiptWorkspace(current) !== workspace) {
     throw new Error(`Run owner receipt does not match parked generation ${parkedGeneration} after registry settlement.`);
   }
   const releasedGeneration = parkedGeneration + 1;
@@ -992,12 +1118,13 @@ export function recoverRunAdmission(
   if (run === null) throw new Error(`No run with id "${runId}" found.`);
   const laneId = `run:${run.id}`;
   const repo = `${run.target.owner}/${run.target.repo}`.toLowerCase();
-  const canonicalReceiptPath = receiptPath ?? resolveRunOwnerReceiptPath(repo, run.id, evidenceForRun(run, run.bootstrap === undefined ? {} : { workspace: run.bootstrap.workspacePath }));
+  const canonicalReceiptPath = receiptPath ?? resolveRunOwnerReceiptPath(repo, run.id, evidenceForRun(run));
   const receipt = readRunOwnerReceipt(canonicalReceiptPath);
   if (receipt === null || receipt.laneId !== laneId || receipt.runId !== run.id || receipt.repository !== repo ||
     receipt.issue !== (run.target.kind === 'issue' ? run.target.issueNumber : undefined) || receipt.claimId !== run.dispatchClaimId) {
     throw new Error(`Run "${run.id}" has no matching private owner receipt; refusing recovery.`);
   }
+  const operationTokenSecret = receipt.token?.token;
   if (receipt.generation !== expectedGeneration &&
     !(receipt.phase === 'released' && receipt.generation === expectedGeneration + 1) &&
     !(receipt.phase === 'pre_execution' && receipt.generation === expectedGeneration + 1) &&
@@ -1005,65 +1132,68 @@ export function recoverRunAdmission(
     throw new Error(`Run owner receipt generation ${receipt.generation} does not match expected generation ${expectedGeneration}.`);
   }
   const lane = registry.readLane(laneId);
-  if (lane === null || lane.missionId !== receipt.missionId || lane.role !== 'production_captain' || lane.evidence.repository !== repo || lane.evidence.run !== run.id ||
-    lane.evidence.issue !== receipt.issue || (receipt.claimId !== undefined && lane.evidence.claim !== receipt.claimId)) {
+  if (lane === null || lane.missionId !== receipt.missionId) {
     throw new Error(`Run owner receipt does not match the canonical registry owner for Run "${run.id}".`);
   }
+  assertRecoveryOwnerEvidence(run, receipt, lane, lane.missionId, expectedGeneration);
   if (lane.status === 'released' && lane.generation === expectedGeneration + 1) {
-    if (receipt.phase === 'released') return 'released';
-    if (receipt.phase === 'release_transition' || receipt.phase === 'parked_release_transition') {
-      registry.withExactReleasedLane(laneId, expectedGeneration + 1, () => {
-        const current = readRunOwnerReceipt(canonicalReceiptPath);
-        const canBindWorkspace = current !== null &&
-          (current.phase === 'release_transition' || current.phase === 'parked_release_transition') &&
-          canBindMissingReceiptWorkspace(current, run, lane.evidence.workspace);
-        const workspaceMatches = current !== null && (current.workspace === lane.evidence.workspace || canBindWorkspace);
-        if (current === null || !sameRunReceiptIdentity(current, run, lane.missionId) || !workspaceMatches ||
-          (current.generation !== expectedGeneration && current.generation !== expectedGeneration + 1)) {
-          throw new Error(`Run owner receipt does not match exact released generation ${expectedGeneration + 1}.`);
-        }
-        if (current.phase === 'released' && current.generation === expectedGeneration + 1 && current.token === undefined) return;
-        if (current.phase !== 'release_transition' && current.phase !== 'parked_release_transition') throw new Error('Run owner receipt phase is not an exact released transition.');
-        const exactActiveTransition = current.phase === 'release_transition' && current.generation === expectedGeneration && current.token?.laneId === laneId && current.token.generation === expectedGeneration;
-        const exactParkedTransition = current.phase === 'parked_release_transition' && current.generation === expectedGeneration && current.token === undefined;
-        if (!exactActiveTransition && !exactParkedTransition) throw new Error('Run owner receipt transition does not match the exact released generation.');
-        const { token: _token, ...withoutToken } = current;
-        writeRunOwnerReceipt(canonicalReceiptPath, { ...withoutToken, ...(canBindWorkspace ? { workspace: lane.evidence.workspace } : {}), phase: 'released', generation: expectedGeneration + 1 });
+    registry.withExactReleasedLane(laneId, expectedGeneration + 1, (releasedLane) => {
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
+      const current = fresh.receipt;
+      if (current.phase === 'released' && current.generation === expectedGeneration + 1 && current.token === undefined) return;
+      if (current.phase !== 'release_transition' && current.phase !== 'parked_release_transition') throw new Error('Run owner receipt phase is not an exact released transition.');
+      const exactActiveTransition = current.phase === 'release_transition' && current.generation === expectedGeneration && current.token?.laneId === laneId && current.token.generation === expectedGeneration && current.token.token === operationTokenSecret;
+      const exactParkedTransition = current.phase === 'parked_release_transition' && current.generation === expectedGeneration && current.token === undefined;
+      if (!exactActiveTransition && !exactParkedTransition) throw new Error('Run owner receipt transition does not match the exact released generation.');
+      const canBindWorkspace = current.phase === 'release_transition' || current.phase === 'parked_release_transition'
+        ? canBindMissingReceiptWorkspace(current, fresh.run, releasedLane.evidence.workspace)
+        : false;
+      const { token: _token, ...withoutToken } = current;
+      writeRunOwnerReceipt(canonicalReceiptPath, {
+        ...withoutToken,
+        ...(canBindWorkspace ? { workspace: releasedLane.evidence.workspace } : {}),
+        phase: 'released', generation: expectedGeneration + 1,
       });
-      return 'released';
-    }
+    });
+    return 'released';
   }
   if (lane.status === 'parked') {
     const expectedParkReason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
-    const workspaceMatches = receipt.workspace === lane.evidence.workspace ||
+    const normalizedReceiptWorkspace = canonicalReceiptWorkspace(receipt);
+    const workspaceMatches = normalizedReceiptWorkspace === lane.evidence.workspace ||
       (receipt.workspace === undefined && ['park_transition', 'parked', 'parked_release_transition'].includes(receipt.phase) &&
         canBindMissingReceiptWorkspace(receipt, run, lane.evidence.workspace));
     const interruptedParkPublication = receipt.phase === 'park_transition' && receipt.generation === expectedGeneration - 1 &&
+      receipt.token?.laneId === laneId && receipt.token.generation === expectedGeneration - 1 &&
       lane.generation === expectedGeneration && lane.parkedReason === expectedParkReason &&
       workspaceMatches;
     const normalizedParkRetry = receipt.generation === expectedGeneration && lane.generation === expectedGeneration &&
-      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && lane.parkedReason === expectedParkReason &&
+      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && receipt.token === undefined && lane.parkedReason === expectedParkReason &&
       workspaceMatches;
     const interruptedParkedReadmission = lane.generation === expectedGeneration && receipt.generation === expectedGeneration + 1 &&
-      (receipt.phase === 'pre_execution' || receipt.phase === 'parked_release_transition') && receipt.workspace === lane.evidence.workspace;
+      ((receipt.phase === 'pre_execution' && receipt.token?.laneId === laneId && receipt.token.generation === expectedGeneration + 1) ||
+        (receipt.phase === 'parked_release_transition' && receipt.token === undefined)) && normalizedReceiptWorkspace === lane.evidence.workspace;
     const exactParkedGeneration = lane.generation === expectedGeneration && receipt.generation === expectedGeneration &&
-      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && workspaceMatches;
+      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && receipt.token === undefined && workspaceMatches;
     if (!interruptedParkPublication && !normalizedParkRetry && !interruptedParkedReadmission && !exactParkedGeneration) throw new Error('Parked registry lane does not match the Run owner receipt phase and generation.');
     if (!operatorStopped) throw new Error('Parked Run recovery requires explicit --stopped operator attestation that the provider and children have stopped.');
     registry.releaseParked(laneId, lane.generation, true,
       (lockedParkedLane) => {
-        if (lockedParkedLane.laneId !== lane.laneId || lockedParkedLane.missionId !== lane.missionId ||
-          lockedParkedLane.generation !== lane.generation || lockedParkedLane.status !== 'parked' ||
-          lockedParkedLane.parkedReason !== lane.parkedReason || JSON.stringify(lockedParkedLane.evidence) !== JSON.stringify(lane.evidence)) {
-          throw new Error('Locked parked Run lane changed identity, evidence, workspace, or settlement reason before stopped recovery.');
-        }
-        writeParkedReleaseTransition(canonicalReceiptPath, run, lane.missionId, lane.generation, lane.evidence.workspace,
-          canBindMissingReceiptWorkspace(receipt, run, lane.evidence.workspace), lockedParkedLane.parkedReason === 'workflow_settled');
+        assertLockedLaneUnchanged(lane, lockedParkedLane, 'parked');
+        const fresh = readRecoveryEvidence(store, canonicalReceiptPath, lockedParkedLane, run.id, lane.missionId, expectedGeneration);
+        writeParkedReleaseTransition(canonicalReceiptPath, fresh.run, lane.missionId, lane.generation, lockedParkedLane.evidence.workspace,
+          canBindMissingReceiptWorkspace(fresh.receipt, fresh.run, lockedParkedLane.evidence.workspace), lockedParkedLane.parkedReason === 'workflow_settled');
         if (interruptedParkPublication) crashAfter?.parkReceiptNormalization?.();
       },
-      () => {
-        finalizeParkedRunOwnerReceipt(canonicalReceiptPath, run, lane.missionId, lane.generation, lane.evidence.workspace);
+      (releasedLane) => {
+        const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
+        finalizeParkedRunOwnerReceipt(canonicalReceiptPath, fresh.run, lane.missionId, lane.generation, releasedLane.evidence.workspace);
         crashAfter?.parkReceiptFinalization?.();
+      },
+      (lockedParkedLane) => {
+        assertLockedLaneUnchanged(lane, lockedParkedLane, 'parked');
+        const fresh = readRecoveryEvidence(store, canonicalReceiptPath, lockedParkedLane, run.id, lane.missionId, expectedGeneration);
+        assertParkedReleaseTransition(fresh.receipt, fresh.run, lane.missionId, lane.generation, lockedParkedLane.parkedReason === 'workflow_settled');
       });
     return 'released';
   }
@@ -1072,9 +1202,23 @@ export function recoverRunAdmission(
   }
   if (!operatorStopped) throw new Error('External recovery requires explicit --stopped operator attestation that the provider and children have stopped; receipt phase alone cannot prove supervisor death.');
   registry.assertCurrentOwner(receipt.token);
-  const transition = { ...receipt, phase: 'release_transition' as const, token: receipt.token };
-  registry.release(receipt.token, true, () => writeRunOwnerReceipt(canonicalReceiptPath, transition),
-    () => finalizeRunOwnerReceipt(canonicalReceiptPath, receipt.token!, 'released', expectedGeneration + 1));
+  registry.release(receipt.token, true,
+    (activeLane) => {
+      assertLockedLaneUnchanged(lane, activeLane, 'active');
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, activeLane, run.id, lane.missionId, expectedGeneration);
+      assertActiveReceiptGeneration(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
+      writeRunOwnerReceipt(canonicalReceiptPath, { ...fresh.receipt, phase: 'release_transition', token: fresh.receipt.token });
+    },
+    (releasedLane) => {
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
+      assertActiveReleaseTransition(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
+      finalizeRunOwnerReceipt(canonicalReceiptPath, receipt.token!, 'released', expectedGeneration + 1);
+    },
+    (activeLane) => {
+      assertLockedLaneUnchanged(lane, activeLane, 'active');
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, activeLane, run.id, lane.missionId, expectedGeneration);
+      assertActiveReleaseTransition(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
+    });
   return 'released';
 }
 

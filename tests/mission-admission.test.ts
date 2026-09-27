@@ -165,6 +165,68 @@ describe('provider-neutral durable mission admission', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('hands release hooks independent detached active, parked, and released lane views', () => {
+    let runGlobalBeforePublish = false;
+    const callbackOrder: string[] = [];
+    const { directory, registry } = fixture({ beforePublish: () => {
+      if (runGlobalBeforePublish) callbackOrder.push('global');
+    } });
+    try {
+      const active = registry.admit({ laneId: 'detached-active-release', role: 'production_captain', evidence: evidence(903) });
+      assert.equal(active.outcome, 'admitted');
+      if (active.outcome !== 'admitted') throw new Error('expected active admission');
+      runGlobalBeforePublish = true;
+      const activeRevision = registry.release(active.token, true,
+        (activeView) => {
+          callbackOrder.push(`prepare:${activeView.status}`);
+          (activeView.evidence as { issue?: number }).issue = 999;
+        },
+        (releasedView) => {
+          callbackOrder.push(`finalize:${releasedView.status}`);
+          assert.equal(releasedView.generation, active.token.generation + 1);
+        },
+        (activeView) => {
+          callbackOrder.push(`validate:${activeView.status}`);
+          assert.equal(activeView.evidence.issue, 903, 'preparation view mutations cannot alter the validation snapshot');
+        });
+      assert.ok(activeRevision > 0);
+      assert.deepEqual(callbackOrder.slice(0, 4), ['prepare:active', 'global', 'validate:active', 'finalize:released']);
+      assert.equal(registry.readLane(active.token.laneId)?.evidence.issue, 903);
+
+      callbackOrder.length = 0;
+      runGlobalBeforePublish = false;
+      const parked = registry.admit({ laneId: 'detached-parked-release', role: 'production_captain', evidence: evidence(904) });
+      assert.equal(parked.outcome, 'admitted');
+      if (parked.outcome !== 'admitted') throw new Error('expected parked release admission');
+      registry.park(parked.token, 'workflow_wait');
+      const parkedGeneration = parked.token.generation + 1;
+      runGlobalBeforePublish = true;
+      const parkedRevision = registry.releaseParked(parked.token.laneId, parkedGeneration, true,
+        (parkedView) => {
+          callbackOrder.push(`prepare:${parkedView.status}`);
+          (parkedView.evidence as { issue?: number }).issue = 998;
+        },
+        (releasedView) => {
+          callbackOrder.push(`finalize:${releasedView.status}`);
+          assert.equal(releasedView.generation, parkedGeneration + 1);
+        },
+        (parkedView) => {
+          callbackOrder.push(`validate:${parkedView.status}`);
+          assert.equal(parkedView.evidence.issue, 904, 'park preparation view mutations cannot alter the validation snapshot');
+        });
+      assert.ok(parkedRevision > activeRevision);
+      assert.deepEqual(callbackOrder, ['prepare:parked', 'global', 'validate:parked', 'finalize:released']);
+      let releasedViewIssue: number | undefined;
+      registry.withExactReleasedLane(parked.token.laneId, parkedGeneration + 1, (releasedView) => {
+        assert.equal(releasedView.status, 'released');
+        releasedViewIssue = releasedView.evidence.issue;
+        (releasedView.evidence as { issue?: number }).issue = 997;
+      });
+      assert.equal(releasedViewIssue, 904);
+      assert.equal(registry.readLane(parked.token.laneId)?.evidence.issue, 904, 'locked released views cannot mutate stored state');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('signals only after atomic publication of meaningful revisions and never hides an admitted token on signal failure', () => {
     let signals = 0;
     const { directory, filePath, registry } = fixture({ onPublishedTransition: (projection) => {
