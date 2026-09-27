@@ -6,6 +6,7 @@ import { describe, it } from 'node:test';
 
 import {
   DISPATCH_QUEUE_MARKER,
+  DISPATCH_RUNTIME_MARKER,
   DispatchProtocolError,
   claimDispatchEntry,
   parseDispatchQueue,
@@ -31,15 +32,24 @@ import { LiveGitHubAdapter } from '../src/github/live-state.js';
 import type { GitHubApiTransport } from '../src/github/transport.js';
 
 const T0 = '2026-09-15T00:00:00.000Z';
+const DISPATCH_AUTHORITY = { revision: 'task-shape-v1', shape: 'interacting' } as const;
 const QUEUE = `${DISPATCH_QUEUE_MARKER}
 ready:
   - issue: 18
     route: codex
     profile: complex
+    task-shape-revision: task-shape-v1
+    task-shape: interacting
   - issue: 19
     route: codex
-    profile: standard`;
-const DISPATCH_AUTHORITY = { revision: 'task-shape-v1', shape: 'interacting' } as const;
+    profile: standard
+    task-shape-revision: task-shape-v1
+    task-shape: interacting`;
+const LEGACY_QUEUE = `${DISPATCH_QUEUE_MARKER}
+ready:
+  - issue: 18
+    route: codex
+    profile: complex`;
 
 class Comments {
   readonly comments: DispatchRuntimeComment[] = [];
@@ -147,9 +157,10 @@ describe('dispatch queue protocol', () => {
 
   it('parses only complete, uniquely identified Codex queue records', () => {
     assert.deepEqual(parseDispatchQueue(QUEUE), [
-      { issue: 18, route: 'codex', profile: 'complex' },
-      { issue: 19, route: 'codex', profile: 'standard' },
+      { issue: 18, route: 'codex', profile: 'complex', repairTaskShapeAuthority: DISPATCH_AUTHORITY },
+      { issue: 19, route: 'codex', profile: 'standard', repairTaskShapeAuthority: DISPATCH_AUTHORITY },
     ]);
+    assert.deepEqual(parseDispatchQueue(LEGACY_QUEUE), [{ issue: 18, route: 'codex', profile: 'complex' }], 'legacy authority-less rows remain parseable for an explicit ineligible result');
     assert.deepEqual(parseDispatchQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: human\n    profile: standard`), [
       { issue: 18, route: 'human', profile: 'standard' },
     ]);
@@ -163,13 +174,30 @@ describe('dispatch queue protocol', () => {
   it('round-trips only the complete runtime schema', () => {
     const body = renderDispatchRuntime({
       issue: 18, claimId: 'claim-1', runId: null, profile: 'complex', state: 'claimed',
+      repairTaskShapeAuthority: DISPATCH_AUTHORITY,
       claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
     });
     assert.deepEqual(parseDispatchRuntime(body), {
       issue: 18, claimId: 'claim-1', runId: null, profile: 'complex', state: 'claimed',
+      repairTaskShapeAuthority: DISPATCH_AUTHORITY,
       claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
     });
     assert.throws(() => parseDispatchRuntime(body.replace('"state": "claimed"', '"state": "claimed", "unsafe": true')), DispatchProtocolError);
+    const legacy = renderDispatchRuntime({
+      issue: 18, claimId: 'legacy-claim', runId: null, profile: 'complex', state: 'claimed',
+      claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+    });
+    assert.equal(parseDispatchRuntime(legacy)?.repairTaskShapeAuthority, undefined);
+    const malformedAuthorityBody = (authority: unknown) => `${DISPATCH_RUNTIME_MARKER}\n\n\`\`\`json\n${JSON.stringify({
+      issue: 18, claimId: 'bad-claim', runId: null, profile: 'complex', state: 'claimed',
+      claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z', repairTaskShapeAuthority: authority,
+    }, null, 2)}\n\`\`\``;
+    for (const authority of [
+      null,
+      { revision: 'task-shape-v1' },
+      { revision: 'task-shape-v1', shape: 'interacting', extra: true },
+      [{ revision: 'task-shape-v1', shape: 'interacting' }],
+    ]) assert.throws(() => parseDispatchRuntime(malformedAuthorityBody(authority)), /invalid task-shape authority/);
   });
 
   it('writes then rereads the exact sole claim before returning ownership', async () => {
@@ -180,12 +208,127 @@ describe('dispatch queue protocol', () => {
     assert.equal(claimed.commentId, 'comment-1');
     assert.deepEqual(claimed.claim, {
       issue: 18, claimId: 'claim-1', runId: null, profile: 'complex', state: 'claimed',
+      repairTaskShapeAuthority: DISPATCH_AUTHORITY,
       claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
     });
     await assert.rejects(
       claimDispatchEntry(comments, parseDispatchQueue(QUEUE)[1]!, { now: () => T0, leaseDurationMs: 60_000 }),
       DispatchProtocolError,
     );
+  });
+
+  it('skips authority-less Codex entries before GitHub reads or claim publication at every profile label', async () => {
+    for (const profile of ['routine', 'standard', 'complex', 'critical']) {
+      const runtime = new Comments();
+      let issueReads = 0;
+      const github = new GitHub();
+      github.readIssue = async (target) => {
+        issueReads += 1;
+        return { target, title: 'queued', body: '', state: 'open' };
+      };
+      const result = await dispatchOnce({
+        queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: ${profile}`,
+        owner: 'acme', repo: 'widgets', github, store: new MemoryStore(), runtime,
+        leaseDurationMs: 60_000, now: () => T0,
+        async execute() { throw new Error('authority-less Codex row must not execute'); },
+      });
+      assert.deepEqual(result, {
+        outcome: 'no_eligible_work',
+        reasons: ['#18: Codex dispatch requires explicit revisioned task-shape authority'],
+      });
+      assert.equal(issueReads, 0);
+      assert.equal(runtime.comments.length, 0);
+    }
+  });
+
+  it('holds an authority-less legacy pre-Run claim for owner reconciliation without mutation', async () => {
+    const runtime = new Comments();
+    const legacyClaim: DispatchRuntimeClaim = {
+      issue: 18, claimId: 'legacy-pre-run', runId: null, profile: 'complex', state: 'claimed',
+      claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+    };
+    const originalBody = renderDispatchRuntime(legacyClaim);
+    runtime.comments.push({ id: 'comment-1', body: originalBody });
+    let calls = 0;
+    const result = await dispatchOnce({
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: critical\n    task-shape-revision: task-shape-v1\n    task-shape: decision`,
+      owner: 'acme', repo: 'widgets', github: new GitHub(), store: new MemoryStore(), runtime,
+      leaseDurationMs: 1, now: () => '2026-09-16T00:00:00.000Z',
+      async execute() { calls += 1; throw new Error('legacy pre-Run claim must be held'); },
+    });
+    assert.equal(result.outcome, 'owner_reconciliation_hold');
+    assert.match(result.reason, /owner reconciliation/);
+    assert.equal(calls, 0);
+    assert.equal(runtime.comments[0]?.body, originalBody, 'legacy claim remains byte-for-byte unchanged without expiry takeover');
+    assert.equal(runtime.updates, 0);
+  });
+
+  it('recovers a pre-Run claim from its original authority after the current queue mutates or removes that row', async () => {
+    const queues = [
+      `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: critical\n    task-shape-revision: changed-v2\n    task-shape: decision`,
+      `${DISPATCH_QUEUE_MARKER}\nready:`,
+    ];
+    for (const currentQueue of queues) {
+      const runtime = new Comments();
+      const store = new MemoryStore();
+      await assert.rejects(dispatchOnce({
+        queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+        leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'pre-run-claim',
+        async execute() { throw new Error('crash after claim publication before Run creation'); },
+      }), /crash after claim publication/);
+      assert.equal(runtime.comments.length, 1);
+      assert.equal(parseDispatchRuntime(runtime.comments[0]!.body)?.repairTaskShapeAuthority?.revision, DISPATCH_AUTHORITY.revision);
+
+      const result = await dispatchOnce({
+        queueBody: currentQueue, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+        leaseDurationMs: 60_000, now: () => T0,
+        async execute(entry, _run, claim) {
+          assert.equal(entry.profile, 'complex');
+          assert.deepEqual(entry.repairTaskShapeAuthority, DISPATCH_AUTHORITY);
+          assert.deepEqual(claim.repairTaskShapeAuthority, DISPATCH_AUTHORITY);
+          const run = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: entry.issue }, T0, 'pre-run-recovered', undefined, claim.claimId, entry.repairTaskShapeAuthority);
+          store.create(run);
+          return { runId: run.id, state: 'IMPLEMENTING' };
+        },
+      });
+      assert.equal(result.outcome, 'dispatched');
+      if (result.outcome !== 'dispatched') throw new Error('expected recovered dispatch');
+      assert.equal(result.claim.claimId, 'pre-run-claim');
+      assert.deepEqual(store.list().map((run) => run.repairTaskShapeAuthority), [DISPATCH_AUTHORITY]);
+      assert.equal(store.list().length, 1, 'recovery creates exactly one durable Run');
+    }
+  });
+
+  it('recovers a Run created before claim.runId publication by the exact claim id and original authority', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    let resumed = 0;
+    await assert.rejects(dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'post-run-claim',
+      async execute(entry, _prior, claim) {
+        const run = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: entry.issue }, T0, 'created-before-claim-id', undefined, claim.claimId, entry.repairTaskShapeAuthority);
+        store.create(run);
+        throw new Error('crash after durable Run creation before claim.runId update');
+      },
+    }), /crash after durable Run creation/);
+    assert.equal(store.list().length, 1);
+    const result = await dispatchOnce({
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: routine\n    task-shape-revision: changed-v3\n    task-shape: bounded`,
+      owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute(entry, prior, claim) {
+        resumed += 1;
+        assert.equal(prior?.id, 'created-before-claim-id');
+        assert.deepEqual(prior?.repairTaskShapeAuthority, DISPATCH_AUTHORITY);
+        assert.equal(entry.profile, 'complex');
+        assert.deepEqual(claim.repairTaskShapeAuthority, DISPATCH_AUTHORITY);
+        return { runId: prior!.id, state: 'IMPLEMENTING' };
+      },
+    });
+    assert.equal(result.outcome, 'dispatched');
+    assert.equal(resumed, 1);
+    assert.equal(store.list().length, 1, 'claim-bound Run is recovered without a second Run');
   });
 
   it('fails closed on duplicate or malformed marked runtime comments', () => {
@@ -207,14 +350,15 @@ describe('dispatch queue protocol', () => {
       async execute(entry) { return { runId: `run-${entry.issue}`, state: 'IMPLEMENTING' }; },
     });
     assert.deepEqual(result, {
-      outcome: 'dispatched', entry: { issue: 18, route: 'codex', profile: 'complex' },
+      outcome: 'dispatched', entry: { issue: 18, route: 'codex', profile: 'complex', repairTaskShapeAuthority: DISPATCH_AUTHORITY },
       claim: {
         issue: 18, claimId: 'claim-1', runId: 'run-18', profile: 'complex', state: 'running',
+        repairTaskShapeAuthority: DISPATCH_AUTHORITY,
         claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
       },
       execution: { runId: 'run-18', state: 'IMPLEMENTING' },
     });
-    store.create(createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'run-18', undefined, 'claim-1'));
+    store.create(createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'run-18', undefined, 'claim-1', DISPATCH_AUTHORITY));
     const alreadyClaimed = await dispatchOnce({
       queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
       leaseDurationMs: 60_000, now: () => T0, async execute(entry) { return { runId: `run-${entry.issue}`, state: 'VALIDATING' }; },
@@ -370,6 +514,105 @@ describe('dispatch queue protocol', () => {
     assert.equal(parseDispatchRuntime(runtime.comments[0]!.body)?.state, 'needs_human');
   });
 
+  it('rejects stale claim updates when any immutable or mutable tuple field changes', async () => {
+    const changes: readonly ((claim: DispatchRuntimeClaim) => DispatchRuntimeClaim)[] = [
+      (claim) => ({ ...claim, issue: 20 }),
+      (claim) => ({ ...claim, profile: 'standard' }),
+      (claim) => ({ ...claim, claimedAt: '2026-09-14T00:00:00.000Z' }),
+      (claim) => ({ ...claim, repairTaskShapeAuthority: { ...DISPATCH_AUTHORITY, revision: 'changed-v2' } }),
+      (claim) => ({ ...claim, repairTaskShapeAuthority: { ...DISPATCH_AUTHORITY, shape: 'decision' } }),
+      (claim) => ({ ...claim, runId: 'other-run' }),
+      (claim) => ({ ...claim, state: 'needs_human' }),
+      (claim) => ({ ...claim, heartbeatAt: '2026-09-15T00:00:01.000Z' }),
+      (claim) => ({ ...claim, leaseUntil: '2026-09-15T00:02:00.000Z' }),
+    ];
+    for (const change of changes) {
+      const runtime = new Comments();
+      await assert.rejects(dispatchOnce({
+        queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store: new MemoryStore(), runtime,
+        leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'claim-identity',
+        async execute(_entry, _run, claim) {
+          await runtime.updateRuntimeComment('comment-1', renderDispatchRuntime(change(claim)));
+          return { runId: 'run-18', state: 'IMPLEMENTING' };
+        },
+      }), /Dispatch claim changed before a serialized heartbeat\/finalization/);
+    }
+  });
+
+  it('refuses execution when any claim identity field changes before the first heartbeat write', async () => {
+    const changes: readonly ((claim: DispatchRuntimeClaim) => DispatchRuntimeClaim)[] = [
+      (claim) => ({ ...claim, issue: 20 }),
+      (claim) => ({ ...claim, profile: 'standard' }),
+      (claim) => ({ ...claim, claimedAt: '2026-09-14T00:00:00.000Z' }),
+      (claim) => ({ ...claim, repairTaskShapeAuthority: { ...DISPATCH_AUTHORITY, revision: 'changed-v2' } }),
+      (claim) => ({ ...claim, repairTaskShapeAuthority: { ...DISPATCH_AUTHORITY, shape: 'decision' } }),
+      (claim) => ({ ...claim, runId: 'other-run' }),
+      (claim) => ({ ...claim, state: 'running' }),
+      (claim) => ({ ...claim, heartbeatAt: '2026-09-15T00:00:01.000Z' }),
+      (claim) => ({ ...claim, leaseUntil: '2026-09-15T00:02:00.000Z' }),
+    ];
+    for (const change of changes) {
+      const runtime = new Comments();
+      const claim: DispatchRuntimeClaim = {
+        issue: 18, claimId: 'live-claim', runId: null, profile: 'complex', state: 'claimed', repairTaskShapeAuthority: DISPATCH_AUTHORITY,
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      };
+      runtime.comments.push({ id: 'comment-1', body: renderDispatchRuntime(claim) });
+      const originalList = runtime.listRuntimeComments.bind(runtime);
+      let reads = 0;
+      runtime.listRuntimeComments = async () => {
+        reads += 1;
+        if (reads === 2) runtime.comments[0] = { id: 'comment-1', body: renderDispatchRuntime(change(claim)) };
+        return await originalList();
+      };
+      let executions = 0;
+      await assert.rejects(dispatchOnce({
+        queueBody: `${DISPATCH_QUEUE_MARKER}\nready:`, owner: 'acme', repo: 'widgets', github: new GitHub(), store: new MemoryStore(), runtime,
+        leaseDurationMs: 60_000, now: () => T0,
+        async execute() { executions += 1; return { runId: 'unexpected-run', state: 'IMPLEMENTING' }; },
+      }), /Dispatch claim changed before heartbeat/);
+      assert.equal(executions, 0);
+    }
+  });
+
+  it('does not recover a claim whose persisted task-shape authority disagrees with its Run', async () => {
+    const runtime = new Comments();
+    const store = new MemoryStore();
+    const run = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'authority-mismatch', undefined, 'claim-1', { revision: 'other-v2', shape: 'bounded' });
+    store.create(run);
+    const claim: DispatchRuntimeClaim = {
+      issue: 18, claimId: 'claim-1', runId: run.id, profile: 'complex', state: 'running', repairTaskShapeAuthority: DISPATCH_AUTHORITY,
+      claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+    };
+    const body = renderDispatchRuntime(claim);
+    runtime.comments.push({ id: 'comment-1', body });
+    let executions = 0;
+    await assert.rejects(dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute() { executions += 1; return { runId: run.id, state: 'IMPLEMENTING' }; },
+    }), /task-shape authority does not match its immutable durable Run/);
+    assert.equal(executions, 0);
+    assert.equal(runtime.comments[0]?.body, body);
+
+    const terminalStore = new MemoryStore();
+    const terminalRun = { ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'terminal-authority-mismatch', undefined, 'terminal-claim', { revision: 'other-v2', shape: 'bounded' }), state: 'FAILED' as const };
+    terminalStore.create(terminalRun);
+    const terminalRuntime = new Comments();
+    const terminalClaim: DispatchRuntimeClaim = {
+      issue: 18, claimId: 'terminal-claim', runId: terminalRun.id, profile: 'complex', state: 'failed', repairTaskShapeAuthority: DISPATCH_AUTHORITY,
+      claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+    };
+    const terminalBody = renderDispatchRuntime(terminalClaim);
+    terminalRuntime.comments.push({ id: 'comment-1', body: terminalBody });
+    await assert.rejects(dispatchOnce({
+      queueBody: QUEUE, owner: 'acme', repo: 'widgets', github: new GitHub(), store: terminalStore, runtime: terminalRuntime,
+      leaseDurationMs: 60_000, now: () => T0,
+      async execute() { throw new Error('terminal authority mismatch must not execute'); },
+    }), /task-shape authority does not match its immutable durable Run/);
+    assert.equal(terminalRuntime.comments[0]?.body, terminalBody, 'mismatched terminal claim is neither retired nor superseded');
+  });
+
   it('does not claim a queued Issue with an active durable run or pull request', async () => {
     const store = new MemoryStore();
     store.create(createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing'));
@@ -385,7 +628,7 @@ describe('dispatch queue protocol', () => {
 
   it('does not treat an incidental open PR cross-reference as an active writer', async () => {
     const result = await dispatchOnce({
-      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard`,
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard\n    task-shape-revision: task-shape-v1\n    task-shape: interacting`,
       owner: 'acme', repo: 'widgets', store: new MemoryStore(), runtime: new Comments(),
       github: new LiveGitHubAdapter({ transport: new IncidentalCrossReferenceTransport(), now: () => T0 }),
       leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'claim-1',
@@ -404,7 +647,7 @@ describe('dispatch queue protocol', () => {
       getPaginated: (path) => base.getPaginated(path),
     };
     const result = await dispatchOnce({
-      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard`,
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard\n    task-shape-revision: task-shape-v1\n    task-shape: interacting`,
       owner: 'acme', repo: 'widgets', store: new MemoryStore(), runtime: new Comments(),
       github: new LiveGitHubAdapter({ transport, now: () => T0 }),
       leaseDurationMs: 60_000, now: () => T0,
@@ -419,7 +662,7 @@ describe('dispatch queue protocol', () => {
 
   it('leaves human, Work, and ChatGPT entries unclaimed while continuing to a later Codex entry', async () => {
     const result = await dispatchOnce({
-      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 7\n    route: human\n    profile: standard\n  - issue: 8\n    route: work\n    profile: standard\n  - issue: 9\n    route: chatgpt\n    profile: standard\n  - issue: 18\n    route: codex\n    profile: complex`,
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 7\n    route: human\n    profile: standard\n  - issue: 8\n    route: work\n    profile: standard\n  - issue: 9\n    route: chatgpt\n    profile: standard\n  - issue: 18\n    route: codex\n    profile: complex\n    task-shape-revision: task-shape-v1\n    task-shape: interacting`,
       owner: 'acme', repo: 'widgets', store: new MemoryStore(), runtime: new Comments(), github: new GitHub(),
       leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'claim-1',
       async execute(entry) { return { runId: `run-${entry.issue}`, state: 'IMPLEMENTING' }; },
@@ -441,20 +684,52 @@ describe('dispatch queue protocol', () => {
         claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
       }),
     });
-    const queue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard`;
+    const queue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: standard\n    task-shape-revision: task-shape-v1\n    task-shape: interacting`;
     const result = await dispatchOnce({
       queueBody: queue, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
       leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'new-claim',
       async execute(entry) { return { runId: `run-${entry.issue}`, state: 'IMPLEMENTING' }; },
     });
     assert.deepEqual(result, {
-      outcome: 'dispatched', entry: { issue: 19, route: 'codex', profile: 'standard' },
+      outcome: 'dispatched', entry: { issue: 19, route: 'codex', profile: 'standard', repairTaskShapeAuthority: DISPATCH_AUTHORITY },
       claim: {
         issue: 19, claimId: 'new-claim', runId: 'run-19', profile: 'standard', state: 'running',
+        repairTaskShapeAuthority: DISPATCH_AUTHORITY,
         claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
       },
       execution: { runId: 'run-19', state: 'IMPLEMENTING' },
     });
+  });
+
+  it('skips authority-less rows in both terminal supersession paths without creating another claim', async () => {
+    const legacyCandidate = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 19\n    route: codex\n    profile: critical`;
+    for (const priorState of ['retired', 'failed'] as const) {
+      const runtime = new Comments();
+      const store = new MemoryStore();
+      const oldRun = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, `old-run-${priorState}`, undefined, 'old-claim');
+      store.create({ ...oldRun, state: 'FAILED' });
+      const prior: DispatchRuntimeClaim = {
+        issue: 18, claimId: 'old-claim', runId: oldRun.id, profile: 'complex', state: priorState,
+        claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z',
+      };
+      runtime.comments.push({ id: 'comment-1', body: renderDispatchRuntime(prior) });
+      let executions = 0;
+      const result = await dispatchOnce({
+        queueBody: legacyCandidate, owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
+        leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'must-not-create',
+        async execute() { executions += 1; return { runId: 'unexpected', state: 'IMPLEMENTING' }; },
+      });
+      assert.equal(result.outcome, 'no_eligible_work');
+      if (result.outcome !== 'no_eligible_work') throw new Error('expected authority-ineligible candidate');
+      assert.deepEqual(result.reasons, ['#19: Codex dispatch requires explicit revisioned task-shape authority']);
+      const current = parseDispatchRuntime(runtime.comments[0]!.body)!;
+      assert.equal(current.claimId, 'old-claim');
+      assert.equal(current.issue, 18);
+      assert.equal(current.state, 'retired', 'terminal old claim may be retired, but never superseded by the ineligible row');
+      assert.equal(runtime.comments.length, 1);
+      assert.equal(runtime.updates, priorState === 'retired' ? 0 : 1);
+      assert.equal(executions, 0);
+    }
   });
 
   it('retires an absent terminal claim so an identical later re-dispatch creates fresh work', async () => {
@@ -478,7 +753,7 @@ describe('dispatch queue protocol', () => {
 
     let existing: Run | null | undefined;
     const result = await dispatchOnce({
-      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complex`,
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complex\n    task-shape-revision: task-shape-v1\n    task-shape: interacting`,
       owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime,
       leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'retry-claim',
       async execute(_entry, prior) { existing = prior; return { runId: 'retry-run', state: 'IMPLEMENTING' }; },
@@ -494,7 +769,7 @@ describe('dispatch queue protocol', () => {
     store.create({ ...createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'old-terminal'), state: 'FAILED' });
     let received: Run | null | undefined;
     await dispatchOnce({
-      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complex`,
+      queueBody: `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 18\n    route: codex\n    profile: complex\n    task-shape-revision: task-shape-v1\n    task-shape: interacting`,
       owner: 'acme', repo: 'widgets', github: new GitHub(), store, runtime: new Comments(),
       leaseDurationMs: 60_000, now: () => T0, createClaimId: () => 'fresh-claim',
       async execute(_entry, existing) { received = existing; return { runId: 'fresh-run', state: 'IMPLEMENTING' }; },
@@ -711,7 +986,7 @@ describe('dispatch queue protocol', () => {
     const runtime = new CommandRuntime(QUEUE);
     const store = new MemoryStore();
     const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
-    const existing = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing', execution, 'claim-1');
+    const existing = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 18 }, T0, 'existing', execution, 'claim-1', DISPATCH_AUTHORITY);
     store.create(existing);
     runtime.comments.push({
       id: 'comment-1',
@@ -728,6 +1003,7 @@ describe('dispatch queue protocol', () => {
       runIssue: async () => { throw new Error('must not start a new claimed run'); },
       resumeClaimedRun: async (run) => {
         assert.equal(run.id, existing.id);
+        assert.deepEqual(run.repairTaskShapeAuthority, DISPATCH_AUTHORITY, 'legacy claim resumes from the exact bound Run authority');
         executions.push(undefined);
         return { outcome: 'needs_human', run: { ...existing, state: 'NEEDS_HUMAN' }, reason: 'parked for test' };
       },

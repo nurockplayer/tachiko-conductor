@@ -9,6 +9,7 @@ import { describe, it } from 'node:test';
 import {
   githubSnapshotCommand,
   assertCanonicalDispatchResumeClaim,
+  assertDispatchRuntimeClaimReadback,
   findRunByTarget,
   LIVE_HEAD_SYNC_DECISION,
   main,
@@ -1807,20 +1808,41 @@ describe('workflow run and resume commands', () => {
   it('accepts only the exact live dispatch claim and lets one of two human decisions win the Run CAS', async () => {
     const store = new MemoryStore();
     const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
-    let run = createRun(TARGET, T0, 'dispatch-human-run', execution, 'dispatch-claim-1');
+    let run = createRun(TARGET, T0, 'dispatch-human-run', execution, 'dispatch-claim-1', REPAIR_AUTHORITY);
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
     run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
     run = applyTransition(run, { type: 'escalate', reason: 'operator input', interrupt: { evidence: 'needs decision', choices: ['A', 'B'] } }, T0);
     store.create(run);
     const config = { revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000 };
-    const liveClaim: DispatchRuntimeClaim = { issue: 42, claimId: 'dispatch-claim-1', runId: run.id, profile: 'complex', state: 'needs_human', claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z' };
+    const liveClaim: DispatchRuntimeClaim = { issue: 42, claimId: 'dispatch-claim-1', runId: run.id, profile: 'complex', repairTaskShapeAuthority: REPAIR_AUTHORITY, state: 'needs_human', claimedAt: T0, heartbeatAt: T0, leaseUntil: '2026-09-15T00:01:00.000Z' };
     assert.doesNotThrow(() => assertCanonicalDispatchResumeClaim(run, liveClaim, config));
     assert.throws(() => assertCanonicalDispatchResumeClaim(run, { ...liveClaim, runId: null }, config), /missing, stale, replaced, or differently bound/);
     assert.doesNotThrow(() => assertCanonicalDispatchResumeClaim(run, { ...liveClaim, runId: null }, config, run), 'a null runtime Run id may be recovered only with separate unique claim-to-Run proof');
     for (const stale of [null, { ...liveClaim, claimId: 'replaced' }, { ...liveClaim, state: 'retired' as const }, { ...liveClaim, runId: 'other-run' }]) {
       assert.throws(() => assertCanonicalDispatchResumeClaim(run, stale, config), /missing, stale, replaced, or differently bound/);
     }
+    assert.throws(() => assertCanonicalDispatchResumeClaim(run, { ...liveClaim, repairTaskShapeAuthority: { ...REPAIR_AUTHORITY, revision: 'changed-v2' } }, config), /missing, stale, replaced, or differently bound/);
+    assert.doesNotThrow(() => assertCanonicalDispatchResumeClaim(run, { ...liveClaim, repairTaskShapeAuthority: undefined }, config), 'a legacy exact-bound Run uses its own durable authority');
+
+    const transitionClaim: DispatchRuntimeClaim = { ...liveClaim, runId: run.id, state: 'running', heartbeatAt: '2026-09-15T00:00:01.000Z', leaseUntil: '2026-09-15T00:01:01.000Z' };
+    assert.doesNotThrow(() => assertDispatchRuntimeClaimReadback('comment-1', transitionClaim, { id: 'comment-1', claim: transitionClaim }));
+    const tamperedClaims: DispatchRuntimeClaim[] = [
+      { ...transitionClaim, issue: 43 },
+      { ...transitionClaim, claimId: 'replacement' },
+      { ...transitionClaim, runId: null },
+      { ...transitionClaim, profile: 'standard' },
+      { ...transitionClaim, repairTaskShapeAuthority: { ...REPAIR_AUTHORITY, revision: 'changed-v2' } },
+      { ...transitionClaim, repairTaskShapeAuthority: { ...REPAIR_AUTHORITY, shape: 'decision' } },
+      { ...transitionClaim, state: 'failed' },
+      { ...transitionClaim, claimedAt: '2026-09-14T00:00:00.000Z' },
+      { ...transitionClaim, heartbeatAt: '2026-09-15T00:00:02.000Z' },
+      { ...transitionClaim, leaseUntil: '2026-09-15T00:02:00.000Z' },
+    ];
+    for (const tampered of tamperedClaims) {
+      assert.throws(() => assertDispatchRuntimeClaimReadback('comment-1', transitionClaim, { id: 'comment-1', claim: tampered }), /claim changed after the human Run decision/);
+    }
+    assert.throws(() => assertDispatchRuntimeClaimReadback('comment-1', transitionClaim, { id: 'replacement-comment', claim: transitionClaim }), /claim changed after the human Run decision/);
 
     let rendezvous!: () => void;
     const bothDecisionsReady = new Promise<void>((resolve) => { rendezvous = resolve; });

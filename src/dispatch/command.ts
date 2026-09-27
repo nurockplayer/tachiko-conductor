@@ -5,6 +5,7 @@ import type { WorkflowDependencies, WorkflowOutcome } from '../workflow/run.js';
 import type { DispatchConfiguration } from './config.js';
 import { dispatchOnce, type DispatchOnceResult, type DispatchRuntimeApi } from './runner.js';
 import type { MissionAdmissionRegistry } from '../mission-admission/registry.js';
+import { hasValidDispatchAuthority } from './queue.js';
 
 export interface DispatchCommandRuntime extends DispatchRuntimeApi {
   readQueueComment(): Promise<string>;
@@ -56,13 +57,23 @@ export async function dispatchOnceCommand(
         if (existing.execution.profile !== entry.profile) {
           throw new Error(`Durable run ${existing.id} profile does not match the retained dispatch claim.`);
         }
+        if (claim.repairTaskShapeAuthority !== undefined &&
+          (existing.repairTaskShapeAuthority?.revision !== claim.repairTaskShapeAuthority.revision ||
+            existing.repairTaskShapeAuthority.shape !== claim.repairTaskShapeAuthority.shape)) {
+          throw new Error(`Durable run ${existing.id} task-shape authority does not match the retained dispatch claim.`);
+        }
         const outcome = await deps.resumeClaimedRun(existing, claim.claimId, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock);
         return { runId: outcome.run.id, state: outcomeState(outcome) };
       }
-      const selected = deps.resolveExecutionProfile(entry.profile);
-      if (entry.repairTaskShapeAuthority === undefined) {
+      if (!hasValidDispatchAuthority(entry)) {
         throw new Error(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
       }
+      if (claim.repairTaskShapeAuthority === undefined ||
+        claim.repairTaskShapeAuthority.revision !== entry.repairTaskShapeAuthority.revision ||
+        claim.repairTaskShapeAuthority.shape !== entry.repairTaskShapeAuthority.shape) {
+        throw new Error(`Dispatch claim ${claim.claimId} does not retain the queue-selected task-shape authority.`);
+      }
+      const selected = deps.resolveExecutionProfile(entry.profile);
       const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock);
       return { runId: outcome.run.id, state: outcomeState(outcome) };
     },

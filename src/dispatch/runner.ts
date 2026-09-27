@@ -7,9 +7,11 @@ import type { MissionAdmissionRegistry } from '../mission-admission/registry.js'
 import {
   DispatchProtocolError,
   claimDispatchEntry,
+  hasValidDispatchAuthority,
   parseDispatchQueue,
   parseDispatchRuntime,
   renderDispatchRuntime,
+  sameDispatchRuntimeClaim,
   selectDispatchRuntime,
   type DispatchClaimApi,
   type DispatchQueueEntry,
@@ -78,6 +80,7 @@ export type DispatchOnceResult =
   | { readonly outcome: 'maintenance_hold'; readonly reason: string }
   | { readonly outcome: 'no_eligible_work'; readonly reasons: readonly string[] }
   | { readonly outcome: 'existing_claim'; readonly claim: DispatchRuntimeClaim }
+  | { readonly outcome: 'owner_reconciliation_hold'; readonly entry: DispatchQueueEntry; readonly claim: DispatchRuntimeClaim; readonly reason: string }
   | { readonly outcome: 'admission_wait'; readonly waitKind: 'capacity' | 'owner'; readonly entry: DispatchQueueEntry; readonly runId: string; readonly claim: DispatchRuntimeClaim; readonly reason: string; readonly admission?: DispatchAdmissionObservation }
   | { readonly outcome: 'dispatched'; readonly entry: DispatchQueueEntry; readonly claim: DispatchRuntimeClaim; readonly execution: DispatchExecution };
 
@@ -145,6 +148,19 @@ async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptio
   return { run, reason: null };
 }
 
+function authorityReason(entry: DispatchQueueEntry): string | null {
+  return hasValidDispatchAuthority(entry)
+    ? null
+    : `#${entry.issue}: Codex dispatch requires explicit revisioned task-shape authority`;
+}
+
+function assertClaimAuthorityMatchesRun(claim: DispatchRuntimeClaim, run: Run): void {
+  const authority = claim.repairTaskShapeAuthority;
+  if (authority !== undefined && (run.repairTaskShapeAuthority?.revision !== authority.revision || run.repairTaskShapeAuthority.shape !== authority.shape)) {
+    throw new DispatchProtocolError('Dispatch runtime claim task-shape authority does not match its immutable durable Run.');
+  }
+}
+
 function stateForExecution(state: WorkflowState): DispatchRuntimeClaim['state'] {
   if (state === 'MERGE_READY') return 'merge_ready';
   // MERGED is terminal too. The runtime protocol intentionally has no
@@ -159,15 +175,22 @@ function stateForExecution(state: WorkflowState): DispatchRuntimeClaim['state'] 
 async function supersedeTerminalClaim(
   api: DispatchRuntimeApi,
   commentId: string,
+  expected: DispatchRuntimeClaim,
   entry: DispatchQueueEntry,
   options: Pick<DispatchOnceOptions, 'now' | 'leaseDurationMs' | 'createClaimId'>,
 ): Promise<DispatchRuntimeClaim> {
+  if (!hasValidDispatchAuthority(entry)) throw new DispatchProtocolError(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
+  const current = selectDispatchRuntime(await api.listRuntimeComments());
+  if (current === null || current.id !== commentId || !sameDispatchRuntimeClaim(current.claim, expected)) {
+    throw new DispatchProtocolError('Dispatch claim changed before terminal supersession; refusing stale overwrite.');
+  }
   const now = options.now();
   const claim: DispatchRuntimeClaim = {
     issue: entry.issue,
     claimId: (options.createClaimId ?? randomUUID)(),
     runId: null,
     profile: entry.profile,
+    repairTaskShapeAuthority: { revision: entry.repairTaskShapeAuthority.revision, shape: entry.repairTaskShapeAuthority.shape },
     state: 'claimed',
     claimedAt: now,
     heartbeatAt: now,
@@ -175,7 +198,7 @@ async function supersedeTerminalClaim(
   };
   await api.updateRuntimeComment(commentId, renderDispatchRuntime(claim));
   const observed = selectDispatchRuntime(await api.listRuntimeComments());
-  if (observed === null || observed.id !== commentId || observed.claim.claimId !== claim.claimId || observed.claim.runId !== null) {
+  if (observed === null || observed.id !== commentId || !sameDispatchRuntimeClaim(observed.claim, claim)) {
     throw new DispatchProtocolError('Superseded dispatch runtime claim did not retain the exact new claim identity.');
   }
   return observed.claim;
@@ -189,6 +212,10 @@ async function updateClaim(
   leaseDurationMs: number,
   run: DispatchExecution,
 ): Promise<DispatchRuntimeClaim> {
+  const current = selectDispatchRuntime(await api.listRuntimeComments());
+  if (current === null || current.id !== commentId || !sameDispatchRuntimeClaim(current.claim, claim)) {
+    throw new DispatchProtocolError('Dispatch claim changed before update; refusing stale overwrite.');
+  }
   const next: DispatchRuntimeClaim = {
     ...claim,
     runId: run.runId,
@@ -198,7 +225,7 @@ async function updateClaim(
   };
   await api.updateRuntimeComment(commentId, renderDispatchRuntime(next));
   const observed = selectDispatchRuntime(await api.listRuntimeComments());
-  if (observed === null || observed.id !== commentId || observed.claim.claimId !== claim.claimId || observed.claim.runId !== run.runId) {
+  if (observed === null || observed.id !== commentId || !sameDispatchRuntimeClaim(observed.claim, next)) {
     throw new DispatchProtocolError('Dispatch runtime heartbeat did not retain the exact claim/run identity.');
   }
   return observed.claim;
@@ -212,9 +239,7 @@ async function withExactClaimLock<T>(
 ): Promise<T> {
   const guarded = async () => {
     const live = selectDispatchRuntime(await options.runtime.listRuntimeComments());
-    if (live === null || live.id !== commentId || live.claim.claimId !== expected.claimId ||
-      live.claim.runId !== expected.runId || live.claim.state !== expected.state ||
-      live.claim.heartbeatAt !== expected.heartbeatAt || live.claim.leaseUntil !== expected.leaseUntil) {
+    if (live === null || live.id !== commentId || !sameDispatchRuntimeClaim(live.claim, expected)) {
       throw new DispatchProtocolError('Dispatch claim changed before a serialized heartbeat/finalization; refusing stale overwrite.');
     }
     return await operation();
@@ -229,6 +254,10 @@ async function refreshClaim(
   now: string,
   leaseDurationMs: number,
 ): Promise<DispatchRuntimeClaim> {
+  const current = selectDispatchRuntime(await api.listRuntimeComments());
+  if (current === null || current.id !== commentId || !sameDispatchRuntimeClaim(current.claim, claim)) {
+    throw new DispatchProtocolError('Dispatch claim changed before heartbeat; refusing stale overwrite.');
+  }
   const next: DispatchRuntimeClaim = {
     ...claim,
     state: 'running',
@@ -237,7 +266,7 @@ async function refreshClaim(
   };
   await api.updateRuntimeComment(commentId, renderDispatchRuntime(next));
   const observed = selectDispatchRuntime(await api.listRuntimeComments());
-  if (observed === null || observed.id !== commentId || observed.claim.claimId !== claim.claimId || observed.claim.runId !== claim.runId || observed.claim.state !== 'running') {
+  if (observed === null || observed.id !== commentId || !sameDispatchRuntimeClaim(observed.claim, next)) {
     throw new DispatchProtocolError('Dispatch runtime heartbeat did not retain the exact active claim identity.');
   }
   return observed.claim;
@@ -279,7 +308,7 @@ async function executeWithHeartbeat(
           await options.runtime.updateRuntimeComment(commentId, renderDispatchRuntime(waiting));
           return selectDispatchRuntime(await options.runtime.listRuntimeComments());
         });
-        if (observed === null || observed.id !== commentId || observed.claim.claimId !== activeClaim.claimId || observed.claim.runId !== error.runId || observed.claim.state !== 'claimed') {
+        if (observed === null || observed.id !== commentId || !sameDispatchRuntimeClaim(observed.claim, waiting)) {
           throw new DispatchProtocolError('Dispatch admission wait did not retain the exact claim and Run identity.');
         }
         return { wait: error, claim: observed.claim };
@@ -315,10 +344,14 @@ async function retireTerminalClaim(
   claim: DispatchRuntimeClaim,
   now: string,
 ): Promise<DispatchRuntimeClaim> {
+  const current = selectDispatchRuntime(await api.listRuntimeComments());
+  if (current === null || current.id !== commentId || !sameDispatchRuntimeClaim(current.claim, claim)) {
+    throw new DispatchProtocolError('Dispatch claim changed before retirement; refusing stale overwrite.');
+  }
   const retired: DispatchRuntimeClaim = { ...claim, state: 'retired', heartbeatAt: now, leaseUntil: now };
   await api.updateRuntimeComment(commentId, renderDispatchRuntime(retired));
   const observed = selectDispatchRuntime(await api.listRuntimeComments());
-  if (observed === null || observed.id !== commentId || observed.claim.claimId !== claim.claimId || observed.claim.state !== 'retired') {
+  if (observed === null || observed.id !== commentId || !sameDispatchRuntimeClaim(observed.claim, retired)) {
     throw new DispatchProtocolError('Retired dispatch runtime claim did not retain its exact claim identity.');
   }
   return observed.claim;
@@ -332,7 +365,12 @@ async function retireTerminalClaim(
 export async function dispatchOnce(options: DispatchOnceOptions): Promise<DispatchOnceResult> {
   const existing = selectDispatchRuntime(await options.runtime.listRuntimeComments());
   if (existing !== null) {
-    const entry: DispatchQueueEntry = { issue: existing.claim.issue, route: 'codex', profile: existing.claim.profile };
+    const entry: DispatchQueueEntry = {
+      issue: existing.claim.issue,
+      route: 'codex',
+      profile: existing.claim.profile,
+      ...(existing.claim.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: existing.claim.repairTaskShapeAuthority }),
+    };
     const queue = parseDispatchQueue(options.queueBody);
     if (existing.claim.state === 'retired') {
       const reasons: string[] = [];
@@ -341,12 +379,17 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
           reasons.push(`#${queued.issue}: route ${queued.route} is not executable by this dispatcher`);
           continue;
         }
+        const authorityUnavailable = authorityReason(queued);
+        if (authorityUnavailable !== null) {
+          reasons.push(authorityUnavailable);
+          continue;
+        }
         const checked = await eligibility(queued, options);
         if (checked.reason !== null) {
           reasons.push(checked.reason);
           continue;
         }
-        const claim = await supersedeTerminalClaim(options.runtime, existing.id, queued, options);
+        const claim = await supersedeTerminalClaim(options.runtime, existing.id, existing.claim, queued, options);
         const dispatched = await executeWithHeartbeat(options, existing.id, queued, checked.run, claim);
         if ('wait' in dispatched) return { outcome: 'admission_wait', waitKind: dispatched.wait.waitKind, entry: queued, runId: dispatched.wait.runId, claim: dispatched.claim, reason: dispatched.wait.message, ...(dispatched.wait.admission === undefined ? {} : { admission: dispatched.wait.admission }) };
         return { outcome: 'dispatched', entry: queued, ...dispatched };
@@ -354,6 +397,13 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       return { outcome: 'no_eligible_work', reasons };
     }
     const run = claimedRun(options.store, existing.claim, entry, options);
+    if (run === null && !hasValidDispatchAuthority(entry)) {
+      return {
+        outcome: 'owner_reconciliation_hold', entry, claim: existing.claim,
+        reason: `Legacy dispatch claim ${existing.claim.claimId} has no retained Run or task-shape authority; owner reconciliation is required before any new Run can be created.`,
+      };
+    }
+    if (run !== null) assertClaimAuthorityMatchesRun(existing.claim, run);
     if (run === null || !isSettledRun(run)) {
       if (run !== null && options.admission?.readLane(`run:${run.id}`)?.status === 'active') {
         return {
@@ -384,12 +434,17 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
         reasons.push(`#${queued.issue}: route ${queued.route} is not executable by this dispatcher`);
         continue;
       }
+      const authorityUnavailable = authorityReason(queued);
+      if (authorityUnavailable !== null) {
+        reasons.push(authorityUnavailable);
+        continue;
+      }
       const checked = await eligibility(queued, options);
       if (checked.reason !== null) {
         reasons.push(checked.reason);
         continue;
       }
-      const claim = await supersedeTerminalClaim(options.runtime, existing.id, queued, options);
+      const claim = await supersedeTerminalClaim(options.runtime, existing.id, existing.claim, queued, options);
       const dispatched = await executeWithHeartbeat(options, existing.id, queued, checked.run, claim);
       if ('wait' in dispatched) return { outcome: 'admission_wait', waitKind: dispatched.wait.waitKind, entry: queued, runId: dispatched.wait.runId, claim: dispatched.claim, reason: dispatched.wait.message, ...(dispatched.wait.admission === undefined ? {} : { admission: dispatched.wait.admission }) };
       return { outcome: 'dispatched', entry: queued, ...dispatched };
@@ -402,6 +457,11 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
   for (const entry of queue) {
     if (entry.route !== 'codex') {
       reasons.push(`#${entry.issue}: route ${entry.route} is not executable by this dispatcher`);
+      continue;
+    }
+    const authorityUnavailable = authorityReason(entry);
+    if (authorityUnavailable !== null) {
+      reasons.push(authorityUnavailable);
       continue;
     }
     const checked = await eligibility(entry, options);

@@ -106,7 +106,7 @@ import { createHostAdmissionRegistry, resolveManualOwnerReceiptPath, resolveRunO
 import { canonicalizeMissionEvidence, type AdmissionLaneView, type AdmissionResult, type AdmissionToken, type MissionAdmissionRegistry } from './mission-admission/registry.js';
 import { readManualOwnerReceipt, validateManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from './mission-admission/manual-owner-receipt.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt, type RunOwnerReceipt, type RunOwnerReceiptPhase } from './mission-admission/run-owner-receipt.js';
-import { selectDispatchRuntime, renderDispatchRuntime, type DispatchRuntimeClaim } from './dispatch/queue.js';
+import { selectDispatchRuntime, renderDispatchRuntime, sameDispatchRuntimeClaim, type DispatchRuntimeClaim } from './dispatch/queue.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
@@ -805,8 +805,21 @@ export function assertCanonicalDispatchResumeClaim(run: Run, claim: DispatchRunt
     (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') ||
     `${run.target.owner}/${run.target.repo}`.toLowerCase() !== `${config.owner}/${config.repo}`.toLowerCase() ||
     claim === null || claim.state !== 'needs_human' || (claim.runId !== run.id && !(claim.runId === null && uniqueUnboundRunProof)) || claim.claimId !== run.dispatchClaimId ||
-    claim.issue !== run.target.issueNumber || claim.profile !== run.execution.profile) {
+    claim.issue !== run.target.issueNumber || claim.profile !== run.execution.profile ||
+    (claim.repairTaskShapeAuthority !== undefined &&
+      (run.repairTaskShapeAuthority?.revision !== claim.repairTaskShapeAuthority.revision ||
+        run.repairTaskShapeAuthority.shape !== claim.repairTaskShapeAuthority.shape))) {
     throw new Error(`Dispatch runtime claim for Run "${run.id}" is missing, stale, replaced, or differently bound; refusing human resume.`);
+  }
+}
+
+export function assertDispatchRuntimeClaimReadback(
+  commentId: string,
+  expected: DispatchRuntimeClaim,
+  observed: { readonly id: string; readonly claim: DispatchRuntimeClaim } | null,
+): asserts observed is { readonly id: string; readonly claim: DispatchRuntimeClaim } {
+  if (observed === null || observed.id !== commentId || !sameDispatchRuntimeClaim(observed.claim, expected)) {
+    throw new Error('Dispatch runtime claim changed after the human Run decision was committed; retained Run and claim require reconciliation.');
   }
 }
 
@@ -2560,9 +2573,7 @@ export async function main(argv: string[]): Promise<number> {
           commitRun();
           await runtime.updateRuntimeComment(live.id, renderDispatchRuntime(transitionClaim));
           const observed = selectDispatchRuntime(await runtime.listRuntimeComments());
-          if (observed === null || observed.id !== live.id || observed.claim.claimId !== transitionClaim.claimId || observed.claim.runId !== expectedRun.id || observed.claim.state !== transitionClaim.state) {
-            throw new Error('Dispatch claim changed after the human Run decision was committed; retained Run and claim require reconciliation.');
-          }
+          assertDispatchRuntimeClaimReadback(live.id, transitionClaim, observed);
         };
       }
       return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities), id, values.decision!, {

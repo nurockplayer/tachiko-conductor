@@ -21,10 +21,33 @@ export interface DispatchRuntimeClaim {
   readonly claimId: string;
   readonly runId: string | null;
   readonly profile: string;
+  /** Immutable authority carried from the queue before a new Run exists. Absent only on legacy claims. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
   readonly state: 'claimed' | 'running' | 'merge_ready' | 'needs_human' | 'failed' | 'retired';
   readonly claimedAt: string;
   readonly heartbeatAt: string;
   readonly leaseUntil: string;
+}
+
+function sameAuthority(
+  left: RepairTaskShapeAuthority | undefined,
+  right: RepairTaskShapeAuthority | undefined,
+): boolean {
+  return left === undefined || right === undefined
+    ? left === right
+    : left.revision === right.revision && left.shape === right.shape;
+}
+
+/** Compare every immutable and mutable claim field; callers also compare comment identity. */
+export function sameDispatchRuntimeClaim(left: DispatchRuntimeClaim, right: DispatchRuntimeClaim): boolean {
+  return left.issue === right.issue && left.claimId === right.claimId && left.runId === right.runId &&
+    left.profile === right.profile && sameAuthority(left.repairTaskShapeAuthority, right.repairTaskShapeAuthority) &&
+    left.state === right.state && left.claimedAt === right.claimedAt && left.heartbeatAt === right.heartbeatAt &&
+    left.leaseUntil === right.leaseUntil;
+}
+
+export function hasValidDispatchAuthority(entry: DispatchQueueEntry): entry is DispatchQueueEntry & { readonly repairTaskShapeAuthority: RepairTaskShapeAuthority } {
+  return exactRepairTaskShapeAuthority(entry.repairTaskShapeAuthority);
 }
 
 export class DispatchProtocolError extends Error {
@@ -38,6 +61,11 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function exactRepairTaskShapeAuthority(value: unknown): value is RepairTaskShapeAuthority {
+  const authority = record(value);
+  return authority !== null && Object.keys(authority).sort().join(',') === 'revision,shape' && isRepairTaskShapeAuthority(authority);
 }
 
 function positiveInteger(value: string): number | null {
@@ -133,8 +161,14 @@ export function parseDispatchRuntime(body: string): DispatchRuntimeClaim | null 
   try { value = JSON.parse(raw); } catch { throw new DispatchProtocolError('Dispatch runtime comment contains invalid JSON.'); }
   const parsed = record(value);
   if (parsed === null) throw new DispatchProtocolError('Dispatch runtime comment must contain an object.');
-  const expected = ['claimId', 'claimedAt', 'heartbeatAt', 'issue', 'leaseUntil', 'profile', 'runId', 'state'];
-  if (Object.keys(parsed).sort().join(',') !== expected.join(',')) throw new DispatchProtocolError('Dispatch runtime comment has unknown or missing fields.');
+  const legacyFields = ['claimId', 'claimedAt', 'heartbeatAt', 'issue', 'leaseUntil', 'profile', 'runId', 'state'];
+  const extendedFields = [...legacyFields, 'repairTaskShapeAuthority'].sort();
+  const fields = Object.keys(parsed).sort();
+  const hasAuthority = Object.hasOwn(parsed, 'repairTaskShapeAuthority');
+  if (fields.join(',') !== (hasAuthority ? extendedFields : legacyFields).join(',')) throw new DispatchProtocolError('Dispatch runtime comment has unknown or missing fields.');
+  if (hasAuthority && !exactRepairTaskShapeAuthority(parsed.repairTaskShapeAuthority)) {
+    throw new DispatchProtocolError('Dispatch runtime comment has invalid task-shape authority.');
+  }
   if (!Number.isSafeInteger(parsed.issue) || (parsed.issue as number) < 1 || !nonEmpty(parsed.claimId) || !nonEmpty(parsed.profile) || !supportedProfile(parsed.profile) ||
     !(parsed.runId === null || nonEmpty(parsed.runId)) || !nonEmpty(parsed.claimedAt) || !nonEmpty(parsed.heartbeatAt) || !nonEmpty(parsed.leaseUntil) ||
     !['claimed', 'running', 'merge_ready', 'needs_human', 'failed', 'retired'].includes(parsed.state as string)) {
@@ -184,6 +218,7 @@ export async function claimDispatchEntry(
   options: DispatchClaimOptions,
 ): Promise<{ readonly commentId: string; readonly claim: DispatchRuntimeClaim }> {
   if (entry.route !== 'codex') throw new DispatchProtocolError(`Queue issue #${entry.issue} is not routed to Codex.`);
+  if (!hasValidDispatchAuthority(entry)) throw new DispatchProtocolError(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
   if (!Number.isSafeInteger(options.leaseDurationMs) || options.leaseDurationMs < 1) {
     throw new DispatchProtocolError('Dispatch lease duration must be a positive safe integer.');
   }
@@ -196,6 +231,7 @@ export async function claimDispatchEntry(
     claimId: (options.createClaimId ?? randomUUID)(),
     runId: null,
     profile: entry.profile,
+    repairTaskShapeAuthority: { revision: entry.repairTaskShapeAuthority.revision, shape: entry.repairTaskShapeAuthority.shape },
     state: 'claimed',
     claimedAt: now,
     heartbeatAt: now,
@@ -203,7 +239,7 @@ export async function claimDispatchEntry(
   };
   const created = await api.createRuntimeComment(renderDispatchRuntime(claim));
   const reread = selectDispatchRuntime(await api.listRuntimeComments());
-  if (reread === null || reread.claim.claimId !== claim.claimId || reread.id !== created.id) {
+  if (reread === null || reread.id !== created.id || !sameDispatchRuntimeClaim(reread.claim, claim)) {
     throw new DispatchProtocolError('Dispatch claim was not the sole canonical runtime claim after write.');
   }
   return { commentId: reread.id, claim: reread.claim };
