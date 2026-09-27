@@ -298,6 +298,21 @@ class ProviderBuildTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "hard-linked"):
             self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
 
+    def test_existing_corepack_snapshot_rejects_incomplete_or_broad_fixture_directories(self) -> None:
+        corepack_bundle = self.module._corepack_bundle_path(self.manifest)
+        corepack_bundle.mkdir(mode=0o755)
+        (corepack_bundle / "dist").mkdir(mode=0o755)
+        reviewed_files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        entry_bytes = reviewed_files["dist/corepack.js"]
+        (corepack_bundle / "dist/corepack.js").write_bytes(entry_bytes)
+        (corepack_bundle / "dist/corepack.js").chmod(0o755)
+        with self.assertRaisesRegex(RuntimeError, "bundle is unsafe"):
+            self.module.verify_existing_corepack_bundle(corepack_bundle, self.manifest, reviewed_files)
+        corepack_bundle.chmod(0o700)
+        (corepack_bundle / "dist").chmod(0o700)
+        with self.assertRaisesRegex(RuntimeError, "file set"):
+            self.module.verify_existing_corepack_bundle(corepack_bundle, self.manifest, reviewed_files)
+
     @unittest.skipUnless(platform.system() == "Darwin", "Corepack cache fence uses qualified Darwin providers")
     def test_corepack_wrapper_rejects_dependency_and_root_drift_between_uses(self) -> None:
         files = self.module.extract_corepack_package(self.manifest, self.artifact)
@@ -961,8 +976,20 @@ class HeartbeatTest(unittest.TestCase):
             for source, label in cases:
                 with self.subTest(loader=label):
                     (output / entry).write_text(source, encoding="utf-8")
-                    with self.assertRaises(RuntimeError):
+                    expected = "missing or escapes" if label == "path traversal" else "unsupported dynamic module loading"
+                    with self.assertRaisesRegex(RuntimeError, expected):
                         module.validate_runtime_import_closure(node, node_digest, compiler_root, output, {entry}, entry)
+
+            static_entry = "import './other.js'; export const loaded = true;\n"
+            (output / entry).write_text(static_entry, encoding="utf-8")
+            other = Path("mission-admission/other.js")
+            (output / other).write_text("export const dependency = true;\n", encoding="utf-8")
+            self.assertEqual(
+                module.validate_runtime_import_closure(node, node_digest, compiler_root, output,
+                                                       {entry, other}, entry),
+                {entry, other},
+                "valid static relative imports remain supported",
+            )
 
     def test_existing_staged_bundle_requires_exact_manifest_and_output_bytes(self) -> None:
         saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
@@ -1028,7 +1055,8 @@ class HeartbeatTest(unittest.TestCase):
         self.assertTrue(dangling.is_symlink(), "refusal must not replace or follow the dangling alias")
 
     def write_config(self, *, safety: int = 1800) -> None:
-        self.state_root.mkdir(parents=True, exist_ok=True)
+        self.state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.state_root.chmod(0o700)
         gh_digest = hashlib.sha256(self.gh.read_bytes()).hexdigest()
         gh_snapshot = self.state_root / ("verified-gh-" + gh_digest)
         gh_snapshot.write_bytes(self.gh.read_bytes())
@@ -1090,14 +1118,32 @@ class HeartbeatTest(unittest.TestCase):
         provider_manifest_bytes = (HERE / "providers/corepack-0.34.6.json").read_bytes()
         canonical_manifest_bytes = (json.dumps(provider_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
         provider_manifest_digest = hashlib.sha256(canonical_manifest_bytes).hexdigest()
-        corepack_entry = str(self.state_root / ("verified-corepack-" + provider_manifest_digest) / "dist/corepack.js")
-        Path(corepack_entry).parent.mkdir(parents=True, exist_ok=True)
+        corepack_bundle = self.state_root / ("verified-corepack-" + provider_manifest_digest)
+        corepack_bundle.mkdir(mode=0o700, exist_ok=True)
+        corepack_bundle.chmod(0o700)
         provider_artifact = (HERE / "providers/corepack-0.34.6.tgz").read_bytes()
         with tarfile.open(fileobj=io.BytesIO(provider_artifact), mode="r:gz") as archive:
-            entry_stream = archive.extractfile("package/dist/corepack.js")
-            self.assertIsNotNone(entry_stream)
-            corepack_entry_bytes = entry_stream.read()
-        Path(corepack_entry).write_bytes(corepack_entry_bytes)
+            members = {member.name: member for member in archive.getmembers() if member.isfile()}
+            self.assertEqual(set(members), {"package/" + item["path"] for item in provider_manifest["files"]})
+            for item in provider_manifest["files"]:
+                member = members["package/" + item["path"]]
+                self.assertEqual(member.mode, item["mode"])
+                stream = archive.extractfile(member)
+                self.assertIsNotNone(stream)
+                data = stream.read()
+                self.assertEqual(len(data), item["size"])
+                self.assertEqual(hashlib.sha256(data).hexdigest(), item["sha256"])
+                relative = Path(item["path"])
+                directory = corepack_bundle
+                for component in relative.parts[:-1]:
+                    directory = directory / component
+                    directory.mkdir(mode=0o700, exist_ok=True)
+                    directory.chmod(0o700)
+                target = corepack_bundle / relative
+                target.write_bytes(data)
+                target.chmod(item["mode"])
+        corepack_entry = str(corepack_bundle / "dist/corepack.js")
+        corepack_entry_bytes = Path(corepack_entry).read_bytes()
         closure = hashlib.sha256()
         for item in provider_manifest["files"]:
             closure.update(item["path"].encode() + b"\0" + str(item["mode"]).encode() + b"\0")
