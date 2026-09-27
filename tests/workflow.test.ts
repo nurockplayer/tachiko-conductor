@@ -115,10 +115,12 @@ function githubAdapter(liveHeads: Array<string | null>): GitHubAdapter {
 
 class FakeReviewer implements ReviewerAdapter {
   readonly kind: 'reviewer' = 'reviewer';
+  readonly requests: ReviewRequest[] = [];
 
   constructor(private readonly outcomes: ReviewResult[]) {}
 
   async review(request: ReviewRequest): Promise<ReviewResult> {
+    this.requests.push(request);
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No review outcome queued');
     return outcome;
@@ -972,6 +974,70 @@ describe('runWorkflow', () => {
           assert.deepEqual(store.read(run.id), concurrent, 'stale worker admission preserves concurrent Run state');
         });
       }
+    }
+  });
+
+  it('settles a superseded repair from the CAS winner and never re-enters the review loop', async (t) => {
+    const cases: Array<{ label: string; state: Run['state']; expected: string }> = [
+      { label: 'waiting-dependency', state: 'WAITING_DEPENDENCY', expected: 'waiting_dependency' },
+      { label: 'merge-ready', state: 'MERGE_READY', expected: 'merge_ready' },
+      { label: 'merged', state: 'MERGED', expected: 'merged' },
+      { label: 'failed', state: 'FAILED', expected: 'failed' },
+      { label: 'changed-active-repair', state: 'IMPLEMENTING', expected: 'needs_human' },
+    ];
+    for (const { label, state, expected } of cases) {
+      await t.test(label, async () => {
+        const store = new MemoryStore();
+        const id = `superseded-repair-${label}`;
+        let run = reviewingRun(store, id, HEAD);
+        run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+        store.update(run);
+        let winner: Run;
+        if (state === 'WAITING_DEPENDENCY') {
+          winner = applyTransition(run, { type: 'wait_dependency', interrupt: { evidence: 'external dependency', choices: ['Retry'] } }, T0);
+        } else if (state === 'FAILED') {
+          winner = applyTransition(run, { type: 'fail', reason: 'concurrent failure' }, T0);
+        } else if (state === 'IMPLEMENTING') {
+          let prior = reviewingRun(new MemoryStore(), id, HEAD);
+          prior = { ...prior, repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' },
+            executor: { provider: 'claude-code', sessionId: 'prior-session' },
+            agentResult: { ...prior.agentResult!, executor: { provider: 'claude-code', sessionId: 'prior-session' }, sessionId: 'prior-session' } };
+          prior = applyTransition(prior, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+          const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'winner-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+          const receipt = createRepairAdmissionSnapshot(prior.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+          const binding = createRepairAttemptBinding(prior, execution);
+          winner = applyTransition(prior, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+          winner = applyTransition(winner, { type: 'repair_executor_handoff', repairAgentResult: {
+            ...successResult(HEAD2), executor: { provider: 'codex-app-server', sessionId: 'new-winner-session', generation: binding.runtimeGeneration }, sessionId: 'new-winner-session',
+          } }, T0);
+        } else {
+          const fresh = new MemoryStore();
+          winner = reviewingRun(fresh, id, HEAD);
+          winner = applyTransition(winner, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+          winner = { ...winner, state: 'MERGE_READY', history: [...winner.history,
+            { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
+          if (state === 'MERGED') winner = applyTransition(winner, { type: 'merged' }, T0);
+        }
+        const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-cas-winner-'));
+        try {
+          const fixtureStore = new JsonFileStore({ dir: fixtureDir });
+          fixtureStore.create(winner);
+          assert.equal(JSON.stringify(new JsonFileStore({ dir: fixtureDir }).read(id)), JSON.stringify(winner), 'race winner survives durable store replay');
+        } finally { rmSync(fixtureDir, { recursive: true, force: true }); }
+        let liveReads = 0;
+        const github = githubAdapter([HEAD]);
+        github.readLiveSnapshot = async () => { liveReads += 1; store.update(winner); return snapshot(HEAD); };
+        const implementation = new FakeImplementation([]);
+        const reviewer = new FakeReviewer([]);
+        const result = await runWorkflow({ store, github, implementation, reviewer }, id,
+          { maxReviewAttempts: 2, now: () => T0 });
+        assert.equal(result.outcome, expected);
+        assert.deepEqual(result.run, winner);
+        assert.deepEqual(store.read(id), winner, 'the exact CAS winner remains durable');
+        assert.equal(liveReads, 1, 'the outer workflow returns immediately without review-loop re-entry');
+        assert.equal(implementation.requests.length, 0);
+        assert.equal(reviewer.requests.length, 0);
+      });
     }
   });
 
@@ -2143,6 +2209,150 @@ describe('runWorkflow', () => {
     assert.equal(outcome.outcome, 'needs_human');
     assert.equal(invocationEffects, 0);
     assert.equal(outcome.run.executor?.sessionId, identity.sessionId);
+  });
+
+  it('rejects an injected generationless nonfresh App Server admission before bootstrap selection', async () => {
+    const store = new MemoryStore();
+    const id = 'injected-generationless-appserver-admission';
+    let run = reviewingRun(store, id, HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    const authority = { revision: 'task-shape-v1', shape: 'bounded' as const };
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+    run = { ...run, repairTaskShapeAuthority: authority, execution: undefined, executor: predecessor,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId } };
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', HEAD, 7, execution, T0);
+    const attemptBinding = { admissionIndex: 0, startFixHistoryIndex: run.history.length, predecessorExecutor: predecessor,
+      predecessorSessionId: predecessor.sessionId, freshExecutor: false, runtimeGeneration: 'invented-generation' };
+    run = { ...run, repairAdmissions: [{ ...receipt, attemptBinding }], state: 'IMPLEMENTING',
+      history: [...run.history, { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0, repairAdmissionIndex: 0 }] };
+    store.update(run);
+    let implementationCalls = 0; let bootstrapSelections = 0;
+    const outcome = await runWorkflow({
+      store, github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { implementationCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]), resolveRepairExecutionProfile: () => execution,
+      bootstrapForExecution: () => { bootstrapSelections += 1; return new FakeBootstrap(); },
+    }, id, { maxReviewAttempts: 1, now: () => T0 });
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /missing, stale, or its exact execution profile can no longer be resolved/);
+    assert.equal(implementationCalls + bootstrapSelections, 0);
+    assert.deepEqual(outcome.run.executor, predecessor);
+    assert.deepEqual(outcome.run.agentResult?.executor, predecessor);
+    assert.equal((outcome.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
+  });
+
+  it('holds a legacy generationless App Server repair before bootstrap selection or provider work', async () => {
+    const store = new MemoryStore();
+    const id = 'legacy-generationless-appserver-repair';
+    let run = reviewingRun(store, id, HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = {
+      ...run,
+      state: 'IMPLEMENTING',
+      execution: undefined,
+      executor: predecessor,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId },
+      history: [...run.history, { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0 }],
+    };
+    store.update(run);
+    let implementationCalls = 0;
+    let bootstrapSelections = 0;
+    const outcome = await runWorkflow({
+      store,
+      github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { implementationCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]),
+      bootstrapForExecution: () => { bootstrapSelections += 1; return new FakeBootstrap(); },
+    }, id, { maxReviewAttempts: 1, now: () => T0 });
+
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /App Server identity has no generation/);
+    assert.equal(implementationCalls, 0);
+    assert.equal(bootstrapSelections, 0);
+    assert.deepEqual(outcome.run.executor, predecessor);
+    assert.deepEqual(outcome.run.agentResult?.executor, predecessor);
+    assert.equal(outcome.run.history.at(-1)?.to, 'NEEDS_HUMAN');
+    assert.equal((outcome.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
+  });
+
+  it('holds a result-only generationless App Server identity despite an explicit different provider', async () => {
+    const store = new MemoryStore();
+    const id = 'legacy-result-only-appserver-repair';
+    let run = reviewingRun(store, id, HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = {
+      ...run,
+      state: 'IMPLEMENTING',
+      execution: { profile: 'routine', revision: 'legacy-v1', executor: 'claude-code', timeoutMs: 60_000 },
+      executor: undefined,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId },
+      history: [...run.history, { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0 }],
+    };
+    store.update(run);
+    let implementationCalls = 0;
+    let bootstrapSelections = 0;
+    const outcome = await runWorkflow({
+      store,
+      github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { implementationCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]),
+      bootstrapForExecution: () => { bootstrapSelections += 1; return new FakeBootstrap(); },
+    }, id, { maxReviewAttempts: 1, now: () => T0 });
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /App Server identity has no generation/);
+    assert.equal(implementationCalls, 0);
+    assert.equal(bootstrapSelections, 0);
+    assert.equal(outcome.run.executor, undefined);
+    assert.deepEqual(outcome.run.agentResult?.executor, predecessor);
+    assert.equal((outcome.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
+  });
+
+  it('holds a Run-carried generationless App Server identity despite explicit different-provider execution', async () => {
+    const store = new MemoryStore();
+    const id = 'legacy-run-carrier-different-provider';
+    let run = reviewingRun(store, id, HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = { ...run, state: 'IMPLEMENTING', execution: { profile: 'routine', revision: 'legacy-v1', executor: 'claude-code', timeoutMs: 60_000 },
+      executor: predecessor, agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId },
+      history: [...run.history, { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0 }] };
+    store.update(run);
+    let implementationCalls = 0; let bootstrapSelections = 0;
+    const outcome = await runWorkflow({
+      store, github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { implementationCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]), bootstrapForExecution: () => { bootstrapSelections += 1; return new FakeBootstrap(); },
+    }, id, { maxReviewAttempts: 1, now: () => T0 });
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.equal(implementationCalls + bootstrapSelections, 0);
+    assert.deepEqual(outcome.run.executor, predecessor);
+    assert.equal((outcome.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
+  });
+
+  it('holds a result-only generationless App Server identity when execution is absent', async () => {
+    const store = new MemoryStore();
+    const id = 'legacy-result-carrier-no-execution';
+    let run = reviewingRun(store, id, HEAD);
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = { ...run, state: 'IMPLEMENTING', execution: undefined, executor: undefined,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId },
+      history: [...run.history, { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0 }] };
+    store.update(run);
+    let implementationCalls = 0; let bootstrapSelections = 0;
+    const outcome = await runWorkflow({
+      store, github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { implementationCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]), bootstrapForExecution: () => { bootstrapSelections += 1; return new FakeBootstrap(); },
+    }, id, { maxReviewAttempts: 1, now: () => T0 });
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.equal(implementationCalls + bootstrapSelections, 0);
+    assert.equal(outcome.run.executor, undefined);
+    assert.deepEqual(outcome.run.agentResult?.executor, predecessor);
+    assert.equal((outcome.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
   });
 
   it('holds consumed repair evidence when the durable adopted identity no longer matches history', async () => {

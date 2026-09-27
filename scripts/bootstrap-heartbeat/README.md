@@ -23,8 +23,13 @@ must also print `TACHIKO_HEARTBEAT_SETTLED_V1` on its own final line before the 
 consumed and the safety clock reset.
 
 Before any wake, the runner verifies and calls a pinned, model-free TypeScript helper built during
-installation from a private `git archive` of one captured commit. It never consumes ambient
-`dist/` or `node_modules`. The helper reserves the same host-global mission-admission registry used by
+installation from raw Git objects for one captured commit. It compares protected committed inputs
+with the unrefreshed index and a no-follow worktree walk; Git status and archive filters do not define
+source cleanliness. The build uses a reviewed, npm-signature-verified Corepack 0.34.6 package snapshot,
+Apple-signed system Git and OpenSSL, and the already pinned Node snapshot. Every package file and
+provider identity is checked before use, and the completed helper manifest records those providers.
+Unsupported Git/OpenSSL providers hold installation. The build never consumes ambient `dist/` or
+`node_modules`. The helper reserves the same host-global mission-admission registry used by
 dispatch and manual work. It pins the resolved Node executable, the complete built JavaScript
 import closure, the registry path, repository/workspace identity, and an explicit revisioned
 capacity configuration at installation. Nondefault positive limits are supported when supplied
@@ -33,11 +38,12 @@ with `--admission-config-json`. All entry paths use the canonical per-user regis
 `--admission-registry-path` or inherited path override. A physical symlink alias that resolves to
 that canonical file is accepted. This keeps heartbeat, native dispatch, and manual admission on
 one host ownership domain.
-The build requires clean committed TypeScript/build inputs, the repository's exact
-`pnpm@10.34.5` lockfile, and a pinned Node/Corepack/TypeScript identity. Its canonical manifest
-binds commit and tree IDs, archive/package/lockfile digests, toolchain identities, every emitted
-`dist/` file, and the runtime import closure. Installation verifies and atomically pins exactly those
-bytes, reusing a bundle only when its full manifest and files match. Use `--no-load` to prepare and
+The build requires exact committed TypeScript/build inputs, the repository's exact
+`pnpm@10.34.5` lockfile, and pinned Node/Corepack/Git/OpenSSL/TypeScript identities. Its canonical manifest
+binds commit and tree IDs, protected source/package/lockfile digests, authenticated provider
+identities, every emitted `dist/` file, and the runtime import closure. Installation verifies and
+atomically pins exactly those bytes, reusing a bundle only when its full manifest and files match.
+Use `--no-load` to prepare and
 validate an install without bootstrapping LaunchAgent; this does not enable the held service.
 The LaunchAgent does not inherit arbitrary admission-domain variables. `wake_env` cannot override
 the registry, config, Run root, or private receipt directory.
@@ -75,9 +81,9 @@ at high reasoning effort.
 
 ## Migration and recovery
 
-Config schema 2 pins the helper build manifest, Node bytes, fixed admission domain, and wake target
-contract. Existing schema-1 configs are rejected. `install.sh` creates a fresh staged build from the
-captured committed source and performs the full provenance verification itself:
+Config schema 3 pins the helper build manifest, Node bytes, fixed admission domain, and wake target
+contract. Existing schema-1 and schema-2 configs are rejected. `install.sh` creates a fresh staged
+build from the captured committed source and performs the full provenance verification itself:
 
 ```sh
 scripts/bootstrap-heartbeat/install.sh --no-load

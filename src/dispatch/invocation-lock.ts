@@ -6,6 +6,7 @@ import {
 } from 'node:fs';
 import path from 'node:path';
 import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
+import { assertSafeCurrentAccountPathIfApplicable } from '../account-home.js';
 
 export class DispatchInvocationLockedError extends Error {
   constructor(lockPath: string) {
@@ -282,6 +283,8 @@ function compatibleProcessStartSchemes(recorded: string, current: string): boole
 /** Acquire the small same-host fence that complements the GitHub claim lease. */
 export function acquireDispatchInvocationLock(options: DispatchInvocationLockOptions): DispatchInvocationLock {
   if (!path.isAbsolute(options.lockPath)) throw new Error('TACHIKO_DISPATCH_LOCK_PATH must be an absolute path.');
+  const validatePath = () => assertSafeCurrentAccountPathIfApplicable(options.lockPath, 'file');
+  validatePath();
   const makeNonce = options.nonce ?? randomUUID;
   const alive = options.isProcessAlive ?? processAlive;
   const identity = options.hostBootIdentity ?? currentHostBootIdentity;
@@ -303,6 +306,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
   const publish = (): boolean => {
     const directory = path.dirname(options.lockPath);
     ensureDurableDirectory(directory, { mode: 0o700, syncDirectoryHierarchy: options.syncDirectoryHierarchy });
+    validatePath();
     const tempPath = `${options.lockPath}.tmp-${randomBytes(16).toString('hex')}`;
     let descriptor: number | undefined;
     let linked = false;
@@ -321,6 +325,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
       closeSync(descriptor);
       descriptor = undefined;
       options.beforeCanonicalLink?.();
+      validatePath();
       try {
         linkSync(tempPath, options.lockPath);
         linked = true;
@@ -339,6 +344,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
           if (canonicalStats.isFile() && !canonicalStats.isSymbolicLink() &&
               tempStats.isFile() && !tempStats.isSymbolicLink() &&
               canonicalStats.dev === tempStats.dev && canonicalStats.ino === tempStats.ino) {
+            validatePath();
             unlinkSync(options.lockPath);
             fsyncParent();
           }
@@ -352,7 +358,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
       if (descriptor !== undefined) {
         try { closeSync(descriptor); } catch (error) { if (failure === undefined) throw error; }
       }
-      try { unlinkSync(tempPath); } catch (error: unknown) {
+      try { validatePath(); unlinkSync(tempPath); } catch (error: unknown) {
         if (typeof error !== 'object' || error === null || (error as { code?: unknown }).code !== 'ENOENT') {
           if (failure === undefined) throw error;
         }
@@ -361,11 +367,13 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
   };
 
   if (!publish()) {
+    validatePath();
     const existing = readLock(options.lockPath);
     if (existing === null || !definitelyStale(existing, alive, identity, processStart)) {
       throw new DispatchInvocationLockedError(options.lockPath);
     }
     options.beforeStaleTakeover?.();
+    validatePath();
 
     // Each claimant is a versioned, immutable symlink target. A dead claimant
     // remains in place and a successor claims its deterministic recovery path,
@@ -380,6 +388,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
       }
       visitedTakeoverPaths.add(takeoverPath);
       if (!createTakeoverClaim(takeoverPath, claim)) {
+        validatePath();
         const previousClaim = readTakeoverClaim(takeoverPath, options.lockPath, existing);
         if (previousClaim === null || !definitelyStale(previousClaim, alive, identity, processStart)) {
           throw new DispatchInvocationLockedError(options.lockPath);
@@ -393,6 +402,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
         throw new DispatchInvocationLockedError(options.lockPath);
       }
       try {
+        validatePath();
         unlinkSync(options.lockPath);
         fsyncParent();
       } catch {
@@ -401,6 +411,7 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
       if (!publish()) throw new DispatchInvocationLockedError(options.lockPath);
       break;
     }
+    validatePath();
     if (!sameLockRecord(readLock(options.lockPath) ?? { nonce: '', pid: 0 }, owner)) {
       throw new DispatchInvocationLockedError(options.lockPath);
     }
@@ -408,9 +419,11 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
 
   return {
     release() {
+      validatePath();
       const current = readLock(options.lockPath);
       if (current === null || !sameLockRecord(current, owner)) return;
       try {
+        validatePath();
         unlinkSync(options.lockPath);
         fsyncParent();
       } catch (error: unknown) {

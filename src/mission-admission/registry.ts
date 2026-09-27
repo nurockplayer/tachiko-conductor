@@ -3,6 +3,7 @@ import path from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../dispatch/invocation-lock.js';
 import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
+import { assertSafeCurrentAccountPathIfApplicable } from '../account-home.js';
 
 export const MISSION_ADMISSION_SCHEMA_VERSION = 1 as const;
 export const MISSION_ADMISSION_ROLES = ['production_captain', 'delegated_mutation_writer', 'read_only_review', 'read_only_consultation', 'isolated_experiment'] as const;
@@ -335,7 +336,8 @@ function acquireLock(lockPath: string, timeoutMs: number, retryMs: number, befor
   }
 }
 
-function writeAtomic(filePath: string, state: RegistryState, syncForDurability: (fd: number, target: 'file' | 'directory') => void): void {
+function writeAtomic(filePath: string, state: RegistryState, syncForDurability: (fd: number, target: 'file' | 'directory') => void, validatePath: () => void): void {
+  validatePath();
   const temporary = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   const fd = openSync(temporary, 'wx', 0o600);
   try {
@@ -344,11 +346,11 @@ function writeAtomic(filePath: string, state: RegistryState, syncForDurability: 
     closeSync(fd);
   } catch (error) {
     try { closeSync(fd); } catch { /* preserve the original write/sync failure */ }
-    try { unlinkSync(temporary); } catch { /* remove only this attempt's temp */ }
+    try { validatePath(); unlinkSync(temporary); } catch { /* remove only this attempt's temp */ }
     throw error;
   }
-  try { renameSync(temporary, filePath); } catch (error) {
-    try { unlinkSync(temporary); } catch { /* remove only this attempt's temp */ }
+  try { validatePath(); renameSync(temporary, filePath); } catch (error) {
+    try { validatePath(); unlinkSync(temporary); } catch { /* remove only this attempt's temp */ }
     throw error;
   }
   const directoryFd = openSync(path.dirname(filePath), 'r');
@@ -374,13 +376,14 @@ export class MissionAdmissionRegistry {
   private readonly beforePublish?: () => void;
   private readonly onPublishedTransition?: (projection: AdmissionProjection) => void;
   private readonly beforeStaleTakeover?: () => void;
-  private readonly validatePath?: () => void;
+  private readonly validatePath: () => void;
   private readonly syncForDurability: (fd: number, target: 'file' | 'directory') => void;
   private readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
 
   constructor(options: MissionAdmissionOptions) {
     validateAdmissionConfig(options.config);
     if (!path.isAbsolute(options.filePath)) throw new AdmissionStateError('Admission registry path must be absolute and host-global.');
+    assertSafeCurrentAccountPathIfApplicable(options.filePath, 'file');
     this.filePath = canonicalPath(options.filePath);
     this.config = structuredClone(options.config);
     this.lockTimeoutMs = options.lockTimeoutMs ?? 2_000;
@@ -389,9 +392,16 @@ export class MissionAdmissionRegistry {
     this.beforePublish = options.beforePublish;
     this.onPublishedTransition = options.onPublishedTransition;
     this.beforeStaleTakeover = options.beforeStaleTakeover;
-    this.validatePath = options.validatePath;
+    this.validatePath = () => {
+      assertSafeCurrentAccountPathIfApplicable(this.filePath, 'file');
+      assertSafeCurrentAccountPathIfApplicable(`${this.filePath}.lock`, 'file');
+      options.validatePath?.();
+      assertSafeCurrentAccountPathIfApplicable(this.filePath, 'file');
+      assertSafeCurrentAccountPathIfApplicable(`${this.filePath}.lock`, 'file');
+    };
     this.syncForDurability = options.syncForDurability ?? ((fd) => fsyncSync(fd));
     this.syncDirectoryHierarchy = options.syncDirectoryHierarchy;
+    this.validatePath();
   }
 
   private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void, validateBeforePublish?: (result: T) => void): T {
@@ -424,7 +434,7 @@ export class MissionAdmissionRegistry {
         this.beforePublish?.();
         this.validatePath?.();
         validateBeforePublish?.(result);
-        writeAtomic(this.filePath, state, this.syncForDurability);
+        writeAtomic(this.filePath, state, this.syncForDurability, this.validatePath);
         if (state.revision !== beforeRevision) {
           try { this.onPublishedTransition?.(project(state)); } catch { /* wake is a best-effort hint; publication remains authoritative */ }
         }

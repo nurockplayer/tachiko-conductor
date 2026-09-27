@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,6 +21,87 @@ async function withAccountHome<T>(home: string, operation: () => Promise<T>): Pr
 }
 
 describe('dispatch scheduler boundary', () => {
+  it('rejects unsafe canonical lock drift before identity, takeover, publication, or cleanup', async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-account-'));
+    const dispatch = path.join(home, '.tachiko-conductor', 'dispatch');
+    mkdirSync(dispatch, { recursive: true, mode: 0o755 });
+    chmodSync(path.join(home, '.tachiko-conductor'), 0o755);
+    chmodSync(dispatch, 0o755);
+    const lockPath = path.join(dispatch, 'once.lock');
+    const stale = JSON.stringify({ nonce: 'stale-owner', pid: 41 });
+    writeFileSync(lockPath, stale, { mode: 0o644 });
+    const before = statSync(lockPath);
+    let identityCalls = 0;
+    let takeoverCalls = 0;
+    await withAccountHome(home, async () => {
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath,
+        hostBootIdentity: () => { identityCalls += 1; return { hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) }; },
+        processStartIdentity: () => 'test-start',
+        isProcessAlive: () => false,
+        beforeStaleTakeover: () => { takeoverCalls += 1; },
+      }), /Unsafe/);
+    });
+    const after = statSync(lockPath);
+    assert.equal(readFileSync(lockPath, 'utf8'), stale);
+    assert.equal(after.mode & 0o777, before.mode & 0o777);
+    assert.equal(after.mtimeMs, before.mtimeMs);
+    assert.equal(identityCalls, 0);
+    assert.equal(takeoverCalls, 0);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('rechecks dispatch ancestry after the pre-publication callback without repairing drift', async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-account-callback-'));
+    const conductor = path.join(home, '.tachiko-conductor');
+    const dispatch = path.join(conductor, 'dispatch');
+    mkdirSync(dispatch, { recursive: true, mode: 0o755 });
+    chmodSync(conductor, 0o755);
+    chmodSync(dispatch, 0o755);
+    const lockPath = path.join(dispatch, 'once.lock');
+    await withAccountHome(home, async () => {
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath,
+        hostBootIdentity: () => ({ hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) }),
+        processStartIdentity: () => 'test-start',
+        beforeCanonicalLink: () => chmodSync(dispatch, 0o777),
+      }), /Unsafe/);
+    });
+    assert.equal(existsSync(lockPath), false);
+    assert.equal(statSync(dispatch).mode & 0o777, 0o777);
+    chmodSync(dispatch, 0o755);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('rejects direct lock acquisition after a cached canonical conductor path is retargeted', async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-account-retarget-'));
+    const conductor = path.join(home, '.tachiko-conductor');
+    const dispatch = path.join(conductor, 'dispatch');
+    mkdirSync(dispatch, { recursive: true, mode: 0o755 });
+    chmodSync(conductor, 0o755);
+    chmodSync(dispatch, 0o755);
+    const lockPath = path.join(dispatch, 'once.lock');
+    const preserved = path.join(home, 'preserved-conductor');
+    const alternate = path.join(home, 'alternate-conductor');
+    mkdirSync(alternate, { mode: 0o755 });
+    renameSync(conductor, preserved);
+    symlinkSync(alternate, conductor, 'dir');
+    let identityCalls = 0;
+    await withAccountHome(home, async () => {
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath,
+        hostBootIdentity: () => { identityCalls += 1; return { hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) }; },
+        processStartIdentity: () => 'test-start',
+      }), /symlink.*wrong filesystem type/);
+    });
+    assert.equal(identityCalls, 0);
+    assert.equal(existsSync(path.join(alternate, 'dispatch')), false);
+    assert.equal(existsSync(path.join(preserved, 'dispatch', 'once.lock')), false);
+    rmSync(conductor);
+    renameSync(preserved, conductor);
+    rmSync(home, { recursive: true, force: true });
+  });
+
   it('does not publish a dispatch lock until each visible lock-directory edge can be synced', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-hierarchy-'));
     const lockDirectory = path.join(directory, 'dispatch', 'nested');

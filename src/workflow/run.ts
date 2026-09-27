@@ -26,7 +26,7 @@ import {
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
-import { activeRepairAdmission, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
+import { activeRepairAdmission, generationlessAppServerPredecessor, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { createBootstrapFailureRun } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
@@ -432,7 +432,6 @@ export async function runWorkflow(
         const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
           ? admittedRepairExecution(run, deps)
           : run.execution;
-        const bootstrapAdapter = deps.bootstrapForExecution?.(effectiveExecution ?? undefined) ?? deps.bootstrap;
         if (pendingRepair && run.repairTaskShapeAuthority !== undefined && effectiveExecution === null) {
           return park(
             run,
@@ -442,6 +441,17 @@ export async function runWorkflow(
             ['Re-admit the exact repair authority and execution profile', CANCEL_RUN_DECISION],
           );
         }
+        const legacyAppServerWithoutGeneration = pendingRepair && run.repairTaskShapeAuthority === undefined &&
+          effectiveExecution?.executor !== 'luna-isolated' && generationlessAppServerPredecessor(run) !== undefined;
+        if (legacyAppServerWithoutGeneration) {
+          return park(
+            run,
+            'Repair admission held: the prior Codex App Server identity has no generation and cannot be continued safely. No model turn or worker process was started.',
+            store,
+            now,
+          );
+        }
+        const bootstrapAdapter = deps.bootstrapForExecution?.(effectiveExecution ?? undefined) ?? deps.bootstrap;
         if (pendingRepair) {
           const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
           if (conflict !== null) return park(run, conflict, store, now);
@@ -1193,6 +1203,9 @@ export async function runWorkflow(
           },
         );
         run = loop.run;
+        if (loop.outcome === 'superseded') {
+          return staleWorkflowOutcome(loop.run.id, loop.run, store, loop.reason);
+        }
         if (loop.outcome === 'needs_human') return { outcome: 'needs_human', run, reason: loop.reason };
         if (loop.outcome === 'unsupported_cas') return { outcome: 'unsupported_cas', run: loop.run, reason: loop.reason };
         if (loop.outcome === 'failed') return { outcome: 'failed', run, reason: loop.reason };

@@ -5,16 +5,19 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import plistlib
+import platform
 import pwd
 import shutil
 import subprocess
 import sys
 import stat
 import tempfile
+import tarfile
 import time
 import unittest
 from unittest import mock
@@ -22,6 +25,525 @@ from unittest import mock
 
 HERE = Path(__file__).resolve().parent
 RUNNER = HERE / "runner.py"
+
+
+class ProviderBuildTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="tachiko-provider-tests-", dir=Path(tempfile.gettempdir()).resolve())
+        self.root = Path(self.temp.name).resolve()
+        saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.root / "state")
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_provider_under_test", RUNNER)
+            assert spec and spec.loader
+            self.module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(self.module)
+        finally:
+            if saved_testing is None:
+                os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
+            if saved_root is None:
+                os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else:
+                os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
+        self.module.ROOT.mkdir(mode=0o700)
+        self.manifest = json.loads((HERE / "providers/corepack-0.34.6.json").read_bytes())
+        self.artifact = (HERE / "providers/corepack-0.34.6.tgz").read_bytes()
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def test_apple_provider_requires_anchored_requirement_and_stable_inode(self) -> None:
+        tool = self.root / "provider"
+        tool.write_bytes(b"qualified bytes")
+        tool.chmod(0o755)
+        codesign = self.root / "codesign"
+        codesign.write_text("unused")
+        codesign.chmod(0o755)
+
+        def result(args: list[str], stdout: str = "", stderr: str = "", returncode: int = 0) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(args, returncode, stdout, stderr)
+
+        responses = [
+            result(["codesign", "--verify", "-R=anchor apple"]),
+            result(["codesign", "-dv"], stderr="Identifier=com.apple.git\n"),
+            result(["codesign", "-d", "-r-"], stderr='designated => identifier "com.apple.git" and anchor apple\n'),
+        ]
+        with mock.patch.object(self.module, "_safe_system_file", return_value=tool), \
+             mock.patch.object(self.module.subprocess, "run", side_effect=responses):
+            qualified = self.module._signed_apple_tool(tool, "com.apple.git", codesign)
+        self.assertIn('identifier "com.apple.git"', qualified["designatedRequirement"])
+        self.assertEqual(qualified["verifiedRequirement"], "anchor apple")
+        self.assertIn("inode", qualified)
+        bad_responses = [
+            result(["codesign", "--verify", "-R=anchor apple"], stderr="anchored verification rejected", returncode=1),
+            result(["codesign", "-dv"], stderr="Identifier=com.apple.git\n"),
+            result(["codesign", "-d", "-r-"],
+                   stderr='designated => identifier "com.apple.git" or anchor apple\n'),
+        ]
+        with mock.patch.object(self.module, "_safe_system_file", return_value=tool), \
+             mock.patch.object(self.module.subprocess, "run", side_effect=bad_responses) as verify:
+            with self.assertRaisesRegex(RuntimeError, "signature qualification"):
+                self.module._signed_apple_tool(tool, "com.apple.git", codesign)
+        self.assertEqual(verify.call_args_list[0].args[0][1:4], ["--verify", "--strict", "-R=anchor apple"])
+        self.assertEqual(verify.call_count, 3, "the rejected designated expression contains an Apple OR alternative")
+
+        with mock.patch.object(self.module, "_system_codesign", return_value=codesign), \
+             mock.patch.object(self.module, "_signed_apple_tool",
+                               side_effect=lambda path, identifier, _codesign:
+                               self.module._provider_filesystem_identity(path, identifier, qualified["designatedRequirement"],
+                                                                        qualified["verifiedRequirement"])):
+            self.module._provider_file(qualified, "fixture Git")
+            replacement = self.root / "replacement"
+            replacement.write_bytes(tool.read_bytes())
+            replacement.chmod(tool.stat().st_mode & 0o777)
+            os.replace(replacement, tool)
+            with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                self.module._provider_file(qualified, "fixture Git")
+
+    def test_unqualified_resolver_is_rejected_before_any_resolver_execution(self) -> None:
+        resolver = {"path": "/usr/bin/xcrun", "sha256": "0" * 64,
+                    "identifier": "com.apple.xcrun", "requirement": "unanchored"}
+        with mock.patch.object(self.module, "_provider_file", side_effect=RuntimeError("unqualified resolver")), \
+             mock.patch.object(self.module.subprocess, "run") as execute:
+            with self.assertRaisesRegex(RuntimeError, "unqualified resolver"):
+                self.module._resolve_apple_git(resolver, Path("/usr/bin/codesign"))
+        execute.assert_not_called()
+
+    def test_qualified_resolver_never_executes_unqualified_selected_git(self) -> None:
+        resolver = {"path": "/usr/bin/xcrun", "sha256": "0" * 64,
+                    "identifier": "com.apple.xcrun",
+                    "designatedRequirement": 'identifier "com.apple.xcrun" or anchor apple',
+                    "verifiedRequirement": "anchor apple"}
+        resolved = subprocess.CompletedProcess(["xcrun", "--find", "git"], 0, "/usr/bin/git\n", "")
+        with mock.patch.object(self.module, "_provider_file") as verify_resolver, \
+             mock.patch.object(self.module.subprocess, "run", return_value=resolved) as execute_resolver, \
+             mock.patch.object(self.module, "_signed_apple_tool", side_effect=RuntimeError("selected Git is unqualified")) as qualify_git:
+            with self.assertRaisesRegex(RuntimeError, "selected Git is unqualified"):
+                self.module._resolve_apple_git(resolver, Path("/usr/bin/codesign"))
+        self.assertEqual(execute_resolver.call_count, 1, "only the qualified resolver may execute")
+        self.assertEqual(execute_resolver.call_args.args[0], ["/usr/bin/xcrun", "--find", "git"])
+        self.assertEqual(qualify_git.call_args.args[0], Path("/usr/bin/git"))
+        self.assertEqual(verify_resolver.call_count, 2, "resolver identity is checked around resolver use")
+
+    def test_git_lazy_fetch_is_disabled_for_a_missing_promisor_object(self) -> None:
+        git_path = shutil.which("git")
+        self.assertIsNotNone(git_path, "promisor regression needs a Git executable")
+        git = {"path": git_path}
+        repo = self.root / "promisor-repo"
+        repo.mkdir()
+        base_env = {**self.module.git_environment(), "GIT_AUTHOR_NAME": "Provider Test",
+                    "GIT_AUTHOR_EMAIL": "provider@example.invalid", "GIT_COMMITTER_NAME": "Provider Test",
+                    "GIT_COMMITTER_EMAIL": "provider@example.invalid"}
+        subprocess.run([git["path"], "init", "--quiet"], cwd=repo, env=base_env, check=True)
+        (repo / "tracked.txt").write_text("promised object\n", encoding="utf-8")
+        subprocess.run([git["path"], "add", "tracked.txt"], cwd=repo, env=base_env, check=True)
+        subprocess.run([git["path"], "commit", "--quiet", "-m", "promisor fixture"], cwd=repo,
+                       env=base_env, check=True)
+        object_id = subprocess.run([git["path"], "hash-object", "tracked.txt"], cwd=repo, env=base_env,
+                                   check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+        commit = subprocess.run([git["path"], "rev-parse", "HEAD"], cwd=repo, env=base_env,
+                                check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+        tree = subprocess.run([git["path"], "rev-parse", "HEAD^{tree}"], cwd=repo, env=base_env,
+                              check=True, stdout=subprocess.PIPE, text=True).stdout.strip()
+        pack_directory = repo / ".git/objects/pack"
+        pack_directory.mkdir(exist_ok=True)
+        pack_id = subprocess.run([git["path"], "pack-objects", str(pack_directory / "pack")], cwd=repo,
+                                 env=base_env, input=commit + "\n" + tree + "\n", check=True,
+                                 stdout=subprocess.PIPE, text=True).stdout.strip()
+        (pack_directory / (pack_id + ".promisor")).touch()
+        helper_marker = self.root / "remote-helper-ran"
+        helper = self.root / "promisor-helper.sh"
+        helper.write_text("#!/bin/sh\nprintf fetched >> " + str(helper_marker) + "\nexit 1\n", encoding="utf-8")
+        helper.chmod(0o700)
+        for key, value in (("extensions.partialClone", "origin"), ("remote.origin.promisor", "true"),
+                           ("remote.origin.url", "ext::/bin/sh " + str(helper)),
+                           ("protocol.ext.allow", "always")):
+            subprocess.run([git["path"], "config", key, value], cwd=repo, env=base_env, check=True)
+        missing_object = repo / ".git/objects" / object_id[:2] / object_id[2:]
+        missing_object.unlink()
+        # Prove the fixture's promisor remote would execute its helper without
+        # the no-lazy-fetch fence; the production plumbing path must not.
+        baseline_env = dict(base_env)
+        baseline_env.pop("GIT_NO_LAZY_FETCH", None)
+        baseline = subprocess.run([git["path"], "-C", str(repo), "cat-file", "-e", object_id],
+                                  env=baseline_env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.assertNotEqual(baseline.returncode, 0)
+        self.assertTrue(helper_marker.exists(), "promisor fixture did not demonstrate a transport attempt")
+        helper_marker.unlink()
+        with mock.patch.object(self.module, "_provider_file"):
+            with self.assertRaisesRegex(RuntimeError, "could not inspect committed"):
+                self.module._git_output(git, repo, "cat-file", "-e", object_id)
+        self.assertFalse(helper_marker.exists(), "missing promisor object must fail without remote helper execution")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "Corepack provider is supported only on qualified Darwin")
+    def test_official_corepack_signature_and_complete_package_inventory(self) -> None:
+        codesign = self.module._system_codesign()
+        openssl = self.module._signed_apple_tool(Path("/usr/bin/openssl"), "com.apple.openssl", codesign)
+        digest = self.module.verify_corepack_artifact(self.manifest, self.artifact, openssl)
+        self.assertEqual(digest, "af29678fc25ed5ae02343e9b67b214a25bacdcffae566f8cf848936beb23a7c8")
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        self.assertEqual(len(files), 54)
+        self.assertIn("LICENSE.md", files)
+        bundle, created = self.module.materialize_corepack_bundle(self.manifest, files)
+        self.assertTrue(created)
+        self.assertEqual((bundle / "LICENSE.md").read_bytes(), files["LICENSE.md"])
+        self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
+
+    def test_reviewed_artifact_rejects_signature_manifest_key_and_byte_changes(self) -> None:
+        bad_artifact = bytearray(self.artifact)
+        bad_artifact[-1] ^= 1
+        with self.assertRaisesRegex(RuntimeError, "SHA-256"):
+            self.module.verify_corepack_artifact(self.manifest, bytes(bad_artifact), {})
+        for key, replacement in (("version", "0.34.0"), ("signature", "AA=="),
+                                 ("publicKey", "AA=="), ("keyId", "SHA256:changed")):
+            with self.subTest(field=key):
+                changed = json.loads(json.dumps(self.manifest))
+                changed[key] = replacement
+                with self.assertRaisesRegex(RuntimeError, "manifest"):
+                    self.module._validate_corepack_manifest(changed)
+
+    def test_generated_corepack_identity_binds_canonical_raw_and_bundle_path(self) -> None:
+        manifest_bytes = (HERE / "providers/corepack-0.34.6.json").read_bytes()
+        manifest = self.module._validate_corepack_manifest(json.loads(manifest_bytes))
+        files = self.module.extract_corepack_package(manifest, self.artifact)
+        bundle, _created = self.module.materialize_corepack_bundle(manifest, files)
+        entry = bundle / "dist/corepack.js"
+        receipt = self.module.corepack_build_identity(
+            manifest, manifest_bytes, entry, self.module.corepack_package_closure_sha256(manifest),
+            hashlib.sha256(self.artifact).hexdigest(),
+        )
+        self.assertEqual(receipt["manifestSha256"], self.module._canonical_corepack_manifest_sha256(manifest))
+        self.assertEqual(receipt["sourceManifestSha256"], hashlib.sha256(manifest_bytes).hexdigest())
+        self.assertEqual(Path(receipt["path"]), self.module._corepack_bundle_path(manifest) / "dist/corepack.js")
+        self.assertTrue(self.module.valid_corepack_provider_identity(receipt))
+        for field, replacement in (("manifestSha256", receipt["sourceManifestSha256"]),
+                                   ("sourceManifestSha256", receipt["manifestSha256"]),
+                                   ("path", str(self.root / "wrong-corepack.js"))):
+            with self.subTest(field=field):
+                changed = dict(receipt, **{field: replacement})
+                self.assertFalse(self.module.valid_corepack_provider_identity(changed))
+
+    def _make_tar(self, *, extra: tuple[str, bytes] | None = None,
+                  duplicate: bool = False, link: bool = False,
+                  missing: bool = False, changed: bool = False,
+                  changed_mode: bool = False) -> bytes:
+        actual_files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        out = io.BytesIO()
+        with tarfile.open(fileobj=out, mode="w:gz") as archive:
+            for item in self.manifest["files"]:
+                if missing and item["path"] == "dist/corepack.js":
+                    continue
+                name = "package/" + item["path"]
+                info = tarfile.TarInfo(name)
+                info.mode = item["mode"]
+                data = actual_files[item["path"]]
+                if changed and item["path"] == "dist/corepack.js":
+                    data += b"// changed"
+                if changed_mode and item["path"] == "dist/corepack.js":
+                    info.mode ^= 0o100
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+                if duplicate and item["path"] == "dist/corepack.js":
+                    archive.addfile(info, io.BytesIO(data))
+            if extra is not None:
+                name, data = extra
+                info = tarfile.TarInfo(name)
+                info.mode = 0o644
+                info.size = len(data)
+                archive.addfile(info, io.BytesIO(data))
+            if link:
+                info = tarfile.TarInfo("package/linked")
+                info.type = tarfile.SYMTYPE
+                info.linkname = "dist/corepack.js"
+                archive.addfile(info)
+        return out.getvalue()
+
+    def test_archive_rejects_duplicate_traversal_link_missing_and_extra_entries(self) -> None:
+        cases = (
+            (self._make_tar(duplicate=True), "duplicate"),
+            (self._make_tar(extra=("package/../escape", b"x")), "unsafe|unexpected"),
+            (self._make_tar(link=True), "link or special"),
+            (self._make_tar(missing=True), "missing"),
+            (self._make_tar(extra=("package/unlisted", b"x")), "unexpected"),
+            (self._make_tar(changed=True), "differs from its reviewed inventory"),
+            (self._make_tar(changed_mode=True), "mode differs from its reviewed inventory"),
+        )
+        for archive, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(RuntimeError, message):
+                self.module.extract_corepack_package(self.manifest, archive)
+
+    def test_existing_corepack_snapshot_rejects_replacement_and_extra_files(self) -> None:
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        bundle, _ = self.module.materialize_corepack_bundle(self.manifest, files)
+        corepack = bundle / "dist/corepack.js"
+        original = corepack.read_bytes()
+        corepack.write_bytes(original + b"// changed")
+        with self.assertRaisesRegex(RuntimeError, "byte verification"):
+            self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
+        corepack.write_bytes(original)
+        (bundle / "unlisted").write_bytes(b"extra")
+        with self.assertRaisesRegex(RuntimeError, "file set"):
+            self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
+
+    def test_existing_corepack_snapshot_rejects_hardlinks(self) -> None:
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        bundle, _ = self.module.materialize_corepack_bundle(self.manifest, files)
+        victim = bundle / "dist/corepack.js"
+        outside = self.root / "linked-corepack.js"
+        os.link(victim, outside)
+        with self.assertRaisesRegex(RuntimeError, "hard-linked"):
+            self.module.verify_existing_corepack_bundle(bundle, self.manifest, files)
+
+    @unittest.skipUnless(platform.system() == "Darwin", "Corepack cache fence uses qualified Darwin providers")
+    def test_corepack_wrapper_rejects_dependency_and_root_drift_between_uses(self) -> None:
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        bundle, _ = self.module.materialize_corepack_bundle(self.manifest, files)
+        source_node = Path(shutil.which("node") or "")
+        self.assertTrue(source_node.is_file())
+        node_source = self.root / "node-source"
+        node_source.write_bytes(source_node.read_bytes())
+        node_source.chmod(0o700)
+        node, digest, _created = self.module.pin_admission_node(node_source)
+        fake_result = subprocess.CompletedProcess([str(node), "corepack"], 0, "ok", "")
+        with mock.patch.object(self.module, "run_verified_node", return_value=fake_result) as invoke:
+            self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
+            changed = bundle / "dist/corepack.js"
+            original = changed.read_bytes()
+            changed.write_bytes(original + b"tampered")
+            with self.assertRaisesRegex(RuntimeError, "byte verification"):
+                self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
+            changed.write_bytes(original)
+            self.assertEqual(invoke.call_count, 1, "changed Corepack dependency must block the next subprocess")
+            self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
+            old_mode = stat.S_IMODE(self.module.ROOT.stat().st_mode)
+            try:
+                self.module.ROOT.chmod(old_mode | 0o077)
+                with self.assertRaisesRegex(RuntimeError, "snapshot root"):
+                    self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
+            finally:
+                self.module.ROOT.chmod(old_mode)
+            self.assertEqual(invoke.call_count, 2, "unsafe private ROOT must block the next subprocess")
+
+    def test_private_snapshot_root_reuses_account_home_and_path_checks_before_node(self) -> None:
+        home = self.root / "account-home"
+        home.mkdir(mode=0o700)
+        snapshot_root = home / "Library/Application Support/provider-test"
+        snapshot_root.mkdir(parents=True, mode=0o700)
+        snapshot_root.chmod(0o700)
+        node_bytes = b"verified node fixture"
+        digest = hashlib.sha256(node_bytes).hexdigest()
+        node = snapshot_root / ("verified-node-" + digest)
+        node.write_bytes(node_bytes)
+        node.chmod(0o700)
+        old_root = self.module.ROOT
+        self.module.ROOT = snapshot_root
+        package_files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        self.module.materialize_corepack_bundle(self.manifest, package_files)
+        real_lstat = Path.lstat
+
+        def altered_lstat(target: Path, *, uid: int | None = None, mode: int | None = None):
+            def inspect(path: Path):
+                result = real_lstat(path)
+                if path == target:
+                    values = list(result)
+                    if uid is not None:
+                        values[4] = uid
+                    if mode is not None:
+                        values[0] = mode
+                    return os.stat_result(values)
+                return result
+            return inspect
+
+        try:
+            with mock.patch.object(self.module, "account_home_directory", return_value=home):
+                for label, target, uid, mode in (
+                    ("root-owned-home", home, 0, None),
+                    ("root-owned-sticky-intermediate", home / "Library", 0, 0o41777),
+                ):
+                    with self.subTest(case=label), \
+                         mock.patch.object(Path, "lstat", altered_lstat(target, uid=uid, mode=mode)), \
+                         mock.patch.object(self.module.subprocess, "run") as execute:
+                        with self.assertRaisesRegex(RuntimeError, "unsafe ownership|unsafe heartbeat"):
+                            self.module.run_verified_node(node, digest, ["--version"])
+                        execute.assert_not_called()
+                    with self.subTest(corepack_case=label), \
+                         mock.patch.object(Path, "lstat", altered_lstat(target, uid=uid, mode=mode)), \
+                         mock.patch.object(self.module, "run_verified_node") as execute_corepack:
+                        with self.assertRaisesRegex(RuntimeError, "unsafe ownership|unsafe heartbeat"):
+                            self.module.run_verified_corepack(node, digest, self.manifest, package_files, ["--version"])
+                        execute_corepack.assert_not_called()
+
+                parent = home.parent
+                with mock.patch.object(Path, "lstat", altered_lstat(parent, uid=0, mode=0o41777)), \
+                     mock.patch.object(self.module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "ok", "")) as execute:
+                    result = self.module.run_verified_node(node, digest, ["--version"], text=True)
+                    self.assertEqual(result.stdout, "ok")
+                    self.assertEqual(execute.call_count, 1, "root-owned sticky ancestry above a valid home remains allowed")
+                with mock.patch.object(Path, "lstat", altered_lstat(parent, uid=0, mode=0o41777)), \
+                     mock.patch.object(self.module, "run_verified_node",
+                                       return_value=subprocess.CompletedProcess([], 0, "ok", "")) as execute_corepack:
+                    result = self.module.run_verified_corepack(
+                        node, digest, self.manifest, package_files, ["--version"], text=True)
+                    self.assertEqual(result.stdout, "ok")
+                    self.assertEqual(execute_corepack.call_count, 1,
+                                     "Corepack may run below a valid home with sticky system ancestry")
+        finally:
+            self.module.ROOT = old_root
+
+    @unittest.skipUnless(platform.system() == "Darwin", "build provider is supported only on qualified Darwin")
+    def test_private_corepack_and_verified_node_ignore_path_shadows(self) -> None:
+        source_node = Path(shutil.which("node") or "")
+        self.assertTrue(source_node.is_file())
+        source_copy = self.root / "original-node"
+        source_copy.write_bytes(source_node.read_bytes())
+        source_copy.chmod(0o700)
+        node, digest, _created = self.module.pin_admission_node(source_copy)
+        source_copy.write_text("#!/bin/sh\nexit 98\n")
+        source_copy.chmod(0o700)
+        self.assertEqual(self.module.run_verified_node(
+            node, digest, ["--version"], check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.root)},
+        ).returncode, 0)
+        child_source = ("const cp=require('node:child_process'); const out=cp.execFileSync(process.execPath,"
+                        "['-e',\"process.stdout.write(process.env.NODE_DISABLE_COMPILE_CACHE+','+process.env.DISABLE_V8_COMPILE_CACHE)\"],"
+                        "{encoding:'utf8'}); process.stdout.write(out);")
+        child_environment = {"PATH": "/usr/bin:/bin", "HOME": str(self.root),
+                             "NODE_DISABLE_COMPILE_CACHE": "0", "DISABLE_V8_COMPILE_CACHE": "0"}
+        cache_result = self.module.run_verified_node(
+            node, digest, ["-e", child_source], check=True, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL,
+            env=child_environment,
+        )
+        self.assertEqual(cache_result.stdout, "1,1", "both cache fences must reach Node and its build child")
+        codesign = self.module._system_codesign()
+        openssl = self.module._signed_apple_tool(Path("/usr/bin/openssl"), "com.apple.openssl", codesign)
+        self.module.verify_corepack_artifact(self.manifest, self.artifact, openssl)
+        files = self.module.extract_corepack_package(self.manifest, self.artifact)
+        bundle, _ = self.module.materialize_corepack_bundle(self.manifest, files)
+        shadows = self.root / "path-shadows"
+        shadows.mkdir()
+        marker = self.root / "path-shadow-ran"
+        for name in ("node", "corepack", "pnpm"):
+            executable = shadows / name
+            executable.write_text("#!/bin/sh\nprintf ran >> " + str(marker) + "\nexit 97\n")
+            executable.chmod(0o700)
+        environment = {"PATH": str(shadows) + ":/usr/bin:/bin", "HOME": str(self.root),
+                       "COREPACK_HOME": str(self.root / "corepack-cache"), "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+        result = self.module.run_verified_corepack(
+            node, digest, self.manifest, files, ["--version"],
+            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL, env=environment,
+        )
+        self.assertEqual(result.stdout.strip(), "0.34.6")
+        self.assertFalse(marker.exists(), "ambient Node/Corepack/pnpm shadows must never execute")
+
+    @unittest.skipUnless(platform.system() == "Darwin", "raw provider proof uses qualified Apple Git")
+    def test_raw_source_inspection_avoids_status_filters_and_rejects_index_or_worktree_changes(self) -> None:
+        shadow_dir = self.root / "provider-path-shadows"
+        shadow_dir.mkdir()
+        provider_marker = self.root / "provider-path-shadow-ran"
+        for name in ("git", "openssl", "codesign"):
+            executable = shadow_dir / name
+            executable.write_text("#!/bin/sh\nprintf ran >> " + str(provider_marker) + "\nexit 96\n")
+            executable.chmod(0o700)
+        with mock.patch.dict(os.environ, {"PATH": str(shadow_dir)}):
+            git, _openssl = self.module.qualified_system_providers()
+        self.assertFalse(provider_marker.exists(), "provider qualification must ignore PATH shadows")
+        repo = self.root / "repo"
+        repo.mkdir()
+        (repo / "src").mkdir()
+        (repo / "src/entry.ts").write_text("export const value = 1;\n")
+        (repo / "scripts/bootstrap-heartbeat/providers").mkdir(parents=True)
+        for name in ("corepack-0.34.6.json", "corepack-0.34.6.tgz"):
+            (repo / "scripts/bootstrap-heartbeat/providers" / name).write_bytes(
+                (HERE / "providers" / name).read_bytes())
+        (repo / "package.json").write_text('{"packageManager":"pnpm@10.34.5"}\n')
+        (repo / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+        (repo / "tsconfig.json").write_text('{"compilerOptions":{}}\n')
+        (repo / ".gitattributes").write_text("src/entry.ts filter=poison export-ignore export-subst\n")
+        (repo / ".gitignore").write_text("src/ignored.txt\n")
+        marker = self.root / "git-filter-ran"
+        script = self.root / "filter.sh"
+        script.write_text("#!/bin/sh\nprintf ran >> " + str(marker) + "\ncat\n")
+        script.chmod(0o700)
+        process_marker = self.root / "git-process-filter-ran"
+        process_script = self.root / "filter-process.sh"
+        process_script.write_text("#!/bin/sh\nprintf ran >> " + str(process_marker) + "\nexit 0\n")
+        process_script.chmod(0o700)
+        env = self.module.git_environment()
+        env.update({"GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "test@example.invalid",
+                    "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid"})
+        subprocess.run([git["path"], "init", "--quiet"], cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "add", "--all"], cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "commit", "--quiet", "-m", "fixture"], cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "config", "--local", "filter.poison.clean", str(script)],
+                       cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "config", "--local", "filter.poison.process", str(process_script)],
+                       cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "config", "--local", "core.fsmonitor", str(script)],
+                       cwd=repo, env=env, check=True)
+        real_run = self.module.subprocess.run
+        commands: list[list[str]] = []
+
+        def traced(args: list[str], *pos: object, **kwargs: object) -> subprocess.CompletedProcess[bytes]:
+            commands.append([str(value) for value in args])
+            return real_run(args, *pos, **kwargs)
+
+        with mock.patch.object(self.module.subprocess, "run", side_effect=traced):
+            snapshot = self.module.capture_committed_build_source(repo, git)
+        self.assertEqual(snapshot["head"], subprocess.run([git["path"], "-C", str(repo), "rev-parse", "HEAD"], env=env,
+                                                          check=True, stdout=subprocess.PIPE, text=True).stdout.strip())
+        self.assertEqual(snapshot["files"]["src/entry.ts"]["bytes"], b"export const value = 1;\n")
+        materialized = self.root / "materialized"
+        self.module.materialize_committed_source(snapshot, materialized)
+        self.assertEqual((materialized / "src/entry.ts").read_bytes(), b"export const value = 1;\n")
+        self.assertFalse(marker.exists(), "Git clean/fsmonitor helpers must not run during raw source inspection")
+        self.assertFalse(process_marker.exists(), "Git process filters must not run during raw source inspection")
+        self.assertFalse(any("status" in command or "archive" in command for command in commands))
+        git_commands = [command for command in commands if command and command[0] == git["path"]]
+        self.assertTrue(git_commands)
+        self.assertTrue(all("--no-lazy-fetch" in command for command in git_commands))
+        (repo / "src/entry.ts").write_text("export const value = 2;\n")
+        with self.assertRaisesRegex(RuntimeError, "worktree|protected"):
+            self.module.capture_committed_build_source(repo, git)
+        (repo / "src/entry.ts").write_text("export const value = 1;\n")
+        (repo / "src/ignored.txt").write_text("extra\n")
+        with self.assertRaisesRegex(RuntimeError, "extra"):
+            self.module.capture_committed_build_source(repo, git)
+        (repo / "src/ignored.txt").unlink()
+        (repo / "src/linked.ts").symlink_to(repo / "src/entry.ts")
+        with self.assertRaisesRegex(RuntimeError, "symlink"):
+            self.module.capture_committed_build_source(repo, git)
+        (repo / "src/linked.ts").unlink()
+        (repo / "src/entry.ts").write_text("export const value = 3;\n")
+        subprocess.run([git["path"], "config", "--local", "--unset", "filter.poison.process"],
+                       cwd=repo, env=env, check=True)
+        subprocess.run([git["path"], "add", "src/entry.ts"], cwd=repo, env=env, check=True)
+        with self.assertRaisesRegex(RuntimeError, "staged protected"):
+            self.module.capture_committed_build_source(repo, git)
+        subprocess.run([git["path"], "reset", "--quiet", "HEAD", "--", "src/entry.ts"], cwd=repo, env=env, check=True)
+        (repo / "src/entry.ts").write_text("export const value = 1;\n")
+        scripts = repo / "scripts"
+        scripts_copy = self.root / "scripts-copy"
+        scripts.rename(scripts_copy)
+        scripts.symlink_to(scripts_copy, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "intermediate symlink"):
+            self.module.capture_committed_build_source(repo, git)
+        scripts.unlink()
+        scripts_copy.rename(scripts)
+        bootstrap = scripts / "bootstrap-heartbeat"
+        bootstrap_copy = self.root / "bootstrap-heartbeat-copy"
+        bootstrap.rename(bootstrap_copy)
+        bootstrap.symlink_to(bootstrap_copy, target_is_directory=True)
+        with self.assertRaisesRegex(RuntimeError, "intermediate symlink"):
+            self.module.capture_committed_build_source(repo, git)
+        bootstrap.unlink()
+        bootstrap_copy.rename(bootstrap)
 
 
 class HeartbeatTest(unittest.TestCase):
@@ -176,6 +698,19 @@ class HeartbeatTest(unittest.TestCase):
         self.assertIn("pinned heartbeat receipt directory does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
         self.assertEqual(self.records(), [])
 
+    def test_generated_provider_identity_passes_full_config_validation(self) -> None:
+        config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
+        corepack = config["admission_build"]["providers"]["corepack"]
+        provider_manifest = json.loads((HERE / "providers/corepack-0.34.6.json").read_bytes())
+        source_bytes = (HERE / "providers/corepack-0.34.6.json").read_bytes()
+        self.assertEqual(corepack["manifestSha256"], hashlib.sha256(
+            (json.dumps(provider_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        ).hexdigest())
+        self.assertEqual(corepack["sourceManifestSha256"], hashlib.sha256(source_bytes).hexdigest())
+        self.assertEqual(corepack["path"], str(self.state_root / ("verified-corepack-" + corepack["manifestSha256"]) / "dist/corepack.js"))
+        result = self.invoke("run", "--prime", check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_loaded_config_rejects_symlink_retargeted_account_admission_roots(self) -> None:
         conductor = self.account_home / ".tachiko-conductor"
         alternate = self.root / "alternate-account-root"
@@ -227,9 +762,12 @@ class HeartbeatTest(unittest.TestCase):
         canonical_receipts = self.account_home / ".tachiko-conductor/mission-admission/heartbeat-receipts"
         canonical_registry = self.account_home / ".tachiko-conductor/mission-admission/registry.json"
         canonical_runs.mkdir(parents=True)
-        canonical_receipts.mkdir(parents=True)
-        canonical_registry.parent.mkdir(parents=True, exist_ok=True)
+        canonical_receipts.mkdir(parents=True, mode=0o700)
+        canonical_registry.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+        canonical_registry.parent.chmod(0o700)
+        canonical_receipts.chmod(0o700)
         canonical_registry.write_text("{}", encoding="utf-8")
+        canonical_registry.chmod(0o600)
         runs_alias = self.root / "runs-alias"
         receipts_alias = self.root / "receipts-alias"
         registry_alias = self.root / "registry-alias.json"
@@ -247,7 +785,6 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(Path(domain["runs"]), canonical_runs.resolve())
         self.assertEqual(Path(domain["receipts"]), canonical_receipts.resolve())
         self.assertEqual(Path(domain["registry"]), canonical_registry.resolve())
-
         for variable, divergent, message in (
             ("TACHIKO_DATA_DIR", self.root / "other-runs", "Run directory must resolve"),
             ("TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR", self.root / "other-receipts", "receipt directory must resolve"),
@@ -255,6 +792,113 @@ class HeartbeatTest(unittest.TestCase):
             with mock.patch.dict(os.environ, {variable: str(divergent)}):
                 with self.assertRaisesRegex(RuntimeError, message):
                     module.admission_domain(repo, None, None)
+
+    def test_account_path_permissions_accept_safe_modes_and_reject_drift_without_repair(self) -> None:
+        spec = importlib.util.spec_from_file_location("heartbeat_account_permissions_under_test", RUNNER)
+        assert spec and spec.loader
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        conductor = self.account_home / ".tachiko-conductor"
+        runs = conductor / "runs"
+        admission = conductor / "mission-admission"
+        receipts = admission / "heartbeat-receipts"
+        runs.mkdir(parents=True, mode=0o755)
+        admission.mkdir(parents=True, mode=0o700)
+        receipts.mkdir(mode=0o700)
+        conductor.chmod(0o755)
+        runs.chmod(0o755)
+        admission.chmod(0o700)
+        receipts.chmod(0o700)
+        run_file = runs / "run.json"
+        registry = admission / "registry.json"
+        lock = conductor / "dispatch" / "once.lock"
+        run_file.write_text("{}\n", encoding="utf-8")
+        run_file.chmod(0o644)
+        registry.write_text("{}\n", encoding="utf-8")
+        registry.chmod(0o600)
+        lock.parent.mkdir(mode=0o755)
+        lock.write_text("{}\n", encoding="utf-8")
+        lock.chmod(0o600)
+        module.assert_safe_account_owned_path(self.account_home, runs, "directory")
+        module.assert_safe_account_owned_path(self.account_home, run_file, "file")
+        module.assert_safe_account_owned_path(self.account_home, registry, "file")
+        module.assert_safe_account_owned_path(self.account_home, lock, "file")
+
+        foreign_owner_targets = (
+            (conductor, "directory"),
+            (registry, "file"),
+            (run_file, "file"),
+            (lock, "file"),
+        )
+        original_lstat = Path.lstat
+        for target, endpoint in foreign_owner_targets:
+            before_bytes = target.read_bytes() if endpoint == "file" else None
+            before = target.stat()
+
+            class ForeignOwnerStat:
+                def __init__(self, original):
+                    self._original = original
+                    self.st_uid = original.st_uid + 100_000
+
+                def __getattr__(self, name):
+                    return getattr(self._original, name)
+
+            def lstat_with_foreign_owner(candidate):
+                original = original_lstat(candidate)
+                if candidate == target:
+                    return ForeignOwnerStat(original)
+                return original
+
+            with mock.patch.object(Path, "lstat", new=lstat_with_foreign_owner):
+                with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+                    module.assert_safe_account_owned_path(self.account_home, target, endpoint)
+
+            after = target.stat()
+            self.assertEqual(after.st_mode, before.st_mode, str(target))
+            self.assertEqual(after.st_mtime_ns, before.st_mtime_ns, str(target))
+            if before_bytes is not None:
+                self.assertEqual(target.read_bytes(), before_bytes, str(target))
+
+        self.root.chmod(0o777)
+        with self.assertRaisesRegex(RuntimeError, "ancestry"):
+            module.assert_safe_account_owned_path(self.account_home, run_file, "file")
+        self.root.chmod(0o1777)
+        with self.assertRaisesRegex(RuntimeError, "ancestry"):
+            module.assert_safe_account_owned_path(self.account_home, run_file, "file")
+        self.root.chmod(0o700)
+        with mock.patch.object(module.os, "geteuid", return_value=os.geteuid() + 1):
+            with self.assertRaisesRegex(RuntimeError, "ancestry|account home"):
+                module.assert_safe_account_owned_path(self.account_home, run_file, "file")
+
+        registry_bytes = registry.read_bytes()
+        registry_mtime = registry.stat().st_mtime_ns
+        registry.chmod(0o644)
+        unsafe_mode = registry.stat().st_mode & 0o777
+        with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+            module.assert_safe_account_owned_path(self.account_home, registry, "file")
+        self.assertEqual(registry.read_bytes(), registry_bytes)
+        self.assertEqual(registry.stat().st_mode & 0o777, unsafe_mode)
+        self.assertEqual(registry.stat().st_mtime_ns, registry_mtime)
+        registry.chmod(0o600)
+
+        admission.chmod(0o755)
+        unsafe_directory_mode = admission.stat().st_mode & 0o777
+        with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+            module.assert_safe_account_owned_path(self.account_home, registry, "file")
+        self.assertEqual(admission.stat().st_mode & 0o777, unsafe_directory_mode)
+
+        admission.chmod(0o700)
+        receipts.chmod(0o755)
+        unsafe_receipt_directory_mode = receipts.stat().st_mode & 0o777
+        with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+            module.assert_safe_account_owned_path(self.account_home, receipts, "directory")
+        self.assertEqual(receipts.stat().st_mode & 0o777, unsafe_receipt_directory_mode)
+        receipts.chmod(0o700)
+        self.account_home.chmod(0o777)
+        unsafe_home_mode = self.account_home.stat().st_mode & 0o777
+        with self.assertRaisesRegex(RuntimeError, "Unsafe|unsafe"):
+            module.assert_safe_account_owned_path(self.account_home, registry, "file")
+        self.assertEqual(self.account_home.stat().st_mode & 0o777, unsafe_home_mode)
 
     def test_account_home_lookup_ignores_divergent_ambient_home_values(self) -> None:
         saved_home = self.env.get("HOME")
@@ -299,7 +943,9 @@ class HeartbeatTest(unittest.TestCase):
             if saved_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
             else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = saved_root
 
-        node = Path(shutil.which("node") or "")
+        node_source = Path(shutil.which("node") or "")
+        self.assertTrue(node_source.is_file(), "closure test needs a Node executable to pin")
+        node, node_digest, _created = module.pin_admission_node(node_source)
         compiler_root = Path.cwd() / "node_modules/typescript"
         self.assertTrue(compiler_root.is_dir(), "closure test needs the repository-pinned TypeScript parser")
         with tempfile.TemporaryDirectory(dir=self.root) as temporary:
@@ -316,7 +962,7 @@ class HeartbeatTest(unittest.TestCase):
                 with self.subTest(loader=label):
                     (output / entry).write_text(source, encoding="utf-8")
                     with self.assertRaises(RuntimeError):
-                        module.validate_runtime_import_closure(node, compiler_root, output, {entry}, entry)
+                        module.validate_runtime_import_closure(node, node_digest, compiler_root, output, {entry}, entry)
 
     def test_existing_staged_bundle_requires_exact_manifest_and_output_bytes(self) -> None:
         saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
@@ -440,16 +1086,53 @@ class HeartbeatTest(unittest.TestCase):
         for path in (package_json, helper_entry):
             path_digest = hashlib.sha256(path.read_bytes()).hexdigest()
             helper_files.append({"path": str(path), "sha256": path_digest})
+        provider_manifest = json.loads((HERE / "providers/corepack-0.34.6.json").read_bytes())
+        provider_manifest_bytes = (HERE / "providers/corepack-0.34.6.json").read_bytes()
+        canonical_manifest_bytes = (json.dumps(provider_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        provider_manifest_digest = hashlib.sha256(canonical_manifest_bytes).hexdigest()
+        corepack_entry = str(self.state_root / ("verified-corepack-" + provider_manifest_digest) / "dist/corepack.js")
+        Path(corepack_entry).parent.mkdir(parents=True, exist_ok=True)
+        provider_artifact = (HERE / "providers/corepack-0.34.6.tgz").read_bytes()
+        with tarfile.open(fileobj=io.BytesIO(provider_artifact), mode="r:gz") as archive:
+            entry_stream = archive.extractfile("package/dist/corepack.js")
+            self.assertIsNotNone(entry_stream)
+            corepack_entry_bytes = entry_stream.read()
+        Path(corepack_entry).write_bytes(corepack_entry_bytes)
+        closure = hashlib.sha256()
+        for item in provider_manifest["files"]:
+            closure.update(item["path"].encode() + b"\0" + str(item["mode"]).encode() + b"\0")
+            closure.update(bytes.fromhex(item["sha256"]))
+        corepack_identity = {
+            "version": provider_manifest["version"], "path": corepack_entry,
+            "entrySha256": hashlib.sha256(corepack_entry_bytes).hexdigest(),
+            "closureSha256": closure.hexdigest(), "manifestSha256": provider_manifest_digest,
+            "sourceManifestSha256": hashlib.sha256(provider_manifest_bytes).hexdigest(),
+            "artifactSha256": hashlib.sha256(provider_artifact).hexdigest(),
+        }
+        def provider_identity(path: str, identifier: str, seed: int) -> dict[str, object]:
+            return {"path": path, "sha256": format(seed, "064x"), "identifier": identifier,
+                    "designatedRequirement": f'identifier "{identifier}" or anchor apple',
+                    "verifiedRequirement": "anchor apple",
+                    "device": 1, "inode": seed, "uid": 0, "gid": 0, "mode": 0o755}
         helper_build = {
-            "source_commit": "a" * 40, "source_tree": "b" * 40, "git_archive_sha256": "c" * 64,
+            "source_commit": "a" * 40, "source_tree": "b" * 40, "source_snapshot_sha256": "c" * 64,
             "package_json_sha256": "d" * 64, "lockfile_sha256": "e" * 64,
-            "node_path": str(node), "node_sha256": node_digest, "node_version": "v22.0.0",
-            "corepack_path": "/usr/bin/corepack", "corepack_sha256": "f" * 64,
-            "corepack_version": "0.34.0", "pnpm_version": "10.34.5",
+            "node_path": str(node_snapshot), "node_sha256": node_digest, "node_version": "v22.0.0",
+            "providers": {
+                "git": {**provider_identity("/usr/bin/git", "com.apple.git", 15),
+                        "resolver": provider_identity("/usr/bin/xcrun", "com.apple.xcrun", 16)},
+                "openssl": provider_identity("/usr/bin/openssl", "com.apple.openssl", 17),
+                "corepack": corepack_identity,
+            },
+            "corepack_version": "0.34.6", "pnpm_version": "10.34.5",
             "typescript_version": "5.9.3", "typescript_package_sha256": "1" * 64,
             "typescript_tree_sha256": "2" * 64,
             "install_command": ["corepack", "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
             "build_command": ["corepack", "pnpm@10.34.5", "build"],
+            "executed_commands": [[str(node_snapshot), corepack_entry, "--version"],
+                                  [str(node_snapshot), corepack_entry, "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
+                                  [str(node_snapshot), corepack_entry, "pnpm@10.34.5", "--version"],
+                                  [str(node_snapshot), corepack_entry, "pnpm@10.34.5", "build"]],
             "entry": "mission-admission/heartbeat-admission-cli.js",
             "files": [{"path": Path(item["path"]).relative_to(helper_root).as_posix(), "sha256": item["sha256"]}
                       for item in sorted(helper_files, key=lambda i: i["path"])],
@@ -478,7 +1161,7 @@ class HeartbeatTest(unittest.TestCase):
             "config": {"schemaVersion": 1, "revision": "test-config-v2", "limits": {"maxCaptains": 2, "maxWriters": 2, "maxHighAutonomy": 1}},
         }
         config = {
-            "schema": 2,
+            "schema": 3,
             "gh": str(gh_snapshot),
             "gh_sha256": gh_digest,
             "repo": str(Path.cwd()),
@@ -1716,7 +2399,7 @@ class HeartbeatTest(unittest.TestCase):
         os.environ["SCD_HEARTBEAT_TESTING"] = "1"
         os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
         try:
-            helper, helper_digest, helper_files, helper_build, _ = module.pin_admission_helper(Path.cwd().resolve(), node_source)
+            helper, helper_digest, helper_files, helper_build, _ = module.pin_admission_helper(Path.cwd().resolve(), node)
         finally:
             if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
             else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
@@ -2357,7 +3040,9 @@ class HeartbeatTest(unittest.TestCase):
         home = self.account_home.resolve()
         canonical_registry = home / ".tachiko-conductor" / "mission-admission" / "registry.json"
         canonical_registry.parent.mkdir(parents=True)
+        canonical_registry.parent.chmod(0o700)
         canonical_registry.write_text("{}", encoding="utf-8")
+        canonical_registry.chmod(0o600)
         registry_alias = self.root / "registry-alias.json"
         registry_alias.symlink_to(canonical_registry)
         args = (

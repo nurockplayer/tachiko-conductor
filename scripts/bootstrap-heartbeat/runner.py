@@ -4,15 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import fcntl
 import hashlib
 import io
 import json
 import os
-import pwd
-from pathlib import Path
-import plistlib
 import platform
+import pwd
+from pathlib import Path, PurePosixPath
+import plistlib
 import re
 import select
 import selectors
@@ -41,15 +43,44 @@ def account_home_directory() -> Path:
         account = pwd.getpwuid(effective_uid)
         if account.pw_uid != effective_uid or not Path(account.pw_dir).is_absolute():
             raise OSError("effective account lookup returned inconsistent identity")
-        return Path(account.pw_dir).resolve(strict=True)
+        home = Path(account.pw_dir).resolve(strict=True)
+        assert_safe_account_home(home, effective_uid)
+        return home
     except (OSError, KeyError, RuntimeError) as error:
         raise RuntimeError("cannot resolve physical home for the effective OS account") from error
 
 
+def assert_safe_account_home(home: Path, account_uid: int | None = None) -> None:
+    """Validate trusted system ancestors and the physical effective-account home."""
+    home = Path(home).resolve(strict=True)
+    uid = os.geteuid() if account_uid is None else account_uid
+    current = Path(home.anchor)
+    ancestors = [current]
+    for component in home.parts[1:]:
+        current = current / component
+        ancestors.append(current)
+    for ancestor in ancestors:
+        info = ancestor.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        root_sticky_directory = info.st_uid == 0 and stat.S_ISDIR(info.st_mode) and bool(mode & stat.S_ISVTX)
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, uid) or
+                ((mode & 0o022) != 0 and not root_sticky_directory) or
+                (mode & 0o7000 & (0o6000 if root_sticky_directory else 0o7000)) != 0):
+            raise RuntimeError("unsafe ownership or permissions in account-home ancestry: " + str(ancestor))
+    info = home.lstat()
+    mode = stat.S_IMODE(info.st_mode)
+    if (info.st_uid != uid or not stat.S_ISDIR(info.st_mode) or (mode & 0o700) != 0o700 or
+            (mode & 0o7022) != 0 or (mode & 0o7000) != 0):
+        raise RuntimeError("unsafe ownership or permissions for physical account home: " + str(home))
+
+
 def assert_safe_account_owned_path(home: Path, target: Path, endpoint: str) -> None:
-    """Reject symlink retargets below the physical account-owned conductor root."""
-    home = Path(home)
+    """Reject unsafe owners, permissions and symlink retargets below the account conductor root."""
+    home = Path(home).resolve(strict=True)
+    assert_safe_account_home(home)
     target = Path(target)
+    if endpoint not in ("file", "directory"):
+        raise RuntimeError("unsupported account-owned path endpoint")
     try:
         relative = target.relative_to(home)
     except ValueError as error:
@@ -67,11 +98,56 @@ def assert_safe_account_owned_path(home: Path, target: Path, endpoint: str) -> N
         last = index == len(parts) - 1
         if current.is_symlink() or (last and endpoint == "file" and not stat.S_ISREG(info.st_mode)) or (not last and not stat.S_ISDIR(info.st_mode)) or (last and endpoint == "directory" and not stat.S_ISDIR(info.st_mode)):
             raise RuntimeError("account-owned conductor path contains a symlink or wrong filesystem type: " + str(current))
+        mode = stat.S_IMODE(info.st_mode)
+        uid = os.geteuid()
+        private_dir = not last or endpoint == "directory"
+        private_area = "mission-admission" in parts[:index + 1] or "receipts" in parts[:index + 1]
+        if info.st_uid != uid or (mode & 0o7022) != 0:
+            raise RuntimeError("unsafe ownership or permissions for account-owned conductor path: " + str(current))
+        if private_dir:
+            if (mode & 0o700) != 0o700 or (private_area and (mode & 0o077) != 0):
+                raise RuntimeError("unsafe directory permissions for account-owned conductor path: " + str(current))
+        else:
+            name = parts[index]
+            private_file = private_area or name in ("once.lock", "once.lock.admission") or name.endswith(".lock")
+            if (mode & 0o400) != 0o400 or (private_file and (mode & 0o077) != 0):
+                raise RuntimeError("unsafe file permissions for account-owned conductor path: " + str(current))
+
+
+def assert_safe_private_account_path(target: Path, endpoint: str) -> None:
+    """Protect the heartbeat's own private directory and lock without constraining test stores."""
+    home = account_home_directory()
+    assert_safe_account_home(home)
+    target = Path(target).absolute()
+    try:
+        relative = target.relative_to(home)
+    except ValueError:
+        return
+    current = home
+    for index, component in enumerate(relative.parts):
+        current = current / component
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            return
+        last = index == len(relative.parts) - 1
+        if current.is_symlink() or (last and endpoint == "file" and not stat.S_ISREG(info.st_mode)) or (not last and not stat.S_ISDIR(info.st_mode)) or (last and endpoint == "directory" and not stat.S_ISDIR(info.st_mode)):
+            raise RuntimeError("heartbeat private path contains a symlink or wrong filesystem type: " + str(current))
+        mode = stat.S_IMODE(info.st_mode)
+        if info.st_uid != os.geteuid() or (mode & 0o7022) != 0:
+            raise RuntimeError("unsafe ownership or permissions for heartbeat private path: " + str(current))
+        if not last or endpoint == "directory":
+            if (mode & 0o700) != 0o700 or (last and (mode & 0o077) != 0):
+                raise RuntimeError("unsafe heartbeat directory permissions: " + str(current))
+        elif (mode & 0o400) != 0o400 or (mode & 0o077) != 0:
+            raise RuntimeError("heartbeat private file is not owner-only: " + str(current))
 
 
 def validate_account_admission_paths(home: Path) -> None:
     root = home / ".tachiko-conductor"
     assert_safe_account_owned_path(home, root / "runs", "directory")
+    assert_safe_account_owned_path(home, root / "dispatch/once.lock", "file")
+    assert_safe_account_owned_path(home, root / "dispatch/once.lock.admission", "file")
     registry = root / "mission-admission/registry.json"
     assert_safe_account_owned_path(home, registry, "file")
     assert_safe_account_owned_path(home, Path(str(registry) + ".lock"), "file")
@@ -93,7 +169,7 @@ DEFAULT_PROMPT = (
     "at a non-terminal re-entry boundary."
 )
 STATE_SCHEMA = 2
-CONFIG_SCHEMA = 2
+CONFIG_SCHEMA = 3
 DEFAULT_POLL_SECONDS = 180
 DEFAULT_SAFETY_SECONDS = 1800
 DEFAULT_POLL_TIMEOUT_SECONDS = 60
@@ -427,8 +503,35 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or helper_entry != str(helper_root / "mission-admission/heartbeat-admission-cli.js")
             or parsed_build.get("entry") != "mission-admission/heartbeat-admission-cli.js"):
         raise RuntimeError("admission helper closure digest or entry does not match its pinned layout")
-    required_build_digests = ("git_archive_sha256", "package_json_sha256", "lockfile_sha256", "node_sha256",
-                              "corepack_sha256", "typescript_package_sha256", "typescript_tree_sha256")
+    required_build_digests = ("source_snapshot_sha256", "package_json_sha256", "lockfile_sha256", "node_sha256",
+                              "typescript_package_sha256", "typescript_tree_sha256")
+    providers = parsed_build.get("providers")
+    git_provider = providers.get("git") if isinstance(providers, dict) else None
+    openssl_provider = providers.get("openssl") if isinstance(providers, dict) else None
+    corepack_provider = providers.get("corepack") if isinstance(providers, dict) else None
+    corepack_entry_path = corepack_provider.get("path") if isinstance(corepack_provider, dict) else ""
+    provider_identity_keys = {"path", "sha256", "identifier", "designatedRequirement", "verifiedRequirement",
+                              "device", "inode", "uid", "gid", "mode"}
+    def valid_provider_identity(record: Any, identifier: str) -> bool:
+        return (isinstance(record, dict) and set(record) == provider_identity_keys
+                and record.get("identifier") == identifier
+                and isinstance(record.get("path"), str) and Path(record["path"]).is_absolute()
+                and re.fullmatch(r"[0-9a-f]{64}", str(record.get("sha256", ""))) is not None
+                and isinstance(record.get("designatedRequirement"), str)
+                and f'identifier "{identifier}"' in record.get("designatedRequirement", "")
+                and record.get("verifiedRequirement") == "anchor apple"
+                and all(type(record.get(key)) is int and record[key] >= 0 for key in ("device", "inode", "uid", "gid", "mode")))
+    resolver_provider = git_provider.get("resolver") if isinstance(git_provider, dict) else None
+    git_identity = ({key: value for key, value in git_provider.items() if key != "resolver"}
+                    if isinstance(git_provider, dict) else None)
+    provider_records_valid = (
+        valid_provider_identity(git_identity, "com.apple.git")
+        and valid_provider_identity(resolver_provider, "com.apple.xcrun")
+        and valid_provider_identity(openssl_provider, "com.apple.openssl")
+        and valid_corepack_provider_identity(corepack_provider)
+        and all(isinstance(item.get("path"), str) and Path(item["path"]).is_absolute()
+                for item in (git_identity, resolver_provider, openssl_provider, corepack_provider))
+    )
     if (not re.fullmatch(r"[0-9a-f]{40,64}", str(parsed_build.get("source_commit", "")))
             or not re.fullmatch(r"[0-9a-f]{40,64}", str(parsed_build.get("source_tree", "")))
             or parsed_build.get("pnpm_version") != "10.34.5"
@@ -437,7 +540,14 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or parsed_build.get("build_command") != ["corepack", "pnpm@10.34.5", "build"]
             or parsed_build.get("node_sha256") != node_digest
             or not isinstance(parsed_build.get("node_path"), str) or not Path(parsed_build["node_path"]).is_absolute()
-            or not isinstance(parsed_build.get("corepack_path"), str) or not Path(parsed_build["corepack_path"]).is_absolute()
+            or parsed_build.get("node_path") != config.get("admission_node")
+            or not provider_records_valid
+            or parsed_build.get("executed_commands") != [
+                [parsed_build.get("node_path"), corepack_entry_path, "--version"],
+                [parsed_build.get("node_path"), corepack_entry_path, "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
+                [parsed_build.get("node_path"), corepack_entry_path, "pnpm@10.34.5", "--version"],
+                [parsed_build.get("node_path"), corepack_entry_path, "pnpm@10.34.5", "build"],
+            ]
             or any(not re.fullmatch(r"[0-9a-f]{64}", str(parsed_build.get(key, ""))) for key in required_build_digests)):
         raise RuntimeError("admission build provenance is incomplete or uses an unsupported toolchain")
     manifest_files = parsed_build.get("files")
@@ -771,21 +881,631 @@ def pin_admission_node(path: Path) -> tuple[Path, str, bool]:
         os.close(source_fd)
 
 
-def _git_output(repo: Path, *args: str) -> bytes:
-    result = subprocess.run(["git", "-C", str(repo), *args], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+def _git_output(git: dict[str, str], repo: Path, *args: str,
+                input_bytes: bytes | None = None) -> bytes:
+    _provider_file(git, "Apple Git")
+    result = subprocess.run([git["path"], "--no-lazy-fetch", "-C", str(repo), *args],
+                            input=input_bytes, stdin=None if input_bytes is not None else subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+                            env=git_environment())
+    _provider_file(git, "Apple Git")
     if result.returncode:
-        raise RuntimeError("could not identify committed admission-helper source snapshot")
+        raise RuntimeError("could not inspect committed admission-helper source: " + result.stderr.decode(errors="replace")[-1000:])
     return result.stdout
 
 
-def _checked_extract_git_archive(archive: bytes, destination: Path) -> None:
-    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as bundle:
-        for member in bundle.getmembers():
-            name = Path(member.name)
-            if name.is_absolute() or ".." in name.parts or not (member.isdir() or member.isfile()):
-                raise RuntimeError("committed source archive contains an unsupported path or file type")
-        bundle.extractall(destination)
+def _protected_source_path(name: str) -> bool:
+    return name.startswith("src/") or name in PROTECTED_SOURCE_FILES or name.startswith("scripts/bootstrap-heartbeat/providers/")
+
+
+def _parse_git_tree(data: bytes) -> dict[str, tuple[int, str, str]]:
+    entries: dict[str, tuple[int, str, str]] = {}
+    for record in data.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_name = record.split(b"\t", 1)
+            mode_text, kind, oid = metadata.decode("ascii").split(" ")
+            name = raw_name.decode("utf-8", errors="strict")
+            mode = int(mode_text, 8)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError("Git returned malformed raw tree entries") from error
+        if name in entries:
+            raise RuntimeError("Git returned a duplicate raw tree path")
+        entries[name] = (mode, oid, kind)
+    return entries
+
+
+def _walk_protected_worktree(repo: Path) -> dict[str, tuple[int, bytes]]:
+    found: dict[str, tuple[int, bytes]] = {}
+
+    def read_fd(fd: int) -> bytes:
+        os.lseek(fd, 0, os.SEEK_SET)
+        chunks = []
+        while chunk := os.read(fd, 1024 * 1024):
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+    def walk(directory: Path, directory_fd: int) -> None:
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                name = entry.name
+                relative = (directory / name).relative_to(repo).as_posix()
+                metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if stat.S_ISLNK(metadata.st_mode):
+                    raise RuntimeError("protected worktree source contains a symlink")
+                if stat.S_ISDIR(metadata.st_mode):
+                    child_fd = os.open(name, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                                       getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+                    try:
+                        opened = os.fstat(child_fd)
+                        if (opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino):
+                            raise RuntimeError("protected worktree directory changed during no-follow inspection")
+                        walk(directory / name, child_fd)
+                    finally:
+                        os.close(child_fd)
+                elif stat.S_ISREG(metadata.st_mode):
+                    file_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+                    try:
+                        opened = os.fstat(file_fd)
+                        if ((opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
+                                or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
+                            raise RuntimeError("protected worktree file changed or is shared during inspection")
+                        found[relative] = (stat.S_IMODE(opened.st_mode), read_fd(file_fd))
+                    finally:
+                        os.close(file_fd)
+                else:
+                    raise RuntimeError("protected worktree source contains a special file")
+
+    try:
+        if Path(repo).resolve(strict=True) != repo:
+            raise RuntimeError("protected repository root is not canonical")
+        repo_metadata = repo.lstat()
+        repo_fd = os.open(repo, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                          getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise RuntimeError("protected repository root is missing or unsafe") from error
+    try:
+        opened_repo = os.fstat(repo_fd)
+        if (not stat.S_ISDIR(opened_repo.st_mode) or stat.S_ISLNK(repo_metadata.st_mode)
+                or (opened_repo.st_dev, opened_repo.st_ino) != (repo_metadata.st_dev, repo_metadata.st_ino)):
+            raise RuntimeError("protected repository root changed during no-follow inspection")
+
+        def open_relative_directory(parts: tuple[str, ...]) -> int:
+            current_fd = os.dup(repo_fd)
+            try:
+                for component in parts:
+                    before = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(before.st_mode):
+                        raise RuntimeError("protected worktree source path contains an intermediate symlink or non-directory")
+                    child_fd = os.open(component, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                                       getattr(os, "O_NOFOLLOW", 0), dir_fd=current_fd)
+                    opened = os.fstat(child_fd)
+                    if (not stat.S_ISDIR(opened.st_mode)
+                            or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+                        os.close(child_fd)
+                        raise RuntimeError("protected worktree directory changed during no-follow inspection")
+                    os.close(current_fd)
+                    current_fd = child_fd
+                result_fd = current_fd
+                current_fd = -1
+                return result_fd
+            finally:
+                if current_fd >= 0:
+                    os.close(current_fd)
+
+        for parts, root in ((("src",), repo / "src"),
+                            (("scripts", "bootstrap-heartbeat", "providers"),
+                             repo / "scripts/bootstrap-heartbeat/providers")):
+            try:
+                root_fd = open_relative_directory(parts)
+            except OSError as error:
+                raise RuntimeError("protected worktree source directory is missing or unsafe") from error
+            try:
+                walk(root, root_fd)
+            finally:
+                os.close(root_fd)
+        for name in PROTECTED_SOURCE_FILES:
+            try:
+                fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=repo_fd)
+            except OSError as error:
+                raise RuntimeError("protected worktree build input is missing or unsafe") from error
+            try:
+                metadata = os.fstat(fd)
+                if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                    raise RuntimeError("protected worktree build input is unsafe or shared")
+                found[name] = (stat.S_IMODE(metadata.st_mode), read_fd(fd))
+            finally:
+                os.close(fd)
+    finally:
+        os.close(repo_fd)
+    return found
+
+
+def capture_committed_build_source(repo: Path, git: dict[str, str]) -> dict[str, Any]:
+    head = _git_output(git, repo, "rev-parse", "--verify", "HEAD").decode().strip()
+    tree = _git_output(git, repo, "rev-parse", "--verify", f"{head}^{{tree}}").decode().strip()
+    if not re.fullmatch(r"[0-9a-f]{40,64}", head) or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
+        raise RuntimeError("invalid committed source identity")
+    tree_entries = _parse_git_tree(_git_output(git, repo, "ls-tree", "-rz", "--full-tree", head))
+    expected_raw = {name: value for name, value in tree_entries.items() if _protected_source_path(name)}
+    if any(kind != "blob" or mode not in (0o100644, 0o100755)
+           for mode, _oid, kind in expected_raw.values()):
+        raise RuntimeError("protected source contains a link, special object, or unsupported mode")
+    expected = {name: (mode, oid) for name, (mode, oid, _kind) in expected_raw.items()}
+    required = {"package.json", "pnpm-lock.yaml", "tsconfig.json",
+                "scripts/bootstrap-heartbeat/providers/corepack-0.34.6.json",
+                "scripts/bootstrap-heartbeat/providers/corepack-0.34.6.tgz"}
+    if not required.issubset(expected) or not any(name.startswith("src/") for name in expected):
+        raise RuntimeError("committed build source or official Corepack provider files are incomplete")
+    index_data = _git_output(git, repo, "ls-files", "--stage", "--full-name", "-z")
+    indexed: dict[str, tuple[int, str]] = {}
+    for record in index_data.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, raw_name = record.split(b"\t", 1)
+            mode_text, oid, stage_text = metadata.decode("ascii").split(" ")
+            name = raw_name.decode("utf-8", errors="strict")
+            if _protected_source_path(name):
+                if stage_text != "0" or name in indexed:
+                    raise RuntimeError("protected source index has a conflict or duplicate path")
+                indexed[name] = (int(mode_text, 8), oid)
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError("Git returned malformed raw index entries") from error
+    if indexed != expected:
+        raise RuntimeError("staged protected source differs from the committed tree")
+    working = _walk_protected_worktree(repo)
+    if set(working) != set(expected):
+        raise RuntimeError("protected worktree has missing or extra files")
+    blobs: dict[str, dict[str, Any]] = {}
+    digest = hashlib.sha256()
+    object_ids = sorted({oid for _mode, oid in expected.values()})
+    batch = _git_output(git, repo, "cat-file", "--batch",
+                        input_bytes=("\n".join(object_ids) + "\n").encode("ascii"))
+    object_bytes: dict[str, bytes] = {}
+    offset = 0
+    for oid in object_ids:
+        try:
+            header_end = batch.index(b"\n", offset)
+            header = batch[offset:header_end].decode("ascii").split(" ")
+            if len(header) != 3 or header[0] != oid or header[1] != "blob":
+                raise RuntimeError("Git batch returned an unexpected object")
+            size = int(header[2])
+            start, end = header_end + 1, header_end + 1 + size
+            if end >= len(batch) or batch[end:end + 1] != b"\n":
+                raise RuntimeError("Git batch returned a truncated object")
+            object_bytes[oid] = batch[start:end]
+            offset = end + 1
+        except (ValueError, UnicodeDecodeError) as error:
+            raise RuntimeError("Git batch returned malformed object bytes") from error
+    for name in sorted(expected):
+        mode, oid = expected[name]
+        work_mode, work_bytes = working[name]
+        committed_bytes = object_bytes[oid]
+        if work_mode != mode & 0o777 or work_bytes != committed_bytes:
+            raise RuntimeError("protected worktree bytes or modes differ from committed source")
+        digest.update(name.encode() + b"\0" + f"{mode:o}".encode() + b"\0")
+        digest.update(hashlib.sha256(committed_bytes).digest())
+        blobs[name] = {"mode": mode, "oid": oid, "bytes": committed_bytes}
+    return {"head": head, "tree": tree, "files": blobs, "snapshot_sha256": digest.hexdigest()}
+
+
+def verify_build_source_unchanged(repo: Path, git: dict[str, str], captured: dict[str, Any]) -> None:
+    current = capture_committed_build_source(repo, git)
+    if (current["head"] != captured["head"] or current["tree"] != captured["tree"]
+            or current["snapshot_sha256"] != captured["snapshot_sha256"]):
+        raise RuntimeError("committed protected build inputs changed during helper preparation")
+
+
+def materialize_committed_source(source: dict[str, Any], destination: Path) -> None:
+    for name, item in source["files"].items():
+        target = destination / name
+        ensure_durable_directory(target.parent, mode=0o700)
+        atomic_write(target, item["bytes"], item["mode"] & 0o777)
+
+
+def verify_private_snapshot_root() -> None:
+    root = Path(ROOT)
+    assert_safe_private_account_path(root, "directory")
+    if not root.is_absolute() or root.resolve(strict=True) != root:
+        raise RuntimeError("private provider snapshot root is not canonical")
+    uid = os.getuid()
+    current = Path(root.anchor)
+    for component in root.parts[1:-1]:
+        current /= component
+        metadata = current.lstat()
+        sticky_root_tmp = metadata.st_uid == 0 and stat.S_ISDIR(metadata.st_mode) and bool(metadata.st_mode & stat.S_ISVTX)
+        if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid not in {0, uid}
+                or (metadata.st_mode & 0o022 and not sticky_root_tmp)):
+            raise RuntimeError("private provider snapshot root ancestry is unsafe: " + str(current))
+    metadata = root.lstat()
+    if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != uid or metadata.st_mode & 0o077 or metadata.st_mode & 0o7000):
+        raise RuntimeError("private provider snapshot root ownership or permissions changed")
+
+
+def verify_admission_node_snapshot(node: Path, digest: str) -> None:
+    verify_private_snapshot_root()
+    expected = ROOT / ("verified-node-" + digest)
+    try:
+        metadata = node.lstat()
+        if (node != expected or node.resolve(strict=True) != node or stat.S_ISLNK(metadata.st_mode)
+                or not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
+                or metadata.st_mode & 0o022 or not os.access(node, os.X_OK)
+                or _hash_file(node) != digest):
+            raise RuntimeError("verified Node snapshot identity changed")
+    except OSError as error:
+        raise RuntimeError("verified Node snapshot is unavailable") from error
+
+
+def run_verified_node(node: Path, digest: str, args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    verify_admission_node_snapshot(node, digest)
+    environment = dict(kwargs.get("env") or os.environ)
+    environment["NODE_DISABLE_COMPILE_CACHE"] = "1"
+    environment["DISABLE_V8_COMPILE_CACHE"] = "1"
+    kwargs["env"] = environment
+    result = subprocess.run([str(node), *args], **kwargs)
+    verify_admission_node_snapshot(node, digest)
+    return result
+
+
+PROVIDER_DIRECTORY = Path(__file__).resolve().parent / "providers"
+COREPACK_MANIFEST_PATH = PROVIDER_DIRECTORY / "corepack-0.34.6.json"
+COREPACK_ARTIFACT_PATH = PROVIDER_DIRECTORY / "corepack-0.34.6.tgz"
+COREPACK_REVIEWED_MANIFEST_SHA256 = "3b998f5dc98f4376ff03e9ae47481cdd762ddc9ed590f87c96070e1121e79c68"
+COREPACK_SOURCE_MANIFEST_SHA256 = "11940f93e8f38ebd2212e30c46b1ef30b3a7d484a8b115e013283f63070e729c"
+PROTECTED_SOURCE_FILES = {"package.json", "pnpm-lock.yaml", "tsconfig.json"}
+
+
+def _safe_system_file(path: Path, *, label: str) -> Path:
+    try:
+        resolved = path.resolve(strict=True)
+        metadata = resolved.lstat()
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            raise RuntimeError(f"{label} ownership or permissions unsafe")
+        for component in (resolved.parent, *resolved.parent.parents):
+            parent = component.lstat()
+            if (not stat.S_ISDIR(parent.st_mode) or stat.S_ISLNK(parent.st_mode)
+                    or parent.st_uid != 0 or parent.st_mode & 0o022):
+                raise RuntimeError(f"{label} ancestry is unsafe")
+        return resolved
+    except OSError as error:
+        raise RuntimeError(f"{label} is unavailable or unsafe") from error
+
+
+def _provider_filesystem_identity(path: Path, identifier: str, requirement: str,
+                                  verified_requirement: str) -> dict[str, Any]:
+    metadata = path.stat()
+    return {"path": str(path), "sha256": _hash_file(path), "identifier": identifier,
+            "designatedRequirement": requirement, "verifiedRequirement": verified_requirement,
+            "device": metadata.st_dev, "inode": metadata.st_ino,
+            "uid": metadata.st_uid, "gid": metadata.st_gid, "mode": stat.S_IMODE(metadata.st_mode)}
+
+
+def _system_codesign() -> Path:
+    if platform.system() != "Darwin":
+        raise RuntimeError("unsupported provider platform: signed Apple Git and OpenSSL are required")
+    return _safe_system_file(Path("/usr/bin/codesign"), label="system codesign")
+
+
+def _signed_apple_tool(path: Path, expected_identifier: str, codesign: Path) -> dict[str, Any]:
+    physical = _safe_system_file(path, label=expected_identifier)
+    env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+    verified_requirement = "anchor apple"
+    verified = subprocess.run([str(codesign), "--verify", "--strict", "-R=" + verified_requirement, str(physical)],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, check=False, env=env)
+    details = subprocess.run([str(codesign), "-dv", "--verbose=4", str(physical)],
+                             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, check=False, env=env)
+    requirement_result = subprocess.run([str(codesign), "-d", "-r-", str(physical)],
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, text=True, check=False, env=env)
+    output = details.stdout + "\n" + details.stderr
+    match = re.search(r"(?m)^Identifier=(.+)$", output)
+    requirement_output = requirement_result.stdout + "\n" + requirement_result.stderr
+    requirement_match = re.search(r"(?m)^designated => (.+)$", requirement_output)
+    requirement = requirement_match.group(1).strip() if requirement_match else ""
+    if (verified.returncode or details.returncode or requirement_result.returncode or not match
+            or match.group(1).strip() != expected_identifier
+            or f'identifier "{expected_identifier}"' not in requirement):
+        raise RuntimeError(f"{expected_identifier} provider failed Apple signature qualification")
+    return _provider_filesystem_identity(physical, expected_identifier, requirement, verified_requirement)
+
+
+def _provider_file(provider: dict[str, Any], label: str) -> None:
+    path = Path(provider["path"])
+    try:
+        if "identifier" not in provider:
+            raise RuntimeError("provider identifier is missing")
+        codesign = _system_codesign()
+        current = _signed_apple_tool(path, provider["identifier"], codesign)
+    except (KeyError, RuntimeError) as error:
+        raise RuntimeError(f"qualified {label} provider identity changed") from error
+    expected = {key: value for key, value in provider.items() if key != "resolver"}
+    if current != expected:
+        raise RuntimeError(f"qualified {label} provider identity changed")
+    resolver = provider.get("resolver")
+    if resolver is not None:
+        _provider_file(resolver, "Apple Git resolver")
+
+
+def git_environment() -> dict[str, str]:
+    return {
+        "PATH": "/usr/bin:/bin", "HOME": "/var/empty", "LC_ALL": "C",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_NO_REPLACE_OBJECTS": "1", "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1", "GIT_NO_LAZY_FETCH": "1",
+        "GIT_CONFIG_COUNT": "3", "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false", "GIT_CONFIG_KEY_1": "core.hooksPath",
+        "GIT_CONFIG_VALUE_1": "/dev/null", "GIT_CONFIG_KEY_2": "credential.helper",
+        "GIT_CONFIG_VALUE_2": "",
+    }
+
+
+def openssl_environment() -> dict[str, str]:
+    return {"PATH": "/usr/bin:/bin", "HOME": "/var/empty", "LC_ALL": "C",
+            "OPENSSL_CONF": "/dev/null"}
+
+
+def _resolve_apple_git(resolver: dict[str, Any], codesign: Path) -> dict[str, Any]:
+    _provider_file(resolver, "Apple Git resolver")
+    resolved = subprocess.run([resolver["path"], "--find", "git"], stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              check=True, env=git_environment()).stdout.strip()
+    _provider_file(resolver, "Apple Git resolver")
+    if not resolved or not Path(resolved).is_absolute():
+        raise RuntimeError("Apple Git resolver returned an invalid executable path")
+    git = _signed_apple_tool(Path(resolved), "com.apple.git", codesign)
+    git["resolver"] = resolver
+    return git
+
+
+def qualified_system_providers() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Resolve and qualify the only supported physical Git and OpenSSL providers."""
+    codesign = _system_codesign()
+    resolver = _signed_apple_tool(Path("/usr/bin/xcrun"), "com.apple.xcrun", codesign)
+    physical_git = _resolve_apple_git(resolver, codesign)
+    openssl = _signed_apple_tool(Path("/usr/bin/openssl"), "com.apple.openssl", codesign)
+    return physical_git, openssl
+
+
+def _manifest_bytes(path: Path = COREPACK_MANIFEST_PATH) -> bytes:
+    return path.read_bytes()
+
+
+def _canonical_corepack_manifest_sha256(manifest: dict[str, Any]) -> str:
+    canonical = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def corepack_build_identity(manifest: dict[str, Any], source_bytes: bytes, entry: Path,
+                            closure_sha256: str, artifact_sha256: str) -> dict[str, str]:
+    return {"version": manifest["version"], "path": str(entry),
+            "entrySha256": _hash_file(entry), "closureSha256": closure_sha256,
+            "manifestSha256": _canonical_corepack_manifest_sha256(manifest),
+            "sourceManifestSha256": hashlib.sha256(source_bytes).hexdigest(),
+            "artifactSha256": artifact_sha256}
+
+
+def corepack_package_closure_sha256(manifest: dict[str, Any]) -> str:
+    digest = hashlib.sha256()
+    for item in manifest["files"]:
+        digest.update(item["path"].encode() + b"\0" + str(item["mode"]).encode() + b"\0")
+        digest.update(bytes.fromhex(item["sha256"]))
+    return digest.hexdigest()
+
+
+def valid_corepack_provider_identity(record: Any) -> bool:
+    return (isinstance(record, dict)
+            and set(record) == {"version", "path", "entrySha256", "closureSha256", "manifestSha256",
+                                "sourceManifestSha256", "artifactSha256"}
+            and record.get("version") == "0.34.6"
+            and record.get("artifactSha256") == "af29678fc25ed5ae02343e9b67b214a25bacdcffae566f8cf848936beb23a7c8"
+            and record.get("entrySha256") == "3655bc798f300951f2070fee411b337d626b0c3ae80c2d24c46ccac4595d4bf9"
+            and record.get("manifestSha256") == COREPACK_REVIEWED_MANIFEST_SHA256
+            and record.get("sourceManifestSha256") == COREPACK_SOURCE_MANIFEST_SHA256
+            and record.get("path") == str(ROOT / ("verified-corepack-" + COREPACK_REVIEWED_MANIFEST_SHA256) / "dist/corepack.js")
+            and all(re.fullmatch(r"[0-9a-f]{64}", str(record.get(key, "")))
+                    for key in ("entrySha256", "closureSha256", "manifestSha256", "sourceManifestSha256", "artifactSha256")))
+
+
+def _validate_corepack_manifest(manifest: Any) -> dict[str, Any]:
+    if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+        raise RuntimeError("unsupported Corepack provider manifest")
+    manifest_identity = _canonical_corepack_manifest_sha256(manifest)
+    if manifest_identity != COREPACK_REVIEWED_MANIFEST_SHA256:
+        raise RuntimeError("Corepack provider manifest differs from the reviewed signing evidence")
+    fixed = {
+        "name": "corepack", "version": "0.34.6",
+        "metadataUrl": "https://registry.npmjs.org/corepack/0.34.6",
+        "keysUrl": "https://registry.npmjs.org/-/npm/v1/keys",
+        "tarballUrl": "https://registry.npmjs.org/corepack/-/corepack-0.34.6.tgz",
+        "keyId": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U",
+        "keyType": "ecdsa-sha2-nistp256", "scheme": "ecdsa-sha2-nistp256",
+        "sha256": "af29678fc25ed5ae02343e9b67b214a25bacdcffae566f8cf848936beb23a7c8",
+        "integrity": "sha512-gvylq9kzJB09mSsiOnKOnhg0YdCWNy2aGaeGbYF4HlyGd/v4moxEonQjJPYI45/K4zP7q1hW9qCVvaYYKK5nkA==",
+        "signedMessage": "corepack@0.34.6:sha512-gvylq9kzJB09mSsiOnKOnhg0YdCWNy2aGaeGbYF4HlyGd/v4moxEonQjJPYI45/K4zP7q1hW9qCVvaYYKK5nkA==",
+    }
+    if any(manifest.get(key) != value for key, value in fixed.items()):
+        raise RuntimeError("Corepack provider manifest does not match the reviewed official provider")
+    try:
+        integrity = manifest["integrity"].removeprefix("sha512-")
+        if len(base64.b64decode(integrity, validate=True)) != 64:
+            raise ValueError("invalid SRI length")
+        key_bytes = base64.b64decode(manifest["publicKey"], validate=True)
+        signature = base64.b64decode(manifest["signature"], validate=True)
+    except (KeyError, ValueError, binascii.Error) as error:
+        raise RuntimeError("Corepack provider manifest has invalid signing material") from error
+    if len(signature) != 71 or len(key_bytes) != 91:
+        raise RuntimeError("Corepack provider manifest has unsupported signing material")
+    files = manifest.get("files")
+    if not isinstance(files, list) or len(files) != 54:
+        raise RuntimeError("Corepack provider manifest must enumerate all 54 package files")
+    seen: set[str] = set()
+    for item in files:
+        if (not isinstance(item, dict) or set(item) != {"path", "type", "mode", "size", "sha256"}
+                or item.get("type") != "file" or item.get("mode") not in (0o644, 0o755)
+                or type(item.get("size")) is not int or item["size"] < 0
+                or not isinstance(item.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"])):
+            raise RuntimeError("invalid Corepack package inventory entry")
+        name = item["path"]
+        path = PurePosixPath(name) if isinstance(name, str) else None
+        if (path is None or path.is_absolute() or not path.parts or ".." in path.parts
+                or "." in path.parts or "\\" in name or name in seen):
+            raise RuntimeError("Corepack package inventory contains an unsafe or duplicate path")
+        seen.add(name)
+    return manifest
+
+
+def _corepack_inventory(manifest: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {item["path"]: item for item in manifest["files"]}
+
+
+def verify_corepack_artifact(manifest: dict[str, Any], artifact: bytes,
+                             openssl: dict[str, str]) -> str:
+    validated = _validate_corepack_manifest(manifest)
+    if hashlib.sha256(artifact).hexdigest() != validated["sha256"]:
+        raise RuntimeError("official Corepack artifact SHA-256 mismatch")
+    expected_integrity = validated["integrity"].removeprefix("sha512-")
+    if base64.b64encode(hashlib.sha512(artifact).digest()).decode("ascii") != expected_integrity:
+        raise RuntimeError("official Corepack artifact SHA-512 integrity mismatch")
+    signature = base64.b64decode(validated["signature"], validate=True)
+    key = base64.b64decode(validated["publicKey"], validate=True)
+    pem = b"-----BEGIN PUBLIC KEY-----\n" + base64.encodebytes(key) + b"-----END PUBLIC KEY-----\n"
+    _provider_file(openssl, "Apple OpenSSL")
+    with tempfile.TemporaryDirectory(prefix="corepack-signature-", dir=ROOT) as temporary:
+        root = Path(temporary)
+        key_path, signature_path = root / "registry-key.pem", root / "registry-signature.der"
+        key_path.write_bytes(pem)
+        signature_path.write_bytes(signature)
+        result = subprocess.run([openssl["path"], "dgst", "-sha256", "-verify", str(key_path),
+                                 "-signature", str(signature_path)], input=validated["signedMessage"].encode(),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                check=False, env=openssl_environment())
+    if result.returncode or result.stdout.strip() != b"Verified OK":
+        raise RuntimeError("official Corepack registry signature verification failed")
+    _provider_file(openssl, "Apple OpenSSL")
+    return hashlib.sha256(artifact).hexdigest()
+
+
+def extract_corepack_package(manifest: dict[str, Any], artifact: bytes) -> dict[str, bytes]:
+    inventory = _corepack_inventory(_validate_corepack_manifest(manifest))
+    extracted: dict[str, bytes] = {}
+    directories = {"package"}
+    for name in inventory:
+        parent = PurePosixPath(name).parent
+        while parent.parts:
+            directories.add("/".join(("package", *parent.parts)))
+            parent = parent.parent
+    seen_directories: set[str] = set()
+    try:
+        with tarfile.open(fileobj=io.BytesIO(artifact), mode="r:gz") as bundle:
+            for member in bundle.getmembers():
+                if member.isdir():
+                    path = PurePosixPath(member.name.rstrip("/"))
+                    name = "/".join(path.parts)
+                    if (path.is_absolute() or ".." in path.parts or "\\" in member.name
+                            or name not in directories or name in seen_directories):
+                        raise RuntimeError("Corepack archive contains an unsafe, unexpected, or duplicate directory")
+                    seen_directories.add(name)
+                    continue
+                if not member.isfile():
+                    raise RuntimeError("Corepack archive contains a link or special file")
+                name = member.name.removeprefix("package/") if member.name.startswith("package/") else ""
+                expected = inventory.get(name)
+                if expected is None or name in extracted:
+                    raise RuntimeError("Corepack archive contains an unexpected or duplicate file")
+                if member.mode != expected["mode"]:
+                    raise RuntimeError("Corepack archive file mode differs from its reviewed inventory")
+                stream = bundle.extractfile(member)
+                if stream is None:
+                    raise RuntimeError("Corepack archive file cannot be read")
+                data = stream.read()
+                if len(data) != expected["size"] or hashlib.sha256(data).hexdigest() != expected["sha256"]:
+                    raise RuntimeError("Corepack archive file differs from its reviewed inventory")
+                extracted[name] = data
+    except (tarfile.TarError, OSError) as error:
+        raise RuntimeError("Corepack package archive is malformed") from error
+    if set(extracted) != set(inventory):
+        raise RuntimeError("Corepack archive is missing reviewed package files")
+    return extracted
+
+
+def _corepack_bundle_path(manifest: dict[str, Any]) -> Path:
+    identity = _canonical_corepack_manifest_sha256(manifest)
+    return ROOT / ("verified-corepack-" + identity)
+
+
+def verify_existing_corepack_bundle(bundle: Path, manifest: dict[str, Any], files: dict[str, bytes]) -> None:
+    verify_private_snapshot_root()
+    try:
+        metadata = bundle.lstat()
+        if (not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077):
+            raise RuntimeError("existing verified Corepack bundle is unsafe")
+        expected = set(files)
+        actual: set[str] = set()
+        for item in bundle.rglob("*"):
+            details = item.lstat()
+            if stat.S_ISLNK(details.st_mode):
+                raise RuntimeError("existing verified Corepack bundle contains a symlink")
+            if stat.S_ISDIR(details.st_mode):
+                if details.st_uid != os.getuid() or stat.S_IMODE(details.st_mode) != 0o700:
+                    raise RuntimeError("existing verified Corepack bundle directory is unsafe")
+                continue
+            if not stat.S_ISREG(details.st_mode):
+                raise RuntimeError("existing verified Corepack bundle contains a special file")
+            if details.st_nlink != 1:
+                raise RuntimeError("existing verified Corepack bundle contains a hard-linked file")
+            actual.add(item.relative_to(bundle).as_posix())
+        if actual != expected:
+            raise RuntimeError("existing verified Corepack bundle file set differs from manifest")
+        for relative, data in files.items():
+            item = bundle / relative
+            if item.read_bytes() != data:
+                raise RuntimeError("existing verified Corepack bundle failed byte verification")
+            details = item.stat()
+            expected_mode = next(entry["mode"] for entry in manifest["files"] if entry["path"] == relative)
+            if (stat.S_IMODE(details.st_mode) != expected_mode or details.st_uid != os.getuid()
+                    or details.st_nlink != 1):
+                raise RuntimeError("existing verified Corepack bundle mode or ownership changed")
+    except OSError as error:
+        raise RuntimeError("existing verified Corepack bundle is incomplete") from error
+
+
+def materialize_corepack_bundle(manifest: dict[str, Any], files: dict[str, bytes]) -> tuple[Path, bool]:
+    bundle = _corepack_bundle_path(manifest)
+    if existing_admission_bundle(bundle):
+        verify_existing_corepack_bundle(bundle, manifest, files)
+        return bundle, False
+    temporary = Path(tempfile.mkdtemp(prefix="corepack-pin-", dir=ROOT))
+    try:
+        for relative, data in files.items():
+            target = temporary / relative
+            ensure_durable_directory(target.parent, mode=0o700)
+            mode = next(entry["mode"] for entry in manifest["files"] if entry["path"] == relative)
+            atomic_write(target, data, mode)
+        os.chmod(temporary, 0o700)
+        os.rename(temporary, bundle)
+    except BaseException:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    verify_existing_corepack_bundle(bundle, manifest, files)
+    return bundle, True
+
+
+def run_verified_corepack(node: Path, node_digest: str, manifest: dict[str, Any],
+                          files: dict[str, bytes], args: list[str], **kwargs: Any) -> subprocess.CompletedProcess[Any]:
+    bundle = _corepack_bundle_path(manifest)
+    verify_existing_corepack_bundle(bundle, manifest, files)
+    try:
+        return run_verified_node(node, node_digest, [str(bundle / "dist/corepack.js"), *args], **kwargs)
+    finally:
+        verify_existing_corepack_bundle(bundle, manifest, files)
 
 
 def _hash_file(path: Path) -> str:
@@ -796,7 +1516,7 @@ def _hash_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_runtime_import_closure(node: Path, compiler_root: Path, output_root: Path,
+def validate_runtime_import_closure(node: Path, node_digest: str, compiler_root: Path, output_root: Path,
                                     emitted_files: set[Path], entry: Path) -> set[Path]:
     parser_script = r'''const fs=require('node:fs'); const path=require('node:path');
 const ts=require(process.argv[1]); const root=process.argv[2]; const files=[];
@@ -810,9 +1530,11 @@ if(ts.isImportDeclaration(node)&&node.moduleSpecifier&&ts.isStringLiteral(node.m
 if(ts.isCallExpression(node)&&(node.expression.kind===ts.SyntaxKind.ImportKeyword||(ts.isIdentifier(node.expression)&&node.expression.text==='require')||isCreateRequire(node.expression))) dynamic=true;
 ts.forEachChild(node,visit);} visit(ast); result[path.relative(root,file).split(path.sep).join('/') ]={imports,dynamic};}
 process.stdout.write(JSON.stringify(result));'''
-    parsed = subprocess.run([str(node), "-e", parser_script, str(compiler_root), str(output_root)],
-                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, check=True, timeout=30)
+    parsed = run_verified_node(node, node_digest,
+                               ["-e", parser_script, str(compiler_root), str(output_root)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, check=True, timeout=30,
+                               env={"PATH": "/usr/bin:/bin", "HOME": "/var/empty", "LC_ALL": "C"})
     parsed_imports = json.loads(parsed.stdout)
     pending = [entry]
     reached: set[Path] = set()
@@ -883,45 +1605,77 @@ def existing_admission_bundle(bundle: Path) -> bool:
 
 
 def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list[dict[str, str]], dict[str, Any], bool]:
-    """Build the helper from one committed snapshot, then pin its complete dist tree."""
+    """Build from raw committed inputs with authenticated, revalidated providers."""
     entry_relative = Path("mission-admission/heartbeat-admission-cli.js")
-    head = _git_output(repo, "rev-parse", "HEAD").decode().strip()
-    tree = _git_output(repo, "rev-parse", f"{head}^{{tree}}").decode().strip()
-    if not re.fullmatch(r"[0-9a-f]{40,64}", head) or not re.fullmatch(r"[0-9a-f]{40,64}", tree):
-        raise RuntimeError("invalid committed source identity")
-    dirty = _git_output(repo, "status", "--porcelain", "--untracked-files=all", "--",
-                        "src", "package.json", "pnpm-lock.yaml", "tsconfig.json").strip()
-    if dirty and not testing():
-        raise RuntimeError("admission helper install requires clean committed TypeScript/build inputs")
-    archive = _git_output(repo, "archive", "--format=tar", head)
-    archive_digest = hashlib.sha256(archive).hexdigest()
-    package_bytes = _git_output(repo, "show", f"{head}:package.json")
-    lock_bytes = _git_output(repo, "show", f"{head}:pnpm-lock.yaml")
+    git, openssl = qualified_system_providers()
+    source = capture_committed_build_source(repo, git)
+    head, tree = source["head"], source["tree"]
+    package_bytes = source["files"]["package.json"]["bytes"]
+    lock_bytes = source["files"]["pnpm-lock.yaml"]["bytes"]
     package = json.loads(package_bytes)
     if package.get("packageManager") != "pnpm@10.34.5":
         raise RuntimeError("committed package manager must pin pnpm@10.34.5")
     node_source = node_source.resolve(strict=True)
-    if not node_source.is_file() or node_source.is_symlink() or not os.access(node_source, os.X_OK):
-        raise RuntimeError("Node build executable is unavailable or unsafe")
-    node_version = subprocess.run([str(node_source), "--version"], check=True, text=True,
-                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
-    corepack = Path(resolved_tool("corepack"))
-    corepack_version = subprocess.run([str(corepack), "--version"], check=True, text=True,
-                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
-    tool_env = {"PATH": os.pathsep.join([str(node_source.parent), str(corepack.parent), "/usr/bin", "/bin"]),
-                "HOME": str(ACCOUNT_HOME), "CI": "1", "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+    node_digest = node_source.name.removeprefix("verified-node-")
+    if not re.fullmatch(r"[0-9a-f]{64}", node_digest):
+        raise RuntimeError("build Node must be an already verified private snapshot")
+    verify_admission_node_snapshot(node_source, node_digest)
+    node_version = run_verified_node(node_source, node_digest, ["--version"], check=True, text=True,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     stdin=subprocess.DEVNULL, env={"PATH": "/usr/bin:/bin", "HOME": "/var/empty", "LC_ALL": "C"}).stdout.strip()
+    manifest_bytes = source["files"]["scripts/bootstrap-heartbeat/providers/corepack-0.34.6.json"]["bytes"]
+    artifact = source["files"]["scripts/bootstrap-heartbeat/providers/corepack-0.34.6.tgz"]["bytes"]
+    try:
+        manifest = _validate_corepack_manifest(json.loads(manifest_bytes))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise RuntimeError("committed official Corepack manifest is malformed") from error
+    raw_manifest_digest = hashlib.sha256(manifest_bytes).hexdigest()
+    if raw_manifest_digest != COREPACK_SOURCE_MANIFEST_SHA256:
+        raise RuntimeError("committed official Corepack manifest bytes differ from the reviewed source identity")
+    artifact_digest = verify_corepack_artifact(manifest, artifact, openssl)
+    package_files = extract_corepack_package(manifest, artifact)
+    corepack_bundle, corepack_created = materialize_corepack_bundle(manifest, package_files)
+    corepack_entry = corepack_bundle / "dist/corepack.js"
+    corepack_closure_digest = corepack_package_closure_sha256(manifest)
+    corepack_identity = corepack_build_identity(manifest, manifest_bytes, corepack_entry,
+                                                corepack_closure_digest, artifact_digest)
+    _provider_file(git, "Apple Git")
+    _provider_file(openssl, "Apple OpenSSL")
+    tool_env: dict[str, str] = {}
     with tempfile.TemporaryDirectory(prefix="admission-build-", dir=ROOT) as source_dir:
         staged_source = Path(source_dir)
-        _checked_extract_git_archive(archive, staged_source)
-        if ((staged_source / "package.json").read_bytes() != package_bytes
-                or (staged_source / "pnpm-lock.yaml").read_bytes() != lock_bytes):
-            raise RuntimeError("Git archive attributes changed committed package/build inputs")
-        subprocess.run([str(corepack), "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"], cwd=staged_source,
-                       env=tool_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       text=True, check=True, timeout=900)
-        installed_pnpm = subprocess.run([str(corepack), "pnpm@10.34.5", "--version"], cwd=staged_source,
-                                        env=tool_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, text=True, check=True, timeout=120).stdout.strip()
+        materialize_committed_source(source, staged_source)
+        tools = staged_source / ".verified-build-tools"
+        tools.mkdir(mode=0o700)
+        (tools / "node").symlink_to(node_source)
+        build_home = staged_source / ".private-build-home"
+        build_home.mkdir(mode=0o700)
+        tool_env = {"PATH": os.pathsep.join([str(tools), "/usr/bin", "/bin"]),
+                    "HOME": str(build_home), "CI": "1", "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0",
+                    "COREPACK_HOME": str(Path(source_dir) / ".corepack-cache"),
+                    "COREPACK_ENABLE_STRICT": "1", "COREPACK_ENABLE_PROJECT_SPEC": "0",
+                    "NODE_DISABLE_COMPILE_CACHE": "1", "DISABLE_V8_COMPILE_CACHE": "1",
+                    "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+                    "GIT_TERMINAL_PROMPT": "0", "GIT_NO_REPLACE_OBJECTS": "1", "GIT_NO_LAZY_FETCH": "1",
+                    "GIT_OPTIONAL_LOCKS": "0", "OPENSSL_CONF": "/dev/null"}
+        node_corepack = [str(node_source), str(corepack_entry)]
+        corepack_version = run_verified_corepack(node_source, node_digest, manifest, package_files,
+                                                 ["--version"], cwd=staged_source, env=tool_env,
+                                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                                 stderr=subprocess.PIPE, text=True, check=True,
+                                                 timeout=120).stdout.strip()
+        if corepack_version != "0.34.6":
+            raise RuntimeError("authenticated Corepack snapshot reported an unexpected version")
+        run_verified_corepack(node_source, node_digest, manifest, package_files,
+                              ["pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
+                              cwd=staged_source, env=tool_env, stdin=subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                              check=True, timeout=900)
+        installed_pnpm = run_verified_corepack(node_source, node_digest, manifest, package_files,
+                                               ["pnpm@10.34.5", "--version"], cwd=staged_source,
+                                               env=tool_env, stdin=subprocess.DEVNULL,
+                                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                               check=True, timeout=120).stdout.strip()
         if installed_pnpm != "10.34.5":
             raise RuntimeError("staged build did not use lockfile-bound pnpm@10.34.5")
         compiler_root = (staged_source / "node_modules/typescript").resolve(strict=True)
@@ -934,9 +1688,10 @@ def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list
             compiler_hash.update(compiler_file.relative_to(compiler_root).as_posix().encode() + b"\0")
             compiler_hash.update(bytes.fromhex(_hash_file(compiler_file)))
         compiler_digest = compiler_hash.hexdigest()
-        subprocess.run([str(corepack), "pnpm@10.34.5", "build"], cwd=staged_source,
-                       env=tool_env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                       text=True, check=True, timeout=300)
+        run_verified_corepack(node_source, node_digest, manifest, package_files,
+                              ["pnpm@10.34.5", "build"], cwd=staged_source, env=tool_env,
+                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True, check=True, timeout=300)
         output_root = staged_source / "dist"
         if not output_root.is_dir() or output_root.is_symlink():
             raise RuntimeError("staged build did not emit a safe dist directory")
@@ -952,25 +1707,33 @@ def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list
             raise RuntimeError("staged build omitted the heartbeat admission entry")
         # Ensure every static runtime import is reachable and backed by an
         # emitted regular file; reject dynamic or non-Node external loading.
-        validate_runtime_import_closure(node_source, compiler_root, output_root, set(emitted), entry_relative)
+        validate_runtime_import_closure(node_source, node_digest, compiler_root, output_root,
+                                        set(emitted), entry_relative)
         emitted[Path("package.json")] = b'{"type":"module"}\n'
         file_hashes = {relative: hashlib.sha256(data).hexdigest() for relative, data in emitted.items()}
         build_inputs = {
-            "source_commit": head, "source_tree": tree, "git_archive_sha256": archive_digest,
+            "source_commit": head, "source_tree": tree, "source_snapshot_sha256": source["snapshot_sha256"],
             "package_json_sha256": hashlib.sha256(package_bytes).hexdigest(),
             "lockfile_sha256": hashlib.sha256(lock_bytes).hexdigest(),
             "node_path": str(node_source), "node_sha256": _hash_file(node_source), "node_version": node_version,
-            "corepack_path": str(corepack.resolve()), "corepack_sha256": _hash_file(corepack.resolve()),
+            "providers": {"git": git, "openssl": openssl, "corepack": corepack_identity},
             "corepack_version": corepack_version, "pnpm_version": installed_pnpm,
             "typescript_version": compiler_info["version"], "typescript_package_sha256": _hash_file(compiler_package),
             "typescript_tree_sha256": compiler_digest,
             "install_command": ["corepack", "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
             "build_command": ["corepack", "pnpm@10.34.5", "build"],
+            "executed_commands": [node_corepack + ["--version"],
+                                  node_corepack + ["pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"],
+                                  node_corepack + ["pnpm@10.34.5", "--version"],
+                                  node_corepack + ["pnpm@10.34.5", "build"]],
             "entry": entry_relative.as_posix(),
             "files": [{"path": rel.as_posix(), "sha256": file_hashes[rel]} for rel in sorted(emitted)],
         }
-    if _git_output(repo, "rev-parse", "HEAD").decode().strip() != head:
-        raise RuntimeError("repository HEAD moved during admission-helper preparation")
+    verify_build_source_unchanged(repo, git, source)
+    _provider_file(git, "Apple Git")
+    _provider_file(openssl, "Apple OpenSSL")
+    verify_admission_node_snapshot(node_source, node_digest)
+    verify_existing_corepack_bundle(corepack_bundle, manifest, package_files)
     manifest_bytes = (json.dumps(build_inputs, sort_keys=True, separators=(",", ":")) + "\n").encode()
     closure_digest = hashlib.sha256(manifest_bytes).hexdigest()
     bundle = ROOT / ("verified-admission-" + closure_digest)
@@ -1138,11 +1901,7 @@ def verify_admission_helper(config: dict[str, Any]) -> None:
             or helper_root.resolve(strict=True) != helper_root):
         raise RuntimeError("pinned admission helper bundle directory is unsafe")
     node = Path(config["admission_node"])
-    metadata = node.lstat()
-    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
-            or metadata.st_mode & 0o022 or not metadata.st_mode & 0o111
-            or hashlib.sha256(node.read_bytes()).hexdigest() != config["admission_node_sha256"]):
-        raise RuntimeError("pinned admission Node bytes failed verification")
+    verify_admission_node_snapshot(node, config["admission_node_sha256"])
     expected_paths: set[str] = set()
     for item in config["admission_helper_files"]:
         candidate = Path(item["path"])
@@ -1189,8 +1948,9 @@ def admission_helper_environment(config: dict[str, Any]) -> dict[str, str]:
 def admission_call(config: dict[str, Any], request: dict[str, Any]) -> dict[str, Any]:
     verify_admission_helper(config)
     try:
-        result = subprocess.run(
-            [config["admission_node"], config["admission_helper"]], cwd=config["repo"],
+        result = run_verified_node(
+            Path(config["admission_node"]), config["admission_node_sha256"],
+            [config["admission_helper"]], cwd=config["repo"],
             input=json.dumps(request, separators=(",", ":")) + "\n", text=True,
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
             timeout=15, env=admission_helper_environment(config),
@@ -1847,7 +2607,11 @@ def run_wake(config: dict[str, Any], lock_fd: int, reservation: dict[str, Any], 
 
 
 def acquire_lock(verbose: bool):
+    assert_safe_private_account_path(ROOT, "directory")
+    assert_safe_private_account_path(LOCK, "file")
     ensure_durable_directory(ROOT, mode=0o700)
+    assert_safe_private_account_path(ROOT, "directory")
+    assert_safe_private_account_path(LOCK, "file")
     os.chmod(ROOT, 0o700)
     stream = LOCK.open("a+b")
     os.chmod(LOCK, 0o600)
@@ -2233,7 +2997,7 @@ def install(args: argparse.Namespace) -> int:
         gh_snapshot, gh_digest, gh_snapshot_created = pin_github_tool(gh_source)
         runner_snapshot, runner_digest, runner_snapshot_created = pin_runner_source(runner)
         node_snapshot, node_digest, node_snapshot_created = pin_admission_node(node_source)
-        helper_entry, helper_digest, helper_files, helper_build, helper_created = pin_admission_helper(repo, node_source)
+        helper_entry, helper_digest, helper_files, helper_build, helper_created = pin_admission_helper(repo, node_snapshot)
         config_values.update(
             gh=str(gh_snapshot), gh_sha256=gh_digest,
             runner=str(runner_snapshot), runner_sha256=runner_digest,

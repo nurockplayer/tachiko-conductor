@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
@@ -1076,8 +1076,8 @@ describe('provider-neutral durable mission admission', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-host-path-'));
     try {
       const canonical = path.join(realpathSync(directory), '.tachiko-conductor', 'mission-admission', 'registry.json');
-      mkdirSync(path.dirname(canonical), { recursive: true });
-      writeFileSync(canonical, '{}');
+      mkdirSync(path.dirname(canonical), { recursive: true, mode: 0o700 });
+      writeFileSync(canonical, '{}', { mode: 0o600 });
       const registryAlias = path.join(directory, 'registry-alias.json');
       symlinkSync(canonical, registryAlias);
       assert.equal(resolveHostAdmissionPath({
@@ -1127,14 +1127,39 @@ describe('provider-neutral durable mission admission', () => {
     }
   });
 
+  it('retains mandatory cached registry checks when a caller supplies a no-op validation hook', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'admission-custom-validation-'));
+    const admission = path.join(home, '.tachiko-conductor', 'mission-admission');
+    mkdirSync(admission, { recursive: true, mode: 0o700 });
+    chmodSync(path.join(home, '.tachiko-conductor'), 0o700);
+    chmodSync(admission, 0o700);
+    const filePath = path.join(admission, 'registry.json');
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const registry = new MissionAdmissionRegistry({ filePath, config, validatePath: () => {} });
+      assert.equal(registry.admit({ laneId: 'cached-private-registry', role: 'production_captain', evidence: evidence(911) }).outcome, 'admitted');
+      const bytes = readFileSync(filePath, 'utf8');
+      chmodSync(filePath, 0o644);
+      assert.throws(() => registry.snapshot(), /Unsafe/);
+      assert.equal(readFileSync(filePath, 'utf8'), bytes);
+      assert.equal(statSync(filePath).mode & 0o777, 0o644, 'unsafe registry drift is rejected without chmod repair');
+    } finally {
+      os.userInfo = originalUserInfo;
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
   it('accepts only canonical manual, heartbeat, and Run receipt roots, including physical aliases', () => {
     const home = mkdtempSync(path.join(os.tmpdir(), 'admission-receipt-account-home-'));
     const workspace = path.join(home, 'workspace');
     mkdirSync(workspace);
     const missionRoot = path.join(home, '.tachiko-conductor', 'mission-admission');
     const runs = path.join(home, '.tachiko-conductor', 'runs');
-    mkdirSync(missionRoot, { recursive: true });
-    mkdirSync(runs, { recursive: true });
+    mkdirSync(missionRoot, { recursive: true, mode: 0o700 });
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(missionRoot, 0o700);
+    chmodSync(runs, 0o755);
     const cases = [
       ['TACHIKO_MANUAL_OWNER_RECEIPTS_DIR', 'manual-receipts', (env: NodeJS.ProcessEnv) => resolveManualOwnerReceiptPath('acme/widgets', workspace, { homeDirectory: home, env })],
       ['TACHIKO_HEARTBEAT_ADMISSION_RECEIPTS_DIR', 'heartbeat-receipts', (env: NodeJS.ProcessEnv) => resolveHeartbeatOwnerReceiptPath('acme/widgets', workspace, { homeDirectory: home, env })],
@@ -1143,7 +1168,8 @@ describe('provider-neutral durable mission admission', () => {
     try {
       for (const [variable, directoryName, resolve] of cases) {
         const canonical = path.join(missionRoot, directoryName);
-        mkdirSync(canonical, { recursive: true });
+        mkdirSync(canonical, { recursive: true, mode: 0o700 });
+        chmodSync(canonical, 0o700);
         const expected = resolve({ TACHIKO_DATA_DIR: runs });
         assert.equal(path.dirname(expected), realpathSync(canonical));
         const alias = path.join(home, `${directoryName}-alias`);
@@ -1210,8 +1236,10 @@ describe('provider-neutral durable mission admission', () => {
       const endpointRoot = path.join(realpathSync(endpointHome), '.tachiko-conductor');
       const endpointAdmission = path.join(endpointRoot, 'mission-admission');
       const endpointRuns = path.join(endpointRoot, 'runs');
-      mkdirSync(endpointAdmission, { recursive: true });
-      mkdirSync(endpointRuns);
+      mkdirSync(endpointAdmission, { recursive: true, mode: 0o700 });
+      mkdirSync(endpointRuns, { recursive: true, mode: 0o755 });
+      chmodSync(endpointAdmission, 0o700);
+      chmodSync(endpointRuns, 0o755);
       const externalFile = path.join(realpathSync(endpointHome), 'external-registry.json');
       writeFileSync(externalFile, '{"preserved":true}');
       const endpointRegistry = path.join(endpointAdmission, 'registry.json');
@@ -1521,7 +1549,8 @@ describe('provider-neutral durable mission admission', () => {
       git(workspace, 'init', '-q', '--initial-branch=main'); git(workspace, 'config', 'user.email', 'captain@example.invalid'); git(workspace, 'config', 'user.name', 'Captain Test');
       writeFileSync(path.join(workspace, 'tracked.txt'), 'checkpoint\n'); git(workspace, 'add', 'tracked.txt'); git(workspace, 'commit', '-q', '-m', 'checkpoint');
       git(workspace, 'remote', 'add', 'origin', 'https://github.com/Acme/Widgets.git');
-      mkdirSync(path.dirname(receipts), { recursive: true });
+      mkdirSync(path.dirname(receipts), { recursive: true, mode: 0o700 });
+      chmodSync(path.dirname(receipts), 0o700);
       writeFileSync(receipts, 'block receipt directory creation');
       const failed = runCli(['dispatch', 'manual', 'register'], workspace, env);
       assert.notEqual(failed.status, 0);
@@ -1530,7 +1559,7 @@ describe('provider-neutral durable mission admission', () => {
       assert.doesNotMatch(failed.stdout + failed.stderr, /"token"\s*:/);
       const registry = new MissionAdmissionRegistry({ filePath: registryPath, config: cliConfig });
       assert.equal(registry.snapshot().counts.captains, 0, 'receipt failure happens before registry publication');
-      rmSync(receipts); mkdirSync(receipts);
+      rmSync(receipts); mkdirSync(receipts, { mode: 0o700 }); chmodSync(receipts, 0o700);
       const retried = runCli(['dispatch', 'manual', 'register'], workspace, env);
       assert.equal(retried.status, 0, retried.stderr);
       const receiptPath = path.join(realpathSync(receipts), `${createHashForTest('acme/widgets', workspace)}.json`);

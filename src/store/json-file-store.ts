@@ -1,4 +1,4 @@
-import { closeSync, existsSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fchmodSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 
@@ -11,6 +11,7 @@ import { deleteOperationalProjection, writeOperationalProjection } from '../oper
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
 import { isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
 import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
+import { assertSafeCurrentAccountPathIfApplicable, isCurrentAccountPathApplicable } from '../account-home.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -309,22 +310,24 @@ function serializedJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-function writeJsonAtomic(filePath: string, value: unknown, syncForDurability: (fd: number, target: 'file' | 'directory') => void): string {
+function writeJsonAtomic(filePath: string, value: unknown, syncForDurability: (fd: number, target: 'file' | 'directory') => void, validatePath: () => void): string {
+  validatePath();
   const serialized = serializedJson(value);
   const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  let fd: number | undefined = openSync(tmpPath, 'wx');
+  let fd: number | undefined = openSync(tmpPath, 'wx', 0o644);
   try {
+    fchmodSync(fd, 0o644);
     writeFileSync(fd, serialized, 'utf8');
     syncForDurability(fd, 'file');
     closeSync(fd);
     fd = undefined;
   } catch (error) {
     if (fd !== undefined) try { closeSync(fd); } catch { /* preserve the original write/sync failure */ }
-    try { unlinkSync(tmpPath); } catch { /* remove only this attempt's temp */ }
+    try { validatePath(); unlinkSync(tmpPath); } catch { /* remove only this attempt's temp */ }
     throw error;
   }
-  try { renameSync(tmpPath, filePath); } catch (error) {
-    try { unlinkSync(tmpPath); } catch { /* remove only this attempt's temp */ }
+  try { validatePath(); renameSync(tmpPath, filePath); } catch (error) {
+    try { validatePath(); unlinkSync(tmpPath); } catch { /* remove only this attempt's temp */ }
     throw error;
   }
   const directoryFd = openSync(path.dirname(filePath), 'r');
@@ -461,7 +464,23 @@ export class JsonFileStore implements RunStore {
     if (!Number.isSafeInteger(this.mutationLockRetryMs) || this.mutationLockRetryMs < 1) {
       throw new Error('mutationLockRetryMs must be a positive safe integer.');
     }
-    this.dir = ensureDurableDirectory(path.resolve(options.dir), { syncDirectoryHierarchy: options.syncDirectoryHierarchy });
+    const requestedDirectory = path.resolve(options.dir);
+    const canonicalAccountDirectory = isCurrentAccountPathApplicable(requestedDirectory);
+    assertSafeCurrentAccountPathIfApplicable(requestedDirectory, 'directory');
+    this.dir = ensureDurableDirectory(requestedDirectory, {
+      ...(canonicalAccountDirectory ? { mode: 0o700 } : {}),
+      syncDirectoryHierarchy: options.syncDirectoryHierarchy,
+    });
+    this.assertSafeDirectory();
+  }
+
+  private assertSafeDirectory(): void {
+    assertSafeCurrentAccountPathIfApplicable(this.dir, 'directory');
+  }
+
+  private assertSafeRunFile(filePath: string): void {
+    this.assertSafeDirectory();
+    assertSafeCurrentAccountPathIfApplicable(filePath, 'file');
   }
 
   private filePathFor(id: string): string {
@@ -479,12 +498,15 @@ export class JsonFileStore implements RunStore {
    * update/create/delete writers use the same fence, closing the TOCTOU window.
    */
   private withMutationLock<T>(id: string, operation: () => T): T {
+    this.assertSafeDirectory();
     const lockPath = this.mutationLockPathFor(id);
     const deadlineAt = Date.now() + this.mutationLockTimeoutMs;
     for (;;) {
+      this.assertSafeRunFile(this.filePathFor(id));
       try {
         const lock = acquireDispatchInvocationLock({ lockPath });
         try {
+          this.assertSafeRunFile(this.filePathFor(id));
           return operation();
         } finally {
           lock.release();
@@ -501,16 +523,18 @@ export class JsonFileStore implements RunStore {
   create(run: Run): void {
     this.withMutationLock(run.id, () => {
       const filePath = this.filePathFor(run.id);
+      this.assertSafeRunFile(filePath);
       if (existsSync(filePath)) {
         throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
       }
-      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability);
+      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability, () => this.assertSafeRunFile(filePath));
       writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
 
   read(id: string): Run | null {
     const filePath = this.filePathFor(id);
+    this.assertSafeRunFile(filePath);
     if (!existsSync(filePath)) return null;
     return readRun(filePath, id);
   }
@@ -518,10 +542,11 @@ export class JsonFileStore implements RunStore {
   update(run: Run): void {
     this.withMutationLock(run.id, () => {
       const filePath = this.filePathFor(run.id);
+      this.assertSafeRunFile(filePath);
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
       assertRepairAdmissionsAppendOnly(current, run);
       assertHistoryAppendOnly(current, run);
-      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability);
+      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability, () => this.assertSafeRunFile(filePath));
       writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
@@ -530,27 +555,35 @@ export class JsonFileStore implements RunStore {
     if (expected.id !== next.id) throw new Error('updateIfUnchanged requires expected and next to name the same Run id.');
     return this.withMutationLock(expected.id, () => {
       const filePath = this.filePathFor(expected.id);
+      this.assertSafeRunFile(filePath);
       const current = readRun(filePath, expected.id);
       if (runFingerprint(current) !== runFingerprint(expected)) return false;
       assertRepairAdmissionsAppendOnly(current, next);
       assertHistoryAppendOnly(current, next);
       this.beforeConditionalWrite?.();
-      const serialized = writeJsonAtomic(filePath, next, this.syncForDurability);
+      this.assertSafeRunFile(filePath);
+      const serialized = writeJsonAtomic(filePath, next, this.syncForDurability, () => this.assertSafeRunFile(filePath));
       writeOperationalProjectionBestEffort(this.dir, next, serialized);
       return true;
     });
   }
 
   list(): Run[] {
+    this.assertSafeDirectory();
     return readdirSync(this.dir)
       .filter((name) => name.endsWith('.json'))
       .sort()
-      .map((name) => readRun(path.join(this.dir, name), name.slice(0, -'.json'.length)));
+      .map((name) => {
+        const filePath = path.join(this.dir, name);
+        this.assertSafeRunFile(filePath);
+        return readRun(filePath, name.slice(0, -'.json'.length));
+      });
   }
 
   delete(id: string): void {
     this.withMutationLock(id, () => {
       const filePath = this.filePathFor(id);
+      this.assertSafeRunFile(filePath);
       if (!existsSync(filePath)) {
         throw new Error(`No run with id "${id}" exists at ${filePath}; nothing to delete.`);
       }
@@ -561,7 +594,11 @@ export class JsonFileStore implements RunStore {
 
   rebuildOperationalProjections(): number {
     const runs = this.list();
-    for (const run of runs) writeOperationalProjection(this.dir, run, readFileSync(this.filePathFor(run.id), 'utf8'));
+    for (const run of runs) {
+      const filePath = this.filePathFor(run.id);
+      this.assertSafeRunFile(filePath);
+      writeOperationalProjection(this.dir, run, readFileSync(filePath, 'utf8'));
+    }
     return runs.length;
   }
 }

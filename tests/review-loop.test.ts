@@ -101,39 +101,28 @@ function repairChangesRun(id: string): Run {
   return applyTransition(admitted, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, reviewAuthority());
 }
 
-class ConcurrentAdmissionStore extends MemoryStore {
-  private attempts = 0;
-
-  constructor(private readonly concurrent: Run) { super(); }
-
-  override updateIfUnchanged(expected: Run, next: Run): boolean {
-    this.attempts += 1;
-    if (this.attempts === 1) {
-      this.update(this.concurrent);
-      return false;
-    }
-    this.update(next);
-    return true;
-  }
-}
-
 class CasMemoryStore extends MemoryStore {
+  casCalls = 0;
+  casSuccesses = 0;
+
   override updateIfUnchanged(expected: Run, next: Run): boolean {
+    this.casCalls += 1;
     const current = this.read(expected.id);
     if (current === null || JSON.stringify(current) !== JSON.stringify(expected)) return false;
     this.update(next);
+    this.casSuccesses += 1;
     return true;
   }
 }
 
 class SpawnRaceStore extends CasMemoryStore {
   private attempts = 0;
-  constructor(private readonly concurrent: Run) { super(); }
+  constructor(private readonly rejectAt: number, private readonly concurrent: (expected: Run) => Run) { super(); }
 
   override updateIfUnchanged(expected: Run, next: Run): boolean {
     this.attempts += 1;
-    if (this.attempts === 2) {
-      this.update(this.concurrent);
+    if (this.attempts === this.rejectAt) {
+      this.update(this.concurrent(expected));
       return false;
     }
     return super.updateIfUnchanged(expected, next);
@@ -712,6 +701,141 @@ describe('runReviewLoop', () => {
     assert.deepEqual(implementation.requests[0]?.execution, complex);
   });
 
+  it('holds a generationless App Server predecessor before start_fix or worker effects', async () => {
+    const store = new CasMemoryStore();
+    let run = repairChangesRun('generationless-appserver-admission');
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = { ...run, executor: predecessor, agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId } };
+    store.create(run);
+    let workerCalls = 0;
+    let bootstrapSelections = 0;
+    const implementation = new FakeImplementation([{ ...successResult(HEAD2), executor: predecessor, sessionId: predecessor.sessionId }]);
+    const outcome = await runReviewLoop({
+      store,
+      github: githubAdapter([HEAD, HEAD]),
+      implementation: {
+        kind: 'implementation-agent',
+        async run() { workerCalls += 1; return successResult(HEAD2); },
+      },
+      reviewer: new FakeReviewer([]),
+      resolveValidationAuthority: reviewAuthority,
+      resolveRepairExecutionProfile: () => ({ ...ROUTINE_REPAIR_EXECUTION, executor: 'codex-cli' }),
+      bootstrapForExecution: () => { bootstrapSelections += 1; return undefined; },
+    }, run.id, { maxAttempts: 3, now: () => T0 });
+
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /App Server identity has no generation/);
+    assert.equal(workerCalls, 0);
+    assert.equal(bootstrapSelections, 0);
+    assert.equal(outcome.run.history.some((event) => event.type === 'start_fix'), false);
+    assert.deepEqual(outcome.run.executor, predecessor);
+    assert.deepEqual(outcome.run.agentResult?.executor, predecessor);
+    assert.equal(implementation.requests.length, 0);
+  });
+
+  it('holds a legacy generationless App Server repair when no execution route is persisted', async () => {
+    const store = new CasMemoryStore();
+    let run = repairChangesRun('legacy-generationless-appserver-review');
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = {
+      ...run,
+      repairTaskShapeAuthority: undefined,
+      execution: undefined,
+      executor: predecessor,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId },
+    };
+    store.create(run);
+    let workerCalls = 0;
+    let bootstrapCalls = 0;
+    let spawnMarkers = 0;
+    const outcome = await runReviewLoop({
+      store,
+      github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { workerCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]),
+      resolveValidationAuthority: reviewAuthority,
+      bootstrapForExecution: () => { bootstrapCalls += 1; return undefined; },
+    }, run.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { spawnMarkers += 1; } });
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /App Server identity has no generation/);
+    assert.equal(workerCalls, 0);
+    assert.equal(bootstrapCalls, 0);
+    assert.equal(spawnMarkers, 0);
+    assert.equal(outcome.run.history.some((event) => event.type === 'start_fix'), false);
+    assert.deepEqual(outcome.run.executor, predecessor);
+  });
+
+  it('does not treat an explicit different provider as fresh authority for a result-only App Server identity', async () => {
+    const store = new CasMemoryStore();
+    let run = repairChangesRun('legacy-result-only-appserver-review');
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = {
+      ...run,
+      repairTaskShapeAuthority: undefined,
+      execution: { ...ROUTINE_REPAIR_EXECUTION, executor: 'claude-code' },
+      executor: undefined,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId },
+    };
+    store.create(run);
+    let workerCalls = 0;
+    let bootstrapCalls = 0;
+    let spawnMarkers = 0;
+    const outcome = await runReviewLoop({
+      store,
+      github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { workerCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]),
+      resolveValidationAuthority: reviewAuthority,
+      bootstrapForExecution: () => { bootstrapCalls += 1; return undefined; },
+    }, run.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { spawnMarkers += 1; } });
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /App Server identity has no generation/);
+    assert.equal(workerCalls, 0);
+    assert.equal(bootstrapCalls, 0);
+    assert.equal(spawnMarkers, 0);
+    assert.equal(outcome.run.executor, undefined, 'the legacy result-only carrier is preserved without fabricating Run.executor');
+    assert.deepEqual(outcome.run.agentResult?.executor, predecessor);
+  });
+
+  it('holds a Run-carried generationless App Server identity despite explicit different-provider execution', async () => {
+    const store = new CasMemoryStore();
+    let run = repairChangesRun('legacy-run-carrier-different-provider');
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = { ...run, repairTaskShapeAuthority: undefined, execution: { ...ROUTINE_REPAIR_EXECUTION, executor: 'claude-code' }, executor: predecessor,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId } };
+    store.create(run);
+    let workerCalls = 0; let bootstrapCalls = 0; let spawnMarkers = 0;
+    const outcome = await runReviewLoop({
+      store, github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { workerCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+      bootstrapForExecution: () => { bootstrapCalls += 1; return undefined; },
+    }, run.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { spawnMarkers += 1; } });
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.equal(workerCalls + bootstrapCalls + spawnMarkers, 0);
+    assert.deepEqual(outcome.run.executor, predecessor);
+  });
+
+  it('holds a result-only generationless App Server identity when execution is absent', async () => {
+    const store = new CasMemoryStore();
+    let run = repairChangesRun('legacy-result-carrier-no-execution');
+    const predecessor = { provider: 'codex-app-server', sessionId: 'legacy-app-session' } as const;
+    run = { ...run, repairTaskShapeAuthority: undefined, execution: undefined, executor: undefined,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId } };
+    store.create(run);
+    let workerCalls = 0; let bootstrapCalls = 0; let spawnMarkers = 0;
+    const outcome = await runReviewLoop({
+      store, github: githubAdapter([HEAD]),
+      implementation: { kind: 'implementation-agent', async run() { workerCalls += 1; return successResult(HEAD2); } },
+      reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+      bootstrapForExecution: () => { bootstrapCalls += 1; return undefined; },
+    }, run.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { spawnMarkers += 1; } });
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.equal(workerCalls + bootstrapCalls + spawnMarkers, 0);
+    assert.equal(outcome.run.executor, undefined);
+    assert.deepEqual(outcome.run.agentResult?.executor, predecessor);
+  });
+
   it('requires the exact App Server identity through a logical codex-cli continuation', () => {
     let run = repairChangesRun('same-provider-continuation');
     const prior = { provider: 'codex-app-server', sessionId: 'old-session', generation: 'run-generation' } as const;
@@ -984,24 +1108,38 @@ describe('runReviewLoop', () => {
     }
   });
 
-  it('does not spawn after a concurrent transition wins the post-admission telemetry fence', async () => {
-    const initial = repairChangesRun('post-admission-race');
-    const started = { ...initial, state: 'IMPLEMENTING' as const, history: [...initial.history,
-      { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }] };
-    const concurrent = applyTransition(started, { type: 'escalate', reason: 'concurrent cancellation' }, T0);
-    const store = new SpawnRaceStore(concurrent);
-    store.create(initial);
-    const implementation = new FakeImplementation([successResult(HEAD2)]);
+  it('blocks repair invocation when start_fix or the final pre-worker CAS loses', async (t) => {
+    for (const [label, rejectAt] of [['start_fix', 2], ['final_pre_worker', 5]] as const) {
+      await t.test(label, async () => {
+        const initial = repairChangesRun(`pre-worker-${label}-race`);
+        const store = new SpawnRaceStore(rejectAt, (expected) => applyTransition(expected,
+          { type: 'escalate', reason: `concurrent decision at ${label}`,
+            interrupt: { evidence: `winner-${label}`, choices: ['Cancel the run'] } }, T0));
+        store.create(initial);
+        let executionMarkers = 0;
+        let capabilityResolutions = 0;
+        const implementation = new FakeImplementation([successResult(HEAD2)]);
+        const reviewer = new FakeReviewer([]);
+        const result = await runReviewLoop({
+          store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority,
+          resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+          resolveImplementationCapabilities: async () => { capabilityResolutions += 1; return []; },
+        }, initial.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { executionMarkers += 1; } });
 
-    const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
-        resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
-      initial.id, { maxAttempts: 3, now: () => T0 },
-    );
-
-    assert.equal(result.outcome, 'needs_human');
-    assert.equal(store.read(initial.id)?.state, 'NEEDS_HUMAN');
-    assert.equal(implementation.requests.length, 0);
+        assert.equal(result.outcome, 'superseded');
+        assert.deepEqual(store.read(initial.id), result.run);
+        assert.equal(result.run.state, 'NEEDS_HUMAN');
+        assert.equal(implementation.requests.length, 0);
+        assert.equal(reviewer.requests.length, 0);
+        if (label === 'start_fix') {
+          assert.equal(capabilityResolutions, 0, 'a lost start_fix CAS blocks all later preflight');
+          assert.equal(executionMarkers, 0);
+        } else {
+          assert.equal(capabilityResolutions, 1, 'capability discovery may finish before the final fence');
+          assert.equal(executionMarkers, 1, 'the execution uncertainty marker precedes the final CAS fence');
+        }
+      });
+    }
   });
 
   it('durably holds governed review repairs before worker telemetry or ambient provider execution', async () => {
@@ -1158,10 +1296,10 @@ describe('runReviewLoop', () => {
       },
       resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
     }, original.id, { maxAttempts: 3, now: () => T0, onExecutionStart: () => { markers += 1; } });
-    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.outcome, 'superseded');
     assert.equal(implementation.requests.length, 0);
     assert.equal(result.run.interrupt?.reason, concurrent.interrupt?.reason);
-    assert.deepEqual(store.read(original.id), concurrent, 'stale reconciliation must preserve the concurrent cancel decision byte-for-byte');
+    assert.equal(JSON.stringify(store.read(original.id)), JSON.stringify(concurrent), 'stale reconciliation must preserve the concurrent cancel decision');
     assert.equal(markers, 1, 'the uncertainty marker occurs after preflight but before final Run CAS');
   });
 
@@ -1198,32 +1336,47 @@ describe('runReviewLoop', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it('does not overwrite a concurrent Run when a repair worker completes or throws', async (t) => {
-    for (const mode of ['success', 'failure'] as const) {
+  it('preserves the exact CAS winner after repair worker success, throw, or publication fence and stops later verification', async (t) => {
+    for (const mode of ['success', 'failure', 'publication'] as const) {
       await t.test(mode, async () => {
         const original = repairChangesRun(`repair-worker-${mode}-race`);
         const store = new CasMemoryStore();
         store.create(original);
-        const concurrent = applyTransition(original, {
-          type: 'escalate', reason: `Concurrent human decision during ${mode} worker`,
-          interrupt: { evidence: `concurrent-${mode}`, choices: ['Cancel the run'] },
-        }, T0);
+        let concurrent: Run | undefined;
+        let pushes = 0;
+        const github = githubAdapter([HEAD, HEAD, HEAD, HEAD]);
+        let liveReads = 0;
+        const readLiveSnapshot = github.readLiveSnapshot.bind(github);
+        github.readLiveSnapshot = async (target) => { liveReads += 1; return readLiveSnapshot(target); };
         const implementation = {
           kind: 'implementation-agent' as const,
-          async run() {
+          async run(request: ImplementationRequest) {
+            const current = store.read(original.id)!;
+            concurrent = applyTransition(current, {
+              type: 'escalate', reason: `Concurrent human decision during ${mode} worker`,
+              interrupt: { evidence: `concurrent-${mode}`, choices: ['Cancel the run'] },
+            }, T0);
             store.update(concurrent);
             if (mode === 'failure') throw new Error('synthetic worker invocation failure');
+            if (mode === 'publication') {
+              request.beforePublish?.();
+              pushes += 1;
+            }
             return successResult(HEAD2);
           },
         };
         const result = await runReviewLoop({
-          store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]),
+          store, github, implementation, reviewer: new FakeReviewer([]),
           resolveValidationAuthority: reviewAuthority,
           resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
         }, original.id, { maxAttempts: 3, now: () => T0 });
-        assert.equal(result.outcome, 'needs_human');
-        assert.equal(result.run.interrupt?.reason, concurrent.interrupt?.reason);
-        assert.deepEqual(store.read(original.id), concurrent, 'completion or failure telemetry must use CAS and preserve concurrent Run state');
+        assert.equal(result.outcome, 'superseded');
+        assert.deepEqual(result.run, concurrent);
+        assert.equal(JSON.stringify(store.read(original.id)), JSON.stringify(concurrent), 'worker spawn telemetry and the concurrent decision remain unchanged');
+        assert.equal(concurrent?.telemetry?.events.filter((event) => event.kind === 'spawn' && event.role === 'worker').length, 1);
+        assert.equal(concurrent?.telemetry?.events.filter((event) => event.kind === 'completion').length, 0, 'completion telemetry from a stale worker is not persisted');
+        assert.equal(pushes, 0, 'publication is rejected before the simulated push');
+        assert.equal(liveReads, 2, 'the repair loop does not proceed to post-worker GitHub verification');
       });
     }
   });
@@ -1393,50 +1546,92 @@ describe('runReviewLoop', () => {
     assert.equal(reviewer.requests.length, 0);
   });
 
-  it('retries stale admission parking from a concurrent nonterminal snapshot without calling a writer or reviewer', async () => {
-    const run = repairChangesRun('repair-cas-race');
-    const concurrent = { ...run, state: 'IMPLEMENTING' as const, history: [...run.history,
-      { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }] };
-    const store = new ConcurrentAdmissionStore(concurrent);
-    store.create(run);
-    const implementation = new FakeImplementation([]);
-    const reviewer = new FakeReviewer([]);
+  it('returns a bounded superseded result for concurrent repair admission winners without changing them', async (t) => {
+    const makeWinners = (id: string): Array<[string, Run]> => {
+      const base = repairChangesRun(id);
+      const waiting = applyTransition(base, { type: 'wait_dependency', interrupt: { evidence: 'external dependency', choices: ['Retry'] } }, T0);
+      let mergeReady = reviewingRun(HEAD, id);
+      mergeReady = applyTransition(mergeReady, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, reviewAuthority());
+      mergeReady = { ...mergeReady, state: 'MERGE_READY', history: [...mergeReady.history,
+        { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
+      const merged = applyTransition(mergeReady, { type: 'merged' }, T0);
+      const failed = applyTransition(base, { type: 'fail', reason: 'concurrent failure' }, T0);
+      const admission = createRepairAdmissionSnapshot(base.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, ROUTINE_REPAIR_EXECUTION, T0);
+      const binding = createRepairAttemptBinding(base, ROUTINE_REPAIR_EXECUTION);
+      let active = applyTransition(base, { type: 'start_fix', repairAdmission: { ...admission, attemptBinding: binding } }, T0);
+      const activeResult = { ...successResult(HEAD2), executor: { provider: 'codex-app-server', sessionId: 'winner-session', generation: binding.runtimeGeneration }, sessionId: 'winner-session' };
+      active = applyTransition(active, { type: 'repair_executor_handoff', repairAgentResult: activeResult }, T0);
+      return [
+        ['waiting dependency', waiting],
+        ['merge ready', mergeReady],
+        ['merged', merged],
+        ['failed', failed],
+        ['changed active repair attempt, executor, and history', active],
+      ];
+    };
+    for (const [label] of makeWinners('repair-cas-winner')) {
+      await t.test(label, async () => {
+        const id = `repair-cas-${label.toLowerCase().replace(/[^a-z0-9.-]/g, '-')}`;
+        const run = repairChangesRun(id);
+        const [, concurrent] = makeWinners(run.id).find(([candidate]) => candidate === label)!;
+        const fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-repair-cas-winner-'));
+        try {
+          const fixtureStore = new JsonFileStore({ dir: fixtureDir });
+          fixtureStore.create(concurrent);
+          assert.equal(JSON.stringify(new JsonFileStore({ dir: fixtureDir }).read(id)), JSON.stringify(concurrent),
+            'the synthetic race winner is a valid durable Run fixture');
+        } finally { rmSync(fixtureDir, { recursive: true, force: true }); }
+        const store = new CasMemoryStore();
+        store.create(run);
+        const implementation = new FakeImplementation([]);
+        const reviewer = new FakeReviewer([]);
+        const github = githubAdapter([HEAD]);
+        github.readLiveSnapshot = async () => {
+          store.update(concurrent);
+          return snapshot(HEAD);
+        };
 
-    const result = await runReviewLoop(
-      { store, github: githubAdapter([HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority,
-        resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
-      run.id, { maxAttempts: 3, now: () => T0 },
-    );
+        const result = await runReviewLoop(
+          { store, github, implementation, reviewer, resolveValidationAuthority: reviewAuthority,
+            resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
+          run.id, { maxAttempts: 3, now: () => T0 },
+        );
 
-    assert.equal(result.outcome, 'needs_human');
-    assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.equal(store.read(run.id)?.interruptedFrom, 'IMPLEMENTING');
-    assert.equal(implementation.requests.length, 0);
-    assert.equal(reviewer.requests.length, 0);
+        assert.equal(result.outcome, 'superseded');
+        assert.match(result.reason, /preserved/);
+        assert.deepEqual(result.run, concurrent);
+        assert.equal(JSON.stringify(store.read(run.id)), JSON.stringify(concurrent), 'the newer winner remains structurally unchanged');
+        assert.equal(store.casCalls, 1, 'the pending GitHub read causes one failed CAS and no retry');
+        assert.equal(store.casSuccesses, 0);
+        assert.equal(implementation.requests.length, 0);
+        assert.equal(reviewer.requests.length, 0);
+      });
+    }
   });
 
-  it('preserves an already parked or terminal concurrent admission snapshot without writer or reviewer calls', async () => {
-    for (const state of ['parked', 'terminal'] as const) {
-      const run = repairChangesRun(`repair-${state}`);
-      const concurrent = state === 'parked'
-        ? applyTransition(run, { type: 'escalate', reason: 'concurrent human decision' }, T0)
-        : applyTransition(run, { type: 'fail', reason: 'concurrent failure' }, T0);
-      const store = new ConcurrentAdmissionStore(concurrent);
-      store.create(run);
-      const implementation = new FakeImplementation([]);
-      const reviewer = new FakeReviewer([]);
-
-      const result = await runReviewLoop(
-        { store, github: githubAdapter([HEAD]), implementation, reviewer, resolveValidationAuthority: reviewAuthority,
-          resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
-        run.id, { maxAttempts: 3, now: () => T0 },
-      );
-
-      assert.equal(result.run.state, concurrent.state, state);
-      assert.equal(store.read(run.id)?.state, concurrent.state, state);
-      assert.equal(implementation.requests.length, 0, state);
-      assert.equal(reviewer.requests.length, 0, state);
-    }
+  it('terminates an always-rejecting repair CAS without writes or effects', async () => {
+    const run = repairChangesRun('repair-cas-always-reject');
+    let casCalls = 0;
+    let updateCalls = 0;
+    const store: RunStore = {
+      name: 'always-reject-cas',
+      create() {},
+      read: () => run,
+      update() { updateCalls += 1; },
+      updateIfUnchanged() { casCalls += 1; return false; },
+      list: () => [run], delete() {},
+    };
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+    const result = await runReviewLoop({ store, github: githubAdapter([HEAD]), implementation, reviewer,
+      resolveValidationAuthority: reviewAuthority, resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION },
+    run.id, { maxAttempts: 3, now: () => T0 });
+    assert.equal(result.outcome, 'superseded');
+    assert.equal(casCalls, 1);
+    assert.equal(updateCalls, 0);
+    assert.deepEqual(result.run, run);
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(reviewer.requests.length, 0);
   });
 
   it('turns retryable and fatal reviewer failures into durable outcomes', async () => {

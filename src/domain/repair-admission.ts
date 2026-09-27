@@ -51,6 +51,14 @@ export interface RepairAttemptBinding {
   readonly runtimeGeneration: string;
 }
 
+/** A durable repair identity cannot be safely continued from this predecessor. */
+export class RepairAdmissionIdentityError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'RepairAdmissionIdentityError';
+  }
+}
+
 export type RepairExecutorHandoff =
   | { readonly kind: 'executor'; readonly identity: ExecutorIdentity }
   | { readonly kind: 'sessionless'; readonly provider: 'worker-router' };
@@ -59,6 +67,18 @@ export type RepairExecutorHandoff =
 export function sameRepairExecutorIdentity(a: ExecutorIdentity | undefined, b: ExecutorIdentity | undefined): boolean {
   return a?.provider === b?.provider && a?.sessionId === b?.sessionId && a?.generation === b?.generation &&
     (a === undefined) === (b === undefined);
+}
+
+/** The durable physical App Server identity, including the legacy result-only carrier. */
+export function generationlessAppServerPredecessor(run: {
+  readonly executor?: ExecutorIdentity;
+  readonly agentResult?: { readonly executor?: ExecutorIdentity };
+}): ExecutorIdentity | undefined {
+  const predecessor = run.executor ?? run.agentResult?.executor;
+  return predecessor?.provider === 'codex-app-server' &&
+    (predecessor.generation === undefined || predecessor.generation.trim() === '')
+    ? predecessor
+    : undefined;
 }
 
 /** Shared admission and ledger rule for the identity adopted by a repair invocation. */
@@ -74,6 +94,10 @@ export function isRepairHandoffCompatible(
   }
 
   const identity = outcome.identity;
+  // WorkerRouter is sessionless by contract. Executor-kind records using its
+  // provider name are malformed even when they appear on both sides of a
+  // ledger handoff.
+  if (selectedProvider === 'worker-router' || identity.provider === 'worker-router') return false;
   const providerMatches = selectedProvider === 'luna-isolated'
     ? identity.provider === 'codex-cli'
     : selectedProvider === 'codex-cli'
@@ -99,13 +123,21 @@ export function createRepairAttemptBinding(run: {
   readonly repairAdmissions?: readonly RepairAdmissionSnapshot[];
   readonly history: readonly unknown[];
   readonly executor?: ExecutorIdentity;
-  readonly agentResult?: { readonly sessionId?: string };
+  readonly agentResult?: { readonly sessionId?: string; readonly executor?: ExecutorIdentity };
 }, execution: ResolvedExecutionConfiguration): RepairAttemptBinding {
   const priorProviderCompatible = run.executor?.provider === execution.executor ||
     (run.executor?.provider === 'codex-app-server' && execution.executor === 'codex-cli');
   const fresh = execution.executor === 'luna-isolated' || execution.executor === 'worker-router' ||
     (run.executor !== undefined && !priorProviderCompatible) ||
     (run.executor === undefined && run.agentResult?.sessionId !== undefined);
+  const predecessor = run.executor ?? run.agentResult?.executor;
+  if (!fresh && predecessor?.provider === 'codex-app-server' &&
+      (execution.executor === 'codex-cli' || execution.executor === 'codex-app-server') &&
+      (predecessor.generation === undefined || predecessor.generation.trim() === '')) {
+    throw new RepairAdmissionIdentityError(
+      'Repair admission held: the prior Codex App Server identity has no generation and cannot be continued safely. No model turn or worker process was started.',
+    );
+  }
   const runtimeGeneration = fresh ? `repair-${randomUUID()}` : run.executor?.generation ?? `repair-${randomUUID()}`;
   return {
     admissionIndex: run.repairAdmissions?.length ?? 0,
@@ -155,6 +187,9 @@ function isAttemptBindingCompatible(selectedProvider: string, binding: RepairAtt
     (predecessor !== undefined && !continuationCompatible) ||
     (predecessor === undefined && binding.predecessorSessionId !== undefined);
   if (binding.freshExecutor !== freshRequired) return false;
+  if (!binding.freshExecutor && predecessor === 'codex-app-server' &&
+      (selectedProvider === 'codex-cli' || selectedProvider === 'codex-app-server') &&
+      (binding.predecessorExecutor?.generation === undefined || binding.predecessorExecutor.generation.trim() === '')) return false;
   if (!binding.freshExecutor && binding.predecessorExecutor?.generation !== undefined &&
       binding.runtimeGeneration !== binding.predecessorExecutor.generation) return false;
   return !(binding.freshExecutor && binding.predecessorExecutor?.generation === binding.runtimeGeneration);

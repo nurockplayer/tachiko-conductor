@@ -19,6 +19,9 @@ import {
   createRepairAttemptBinding,
   createRepairAdmissionSnapshot,
   decideRepairAdmission,
+  generationlessAppServerPredecessor,
+  RepairAdmissionIdentityError,
+  type RepairAttemptBinding,
   type RepairFindingKind,
 } from '../domain/repair-admission.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
@@ -70,6 +73,7 @@ export type ReviewLoopResult =
   | { readonly outcome: 'revalidating'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'unsupported_cas'; readonly run: Run; readonly reason: string }
+  | { readonly outcome: 'superseded'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'failed'; readonly run: Run; readonly reason: string };
 
 function formatTarget(target: Target): string {
@@ -224,34 +228,17 @@ function parkRepairAuthority(
   return { outcome: 'needs_human', run: parked, reason };
 }
 
-/** A failed admission CAS is itself durable safety evidence, never a silent return. */
-function parkStaleRepairAdmission(runId: string, fallback: Run, store: RunStore, now: () => string): ReviewLoopResult {
-  const reason = 'Repair admission parked: admission_stale.';
-  let current = store.read(runId) ?? fallback;
+/** A repair CAS loser may observe a newer decision but must never mutate it. */
+function supersededRepairAdmission(runId: string, fallback: Run, store: RunStore): ReviewLoopResult {
+  const current = store.read(runId) ?? fallback;
   if (store.updateIfUnchanged === undefined) {
-    return { outcome: 'unsupported_cas', run: store.read(runId) ?? current,
+    return { outcome: 'unsupported_cas', run: current,
       reason: 'Repair admission is held because durable compare-and-swap is unavailable; no Run write was attempted.' };
   }
-  // Keep the established repair-admission behavior: if a concurrent writer
-  // wins, reconcile the freshest active snapshot rather than applying a stale
-  // repair transition. Reviewer-result paths use staleReviewOutcome and never
-  // mutate the newer durable Run.
-  for (;;) {
-    if (current.state === 'NEEDS_HUMAN') return { outcome: 'needs_human', run: current, reason };
-    if (isTerminal(current.state)) return { outcome: 'failed', run: current, reason };
-    const parked = applyTransition(current, {
-      type: 'escalate', reason,
-      interrupt: { evidence: reason, choices: ['Re-admit the exact repair authority and execution profile', CANCEL_RUN_DECISION] },
-    }, now());
-    if (!store.updateIfUnchanged(current, parked)) {
-      current = store.read(runId) ?? current;
-      continue;
-    }
-    const persisted = store.read(runId) ?? parked;
-    if (persisted.state === 'NEEDS_HUMAN') return { outcome: 'needs_human', run: persisted, reason };
-    if (isTerminal(persisted.state)) return { outcome: 'failed', run: persisted, reason };
-    current = persisted;
-  }
+  return {
+    outcome: 'superseded', run: current,
+    reason: 'Repair review stopped after compare-and-swap rejected a stale snapshot; the durable Run was preserved.',
+  };
 }
 
 /**
@@ -374,7 +361,7 @@ export async function runReviewLoop(
         const expected = run;
         try {
           const live = await github.readLiveSnapshot(target);
-          if (!updateReviewRun(store, expected, expected)) return parkStaleRepairAdmission(run.id, expected, store, now);
+          if (!updateReviewRun(store, expected, expected)) return supersededRepairAdmission(run.id, expected, store);
           const conflict = pullRequestIdentityConflict(run, live, { allowHeadAdvance: true });
           if (conflict === null && live.headSha === run.headSha) {
             repairSnapshot = live;
@@ -405,6 +392,15 @@ export async function runReviewLoop(
       let repairStartsWithFreshExecutor = false;
       let repairAttempt = activeRepairAdmission(run);
       const authority = run.repairTaskShapeAuthority;
+      const legacyAppServer = generationlessAppServerPredecessor(run);
+      if (authority === undefined && repairExecution?.executor !== 'luna-isolated' && legacyAppServer !== undefined) {
+        return parkRepairAuthority(
+          run,
+          `Repair admission held: the prior Codex App Server identity has no generation and cannot be continued safely. No model turn or worker process was started.${deps.governedPublicationRequired ? ' Governed repair also requires the source-qualified publication boundary.' : ''}`,
+          store,
+          now,
+        );
+      }
       if (authority !== undefined) {
         const decision = decideRepairAdmission(authority);
         if (decision.kind === 'park') {
@@ -427,7 +423,16 @@ export async function runReviewLoop(
         // A promoted repair may be assigned to another provider. Continuing a
         // prior provider's session across that boundary is not valid executor
         // continuity; intentionally start the selected profile fresh.
-        const attemptBinding = createRepairAttemptBinding(run, repairExecution);
+        let attemptBinding: RepairAttemptBinding;
+        try {
+          attemptBinding = createRepairAttemptBinding(run, repairExecution);
+        } catch (error) {
+          if (error instanceof RepairAdmissionIdentityError) {
+            const reason = `${error.message}${deps.governedPublicationRequired ? ' Governed repair also requires the source-qualified publication boundary.' : ''}`;
+            return parkRepairAuthority(run, reason, store, now);
+          }
+          throw error;
+        }
         repairStartsWithFreshExecutor = attemptBinding.freshExecutor;
         const finding: RepairFindingKind = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
           ? 'validation_failed'
@@ -440,7 +445,7 @@ export async function runReviewLoop(
         // exact durable Run that was preflighted. Never invoke a worker after a
         // stale CAS, because another writer may have replaced its HEAD or PR.
         if (!updateReviewRun(store, run, startedFix)) {
-          return parkStaleRepairAdmission(run.id, run, store, now);
+          return supersededRepairAdmission(run.id, run, store);
         }
         run = startedFix;
         repairAttempt = activeRepairAdmission(run);
@@ -574,7 +579,7 @@ export async function runReviewLoop(
       // Fence the telemetry handoff in every mode, then fence it again after
       // awaited capability resolution immediately before entering the worker.
       if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(beforeSpawn, run)) {
-        return parkStaleRepairAdmission(run.id, beforeSpawn, store, now);
+        return supersededRepairAdmission(run.id, beforeSpawn, store);
       }
       const workerHandoff = run;
       const recordWorkerInvocationFailure = (error: unknown): ReviewLoopResult | null => {
@@ -594,7 +599,7 @@ export async function runReviewLoop(
             } catch { /* An unqualified post-execution identity cannot replace the predecessor. */ }
             const parked = createBootstrapFailureRun(captured, error, now);
             if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, parked.run)) {
-              return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+              return supersededRepairAdmission(run.id, workerHandoff, store);
             }
             run = parked.run;
             return { outcome: 'needs_human', ...parked };
@@ -612,7 +617,7 @@ export async function runReviewLoop(
           ...(repairExecution?.reasoningEffort === undefined ? {} : { reasoningEffort: repairExecution.reasoningEffort }),
         }, 'worker', workerSpawn.invocationId), now());
         if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, failed)) {
-          return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+          return supersededRepairAdmission(run.id, workerHandoff, store);
         }
         run = failed;
         return null;
@@ -635,7 +640,7 @@ export async function runReviewLoop(
         // Recheck only the generation now; evidence is already strengthened.
         deps.assertCurrentMutation?.();
         if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, workerHandoff)) {
-          return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+          return supersededRepairAdmission(run.id, workerHandoff, store);
         }
       } catch (error) {
         const outcome = recordWorkerInvocationFailure(error);
@@ -686,14 +691,14 @@ export async function runReviewLoop(
         } catch (error) {
           const persistedTelemetry = completed;
           if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, persistedTelemetry)) {
-            return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+            return supersededRepairAdmission(run.id, workerHandoff, store);
           }
           run = persistedTelemetry;
           return parkRepairAuthority(run, `Repair executor handoff is unqualified: ${errorMessage(error)} No provider identity was adopted.`, store, now);
         }
       }
       if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, completed)) {
-        return parkStaleRepairAdmission(run.id, workerHandoff, store, now);
+        return supersededRepairAdmission(run.id, workerHandoff, store);
       }
       run = completed;
       if (fixResult.exitStatus === 'failure') {
@@ -712,12 +717,12 @@ export async function runReviewLoop(
             },
             now(),
           );
-          if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, takeover)) return parkStaleRepairAdmission(run.id, completed, store, now);
+          if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, takeover)) return supersededRepairAdmission(run.id, completed, store);
           run = takeover;
           return { outcome: 'needs_human', run, reason: takeoverReason };
         }
         const failed = applyTransition(run, { type: 'agent_failed', agentResult: fixResult, headSha: fixResult.headSha }, now());
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, failed)) return parkStaleRepairAdmission(run.id, completed, store, now);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, failed)) return supersededRepairAdmission(run.id, completed, store);
         run = failed;
         return { outcome: 'failed', run, reason: `Implementation failed while fixing review findings: ${fixResult.summary}` };
       }
@@ -735,7 +740,7 @@ export async function runReviewLoop(
           },
           now(),
         );
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, noHead)) return parkStaleRepairAdmission(run.id, completed, store, now);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(completed, noHead)) return supersededRepairAdmission(run.id, completed, store);
         run = noHead;
         return { outcome: 'needs_human', run, reason };
       }
@@ -780,7 +785,7 @@ export async function runReviewLoop(
           },
           now(),
         );
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, failedValidation)) return parkStaleRepairAdmission(run.id, run, store, now);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, failedValidation)) return supersededRepairAdmission(run.id, run, store);
         run = failedValidation;
         return { outcome: 'needs_human', run, reason };
       }
@@ -800,7 +805,7 @@ export async function runReviewLoop(
           },
           now(),
         );
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, movedHead)) return parkStaleRepairAdmission(run.id, run, store, now);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, movedHead)) return supersededRepairAdmission(run.id, run, store);
         run = movedHead;
         return { outcome: 'needs_human', run, reason };
       }
@@ -809,7 +814,7 @@ export async function runReviewLoop(
         (run.pullRequest !== undefined && validatedSnapshot!.pullRequest.number !== run.pullRequest.number)) {
         const reason = conflict ?? 'Live pull request disappeared or changed after the review fix.';
         const identityConflict = applyTransition(run, { type: 'escalate', reason, interrupt: { evidence: reason, choices: ['Resolve the pull request identity conflict and retry', CANCEL_RUN_DECISION] } }, now());
-        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, identityConflict)) return parkStaleRepairAdmission(run.id, run, store, now);
+        if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, identityConflict)) return supersededRepairAdmission(run.id, run, store);
         run = identityConflict;
         return { outcome: 'needs_human', run, reason };
       }
@@ -817,7 +822,7 @@ export async function runReviewLoop(
         type: 'agent_succeeded', agentResult: fixResult, headSha: fixResult.headSha,
         pullRequest: { number: validatedSnapshot!.pullRequest.number, headSha: fixResult.headSha },
       }, now());
-      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, fixed)) return parkStaleRepairAdmission(run.id, run, store, now);
+      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(run, fixed)) return supersededRepairAdmission(run.id, run, store);
       run = fixed;
       // A new fix creates a new exact HEAD. Validation is owned by the outer
       // workflow so it must collect fresh local and hosted evidence before a
