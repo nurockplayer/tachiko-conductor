@@ -9,7 +9,7 @@ import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetr
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
-import { isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
+import { isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, sameRepairExecutorIdentity, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
 import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 import { assertSafeCurrentAccountPathIfApplicable, isCurrentAccountPathApplicable } from '../account-home.js';
 
@@ -244,6 +244,27 @@ function isRepairHistoryCoherent(run: Record<string, unknown>): boolean {
     if (binding === undefined || !isRepairHandoffCompatible(admission.execution.executor, binding,
         handoff.outcome as RepairExecutorHandoff, prior?.outcome)) return false;
     consumed.set(key, handoff);
+  }
+  if (run.state === 'IMPLEMENTING') {
+    const startFixHistoryIndex = history.map((event, index) => ({ event, index })).reverse()
+      .find(({ event }) => event.type === 'start_fix' && event.from === 'CHANGES_REQUESTED' && event.to === 'IMPLEMENTING')?.index;
+    const startFix = startFixHistoryIndex === undefined ? undefined : history[startFixHistoryIndex];
+    if (startFixHistoryIndex !== undefined && startFix?.repairAdmissionIndex !== undefined) {
+      const active = handoffs.filter(({ handoff }) => handoff.startFixHistoryIndex === startFixHistoryIndex &&
+        handoff.admissionHistoryIndex === startFix.repairAdmissionIndex).at(-1)?.handoff;
+      if (active !== undefined && !isRepairHandoffRecord(active)) return false;
+      const activeHandoff = active as RepairHandoffRecord | undefined;
+      if (activeHandoff?.outcome.kind === 'sessionless') {
+        const result = run.agentResult as Record<string, unknown> | undefined;
+        if (run.executor !== undefined || result?.executor !== undefined || result?.sessionId !== undefined) return false;
+      } else if (activeHandoff?.outcome.kind === 'executor') {
+        const result = run.agentResult as Record<string, unknown> | undefined;
+        if (!isExecutorIdentity(run.executor) || !sameRepairExecutorIdentity(run.executor as Run['executor'], activeHandoff.outcome.identity) ||
+            (result?.executor !== undefined && (!isExecutorIdentity(result.executor) ||
+              !sameRepairExecutorIdentity(result.executor as Run['executor'], activeHandoff.outcome.identity))) ||
+            (result?.sessionId !== undefined && result.sessionId !== activeHandoff.outcome.identity.sessionId)) return false;
+      }
+    }
   }
   return true;
 }

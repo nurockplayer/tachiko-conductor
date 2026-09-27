@@ -1,15 +1,30 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
-import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, qualifyGovernedPublicationAdapter, type GovernedInvocationPreparation, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, type GovernedInvocationPreparation, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
-import { CodexCliAdapter } from './codex-cli.js';
+import { CodexCliAdapter, hasOriginalCodexCliRun } from './codex-cli.js';
 import { hasPreparedStandaloneLunaInvocation } from '../workspace/standalone-git-bootstrap.js';
 
 /** The sole production name for the #92-qualified subscription transport. */
 export const LUNA_ISOLATED_PROVIDER = 'luna-isolated';
 export const LUNA_ISOLATED_MODEL = 'gpt-5.6-luna';
 export const LUNA_TRUSTED_RUNTIME_REVISION = 'luna-qualified-runtime-v1';
+
+const qualifiedRuntimes = new WeakMap<object, { readonly run: Function; readonly prepare?: Function }>();
+
+/** Read-only source-owned qualification; concrete methods are checked again to reject post-construction replacement. */
+export function hasGovernedPublicationConfinement(adapter: object): boolean {
+  const qualification = qualifiedRuntimes.get(adapter);
+  if (qualification === undefined) return false;
+  if (adapter instanceof IsolatedLunaAdapter) {
+    return Object.getPrototypeOf(adapter) === IsolatedLunaAdapter.prototype &&
+      qualification.run === ORIGINAL_LUNA_RUN && hasOriginalDataMethod(adapter, 'run', qualification.run) &&
+      qualification.prepare === ORIGINAL_LUNA_PREPARE && hasOriginalDataMethod(adapter, 'prepareGovernedInvocation', qualification.prepare);
+  }
+  return adapter instanceof CodexCliAdapter && hasOriginalCodexCliRun(adapter) &&
+    qualification.run === getDataMethod(CodexCliAdapter.prototype, 'run');
+}
 
 export const LUNA_ISOLATED_ERROR_CODE = {
   TRANSPORT_MISMATCH: 'LUNA_TRANSPORT_MISMATCH',
@@ -45,7 +60,10 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     this.runtimeConfig = parseTrustedLunaConfig(readFileSync(configPath, 'utf8'));
     this.timeoutMs = options.timeoutMs;
     this.executablePath = options.path;
-    qualifyGovernedPublicationAdapter(this);
+    if (new.target === IsolatedLunaAdapter && hasOriginalDataMethod(this, 'run', ORIGINAL_LUNA_RUN) &&
+        hasOriginalDataMethod(this, 'prepareGovernedInvocation', ORIGINAL_LUNA_PREPARE)) {
+      qualifiedRuntimes.set(this, { run: ORIGINAL_LUNA_RUN, prepare: ORIGINAL_LUNA_PREPARE });
+    }
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -64,12 +82,26 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     if (request.executor !== undefined || request.sessionId !== undefined) return failure(LUNA_ISOLATED_ERROR_CODE.CONTINUATION_FORBIDDEN, 'Isolated Luna repair/restart uses a fresh bounded worker; session continuation is forbidden.');
     if (request.workspacePath === undefined || request.branch === undefined) return failure(LUNA_ISOLATED_ERROR_CODE.RUNTIME_UNQUALIFIED, 'Isolated Luna requires a host-prepared standalone workspace and branch.');
     const env = isolatedLunaEnvironment(this.home, this.executablePath);
-    const isolatedCli = qualifyGovernedPublicationAdapter(new CodexCliAdapter({
+    const isolatedCli = new CodexCliAdapter({
       cwd: request.workspacePath, model: LUNA_ISOLATED_MODEL,
       reasoningEffort: request.execution.reasoningEffort, sandboxMode: 'workspace-write', approvalPolicy: 'never',
       timeoutMs: this.timeoutMs, env, requiredConfig: this.runtimeConfig,
-    }));
-    return await isolatedCli.run(request);
+    });
+    const nestedRun = getDataMethod(CodexCliAdapter.prototype, 'run');
+    if (nestedRun === undefined || !hasOriginalCodexCliRun(isolatedCli)) {
+      return failure(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED,
+        `Governed isolated Luna refused a nested Codex CLI whose source-owned run method changed. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+        request);
+    }
+    if (hasPreparedStandaloneLunaInvocation(request)) {
+      qualifiedRuntimes.set(isolatedCli, { run: nestedRun });
+    }
+    if (!hasOriginalCodexCliRun(isolatedCli)) {
+      return failure(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED,
+        `Governed isolated Luna refused a nested Codex CLI whose source-owned run method changed before invocation. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+        request);
+    }
+    return await nestedRun.call(isolatedCli, request);
   }
 
   prepareGovernedInvocation(request: ImplementationRequest): GovernedInvocationPreparation {
@@ -78,6 +110,23 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     }
     return { status: 'qualified', agent: this };
   }
+}
+
+// Capture the original concrete methods after this class initializes. These
+// are intentionally local to Luna's module; cross-module CLI identities are
+// captured per privately minted adapter during the runtime call above.
+const ORIGINAL_LUNA_RUN = IsolatedLunaAdapter.prototype.run;
+const ORIGINAL_LUNA_PREPARE = IsolatedLunaAdapter.prototype.prepareGovernedInvocation;
+function getDataMethod(target: object, name: string): Function | undefined {
+  const descriptor = Object.getOwnPropertyDescriptor(target, name);
+  return descriptor !== undefined && 'value' in descriptor && typeof descriptor.value === 'function'
+    ? descriptor.value
+    : undefined;
+}
+
+function hasOriginalDataMethod(target: object, name: string, expected: Function | undefined): boolean {
+  if (expected === undefined || Object.getOwnPropertyDescriptor(target, name) !== undefined) return false;
+  return getDataMethod(Object.getPrototypeOf(target), name) === expected;
 }
 
 /** Minimal fresh-worker environment; deliberately independent of user HOME. */

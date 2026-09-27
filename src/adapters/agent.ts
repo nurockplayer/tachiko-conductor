@@ -1,21 +1,12 @@
 import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
+import { hasGovernedPublicationConfinement } from '../agents/luna-isolated.js';
 
 export const HUMAN_TAKEOVER_DIAGNOSTIC = 'TACHIKO_NEEDS_HUMAN:';
 export const GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED = 'GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED' as const;
 export const GOVERNED_PUBLICATION_REENTRY_ACTION = 'Preserve this Run’s executor/session and retry only after its exact runtime has a source-qualified host publication boundary.';
 
-const confinedAgents = new WeakSet<object>();
-
-/** Mark a source-owned adapter whose runtime confines worker writes and host-owned publication. */
-export function qualifyGovernedPublicationAdapter<T extends object>(adapter: T): T {
-  confinedAgents.add(adapter);
-  return adapter;
-}
-
-export function hasGovernedPublicationConfinement(adapter: object): boolean {
-  return confinedAgents.has(adapter);
-}
+export { hasGovernedPublicationConfinement } from '../agents/luna-isolated.js';
 
 export function humanTakeoverReason(result: AgentResult): string | undefined {
   const diagnostic = result.diagnostics?.find((value) => value.startsWith(HUMAN_TAKEOVER_DIAGNOSTIC));

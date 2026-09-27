@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { qualifyGovernedPublicationAdapter, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
+import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
+import { hasGovernedPublicationConfinement } from '../src/adapters/agent.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import type { AgentResult } from '../src/domain/types.js';
 import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { TARGET, successResult } from './helpers.js';
+import { createGenuineLunaFixture } from './support/genuine-luna.js';
 
 class RecordingAgent implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
@@ -20,34 +22,28 @@ class RecordingAgent implements ImplementationAgent {
 }
 
 describe('ImplementationAgentRegistry', () => {
-  it('preflights the exact selected adapter and pins that qualified instance through invocation', async () => {
-    const worker = qualifyGovernedPublicationAdapter(new RecordingAgent(successResult('a'.repeat(40))));
-    const fallback = new RecordingAgent(successResult('b'.repeat(40)));
-    let workerSelections = 0;
-    let fallbackSelections = 0;
+  it('recognizes and invokes only a genuine Luna instance with a prepared standalone guard', async () => {
+    const fixture = await createGenuineLunaFixture('registry-genuine-luna');
+    let selectedProviderCalls = 0;
+    let fallbackCalls = 0;
     const registry = new ImplementationAgentRegistry({
-      defaultProvider: 'worker-router',
+      defaultProvider: 'luna-isolated',
       providers: {
-        'worker-router': () => { workerSelections += 1; return worker; },
-        'codex-cli': () => { fallbackSelections += 1; return fallback; },
+        'luna-isolated': () => { selectedProviderCalls += 1; return fixture.adapter; },
+        'claude-code': () => { fallbackCalls += 1; return new RecordingAgent(successResult('b'.repeat(40))); },
       },
     });
-    const execution: ResolvedExecutionConfiguration = { profile: 'standard', revision: 'profiles-v1', executor: 'worker-router', timeoutMs: 10_000 };
-    const request: ImplementationRequest = {
-      target: TARGET, baseSha: 'base', execution,
-      runtimeOwnership: { runId: 'run-governed', generation: 'run-generation' },
-      governedPublication: { required: true, continuation: false },
-    };
-
-    const prepared = registry.prepareGovernedInvocation(request);
-    assert.equal(prepared.status, 'qualified');
-    if (prepared.status !== 'qualified') return;
-    const result = await prepared.agent.run({ ...request, instructions: 'host packet' });
-
-    assert.equal(result.exitStatus, 'success');
-    assert.equal(workerSelections, 1, 'preflight selects the runtime once and invocation uses that exact adapter');
-    assert.equal(fallbackSelections, 0, 'no ambient fallback is reconstructed');
-    assert.equal(worker.requests.length, 1);
+    try {
+      assert.equal(hasGovernedPublicationConfinement(fixture.adapter), true);
+      const prepared = registry.prepareGovernedInvocation(fixture.request);
+      assert.equal(prepared.status, 'qualified');
+      if (prepared.status !== 'qualified') return;
+      const result = await prepared.agent.run(fixture.request);
+      assert.equal(result.exitStatus, 'success');
+      assert.equal(prepared.agent, fixture.adapter);
+      assert.equal(selectedProviderCalls, 1, 'the registry selected the source-owned adapter exactly once');
+      assert.equal(fallbackCalls, 0, 'a successful exact adapter preflight never selects fallback');
+    } finally { fixture.cleanup(); }
   });
 
   it('delegates governed qualification to the selected source adapter and holds adapter rejection without fallback', () => {
@@ -58,18 +54,21 @@ describe('ImplementationAgentRegistry', () => {
     };
     let selectedRuns = 0;
     let fallbackSelections = 0;
-    const source = qualifyGovernedPublicationAdapter({
+    let preflightCalls = 0;
+    const source = {
       kind: 'implementation-agent' as const,
       async run() { selectedRuns += 1; return successResult('a'.repeat(40)); },
-      prepareGovernedInvocation() { return { status: 'held' as const, reason: 'source proof absent' }; },
-    });
+      prepareGovernedInvocation() { preflightCalls += 1; return { status: 'held' as const, reason: 'source proof absent' }; },
+    };
     const registry = new ImplementationAgentRegistry({
       defaultProvider: 'codex-cli',
       providers: { 'codex-cli': () => source, 'claude-code': () => { fallbackSelections += 1; return new RecordingAgent(successResult('b'.repeat(40))); } },
     });
     const prepared = registry.prepareGovernedInvocation(request);
-    assert.deepEqual(prepared, { status: 'held', reason: 'source proof absent' });
+    assert.equal(prepared.status, 'held');
+    if (prepared.status === 'held') assert.match(prepared.reason, /source-qualified host publication boundary/);
     assert.equal(selectedRuns, 0);
+    assert.equal(preflightCalls, 0, 'arbitrary adapter preflight cannot mint qualification');
     assert.equal(fallbackSelections, 0);
   });
 
@@ -83,40 +82,40 @@ describe('ImplementationAgentRegistry', () => {
       let selectedRuns = 0;
       let fallbackSelections = 0;
       let substitutedRuns = 0;
-      const substituted = qualifyGovernedPublicationAdapter({
+      const substituted = {
         kind: 'implementation-agent' as const,
         async run() { substitutedRuns += 1; return successResult('c'.repeat(40)); },
-      });
-      const source = qualifyGovernedPublicationAdapter({
+      };
+      const source = {
         kind: 'implementation-agent' as const,
         async run() { selectedRuns += 1; return successResult('a'.repeat(40)); },
         prepareGovernedInvocation() {
           if (mode === 'throw') throw new Error('preflight unavailable');
           return { status: 'qualified' as const, agent: substituted };
         },
-      });
+      };
       const registry = new ImplementationAgentRegistry({
         defaultProvider: 'codex-cli',
         providers: { 'codex-cli': () => source, 'claude-code': () => { fallbackSelections += 1; return new RecordingAgent(successResult('b'.repeat(40))); } },
       });
       const prepared = registry.prepareGovernedInvocation(request);
       assert.equal(prepared.status, 'held', `${mode} preflight must hold`);
-      if (prepared.status === 'held' && mode === 'throw') assert.match(prepared.reason, /preflight unavailable/);
-      if (prepared.status === 'held' && mode === 'substitute') assert.match(prepared.reason, /did not qualify its own exact governed invocation/);
+      if (prepared.status === 'held') assert.match(prepared.reason, /source-qualified host publication boundary/);
       assert.equal(selectedRuns, 0);
       assert.equal(substitutedRuns, 0);
       assert.equal(fallbackSelections, 0);
     }
   });
 
-  it('holds ambient and unknown continuation routes without silently selecting the qualified default', async () => {
+  it('holds ambient and unknown continuation routes without silently selecting the genuine default', async () => {
+    const fixture = await createGenuineLunaFixture('registry-ambient-luna');
     const ambient = new RecordingAgent(successResult('a'.repeat(40)));
-    const qualifiedDefault = qualifyGovernedPublicationAdapter(new RecordingAgent(successResult('b'.repeat(40))));
+    const qualifiedDefault = fixture.adapter;
     let ambientCalls = 0;
     const registry = new ImplementationAgentRegistry({
-      defaultProvider: 'worker-router',
+      defaultProvider: 'luna-isolated',
       providers: {
-        'worker-router': () => qualifiedDefault,
+        'luna-isolated': () => qualifiedDefault,
         'codex-cli': () => { ambientCalls += 1; return ambient; },
       },
     });
@@ -132,7 +131,7 @@ describe('ImplementationAgentRegistry', () => {
     if (ambientPreflight.status === 'held') assert.match(ambientPreflight.reason, /publication boundary/);
     assert.equal(ambientCalls, 1);
     assert.equal(ambient.requests.length, 0);
-    assert.equal(qualifiedDefault.requests.length, 0, 'the router does not replace a durable ambient executor with the default');
+    assert.equal(qualifiedDefault, fixture.adapter, 'the router retains the exact source-qualified default instance');
     const direct = await registry.run({ ...governed, executor: { provider: 'codex-cli', sessionId: 'exact-thread' } });
     assert.equal(direct.exitStatus, 'failure');
     assert.equal(ambient.requests.length, 0, 'the registry also fences direct governed calls that skip workflow preflight');
@@ -146,8 +145,8 @@ describe('ImplementationAgentRegistry', () => {
 
     let defaultSelections = 0;
     const unknownFresh = new ImplementationAgentRegistry({
-      defaultProvider: 'worker-router',
-      providers: { 'worker-router': () => { defaultSelections += 1; return qualifiedDefault; } },
+      defaultProvider: 'luna-isolated',
+      providers: { 'luna-isolated': () => { defaultSelections += 1; return qualifiedDefault; } },
     });
     const unknownInitialRequest = {
       ...governed,
@@ -161,7 +160,7 @@ describe('ImplementationAgentRegistry', () => {
     assert.equal(initialDirect.durationMs, 0, 'the model-free hold reports no provider duration');
     assert.match(initialDirect.summary, /No model turn or worker process was started/);
     assert.equal(defaultSelections, 0, 'unknown governed identity is rejected before selecting even the default adapter');
-    assert.equal(qualifiedDefault.requests.length, 0);
+    fixture.cleanup();
   });
 
   it('reconstructs the persisted provider for resume even when the fresh default is different', async () => {

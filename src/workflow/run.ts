@@ -15,7 +15,7 @@ import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
 import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
-import type { AgentResult, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
+import type { AgentResult, ExecutorIdentity, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import {
   createCompletionInputFromResult,
   recordCompletionTelemetry,
@@ -26,7 +26,7 @@ import {
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
-import { activeRepairAdmission, generationlessAppServerPredecessor, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
+import { activeRepairAdmission, generationlessAppServerPredecessor, resolveRepairPredecessor, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { createBootstrapFailureRun } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
@@ -424,9 +424,16 @@ export async function runWorkflow(
           run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
           run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
         const pendingRepair = pendingReviewFix || pendingValidationRepair;
+        let repairPredecessor: ExecutorIdentity | undefined = run.executor;
+        if (pendingRepair) {
+          try { repairPredecessor = resolveRepairPredecessor(run); }
+          catch (error) {
+            return park(run, `${error instanceof Error ? error.message : String(error)} No model turn or worker process was started.`, store, now);
+          }
+        }
         const repairAttempt = pendingRepair ? activeRepairAdmission(run) : null;
         const repairFreshStart = repairAttempt?.snapshot.attemptBinding?.freshExecutor === true && repairAttempt.handoff === undefined;
-        const repairRuntimeGeneration = repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id;
+        const repairRuntimeGeneration = repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? repairPredecessor?.generation ?? run.id;
         // A restarted repair may execute only from its append-only admission
         // receipt. It must not inherit the initial run profile as a fallback.
         const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
@@ -663,12 +670,13 @@ export async function runWorkflow(
           ? undefined
           : Object.freeze({ required: true as const, continuation: workerAttemptKind !== 'initial' });
         let preparedGovernedInvocation: GovernedInvocationPreparation | undefined;
+        let qualifiedGovernedAgent: ImplementationAgent | undefined;
         if (governedPublication !== undefined) {
           const preflightRequest = {
             target,
             baseSha,
             ...(isIsolatedLuna || repairFreshStart || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-            ...(isIsolatedLuna || repairFreshStart || run.executor === undefined ? {} : { executor: run.executor }),
+            ...(isIsolatedLuna || repairFreshStart || repairPredecessor === undefined ? {} : { executor: repairPredecessor }),
             runtimeOwnership: {
               runId: run.id,
               generation: repairRuntimeGeneration,
@@ -707,6 +715,9 @@ export async function runWorkflow(
               [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
             );
           }
+          // Retain the exact source-qualified instance. Later callbacks may
+          // mutate the preparation object or its adapter after preflight.
+          qualifiedGovernedAgent = preparedGovernedInvocation.agent;
         }
         const workerSpawn = recordSpawnTelemetry(run, {
           role: 'worker',
@@ -728,6 +739,9 @@ export async function runWorkflow(
         let result: AgentResult;
         try {
           const capabilities = isIsolatedLuna ? undefined : await deps.resolveImplementationCapabilities?.();
+          if (!updateIfCurrent(store, workerHandoff, workerHandoff)) {
+            return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while implementation capabilities were resolving; preserving the newer Run.');
+          }
           const executionWorkspace = bootstrap?.workspacePath ?? options.admissionFence?.executionWorkspace;
           if (options.admissionFence !== undefined && executionWorkspace === undefined) {
             throw new Error('Mission admission cannot authorize an unbootstrapped worker without an explicit execution workspace.');
@@ -764,7 +778,7 @@ export async function runWorkflow(
             // is a durable continuation; its explicit exact-HEAD bootstrap
             // and newly copied bounded packet are the continuity authority.
             ...(isIsolatedLuna || repairFreshStart || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
-            ...(isIsolatedLuna || repairFreshStart || run.executor === undefined ? {} : { executor: run.executor }),
+            ...(isIsolatedLuna || repairFreshStart || repairPredecessor === undefined ? {} : { executor: repairPredecessor }),
             runtimeOwnership: {
               runId: run.id,
               generation: repairRuntimeGeneration,
@@ -772,8 +786,18 @@ export async function runWorkflow(
             },
             ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
           };
-          result = await (preparedGovernedInvocation?.status === 'qualified'
-            ? preparedGovernedInvocation.agent.run(implementationRequest)
+          if (governedPublication !== undefined &&
+              (qualifiedGovernedAgent === undefined || !hasGovernedPublicationConfinement(qualifiedGovernedAgent))) {
+            return park(
+              workerHandoff,
+              `Governed implementation is on hold because the source-qualified publication boundary changed after preflight. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+              store,
+              now,
+              [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
+            );
+          }
+          result = await (qualifiedGovernedAgent !== undefined
+            ? qualifiedGovernedAgent.run(implementationRequest)
             : implementation.run(implementationRequest));
         } catch (error) {
           if (isWorkspaceGuardFailure(error)) {

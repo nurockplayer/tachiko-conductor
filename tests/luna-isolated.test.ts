@@ -5,6 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { hasGovernedPublicationConfinement } from '../src/adapters/agent.js';
+import { CodexCliAdapter } from '../src/agents/codex-cli.js';
 import { IsolatedLunaAdapter, LUNA_ISOLATED_MODEL, LUNA_ISOLATED_PROVIDER, isolatedLunaEnvironment, parseTrustedLunaConfig } from '../src/agents/luna-isolated.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 import { createBootstrapGitFixture, type BootstrapGitFixture } from './bootstrap-fixture.js';
@@ -84,6 +85,97 @@ describe('qualified Luna runtime configuration', () => {
       assert.equal(copied.exitStatus, 'failure');
       assert.equal(existsSync(marker), false);
     } finally { rmSync(root, { recursive: true, force: true }); for (const fixture of fixtures.splice(0)) fixture.cleanup(); }
+  });
+
+  it('does not qualify subclasses or a genuine runtime after execution/preflight methods are replaced', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-luna-qualification-'));
+    try {
+      const home = path.join(root, 'home'); mkdirSync(home);
+      writeFileSync(path.join(home, 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
+      class OverriddenLuna extends IsolatedLunaAdapter {
+        override async run() { return { exitStatus: 'failure' as const, summary: 'overridden', durationMs: 0 }; }
+      }
+      const subclass = new OverriddenLuna({ codexHome: home, timeoutMs: 10_000 });
+      assert.equal(hasGovernedPublicationConfinement(subclass), false);
+      const replacedRun = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 10_000 });
+      (replacedRun as { run: IsolatedLunaAdapter['run'] }).run = async () => ({ exitStatus: 'failure', summary: 'replaced', durationMs: 0 });
+      assert.equal(hasGovernedPublicationConfinement(replacedRun), false);
+      const replacedPreflight = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 10_000 });
+      (replacedPreflight as { prepareGovernedInvocation: IsolatedLunaAdapter['prepareGovernedInvocation'] }).prepareGovernedInvocation = () => ({ status: 'held', reason: 'replacement' });
+      assert.equal(hasGovernedPublicationConfinement(replacedPreflight), false);
+      const prototypeReplacement = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 10_000 });
+      assert.equal(hasGovernedPublicationConfinement(prototypeReplacement), true);
+      const originalPrototypeRun = IsolatedLunaAdapter.prototype.run;
+      try {
+        IsolatedLunaAdapter.prototype.run = async () => ({ exitStatus: 'failure', summary: 'prototype replacement', durationMs: 0 });
+        assert.equal(hasGovernedPublicationConfinement(prototypeReplacement), false,
+          'changing the prototype after construction cannot change the captured original method identity');
+      } finally {
+        IsolatedLunaAdapter.prototype.run = originalPrototypeRun;
+      }
+      assert.equal(hasGovernedPublicationConfinement(prototypeReplacement), true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('refuses a nested CLI whose public run method was replaced before Luna creates it', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-luna-cli-origin-'));
+    const original = Object.getOwnPropertyDescriptor(CodexCliAdapter.prototype, 'run');
+    try {
+      const home = path.join(root, 'home'); const bin = path.join(root, 'bin');
+      mkdirSync(home); mkdirSync(bin);
+      writeFileSync(path.join(home, 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
+      let replacementCalls = 0;
+      const replacement = async function () { replacementCalls += 1; return { exitStatus: 'success' as const, summary: 'ambient replacement', durationMs: 0 }; };
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const target = { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 42 };
+      const plan = { runId: 'run-luna-cli-origin', target, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+      const identity = await bootstrap.plan(plan);
+      await bootstrap.prepare({ ...plan, existing: identity });
+      const adapter = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 10_000, path: bin });
+      Object.defineProperty(CodexCliAdapter.prototype, 'run', { ...original, value: replacement });
+      const result = await adapter.run({
+        target, baseSha: fixture.baseSha, workspacePath: identity.workspacePath, branch: identity.branch,
+        workspaceGuard: bootstrap.guard(identity), authority: 'embedded', instructions: 'bounded task',
+        execution: { profile: 'standard', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL,
+          reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' },
+        runtimeOwnership: { runId: plan.runId, generation: 'luna-generation' },
+        governedPublication: { required: true, continuation: false },
+      });
+      assert.equal(result.exitStatus, 'failure');
+      assert.match(result.diagnostics?.join(' ') ?? '', /GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED/);
+      assert.equal(replacementCalls, 0, 'the ambient method is rejected before invocation');
+    } finally {
+      if (original !== undefined) Object.defineProperty(CodexCliAdapter.prototype, 'run', original);
+      rmSync(root, { recursive: true, force: true });
+      for (const item of fixtures.splice(0)) item.cleanup();
+    }
+  });
+
+  it('checks original Luna method descriptors without invoking accessors', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-luna-descriptors-'));
+    const originalRun = Object.getOwnPropertyDescriptor(IsolatedLunaAdapter.prototype, 'run');
+    try {
+      const home = path.join(root, 'home'); mkdirSync(home);
+      writeFileSync(path.join(home, 'config.toml'), 'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');
+      const adapter = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 10_000 });
+      const replacement = async () => ({ exitStatus: 'failure' as const, summary: 'replacement', durationMs: 0 });
+      let getterCalls = 0;
+      Object.defineProperty(adapter, 'run', { configurable: true, get() { getterCalls += 1; return replacement; } });
+      assert.equal(hasGovernedPublicationConfinement(adapter), false);
+      assert.equal(getterCalls, 0, 'own accessors are rejected by descriptor without execution');
+      delete (adapter as { run?: IsolatedLunaAdapter['run'] }).run;
+
+      getterCalls = 0;
+      Object.defineProperty(IsolatedLunaAdapter.prototype, 'run', { configurable: true, get() { getterCalls += 1; return replacement; } });
+      assert.equal(hasGovernedPublicationConfinement(adapter), false);
+      assert.equal(getterCalls, 0, 'prototype accessors are rejected by descriptor without execution');
+      assert.equal(hasGovernedPublicationConfinement(adapter), false, 'the descriptor remains unqualified without invoking it again');
+      assert.equal(getterCalls, 0);
+    } finally {
+      if (originalRun !== undefined) Object.defineProperty(IsolatedLunaAdapter.prototype, 'run', originalRun);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('pins all capability-denying overrides after repository configuration', () => {

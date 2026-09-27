@@ -69,12 +69,29 @@ export function sameRepairExecutorIdentity(a: ExecutorIdentity | undefined, b: E
     (a === undefined) === (b === undefined);
 }
 
+/** Resolve the physical predecessor once, rejecting contradictory durable carriers. */
+export function resolveRepairPredecessor(run: {
+  readonly executor?: ExecutorIdentity;
+  readonly agentResult?: { readonly sessionId?: string; readonly executor?: ExecutorIdentity };
+}): ExecutorIdentity | undefined {
+  if (run.executor !== undefined && run.agentResult?.executor !== undefined &&
+      !sameRepairExecutorIdentity(run.executor, run.agentResult.executor)) {
+    throw new RepairAdmissionIdentityError('Repair admission held: persisted Run and implementation-result executor identities disagree. No model turn or worker process was started.');
+  }
+  const predecessor = run.executor ?? run.agentResult?.executor;
+  if (predecessor !== undefined && run.agentResult?.sessionId !== undefined &&
+      predecessor.sessionId !== run.agentResult.sessionId) {
+    throw new RepairAdmissionIdentityError('Repair admission held: persisted implementation session disagrees with its executor identity. No model turn or worker process was started.');
+  }
+  return predecessor;
+}
+
 /** The durable physical App Server identity, including the legacy result-only carrier. */
 export function generationlessAppServerPredecessor(run: {
   readonly executor?: ExecutorIdentity;
-  readonly agentResult?: { readonly executor?: ExecutorIdentity };
+  readonly agentResult?: { readonly sessionId?: string; readonly executor?: ExecutorIdentity };
 }): ExecutorIdentity | undefined {
-  const predecessor = run.executor ?? run.agentResult?.executor;
+  const predecessor = resolveRepairPredecessor(run);
   return predecessor?.provider === 'codex-app-server' &&
     (predecessor.generation === undefined || predecessor.generation.trim() === '')
     ? predecessor
@@ -125,12 +142,12 @@ export function createRepairAttemptBinding(run: {
   readonly executor?: ExecutorIdentity;
   readonly agentResult?: { readonly sessionId?: string; readonly executor?: ExecutorIdentity };
 }, execution: ResolvedExecutionConfiguration): RepairAttemptBinding {
-  const priorProviderCompatible = run.executor?.provider === execution.executor ||
-    (run.executor?.provider === 'codex-app-server' && execution.executor === 'codex-cli');
+  const predecessor = resolveRepairPredecessor(run);
+  const priorProviderCompatible = predecessor?.provider === execution.executor ||
+    (predecessor?.provider === 'codex-app-server' && execution.executor === 'codex-cli');
   const fresh = execution.executor === 'luna-isolated' || execution.executor === 'worker-router' ||
-    (run.executor !== undefined && !priorProviderCompatible) ||
-    (run.executor === undefined && run.agentResult?.sessionId !== undefined);
-  const predecessor = run.executor ?? run.agentResult?.executor;
+    (predecessor !== undefined && !priorProviderCompatible) ||
+    (predecessor === undefined && run.agentResult?.sessionId !== undefined);
   if (!fresh && predecessor?.provider === 'codex-app-server' &&
       (execution.executor === 'codex-cli' || execution.executor === 'codex-app-server') &&
       (predecessor.generation === undefined || predecessor.generation.trim() === '')) {
@@ -138,11 +155,11 @@ export function createRepairAttemptBinding(run: {
       'Repair admission held: the prior Codex App Server identity has no generation and cannot be continued safely. No model turn or worker process was started.',
     );
   }
-  const runtimeGeneration = fresh ? `repair-${randomUUID()}` : run.executor?.generation ?? `repair-${randomUUID()}`;
+  const runtimeGeneration = fresh ? `repair-${randomUUID()}` : predecessor?.generation ?? `repair-${randomUUID()}`;
   return {
     admissionIndex: run.repairAdmissions?.length ?? 0,
     startFixHistoryIndex: run.history.length,
-    ...(run.executor === undefined ? {} : { predecessorExecutor: { ...run.executor } }),
+    ...(predecessor === undefined ? {} : { predecessorExecutor: { ...predecessor } }),
     ...(run.agentResult?.sessionId === undefined ? {} : { predecessorSessionId: run.agentResult.sessionId }),
     freshExecutor: fresh,
     runtimeGeneration,
@@ -202,26 +219,36 @@ function isRepairAttemptBinding(value: unknown): value is RepairAttemptBinding {
     Number.isSafeInteger(binding.startFixHistoryIndex) && (binding.startFixHistoryIndex as number) >= 0 &&
     (binding.predecessorExecutor === undefined || isRepairExecutorIdentity(binding.predecessorExecutor)) &&
     (binding.predecessorSessionId === undefined || (typeof binding.predecessorSessionId === 'string' && binding.predecessorSessionId.trim() !== '')) &&
+    (binding.predecessorExecutor === undefined || binding.predecessorSessionId === undefined ||
+      binding.predecessorExecutor.sessionId === binding.predecessorSessionId) &&
     typeof binding.freshExecutor === 'boolean' && typeof binding.runtimeGeneration === 'string' && binding.runtimeGeneration.trim() !== '';
 }
 
 export function isRepairExecutorIdentity(value: unknown): value is ExecutorIdentity {
-  if (typeof value !== 'object' || value === null) return false;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
   const identity = value as Record<string, unknown>;
-  return typeof identity.provider === 'string' && identity.provider.trim() !== '' &&
+  return Object.keys(identity).every((key) => key === 'provider' || key === 'sessionId' || key === 'generation') &&
+    typeof identity.provider === 'string' && identity.provider.trim() !== '' &&
     typeof identity.sessionId === 'string' && identity.sessionId.trim() !== '' &&
     (identity.generation === undefined || (typeof identity.generation === 'string' && identity.generation.trim() !== ''));
 }
 
 export function isRepairHandoffRecord(value: unknown): value is RepairHandoffRecord {
-  if (typeof value !== 'object' || value === null) return false;
+  if (!isClosedRecord(value, ['admissionHistoryIndex', 'startFixHistoryIndex', 'outcome'])) return false;
   const record = value as Record<string, unknown>;
   if (!Number.isSafeInteger(record.admissionHistoryIndex) || (record.admissionHistoryIndex as number) < 0 ||
       !Number.isSafeInteger(record.startFixHistoryIndex) || (record.startFixHistoryIndex as number) < 0 ||
       typeof record.outcome !== 'object' || record.outcome === null) return false;
   const outcome = record.outcome as Record<string, unknown>;
-  return outcome.kind === 'executor' ? isRepairExecutorIdentity(outcome.identity) :
-    outcome.kind === 'sessionless' && outcome.provider === 'worker-router';
+  return outcome.kind === 'executor'
+    ? isClosedRecord(outcome, ['kind', 'identity']) && isRepairExecutorIdentity(outcome.identity)
+    : outcome.kind === 'sessionless' && isClosedRecord(outcome, ['kind', 'provider']) && outcome.provider === 'worker-router';
+}
+
+function isClosedRecord(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const actual = Object.keys(value);
+  return actual.length === keys.length && actual.every((key) => keys.includes(key));
 }
 
 /** Current unfinished start_fix is the only receipt that can authorize repair execution. */
@@ -261,16 +288,20 @@ export function activeRepairAdmission(run: {
     event.repairHandoff.startFixHistoryIndex === startFixHistoryIndex);
   const handoff = handoffEvent?.event.repairHandoff;
   const binding = snapshot.attemptBinding!;
+  let predecessor: ExecutorIdentity | undefined;
+  try { predecessor = resolveRepairPredecessor(run); } catch { return null; }
   if (handoff === undefined) {
-    if (!sameRepairExecutorIdentity(run.executor, binding.predecessorExecutor) ||
-        (run.agentResult?.executor !== undefined && !sameRepairExecutorIdentity(run.agentResult.executor, binding.predecessorExecutor)) ||
+    if (!sameRepairExecutorIdentity(predecessor, binding.predecessorExecutor) ||
         run.agentResult?.sessionId !== binding.predecessorSessionId) return null;
   } else if (handoff.outcome.kind === 'sessionless') {
     if (run.executor !== undefined || run.agentResult?.executor !== undefined || run.agentResult?.sessionId !== undefined) return null;
   } else {
     const adopted = handoff.outcome.identity;
-    if (!sameRepairExecutorIdentity(run.executor, adopted) ||
-        (run.agentResult?.executor !== undefined && !sameRepairExecutorIdentity(run.agentResult.executor, adopted)) ||
+    // A legacy result-only predecessor is usable before the first handoff,
+    // but after adoption the canonical Run executor is mandatory and must
+    // remain the exact persisted identity.
+    if (run.executor === undefined || !sameRepairExecutorIdentity(run.executor, adopted) ||
+        !sameRepairExecutorIdentity(predecessor, adopted) ||
         (run.agentResult?.sessionId !== undefined && run.agentResult.sessionId !== adopted.sessionId)) return null;
   }
   return { snapshot, admissionHistoryIndex, startFixHistoryIndex, ...(handoff === undefined ? {} : { handoff }) };

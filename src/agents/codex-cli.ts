@@ -295,6 +295,16 @@ export class CodexCliAdapter implements ImplementationAgent {
   }
 }
 
+const ORIGINAL_CODEX_CLI_RUN = CodexCliAdapter.prototype.run;
+
+/** Read-only origin check for Luna's privately confined nested CLI adapter. */
+export function hasOriginalCodexCliRun(adapter: object): boolean {
+  if (!(adapter instanceof CodexCliAdapter) || Object.getPrototypeOf(adapter) !== CodexCliAdapter.prototype ||
+      Object.getOwnPropertyDescriptor(adapter, 'run') !== undefined) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(CodexCliAdapter.prototype, 'run');
+  return descriptor !== undefined && 'value' in descriptor && descriptor.value === ORIGINAL_CODEX_CLI_RUN;
+}
+
 function buildPrompt(request: ImplementationRequest): string {
   const instructions = request.authority === 'live-target'
     ? request.supplementalInstructions

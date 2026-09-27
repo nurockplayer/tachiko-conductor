@@ -560,6 +560,114 @@ class ProviderBuildTest(unittest.TestCase):
         bootstrap.unlink()
         bootstrap_copy.rename(bootstrap)
 
+    def test_heartbeat_log_creation_append_and_bounded_trim_use_private_file(self) -> None:
+        log_path = self.module.ROOT / "heartbeat.log"
+        self.module.log("first entry")
+        self.assertEqual(stat.S_IMODE(log_path.stat().st_mode), 0o600)
+        self.module.log("second entry")
+        self.assertIn("first entry", log_path.read_text(encoding="utf-8"))
+        self.assertIn("second entry", log_path.read_text(encoding="utf-8"))
+        old_limit = self.module.MAX_HEARTBEAT_LOG
+        try:
+            self.module.MAX_HEARTBEAT_LOG = 1024
+            log_path.write_bytes(b"x" * 1800)
+            log_path.chmod(0o600)
+            self.module.log("trimmed tail")
+        finally:
+            self.module.MAX_HEARTBEAT_LOG = old_limit
+        self.assertLessEqual(log_path.stat().st_size, 1024)
+        self.assertIn(b"trimmed tail", log_path.read_bytes())
+
+    def test_heartbeat_log_rejects_unsafe_endpoints_without_normalizing_them(self) -> None:
+        root = self.root / "unsafe-endpoint-root"
+        root.mkdir(mode=0o700)
+        self.module.ROOT = root
+        victim = self.root / "log-victim"
+        victim.write_bytes(b"victim bytes remain exact\n")
+        victim.chmod(0o640)
+        victim_before = (victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns)
+
+        for name, target in (("symlink", victim), ("dangling", self.root / "missing-victim")):
+            with self.subTest(endpoint=name):
+                link = root / "heartbeat.log"
+                link.symlink_to(target)
+                with self.assertRaises((RuntimeError, OSError)):
+                    self.module.log("must not follow")
+                self.assertTrue(link.is_symlink())
+                link.unlink()
+                self.assertEqual((victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns), victim_before)
+
+        log_path = root / "heartbeat.log"
+        log_path.write_bytes(b"unsafe mode remains")
+        log_path.chmod(0o644)
+        mode_before = (log_path.read_bytes(), stat.S_IMODE(log_path.stat().st_mode), log_path.stat().st_mtime_ns)
+        with self.assertRaisesRegex(RuntimeError, "unsafe heartbeat log endpoint"):
+            self.module.log("must not chmod")
+        self.assertEqual((log_path.read_bytes(), stat.S_IMODE(log_path.stat().st_mode), log_path.stat().st_mtime_ns), mode_before)
+        log_path.unlink()
+
+        log_path.mkdir(mode=0o700)
+        with self.assertRaisesRegex(RuntimeError, "unsafe heartbeat log endpoint"):
+            self.module.log("must not write directory")
+        self.assertTrue(log_path.is_dir())
+        log_path.rmdir()
+
+        log_path.write_bytes(b"foreign owner remains untouched")
+        log_path.chmod(0o600)
+        foreign_before = (log_path.read_bytes(), stat.S_IMODE(log_path.stat().st_mode), log_path.stat().st_mtime_ns)
+        real_fstat = self.module.os.fstat
+        expected_inode = log_path.stat().st_ino
+
+        def foreign_fstat(descriptor: int):
+            result = real_fstat(descriptor)
+            if result.st_ino != expected_inode:
+                return result
+            fields = list(result)
+            fields[4] = os.geteuid() + 1
+            return os.stat_result(fields)
+
+        with mock.patch.object(self.module.os, "fstat", side_effect=foreign_fstat):
+            with self.assertRaisesRegex(RuntimeError, "unsafe heartbeat log endpoint"):
+                self.module.log("must not append as foreign owner")
+        self.assertEqual((log_path.read_bytes(), stat.S_IMODE(log_path.stat().st_mode), log_path.stat().st_mtime_ns), foreign_before)
+
+    def test_heartbeat_log_rejects_symlink_replacement_between_stat_and_open(self) -> None:
+        root = self.root / "racing-log-root"
+        root.mkdir(mode=0o700)
+        self.module.ROOT = root
+        endpoint = root / "heartbeat.log"
+        endpoint.write_bytes(b"safe initial entry\n")
+        endpoint.chmod(0o600)
+        victim = self.root / "racing-victim"
+        victim.write_bytes(b"victim bytes remain exact\n")
+        victim.chmod(0o640)
+        before = (victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns)
+        real_open = self.module.os.open
+        replaced = False
+
+        def replace_before_open(file, flags, mode=0o777, *, dir_fd=None):
+            nonlocal replaced
+            if not replaced and file == "heartbeat.log" and dir_fd is not None:
+                replaced = True
+                os.unlink(file, dir_fd=dir_fd)
+                os.symlink(victim, file, dir_fd=dir_fd)
+            return real_open(file, flags, mode, dir_fd=dir_fd)
+
+        with mock.patch.object(self.module.os, "open", side_effect=replace_before_open):
+            with self.assertRaises(OSError):
+                self.module.log("must not follow a replacement")
+        self.assertTrue(replaced)
+        self.assertTrue(endpoint.is_symlink())
+        self.assertEqual((victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns), before)
+
+    def test_outer_heartbeat_log_failure_reports_to_stderr_without_retry(self) -> None:
+        stderr = io.StringIO()
+        with mock.patch.object(self.module, "log") as log, mock.patch.object(self.module.sys, "stderr", stderr):
+            self.module.report_log_failure("heartbeat error; no wake: rejected private root")
+        log.assert_not_called()
+        self.assertIn("heartbeat log unavailable", stderr.getvalue())
+        self.assertIn("rejected private root", stderr.getvalue())
+
 
 class HeartbeatTest(unittest.TestCase):
     def setUp(self) -> None:
@@ -682,6 +790,33 @@ class HeartbeatTest(unittest.TestCase):
         self.assertIn("reviewThreads(first: 100)", source)
         self.assertIn("MAX_POLL_QUERY_COST = 100", source)
 
+    def test_logging_refuses_unsafe_root_without_mutation_and_rejects_symlink_log_without_recursion(self) -> None:
+        private_parent = self.account_home / ".tachiko-conductor"
+        private_parent.mkdir(mode=0o700)
+        unsafe_root = private_parent / "unsafe-heartbeat"
+        unsafe_root.mkdir(mode=0o755)
+        victim = self.root / "log-victim"
+        victim.write_bytes(b"victim bytes remain exact\n")
+        unsafe_log = unsafe_root / "heartbeat.log"
+        unsafe_log.symlink_to(victim)
+        before = (victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns)
+        unsafe_mode = stat.S_IMODE(unsafe_root.stat().st_mode)
+        env = self.env | {"SCD_HEARTBEAT_TEST_ROOT": str(unsafe_root)}
+        rejected = self.invoke("run", "--prime", env=env, check=False)
+        self.assertEqual(rejected.returncode, 1)
+        self.assertIn("lock error; no wake", rejected.stderr)
+        self.assertEqual(stat.S_IMODE(unsafe_root.stat().st_mode), unsafe_mode)
+        self.assertTrue(unsafe_log.is_symlink(), "unsafe-root validation must preserve an existing log symlink")
+        self.assertEqual((victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns), before)
+
+        log_link = self.state_root / "heartbeat.log"
+        log_link.symlink_to(victim)
+        linked = self.invoke("run", "--prime", check=False)
+        self.assertEqual(linked.returncode, 1)
+        self.assertIn("heartbeat log unavailable", linked.stderr)
+        self.assertTrue(log_link.is_symlink(), "unsafe endpoint is never normalized or replaced")
+        self.assertEqual((victim.read_bytes(), stat.S_IMODE(victim.stat().st_mode), victim.stat().st_mtime_ns), before)
+
     def test_loaded_config_rejects_pinned_admission_from_another_home(self) -> None:
         config_path = self.state_root / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -689,28 +824,28 @@ class HeartbeatTest(unittest.TestCase):
         config_path.write_text(json.dumps(config), encoding="utf-8")
         result = self.invoke("run", check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("pinned heartbeat admission home does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+        self.assertIn("pinned heartbeat admission home does not match", result.stderr)
         self.assertEqual(self.records(), [], "stale pinned account root must be rejected before wake")
         config["admission"]["home"] = str(self.account_home)
         config["admission"]["registry"] = str(self.root / "stale-registry.json")
         config_path.write_text(json.dumps(config), encoding="utf-8")
         result = self.invoke("run", check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("pinned heartbeat admission registry does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+        self.assertIn("pinned heartbeat admission registry does not match", result.stderr)
         self.assertEqual(self.records(), [])
         config["admission"]["registry"] = str(self.account_home / ".tachiko-conductor/mission-admission/registry.json")
         config["admission"]["runs"] = str(self.root / "stale-runs")
         config_path.write_text(json.dumps(config), encoding="utf-8")
         result = self.invoke("run", check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("pinned heartbeat Run directory does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+        self.assertIn("pinned heartbeat Run directory does not match", result.stderr)
         self.assertEqual(self.records(), [])
         config["admission"]["runs"] = str(self.account_home / ".tachiko-conductor/runs")
         config["admission"]["receipts"] = str(self.root / "stale-receipts")
         config_path.write_text(json.dumps(config), encoding="utf-8")
         result = self.invoke("run", check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("pinned heartbeat receipt directory does not match", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+        self.assertIn("pinned heartbeat receipt directory does not match", result.stderr)
         self.assertEqual(self.records(), [])
 
     def test_generated_provider_identity_passes_full_config_validation(self) -> None:
@@ -734,13 +869,13 @@ class HeartbeatTest(unittest.TestCase):
         try:
             result = self.invoke("run", check=False)
             self.assertEqual(result.returncode, 1)
-            self.assertIn("symlink or wrong filesystem type", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+            self.assertIn("symlink or wrong filesystem type", result.stderr)
             self.assertEqual(self.records(), [], "retargeted account root is rejected before wake")
             self.assertFalse((alternate / "mission-admission").exists())
         finally:
             conductor.unlink()
 
-        conductor.mkdir()
+        conductor.mkdir(mode=0o700)
         mission = conductor / "mission-admission"
         alternate_mission = self.root / "alternate-mission-admission"
         alternate_mission.mkdir()
@@ -748,13 +883,13 @@ class HeartbeatTest(unittest.TestCase):
         try:
             result = self.invoke("run", check=False)
             self.assertEqual(result.returncode, 1)
-            self.assertIn("symlink or wrong filesystem type", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+            self.assertIn("symlink or wrong filesystem type", result.stderr)
             self.assertEqual(self.records(), [])
             self.assertFalse((alternate_mission / "registry.json").exists())
         finally:
             mission.unlink()
 
-        mission.mkdir()
+        mission.mkdir(mode=0o700)
         canonical_receipts = mission / "heartbeat-receipts"
         alternate_receipts = self.root / "alternate-heartbeat-receipts"
         alternate_receipts.mkdir()
@@ -762,7 +897,7 @@ class HeartbeatTest(unittest.TestCase):
         try:
             result = self.invoke("run", check=False)
             self.assertEqual(result.returncode, 1)
-            self.assertIn("symlink or wrong filesystem type", (self.state_root / "heartbeat.log").read_text(encoding="utf-8"))
+            self.assertIn("symlink or wrong filesystem type", result.stderr)
             self.assertEqual(self.records(), [])
             self.assertEqual(list(alternate_receipts.iterdir()), [])
         finally:

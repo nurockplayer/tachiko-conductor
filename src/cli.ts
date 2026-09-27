@@ -695,10 +695,11 @@ export function parseIssueRef(raw: string): IssueTarget {
   if (match === null) {
     throw new Error(`Invalid issue reference "${raw}": expected owner/repo#123.`);
   }
+  const repository = canonicalizeMissionEvidence({ repository: `${match[1] ?? ''}/${match[2] ?? ''}`, issue: 1 }).repository.split('/');
   return {
     kind: 'issue',
-    owner: match[1] ?? '',
-    repo: match[2] ?? '',
+    owner: repository[0]!,
+    repo: repository[1]!,
     issueNumber: parseIssueNumber(match[3] ?? ''),
   };
 }
@@ -727,7 +728,8 @@ export async function githubSnapshotCommand(adapter: GitHubAdapter, ref: string)
 }
 
 function targetsEqual(a: Target, b: Target): boolean {
-  if (a.kind !== b.kind || a.owner !== b.owner || a.repo !== b.repo) return false;
+  const canonicalRepository = (target: Target) => canonicalizeMissionEvidence({ repository: `${target.owner}/${target.repo}`, issue: 1 }).repository;
+  if (a.kind !== b.kind || canonicalRepository(a) !== canonicalRepository(b)) return false;
   if (a.kind === 'issue') return (b as IssueTarget).issueNumber === (a as IssueTarget).issueNumber;
   return (b as RepositoryTarget).branch === (a as RepositoryTarget).branch;
 }

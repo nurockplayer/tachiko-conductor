@@ -8,7 +8,7 @@ import {
 import { recordWaitTelemetry } from './telemetry.js';
 import type { ReviewResult, Run, TransitionInput, TransitionType, ValidationResult, WorkflowState } from './types.js';
 import { isValidationResultCoherent } from './validation.js';
-import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairExecutorIdentity, isRepairHandoffCompatible, sameRepairExecutorIdentity, type RepairExecutorHandoff, type RepairHandoffRecord } from './repair-admission.js';
+import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairExecutorIdentity, isRepairHandoffCompatible, resolveRepairPredecessor, sameRepairExecutorIdentity, type RepairExecutorHandoff, type RepairHandoffRecord } from './repair-admission.js';
 
 /** Why a transition was rejected. */
 export type InvalidTransitionCode =
@@ -357,7 +357,14 @@ function validateRepairHandoff(run: Run, result: NonNullable<TransitionInput['re
   const identity = result.executor;
   if (!isRepairExecutorIdentity(identity) || identity.sessionId.trim() === '' ||
       (result.sessionId !== undefined && result.sessionId !== identity.sessionId)) return hold();
-  const outcome: RepairExecutorHandoff = { kind: 'executor', identity: { ...identity } };
+  const outcome: RepairExecutorHandoff = {
+    kind: 'executor',
+    identity: {
+      provider: identity.provider,
+      sessionId: identity.sessionId,
+      ...(identity.generation === undefined ? {} : { generation: identity.generation }),
+    },
+  };
   if (!isRepairHandoffCompatible(provider, snapshot.attemptBinding!, outcome, continued ? active.handoff?.outcome : undefined)) return hold();
   return { admissionHistoryIndex, startFixHistoryIndex, outcome };
 }
@@ -397,11 +404,12 @@ function assertPayload(
     const admission = input.repairAdmission;
     const authority = run.repairTaskShapeAuthority;
     const binding = admission.attemptBinding;
+    let coherentPredecessor = false;
+    try { coherentPredecessor = sameRepairExecutorIdentity(binding?.predecessorExecutor, resolveRepairPredecessor(run)); } catch { /* rejected below */ }
     if (from !== 'CHANGES_REQUESTED' || authority === undefined || run.headSha === undefined || run.pullRequest === undefined ||
         !isRepairAdmissionSnapshot(admission) || admission.attemptBinding?.admissionIndex !== (run.repairAdmissions?.length ?? 0) ||
         admission.attemptBinding.startFixHistoryIndex !== run.history.length || admission.authorityRevision !== authority.revision ||
-        !sameRepairExecutorIdentity(binding?.predecessorExecutor, run.executor) ||
-        (run.agentResult?.executor !== undefined && !sameRepairExecutorIdentity(binding?.predecessorExecutor, run.agentResult.executor)) ||
+        !coherentPredecessor ||
         binding?.predecessorSessionId !== run.agentResult?.sessionId ||
         admission.taskShape !== authority.shape || admission.headSha !== run.headSha || admission.pullRequestNumber !== run.pullRequest.number ||
         admission.finding !== (run.validationResult?.status === 'failed' && run.reviewResult?.verdict !== 'request_changes' ? 'validation_failed' : 'review_blocking')) {
@@ -820,17 +828,23 @@ export function applyTransition(
   if (input.repairAgentResult === undefined) return recorded;
   const handoff = recorded.history.at(-1)?.repairHandoff;
   const { executor: _previousExecutor, agentResult: previousAgentResult, ...withoutPriorExecutor } = recorded;
-  const identity = handoff?.outcome.kind === 'executor' ? handoff.outcome.identity : undefined;
+  const adopted = handoff?.outcome.kind === 'executor'
+    ? {
+      provider: handoff.outcome.identity.provider,
+      sessionId: handoff.outcome.identity.sessionId,
+      ...(handoff.outcome.identity.generation === undefined ? {} : { generation: handoff.outcome.identity.generation }),
+    }
+    : undefined;
   if (previousAgentResult === undefined) {
-    return { ...withoutPriorExecutor, ...(identity === undefined ? {} : { executor: identity }) };
+    return { ...withoutPriorExecutor, ...(adopted === undefined ? {} : { executor: adopted }) };
   }
   const { executor: _staleResultExecutor, sessionId: _staleResultSession, ...resultWithoutPriorIdentity } = previousAgentResult;
   return {
     ...withoutPriorExecutor,
-    ...(identity === undefined ? {} : { executor: identity }),
+    ...(adopted === undefined ? {} : { executor: adopted }),
     agentResult: {
       ...resultWithoutPriorIdentity,
-      ...(identity === undefined ? {} : { executor: identity, sessionId: identity.sessionId }),
+      ...(adopted === undefined ? {} : { executor: adopted, sessionId: adopted.sessionId }),
     },
   };
 }

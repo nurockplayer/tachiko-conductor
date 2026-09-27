@@ -446,6 +446,16 @@ describe('JsonFileStore — persistence round-trips', () => {
         eventType: 'repair_executor_handoff',
         change: (identity: Record<string, unknown>) => { identity.sessionId = 'session-B'; },
       },
+      {
+        label: 'first handoff identity extra on valid App Server identity',
+        eventType: 'repair_executor_handoff',
+        change: (identity: Record<string, unknown>) => { identity.extra = true; },
+      },
+      {
+        label: 'continuation identity extra on valid App Server identity',
+        eventType: 'repair_executor_continued',
+        change: (identity: Record<string, unknown>) => { identity.extra = true; },
+      },
     ];
     for (const { label, eventType, change } of corruptions) {
       const damaged = JSON.parse(original) as Record<string, any>;
@@ -456,6 +466,13 @@ describe('JsonFileStore — persistence round-trips', () => {
       assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/, label);
       assert.equal(readFileSync(file, 'utf8'), corruptBytes, 'rejected replay leaves persisted corrupt bytes untouched');
     }
+    const missingCanonicalExecutor = JSON.parse(original) as Record<string, any>;
+    delete missingCanonicalExecutor.executor;
+    const missingCanonicalBytes = JSON.stringify(missingCanonicalExecutor);
+    writeFileSync(file, missingCanonicalBytes, 'utf8');
+    assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/,
+      'a post-handoff result carrier cannot substitute for the canonical Run executor');
+    assert.equal(readFileSync(file, 'utf8'), missingCanonicalBytes, 'rejected post-handoff history is never rewritten');
     const generationless = JSON.parse(original) as Record<string, any>;
     delete generationless.repairAdmissions[0].attemptBinding.predecessorExecutor.generation;
     const invalidAdmissionBytes = JSON.stringify(generationless);
@@ -487,20 +504,26 @@ describe('JsonFileStore — persistence round-trips', () => {
     const file = path.join(dir, `${run.id}.json`);
     const original = readFileSync(file, 'utf8');
     const forged = { kind: 'executor', identity: { provider: 'worker-router', sessionId: 'invented-session' } };
-    for (const corruption of ['first-only', 'continuation-only'] as const) {
+    const corruptions: Array<[string, (handoffs: any[]) => void]> = [
+      ['first-only executor-kind WorkerRouter', (handoffs) => { handoffs[0].repairHandoff.outcome = forged; }],
+      ['continuation-only executor-kind WorkerRouter', (handoffs) => { handoffs[1].repairHandoff.outcome = forged; }],
+      ['first-only record extra', (handoffs) => { handoffs[0].repairHandoff.extra = true; }],
+      ['continuation-only record extra', (handoffs) => { handoffs[1].repairHandoff.extra = true; }],
+      ['first-only outcome extra', (handoffs) => { handoffs[0].repairHandoff.outcome.extra = true; }],
+      ['continuation-only outcome extra', (handoffs) => { handoffs[1].repairHandoff.outcome.extra = true; }],
+    ];
+    for (const [corruption, mutate] of corruptions) {
       const damaged = JSON.parse(original) as Record<string, any>;
       const handoffs = damaged.history.filter((entry: { type: string }) => entry.type === 'repair_executor_handoff' || entry.type === 'repair_executor_continued');
-      if (corruption === 'first-only') {
-        handoffs[0].repairHandoff.outcome = forged;
-      } else {
-        handoffs[1].repairHandoff.outcome = forged;
+      mutate(handoffs);
+      if (corruption === 'continuation-only executor-kind WorkerRouter') {
         damaged.executor = forged.identity;
         damaged.agentResult.executor = forged.identity;
         damaged.agentResult.sessionId = forged.identity.sessionId;
       }
       const corruptBytes = JSON.stringify(damaged);
       writeFileSync(file, corruptBytes, 'utf8');
-      assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/, `${corruption} executor-kind WorkerRouter handoff is rejected`);
+      assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/, `${corruption} persisted handoff is rejected`);
       assert.equal(readFileSync(file, 'utf8'), corruptBytes, `${corruption} rejected history is not rewritten`);
     }
   });

@@ -20,6 +20,7 @@ import {
   createRepairAdmissionSnapshot,
   decideRepairAdmission,
   generationlessAppServerPredecessor,
+  resolveRepairPredecessor,
   RepairAdmissionIdentityError,
   type RepairAttemptBinding,
   type RepairFindingKind,
@@ -128,11 +129,7 @@ function renderFailure(prefix: string, error: unknown): string {
 }
 
 function staleReviewOutcome(runId: string, fallback: Run, store: RunStore): ReviewLoopResult {
-  const current = store.read(runId) ?? fallback;
-  const reason = 'Review stopped because the durable Run changed; preserving the newer Run.';
-  return isTerminal(current.state)
-    ? { outcome: 'failed', run: current, reason }
-    : { outcome: 'needs_human', run: current, reason };
+  return supersededRepairAdmission(runId, fallback, store);
 }
 
 function updateReviewRun(store: RunStore, expected: Run, next: Run): boolean {
@@ -392,6 +389,11 @@ export async function runReviewLoop(
       let repairStartsWithFreshExecutor = false;
       let repairAttempt = activeRepairAdmission(run);
       const authority = run.repairTaskShapeAuthority;
+      let physicalPredecessor;
+      try { physicalPredecessor = resolveRepairPredecessor(run); }
+      catch (error) {
+        return parkRepairAuthority(run, `${errorMessage(error)}${deps.governedPublicationRequired ? ` Governed repair also requires the source-qualified publication boundary.` : ''}`, store, now);
+      }
       const legacyAppServer = generationlessAppServerPredecessor(run);
       if (authority === undefined && repairExecution?.executor !== 'luna-isolated' && legacyAppServer !== undefined) {
         return parkRepairAuthority(
@@ -540,10 +542,10 @@ export async function runReviewLoop(
           baseSha: progressBaseSha ?? '',
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.agentResult?.sessionId !== undefined ? { sessionId: run.agentResult.sessionId } : {}),
-          ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.executor !== undefined ? { executor: run.executor } : {}),
+          ...(!repairStartsWithFreshExecutor && !isolatedLuna && physicalPredecessor !== undefined ? { executor: physicalPredecessor } : {}),
           runtimeOwnership: {
             runId: run.id,
-            generation: repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id,
+            generation: repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? physicalPredecessor?.generation ?? run.id,
             ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
           },
           governedPublication,
@@ -630,6 +632,9 @@ export async function runReviewLoop(
         if (outcome !== null) return outcome;
         throw error;
       }
+      if (store.updateIfUnchanged === undefined || !store.updateIfUnchanged(workerHandoff, workerHandoff)) {
+        return supersededRepairAdmission(run.id, workerHandoff, store);
+      }
       // Strengthen physical workspace evidence while execution is still
       // provably pre-worker, so a normal overlap rejection can release the
       // admission generation through the CLI pre-execution path.
@@ -647,6 +652,11 @@ export async function runReviewLoop(
         if (outcome !== null) return outcome;
         throw error;
       }
+      if (deps.governedPublicationRequired === true &&
+          (governedRepairAgent === undefined || !hasGovernedPublicationConfinement(governedRepairAgent))) {
+        const reason = `Governed review repair is on hold because the source-qualified publication boundary changed after preflight. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`;
+        return parkRepairAuthority(run, reason, store, now, [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION]);
+      }
       let fixResult;
       try {
         fixResult = await (governedRepairAgent ?? implementation).run({
@@ -661,10 +671,11 @@ export async function runReviewLoop(
             deps.assertCurrentMutation?.();
             deps.assertCanPublish?.();
           },
-          ...(repairStartsWithFreshExecutor || isolatedLuna ? {} : { sessionId: run.agentResult?.sessionId, executor: run.executor }),
+          ...(repairStartsWithFreshExecutor || isolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
+          ...(repairStartsWithFreshExecutor || isolatedLuna || physicalPredecessor === undefined ? {} : { executor: physicalPredecessor }),
           runtimeOwnership: {
             runId: run.id,
-            generation: repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? run.executor?.generation ?? run.id,
+            generation: repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? physicalPredecessor?.generation ?? run.id,
             ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
           },
           ...(deps.governedPublicationRequired === true ? {

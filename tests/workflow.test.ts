@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -22,10 +22,12 @@ import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import { AppServerUnavailableError, CodexAppServerAdapter } from '../src/agents/codex-app-server.js';
+import { CodexCliAdapter } from '../src/agents/codex-cli.js';
+import { hasGovernedPublicationConfinement } from '../src/agents/luna-isolated.js';
 import { WorkerRouterAdapter } from '../src/agents/worker-router.js';
-import { qualifyGovernedPublicationAdapter } from '../src/adapters/agent.js';
 import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 import { createBootstrapGitFixture } from './bootstrap-fixture.js';
+import { createGenuineLunaFixture } from './support/genuine-luna.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
@@ -132,9 +134,7 @@ class FakeImplementation implements ImplementationAgent {
   readonly requests: ImplementationRequest[] = [];
   readonly preflightRequests: ImplementationRequest[] = [];
 
-  constructor(private readonly outcomes: AgentResult[]) {
-    qualifyGovernedPublicationAdapter(this);
-  }
+  constructor(private readonly outcomes: AgentResult[]) {}
 
   prepareGovernedInvocation(request: ImplementationRequest) {
     this.preflightRequests.push(request);
@@ -214,7 +214,7 @@ function reviewingRun(store: RunStore, id = 'run-1', headSha = HEAD): Run {
   return run;
 }
 
-describe('runWorkflow', () => {
+describe('runWorkflow', { concurrency: false }, () => {
   it('durably holds unsupported governed fresh and continuation runs before spawn telemetry or provider fallback', async (t) => {
     for (const mode of ['fresh', 'continuation', 'unknown-crash', 'forged-preparation'] as const) {
       await t.test(mode, async () => {
@@ -722,32 +722,353 @@ describe('runWorkflow', () => {
       config: { schemaVersion: 1, revision: 'review-repair-governed-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
     });
     const store = new MemoryStore();
-    store.create(createRun(TARGET, T0, 'workflow-governed-review-repair'));
+    reviewingRun(store, 'workflow-governed-review-repair', HEAD);
     const admitted = registry.admit({ laneId: 'run:workflow-governed-review-repair', role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: 'workflow-governed-review-repair' } });
     assert.equal(admitted.outcome, 'admitted');
     if (admitted.outcome !== 'admitted') return;
     try {
-      const implementation = new FakeImplementation([successResult(HEAD), successResult(HEAD2, 'repair')]);
+      const implementation = new FakeImplementation([successResult(HEAD2, 'must not run')]);
       const result = await runWorkflow(
-        { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer: new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrap: new FakeBootstrap() },
+        { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([requestChanges(HEAD)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrap: new FakeBootstrap() },
         'workflow-governed-review-repair',
         { maxReviewAttempts: 3, now: () => T0, admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: '/tmp/governed-review-repair' } },
       );
-      assert.equal(result.outcome, 'merge_ready');
-      assert.equal(implementation.requests.length, 2);
-      assert.deepEqual(implementation.requests.map((request) => request.governedPublication), [
-        { required: true, continuation: false },
-        { required: true, continuation: true },
-      ], 'review repair receives its own explicit host confinement preflight requirement');
-      assert.equal(implementation.requests[1]?.runtimeOwnership?.runId, result.run.id);
-      assert.equal(implementation.requests[1]?.sessionId, result.run.agentResult?.sessionId);
-      for (const index of [0, 1]) {
-        assert.equal(implementation.preflightRequests[index]?.workspacePath, implementation.requests[index]?.workspacePath);
-        assert.equal(implementation.preflightRequests[index]?.branch, implementation.requests[index]?.branch);
-        assert.equal(implementation.preflightRequests[index]?.workspaceGuard, implementation.requests[index]?.workspaceGuard,
-          'governed preflight and implementation share the same prepared guard');
-      }
+      assert.equal(result.outcome, 'needs_human', 'the selected fake adapter cannot claim source-owned governed confinement');
+      assert.equal(implementation.preflightRequests.length, 1);
+      assert.deepEqual(implementation.preflightRequests[0]?.governedPublication, { required: true, continuation: true },
+        'review repair receives its explicit continuation preflight requirement');
+      assert.equal(implementation.preflightRequests[0]?.runtimeOwnership?.runId, result.run.id);
+      assert.equal(implementation.requests.length, 0, 'the unqualified adapter is held before any worker call');
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('rechecks the exact genuine Luna instance at invocation entry after synchronous callbacks', async () => {
+    const id = 'workflow-luna-entry-recheck';
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-luna-entry-recheck-'));
+    const luna = await createGenuineLunaFixture(id, { deferPrepare: true });
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'luna-entry-recheck-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const store = new MemoryStore();
+    const sourceHead = luna.identity.baseSha;
+    assert.equal(hasGovernedPublicationConfinement(luna.adapter), true, 'fixture starts with its constructor-minted source qualification');
+    const initial = reviewingRun(store, id, sourceHead);
+    store.update({ ...initial, execution: luna.request.execution });
+    const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
+      evidence: { repository: 'acme/widgets', issue: 42, run: id } });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') { luna.cleanup(); rmSync(directory, { recursive: true, force: true }); return; }
+    let replacementCalls = 0;
+    let fallbackCalls = 0;
+    let sourcePreflightHold: string | undefined;
+    let sourcePreflightQualified = false;
+    let invocationEntryMutationArmed = false;
+    const preparation: { status: 'qualified'; agent: ImplementationAgent } = { status: 'qualified', agent: luna.adapter };
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      prepareGovernedInvocation(request) {
+        const qualified = luna.adapter.prepareGovernedInvocation(request);
+        if (qualified.status !== 'qualified') { sourcePreflightHold = qualified.reason; return qualified; }
+        sourcePreflightQualified = hasGovernedPublicationConfinement(qualified.agent);
+        preparation.agent = qualified.agent;
+        invocationEntryMutationArmed = true;
+        return preparation;
+      },
+      async run() { fallbackCalls += 1; return successResult(HEAD); },
+    };
+    const github = githubAdapter([sourceHead, sourceHead, sourceHead, sourceHead]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, repository: { ...live.repository, defaultBranchHeadSha: sourceHead },
+        pullRequest: live.pullRequest === null ? null : { ...live.pullRequest, headSha: sourceHead, baseSha: sourceHead,
+          headRef: luna.identity.branch, baseRef: luna.identity.baseBranch, headRepository: { owner: 'acme', repo: 'widgets' } } };
+    };
+    try {
+      const result = await runWorkflow(
+        { store, github, implementation, reviewer: new FakeReviewer([requestChanges(sourceHead)]), validation: new FakeValidation(),
+          hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrapForExecution: () => luna.bootstrap,
+          resolveRepairExecutionProfile: () => luna.request.execution },
+        id,
+        {
+          maxReviewAttempts: 2,
+          now: () => T0,
+          admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: luna.identity.workspacePath },
+          onExecutionStart: () => {
+            if (!invocationEntryMutationArmed) return;
+            invocationEntryMutationArmed = false;
+            luna.adapter.run = async () => { replacementCalls += 1; return successResult(HEAD); };
+          },
+        },
+      );
+      assert.equal(result.outcome, 'needs_human');
+      assert.match(result.reason, /publication boundary changed after preflight/, `preflight hold: ${sourcePreflightHold ?? '(none)'}, qualified=${sourcePreflightQualified}`);
+      assert.equal(replacementCalls, 0, 'the replaced method on the captured genuine adapter is never entered');
+      assert.equal(fallbackCalls, 0, 'the original selected provider does not fall back after its instance method changes');
+      assert.equal(result.run.executor, undefined);
+    } finally {
+      luna.cleanup();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('invokes the captured genuine Luna when only the retained preparation object is redirected', async () => {
+    const id = 'workflow-luna-retained-preparation';
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-luna-retained-preparation-'));
+    const luna = await createGenuineLunaFixture(id, { deferPrepare: true });
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'luna-retained-preparation-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const store = new MemoryStore();
+    const sourceHead = luna.identity.baseSha;
+    const initial = reviewingRun(store, id, sourceHead);
+    store.update({ ...initial, execution: luna.request.execution });
+    const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
+      evidence: { repository: 'acme/widgets', issue: 42, run: id } });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') { luna.cleanup(); rmSync(directory, { recursive: true, force: true }); return; }
+    let replacementCalls = 0;
+    const attacker: ImplementationAgent = { kind: 'implementation-agent', async run() { replacementCalls += 1; return successResult(HEAD); } };
+      const preparation: { status: 'qualified'; agent: ImplementationAgent } = { status: 'qualified', agent: luna.adapter };
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      prepareGovernedInvocation(request) {
+        const qualified = luna.adapter.prepareGovernedInvocation(request);
+        if (qualified.status !== 'qualified') return qualified;
+        preparation.agent = qualified.agent;
+        return preparation;
+      },
+      async run() { throw new Error('ambient fallback must not run'); },
+    };
+    const workerMarker = path.join(luna.root, 'worker-invoked');
+    writeFileSync(path.join(luna.root, 'bin', 'codex'), `#!/bin/sh\nprintf invoked > '${workerMarker}'\nprintf '%s\\n' '{"type":"thread.started","thread_id":"genuine-luna-thread"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"genuine-luna-message","type":"agent_message","text":"bounded fixture result"}}' '{"type":"turn.completed"}'\n`, { mode: 0o700 });
+    const github = githubAdapter([sourceHead, sourceHead, sourceHead, sourceHead]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, repository: { ...live.repository, defaultBranchHeadSha: sourceHead },
+        pullRequest: live.pullRequest === null ? null : { ...live.pullRequest, headSha: sourceHead, baseSha: sourceHead,
+          headRef: luna.identity.branch, baseRef: luna.identity.baseBranch, headRepository: { owner: 'acme', repo: 'widgets' } } };
+    };
+    try {
+      const result = await runWorkflow(
+        { store, github, implementation, reviewer: new FakeReviewer([requestChanges(sourceHead)]), validation: new FakeValidation(),
+          hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrapForExecution: () => luna.bootstrap,
+          resolveRepairExecutionProfile: () => luna.request.execution },
+        id,
+        {
+          maxReviewAttempts: 2,
+          now: () => T0,
+          admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: luna.identity.workspacePath },
+          onExecutionStart: () => { preparation.agent = attacker; },
+        },
+      );
+      const settled = await result;
+      assert.equal(settled.outcome, 'needs_human');
+      assert.equal(existsSync(workerMarker), true, 'the retained exact qualified adapter executes despite a mutable preparation object');
+      assert.equal(settled.run.agentResult?.exitStatus, 'success', 'the original Luna result, not the replacement, is persisted');
+      assert.equal(replacementCalls, 0, 'mutating the retained preparation object cannot redirect invocation');
+      assert.equal(settled.run.executor, undefined);
+    } finally {
+      luna.cleanup();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses a nested CLI origin changed by the execution-start callback', async () => {
+    const id = 'workflow-luna-cli-origin-recheck';
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-luna-cli-origin-recheck-'));
+    const luna = await createGenuineLunaFixture(id, { deferPrepare: true });
+    const originalRun = Object.getOwnPropertyDescriptor(CodexCliAdapter.prototype, 'run');
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'luna-cli-origin-recheck-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const store = new MemoryStore();
+    const sourceHead = luna.identity.baseSha;
+    const initial = reviewingRun(store, id, sourceHead);
+    store.update({ ...initial, execution: luna.request.execution });
+    const spawnMarker = path.join(luna.root, 'worker-spawned');
+    writeFileSync(path.join(luna.root, 'bin', 'codex'), `#!/bin/sh\nprintf x > '${spawnMarker}'\nprintf '%s\\n' '{"type":"thread.started","thread_id":"unexpected"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"message","type":"agent_message","text":"unexpected"}}' '{"type":"turn.completed"}'\n`, { mode: 0o700 });
+    const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
+      evidence: { repository: 'acme/widgets', issue: 42, run: id } });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') { luna.cleanup(); rmSync(directory, { recursive: true, force: true }); return; }
+    let replacementCalls = 0;
+    const replacement = async function () { replacementCalls += 1; return successResult(sourceHead); };
+    let invocationEntryMutationArmed = false;
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      prepareGovernedInvocation(request) {
+        const prepared = luna.adapter.prepareGovernedInvocation(request);
+        if (prepared.status === 'qualified') invocationEntryMutationArmed = true;
+        return prepared;
+      },
+      async run(request) { return await luna.adapter.run(request); },
+    };
+    const github = githubAdapter([sourceHead, sourceHead, sourceHead, sourceHead]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, repository: { ...live.repository, defaultBranchHeadSha: sourceHead },
+        pullRequest: live.pullRequest === null ? null : { ...live.pullRequest, headSha: sourceHead, baseSha: sourceHead,
+          headRef: luna.identity.branch, baseRef: luna.identity.baseBranch, headRepository: { owner: 'acme', repo: 'widgets' } } };
+    };
+    let publicationCalls = 0;
+    github.createImplementationPullRequest = async () => { publicationCalls += 1; return { number: 8 }; };
+    try {
+      const result = await runWorkflow(
+        { store, github, implementation, reviewer: new FakeReviewer([requestChanges(sourceHead)]), validation: new FakeValidation(),
+          hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrapForExecution: () => luna.bootstrap,
+          resolveRepairExecutionProfile: () => luna.request.execution },
+        id,
+        {
+          maxReviewAttempts: 2,
+          now: () => T0,
+          admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: luna.identity.workspacePath },
+          onExecutionStart: () => {
+            if (!invocationEntryMutationArmed) return;
+            invocationEntryMutationArmed = false;
+            Object.defineProperty(CodexCliAdapter.prototype, 'run', { ...originalRun, value: replacement });
+          },
+        },
+      );
+      assert.equal(result.outcome, 'failed');
+      assert.match(result.run.agentResult?.diagnostics?.join(' ') ?? '', /nested Codex CLI whose source-owned run method changed/);
+      assert.equal(replacementCalls, 0, 'the changed nested CLI method is refused before invocation');
+      assert.equal(existsSync(spawnMarker), false, 'the original CLI never launches a worker process');
+      assert.equal(publicationCalls, 0, 'refusal precedes host PR publication');
+      assert.equal(result.run.executor, undefined, 'refusal happens before a worker session is recorded');
+    } finally {
+      if (originalRun !== undefined) Object.defineProperty(CodexCliAdapter.prototype, 'run', originalRun);
+      luna.cleanup();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('captures the genuine Luna adapter on the initial IMPLEMENTING path after standalone preparation', async () => {
+    const id = 'workflow-initial-luna-retained-preparation';
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-initial-luna-retained-'));
+    const luna = await createGenuineLunaFixture(id, { deferPrepare: true });
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'initial-luna-retained-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, id, luna.request.execution));
+    const github = githubAdapter([null]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, repository: { ...live.repository, defaultBranchHeadSha: luna.identity.baseSha } };
+    };
+    const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
+      evidence: { repository: 'acme/widgets', issue: 42, run: id, workspace: luna.identity.workspacePath } });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') { luna.cleanup(); rmSync(directory, { recursive: true, force: true }); return; }
+
+    const marker = path.join(luna.root, 'initial-worker-invoked');
+    writeFileSync(path.join(luna.root, 'bin', 'codex'), `#!/bin/sh\nprintf invoked > '${marker}'\nprintf '%s\\n' '{"type":"thread.started","thread_id":"genuine-luna-thread"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"genuine-luna-message","type":"agent_message","text":"bounded fixture result"}}' '{"type":"turn.completed"}'\n`, { mode: 0o700 });
+    let redirectedAgentCalls = 0;
+    let fallbackCalls = 0;
+    let sourcePreflightQualified = false;
+    const attacker: ImplementationAgent = { kind: 'implementation-agent', async run() { redirectedAgentCalls += 1; return successResult(luna.identity.baseSha); } };
+    const preparation: { status: 'qualified'; agent: ImplementationAgent } = { status: 'qualified', agent: luna.adapter };
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      prepareGovernedInvocation(request) {
+        const prepared = luna.adapter.prepareGovernedInvocation(request);
+        if (prepared.status === 'held') return prepared;
+        sourcePreflightQualified = hasGovernedPublicationConfinement(prepared.agent);
+        preparation.agent = prepared.agent;
+        return preparation;
+      },
+      async run() { fallbackCalls += 1; return successResult(luna.identity.baseSha); },
+    };
+    try {
+      const result = await runWorkflow({
+        store, github, implementation,
+        reviewer: new FakeReviewer([approve(luna.identity.baseSha)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+        bootstrapForExecution: () => luna.bootstrap,
+      }, id, {
+        maxReviewAttempts: 1, now: () => T0,
+        admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId,
+          executionWorkspace: luna.identity.workspacePath },
+        onExecutionStart: () => { preparation.agent = attacker; },
+      });
+
+      assert.equal(sourcePreflightQualified, true, 'the exact prepared instance came from genuine source-owned qualification');
+      assert.equal(existsSync(marker), true, 'the original source-qualified Luna reaches its controlled executable');
+      assert.equal(redirectedAgentCalls, 0, 'the attacker installed in the retained preparation is never selected');
+      assert.equal(fallbackCalls, 0, 'the ambient implementation fallback is never selected');
+      assert.equal(result.run.executor, undefined, 'the initial Luna invocation records no CLI identity');
+    } finally {
+      luna.cleanup();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('rechecks the exact genuine Luna instance on the initial IMPLEMENTING path after standalone preparation', async () => {
+    const id = 'workflow-initial-luna-entry-recheck';
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-initial-luna-entry-'));
+    const luna = await createGenuineLunaFixture(id, { deferPrepare: true });
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'initial-luna-entry-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const store = new MemoryStore();
+    store.create(createRun(TARGET, T0, id, luna.request.execution));
+    const github = githubAdapter([null]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, repository: { ...live.repository, defaultBranchHeadSha: luna.identity.baseSha } };
+    };
+    const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
+      evidence: { repository: 'acme/widgets', issue: 42, run: id, workspace: luna.identity.workspacePath } });
+    assert.equal(admitted.outcome, 'admitted');
+    if (admitted.outcome !== 'admitted') { luna.cleanup(); rmSync(directory, { recursive: true, force: true }); return; }
+
+    const marker = path.join(luna.root, 'must-not-spawn');
+    writeFileSync(path.join(luna.root, 'bin', 'codex'), `#!/bin/sh\nprintf invoked > '${marker}'\nexit 70\n`, { mode: 0o700 });
+    let invocationEntryMutationArmed = false;
+    let replacementCalls = 0;
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      prepareGovernedInvocation(request) {
+        const prepared = luna.adapter.prepareGovernedInvocation(request);
+        if (prepared.status === 'qualified') invocationEntryMutationArmed = true;
+        return prepared;
+      },
+      async run() { replacementCalls += 1; throw new Error('ambient implementation fallback must not run'); },
+    };
+    const replacement = async () => { replacementCalls += 1; return successResult(luna.identity.baseSha); };
+    try {
+      const result = await runWorkflow({
+        store, github, implementation, reviewer: new FakeReviewer([]),
+        validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrapForExecution: () => luna.bootstrap,
+      }, id, {
+        maxReviewAttempts: 1, now: () => T0,
+        admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId,
+          executionWorkspace: luna.identity.workspacePath },
+        onExecutionStart: () => {
+          if (!invocationEntryMutationArmed) return;
+          invocationEntryMutationArmed = false;
+          luna.adapter.run = replacement;
+        },
+      });
+
+      assert.equal(result.outcome, 'needs_human');
+      assert.match(result.reason, /publication boundary changed after preflight/);
+      assert.equal(existsSync(marker), false, 'the real worker executable remains unstarted');
+      assert.equal(replacementCalls, 0, 'neither the instance replacement nor fallback is entered');
+      assert.equal(result.run.executor, undefined);
+    } finally {
+      luna.cleanup();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('holds admission-backed review and validation repairs before any ambient provider or publication effect', async (t) => {
@@ -775,7 +1096,7 @@ describe('runWorkflow', () => {
           run = {
             ...run,
             execution,
-            executor: { provider, sessionId: `thread-${provider}`, generation: `generation-${id}` },
+            executor: { provider, sessionId: `session-${provider}`, generation: `generation-${id}` },
             agentResult: { ...run.agentResult!, sessionId: `session-${provider}` },
             repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' },
           };
@@ -1037,6 +1358,60 @@ describe('runWorkflow', () => {
         assert.equal(liveReads, 1, 'the outer workflow returns immediately without review-loop re-entry');
         assert.equal(implementation.requests.length, 0);
         assert.equal(reviewer.requests.length, 0);
+      });
+    }
+  });
+
+  it('maps ordinary pending-review CAS losses to the exact stored winner without loop re-entry', async (t) => {
+    const cases: Array<{ label: string; state: Run['state']; expected: string }> = [
+      { label: 'waiting-dependency', state: 'WAITING_DEPENDENCY', expected: 'waiting_dependency' },
+      { label: 'merge-ready', state: 'MERGE_READY', expected: 'merge_ready' },
+      { label: 'merged', state: 'MERGED', expected: 'merged' },
+      { label: 'failed', state: 'FAILED', expected: 'failed' },
+      { label: 'changed-active-repair', state: 'IMPLEMENTING', expected: 'needs_human' },
+    ];
+    for (const { label, state, expected } of cases) {
+      await t.test(label, async () => {
+        const store = new MemoryStore();
+        const id = `ordinary-review-cas-winner-${label}`;
+        const prior = reviewingRun(store, id, HEAD);
+        let winner: Run;
+        if (state === 'WAITING_DEPENDENCY') {
+          winner = applyTransition(prior, { type: 'wait_dependency', interrupt: { evidence: 'external dependency', choices: ['Retry'] } }, T0);
+        } else if (state === 'FAILED') {
+          winner = applyTransition(prior, { type: 'fail', reason: 'concurrent ordinary-review failure' }, T0);
+        } else if (state === 'IMPLEMENTING') {
+          let repairPrior: Run = { ...prior, repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' as const },
+            executor: { provider: 'claude-code', sessionId: 'prior-session' },
+            agentResult: { ...prior.agentResult!, executor: { provider: 'claude-code', sessionId: 'prior-session' }, sessionId: 'prior-session' } };
+          repairPrior = applyTransition(repairPrior, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+          const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'ordinary-winner-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+          const admission = createRepairAdmissionSnapshot(repairPrior.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+          const binding = createRepairAttemptBinding(repairPrior, execution);
+          winner = applyTransition(repairPrior, { type: 'start_fix', repairAdmission: { ...admission, attemptBinding: binding } }, T0);
+          winner = applyTransition(winner, { type: 'repair_executor_handoff', repairAgentResult: {
+            ...successResult(HEAD2), executor: { provider: 'codex-app-server', sessionId: 'winner-session', generation: binding.runtimeGeneration }, sessionId: 'winner-session',
+          } }, T0);
+        } else {
+          winner = applyTransition(prior, { type: 'review_approved', reviewResult: approve(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+          winner = { ...winner, state: 'MERGE_READY', history: [...winner.history,
+            { type: 'final_gate_verified', from: 'FINAL_GATE', to: 'MERGE_READY', at: T0 }] };
+          if (state === 'MERGED') winner = applyTransition(winner, { type: 'merged' }, T0);
+        }
+        const reviewer = {
+          kind: 'reviewer' as const,
+          calls: 0,
+          async review() { this.calls += 1; store.update(winner); return approve(HEAD); },
+        };
+        const implementation = new FakeImplementation([]);
+        const result = await runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer,
+          validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, id,
+          { maxReviewAttempts: 2, now: () => T0 });
+        assert.equal(result.outcome, expected);
+        assert.deepEqual(result.run, winner, 'outer workflow returns the exact durable race winner');
+        assert.deepEqual(store.read(id), winner, 'the stale reviewer result does not rewrite the winner');
+        assert.equal(reviewer.calls, 1, 'the outer workflow does not re-enter review after a stale result');
+        assert.equal(implementation.requests.length, 0, 'stale approval never starts another implementation');
       });
     }
   });
@@ -1569,82 +1944,43 @@ describe('runWorkflow', () => {
     }
   });
 
-  it('passes a synchronous worker publication fence that rejects stale Run and admission authority', async (t) => {
-    for (const mode of ['run-changed', 'admission-stale'] as const) {
-      await t.test(mode, async () => {
-        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-worker-publish-fence-'));
-        const registry = new MissionAdmissionRegistry({
-          filePath: path.join(directory, 'registry.json'),
-          config: { schemaVersion: 1, revision: 'worker-publish-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
-        });
-        const id = `worker-publish-fence-${mode}`;
-        const admitted = registry.admit({
-          laneId: 'captain', role: 'production_captain',
-          evidence: { repository: 'acme/widgets', issue: 42, run: id },
-        });
-        assert.equal(admitted.outcome, 'admitted');
-        if (admitted.outcome !== 'admitted') return;
-        try {
-          const store = new MemoryStore();
-          const run = createRun(TARGET, T0, id);
-          store.create(run);
-          let callbackCalls = 0;
-          let implementationCalls = 0;
-          let escapedFailure: Error | undefined;
-          const implementation: ImplementationAgent = {
-            kind: 'implementation-agent',
-            prepareGovernedInvocation(request) {
-              qualifyGovernedPublicationAdapter(this);
-              return { status: 'qualified', agent: this };
-            },
-            async run(request) {
-              implementationCalls += 1;
-              assert.equal(typeof request.beforePublish, 'function', 'runWorkflow passes a host-only synchronous publication fence');
-              if (mode === 'run-changed') {
-                const current = store.read(id)!;
-                store.update(applyTransition(current, { type: 'escalate', reason: 'operator cancellation while worker is running' }, T0));
-              } else {
-                registry.release(admitted.token, true);
-              }
-              try {
-                request.beforePublish!();
-                callbackCalls += 1;
-                return successResult(HEAD);
-              } catch (error) {
-                escapedFailure = error instanceof Error ? error : new Error(String(error));
-                return failureResult('worker publication authority rejected');
-              }
-            },
-          };
-          const github = githubAdapter([null, null]);
-          let pullRequestCreates = 0;
-          github.createImplementationPullRequest = async () => { pullRequestCreates += 1; return { number: 8 }; };
-          const outcome = await runWorkflow(
-            { store, github, implementation, bootstrap: new FakeBootstrap(), reviewer: new FakeReviewer([]) }, id,
-            {
-              maxReviewAttempts: 1, now: () => T0,
-              admissionFence: {
-                registry, token: admitted.token, productionMissionId: admitted.missionId,
-                executionWorkspace: '/tmp/tachiko-workspace',
-              },
-            },
-          );
-
-          assert.equal(callbackCalls, 0, 'a rejected fence cannot pass control to publication');
-          assert.ok(escapedFailure?.message.includes(mode === 'run-changed' ? 'Run changed' : 'Admission generation token is stale'),
-            `callback refusal should reach the worker: calls=${implementationCalls}, outcome=${JSON.stringify(outcome)}`);
-          assert.equal(pullRequestCreates, 0, 'no PR publication follows a refused worker publication fence');
-          if (mode === 'run-changed') {
-            assert.equal(outcome.outcome, 'needs_human');
-            assert.equal(store.read(id)?.state, 'NEEDS_HUMAN', 'the concurrent durable Run remains authoritative');
-          } else {
-            assert.equal(outcome.outcome, 'failed');
-            assert.equal(registry.snapshot().lanes.find((lane) => lane.laneId === admitted.token.laneId)?.status, 'released');
-          }
-        } finally {
-          rmSync(directory, { recursive: true, force: true });
-        }
+  it('holds an unqualified implementation before governed worker or publication effects', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-worker-publish-fence-'));
+    try {
+      const registry = new MissionAdmissionRegistry({
+        filePath: path.join(directory, 'registry.json'),
+        config: { schemaVersion: 1, revision: 'worker-publish-fence-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
       });
+      const id = 'worker-publish-fence-unqualified';
+      const admitted = registry.admit({
+        laneId: 'captain', role: 'production_captain',
+        evidence: { repository: 'acme/widgets', issue: 42, run: id },
+      });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') return;
+      const store = new MemoryStore();
+      store.create(createRun(TARGET, T0, id));
+      let providerCalls = 0;
+      let pullRequestCreates = 0;
+      const implementation: ImplementationAgent = {
+        kind: 'implementation-agent',
+        prepareGovernedInvocation() { return { status: 'qualified', agent: this }; },
+        async run() { providerCalls += 1; return successResult(HEAD); },
+      };
+      const github = githubAdapter([null, null]);
+      github.createImplementationPullRequest = async () => { pullRequestCreates += 1; return { number: 8 }; };
+      const outcome = await runWorkflow(
+        { store, github, implementation, bootstrap: new FakeBootstrap(), reviewer: new FakeReviewer([]) }, id,
+        { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+          registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: '/tmp/tachiko-workspace',
+        } },
+      );
+      assert.equal(outcome.outcome, 'needs_human');
+      assert.equal(providerCalls, 0, 'an injected qualified result cannot grant governed execution authority');
+      assert.equal(pullRequestCreates, 0, 'held implementation cannot reach PR publication');
+      assert.equal(store.read(id)?.agentResult, undefined, 'the hold does not invent a provider result');
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 
@@ -1930,10 +2266,10 @@ describe('runWorkflow', () => {
     run = {
       ...run,
       headSha: HEAD,
-      executor: { provider: 'codex-cli', sessionId: 'thread-from-disk' },
+      executor: { provider: 'codex-cli', sessionId: 'thread-from-disk', generation: 'generation-from-disk' },
       agentResult: {
         ...successResult(HEAD),
-        executor: { provider: 'codex-cli', sessionId: 'thread-from-disk' },
+        executor: { provider: 'codex-cli', sessionId: 'thread-from-disk', generation: 'generation-from-disk' },
       },
     };
     store.create(run);
@@ -1950,6 +2286,7 @@ describe('runWorkflow', () => {
     assert.deepEqual(implementation.requests[0]?.executor, {
       provider: 'codex-cli',
       sessionId: 'thread-from-disk',
+      generation: 'generation-from-disk',
     });
   });
 

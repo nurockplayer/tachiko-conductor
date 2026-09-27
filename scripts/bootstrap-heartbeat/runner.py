@@ -348,11 +348,62 @@ def trim(path: Path, limit: int) -> None:
 
 
 def log(message: str) -> None:
-    ensure_durable_directory(ROOT, mode=0o700)
-    with HEARTBEAT_LOG.open("a", encoding="utf-8") as stream:
-        stream.write(time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + message + "\n")
-    os.chmod(HEARTBEAT_LOG, 0o600)
-    trim(HEARTBEAT_LOG, MAX_HEARTBEAT_LOG)
+    # Validate before any creation, then pin the private directory and log
+    # endpoint with descriptors so a symlink swap cannot redirect a write.
+    assert_safe_private_account_path(ROOT, "directory")
+    ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
+    assert_safe_private_account_path(ROOT, "directory")
+    root_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(ROOT, root_flags)
+    descriptor = -1
+    try:
+        root_info = os.fstat(root_fd)
+        path_info = ROOT.lstat()
+        root_mode = stat.S_IMODE(root_info.st_mode)
+        if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.geteuid() or
+                (root_mode & 0o7022) != 0 or (root_mode & 0o700) != 0o700 or
+                (root_info.st_dev, root_info.st_ino) != (path_info.st_dev, path_info.st_ino) or
+                stat.S_ISLNK(path_info.st_mode)):
+            raise RuntimeError("unsafe heartbeat logging directory identity")
+        try:
+            endpoint_info = os.stat("heartbeat.log", dir_fd=root_fd, follow_symlinks=False)
+            if stat.S_ISLNK(endpoint_info.st_mode) or not stat.S_ISREG(endpoint_info.st_mode):
+                raise RuntimeError("unsafe heartbeat log endpoint")
+            descriptor = os.open("heartbeat.log", os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd)
+        except FileNotFoundError:
+            descriptor = os.open("heartbeat.log", os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_EXCL |
+                                 getattr(os, "O_NOFOLLOW", 0), 0o600, dir_fd=root_fd)
+            os.fchmod(descriptor, 0o600)
+        info = os.fstat(descriptor)
+        mode = stat.S_IMODE(info.st_mode)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or
+                (mode & 0o077) != 0 or (mode & 0o600) != 0o600 or (mode & 0o7000) != 0):
+            raise RuntimeError("unsafe heartbeat log endpoint")
+        visible_info = os.stat("heartbeat.log", dir_fd=root_fd, follow_symlinks=False)
+        if (info.st_dev, info.st_ino) != (visible_info.st_dev, visible_info.st_ino):
+            raise RuntimeError("heartbeat log endpoint changed during open")
+        payload = (time.strftime("%Y-%m-%dT%H:%M:%S%z") + " " + message + "\n").encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        info = os.fstat(descriptor)
+        if info.st_size > MAX_HEARTBEAT_LOG:
+            tail = os.pread(descriptor, MAX_HEARTBEAT_LOG, info.st_size - MAX_HEARTBEAT_LOG)
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            offset = 0
+            while offset < len(tail):
+                offset += os.write(descriptor, tail[offset:])
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        os.close(root_fd)
+
+
+def report_log_failure(message: str) -> None:
+    # This is the outer logging-failure path: never retry the rejected file
+    # endpoint after a lock/private-root failure, and do not recurse into log.
+    print(f"heartbeat log unavailable; {message}", file=sys.stderr)
 
 
 def load_object(path: Path) -> dict[str, Any]:
@@ -2620,7 +2671,7 @@ def acquire_lock(verbose: bool):
     except BlockingIOError:
         stream.close()
         if verbose:
-            log("no-op: another heartbeat invocation owns the atomic lock")
+            print("heartbeat no-op: another invocation owns the atomic lock", file=sys.stderr)
         return None
     stream.seek(0)
     prior = stream.read().strip()
@@ -2679,7 +2730,7 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
     try:
         lock_stream = acquire_lock(verbose)
     except Exception as error:
-        log("lock error; no wake: " + str(error))
+        print("heartbeat lock error; no wake: " + str(error), file=sys.stderr)
         return 1
     if lock_stream is None:
         return 0
@@ -2810,7 +2861,7 @@ def heartbeat(verbose: bool = False, do_prime: bool = False) -> int:
         log("wake target acknowledged settled state; fingerprint and safety clock committed")
         return 0
     except Exception as error:
-        log("heartbeat error; no wake: " + str(error))
+        report_log_failure("heartbeat error; no wake: " + str(error))
         return 1
     finally:
         release_lock(lock_stream)

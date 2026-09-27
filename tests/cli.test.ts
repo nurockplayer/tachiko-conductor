@@ -33,7 +33,7 @@ import {
   runShowView,
   runTransitionCommand,
 } from '../src/cli.js';
-import { qualifyGovernedPublicationAdapter, type ImplementationAgent } from '../src/adapters/agent.js';
+import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
@@ -50,6 +50,7 @@ import { DispatchAdmissionWaitError } from '../src/dispatch/runner.js';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../src/dispatch/invocation-lock.js';
 import type { DispatchRuntimeClaim } from '../src/dispatch/queue.js';
 import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
+import { createGenuineLunaFixture } from './support/genuine-luna.js';
 
 const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 async function runMergedTransitionForTest(
@@ -80,16 +81,6 @@ describe('CLI held workflow outcomes', () => {
     assert.equal(outcomeExitCode(outcome), 2);
   });
 });
-
-/** Mark one CLI test fake as the host-confined implementation boundary it models. */
-function qualifyGovernedFake<T extends ImplementationAgent>(agent: T): T {
-  qualifyGovernedPublicationAdapter(agent);
-  Object.defineProperty(agent, 'prepareGovernedInvocation', {
-    configurable: true,
-    value: () => ({ status: 'qualified' as const, agent }),
-  });
-  return agent;
-}
 
 function tempStore(): { store: JsonFileStore; dir: string } {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-'));
@@ -313,6 +304,22 @@ describe('CLI command layer', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   });
+
+  it('matches canonical repository aliases without changing issue, target kind, or branch identity', () => {
+    const { store, dir } = tempStore();
+    try {
+      const issue = createRun({ kind: 'issue', owner: 'Acme', repo: 'Widgets.Git', issueNumber: 42 }, T0, 'canonical-issue');
+      const branch = createRun({ kind: 'repository', owner: 'Acme', repo: 'Widgets.Git', branch: 'Feature' }, T0, 'canonical-branch');
+      store.create(issue); store.create(branch);
+      assert.equal(parseIssueRef('ACME/Widgets.Git#42').owner, 'acme');
+      assert.equal(findRunByTarget(store, { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 })?.id, issue.id);
+      assert.equal(findRunByTarget(store, { kind: 'repository', owner: 'acme', repo: 'widgets', branch: 'Feature' })?.id, branch.id);
+      assert.equal(findRunByTarget(store, { kind: 'repository', owner: 'acme', repo: 'widgets.git', branch: 'feature' }), null);
+      assert.equal(findRunByTarget(store, { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 41 }), null);
+      assert.deepEqual(store.read(branch.id)?.target, branch.target, 'historical target bytes are not rewritten by alias matching');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
 
   it('fails loudly for an unknown run and for an invalid transition', () => {
     const { store, dir } = tempStore();
@@ -1324,6 +1331,32 @@ describe('workflow run and resume commands', () => {
     } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('rejects duplicate active aliases before Run, admission, or workflow effects', async () => {
+    const { store, dir } = tempStore();
+    try {
+      const first = createRun({ kind: 'issue', owner: 'Acme', repo: 'Widgets.Git', issueNumber: 42 }, T0, 'duplicate-alias-first');
+      const second = createRun({ kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 }, T0, 'duplicate-alias-second');
+      store.create(first);
+      store.create(second);
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config: {
+        schemaVersion: 1, revision: 'duplicate-alias-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 },
+      } });
+      let githubReads = 0;
+      const github = githubAdapter([]);
+      const read = github.readLiveSnapshot.bind(github);
+      github.readLiveSnapshot = async (target) => { githubReads += 1; return await read(target); };
+      const before = store.list().map((run) => JSON.stringify(run));
+      await assert.rejects(runIssueCommand(deps(store, github, new FakeImplementation([]), new FakeReviewer([])), 'ACME/Widgets.GIT#42', {
+        admission: registry, runOwnerReceiptPath: path.join(dir, 'owner.json'),
+      }), /Multiple active durable Runs overlap target .*refusing ambiguous ownership/);
+      assert.deepEqual(store.list().map((run) => JSON.stringify(run)), before, 'duplicate historical aliases are not rewritten');
+      assert.equal(existsSync(path.join(dir, 'owner.json')), false, 'ambiguous historical aliases are rejected before writing an owner receipt');
+      assert.equal(registry.snapshot().lanes.length, 0, 'ambiguous targets are rejected before admission');
+      assert.equal(githubReads, 0, 'ambiguous targets are rejected before workflow I/O');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+
   it('starts an issue end-to-end and reaches MERGE_READY through the fake adapters', async () => {
     const store = new MemoryStore();
     const implementation = new FakeImplementation([successResult(HEAD)]);
@@ -1357,34 +1390,45 @@ describe('workflow run and resume commands', () => {
         const release = () => { if (!released) { released = true; admissionLockHeld = false; unlock(); } };
         try { return await operation(release); } finally { release(); }
       };
-      let markEntered!: () => void;
-      const entered = new Promise<void>((resolve) => { markEntered = resolve; });
-      let allowFailure!: () => void;
-      const failureGate = new Promise<void>((resolve) => { allowFailure = resolve; });
-      let providerSawReleasedLock = false;
-      class BlockingImplementation implements ImplementationAgent {
-        readonly kind = 'implementation-agent' as const;
-        async run(): Promise<AgentResult> {
-          providerSawReleasedLock = !admissionLockHeld;
-          markEntered();
-          await failureGate;
-          throw new Error('injected uncertain workflow stop');
-        }
-      }
+      let markSnapshotEntered!: () => void;
+      const snapshotEntered = new Promise<void>((resolve) => { markSnapshotEntered = resolve; });
+      let unblockSnapshot!: () => void;
+      const snapshotGate = new Promise<void>((resolve) => { unblockSnapshot = resolve; });
+      const github = githubAdapter([HEAD]);
+      const readLive = github.readLiveSnapshot.bind(github);
+      github.readLiveSnapshot = async (target) => {
+        markSnapshotEntered();
+        await snapshotGate;
+        return await readLive(target);
+      };
       const options = {
         admission: registry,
         admissionWorkspace: dir,
         runOwnerReceiptPath: path.join(dir, 'owner.json'),
         withRunAdmissionLock,
       };
-      const workflowDeps = deps(store, githubAdapter([HEAD]), qualifyGovernedFake(new BlockingImplementation()), new FakeReviewer([]));
-      const first = runIssueCommand(workflowDeps, 'acme/widgets#42', options);
-      await entered;
-      await assert.rejects(runIssueCommand(workflowDeps, 'acme/widgets#42', options), /Lane already has active ownership|active or parked lane/);
-      assert.equal(store.list().length, 1, 'concurrent callers share the persisted READY Run id');
-      assert.equal(providerSawReleasedLock, true, 'provider execution begins only after the direct admission lock is released');
-      allowFailure();
-      await assert.rejects(first, /injected uncertain workflow stop/);
+      const workflowDeps = deps(store, github, new FakeImplementation([]), new FakeReviewer([]));
+      let first: Promise<WorkflowOutcome> | undefined;
+      let snapshotTimeout: NodeJS.Timeout | undefined;
+      try {
+        first = runIssueCommand(workflowDeps, 'acme/widgets#42', options);
+        await Promise.race([
+          snapshotEntered,
+          new Promise<never>((_, reject) => {
+            snapshotTimeout = setTimeout(() => reject(new Error('timed out waiting for the first direct Run to enter GitHub snapshot I/O')), 2_000);
+          }),
+        ]);
+        assert.equal(admissionLockHeld, false, 'the short direct-run lock is released before live GitHub workflow I/O');
+        await assert.rejects(runIssueCommand(workflowDeps, 'acme/widgets#42', options), /Lane already has active ownership|active or parked lane/);
+        assert.equal(store.list().length, 1, 'concurrent callers share the persisted READY Run id');
+      } finally {
+        if (snapshotTimeout !== undefined) clearTimeout(snapshotTimeout);
+        unblockSnapshot();
+        if (first !== undefined) await first.catch(() => undefined);
+      }
+      const settled = await first;
+      assert.equal(settled.outcome, 'needs_human', 'the actual source qualification hold settles the admitted Run safely');
+      assert.equal((settled.run.agentResult?.diagnostics ?? []).length, 0, 'no provider result or uncertain child claim is fabricated');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -1405,16 +1449,16 @@ describe('workflow run and resume commands', () => {
       assert.equal(parked?.status, 'parked');
       if (holder.outcome !== 'admitted') return;
       registry.release(holder.token, true);
-      class StopAfterAdmission implements ImplementationAgent {
-        readonly kind = 'implementation-agent' as const;
-        async run(): Promise<AgentResult> { throw new Error('stopped after retry admission'); }
-      }
-      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), qualifyGovernedFake(new StopAfterAdmission()), new FakeReviewer([])), 'acme/widgets#42', {
+      const beforeRetryGeneration = parked?.generation ?? 0;
+      const settled = await runIssueCommand(deps(store, githubAdapter([HEAD]), new FakeImplementation([]), new FakeReviewer([])), 'ACME/Widgets.GIT#42', {
         admission: registry, admissionWorkspace: dir, runOwnerReceiptPath: path.join(dir, 'owner.json'), now: () => T0,
-      }), /stopped after retry admission/);
+      });
+      assert.equal(settled.outcome, 'needs_human', 'an unqualified fake is held after capacity is released');
       assert.equal(store.list().length, 1, 'retry does not construct a second random Run id');
       assert.equal(store.list()[0]?.id, persisted[0]?.id);
-      assert.equal(registry.readLane(`run:${persisted[0]!.id}`)?.status, 'active');
+      const afterRetry = registry.readLane(`run:${persisted[0]!.id}`);
+      assert.equal(afterRetry?.status, 'parked', 'source-proof hold settles the retried lane');
+      assert.ok((afterRetry?.generation ?? 0) > beforeRetryGeneration, 'the same Run receives a new admission generation after capacity release');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
@@ -1424,16 +1468,17 @@ describe('workflow run and resume commands', () => {
       const store = new MemoryStore();
       const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: { schemaVersion: 1, revision: 'logical-admission-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } } });
       registry.admit({ laneId: 'ambient-cwd-owner', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 99, workspace: process.cwd() } });
-      const implementation = qualifyGovernedFake(new FakeImplementation([]));
-      await assert.rejects(runIssueCommand(
+      const implementation = new FakeImplementation([]);
+      const result = await runIssueCommand(
         deps(store, githubAdapter([HEAD]), implementation, new FakeReviewer([])),
         'acme/widgets#42',
         { admission: registry, runOwnerReceiptPath: path.join(directory, 'owner.json'), now: () => T0 },
-      ), /explicit execution workspace/);
+      );
       const run = store.list()[0]!;
       const lane = registry.readLane(`run:${run.id}`)!;
+      assert.equal(result.outcome, 'needs_human', 'a run without workspace authority is held before worker invocation');
       assert.equal(lane.evidence.workspace, undefined, 'initial logical reservation does not capture ambient cwd');
-      assert.equal(implementation.calls, 0, 'the mutation fence still requires a physical workspace');
+      assert.equal(implementation.calls, 0, 'the held path never invokes an unqualified provider');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
@@ -1455,15 +1500,17 @@ describe('workflow run and resume commands', () => {
         guard() { return { assertValid() {} }; },
         async verifyDurable() { return { headSha: HEAD, branch: identity.branch }; },
       };
-      class UncertainImplementation implements ImplementationAgent {
+      class UnqualifiedImplementation implements ImplementationAgent {
         readonly kind = 'implementation-agent' as const;
         observedWorkspace: string | undefined;
+        calls = 0;
         async run(request: Parameters<ImplementationAgent['run']>[0]): Promise<AgentResult> {
+          this.calls += 1;
           this.observedWorkspace = request.workspacePath;
-          throw new Error('stop after observing prepared workspace');
+          return { exitStatus: 'failure', summary: 'must remain uninvoked' };
         }
       }
-      const implementation = qualifyGovernedFake(new UncertainImplementation());
+      const implementation = new UnqualifiedImplementation();
       const live = githubAdapter([HEAD, HEAD]);
       const noPullRequestGithub: GitHubAdapter = {
         ...live,
@@ -1478,18 +1525,20 @@ describe('workflow run and resume commands', () => {
         },
       };
       const workflow = { ...deps(store, noPullRequestGithub, implementation, new FakeReviewer([])), bootstrap };
-      await assert.rejects(runIssueCommand(workflow, 'acme/widgets#42', {
+      const result = await runIssueCommand(workflow, 'acme/widgets#42', {
         admission: registry,
         runOwnerReceiptPath: path.join(directory, 'owner.json'),
         now: () => T0,
-      }), /stop after observing prepared workspace/);
+      });
       const run = store.list()[0]!;
       const lane = registry.readLane(`run:${run.id}`)!;
       assert.equal(prepareCalls, 1);
-      assert.equal(implementation.observedWorkspace, canonicalWorkspace);
+      assert.equal(result.outcome, 'needs_human', 'prepared workspace cannot turn an unqualified fake into a governed provider');
+      assert.equal(implementation.calls, 0);
+      assert.equal(implementation.observedWorkspace, undefined);
       assert.equal(lane.evidence.workspace, realpathSync(canonicalWorkspace));
       assert.notEqual(lane.evidence.workspace, process.cwd());
-      assert.equal(lane.status, 'active', 'uncertain worker execution keeps the exact bound workspace fenced');
+      assert.equal(lane.status, 'parked', 'pre-provider hold settles the admitted lane while retaining prepared workspace evidence');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
@@ -1585,54 +1634,22 @@ describe('workflow run and resume commands', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it('binds a missing logical Run workspace on exact active-release retry after publication crash', async () => {
+  it('binds a missing logical Run workspace on exact active-release retry after publication crash', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-logical-release-recovery-'));
     try {
-      const store = new MemoryStore();
-      const workspace = path.join(directory, 'prepared-worktree');
-      mkdirSync(workspace);
-      const receiptPath = path.join(directory, 'owner.json');
-      const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'logical-release-recovery-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } };
-      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'), config: admissionConfig });
-      const identity = { bootstrapKind: 'linked-worktree' as const, owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: HEAD, branch: 'codex/run-42', workspacePath: workspace };
-      let logicalReservationSeen = false;
-      const bootstrap = {
-        kind: 'implementation-bootstrap' as const,
-        bootstrapKind: 'linked-worktree' as const,
-        async plan() {
-          const lane = registry.snapshot().lanes.find((candidate) => candidate.laneId.startsWith('run:'));
-          assert.ok(lane);
-          assert.equal(lane.evidence.workspace, undefined);
-          logicalReservationSeen = true;
-          return identity;
-        },
-        async prepare() { return identity; },
-        guard() { return { assertValid() {} }; },
-        async verifyDurable() { return { headSha: HEAD, branch: identity.branch }; },
-      };
-      const live = githubAdapter([HEAD, HEAD]);
-      const noPullRequestGithub: GitHubAdapter = {
-        ...live,
-        async readLiveSnapshot(target) {
-          const snapshot = await live.readLiveSnapshot(target);
-          return { ...snapshot, repository: { ...snapshot.repository, defaultBranch: 'main', defaultBranchHeadSha: HEAD }, pullRequest: null, headSha: null };
-        },
-      };
-      class UncertainImplementation implements ImplementationAgent {
-        readonly kind = 'implementation-agent' as const;
-        async run(): Promise<AgentResult> { throw new Error('worker stopped with uncertain execution'); }
-      }
-      await assert.rejects(runIssueCommand({ ...deps(store, noPullRequestGithub, qualifyGovernedFake(new UncertainImplementation()), new FakeReviewer([])), bootstrap },
-        'acme/widgets#42', { admission: registry, runOwnerReceiptPath: receiptPath, now: () => T0 }), /worker stopped with uncertain execution/);
-      const run = store.list()[0]!;
+      const { store, run, registry, receiptPath, token, workspacePath } = logicalBootstrapPlanningFixture(directory, 'logical-release-recovery');
+      const workspace = realpathSync(workspacePath);
+      registry.strengthen(token, { repository: 'acme/widgets', workspace });
+      registry.renew(token, () => {
+        const receipt = readRunOwnerReceipt(receiptPath)!;
+        writeRunOwnerReceipt(receiptPath, { ...receipt, phase: 'pre_execution' });
+      });
       const lane = registry.readLane(`run:${run.id}`)!;
       const activeReceipt = readRunOwnerReceipt(receiptPath)!;
-      assert.equal(logicalReservationSeen, true);
-      assert.equal(run.bootstrap?.workspacePath, workspace);
       assert.equal(lane.status, 'active');
-      assert.equal(lane.evidence.workspace, realpathSync(workspace));
-      assert.equal(activeReceipt.phase, 'execution_possible');
-      assert.equal(activeReceipt.workspace, undefined, 'the execution receipt predates workspace strengthening');
+      assert.equal(lane.evidence.workspace, workspace);
+      assert.equal(activeReceipt.phase, 'pre_execution');
+      assert.equal(activeReceipt.workspace, undefined, 'the supported logical-bootstrap receipt has no workspace yet');
 
       const originalRelease = registry.release.bind(registry);
       registry.release = (token, stopped, beforePublish, afterPublish, validateBeforePublish) => {
@@ -1649,7 +1666,7 @@ describe('workflow run and resume commands', () => {
       assert.equal(recoverRunAdmission(store, registry, run.id, activeReceipt.generation, true, receiptPath), 'released');
       const finalReceipt = readRunOwnerReceipt(receiptPath);
       assert.equal(finalReceipt?.phase, 'released');
-      assert.equal(finalReceipt?.workspace, realpathSync(workspace), 'exact released retry binds persisted canonical W under the registry lock');
+      assert.equal(finalReceipt?.workspace, workspace, 'exact released retry binds persisted canonical W under the registry lock');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
@@ -2239,23 +2256,52 @@ describe('workflow run and resume commands', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('retains active admission after an implementation invocation throws with uncertain child settlement', async () => {
+  it('retains active admission when a completed genuine worker cannot persist completion telemetry', async () => {
     const { dir } = tempStore();
+    const fixture = await createGenuineLunaFixture('cli-completion-telemetry-failure', { deferPrepare: true });
     try {
       const store = new MemoryStore();
       const admissionConfig: AdmissionConfig = { schemaVersion: 1, revision: 'uncertain-child-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
       const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: admissionConfig });
-      class UncertainImplementation extends FakeImplementation {
-        override async run(): Promise<AgentResult> { throw new Error('provider invocation settlement is uncertain'); }
-      }
+      const runId = fixture.request.runtimeOwnership.runId;
+      const run = createRun(TARGET, T0, runId, fixture.request.execution);
+      store.create(run);
+      const receiptPath = path.join(dir, 'run-owner-uncertain.json');
+      const marker = path.join(fixture.root, 'worker-finished');
+      let completionTelemetryRejected = false;
+      writeFileSync(path.join(fixture.root, 'bin', 'codex'), `#!/bin/sh\nprintf finished > '${marker}'\nprintf '%s\\n' '{"type":"thread.started","thread_id":"genuine-luna-thread"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"genuine-luna-message","type":"agent_message","text":"bounded fixture result"}}' '{"type":"turn.completed"}'\n`, { mode: 0o700 });
+      const originalUpdateIfUnchanged = store.updateIfUnchanged.bind(store);
+      store.updateIfUnchanged = (expected, next) => {
+        if (next.telemetry?.events.some((event) => event.kind === 'completion' && event.role === 'worker')) {
+          completionTelemetryRejected = true;
+          throw new Error('injected completion telemetry storage failure');
+        }
+        return originalUpdateIfUnchanged(expected, next);
+      };
+      const live = githubAdapter([fixture.identity.baseSha, fixture.identity.baseSha, fixture.identity.baseSha]);
+      const github: GitHubAdapter = {
+        ...live,
+        async readLiveSnapshot(target) {
+          const snapshot = await live.readLiveSnapshot(target);
+          return { ...snapshot, repository: { ...snapshot.repository, defaultBranch: fixture.identity.baseBranch,
+            defaultBranchHeadSha: fixture.identity.baseSha }, pullRequest: null, headSha: null };
+        },
+      };
       await assert.rejects(
-        runIssueCommand(deps(store, githubAdapter([HEAD]), qualifyGovernedFake(new UncertainImplementation([])), new FakeReviewer([])), 'acme/widgets#42', { admission, admissionWorkspace: process.cwd(), runOwnerReceiptPath: path.join(dir, 'run-owner-uncertain.json') }),
-        /provider invocation settlement is uncertain/,
+        runIssueCommand({ ...deps(store, github, fixture.adapter, new FakeReviewer([])), bootstrapForExecution: () => fixture.bootstrap },
+          'acme/widgets#42', { admission, admissionWorkspace: fixture.identity.workspacePath, runOwnerReceiptPath: receiptPath }),
+        /injected completion telemetry storage failure/,
       );
-      const run = store.list()[0];
-      assert.ok(run);
+      assert.equal(completionTelemetryRejected, true, 'the injected completion telemetry write was reached and rejected');
+      assert.equal(existsSync(marker), true, 'the controlled child finished before telemetry persistence failed');
       assert.equal(admission.readLane(`run:${run.id}`)?.status, 'active');
-    } finally { rmSync(dir, { recursive: true, force: true }); }
+      const receipt = readRunOwnerReceipt(receiptPath)!;
+      assert.equal(receipt.phase, 'execution_possible', 'the pre-execution uncertainty marker remains authoritative');
+      assert.equal(receipt.generation, admission.readLane(`run:${run.id}`)?.generation);
+      assert.equal(recoverRunAdmission(store, admission, run.id, receipt.generation, true, receiptPath), 'released',
+        'the interrupted completion can be settled with explicit stopped proof after the child is known to have finished');
+      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'released');
+    } finally { fixture.cleanup(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('refuses uncertain Run recovery when persisted PR evidence is absent from its admission lane', async () => {
@@ -2263,20 +2309,26 @@ describe('workflow run and resume commands', () => {
     try {
       const store = new MemoryStore();
       const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, 'admission.json'), config: { schemaVersion: 1, revision: 'run-recovery-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const runId = 'run-recovery-missing-pr-evidence';
+      let run = createRun(TARGET, T0, runId);
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(HEAD),
+        pullRequest: { number: 7, headSha: HEAD } }, T0, TEST_VALIDATION_AUTHORITY);
+      store.create(run);
       const receiptPath = path.join(dir, 'owner-receipt.json');
-      class UncertainImplementation extends FakeImplementation { override async run(): Promise<AgentResult> { throw new Error('worker settlement uncertain'); } }
-      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), qualifyGovernedFake(new UncertainImplementation([])), new FakeReviewer([])), 'acme/widgets#42', {
-        admission, admissionWorkspace: process.cwd(), runOwnerReceiptPath: receiptPath,
-      }), /worker settlement uncertain/);
-      const run = store.list()[0]!;
+      const admitted = admission.admit({ laneId: `run:${runId}`, role: 'production_captain', highAutonomy: true,
+        evidence: { repository: 'acme/widgets', issue: 42, run: runId, workspace: process.cwd() } });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') return;
+      writeRunOwnerReceipt(receiptPath, { schemaVersion: 1, laneId: admitted.token.laneId, missionId: admitted.missionId,
+        repository: 'acme/widgets', runId, issue: 42, workspace: process.cwd(), token: admitted.token,
+        generation: admitted.token.generation, phase: 'execution_possible' });
       const receipt = readRunOwnerReceipt(receiptPath)!;
-      assert.equal(receipt.phase, 'execution_possible');
-      assert.ok(receipt.token);
-      assert.equal(admission.readLane(`run:${run.id}`)?.generation, receipt.generation);
       const receiptBefore = readFileSync(receiptPath, 'utf8');
       const registryBefore = readFileSync(path.join(dir, 'admission.json'), 'utf8');
-      assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation, false, receiptPath), /pullRequest evidence does not match durable Run/);
-      assert.equal(admission.readLane(`run:${run.id}`)?.status, 'active');
+      assert.throws(() => recoverRunAdmission(store, admission, runId, receipt.generation, false, receiptPath), /pullRequest evidence does not match durable Run/);
+      assert.equal(admission.readLane(`run:${runId}`)?.status, 'active');
       assert.equal(readFileSync(receiptPath, 'utf8'), receiptBefore);
       assert.equal(readFileSync(path.join(dir, 'admission.json'), 'utf8'), registryBefore);
     } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -2361,7 +2413,7 @@ describe('workflow run and resume commands', () => {
         override async run(): Promise<AgentResult> { providerCalls += 1; throw new Error('provider must not be invoked'); }
       }
       await assert.rejects(runIssueCommand({
-        ...deps(store, noPullRequestGithub, qualifyGovernedFake(new NeverInvokedImplementation([])), new FakeReviewer([])), bootstrap,
+        ...deps(store, noPullRequestGithub, new NeverInvokedImplementation([]), new FakeReviewer([])), bootstrap,
       }, 'acme/widgets#42', { admission: registry, runOwnerReceiptPath: receiptPath, now: () => T0 }), /simulated process exit before workflow settlement/);
       registry.park = originalPark;
       store.updateIfUnchanged = originalUpdateIfUnchanged;
