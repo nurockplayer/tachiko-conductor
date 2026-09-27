@@ -8,7 +8,7 @@ import {
 import { recordWaitTelemetry } from './telemetry.js';
 import type { ReviewResult, Run, TransitionInput, TransitionType, ValidationResult, WorkflowState } from './types.js';
 import { isValidationResultCoherent } from './validation.js';
-import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairExecutorIdentity, type RepairHandoffRecord } from './repair-admission.js';
+import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairExecutorIdentity, isRepairHandoffCompatible, sameRepairExecutorIdentity, type RepairExecutorHandoff, type RepairHandoffRecord } from './repair-admission.js';
 
 /** Why a transition was rejected. */
 export type InvalidTransitionCode =
@@ -350,25 +350,16 @@ function validateRepairHandoff(run: Run, result: NonNullable<TransitionInput['re
   if (provider === 'worker-router') {
     if (result.exitStatus !== 'success' || result.executor !== undefined || result.sessionId !== undefined ||
         result.diagnostics?.some((diagnostic) => /EXECUTOR_PROVIDER_|EXECUTOR_RECONSTRUCTION_FAILED/.test(diagnostic))) return hold();
-    if (continued && active.handoff?.outcome.kind !== 'sessionless') return hold();
-    return { admissionHistoryIndex, startFixHistoryIndex, outcome: { kind: 'sessionless', provider: 'worker-router' } };
+    const outcome: RepairExecutorHandoff = { kind: 'sessionless', provider: 'worker-router' };
+    if (!isRepairHandoffCompatible(provider, snapshot.attemptBinding!, outcome, continued ? active.handoff?.outcome : undefined)) return hold();
+    return { admissionHistoryIndex, startFixHistoryIndex, outcome };
   }
   const identity = result.executor;
   if (!isRepairExecutorIdentity(identity) || identity.sessionId.trim() === '' ||
       (result.sessionId !== undefined && result.sessionId !== identity.sessionId)) return hold();
-  const providerMatches = provider === 'luna-isolated'
-    ? identity.provider === 'codex-cli'
-    : provider === 'codex-cli'
-      ? identity.provider === 'codex-cli' || identity.provider === 'codex-app-server'
-      : identity.provider === provider;
-  if (!providerMatches) return hold();
-  const predecessorProvider = snapshot.attemptBinding?.predecessorExecutor?.provider;
-  if (!snapshot.attemptBinding?.freshExecutor && predecessorProvider !== undefined && identity.provider !== predecessorProvider &&
-      !(predecessorProvider === 'codex-app-server' && provider === 'codex-cli' && identity.provider === 'codex-cli')) return hold();
-  if (continued && (active.handoff?.outcome.kind !== 'executor' || active.handoff.outcome.identity.provider !== identity.provider)) return hold();
-  const expectedGeneration = snapshot.attemptBinding?.runtimeGeneration;
-  if (identity.provider === 'codex-app-server' && (expectedGeneration === undefined || expectedGeneration !== identity.generation)) return hold();
-  return { admissionHistoryIndex, startFixHistoryIndex, outcome: { kind: 'executor', identity: { ...identity } } };
+  const outcome: RepairExecutorHandoff = { kind: 'executor', identity: { ...identity } };
+  if (!isRepairHandoffCompatible(provider, snapshot.attemptBinding!, outcome, continued ? active.handoff?.outcome : undefined)) return hold();
+  return { admissionHistoryIndex, startFixHistoryIndex, outcome };
 }
 
 function assertPayload(
@@ -406,13 +397,11 @@ function assertPayload(
     const admission = input.repairAdmission;
     const authority = run.repairTaskShapeAuthority;
     const binding = admission.attemptBinding;
-    const sameExecutor = (a: Run['executor'], b: Run['executor']): boolean => a?.provider === b?.provider &&
-      a?.sessionId === b?.sessionId && a?.generation === b?.generation && (a === undefined) === (b === undefined);
     if (from !== 'CHANGES_REQUESTED' || authority === undefined || run.headSha === undefined || run.pullRequest === undefined ||
         !isRepairAdmissionSnapshot(admission) || admission.attemptBinding?.admissionIndex !== (run.repairAdmissions?.length ?? 0) ||
         admission.attemptBinding.startFixHistoryIndex !== run.history.length || admission.authorityRevision !== authority.revision ||
-        !sameExecutor(binding?.predecessorExecutor, run.executor) ||
-        (run.agentResult?.executor !== undefined && !sameExecutor(binding?.predecessorExecutor, run.agentResult.executor)) ||
+        !sameRepairExecutorIdentity(binding?.predecessorExecutor, run.executor) ||
+        (run.agentResult?.executor !== undefined && !sameRepairExecutorIdentity(binding?.predecessorExecutor, run.agentResult.executor)) ||
         binding?.predecessorSessionId !== run.agentResult?.sessionId ||
         admission.taskShape !== authority.shape || admission.headSha !== run.headSha || admission.pullRequestNumber !== run.pullRequest.number ||
         admission.finding !== (run.validationResult?.status === 'failed' && run.reviewResult?.verdict !== 'request_changes' ? 'validation_failed' : 'review_blocking')) {

@@ -1908,7 +1908,7 @@ describe('runWorkflow', () => {
     assert.equal(implementation.requests[0]?.instructions, '1. [blocking] the diff has a bug');
   });
 
-  it('restarts a Luna repair after durable identity capture and accepts its new codex-cli session', async () => {
+  it('restarts a Luna repair and continues only with the durably adopted codex-cli identity', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-repair-handoff-restart-'));
     try {
       const store = new JsonFileStore({ dir: directory });
@@ -1933,6 +1933,8 @@ describe('runWorkflow', () => {
       let implementationStarted = false;
       let firstPostWorkerRead = true;
       let secondInvocationStarted = false;
+      let thirdInvocationStarted = false;
+      let thirdWorkerCompleted = false;
       const github = githubAdapter(Array(20).fill(HEAD));
       const readLiveSnapshot = github.readLiveSnapshot.bind(github);
       github.readLiveSnapshot = async (target) => {
@@ -1944,12 +1946,15 @@ describe('runWorkflow', () => {
           assert.equal(independentlyLoaded?.executor?.sessionId, 'captured-session');
           throw new Error('simulated process interruption after durable handoff, before GitHub verification');
         }
-        const live = secondInvocationStarted ? snapshot(HEAD2) : await readLiveSnapshot(target);
+        const live = thirdInvocationStarted
+          ? snapshot(thirdWorkerCompleted ? HEAD2 : HEAD)
+          : secondInvocationStarted ? snapshot(HEAD2) : await readLiveSnapshot(target);
         return { ...live, pullRequest: { ...live.pullRequest!, headRef: 'existing-pr', baseRef: 'main', headRepository: { owner: 'acme', repo: 'widgets' } } };
       };
       const implementation = new FakeImplementation([
         { ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'captured-session' }, sessionId: 'captured-session' },
-        { ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'fresh-luna-session-after-restart' }, sessionId: 'fresh-luna-session-after-restart' },
+        { ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'new-session-after-restart' }, sessionId: 'new-session-after-restart' },
+        { ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'captured-session' }, sessionId: 'captured-session' },
       ]);
       const invoke = implementation.run.bind(implementation);
       let invocationCount = 0;
@@ -1957,7 +1962,10 @@ describe('runWorkflow', () => {
         invocationCount += 1;
         implementationStarted = true;
         if (invocationCount === 2) secondInvocationStarted = true;
-        return await invoke(request);
+        if (invocationCount === 3) thirdInvocationStarted = true;
+        const result = await invoke(request);
+        if (invocationCount === 3) thirdWorkerCompleted = true;
+        return result;
       };
       const bootstrapIdentity = {
         bootstrapKind: 'standalone-isolated' as const, owner: 'acme', repo: 'widgets', issueNumber: 42,
@@ -1989,13 +1997,26 @@ describe('runWorkflow', () => {
 
       const restartedStore = new JsonFileStore({ dir: directory });
       const second = await runWorkflow({ ...deps, store: restartedStore }, id, { maxReviewAttempts: 2, now: () => T0 });
-      assert.equal(second.outcome, 'merge_ready', second.outcome === 'needs_human' ? second.reason : undefined);
+      assert.equal(second.outcome, 'needs_human', 'a restarted Luna worker cannot rotate the already adopted provider session');
       assert.equal(implementation.requests[1]?.executor, undefined, 'Luna remains isolated after restart');
       assert.equal(implementation.requests[1]?.sessionId, undefined, 'the prior codex-cli identity is never injected into Luna');
       assert.equal(implementation.requests[1]?.runtimeOwnership?.generation, implementation.requests[0]?.runtimeOwnership?.generation);
-      assert.equal(second.run.executor?.sessionId, 'fresh-luna-session-after-restart');
+      assert.equal(second.run.executor?.sessionId, 'captured-session');
       assert.equal(second.run.history.filter((event) => event.type === 'repair_executor_handoff').length, 1);
-      assert.equal(second.run.history.filter((event) => event.type === 'repair_executor_continued').length, 1);
+      assert.equal(second.run.history.filter((event) => event.type === 'repair_executor_continued').length, 0);
+      const held = new JsonFileStore({ dir: directory }).read(id)!;
+      assert.equal(held.executor?.sessionId, 'captured-session', 'the last adopted executor remains authoritative after the refused result');
+      assert.equal(held.history.filter((event) => event.type === 'repair_executor_handoff').length, 1);
+      assert.equal(held.history.filter((event) => event.type === 'repair_executor_continued').length, 0);
+
+      store.update(applyTransition(held, { type: 'human_resolved', reason: 'Retry with the retained executor identity' }, T0));
+      secondInvocationStarted = false;
+      const third = await runWorkflow({ ...deps, store: new JsonFileStore({ dir: directory }) }, id, { maxReviewAttempts: 2, now: () => T0 });
+      assert.equal(third.outcome, 'merge_ready', third.outcome === 'needs_human' ? third.reason : undefined);
+      assert.equal(third.run.executor?.sessionId, 'captured-session');
+      assert.equal(third.run.history.filter((event) => event.type === 'repair_executor_handoff').length, 1);
+      assert.equal(third.run.history.filter((event) => event.type === 'repair_executor_continued').length, 1);
+      assert.equal(implementation.requests[2]?.executor, undefined, 'Luna stays isolated on the exact-identity retry');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
@@ -2139,7 +2160,7 @@ describe('runWorkflow', () => {
     const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
     const binding = createRepairAttemptBinding(run, execution);
     run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
-    const adopted = { provider: 'codex-cli', sessionId: 'adopted-session' } as const;
+    const adopted = { provider: 'codex-cli', sessionId: 'predecessor-session' } as const;
     run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: { ...successResult(HEAD2), executor: adopted, sessionId: adopted.sessionId } }, T0);
     run = { ...run, executor: { provider: 'claude-code', sessionId: 'forged-current-session' } };
     store.create(run);

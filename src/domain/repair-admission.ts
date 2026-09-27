@@ -55,6 +55,40 @@ export type RepairExecutorHandoff =
   | { readonly kind: 'executor'; readonly identity: ExecutorIdentity }
   | { readonly kind: 'sessionless'; readonly provider: 'worker-router' };
 
+/** Exact provider/session/generation equality, including undefined identities and generations. */
+export function sameRepairExecutorIdentity(a: ExecutorIdentity | undefined, b: ExecutorIdentity | undefined): boolean {
+  return a?.provider === b?.provider && a?.sessionId === b?.sessionId && a?.generation === b?.generation &&
+    (a === undefined) === (b === undefined);
+}
+
+/** Shared admission and ledger rule for the identity adopted by a repair invocation. */
+export function isRepairHandoffCompatible(
+  selectedProvider: string,
+  binding: RepairAttemptBinding,
+  outcome: RepairExecutorHandoff,
+  previous?: RepairExecutorHandoff,
+): boolean {
+  if (outcome.kind === 'sessionless') {
+    if (selectedProvider !== 'worker-router' || outcome.provider !== 'worker-router') return false;
+    return previous === undefined || (previous.kind === 'sessionless' && previous.provider === outcome.provider);
+  }
+
+  const identity = outcome.identity;
+  const providerMatches = selectedProvider === 'luna-isolated'
+    ? identity.provider === 'codex-cli'
+    : selectedProvider === 'codex-cli'
+      ? identity.provider === 'codex-cli' || identity.provider === 'codex-app-server'
+      : identity.provider === selectedProvider;
+  if (!providerMatches) return false;
+
+  if (identity.provider === 'codex-app-server' && identity.generation !== binding.runtimeGeneration) return false;
+  if (!binding.freshExecutor) {
+    if (binding.predecessorExecutor !== undefined && !sameRepairExecutorIdentity(binding.predecessorExecutor, identity)) return false;
+    if (binding.predecessorSessionId !== undefined && binding.predecessorSessionId !== identity.sessionId) return false;
+  }
+  return previous === undefined || (previous.kind === 'executor' && sameRepairExecutorIdentity(previous.identity, identity));
+}
+
 export interface RepairHandoffRecord {
   readonly admissionHistoryIndex: number;
   readonly startFixHistoryIndex: number;
@@ -193,23 +227,18 @@ export function activeRepairAdmission(run: {
   const handoff = handoffEvent?.event.repairHandoff;
   const binding = snapshot.attemptBinding!;
   if (handoff === undefined) {
-    if (!sameExecutor(run.executor, binding.predecessorExecutor) ||
-        (run.agentResult?.executor !== undefined && !sameExecutor(run.agentResult.executor, binding.predecessorExecutor)) ||
+    if (!sameRepairExecutorIdentity(run.executor, binding.predecessorExecutor) ||
+        (run.agentResult?.executor !== undefined && !sameRepairExecutorIdentity(run.agentResult.executor, binding.predecessorExecutor)) ||
         run.agentResult?.sessionId !== binding.predecessorSessionId) return null;
   } else if (handoff.outcome.kind === 'sessionless') {
     if (run.executor !== undefined || run.agentResult?.executor !== undefined || run.agentResult?.sessionId !== undefined) return null;
   } else {
     const adopted = handoff.outcome.identity;
-    if (!sameExecutor(run.executor, adopted) ||
-        (run.agentResult?.executor !== undefined && !sameExecutor(run.agentResult.executor, adopted)) ||
+    if (!sameRepairExecutorIdentity(run.executor, adopted) ||
+        (run.agentResult?.executor !== undefined && !sameRepairExecutorIdentity(run.agentResult.executor, adopted)) ||
         (run.agentResult?.sessionId !== undefined && run.agentResult.sessionId !== adopted.sessionId)) return null;
   }
   return { snapshot, admissionHistoryIndex, startFixHistoryIndex, ...(handoff === undefined ? {} : { handoff }) };
-}
-
-function sameExecutor(a: ExecutorIdentity | undefined, b: ExecutorIdentity | undefined): boolean {
-  return a?.provider === b?.provider && a?.sessionId === b?.sessionId && a?.generation === b?.generation &&
-    (a === undefined) === (b === undefined);
 }
 
 function isResolvedExecution(value: unknown): value is ResolvedExecutionConfiguration {

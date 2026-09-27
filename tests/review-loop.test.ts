@@ -712,7 +712,7 @@ describe('runReviewLoop', () => {
     assert.deepEqual(implementation.requests[0]?.execution, complex);
   });
 
-  it('binds App Server continuation to the exact request generation and permits same-provider session rotation only', () => {
+  it('requires the exact App Server identity through a logical codex-cli continuation', () => {
     let run = repairChangesRun('same-provider-continuation');
     const prior = { provider: 'codex-app-server', sessionId: 'old-session', generation: 'run-generation' } as const;
     run = { ...run, executor: prior, agentResult: { ...run.agentResult!, sessionId: prior.sessionId, executor: prior } };
@@ -724,29 +724,33 @@ describe('runReviewLoop', () => {
     run = applyTransition(run, {
       type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding },
     }, T0);
-    const initialResult: AgentResult = {
-      ...successResult(HEAD2), executor: { ...prior, sessionId: 'first-session' }, sessionId: 'first-session',
-    };
+    const initialResult: AgentResult = { ...successResult(HEAD2), executor: prior, sessionId: prior.sessionId };
     assert.throws(() => applyTransition(run, {
       type: 'repair_executor_handoff',
       repairAgentResult: { ...initialResult, executor: { ...initialResult.executor!, generation: '' } },
     }, T0), /Repair executor result does not prove the admitted provider identity/);
     run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: initialResult }, T0);
-    const rotated: AgentResult = {
-      ...successResult(HEAD2), executor: { ...prior, sessionId: 'rotated-session' }, sessionId: 'rotated-session',
-    };
-    const continued = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: rotated }, T0);
-    assert.equal(continued.executor?.sessionId, 'rotated-session');
+    const continued = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: initialResult }, T0);
+    assert.deepEqual(continued.executor, prior);
     assert.equal(continued.history.at(-1)?.type, 'repair_executor_continued');
-    assert.throws(() => applyTransition(continued, {
-      type: 'repair_executor_continued',
-      repairAgentResult: { ...rotated, executor: { provider: 'claude-code', sessionId: 'other-provider' }, sessionId: 'other-provider' },
-    }, T0), /Repair executor result does not prove the admitted provider identity/);
+    const invalidResults: AgentResult[] = [
+      { ...initialResult, executor: { provider: 'codex-app-server', sessionId: 'rotated-session', generation: prior.generation }, sessionId: 'rotated-session' },
+      { ...initialResult, executor: { provider: 'codex-app-server', sessionId: prior.sessionId }, sessionId: prior.sessionId },
+      { ...initialResult, executor: { provider: 'codex-app-server', sessionId: prior.sessionId, generation: 'other-generation' } },
+      { ...initialResult, executor: { provider: 'codex-cli', sessionId: prior.sessionId }, sessionId: prior.sessionId },
+      { ...initialResult, sessionId: 'legacy-session-drift' },
+    ];
+    for (const invalid of invalidResults) {
+      assert.throws(() => applyTransition(continued, { type: 'repair_executor_continued', repairAgentResult: invalid }, T0),
+        /Repair executor result does not prove the admitted provider identity/);
+      assert.equal(continued.history.at(-1)?.type, 'repair_executor_continued', 'rejection leaves durable history unchanged');
+      assert.deepEqual(continued.executor, prior, 'rejection leaves the predecessor identity unchanged');
+    }
     const laterStartFix = {
       ...continued,
       history: [...continued.history, { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }],
     };
-    assert.throws(() => applyTransition(laterStartFix, { type: 'repair_executor_continued', repairAgentResult: rotated }, T0),
+    assert.throws(() => applyTransition(laterStartFix, { type: 'repair_executor_continued', repairAgentResult: initialResult }, T0),
       /Repair executor result does not prove the admitted provider identity/,
     'same HEAD/PR and timestamp on an older receipt cannot authorize a newer start_fix');
     assert.throws(() => applyTransition({ ...run, repairTaskShapeAuthority: { revision: 'new-authority', shape: 'bounded' } }, {
@@ -760,6 +764,68 @@ describe('runReviewLoop', () => {
     const badRevision = { ...run, repairAdmissions: [{ ...receipt, attemptBinding: binding, executionRevision: 'rewritten' }] };
     assert.throws(() => applyTransition(badRevision, { type: 'repair_executor_handoff', repairAgentResult: initialResult }, T0),
       /Repair executor result does not prove the admitted provider identity/);
+  });
+
+  it('accepts a genuinely predecessor-free initial adoption and keeps fresh Luna continuation exact', () => {
+    {
+      let run = repairChangesRun('repair-without-predecessor');
+      const execution: ResolvedExecutionConfiguration = { ...ROUTINE_REPAIR_EXECUTION, executor: 'codex-cli' };
+      const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+      const binding = createRepairAttemptBinding(run, execution);
+      assert.equal(binding.freshExecutor, false);
+      assert.equal(binding.predecessorExecutor, undefined);
+      assert.equal(binding.predecessorSessionId, undefined);
+      run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+      const adopted: AgentResult = { ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'initial-session' }, sessionId: 'initial-session' };
+      run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: adopted }, T0);
+      assert.equal(run.executor?.sessionId, 'initial-session');
+    }
+    {
+      let run = repairChangesRun('fresh-luna-continuation-identity');
+      const prior = { provider: 'claude-code', sessionId: 'prior-session' } as const;
+      run = { ...run, executor: prior, agentResult: { ...run.agentResult!, executor: prior, sessionId: prior.sessionId } };
+      const execution: ResolvedExecutionConfiguration = { ...ROUTINE_REPAIR_EXECUTION, executor: 'luna-isolated' };
+      const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+      const binding = createRepairAttemptBinding(run, execution);
+      assert.equal(binding.freshExecutor, true);
+      run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+      const adopted: AgentResult = { ...successResult(HEAD2), executor: { provider: 'codex-cli', sessionId: 'luna-session' }, sessionId: 'luna-session' };
+      run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: adopted }, T0);
+      const rotated: AgentResult = { ...adopted, executor: { provider: 'codex-cli', sessionId: 'restarted-session' }, sessionId: 'restarted-session' };
+      assert.throws(() => applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: rotated }, T0),
+        /Repair executor result does not prove the admitted provider identity/);
+      const continued = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: adopted }, T0);
+      assert.equal(continued.executor?.sessionId, 'luna-session');
+    }
+    {
+      let run = repairChangesRun('worker-router-sessionless-repair');
+      const execution: ResolvedExecutionConfiguration = { ...ROUTINE_REPAIR_EXECUTION, executor: 'worker-router' };
+      const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+      const binding = createRepairAttemptBinding(run, execution);
+      run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+      const result = successResult(HEAD2);
+      run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: result }, T0);
+      const continued = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: result }, T0);
+      assert.equal(continued.executor, undefined);
+      assert.equal(continued.history.at(-1)?.repairHandoff?.outcome.kind, 'sessionless');
+    }
+  });
+
+  it('requires a nonfresh predecessor generation to remain absent when it was absent at admission', () => {
+    let run = repairChangesRun('repair-generation-presence');
+    const prior = { provider: 'claude-code', sessionId: 'same-session' } as const;
+    run = { ...run, executor: prior, agentResult: { ...run.agentResult!, executor: prior, sessionId: prior.sessionId } };
+    const execution: ResolvedExecutionConfiguration = { ...ROUTINE_REPAIR_EXECUTION, executor: 'claude-code' };
+    const receipt = createRepairAdmissionSnapshot(run.repairTaskShapeAuthority!, 'review_blocking', HEAD, 7, execution, T0);
+    const binding = createRepairAttemptBinding(run, execution);
+    run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+    const addedGeneration: AgentResult = {
+      ...successResult(HEAD2), executor: { ...prior, generation: 'introduced-generation' }, sessionId: prior.sessionId,
+    };
+    assert.throws(() => applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: addedGeneration }, T0),
+      /Repair executor result does not prove the admitted provider identity/);
+    assert.equal(run.executor?.generation, undefined);
+    assert.equal(run.history.at(-1)?.type, 'start_fix');
   });
 
   it('rejects a forged or missing captured predecessor before authorizing start_fix', () => {

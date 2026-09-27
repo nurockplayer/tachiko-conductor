@@ -12,7 +12,7 @@ import { JsonFileStore } from '../src/store/json-file-store.js';
 import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { ensureDurableDirectory, syncDirectory } from '../src/durable-directory.js';
 import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, operationalRunProjection, sha256 } from '../src/operational/projection.js';
-import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
+import { T0, TARGET, TEST_VALIDATION_AUTHORITY, changesRequested, newRun, successResult, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
@@ -248,6 +248,72 @@ describe('JsonFileStore — persistence round-trips', () => {
       assert.throws(() => new JsonFileStore({ dir }).read(valid.id), /corrupt or incompatible/);
       writeFileSync(file, JSON.stringify(valid), 'utf8');
     }
+  });
+
+  it('replays every repair handoff against the exact previous executor identity', () => {
+    const { store, dir } = tempStore();
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const predecessor = { provider: 'codex-app-server', sessionId: 'session-A', generation: 'run-generation' } as const;
+    let run = newRun('repair-handoff-ledger-replay');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('head-sha'), headSha: 'head-sha' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('head-sha'), pullRequest: { number: 7, headSha: 'head-sha' } }, T0);
+    run = {
+      ...run, repairTaskShapeAuthority: authority,
+      executor: predecessor,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId },
+    };
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'head-sha') }, T0, TEST_VALIDATION_AUTHORITY);
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+    const binding = createRepairAttemptBinding(run, execution);
+    assert.equal(binding.freshExecutor, false);
+    run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+    const exact = { ...successResult('fixed-sha'), executor: predecessor, sessionId: predecessor.sessionId };
+    run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: exact }, T0);
+    run = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: exact }, T0);
+    run = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: exact }, T0);
+    store.create(run);
+
+    const restarted = new JsonFileStore({ dir });
+    const replayed = restarted.read(run.id);
+    assert.equal(replayed?.history.length, run.history.length, 'exact logical codex-cli/App Server identity remains valid after restart');
+    assert.deepEqual(replayed?.history.map((event) => event.repairHandoff).filter(Boolean), run.history.map((event) => event.repairHandoff).filter(Boolean));
+    const file = path.join(dir, `${run.id}.json`);
+    const original = readFileSync(file, 'utf8');
+    const corruptions = [
+      {
+        label: 'session-only continuation substitution followed by a return to A',
+        eventType: 'repair_executor_continued',
+        change: (identity: Record<string, unknown>) => { identity.sessionId = 'session-B'; },
+      },
+      {
+        label: 'generation-only continuation change',
+        eventType: 'repair_executor_continued',
+        change: (identity: Record<string, unknown>) => { identity.generation = 'other-generation'; },
+      },
+      {
+        label: 'generation-only continuation removal',
+        eventType: 'repair_executor_continued',
+        change: (identity: Record<string, unknown>) => { delete identity.generation; },
+      },
+      {
+        label: 'first handoff session substitution followed by a return to A',
+        eventType: 'repair_executor_handoff',
+        change: (identity: Record<string, unknown>) => { identity.sessionId = 'session-B'; },
+      },
+    ];
+    for (const { label, eventType, change } of corruptions) {
+      const damaged = JSON.parse(original) as Record<string, any>;
+      const event = damaged.history.find((candidate: { type: string }) => candidate.type === eventType);
+      change(event.repairHandoff.outcome.identity);
+      const corruptBytes = JSON.stringify(damaged);
+      writeFileSync(file, corruptBytes, 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/, label);
+      assert.equal(readFileSync(file, 'utf8'), corruptBytes, 'rejected replay leaves persisted corrupt bytes untouched');
+    }
+    assert.equal(run.history.at(-1)?.repairHandoff?.outcome.kind, 'executor', 'replay rejection did not mutate the caller-owned history');
+    writeFileSync(file, original, 'utf8');
   });
 
   it('projects the selected provider and profile before an agent session exists', () => {

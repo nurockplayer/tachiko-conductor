@@ -9,7 +9,7 @@ import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetr
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
-import { isRepairAdmissionSnapshot, isRepairHandoffRecord, isRepairTaskShapeAuthority } from '../domain/repair-admission.js';
+import { isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
 import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 
 /**
@@ -226,42 +226,23 @@ function isRepairHistoryCoherent(run: Record<string, unknown>): boolean {
     if (event?.type !== 'start_fix' || event.from !== 'CHANGES_REQUESTED' || event.to !== 'IMPLEMENTING' || event.repairAdmissionIndex !== admissionIndex ||
         markers.get(admissionIndex) !== binding.startFixHistoryIndex) return false;
   }
-  const consumed = new Map<string, Record<string, unknown>>();
+  const consumed = new Map<string, RepairHandoffRecord>();
   for (const { handoff, index: eventIndex, entry } of handoffs) {
+    if (!isRepairHandoffRecord(handoff)) return false;
     const key = `${String(handoff.admissionHistoryIndex)}:${String(handoff.startFixHistoryIndex)}`;
     const prior = consumed.get(key);
     if (entry.type === 'repair_executor_handoff' ? prior !== undefined : prior === undefined) return false;
-    consumed.set(key, handoff);
     const admission = admissions[handoff.admissionHistoryIndex as number];
-    const binding = admission?.attemptBinding as Record<string, unknown> | undefined;
-    if (admission === undefined || binding === undefined || binding.admissionIndex !== handoff.admissionHistoryIndex || binding.startFixHistoryIndex !== handoff.startFixHistoryIndex ||
+    if (admission === undefined || !isRepairAdmissionSnapshot(admission)) return false;
+    const binding = admission.attemptBinding;
+    if (binding === undefined || binding.admissionIndex !== handoff.admissionHistoryIndex || binding.startFixHistoryIndex !== handoff.startFixHistoryIndex ||
         entry.from !== 'IMPLEMENTING' || entry.to !== 'IMPLEMENTING' || eventIndex <= (binding.startFixHistoryIndex as number)) return false;
     const nextBoundary = history.findIndex((event, index) => index > (binding.startFixHistoryIndex as number) &&
       (event.type === 'start_fix' || event.type === 'agent_succeeded' || event.type === 'agent_failed'));
     if (nextBoundary >= 0 && eventIndex >= nextBoundary) return false;
-    const execution = (admission.execution ?? {}) as Record<string, unknown>;
-    const provider = execution.executor;
-    const outcome = handoff.outcome as Record<string, unknown>;
-    if (outcome.kind === 'sessionless') {
-      if (provider !== 'worker-router' || outcome.provider !== 'worker-router') return false;
-    } else {
-      const identity = outcome.identity as Record<string, unknown>;
-      const matches = provider === 'luna-isolated' ? identity.provider === 'codex-cli' :
-        provider === 'codex-cli' ? identity.provider === 'codex-cli' || identity.provider === 'codex-app-server' : identity.provider === provider;
-      if (!matches) return false;
-      const expectedGeneration = binding.runtimeGeneration;
-      if (identity.provider === 'codex-app-server' && (expectedGeneration === undefined || identity.generation !== expectedGeneration)) return false;
-    }
-    if (prior !== undefined) {
-      const previousOutcome = prior.outcome as Record<string, unknown>;
-      const nextOutcome = handoff.outcome as Record<string, unknown>;
-      if (previousOutcome.kind !== nextOutcome.kind) return false;
-      if (previousOutcome.kind === 'executor') {
-        const previousIdentity = previousOutcome.identity as Record<string, unknown>;
-        const nextIdentity = nextOutcome.identity as Record<string, unknown>;
-        if (previousIdentity.provider !== nextIdentity.provider) return false;
-      } else if (previousOutcome.provider !== nextOutcome.provider) return false;
-    }
+    if (binding === undefined || !isRepairHandoffCompatible(admission.execution.executor, binding,
+        handoff.outcome as RepairExecutorHandoff, prior?.outcome)) return false;
+    consumed.set(key, handoff);
   }
   return true;
 }
