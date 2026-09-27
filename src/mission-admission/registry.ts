@@ -404,7 +404,7 @@ export class MissionAdmissionRegistry {
     this.validatePath();
   }
 
-  private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void, validateBeforePublish?: (result: T) => void): T {
+  private transact<T>(operation: (state: RegistryState) => T, beforeStatePublish?: (result: T) => void, afterPublish?: (result: T) => void, validateBeforePublish?: (result: T) => void, beforeStatePublishOnNoop = false): T {
     this.validatePath?.();
     ensureDurableDirectory(path.dirname(this.filePath), { mode: 0o700, syncDirectoryHierarchy: this.syncDirectoryHierarchy });
     this.validatePath?.();
@@ -438,6 +438,12 @@ export class MissionAdmissionRegistry {
         if (state.revision !== beforeRevision) {
           try { this.onPublishedTransition?.(project(state)); } catch { /* wake is a best-effort hint; publication remains authoritative */ }
         }
+      } else if (beforeStatePublishOnNoop) {
+        // Renewal receipts still need finalizing under the registry lock when
+        // the timestamp is unchanged (for example, two operations in one ms).
+        // Other transaction callbacks retain their state-change-only behavior.
+        validateState(state);
+        beforeStatePublish?.(result);
       }
       // Receipt finalization belongs to the same host-global transaction as
       // the registry publication. Same-lane admission cannot publish its
@@ -561,7 +567,7 @@ export class MissionAdmissionRegistry {
       const lane = requireCurrentToken(state, token);
       lane.updatedAt = this.now();
       return tokenRecord(lane);
-    }, () => beforePublish?.());
+    }, () => beforePublish?.(), undefined, undefined, true);
   }
 
   readLane(laneId: string): AdmissionLaneView | null {

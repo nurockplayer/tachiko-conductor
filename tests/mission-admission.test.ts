@@ -17,7 +17,7 @@ import { syncDirectory } from '../src/durable-directory.js';
 import { createRun } from '../src/domain/run.js';
 import { findRunByTarget, parseGitHubRepositoryRemote, resolveRunsDir } from '../src/cli.js';
 import { readManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
-import { writeRunOwnerReceipt, type RunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
+import { readRunOwnerReceipt, writeRunOwnerReceipt, type RunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { handleHeartbeatAdmission } from '../src/mission-admission/heartbeat-admission.js';
 import { T0, TARGET } from './helpers.js';
 
@@ -30,10 +30,10 @@ function createHashForTest(repository: string, workspace: string): string {
   return createHash('sha256').update(`${repository}\0${realpathSync(workspace)}`).digest('hex');
 }
 
-function fixture(overrides: { readonly config?: AdmissionConfig; readonly beforePublish?: () => void; readonly onPublishedTransition?: (projection: import('../src/mission-admission/registry.js').AdmissionProjection) => void; readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void; readonly syncDirectoryHierarchy?: (directory: string) => void } = {}): { directory: string; filePath: string; registry: MissionAdmissionRegistry } {
+function fixture(overrides: { readonly config?: AdmissionConfig; readonly beforePublish?: () => void; readonly onPublishedTransition?: (projection: import('../src/mission-admission/registry.js').AdmissionProjection) => void; readonly now?: () => string; readonly syncForDurability?: (fd: number, target: 'file' | 'directory') => void; readonly syncDirectoryHierarchy?: (directory: string) => void } = {}): { directory: string; filePath: string; registry: MissionAdmissionRegistry } {
   const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-'));
   const filePath = path.join(directory, 'host', 'admission.json');
-  return { directory, filePath, registry: new MissionAdmissionRegistry({ filePath, config: overrides.config ?? config, lockTimeoutMs: 10_000, ...(overrides.beforePublish ? { beforePublish: overrides.beforePublish } : {}), ...(overrides.onPublishedTransition ? { onPublishedTransition: overrides.onPublishedTransition } : {}), ...(overrides.syncForDurability ? { syncForDurability: overrides.syncForDurability } : {}), ...(overrides.syncDirectoryHierarchy ? { syncDirectoryHierarchy: overrides.syncDirectoryHierarchy } : {}) }) };
+  return { directory, filePath, registry: new MissionAdmissionRegistry({ filePath, config: overrides.config ?? config, lockTimeoutMs: 10_000, ...(overrides.beforePublish ? { beforePublish: overrides.beforePublish } : {}), ...(overrides.onPublishedTransition ? { onPublishedTransition: overrides.onPublishedTransition } : {}), ...(overrides.now ? { now: overrides.now } : {}), ...(overrides.syncForDurability ? { syncForDurability: overrides.syncForDurability } : {}), ...(overrides.syncDirectoryHierarchy ? { syncDirectoryHierarchy: overrides.syncDirectoryHierarchy } : {}) }) };
 }
 
 function evidence(issue: number, overrides: Partial<MissionEvidence> = {}): MissionEvidence {
@@ -472,6 +472,60 @@ describe('provider-neutral durable mission admission', () => {
       const after = registry.snapshot();
       assert.equal(after.revision, before.revision);
       assert.deepEqual(after.lastTransition, before.lastTransition);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('finalizes a renewal receipt on a same-millisecond no-op before guarded effects', () => {
+    const fixedTime = '2026-09-28T00:00:00.000Z';
+    let wakes = 0;
+    const { directory, registry } = fixture({ now: () => fixedTime, onPublishedTransition: () => { wakes += 1; } });
+    try {
+      const admitted = registry.admit({ laneId: 'same-ms-renew-lane', role: 'production_captain', evidence: evidence(33) });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') return;
+      const before = registry.snapshot();
+      const generation = registry.readLane(admitted.token.laneId)?.generation;
+      const wakesBeforeRenew = wakes;
+      const receiptPath = path.join(directory, 'same-ms-run-receipt.json');
+      const preExecutionReceipt: RunOwnerReceipt = {
+        schemaVersion: 1, laneId: admitted.token.laneId, missionId: admitted.missionId,
+        repository: 'example/widgets', runId: 'same-ms-run', issue: 33,
+        token: admitted.token, generation: admitted.token.generation, phase: 'pre_execution',
+      };
+      writeRunOwnerReceipt(receiptPath, preExecutionReceipt);
+      let receiptCalls = 0;
+      let guardedEffects = 0;
+
+      assert.throws(() => {
+        registry.renew(admitted.token, () => {
+          receiptCalls += 1;
+          throw new Error('receipt finalization failed');
+        });
+        guardedEffects += 1;
+      }, /receipt finalization failed/);
+
+      const after = registry.snapshot();
+      assert.equal(receiptCalls, 1, 'renewal receipt callback runs once despite unchanged serialized state');
+      assert.equal(guardedEffects, 0, 'receipt failure propagates before the guarded effect');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'pre_execution', 'failed receipt transition leaves the prior durable phase intact');
+      assert.equal(registry.readLane(admitted.token.laneId)?.generation, generation);
+      assert.equal(after.revision, before.revision);
+      assert.deepEqual(after.lastTransition, before.lastTransition);
+      assert.equal(wakes, wakesBeforeRenew, 'same-millisecond renewal does not send a transition wake');
+
+      let successfulReceiptCalls = 0;
+      registry.renew(admitted.token, () => {
+        successfulReceiptCalls += 1;
+        writeRunOwnerReceipt(receiptPath, { ...preExecutionReceipt, phase: 'execution_possible' });
+      });
+
+      const afterSuccessfulRenew = registry.snapshot();
+      assert.equal(successfulReceiptCalls, 1, 'successful same-millisecond receipt callback runs once');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'execution_possible', 'the guarded phase is durably readable after renew returns');
+      assert.equal(registry.readLane(admitted.token.laneId)?.generation, generation);
+      assert.equal(afterSuccessfulRenew.revision, before.revision);
+      assert.deepEqual(afterSuccessfulRenew.lastTransition, before.lastTransition);
+      assert.equal(wakes, wakesBeforeRenew, 'same-millisecond receipt finalization does not send a transition wake');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
