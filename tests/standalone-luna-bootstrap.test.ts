@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
-import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
+import { hasPreparedStandaloneLunaInvocation, StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 import type { ProcessRunner } from '../src/github/transport.js';
 import { createBootstrapGitFixture, type BootstrapGitFixture } from './bootstrap-fixture.js';
 
@@ -45,7 +45,12 @@ describe('standalone Luna bootstrap', () => {
 
   it('gives the worker a remote-free standalone checkout and host-publishes only its exact clean descendant', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
-    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const order: string[] = [];
+    const runner: ProcessRunner = { run: async (file, args, options) => {
+      if (args.includes('push')) order.push('push');
+      return fixture.runner.run(file, args, options);
+    } };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
     const request = { runId: 'luna-99', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
     const identity = await bootstrap.plan(request);
     await bootstrap.prepare({ ...request, existing: identity });
@@ -55,7 +60,8 @@ describe('standalone Luna bootstrap', () => {
     fixture.git(identity.workspacePath, ['add', 'luna.txt']);
     fixture.git(identity.workspacePath, ['-c', 'user.name=Luna', '-c', 'user.email=luna@example.invalid', 'commit', '-m', 'luna commit']);
     const head = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim();
-    const durable = await bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha });
+    const durable = await bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, beforePublish: () => { order.push('fence'); } });
+    assert.deepEqual(order, ['fence', 'push'], 'the host fence is synchronous and directly adjacent to publication');
     assert.equal(durable.headSha, head);
     assert.equal(fixture.git(fixture.remote, ['rev-parse', `refs/heads/${identity.branch}`]).trim(), head);
   });
@@ -79,12 +85,168 @@ describe('standalone Luna bootstrap', () => {
     assert.equal(fixture.git(fixture.remote, ['for-each-ref', 'refs/heads/tachiko/luna-pre-push-fence']).trim(), '');
   });
 
+  it('rejects missing publication authority without pushing and preserves callback-free adoption', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-required-fence', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    const head = fixture.commit(identity.workspacePath, 'candidate.txt', 'candidate\n');
+    const before = fixture.commands.length;
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha }), /requires a synchronous host-owned/);
+    assert.equal(fixture.commands.slice(before).some((command) => command.args[0] === 'push'), false);
+    assert.equal(fixture.git(fixture.remote, ['for-each-ref', 'refs/heads/tachiko/luna-required-fence']).trim(), '');
+    await assert.doesNotReject(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, adoptExistingHead: true }));
+  });
+
+  it('binds proof to exact target, run, branch, workspace and authorized repair head, invalidating before failed reprepare', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const target = { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 };
+    const request = { runId: 'luna-proof', target, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    const guard = bootstrap.guard(identity);
+    const invocation = { target, baseSha: fixture.baseSha, workspacePath: identity.workspacePath, branch: identity.branch, workspaceGuard: guard, runtimeOwnership: { runId: request.runId, generation: 'generation' } };
+    assert.equal(Object.isFrozen(guard), true);
+    assert.equal(hasPreparedStandaloneLunaInvocation(invocation), true);
+    assert.equal(hasPreparedStandaloneLunaInvocation({ ...invocation, branch: 'other' }), false);
+    assert.equal(hasPreparedStandaloneLunaInvocation({ ...invocation, baseSha: 'f'.repeat(40) }), false);
+    assert.equal(hasPreparedStandaloneLunaInvocation({ ...invocation, runtimeOwnership: { runId: 'other', generation: 'generation' } }), false);
+    assert.equal(hasPreparedStandaloneLunaInvocation({ ...invocation, target: { ...target, issueNumber: 100 } }), false);
+    assert.equal(hasPreparedStandaloneLunaInvocation({ ...invocation, workspaceGuard: Object.freeze({ assertValid() {} }) }), false);
+    await assert.rejects(() => bootstrap.prepare({ ...request, runId: 'invalid..run', existing: identity }), /invalid Git branch/);
+    assert.equal(hasPreparedStandaloneLunaInvocation(invocation), false);
+    await assert.rejects(async () => { await guard.assertValid(); }, /preparation proof was superseded/);
+    await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); });
+  });
+
+  it('rejects an in-flight guard check when successful reprepare supersedes its proof', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    let releaseCheck!: () => void;
+    let checkStarted!: () => void;
+    const started = new Promise<void>((resolve) => { checkStarted = resolve; });
+    const blocked = new Promise<void>((resolve) => { releaseCheck = resolve; });
+    let armed = false;
+    let paused = false;
+    const runner: ProcessRunner = { run: async (file, args, options) => {
+      if (armed && !paused && args.includes('ls-files') && args.includes('-v')) {
+        paused = true;
+        checkStarted();
+        await blocked;
+      }
+      return fixture.runner.run(file, args, options);
+    } };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: 'luna-inflight-proof', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    armed = true;
+    const oldGuard = bootstrap.guard(identity);
+    const pendingCheck = oldGuard.assertValid();
+    await started;
+    await bootstrap.prepare({ ...request, existing: identity });
+    releaseCheck();
+    await assert.rejects(async () => await pendingCheck, /preparation proof was superseded/);
+    await assert.doesNotReject(async () => await bootstrap.guard(identity).assertValid(), 'the current guard remains reusable');
+  });
+
+  it('accepts a standalone checkout when optional info and hooks directories are absent at preparation', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    let workspacePath: string | undefined;
+    const runner: ProcessRunner = { run: async (file, args, options) => {
+      const result = await fixture.runner.run(file, args, options);
+      if (args.includes('remote') && workspacePath !== undefined && options.cwd === workspacePath) {
+        rmSync(path.join(workspacePath, '.git', 'info'), { recursive: true, force: true });
+        rmSync(path.join(workspacePath, '.git', 'hooks'), { recursive: true, force: true });
+      }
+      return result;
+    } };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: 'luna-optional-git-dirs', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); workspacePath = identity.workspacePath;
+    await bootstrap.prepare({ ...request, existing: identity });
+    await assert.doesNotReject(async () => await bootstrap.guard(identity).assertValid());
+  });
+
+  it('rejects a workspace replacement introduced during the final awaited Git check', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    let workspacePath: string | undefined;
+    let armed = false;
+    let replaced = false;
+    const runner: ProcessRunner = { run: async (file, args, options) => {
+      const result = await fixture.runner.run(file, args, options);
+      if (armed && !replaced && args.includes('rev-parse') && args.includes('HEAD') && options.cwd === workspacePath) {
+        replaced = true;
+        const moved = `${workspacePath}-during-check`;
+        renameSync(workspacePath!, moved);
+        symlinkSync(moved, workspacePath!);
+      }
+      return result;
+    } };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: 'luna-final-check-replacement', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); workspacePath = identity.workspacePath;
+    await bootstrap.prepare({ ...request, existing: identity });
+    armed = true;
+    await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /physical identity changed/);
+    assert.equal(replaced, true);
+  });
+
+  it('mints a new proof from reconstructed repair preparation while retaining immutable bootstrap base', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const target = { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 };
+    const request = { runId: 'luna-reconstructed-proof', target, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const first = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const planned = await first.plan(request); const identity = await first.prepare({ ...request, existing: planned });
+    const repairHead = fixture.commit(identity.workspacePath, 'repair-base.txt', 'repair base\n');
+    const reconstructed = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const repairedIdentity = await reconstructed.prepare({ ...request, existing: identity, recoveryAuthority: { expectedHeadSha: repairHead } });
+    const guard = reconstructed.guard(repairedIdentity);
+    assert.equal(repairedIdentity.baseSha, fixture.baseSha);
+    assert.equal(hasPreparedStandaloneLunaInvocation({ target, baseSha: repairHead, workspacePath: repairedIdentity.workspacePath, branch: repairedIdentity.branch, workspaceGuard: guard, runtimeOwnership: { runId: request.runId, generation: 'repair' } }), true);
+    assert.equal(hasPreparedStandaloneLunaInvocation({ target, baseSha: fixture.baseSha, workspacePath: repairedIdentity.workspacePath, branch: repairedIdentity.branch, workspaceGuard: guard, runtimeOwnership: { runId: request.runId, generation: 'repair' } }), false);
+  });
+
+  it('rejects workspace path replacement and Git object-store redirection after preparation', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-physical-replacement', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    const guard = bootstrap.guard(identity);
+    const moved = `${identity.workspacePath}-moved`;
+    renameSync(identity.workspacePath, moved);
+    symlinkSync(moved, identity.workspacePath);
+    await assert.rejects(async () => { await guard.assertValid(); }, /physical identity changed/);
+  });
+
+  it('rejects replacement of the captured Git object directory and hardlinked Git metadata files', async () => {
+    {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const request = { runId: 'luna-object-dir-replaced', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+      const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+      const objects = path.join(identity.workspacePath, '.git', 'objects');
+      renameSync(objects, `${objects}-saved`); mkdirSync(objects);
+      await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); }, /metadata directory physical identity changed/);
+    }
+    {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const request = { runId: 'luna-hardlinked-config', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+      const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+      const config = path.join(identity.workspacePath, '.git', 'config');
+      const outsideLink = path.join(fixture.root, 'config-hardlink');
+      const before = readFileSync(config, 'utf8');
+      linkSync(config, outsideLink);
+      await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); }, /private regular files/);
+      assert.equal(readFileSync(outsideLink, 'utf8'), before, 'rejection leaves shared external metadata unchanged');
+    }
+  });
+
   it('rejects an initial no-progress result before host publication', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
     const request = { runId: 'luna-99-empty', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
     const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
-    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: fixture.baseSha }), /did not advance/);
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: fixture.baseSha, beforePublish: () => {} }), /did not advance/);
   });
 
   it('rejects every effective origin push URL before host publication', async () => {
@@ -110,7 +272,7 @@ describe('standalone Luna bootstrap', () => {
     fixture.git(identity.workspacePath, ['-c', 'user.name=Luna', '-c', 'user.email=luna@example.invalid', 'commit', '-m', 'candidate']);
     const head = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim();
     extraPushUrl = true;
-    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head }), /publication remote/);
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, beforePublish: () => {} }), /publication remote/);
     assert.equal(calls.some((args) => args.includes('push')), false);
     assert.equal(fixture.git(fixture.remote, ['for-each-ref', 'refs/heads/tachiko/luna-99-extra-push']).trim(), '');
   });
@@ -128,7 +290,7 @@ describe('standalone Luna bootstrap', () => {
     assert.notEqual(identity.branch, identity.publicationBranch);
     fixture.commit(identity.workspacePath, 'repair.txt', 'repair\n');
     const repaired = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim();
-    await bootstrap.verifyDurable({ identity, expectedHeadSha: repaired, progressBaseSha: adoptedHead });
+    await bootstrap.verifyDurable({ identity, expectedHeadSha: repaired, progressBaseSha: adoptedHead, beforePublish: () => {} });
     assert.equal(fixture.git(fixture.remote, ['rev-parse', 'refs/heads/tachiko/existing-pr']).trim(), repaired);
     fixture.git(identity.workspacePath, ['reset', '--hard', fixture.baseSha]);
     await assert.rejects(
@@ -157,7 +319,7 @@ describe('standalone Luna bootstrap', () => {
     const repaired = fixture.commit(identity.workspacePath, 'repair.txt', 'repair\n');
     const repairIdentity = await bootstrap.prepare({ ...request, existing: validationIdentity, recoveryAuthority: { expectedHeadSha: repaired } });
     assert.equal(repairIdentity.publicationBranch, 'tachiko/existing-pr');
-    await bootstrap.verifyDurable({ identity: repairIdentity, expectedHeadSha: repaired, progressBaseSha: adoptedHead });
+    await bootstrap.verifyDurable({ identity: repairIdentity, expectedHeadSha: repaired, progressBaseSha: adoptedHead, beforePublish: () => {} });
     assert.equal(fixture.git(fixture.remote, ['rev-parse', 'refs/heads/tachiko/existing-pr']).trim(), repaired);
   });
 
@@ -241,6 +403,15 @@ describe('standalone Luna bootstrap', () => {
     const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
     writeFileSync(path.join(identity.workspacePath, '.git', 'commondir'), '../worker-controlled-common\n');
     await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /redirects its common metadata/);
+  });
+
+  it('rejects alternate Git object stores before host Git verification', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const request = { runId: 'luna-alternates', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
+    writeFileSync(path.join(identity.workspacePath, '.git', 'objects', 'info', 'alternates'), `${path.join(fixture.source, '.git', 'objects')}\n`);
+    await assert.rejects(async () => { await bootstrap.guard(identity).assertValid(); }, /redirects object storage through alternates/);
   });
 
   it('rejects executable worktree config before its fsmonitor payload can run', async () => {

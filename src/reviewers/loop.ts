@@ -533,7 +533,7 @@ export async function runReviewLoop(
         const request = {
           target,
           baseSha: progressBaseSha ?? '',
-          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch }),
+          ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.agentResult?.sessionId !== undefined ? { sessionId: run.agentResult.sessionId } : {}),
           ...(!repairStartsWithFreshExecutor && !isolatedLuna && run.executor !== undefined ? { executor: run.executor } : {}),
           runtimeOwnership: {

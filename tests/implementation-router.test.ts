@@ -50,6 +50,65 @@ describe('ImplementationAgentRegistry', () => {
     assert.equal(worker.requests.length, 1);
   });
 
+  it('delegates governed qualification to the selected source adapter and holds adapter rejection without fallback', () => {
+    const request: ImplementationRequest = {
+      target: TARGET, baseSha: 'base', execution: { profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 10_000 },
+      runtimeOwnership: { runId: 'run-source-preflight', generation: 'generation' },
+      governedPublication: { required: true, continuation: false },
+    };
+    let selectedRuns = 0;
+    let fallbackSelections = 0;
+    const source = qualifyGovernedPublicationAdapter({
+      kind: 'implementation-agent' as const,
+      async run() { selectedRuns += 1; return successResult('a'.repeat(40)); },
+      prepareGovernedInvocation() { return { status: 'held' as const, reason: 'source proof absent' }; },
+    });
+    const registry = new ImplementationAgentRegistry({
+      defaultProvider: 'codex-cli',
+      providers: { 'codex-cli': () => source, 'claude-code': () => { fallbackSelections += 1; return new RecordingAgent(successResult('b'.repeat(40))); } },
+    });
+    const prepared = registry.prepareGovernedInvocation(request);
+    assert.deepEqual(prepared, { status: 'held', reason: 'source proof absent' });
+    assert.equal(selectedRuns, 0);
+    assert.equal(fallbackSelections, 0);
+  });
+
+  it('holds thrown or substituted selected-adapter preflight without invoking either adapter or fallback', () => {
+    const request: ImplementationRequest = {
+      target: TARGET, baseSha: 'base', execution: { profile: 'standard', revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 10_000 },
+      runtimeOwnership: { runId: 'run-substituted-preflight', generation: 'generation' },
+      governedPublication: { required: true, continuation: false },
+    };
+    for (const mode of ['throw', 'substitute'] as const) {
+      let selectedRuns = 0;
+      let fallbackSelections = 0;
+      let substitutedRuns = 0;
+      const substituted = qualifyGovernedPublicationAdapter({
+        kind: 'implementation-agent' as const,
+        async run() { substitutedRuns += 1; return successResult('c'.repeat(40)); },
+      });
+      const source = qualifyGovernedPublicationAdapter({
+        kind: 'implementation-agent' as const,
+        async run() { selectedRuns += 1; return successResult('a'.repeat(40)); },
+        prepareGovernedInvocation() {
+          if (mode === 'throw') throw new Error('preflight unavailable');
+          return { status: 'qualified' as const, agent: substituted };
+        },
+      });
+      const registry = new ImplementationAgentRegistry({
+        defaultProvider: 'codex-cli',
+        providers: { 'codex-cli': () => source, 'claude-code': () => { fallbackSelections += 1; return new RecordingAgent(successResult('b'.repeat(40))); } },
+      });
+      const prepared = registry.prepareGovernedInvocation(request);
+      assert.equal(prepared.status, 'held', `${mode} preflight must hold`);
+      if (prepared.status === 'held' && mode === 'throw') assert.match(prepared.reason, /preflight unavailable/);
+      if (prepared.status === 'held' && mode === 'substitute') assert.match(prepared.reason, /did not qualify its own exact governed invocation/);
+      assert.equal(selectedRuns, 0);
+      assert.equal(substitutedRuns, 0);
+      assert.equal(fallbackSelections, 0);
+    }
+  });
+
   it('holds ambient and unknown continuation routes without silently selecting the qualified default', async () => {
     const ambient = new RecordingAgent(successResult('a'.repeat(40)));
     const qualifiedDefault = qualifyGovernedPublicationAdapter(new RecordingAgent(successResult('b'.repeat(40))));

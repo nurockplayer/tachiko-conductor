@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
+import { qualifyGovernedPublicationAdapter, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
@@ -204,6 +204,7 @@ class FakeReviewer implements ReviewerAdapter {
 
 class FakeImplementation implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
+  readonly preflightRequests: ImplementationRequest[] = [];
   readonly requests: Array<{
     baseSha: string;
     instructions: string | undefined;
@@ -213,9 +214,16 @@ class FakeImplementation implements ImplementationAgent {
     capabilities: ImplementationRequest['capabilities'];
     workspacePath: string | undefined;
     branch: string | undefined;
+    workspaceGuard: ImplementationRequest['workspaceGuard'];
   }> = [];
 
   constructor(private readonly outcomes: AgentResult[]) {}
+
+  prepareGovernedInvocation(request: ImplementationRequest) {
+    this.preflightRequests.push(request);
+    qualifyGovernedPublicationAdapter(this);
+    return { status: 'qualified' as const, agent: this };
+  }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
     this.requests.push({
@@ -227,6 +235,7 @@ class FakeImplementation implements ImplementationAgent {
       capabilities: request.capabilities,
       workspacePath: request.workspacePath,
       branch: request.branch,
+      workspaceGuard: request.workspaceGuard,
     });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No implementation outcome queued');
@@ -801,7 +810,7 @@ describe('runReviewLoop', () => {
 
     const result = await runReviewLoop(
       { store, github, implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
-        bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => luna },
+        bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => luna, governedPublicationRequired: true },
       run.id, { maxAttempts: 3, now: () => T0 },
     );
 
@@ -810,6 +819,10 @@ describe('runReviewLoop', () => {
     assert.deepEqual((prepared[0] as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
     assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
     assert.equal(implementation.requests[0]?.branch, identity.branch);
+    assert.equal(implementation.preflightRequests[0]?.workspacePath, implementation.requests[0]?.workspacePath);
+    assert.equal(implementation.preflightRequests[0]?.branch, implementation.requests[0]?.branch);
+    assert.equal(implementation.preflightRequests[0]?.workspaceGuard, implementation.requests[0]?.workspaceGuard,
+      'repair preflight and implementation share the same prepared guard object');
     assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
   });
 

@@ -63,6 +63,15 @@ export class ImplementationAgentRegistry implements ImplementationAgent {
     if (!hasGovernedPublicationConfinement(selected.agent)) {
       return { status: 'held', reason: 'The selected adapter has no source-qualified host publication boundary.' };
     }
+    if (selected.agent.prepareGovernedInvocation !== undefined) {
+      let prepared: GovernedInvocationPreparation;
+      try { prepared = selected.agent.prepareGovernedInvocation(request); }
+      catch (error) { return { status: 'held', reason: `Selected adapter preflight failed: ${errorMessage(error)}` }; }
+      if (prepared === null || typeof prepared !== 'object' || prepared.status !== 'qualified' || prepared.agent !== selected.agent ||
+          !hasGovernedPublicationConfinement(prepared.agent)) {
+        return { status: 'held', reason: prepared?.status === 'held' ? prepared.reason : 'Selected adapter did not qualify its own exact governed invocation.' };
+      }
+    }
     return {
       status: 'qualified',
       agent: selected.agent,

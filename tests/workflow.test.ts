@@ -128,12 +128,14 @@ class FakeReviewer implements ReviewerAdapter {
 class FakeImplementation implements ImplementationAgent {
   readonly kind: 'implementation-agent' = 'implementation-agent';
   readonly requests: ImplementationRequest[] = [];
+  readonly preflightRequests: ImplementationRequest[] = [];
 
   constructor(private readonly outcomes: AgentResult[]) {
     qualifyGovernedPublicationAdapter(this);
   }
 
-  prepareGovernedInvocation(_request: ImplementationRequest) {
+  prepareGovernedInvocation(request: ImplementationRequest) {
+    this.preflightRequests.push(request);
     return { status: 'qualified' as const, agent: this };
   }
 
@@ -725,7 +727,7 @@ describe('runWorkflow', () => {
     try {
       const implementation = new FakeImplementation([successResult(HEAD), successResult(HEAD2, 'repair')]);
       const result = await runWorkflow(
-        { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer: new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY },
+        { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2, HEAD2]), implementation, reviewer: new FakeReviewer([requestChanges(HEAD), approve(HEAD2)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrap: new FakeBootstrap() },
         'workflow-governed-review-repair',
         { maxReviewAttempts: 3, now: () => T0, admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: '/tmp/governed-review-repair' } },
       );
@@ -737,6 +739,12 @@ describe('runWorkflow', () => {
       ], 'review repair receives its own explicit host confinement preflight requirement');
       assert.equal(implementation.requests[1]?.runtimeOwnership?.runId, result.run.id);
       assert.equal(implementation.requests[1]?.sessionId, result.run.agentResult?.sessionId);
+      for (const index of [0, 1]) {
+        assert.equal(implementation.preflightRequests[index]?.workspacePath, implementation.requests[index]?.workspacePath);
+        assert.equal(implementation.preflightRequests[index]?.branch, implementation.requests[index]?.branch);
+        assert.equal(implementation.preflightRequests[index]?.workspaceGuard, implementation.requests[index]?.workspaceGuard,
+          'governed preflight and implementation share the same prepared guard');
+      }
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

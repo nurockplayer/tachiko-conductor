@@ -1,9 +1,10 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
-import { qualifyGovernedPublicationAdapter, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, qualifyGovernedPublicationAdapter, type GovernedInvocationPreparation, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { CodexCliAdapter } from './codex-cli.js';
+import { hasPreparedStandaloneLunaInvocation } from '../workspace/standalone-git-bootstrap.js';
 
 /** The sole production name for the #92-qualified subscription transport. */
 export const LUNA_ISOLATED_PROVIDER = 'luna-isolated';
@@ -48,6 +49,11 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    if (request.governedPublication !== undefined && !hasPreparedStandaloneLunaInvocation(request)) {
+      return failure(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED,
+        `Governed isolated Luna requires the exact current standalone preparation proof. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
+        request);
+    }
     if (request.execution?.executor !== LUNA_ISOLATED_PROVIDER || request.execution.model !== LUNA_ISOLATED_MODEL) {
       return failure(LUNA_ISOLATED_ERROR_CODE.TRANSPORT_MISMATCH, 'Isolated Luna requires the exact luna-isolated / gpt-5.6-luna execution snapshot.');
     }
@@ -64,6 +70,13 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
       timeoutMs: this.timeoutMs, env, requiredConfig: this.runtimeConfig,
     }));
     return await isolatedCli.run(request);
+  }
+
+  prepareGovernedInvocation(request: ImplementationRequest): GovernedInvocationPreparation {
+    if (!hasPreparedStandaloneLunaInvocation(request)) {
+      return { status: 'held', reason: `Isolated Luna has no exact current standalone preparation proof. ${GOVERNED_PUBLICATION_REENTRY_ACTION}` };
+    }
+    return { status: 'qualified', agent: this };
   }
 }
 
@@ -87,6 +100,8 @@ export function parseTrustedLunaConfig(raw: string): readonly string[] {
   return ['features.plugins=false', 'features.apps=false', 'mcp_servers={}', 'web_search=false', 'sandbox_workspace_write.network_access=false'];
 }
 
-function failure(code: string, summary: string): AgentResult {
-  return { exitStatus: 'failure', summary, diagnostics: [`${code}: ${summary}`] };
+function failure(code: string, summary: string, request?: ImplementationRequest): AgentResult {
+  return { exitStatus: 'failure', summary, diagnostics: [`${code}: ${summary}`],
+    ...(request?.executor === undefined ? {} : { executor: request.executor }),
+    ...(request?.sessionId === undefined ? {} : { sessionId: request.sessionId }), durationMs: 0 };
 }

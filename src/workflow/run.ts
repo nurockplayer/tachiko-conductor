@@ -665,6 +665,7 @@ export async function runWorkflow(
               ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId }),
             },
             governedPublication,
+            ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(effectiveExecution === undefined || effectiveExecution === null ? {} : { execution: effectiveExecution }),
           };
           if (implementation.prepareGovernedInvocation === undefined) {
