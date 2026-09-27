@@ -16,7 +16,7 @@ import {
   type CodexAppServerClientFactory,
   type NativeThreadObservation,
 } from '../src/agents/codex-app-server.js';
-import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, WorkspaceGuardFailure, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
+import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, WorkspaceGuardFailure, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
 import type { AgentResult } from '../src/domain/types.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
@@ -217,6 +217,37 @@ describe('CodexAppServerAdapter', () => {
     assert.equal(factory.opens, 0);
   });
 
+  it('refuses governed steering before opening or observing either transport for fresh and continued requests', async () => {
+    for (const continuation of [false, true]) {
+      const client = new FakeClient({ threadId: 'durable-thread', status: 'active', activeTurnId: 'turn-1', history: [] });
+      const factory = new Factory(client);
+      const fallback = new Fallback();
+      const runner = new HeadRunner();
+      const adapter = new CodexAppServerAdapter({ clientFactory: factory, fallback, runner });
+      const executor = { provider: CODEX_APP_SERVER_PROVIDER, sessionId: 'durable-thread', generation: 'run-generation' } as const;
+      const ownership = { runId: 'run-1', generation: 'run-generation', dispatchClaimId: 'claim-1' } as const;
+      const workspaceGuard = { assertValid() { throw new Error('steering must be refused before the guard'); } };
+      const steerRequest = request({ executor, sessionId: executor.sessionId, runtimeOwnership: ownership, workspaceGuard,
+        governedPublication: { required: true, continuation } });
+
+      await assert.rejects(
+        () => adapter.steerActiveTurn(steerRequest, 'turn-1', 'please continue'),
+        (error: unknown) => {
+          assert.ok(error instanceof Error);
+          assert.match(error.message, new RegExp(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED));
+          assert.ok(error.message.includes(GOVERNED_PUBLICATION_REENTRY_ACTION));
+          return true;
+        },
+      );
+      assert.equal(factory.opens, 0);
+      assert.deepEqual(client.calls, []);
+      assert.deepEqual(runner.calls, []);
+      assert.equal(fallback.calls, 0);
+      assert.deepEqual(steerRequest.executor, executor);
+      assert.deepEqual(steerRequest.runtimeOwnership, ownership);
+    }
+  });
+
   it('allows exact owned active-turn steer and interrupt but rejects a foreign expected turn', async () => {
     const client = new FakeClient({ threadId: 'thread-1', status: 'active', activeTurnId: 'turn-1', history: [] });
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner() });
@@ -228,6 +259,58 @@ describe('CodexAppServerAdapter', () => {
       'read:thread-1', 'turn/interrupt:thread-1:turn-1', 'close',
       'read:thread-1', 'close',
     ]);
+  });
+
+  it('keeps exact owned governed interrupt usable without steering, starting, or resuming a turn', async () => {
+    const client = new FakeClient({ threadId: 'thread-1', status: 'active', activeTurnId: 'turn-1', history: [] });
+    const factory = new Factory(client);
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, runner: new HeadRunner() });
+    let guardCalls = 0;
+    const governedRequest = request({
+      executor: EXECUTOR,
+      governedPublication: { required: true, continuation: true },
+      workspaceGuard: { assertValid() { guardCalls += 1; } },
+    });
+
+    await adapter.interruptActiveTurn(governedRequest, 'turn-1');
+    assert.equal(factory.opens, 1);
+    assert.equal(guardCalls, 1);
+    assert.deepEqual(client.calls, ['read:thread-1', 'turn/interrupt:thread-1:turn-1', 'close']);
+    assert.equal(client.calls.some((call) => call.startsWith('turn/steer:') || call.startsWith('turn/start:') || call.startsWith('thread/resume:')), false);
+  });
+
+  it('keeps governed interrupt behind exact ownership, active-turn, and workspace checks', async () => {
+    const cases = [
+      { name: 'missing ownership', extra: { executor: EXECUTOR, runtimeOwnership: undefined }, observation: { threadId: 'thread-1', status: 'active' as const, activeTurnId: 'turn-1', history: [] }, expected: /ownership fence/ },
+      { name: 'mismatched generation', extra: { executor: EXECUTOR, runtimeOwnership: { runId: 'run-1', generation: 'other-generation' } }, observation: { threadId: 'thread-1', status: 'active' as const, activeTurnId: 'turn-1', history: [] }, expected: /ownership fence/ },
+      { name: 'wrong active turn', extra: { executor: EXECUTOR, runtimeOwnership: OWNERSHIP }, observation: { threadId: 'thread-1', status: 'active' as const, activeTurnId: 'foreign-turn', history: [] }, expected: /does not match/ },
+    ];
+    for (const entry of cases) {
+      const client = new FakeClient(entry.observation);
+      const factory = new Factory(client);
+      const adapter = new CodexAppServerAdapter({ clientFactory: factory, runner: new HeadRunner() });
+      await assert.rejects(
+        () => adapter.interruptActiveTurn(request({ ...entry.extra, governedPublication: { required: true, continuation: true } }), 'turn-1'),
+        entry.expected,
+        entry.name,
+      );
+      assert.deepEqual(client.calls, entry.name === 'missing ownership' || entry.name === 'mismatched generation'
+        ? []
+        : ['read:thread-1', 'close']);
+      assert.equal(client.calls.some((call) => call.startsWith('turn/interrupt:')), false);
+    }
+
+    const guardedClient = new FakeClient({ threadId: 'thread-1', status: 'active', activeTurnId: 'turn-1', history: [] });
+    const guardedAdapter = new CodexAppServerAdapter({ clientFactory: new Factory(guardedClient), runner: new HeadRunner() });
+    await assert.rejects(
+      () => guardedAdapter.interruptActiveTurn(request({
+        executor: EXECUTOR,
+        governedPublication: { required: true, continuation: true },
+        workspaceGuard: { assertValid() { throw new WorkspaceGuardFailure('workspace changed'); } },
+      }), 'turn-1'),
+      WorkspaceGuardFailure,
+    );
+    assert.deepEqual(guardedClient.calls, ['read:thread-1', 'close']);
   });
 
   it('rechecks the workspace guard after observing an active turn and before steering or interrupting it', async () => {

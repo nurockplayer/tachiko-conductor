@@ -387,6 +387,10 @@ export class CodexAppServerAdapter implements ImplementationAgent {
 
   /** Steer only an exact observed active turn under the durable Run fence. */
   async steerActiveTurn(request: ImplementationRequest, turnId: string, prompt: string): Promise<string> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) {
+      throw new Error(publicationRefusal.diagnostics?.[0] ?? publicationRefusal.summary);
+    }
     return this.mutateActiveTurn(request, turnId, async (client, executor) => client.steerTurn(executor.sessionId, turnId, prompt));
   }
 
