@@ -22,6 +22,7 @@ import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import { AppServerUnavailableError, CodexAppServerAdapter } from '../src/agents/codex-app-server.js';
+import { WorkerRouterAdapter } from '../src/agents/worker-router.js';
 import { qualifyGovernedPublicationAdapter } from '../src/adapters/agent.js';
 import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 import { createBootstrapGitFixture } from './bootstrap-fixture.js';
@@ -741,7 +742,7 @@ describe('runWorkflow', () => {
 
   it('holds admission-backed review and validation repairs before any ambient provider or publication effect', async (t) => {
     for (const repairKind of ['review', 'validation'] as const) {
-      for (const provider of ['codex-cli', 'codex-app-server', 'claude-code'] as const) {
+      for (const provider of ['codex-cli', 'codex-app-server', 'claude-code', 'worker-router'] as const) {
         await t.test(`${repairKind}/${provider}`, async () => {
           const id = `workflow-governed-hold-${repairKind}-${provider}`;
           const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-governed-hold-'));
@@ -811,6 +812,7 @@ describe('runWorkflow', () => {
               'codex-cli': () => ambient,
               'codex-app-server': () => appServerAmbient,
               'claude-code': () => ambient,
+              'worker-router': () => new WorkerRouterAdapter({ env: {} }),
             },
           });
           const github: GitHubAdapter = {

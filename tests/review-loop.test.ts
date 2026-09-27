@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { qualifyGovernedPublicationAdapter, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
+import { type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
@@ -905,141 +905,6 @@ describe('runReviewLoop', () => {
     }
   });
 
-  it('fences worker-router host push with the exact durable Run and current admission', async (t) => {
-    for (const mode of ['run-changed', 'mutation-stale', 'publication-stale', 'current'] as const) {
-      await t.test(mode, async () => {
-        const fixture = createBootstrapGitFixture();
-        try {
-          const id = `worker-router-publish-${mode}`;
-          const store = new CasMemoryStore();
-          const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
-          const planned = await bootstrap.plan({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
-          const prepared = await bootstrap.prepare({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha, existing: planned });
-          fixture.git(fixture.source, ['push', 'origin', `${fixture.baseSha}:refs/heads/${prepared.branch}`]);
-          const repairExecution: ResolvedExecutionConfiguration = {
-            profile: 'routine', revision: 'worker-router-publish-v1', executor: 'worker-router', timeoutMs: 60_000,
-          };
-          const admitted = {
-            ...reviewingRun(fixture.baseSha, id, undefined, repairExecution),
-            bootstrap: prepared,
-            repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' as const },
-          };
-          store.create(applyTransition(admitted, {
-            type: 'changes_requested', reviewResult: requestChanges(fixture.baseSha),
-          }, T0, reviewAuthority()));
-          let repairedHead: string | undefined;
-          let workerStarted = false;
-          let concurrent: Run | undefined;
-          const container: ContainerWorkerExecution = {
-            async run(spec) {
-              workerStarted = true;
-              repairedHead = fixture.commit(spec.workdir, 'worker-router-fix.txt', 'review repair\n', 'worker-router repair');
-              if (mode === 'run-changed') {
-                const current = store.read(id)!;
-                concurrent = applyTransition(current, { type: 'escalate', reason: 'operator cancellation during worker execution' }, T0);
-                store.update(concurrent);
-              }
-              return {
-                containerId: 'f'.repeat(64), exitCode: 0, terminalState: 'exited', restartPolicy: 'no',
-                stdout: '', stderr: '[worker-router] -> luna-worker\n',
-              };
-            },
-          };
-          const implementation = new WorkerRouterAdapter({
-            runner: fixture.runner, container, image: `tachiko/worker-router-test@sha256:${'a'.repeat(64)}`,
-          });
-          const governedRequests: ImplementationRequest[] = [];
-          const governedImplementation: ImplementationAgent = {
-            kind: 'implementation-agent',
-            prepareGovernedInvocation() { return { status: 'qualified', agent: governedImplementation }; },
-            run(request) { governedRequests.push(request); return implementation.run(request); },
-          };
-          qualifyGovernedPublicationAdapter(governedImplementation);
-          let mutationChecks = 0;
-          let publicationChecks = 0;
-          const liveHeads: Array<string | null> = [fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha];
-          const baseGithub = githubAdapter(liveHeads);
-          const github: GitHubAdapter = {
-            ...baseGithub,
-            async readLiveSnapshot(target) {
-              const live = await baseGithub.readLiveSnapshot(target);
-              const head = repairedHead ?? live.headSha ?? fixture.baseSha;
-              return {
-                ...live,
-                repository: { ...live.repository, defaultBranchHeadSha: fixture.baseSha },
-                headSha: head,
-                pullRequest: live.pullRequest === null ? null : {
-                  ...live.pullRequest,
-                  headSha: head,
-                  baseSha: fixture.baseSha,
-                  headRef: prepared.branch,
-                  baseRef: fixture.branch,
-                  headRepository: { owner: 'acme', repo: 'widgets' },
-                },
-              };
-            },
-          };
-          const commandStart = fixture.commands.length;
-          const result = await runReviewLoop({
-            store, github, implementation: governedImplementation, reviewer: new FakeReviewer([requestChanges(fixture.baseSha)]),
-            resolveValidationAuthority: reviewAuthority,
-            bootstrapForExecution: () => bootstrap,
-            resolveRepairExecutionProfile: () => repairExecution,
-            governedPublicationRequired: true,
-            assertCanMutate: () => undefined,
-            assertCurrentMutation: () => {
-              mutationChecks += 1;
-              if (workerStarted && mode === 'mutation-stale') throw new Error('mutation generation became stale');
-            },
-            assertCanPublish: () => {
-              publicationChecks += 1;
-              if (mode === 'publication-stale') throw new Error('publication admission became stale');
-            },
-          }, id, { maxAttempts: 3, now: () => T0 });
-          assert.deepEqual(governedRequests[0]?.governedPublication, { required: true, continuation: true });
-          assert.equal(governedRequests[0]?.runtimeOwnership?.runId, id);
-
-          const publicationBranch = result.run.bootstrap?.publicationBranch ?? result.run.bootstrap?.branch ?? 'existing-pr';
-          const remoteHead = fixture.git(fixture.remote, ['for-each-ref', '--format=%(objectname)', `refs/heads/${publicationBranch}`]);
-          const pushes = fixture.commands.slice(commandStart).filter((command) => command.file === 'git' && command.args[0] === 'push');
-          if (mode === 'run-changed') {
-            assert.equal(result.outcome, 'needs_human');
-            assert.deepEqual(store.read(id), concurrent, 'the changed durable Run wins the pre-push CAS');
-            assert.equal(remoteHead, fixture.baseSha, 'a stale Run cannot move the existing PR branch');
-            assert.equal(pushes.length, 0);
-            assert.equal(publicationChecks, 0, 'Run CAS rejection precedes mutation/publication admission checks');
-          } else if (mode === 'mutation-stale') {
-            assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
-            assert.equal(remoteHead, fixture.baseSha, 'a stale mutation generation cannot move the existing PR branch');
-            assert.equal(pushes.length, 0);
-            assert.equal(mutationChecks, 2, 'mutation ownership is checked again at the host push boundary');
-            assert.equal(publicationChecks, 0, 'publication is not checked after mutation admission rejects');
-          } else if (mode === 'publication-stale') {
-            assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
-            assert.equal(remoteHead, fixture.baseSha, 'stale publication admission cannot move the existing PR branch');
-            assert.equal(pushes.length, 0);
-            assert.equal(publicationChecks, 1);
-          } else {
-            assert.equal(result.outcome, 'revalidating', JSON.stringify(result));
-            assert.equal(remoteHead, repairedHead, 'the unchanged durable owner publishes its exact worker HEAD');
-            assert.ok(pushes.length >= 1);
-            assert.equal(result.run.agentResult?.headSha, repairedHead);
-            const events = result.run.telemetry?.events ?? [];
-            const spawn = events.find((event): event is RunTelemetrySpawnEvent => event.kind === 'spawn' && event.role === 'worker');
-            const completion = events.find((event): event is RunTelemetryCompletionEvent => event.kind === 'completion' && event.role === 'worker' && event.invocationId === spawn?.invocationId);
-            assert.ok(spawn, 'worker spawn telemetry is persisted');
-            assert.ok(completion, 'worker completion telemetry matches the invocation');
-            assert.equal(completion.outcome, 'completed');
-            assert.ok(mutationChecks >= 2);
-            assert.ok(publicationChecks >= 1);
-          }
-        } finally {
-          fixture.cleanup();
-        }
-      });
-    }
-  });
-
   it('does not spawn after a concurrent transition wins the post-admission telemetry fence', async () => {
     const initial = repairChangesRun('post-admission-race');
     const started = { ...initial, state: 'IMPLEMENTING' as const, history: [...initial.history,
@@ -1062,7 +927,7 @@ describe('runReviewLoop', () => {
 
   it('durably holds governed review repairs before worker telemetry or ambient provider execution', async () => {
     for (const repairKind of ['review', 'validation'] as const) {
-      for (const provider of ['codex-cli', 'codex-app-server', 'claude-code'] as const) {
+      for (const provider of ['codex-cli', 'codex-app-server', 'claude-code', 'worker-router'] as const) {
       const id = `governed-${repairKind}-${provider}`;
       const base = repairKind === 'review'
         ? repairChangesRun(id)
@@ -1090,7 +955,7 @@ describe('runReviewLoop', () => {
       const implementation = new ImplementationAgentRegistry({
         defaultProvider: 'codex-cli',
         legacySessionProvider: 'claude-code',
-        providers: { [provider]: () => ambient },
+        providers: { [provider]: () => provider === 'worker-router' ? new WorkerRouterAdapter({ env: {} }) : ambient },
       });
       let capabilityResolutions = 0;
       let spawnMarkers = 0;

@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-import { assertWorkspaceGuard, qualifyGovernedPublicationAdapter, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import { assertWorkspaceGuard, governedPublicationRefusal, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessRunner, type ProcessRunOptions } from '../github/transport.js';
 import { providerTelemetry } from './provider-telemetry.js';
@@ -100,10 +100,11 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     this.containerEnvKeys = options.containerEnv ?? WORKER_ROUTER_CONTAINER_ENV_ALLOWLIST;
     // The real boundary is the only production path; there is no host fallback.
     this.container = options.container ?? new ContainerWorkerBoundary();
-    if (options.container === undefined) qualifyGovernedPublicationAdapter(this);
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) return publicationRefusal;
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', 0);
     if (request.workspacePath === undefined || request.workspacePath.trim() === '' || request.branch === undefined || request.branch.trim() === '') {
       return failure(

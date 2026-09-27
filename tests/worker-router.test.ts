@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { hasGovernedPublicationConfinement, WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import {
   WORKER_ROUTER_ERROR_CODE,
@@ -101,27 +101,62 @@ function requestFor(workspacePath: string): {
 }
 
 describe('WorkerRouterAdapter container boundary', () => {
-  it('preflights only the source-owned production container boundary as governed-capable', () => {
-    const request = {
+  it('holds governed fresh and continued routes even when the production container boundary is selected', () => {
+    const freshRequest = {
       target: TARGET,
       baseSha: BASE,
       execution: { profile: 'standard' as const, revision: 'profiles-v1', executor: 'worker-router', timeoutMs: 9_000 },
-      runtimeOwnership: { runId: 'run-qualified-router', generation: 'router-generation' },
+      runtimeOwnership: { runId: 'run-held-router', generation: 'router-generation' },
       governedPublication: { required: true as const, continuation: false },
     };
     const realBoundaryRegistry = new ImplementationAgentRegistry({
       defaultProvider: 'worker-router',
       providers: { 'worker-router': () => new WorkerRouterAdapter({ runner: new FakeRunner([]), image: IMAGE, executable: '/router', env: {} }) },
     });
-    const productionBoundary = realBoundaryRegistry.prepareGovernedInvocation(request);
-    assert.equal(productionBoundary.status, 'qualified');
+    const freshPreparation = realBoundaryRegistry.prepareGovernedInvocation(freshRequest);
+    assert.equal(freshPreparation.status, 'held');
 
-    const injectedBoundaryRegistry = new ImplementationAgentRegistry({
-      defaultProvider: 'worker-router',
-      providers: { 'worker-router': () => new WorkerRouterAdapter({ runner: new FakeRunner([]), container: new FakeContainer([]), image: IMAGE, executable: '/router', env: {} }) },
+    const continuedPreparation = realBoundaryRegistry.prepareGovernedInvocation({
+      ...freshRequest,
+      sessionId: 'existing-worker-session',
+      executor: { provider: 'worker-router', sessionId: 'existing-worker-session', generation: 'router-generation' },
+      governedPublication: { required: true, continuation: true },
     });
-    const injectedBoundary = injectedBoundaryRegistry.prepareGovernedInvocation(request);
-    assert.equal(injectedBoundary.status, 'held', 'a mutable injected execution boundary is not assumed qualified');
+    assert.equal(continuedPreparation.status, 'held', 'an existing WorkerRouter executor/session is preserved behind the governed hold');
+  });
+
+  it('refuses direct governed production and injected calls before guards, container, runner, or publication', async () => {
+    for (const injected of [false, true]) {
+      const runner = new FakeRunner([]);
+      const container = new FakeContainer([]);
+      let guards = 0;
+      let publication = 0;
+      const adapter = new WorkerRouterAdapter({
+        runner,
+        ...(injected ? { container } : {}),
+        // Missing image must not hide the governed-confinement diagnostic.
+        env: {},
+      });
+      if (!injected) assert.equal(hasGovernedPublicationConfinement(adapter), false);
+      const request = {
+        target: TARGET,
+        baseSha: BASE,
+        governedPublication: { required: true as const, continuation: true },
+        executor: { provider: 'worker-router', sessionId: 'durable-session', generation: 'durable-generation' },
+        sessionId: 'durable-session',
+        workspaceGuard: { assertValid() { guards++; } },
+        beforePublish() { publication++; },
+      };
+      const response = await adapter.run(request);
+      assert.equal(response.exitStatus, 'failure');
+      assert.match(response.summary, /source-qualified publication confinement/i);
+      assert.deepEqual(response.executor, request.executor);
+      assert.equal(response.sessionId, 'durable-session');
+      assert.equal(guards, 0);
+      assert.equal(container.specs.length, 0);
+      assert.equal(runner.calls.length, 0);
+      assert.equal(publication, 0);
+    }
   });
 
   it('runs the containerized worker, then proves HEAD and publishes it only after container terminal', async () => {

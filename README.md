@@ -506,8 +506,12 @@ generation receipt under the dispatch and registry locks.
 `WorkerRouterAdapter` is the one executor placed behind the container boundary
 proven in issue #73. The untrusted worker runs only inside a digest-pinned
 container; the host worker path is never executed and there is no fallback.
+This adapter is not currently source-qualified for governed publication, so
+fresh and continued governed invocations are held before any worker or host
+publication operation. Its execution and host publication path remains
+available to ungoverned callers.
 
-The adapter keeps the authority split unchanged. It runs `guard(before)`, then
+For an ungoverned call, the adapter runs `guard(before)`, then
 creates and starts the container, forwards the task on stdin, waits for the
 exact container terminal state, and only then runs `guard(after)`, reads the
 exact HEAD, proves base ancestry, and publishes that exact HEAD from the host.
