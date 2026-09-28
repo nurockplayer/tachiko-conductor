@@ -2548,6 +2548,68 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(outcome.run.executor?.sessionId, identity.sessionId);
   });
 
+  it('holds a custom-store bound attempt missing current authority or finding evidence before execution effects', async (t) => {
+    for (const missing of ['authority', 'review finding', 'validation finding'] as const) {
+      await t.test(missing, async () => {
+        const store = new MemoryStore();
+        const id = `bound-attempt-missing-${missing.replaceAll(' ', '-')}`;
+        let run = reviewingRun(store, id, HEAD);
+        run = applyTransition(run, { type: 'changes_requested', reviewResult: requestChanges(HEAD) }, T0, TEST_VALIDATION_AUTHORITY);
+        const authority = { revision: 'task-shape-v1', shape: 'bounded' as const };
+        run = { ...run, repairTaskShapeAuthority: authority };
+        if (missing === 'validation finding') {
+          run = { ...run, reviewResult: approve(HEAD), validationResult: validationFailed(HEAD) };
+        }
+        const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 60_000 };
+        const finding = missing === 'validation finding' ? 'validation_failed' : 'review_blocking';
+        const receipt = createRepairAdmissionSnapshot(authority, finding, HEAD, 7, execution, T0);
+        const binding = createRepairAttemptBinding(run, execution);
+        run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+        run = missing === 'authority'
+          ? { ...run, repairTaskShapeAuthority: undefined }
+          : missing === 'validation finding'
+            ? { ...run, validationResult: undefined }
+          : { ...run, reviewResult: undefined };
+        store.update(run);
+
+        let publicationChecks = 0;
+        const implementation = new FakeImplementation([successResult(HEAD2)]);
+        const invoke = implementation.run.bind(implementation);
+        implementation.run = async (request) => {
+          if (request.beforePublish !== undefined) {
+            publicationChecks += 1;
+            request.beforePublish();
+          }
+          return invoke(request);
+        };
+        const reviewer = new FakeReviewer([approve(HEAD2)]);
+        const validation = new FakeValidation();
+        let bootstrapSelections = 0;
+        let profileSelections = 0;
+        let executionStarts = 0;
+        const outcome = await runWorkflow({
+          store,
+          github: githubAdapter([HEAD]),
+          implementation,
+          reviewer,
+          validation,
+          hostedCheckPolicy: TEST_HOSTED_POLICY,
+          resolveRepairExecutionProfile: () => { profileSelections += 1; return execution; },
+          bootstrapForExecution: () => { bootstrapSelections += 1; return new FakeBootstrap(); },
+        }, id, { maxReviewAttempts: 1, now: () => T0, onExecutionStart: () => { executionStarts += 1; } });
+
+        assert.equal(outcome.outcome, 'needs_human');
+        assert.match(outcome.reason, /missing, stale, or its exact execution profile can no longer be resolved/);
+        assert.equal(implementation.preflightRequests.length + implementation.requests.length, 0);
+        assert.equal(reviewer.requests.length + validation.requests.length, 0);
+        assert.equal(bootstrapSelections + profileSelections + executionStarts + publicationChecks, 0);
+        assert.deepEqual(outcome.run.executor, run.executor);
+        assert.deepEqual(outcome.run.agentResult, run.agentResult);
+        assert.equal((outcome.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn' && event.role === 'worker'), false);
+      });
+    }
+  });
+
   it('rejects an injected generationless nonfresh App Server admission before bootstrap selection', async () => {
     const store = new MemoryStore();
     const id = 'injected-generationless-appserver-admission';

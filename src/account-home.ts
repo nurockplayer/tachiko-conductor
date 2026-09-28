@@ -112,10 +112,18 @@ export function assertSafeAccountOwnedPath(homeDirectory: string, targetPath: st
 /** Apply the account-root fence to production paths while leaving explicit, out-of-home test stores usable. */
 export function assertSafeCurrentAccountPathIfApplicable(targetPath: string, endpoint: AccountPathEndpoint): void {
   const home = applicableAccountHomeForPath(targetPath);
-  if (home !== null) assertSafeAccountOwnedPath(home, path.resolve(targetPath), endpoint);
+  if (home !== null) {
+    const target = path.resolve(targetPath);
+    const root = path.join(home, '.tachiko-conductor');
+    const relative = path.relative(root, target);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('Account-owned conductor paths must use their canonical account-home spelling.');
+    }
+    assertSafeAccountOwnedPath(home, target, endpoint);
+  }
 }
 
-/** Decide whether a path is lexically part of this account's canonical conductor tree. */
+/** Decide whether a path is canonical or physically aliases this account's conductor tree. */
 export function isCurrentAccountPathApplicable(targetPath: string): boolean {
   return applicableAccountHomeForPath(targetPath) !== null;
 }
@@ -124,13 +132,56 @@ function applicableAccountHomeForPath(targetPath: string): string | null {
   const target = path.resolve(targetPath);
   const physicalHome = resolveAccountHomeDirectory();
   const homes = [...new Set([path.resolve(os.userInfo().homedir), physicalHome])];
+  // Keep the lexical decision first so a canonical spelling with a replaced
+  // component is still checked by assertSafeAccountOwnedPath itself.
   for (const home of homes) {
     const root = path.join(home, '.tachiko-conductor');
     const relative = path.relative(root, target);
     if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+    physicalizeThroughDeepestExistingAncestor(target);
+    return home;
+  }
+  const physicalTarget = physicalizeThroughDeepestExistingAncestor(target);
+  for (const home of homes) {
+    let physicalHomeRoot: string;
+    try { physicalHomeRoot = realpathSync.native(home); } catch { continue; }
+    const canonicalRoot = physicalizeThroughDeepestExistingAncestor(path.join(physicalHomeRoot, '.tachiko-conductor'));
+    const root = canonicalRoot;
+    const relative = path.relative(root, physicalTarget);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) continue;
+    // Recognize physical aliases, including aliases beneath an in-home symlink.
+    // The caller rejects these spellings instead of treating them as unrelated storage.
     return home;
   }
   return null;
+}
+
+function physicalizeThroughDeepestExistingAncestor(target: string): string {
+  let current = target;
+  const missing: string[] = [];
+  for (;;) {
+    try {
+      return path.resolve(realpathSync.native(current), ...missing.reverse());
+    } catch (error) {
+      const code = typeof error === 'object' && error !== null ? (error as NodeJS.ErrnoException).code : undefined;
+      if (code !== 'ENOENT') throw error;
+      try {
+        lstatSync(current);
+        // An existing but unresolved component (especially a dangling symlink)
+        // is not a missing descendant and cannot be used for classification.
+        throw error;
+      } catch (statError) {
+        if (statError !== error && typeof statError === 'object' && statError !== null && (statError as NodeJS.ErrnoException).code !== 'ENOENT') {
+          throw statError;
+        }
+        if (statError === error) throw error;
+      }
+      const parent = path.dirname(current);
+      if (parent === current) return target;
+      missing.push(path.basename(current));
+      current = parent;
+    }
+  }
 }
 
 /** Resolve the physical home directory of the effective OS account.

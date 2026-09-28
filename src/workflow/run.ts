@@ -26,7 +26,7 @@ import {
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
-import { activeRepairAdmission, generationlessAppServerPredecessor, resolveRepairPredecessor, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
+import { activeRepairAdmission, generationlessAppServerPredecessor, resolveRepairPredecessor, unfinishedBoundRepairAttempt, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
 import { createBootstrapFailureRun } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
@@ -423,7 +423,8 @@ export async function runWorkflow(
         const pendingValidationRepair = run.validationResult?.status === 'failed' &&
           run.headSha !== undefined && run.pullRequest?.headSha === run.headSha &&
           run.history.some((entry) => entry.type === 'start_fix' && entry.to === 'IMPLEMENTING');
-        const pendingRepair = pendingReviewFix || pendingValidationRepair;
+        const boundRepairAttempt = unfinishedBoundRepairAttempt(run);
+        const pendingRepair = pendingReviewFix || pendingValidationRepair || boundRepairAttempt !== null;
         let repairPredecessor: ExecutorIdentity | undefined = run.executor;
         if (pendingRepair) {
           try { repairPredecessor = resolveRepairPredecessor(run); }
@@ -432,14 +433,15 @@ export async function runWorkflow(
           }
         }
         const repairAttempt = pendingRepair ? activeRepairAdmission(run) : null;
+        const requiresAdmittedRepair = pendingRepair && (boundRepairAttempt !== null || run.repairTaskShapeAuthority !== undefined);
         const repairFreshStart = repairAttempt?.snapshot.attemptBinding?.freshExecutor === true && repairAttempt.handoff === undefined;
         const repairRuntimeGeneration = repairAttempt?.snapshot.attemptBinding?.runtimeGeneration ?? repairPredecessor?.generation ?? run.id;
         // A restarted repair may execute only from its append-only admission
         // receipt. It must not inherit the initial run profile as a fallback.
-        const effectiveExecution = pendingRepair && run.repairTaskShapeAuthority !== undefined
+        const effectiveExecution = requiresAdmittedRepair
           ? admittedRepairExecution(run, deps)
           : run.execution;
-        if (pendingRepair && run.repairTaskShapeAuthority !== undefined && effectiveExecution === null) {
+        if (requiresAdmittedRepair && effectiveExecution === null) {
           return park(
             run,
             'Repair admission is missing, stale, or its exact execution profile can no longer be resolved.',

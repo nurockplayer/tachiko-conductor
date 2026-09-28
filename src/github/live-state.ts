@@ -533,6 +533,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const head = asRecord(record.head);
     const base = asRecord(record.base);
     if (head === null || base === null) throw invalid(path, 'missing head/base object');
+    if (typeof record.draft !== 'boolean') throw invalid(path, 'draft is not a boolean');
     const headSha = typeof head.sha === 'string' && head.sha.trim() !== '' ? head.sha : null;
     if (headSha === null) {
       throw new GitHubLiveStateError(
@@ -563,7 +564,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       title: requireString(record, 'title', path),
       url: requireString(record, 'html_url', path),
       state: normalizePullState(record),
-      isDraft: record.draft === true,
+      isDraft: record.draft,
       mergeable: typeof record.mergeable === 'boolean' ? record.mergeable : null,
       mergeStateStatus:
         typeof record.mergeable_state === 'string'
@@ -769,8 +770,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     for (const item of raw) {
       const record = asRecord(item);
       if (record === null) throw invalid(path, 'review entry is not an object');
-      const submittedAt = typeof record.submitted_at === 'string' ? record.submitted_at : '';
-      if (submittedAt === '' || record.state === 'PENDING') continue;
+      const submittedAt = this.normalizeReviewSubmittedAt(record, path);
+      if (submittedAt === null) continue;
       entries.push({
         id: requireString(record, 'node_id', path),
         scope: 'pull_request',
@@ -783,6 +784,14 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       });
     }
     return entries;
+  }
+
+  private normalizeReviewSubmittedAt(record: Record<string, unknown>, path: string): string | null {
+    if (record.state === 'PENDING') return null;
+    if (typeof record.submitted_at !== 'string' || record.submitted_at.trim() === '') {
+      throw invalid(path, 'non-PENDING review has no nonblank submitted_at value');
+    }
+    return record.submitted_at;
   }
 
   private authorLogin(record: Record<string, unknown>, path: string): string | null {
@@ -861,9 +870,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     for (const item of raw) {
       const record = asRecord(item);
       if (record === null) throw invalid(path, 'review entry is not an object');
-      if (record.state === 'PENDING') continue;
-      const submittedAt = typeof record.submitted_at === 'string' ? record.submitted_at : '';
-      if (submittedAt === '') continue;
+      const submittedAt = this.normalizeReviewSubmittedAt(record, path);
+      if (submittedAt === null) continue;
       const commitSha = typeof record.commit_id === 'string' && record.commit_id !== '' ? record.commit_id : null;
       const review: GitHubReviewSnapshot = {
         id: requireString(record, 'node_id', path),
@@ -888,7 +896,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const latestByAuthor = new Map<string, GitHubReviewSnapshot>();
     const byAuthor = new Map<string, GitHubReviewSnapshot[]>();
     for (const review of reviews) {
-      const key = review.author ?? '';
+      const key = review.author === null ? `review-id:${review.id}` : `author:${review.author}`;
       const entries = byAuthor.get(key) ?? [];
       entries.push(review);
       byAuthor.set(key, entries);

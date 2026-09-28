@@ -378,6 +378,67 @@ PR: #7`;
     assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED', 'R_CHANGES']);
   });
 
+  it('keeps unidentified decisive reviews in distinct review-id namespaces regardless of order', async () => {
+    const changes = {
+      node_id: 'R_NULL_CHANGES', user: null, state: 'CHANGES_REQUESTED', commit_id: HEAD,
+      submitted_at: '2026-08-14T01:00:00.000Z', html_url: 'https://github.test/reviews/null-changes',
+    };
+    const approval = {
+      node_id: 'R_NULL_APPROVED', user: null, state: 'APPROVED', commit_id: HEAD,
+      submitted_at: '2026-08-14T02:00:00.000Z', html_url: 'https://github.test/reviews/null-approved',
+    };
+    for (const ordered of [[changes, approval], [approval, changes]]) {
+      const snapshot = await new LiveGitHubAdapter({
+        transport: prTransport().collection('repos/acme/widgets/pulls/7/reviews', ordered), now: () => OBSERVED_AT,
+      }).readLiveSnapshot(TARGET);
+      assert.equal(snapshot.reviews.decision, 'changes_requested');
+      assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id).sort(), ['R_NULL_APPROVED', 'R_NULL_CHANGES']);
+      assert.ok(snapshot.reviews.latestByAuthor.every((review) => review.author === null));
+    }
+  });
+
+  it('preserves PENDING review exclusion when submission time is absent', async () => {
+    const snapshot = await new LiveGitHubAdapter({
+      transport: prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+        { node_id: 'R_PENDING', user: { login: 'alice' }, state: 'PENDING', html_url: 'https://github.test/reviews/pending' },
+        { node_id: 'R_APPROVED', user: { login: 'alice' }, state: 'APPROVED', commit_id: HEAD,
+          submitted_at: '2026-08-14T02:00:00.000Z', html_url: 'https://github.test/reviews/approved' },
+      ]), now: () => OBSERVED_AT,
+    }).readLiveSnapshot(TARGET);
+    assert.equal(snapshot.reviews.decision, 'approved');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED']);
+    assert.equal(snapshot.conversations.some((entry) => entry.id === 'R_PENDING'), false);
+  });
+
+  it('rejects malformed pull-request draft values instead of coercing them to non-draft', async (t) => {
+    const cases: Array<{ readonly name: string; readonly draft?: unknown; readonly missing?: boolean }> = [
+      { name: 'missing', missing: true }, { name: 'undefined', draft: undefined },
+      { name: 'null', draft: null }, { name: 'string', draft: 'false' }, { name: 'number', draft: 0 },
+    ];
+    for (const scenario of cases) {
+      await t.test(scenario.name, async () => {
+        const malformed = pull(7, HEAD, scenario.missing ? {} : { draft: scenario.draft });
+        if (scenario.missing) delete (malformed as { draft?: boolean }).draft;
+        const transport = prTransport().queue('repos/acme/widgets/pulls/7', malformed, malformed);
+        await expectError(new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET), 'GH_INVALID_RESPONSE', false);
+      });
+    }
+  });
+
+  it('rejects blank or non-string submission evidence for every non-PENDING review', async (t) => {
+    for (const submittedAt of [undefined, null, '', '   ', 123]) {
+      await t.test(String(submittedAt), async () => {
+        const review: Record<string, unknown> = {
+          node_id: 'R_BAD_TIME', user: { login: 'alice' }, state: 'CHANGES_REQUESTED', commit_id: HEAD,
+          html_url: 'https://github.test/reviews/bad-time',
+        };
+        if (submittedAt !== undefined) review.submitted_at = submittedAt;
+        const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [review]);
+        await expectError(new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET), 'GH_INVALID_RESPONSE', false);
+      });
+    }
+  });
+
   it('keeps a current-HEAD change request active across a later comment-only review from the same author', async () => {
     const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
       {

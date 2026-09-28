@@ -8,11 +8,12 @@ import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
+import { isCurrentAccountPathApplicable } from '../src/account-home.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
 import { ensureDurableDirectory, syncDirectory } from '../src/durable-directory.js';
 import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, operationalRunProjection, sha256 } from '../src/operational/projection.js';
-import { T0, TARGET, TEST_VALIDATION_AUTHORITY, changesRequested, newRun, successResult, validationPassed } from './helpers.js';
+import { T0, TARGET, TEST_VALIDATION_AUTHORITY, changesRequested, newRun, successResult, validationFailed, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
@@ -40,6 +41,61 @@ afterEach(() => {
 });
 
 describe('JsonFileStore — persistence round-trips', () => {
+  it('rejects an external alias to canonical storage during store construction without creating through it', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-alias-'));
+    tmpDirs.push(home);
+    const runs = path.join(home, '.tachiko-conductor', 'runs');
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(home, 0o700);
+    chmodSync(path.join(home, '.tachiko-conductor'), 0o755);
+    chmodSync(runs, 0o755);
+    const alias = path.join(home, 'external-runs-alias');
+    symlinkSync(runs, alias, 'dir');
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      assert.throws(() => new JsonFileStore({ dir: alias }), /canonical account-home spelling/);
+      assert.equal(readdirSync(runs).length, 0, 'constructor rejection creates no files through the alias');
+      assert.equal(statSync(runs).mode & 0o777, 0o755);
+    } finally {
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('keeps independent temp stores usable and rejects one retargeted into canonical storage', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-retarget-home-'));
+    const externalRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-independent-temp-'));
+    tmpDirs.push(home, externalRoot);
+    const runs = path.join(home, '.tachiko-conductor', 'runs');
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const canonical = new JsonFileStore({ dir: runs });
+      const protectedRun = newRun('canonical-retarget-protected');
+      canonical.create(protectedRun);
+      const protectedBytes = readFileSync(path.join(runs, `${protectedRun.id}.json`), 'utf8');
+
+      const external = path.join(externalRoot, 'runs');
+      mkdirSync(external, { mode: 0o700 });
+      const independent = new JsonFileStore({ dir: external });
+      const independentRun = newRun('independent-temp-run');
+      independent.create(independentRun);
+      assert.equal(isCurrentAccountPathApplicable(external), false, 'ordinary platform temp storage remains independent');
+      assert.deepEqual(independent.read(independentRun.id), independentRun);
+
+      const preservedExternal = path.join(externalRoot, 'preserved-independent-runs');
+      renameSync(external, preservedExternal);
+      symlinkSync(runs, external, 'dir');
+      assert.throws(() => independent.read(independentRun.id), /canonical account-home spelling/);
+      assert.equal(readFileSync(path.join(runs, `${protectedRun.id}.json`), 'utf8'), protectedBytes,
+        'cached external-store rejection leaves canonical Run bytes unchanged');
+      assert.deepEqual(new JsonFileStore({ dir: preservedExternal }).read(independentRun.id), independentRun,
+        'the original independent data remains intact at its preserved path');
+    } finally {
+      os.userInfo = originalUserInfo;
+    }
+  });
+
   it('rechecks canonical Run ancestry after the CAS callback and preserves committed bytes on unsafe drift', () => {
     const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-'));
     tmpDirs.push(home);
@@ -360,6 +416,7 @@ describe('JsonFileStore — persistence round-trips', () => {
     const predecessor = {
       ...newRun('orphan-repair-marker'), state: 'IMPLEMENTING' as const, headSha: 'head-sha',
       pullRequest: { number: 7, headSha: 'head-sha' }, repairTaskShapeAuthority: authority,
+      reviewResult: { verdict: 'request_changes' as const, reviewerName: 'reviewer', headSha: 'head-sha', findings: [] },
     };
     const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
     const binding = createRepairAttemptBinding(predecessor, execution);
@@ -412,6 +469,51 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.throws(() => new JsonFileStore({ dir }).read(preHandoff.id), /corrupt or incompatible/,
       'an active nonfresh App Server admission without a generation is invalid even before handoff');
     assert.equal(readFileSync(preHandoffFile, 'utf8'), generationlessBytes, 'rejected pre-handoff admission bytes remain unchanged');
+    writeFileSync(preHandoffFile, preHandoffOriginal, 'utf8');
+    const predecessorContradictions = [
+      {
+        label: 'Run executor session changed before first handoff',
+        change: (json: Record<string, any>) => { json.executor.sessionId = 'session-B'; },
+      },
+      {
+        label: 'coherent Run and result session changed before first handoff',
+        change: (json: Record<string, any>) => {
+          json.executor.sessionId = 'session-B';
+          json.agentResult.executor.sessionId = 'session-B';
+          json.agentResult.sessionId = 'session-B';
+        },
+      },
+      {
+        label: 'result-only executor replaced before first handoff',
+        change: (json: Record<string, any>) => {
+          delete json.executor;
+          json.agentResult.executor.sessionId = 'session-B';
+          json.agentResult.sessionId = 'session-B';
+        },
+      },
+      {
+        label: 'coherent Run and result generation changed before first handoff',
+        change: (json: Record<string, any>) => {
+          json.executor.generation = 'generation-B';
+          json.agentResult.executor.generation = 'generation-B';
+        },
+      },
+      {
+        label: 'coherent Run and result generation removed before first handoff',
+        change: (json: Record<string, any>) => {
+          delete json.executor.generation;
+          delete json.agentResult.executor.generation;
+        },
+      },
+    ];
+    for (const contradiction of predecessorContradictions) {
+      const altered = JSON.parse(preHandoffOriginal) as Record<string, any>;
+      contradiction.change(altered);
+      const corruptedBytes = JSON.stringify(altered);
+      writeFileSync(preHandoffFile, corruptedBytes, 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(preHandoff.id), /corrupt or incompatible/, contradiction.label);
+      assert.equal(readFileSync(preHandoffFile, 'utf8'), corruptedBytes, `${contradiction.label}: rejected bytes remain unchanged`);
+    }
     writeFileSync(preHandoffFile, preHandoffOriginal, 'utf8');
     const exact = { ...successResult('fixed-sha'), executor: predecessor, sessionId: predecessor.sessionId };
     run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: exact }, T0);
@@ -481,6 +583,103 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(readFileSync(file, 'utf8'), invalidAdmissionBytes, 'rejected admission bytes remain untouched');
     assert.equal(run.history.at(-1)?.repairHandoff?.outcome.kind, 'executor', 'replay rejection did not mutate the caller-owned history');
     writeFileSync(file, original, 'utf8');
+  });
+
+  it('rejects active bound repair restarts missing their required authority or finding carrier without rewriting bytes', () => {
+    const { dir } = tempStore();
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const reviewRun = (() => {
+      const predecessor = {
+        ...newRun('bound-review-carrier'), state: 'IMPLEMENTING' as const, headSha: 'head-sha',
+        pullRequest: { number: 7, headSha: 'head-sha' }, repairTaskShapeAuthority: authority,
+        reviewResult: { verdict: 'request_changes' as const, reviewerName: 'reviewer', headSha: 'head-sha', findings: [] },
+      };
+      const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+      const binding = createRepairAttemptBinding(predecessor, execution);
+      return {
+        ...predecessor,
+        history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0, repairAdmissionIndex: 0 }],
+        repairAdmissions: [{ ...receipt, attemptBinding: binding }],
+      };
+    })();
+    const validationRun = (() => {
+      const predecessor = {
+        ...newRun('bound-validation-carrier'), state: 'IMPLEMENTING' as const, headSha: 'head-sha',
+        pullRequest: { number: 7, headSha: 'head-sha' }, repairTaskShapeAuthority: authority,
+        validationResult: validationFailed('head-sha'),
+      };
+      const receipt = createRepairAdmissionSnapshot(authority, 'validation_failed', 'head-sha', 7, execution, T0);
+      const binding = createRepairAttemptBinding(predecessor, execution);
+      return {
+        ...predecessor,
+        history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0, repairAdmissionIndex: 0 }],
+        repairAdmissions: [{ ...receipt, attemptBinding: binding }],
+      };
+    })();
+    const store = new JsonFileStore({ dir });
+    for (const run of [reviewRun, validationRun]) store.create(run);
+    const cases = [
+      { id: reviewRun.id, label: 'task-shape authority', mutate: (json: Record<string, any>) => { delete json.repairTaskShapeAuthority; } },
+      { id: reviewRun.id, label: 'review finding', mutate: (json: Record<string, any>) => { delete json.reviewResult; } },
+      { id: validationRun.id, label: 'validation finding', mutate: (json: Record<string, any>) => { delete json.validationResult; } },
+    ];
+    for (const { id, label, mutate } of cases) {
+      const file = path.join(dir, `${id}.json`);
+      const json = JSON.parse(readFileSync(file, 'utf8')) as Record<string, any>;
+      mutate(json);
+      const bytes = JSON.stringify(json);
+      writeFileSync(file, bytes, 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(id), /corrupt or incompatible/, label);
+      assert.equal(readFileSync(file, 'utf8'), bytes, `${label}: failed restart read leaves bytes untouched`);
+    }
+  });
+
+  it('retains result-only predecessors, completed repair history, and legacy unbound start_fix records', () => {
+    const { store, dir } = tempStore();
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const resultOnlyExecutor = { provider: 'codex-app-server', sessionId: 'result-only-session', generation: 'runtime-generation' } as const;
+
+    let resultOnly = newRun('valid-result-only-predecessor');
+    resultOnly = applyTransition(resultOnly, { type: 'start' }, T0);
+    resultOnly = applyTransition(resultOnly, {
+      type: 'agent_succeeded',
+      agentResult: { ...successResult('head-sha'), executor: resultOnlyExecutor, sessionId: resultOnlyExecutor.sessionId },
+      headSha: 'head-sha',
+    }, T0);
+    resultOnly = applyTransition(resultOnly, { type: 'validation_passed', validationResult: validationPassed('head-sha'), pullRequest: { number: 7, headSha: 'head-sha' } }, T0);
+    resultOnly = { ...resultOnly, executor: undefined, repairTaskShapeAuthority: authority };
+    resultOnly = applyTransition(resultOnly, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'head-sha') }, T0, TEST_VALIDATION_AUTHORITY);
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+    const binding = createRepairAttemptBinding(resultOnly, execution);
+    assert.equal(binding.predecessorExecutor?.sessionId, resultOnlyExecutor.sessionId);
+    resultOnly = applyTransition(resultOnly, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+    store.create(resultOnly);
+    assert.equal(JSON.stringify(new JsonFileStore({ dir }).read(resultOnly.id)), JSON.stringify(resultOnly),
+      'legacy result-only identity remains a valid predecessor on restart');
+
+    const completed = { ...applyTransition(resultOnly, {
+      type: 'agent_succeeded', agentResult: successResult('fixed-head'), headSha: 'fixed-head',
+      pullRequest: { number: 7, headSha: 'fixed-head' },
+    }, T0), id: 'completed-historical-repair' };
+    assert.equal(completed.state, 'VALIDATING');
+    assert.equal(completed.reviewResult, undefined, 'completed repair clears the old finding projection');
+    store.create(completed);
+
+    let legacy = newRun('legacy-unbound-start-fix');
+    legacy = applyTransition(legacy, { type: 'start' }, T0);
+    legacy = applyTransition(legacy, { type: 'agent_succeeded', agentResult: successResult('legacy-head'), headSha: 'legacy-head' }, T0);
+    legacy = applyTransition(legacy, { type: 'validation_passed', validationResult: validationPassed('legacy-head'), pullRequest: { number: 7, headSha: 'legacy-head' } }, T0);
+    legacy = applyTransition(legacy, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'legacy-head') }, T0, TEST_VALIDATION_AUTHORITY);
+    legacy = applyTransition(legacy, { type: 'start_fix' }, T0);
+    store.create(legacy);
+
+    const restarted = new JsonFileStore({ dir });
+    assert.equal(JSON.stringify(restarted.read(completed.id)), JSON.stringify(completed),
+      'completed history remains valid after its finding is cleared');
+    assert.equal(JSON.stringify(restarted.read(legacy.id)), JSON.stringify(legacy),
+      'legacy unbound attempt remains readable without manufacturing an admission');
   });
 
   it('replays WorkerRouter repair handoffs as sessionless and rejects executor-kind ledger history', () => {

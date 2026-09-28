@@ -86,6 +86,34 @@ export function resolveRepairPredecessor(run: {
   return predecessor;
 }
 
+export interface UnfinishedBoundRepairAttempt {
+  readonly startFixHistoryIndex: number;
+  readonly admissionIndex: number | undefined;
+}
+
+/** Identify an unfinished new-format attempt from its immutable history/binding, not mutable finding projections. */
+export function unfinishedBoundRepairAttempt(run: {
+  readonly state: string;
+  readonly history: readonly { readonly type: string; readonly from?: string; readonly to?: string; readonly repairAdmissionIndex?: number }[];
+  readonly repairAdmissions?: readonly RepairAdmissionSnapshot[];
+}): UnfinishedBoundRepairAttempt | null {
+  if (run.state !== 'IMPLEMENTING') return null;
+  let startFixHistoryIndex = -1;
+  for (let index = run.history.length - 1; index >= 0; index -= 1) {
+    const event = run.history[index]!;
+    if (event.type === 'start_fix' && event.from === 'CHANGES_REQUESTED' && event.to === 'IMPLEMENTING') {
+      startFixHistoryIndex = index;
+      break;
+    }
+  }
+  if (startFixHistoryIndex < 0 || run.history.slice(startFixHistoryIndex + 1).some((event) => event.type === 'agent_succeeded' || event.type === 'agent_failed')) return null;
+  const marker = run.history[startFixHistoryIndex]?.repairAdmissionIndex;
+  const bindingIndex = run.repairAdmissions?.findIndex((admission, index) =>
+    admission.attemptBinding?.admissionIndex === index && admission.attemptBinding.startFixHistoryIndex === startFixHistoryIndex) ?? -1;
+  if (marker === undefined && bindingIndex < 0) return null;
+  return { startFixHistoryIndex, admissionIndex: marker ?? (bindingIndex < 0 ? undefined : bindingIndex) };
+}
+
 /** The durable physical App Server identity, including the legacy result-only carrier. */
 export function generationlessAppServerPredecessor(run: {
   readonly executor?: ExecutorIdentity;
@@ -261,8 +289,8 @@ export function activeRepairAdmission(run: {
   readonly agentResult?: { readonly sessionId?: string; readonly executor?: ExecutorIdentity };
   readonly headSha?: string;
   readonly pullRequest?: { readonly number: number };
-  readonly validationResult?: { readonly status?: string };
-  readonly reviewResult?: { readonly verdict?: string };
+  readonly validationResult?: { readonly status?: string; readonly headSha?: string };
+  readonly reviewResult?: { readonly verdict?: string; readonly headSha?: string };
 }): { readonly snapshot: RepairAdmissionSnapshot; readonly admissionHistoryIndex: number; readonly startFixHistoryIndex: number; readonly handoff?: RepairHandoffRecord } | null {
   if (run.state !== 'IMPLEMENTING' || run.headSha === undefined || run.pullRequest === undefined || run.repairTaskShapeAuthority === undefined) return null;
   let startFixHistoryIndex = -1;
@@ -281,6 +309,10 @@ export function activeRepairAdmission(run: {
     ? 'validation_failed'
     : 'review_blocking';
   if (snapshot === undefined || snapshot.finding !== expectedFinding) return null;
+  if (snapshot.finding === 'review_blocking' &&
+      (run.reviewResult?.verdict !== 'request_changes' || run.reviewResult.headSha !== run.headSha)) return null;
+  if (snapshot.finding === 'validation_failed' &&
+      (run.validationResult?.status !== 'failed' || run.validationResult.headSha !== run.headSha)) return null;
   const admissionHistoryIndex = (run.repairAdmissions ?? []).indexOf(snapshot);
   const handoffEvent = [...run.history].map((event, index) => ({ event, index })).reverse().find(({ event }) =>
     (event.type === 'repair_executor_handoff' || event.type === 'repair_executor_continued') &&

@@ -5,6 +5,8 @@ import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter } from '../src/adapters/reviewer.js';
 import type { ValidationAdapter } from '../src/adapters/validation.js';
+import { LiveGitHubAdapter } from '../src/github/live-state.js';
+import type { GitHubApiTransport } from '../src/github/transport.js';
 import { createRun } from '../src/domain/run.js';
 import {
   InvalidTransitionError,
@@ -158,6 +160,39 @@ function githubReturning(snapshot: GitHubLiveSnapshot): GitHubAdapter {
   };
 }
 
+function rawGitHubTransport(options: { readonly reviews?: readonly unknown[]; readonly draft?: unknown; readonly omitDraft?: boolean }): GitHubApiTransport {
+  let pullReads = 0;
+  const pull = {
+    node_id: 'PR_7', number: 7, title: 'Fix', body: 'Closes #42', state: 'open',
+    ...(options.omitDraft ? {} : { draft: Object.hasOwn(options, 'draft') ? options.draft : false }),
+    html_url: 'https://github.test/acme/widgets/pull/7', mergeable: true, mergeable_state: 'clean',
+    updated_at: T0, merged_at: null, head: { sha: HEAD }, base: { sha: 'base' },
+  };
+  return {
+    async get(path) {
+      if (path === 'repos/acme/widgets/issues/42') return {
+        node_id: 'I_42', number: 42, title: 'Fix', body: 'DoR-ready.', state: 'open',
+        html_url: 'https://github.test/acme/widgets/issues/42', created_at: T0, updated_at: T0,
+      };
+      if (path === 'repos/acme/widgets/pulls/7') { pullReads += 1; return pull; }
+      if (path.endsWith('/status')) return { state: 'success', statuses: [] };
+      if (path.endsWith('/check-runs')) return { total_count: 1, check_runs: [{ id: 1, name: 'required-ci', status: 'completed', conclusion: 'success', html_url: 'https://github.test/checks/1', completed_at: T0 }] };
+      throw new Error(`Unexpected raw GitHub GET ${path} (PR reads ${pullReads})`);
+    },
+    async getPaginated(path) {
+      if (path === 'repos/acme/widgets/issues/42/timeline') return [{
+        event: 'cross-referenced', source: { issue: { number: 7, pull_request: { url: 'https://api.github.com/repos/acme/widgets/pulls/7' } } },
+      }];
+      if (path === 'repos/acme/widgets/pulls/7/reviews') return options.reviews ?? [];
+      if (path.endsWith('/comments')) return [];
+      throw new Error(`Unexpected raw GitHub collection ${path}`);
+    },
+    async graphql() {
+      return { data: { repository: { pullRequest: { reviewThreads: { nodes: [], pageInfo: { hasNextPage: false, endCursor: null } } } } } };
+    },
+  };
+}
+
 const unusedImplementation: ImplementationAgent = {
   kind: 'implementation-agent',
   async run() {
@@ -216,6 +251,78 @@ describe('final-gate authority', () => {
     assert.equal(result.outcome, 'merge_ready');
     assert.equal(result.run.state, 'MERGE_READY');
     assert.equal(result.run.history.at(-1)?.type, 'final_gate_verified');
+  });
+
+  it('passes a raw LiveGitHubAdapter final gate with valid draft and named approval evidence', async () => {
+    const store = new MemoryStore();
+    const run = finalGateRun('raw-github-valid-final-gate');
+    store.create(run);
+    const result = await runWorkflow({
+      store,
+      github: new LiveGitHubAdapter({ transport: rawGitHubTransport({ reviews: [{
+        node_id: 'R_RAW_APPROVED', user: { login: 'sol' }, state: 'APPROVED', commit_id: HEAD,
+        submitted_at: '2026-08-14T02:00:00.000Z', html_url: 'https://github.test/reviews/approved',
+      }] }), now: () => T0 }),
+      implementation: unusedImplementation,
+      reviewer: unusedReviewer,
+      validation: existingValidation,
+      hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+    }, run.id, { maxReviewAttempts: 1, now: () => T0 });
+
+    assert.equal(result.outcome, 'merge_ready');
+    assert.equal(result.run.state, 'MERGE_READY');
+    assert.equal(result.run.history.at(-1)?.type, 'final_gate_verified');
+  });
+
+  it('never records final-gate readiness from raw unidentified or malformed GitHub review evidence', async (t) => {
+    const nullAuthorChanges = {
+      node_id: 'R_NULL_CHANGES', user: null, state: 'CHANGES_REQUESTED', commit_id: HEAD,
+      submitted_at: '2026-08-14T01:00:00.000Z', html_url: 'https://github.test/reviews/null-changes',
+    };
+    const nullAuthorApproval = {
+      node_id: 'R_NULL_APPROVED', user: null, state: 'APPROVED', commit_id: HEAD,
+      submitted_at: '2026-08-14T02:00:00.000Z', html_url: 'https://github.test/reviews/null-approved',
+    };
+    const cases: Array<{ readonly name: string; readonly transport: GitHubApiTransport }> = [
+      { name: 'null-author changes then approval', transport: rawGitHubTransport({ reviews: [nullAuthorChanges, nullAuthorApproval] }) },
+      { name: 'null-author approval then changes', transport: rawGitHubTransport({ reviews: [nullAuthorApproval, nullAuthorChanges] }) },
+      { name: 'missing draft', transport: rawGitHubTransport({ omitDraft: true }) },
+      { name: 'null draft', transport: rawGitHubTransport({ draft: null }) },
+      { name: 'string draft', transport: rawGitHubTransport({ draft: 'false' }) },
+      { name: 'number draft', transport: rawGitHubTransport({ draft: 0 }) },
+      ...[
+        { name: 'missing', value: undefined, omit: true },
+        { name: 'null', value: null },
+        { name: 'empty', value: '' },
+        { name: 'whitespace', value: '   ' },
+        { name: 'non-string', value: 123 },
+      ].map(({ name, value, omit }) => {
+        const review: Record<string, unknown> = {
+          node_id: `R_BAD_TIME_${name}`, user: { login: 'reviewer' }, state: 'CHANGES_REQUESTED', commit_id: HEAD,
+          html_url: 'https://github.test/reviews/bad-time',
+        };
+        if (!omit) review.submitted_at = value;
+        return { name: `${name} submitted_at`, transport: rawGitHubTransport({ reviews: [review] }) };
+      }),
+    ];
+    for (const { name, transport } of cases) {
+      await t.test(name, async () => {
+        const store = new MemoryStore();
+        const run = finalGateRun(`raw-github-final-gate-${name.replaceAll(' ', '-')}`);
+        store.create(run);
+        const result = await runWorkflow({
+          store,
+          github: new LiveGitHubAdapter({ transport, now: () => T0 }),
+          implementation: unusedImplementation,
+          reviewer: unusedReviewer,
+          validation: existingValidation,
+          hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } },
+        }, run.id, { maxReviewAttempts: 1, now: () => T0 });
+        assert.notEqual(result.outcome, 'merge_ready');
+        assert.notEqual(result.run.state, 'MERGE_READY');
+        assert.equal(result.run.history.some((entry) => entry.type === 'final_gate_verified'), false);
+      });
+    }
   });
 
   it('parks required pending checks before interpreting a BLOCKED merge state', async () => {

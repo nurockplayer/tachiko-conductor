@@ -9,7 +9,7 @@ import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetr
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
-import { isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, sameRepairExecutorIdentity, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
+import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, sameRepairExecutorIdentity, unfinishedBoundRepairAttempt, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
 import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 import { assertSafeCurrentAccountPathIfApplicable, isCurrentAccountPathApplicable } from '../account-home.js';
 
@@ -265,6 +265,8 @@ function isRepairHistoryCoherent(run: Record<string, unknown>): boolean {
             (result?.sessionId !== undefined && result.sessionId !== activeHandoff.outcome.identity.sessionId)) return false;
       }
     }
+    if (unfinishedBoundRepairAttempt(run as unknown as Run) !== null &&
+        activeRepairAdmission(run as unknown as Run) === null) return false;
   }
   return true;
 }
