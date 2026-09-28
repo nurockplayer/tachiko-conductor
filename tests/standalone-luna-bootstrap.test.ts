@@ -4,6 +4,8 @@ import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
 import { hasPreparedStandaloneLunaInvocation, StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
+import { ExecutionAdmissionRefusal } from '../src/adapters/agent.js';
+import { IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, ImplementationBootstrapError } from '../src/adapters/bootstrap.js';
 import type { ProcessRunner } from '../src/github/transport.js';
 import { createBootstrapGitFixture, type BootstrapGitFixture } from './bootstrap-fixture.js';
 
@@ -19,6 +21,129 @@ describe('standalone Luna bootstrap', () => {
       const identity = await bootstrap.plan(request);
       await assert.doesNotReject(() => bootstrap.prepare({ ...request, existing: identity }));
     }
+  });
+
+  it('revalidates the configured publication remote before the first immutable-base prepare fetch', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    let changedAfterPlan = false;
+    const delegated: { args: readonly string[]; cwd?: string }[] = [];
+    const runner: ProcessRunner = { run: async (file, args, options) => {
+      const command = args.filter((value, index) => !(value === '-c' && args[index + 1] !== undefined) &&
+        !['core.hooksPath=/dev/null', 'core.fsmonitor=false', 'core.attributesFile=/dev/null', 'core.useReplaceRefs=false', 'core.commitGraph=false'].includes(value)).join(' ');
+      if (file === 'git' && command.includes('remote get-url --all')) {
+        const url = changedAfterPlan ? 'git@github.com:other/project.git' : 'git@github.com:acme/widgets.git';
+        return { stdout: `${url}\n`, stderr: '', exitCode: 0 };
+      }
+      delegated.push({ args: [...args], cwd: options.cwd });
+      return fixture.runner.run(file, args, options);
+    } };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: 'luna-remote-changed-after-plan', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request);
+    changedAfterPlan = true;
+
+    await assert.rejects(() => bootstrap.prepare({ ...request, existing: identity }), /publication remote does not exactly match/i);
+    const delegatedGit = delegated.filter(({ args }) => args.length > 0);
+    const delegatedFetches = delegatedGit.filter(({ args }) => args.includes('fetch'));
+    const delegatedInitializations = delegatedGit.filter(({ args }) => args.includes('init'));
+    assert.deepEqual(delegatedFetches, [], 'the changed remote is rejected before either immutable-base or workspace import fetch');
+    assert.deepEqual(delegatedInitializations, [], 'the changed remote is rejected before workspace initialization');
+    assert.equal(existsSync(identity.workspacePath), false);
+  });
+
+  it('refuses immutable-base import when the configured remote no longer serves a locally cached planned commit', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    let preparing = false;
+    let exactBaseFetches = 0;
+    let beforeMutationCalls = 0;
+    let failedFetchExit: number | undefined;
+    let immutableFetchArgs: string[] | undefined;
+    const runner: ProcessRunner = {
+      async run(file, args, options) {
+        const immutableFetch = preparing && file === 'git' && args.includes('fetch') && args.includes('origin') && args.at(-1) === fixture.baseSha;
+        if (immutableFetch) {
+          exactBaseFetches += 1;
+          immutableFetchArgs = [...args];
+          const original = options.beforeSpawn;
+          const result = await fixture.runner.run(file, args, { ...options, beforeSpawn: () => {
+            beforeMutationCalls += 1;
+            original?.();
+          } });
+          failedFetchExit = result.exitCode;
+          return result;
+        }
+        return fixture.runner.run(file, args, options);
+      },
+    };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: 'luna-base-remote-unavailable', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request);
+    assert.equal(fixture.git(fixture.source, ['cat-file', '-e', `${fixture.baseSha}^{commit}`]), '', 'the trusted source checkout still caches the planned commit');
+    fixture.git(fixture.remote, ['update-ref', '-d', `refs/heads/${fixture.branch}`]);
+    fixture.git(fixture.remote, ['reflog', 'expire', '--expire=now', '--all']);
+    fixture.git(fixture.remote, ['gc', '--prune=now']);
+    assert.throws(() => fixture.git(fixture.remote, ['cat-file', '-e', `${fixture.baseSha}^{commit}`]),
+      (error: unknown) => error instanceof Error,
+      'the isolated bare remote no longer has the planned commit object');
+    assert.equal(fixture.git(fixture.source, ['cat-file', '-e', `${fixture.baseSha}^{commit}`]), '',
+      'the trusted source still has its local copy before prepare');
+    preparing = true;
+
+    await assert.rejects(() => bootstrap.prepare({ ...request, existing: identity }), (error: unknown) =>
+      error instanceof ImplementationBootstrapError && error.code === IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.COMMAND_FAILED);
+
+    assert.equal(exactBaseFetches, 1, 'prepare attempted exactly the authorized immutable-base import');
+    assert.ok(immutableFetchArgs?.includes('--refetch'), 'the immutable-base import bypasses cached-object negotiation');
+    assert.equal(beforeMutationCalls, 1, 'the actual failed fetch crossed its synchronous admission callback');
+    assert.notEqual(failedFetchExit, 0, 'the configured remote rejected the unavailable object despite the local cache');
+    assert.equal(existsSync(identity.workspacePath), false, 'the worker checkout was not initialized after fetch failure');
+    const prepareCommands = fixture.commands.slice(fixture.commands.findIndex(({ args }) => args.includes('fetch')));
+    assert.equal(prepareCommands.some(({ args }) => args.includes('init') || args.includes('checkout') || args.includes('switch') || args.includes('update-ref')), false,
+      'no fallback or workspace/ref mutation follows the failed immutable-base import');
+  });
+
+  it('rejects a wrong FETCH_HEAD after actual immutable-base import before checkout mutations', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    let preparing = false;
+    let exactBaseFetches = 0;
+    let beforeMutationCalls = 0;
+    let wrongFetchHead: string | undefined;
+    const runner: ProcessRunner = {
+      async run(file, args, options) {
+        const immutableFetch = preparing && file === 'git' && args.includes('fetch') && args.includes('origin') && args.at(-1) === fixture.baseSha;
+        if (immutableFetch) {
+          exactBaseFetches += 1;
+          const original = options.beforeSpawn;
+          const result = await fixture.runner.run(file, args, { ...options, beforeSpawn: () => {
+            beforeMutationCalls += 1;
+            original?.();
+          } });
+          if (result.exitCode === 0) {
+            wrongFetchHead = fixture.commit(fixture.source, 'wrong-luna-fetch-head.txt', 'different cached commit\n');
+            writeFileSync(path.join(fixture.source, '.git', 'FETCH_HEAD'), `${wrongFetchHead}\t\tfixture wrong fetch head\n`);
+          }
+          return result;
+        }
+        return fixture.runner.run(file, args, options);
+      },
+    };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: 'luna-base-wrong-fetch-head', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request);
+    preparing = true;
+
+    await assert.rejects(() => bootstrap.prepare({ ...request, existing: identity }), (error: unknown) =>
+      error instanceof ImplementationBootstrapError && error.code === IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.BASE_DRIFT);
+
+    assert.notEqual(wrongFetchHead, undefined);
+    assert.notEqual(wrongFetchHead, fixture.baseSha);
+    assert.equal(fixture.git(fixture.source, ['rev-parse', 'FETCH_HEAD']), wrongFetchHead, 'the negative case observes the wrong fetched identity');
+    assert.equal(exactBaseFetches, 1);
+    assert.equal(beforeMutationCalls, 1, 'the real fetch crossed its synchronous admission callback');
+    assert.equal(existsSync(identity.workspacePath), false, 'workspace initialization is refused after FETCH_HEAD mismatch');
+    const prepareCommands = fixture.commands.slice(fixture.commands.findIndex(({ args }) => args.includes('fetch')));
+    assert.equal(prepareCommands.some(({ args }) => args.includes('init') || args.includes('checkout') || args.includes('switch') || args.includes('update-ref')), false,
+      'the wrong FETCH_HEAD is rejected before subsequent workspace/ref effects');
   });
 
   it('rejects a persisted run ID that cannot form a safe standalone branch', async () => {
@@ -396,6 +521,85 @@ describe('standalone Luna bootstrap', () => {
     assert.equal(hasPreparedStandaloneLunaInvocation({ target, baseSha: fixture.baseSha, workspacePath: repairedIdentity.workspacePath, branch: repairedIdentity.branch, workspaceGuard: guard, runtimeOwnership: { runId: request.runId, generation: 'repair' } }), false);
   });
 
+  it('recovers an authorized descendant after the original named base ref is removed', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const target = { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 };
+    const request = { runId: 'luna-historical-base-ref-removed', target, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const identity = await bootstrap.plan(request);
+    const authorizedHead = fixture.commit(fixture.source, 'authorized-recovery.txt', 'authorized recovery\n');
+    fixture.git(fixture.source, ['push', 'origin', `${authorizedHead}:refs/heads/${identity.branch}`]);
+    fixture.git(fixture.remote, ['branch', '-D', fixture.branch]);
+
+    const recovered = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const prepared = await recovered.prepare({ ...request, existing: identity, recoveryAuthority: { expectedHeadSha: authorizedHead } });
+    assert.equal(prepared.baseSha, fixture.baseSha, 'recovery retains the immutable planned base');
+    assert.equal(fixture.git(prepared.workspacePath, ['rev-parse', 'HEAD']), authorizedHead);
+    assert.equal(fixture.git(prepared.workspacePath, ['cat-file', '-e', `${fixture.baseSha}^{commit}`]), '');
+  });
+
+  for (const boundary of ['trusted-source-fetch', 'workspace-import'] as const) {
+    it(`refuses standalone recovery at ${boundary} after preserving earlier real Git effects`, async () => {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const target = { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 };
+      const request = { runId: `luna-recovery-${boundary}`, target, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+      const planner = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const identity = await planner.plan(request);
+      const authorizedHead = fixture.commit(fixture.source, 'authorized-recovery.txt', 'authorized non-base head\n');
+      fixture.git(fixture.source, ['push', 'origin', `HEAD:refs/heads/tachiko/${request.runId}-authorized`]);
+
+      let release!: () => void;
+      let entered!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      const reached = new Promise<void>((resolve) => { entered = resolve; });
+      const attempts: { readonly args: readonly string[]; readonly cwd?: string }[] = [];
+      const delegated: { readonly args: readonly string[]; readonly cwd?: string }[] = [];
+      let targetSpawnAttempted = false;
+      let authorityRefused = false;
+      const commandArgs = (args: readonly string[]) => {
+        let offset = 0;
+        while (args[offset] === '-c') offset += 2;
+        return args.slice(offset);
+      };
+      const refusal = new ExecutionAdmissionRefusal(`held at ${boundary}`, false, { cause: new Error('admission changed after runner preparation') });
+      const runner: ProcessRunner = { run: async (file, args, options) => {
+        attempts.push({ args: [...args], cwd: options.cwd });
+        const command = commandArgs(args);
+        const isTrustedFetch = file === 'git' && options.cwd === realpathSync(fixture.source) && command[0] === 'fetch' && command.at(-1) === authorizedHead;
+        const isWorkspaceImport = file === 'git' && options.cwd === identity.workspacePath && command[0] === 'fetch' && command.includes(realpathSync(fixture.source)) && command.at(-1) === authorizedHead;
+        if (!targetSpawnAttempted && (boundary === 'trusted-source-fetch' ? isTrustedFetch : isWorkspaceImport)) {
+          targetSpawnAttempted = true;
+          entered();
+          await held;
+          // The actual ProcessRunner callback is the accepted final synchronous
+          // boundary. It is invoked only after the injected runner's async prep.
+          options.beforeSpawn?.();
+        }
+        delegated.push({ args: [...args], cwd: options.cwd });
+        return fixture.runner.run(file, args, options);
+      } };
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+      const pending = bootstrap.prepare({ ...request, existing: identity, recoveryAuthority: { expectedHeadSha: authorizedHead }, beforeMutation: () => { if (authorityRefused) throw refusal; } });
+      await reached;
+      authorityRefused = true;
+      release();
+      await assert.rejects(pending, (error: unknown) => {
+        assert.strictEqual(error, refusal);
+        assert.strictEqual((error as Error).cause, refusal.cause);
+        return true;
+      });
+
+      assert.equal(targetSpawnAttempted, true, 'the asynchronous runner reached the exact recovery-fetch boundary');
+      assert.equal(delegated.some(({ args, cwd }) => cwd === fixture.workspaceRoot && commandArgs(args)[0] === 'init' && commandArgs(args).includes(identity.workspacePath)), true, 'the earlier workspace initialization remains real');
+      assert.equal(delegated.some(({ args, cwd }) => cwd === identity.workspacePath && commandArgs(args)[0] === 'fetch' && commandArgs(args).at(-1) === identity.baseSha), true, 'the earlier authorized base import remains real');
+      assert.equal(delegated.some(({ args, cwd }) => cwd === realpathSync(fixture.source) && commandArgs(args)[0] === 'fetch' && commandArgs(args).at(-1) === authorizedHead), boundary === 'workspace-import', 'trusted-source fetch delegates only before the workspace-import boundary');
+      assert.equal(delegated.some(({ args, cwd }) => cwd === identity.workspacePath && commandArgs(args)[0] === 'fetch' && commandArgs(args).at(-1) === authorizedHead), false, 'the current or later authorized-head import never reaches Git');
+      assert.equal(delegated.some(({ args, cwd }) => cwd === identity.workspacePath && (commandArgs(args)[0] === 'checkout' || commandArgs(args)[0] === 'switch')), false, 'checkout and branch switch remain blocked after refusal');
+      assert.equal(existsSync(identity.workspacePath), true, 'earlier workspace initialization is not rolled back');
+      assert.doesNotThrow(() => fixture.git(identity.workspacePath, ['cat-file', '-e', `${identity.baseSha}^{commit}`]), 'earlier base objects remain imported');
+    });
+  }
+
   it('rejects workspace path replacement and Git object-store redirection after preparation', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
@@ -673,4 +877,59 @@ describe('standalone Luna bootstrap', () => {
       await assert.rejects(async () => await bootstrap.guard(identity).assertValid(), /Git config requests executable behavior/, key);
     }
   });
+
+  it('keeps planning read-only and gates the immutable-base prepare fetch after injected runner preparation', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const refusal = new ExecutionAdmissionRefusal('planning fetch lost admission', false);
+    let armed = false;
+    let enteredResolve!: () => void;
+    let releaseResolve!: () => void;
+    const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+    const released = new Promise<void>((resolve) => { releaseResolve = resolve; });
+    const runner: ProcessRunner = { run: async (file, args, options) => {
+      const selected = file === 'git' && args.includes('fetch') && args.includes('origin');
+      if (selected) { enteredResolve(); await released; armed = true; }
+      options.beforeSpawn?.();
+      return fixture.runner.run(file, args, { ...options, beforeSpawn: undefined });
+    } };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: 'luna-plan-fetch-fence', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const planned = await bootstrap.plan(request);
+    assert.equal(fixture.commands.some(({ args }) => args.includes('fetch')), false, 'read-only planning does not fetch or change FETCH_HEAD');
+    const preparing = bootstrap.prepare({ ...request, existing: planned, beforeMutation: () => { if (armed) throw refusal; } });
+    await entered;
+    releaseResolve();
+    await assert.rejects(preparing, (error) => error === refusal);
+    assert.equal(fixture.commands.some(({ args }) => args.includes('fetch') && args.includes('origin')), false);
+  });
+
+  for (const boundary of ['init', 'checkout', 'switch'] as const) {
+    it(`gates standalone ${boundary} after asynchronous runner preparation`, async () => {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const refusal = new ExecutionAdmissionRefusal(`blocked ${boundary}`, false);
+      let armed = false;
+      let enteredResolve!: () => void;
+      let releaseResolve!: () => void;
+      const entered = new Promise<void>((resolve) => { enteredResolve = resolve; });
+      const released = new Promise<void>((resolve) => { releaseResolve = resolve; });
+      const runner: ProcessRunner = { run: async (file, args, options) => {
+        const selected = file === 'git' && args.includes(boundary);
+        if (selected) { enteredResolve(); await released; armed = true; }
+        options.beforeSpawn?.();
+        return fixture.runner.run(file, args, { ...options, beforeSpawn: undefined });
+      } };
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+      const request = { runId: `luna-${boundary}-fence`, target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+      const identity = await bootstrap.plan(request);
+      const preparing = bootstrap.prepare({ ...request, existing: identity, beforeMutation: () => { if (armed) throw refusal; } });
+      await entered;
+      releaseResolve();
+      await assert.rejects(preparing, (error) => error === refusal);
+      assert.equal(fixture.commands.some(({ args }) => args.includes(boundary)), false, 'the intercepted command never reaches real Git');
+      if (boundary === 'init') assert.equal(existsSync(identity.workspacePath), false);
+      if (boundary === 'switch') {
+        assert.equal(fixture.git(identity.workspacePath, ['rev-parse', '--abbrev-ref', 'HEAD']), 'HEAD', 'blocked switch leaves the checkout detached');
+      }
+    });
+  }
 });

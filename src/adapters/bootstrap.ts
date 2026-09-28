@@ -12,6 +12,8 @@ export interface BootstrapPlanRequest {
   readonly baseBranch: string;
   readonly baseSha: string;
   readonly publicationBranch?: string;
+  /** Ephemeral synchronous authority check immediately before each deliberate Git/filesystem mutation. */
+  readonly beforeMutation?: () => void;
 }
 
 export interface BootstrapPrepareRequest extends BootstrapPlanRequest {

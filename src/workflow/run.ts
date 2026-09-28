@@ -84,7 +84,29 @@ function runAdmissionEvidence(run: Run, additional: { readonly pullRequest?: num
 
 function strengthenAdmissionEvidence(options: WorkflowOptions, run: Run, additional: { readonly pullRequest?: number; readonly workspace?: string } = {}): void {
   const fence = options.admissionFence;
-  if (fence !== undefined) fence.registry.strengthen(fence.token, runAdmissionEvidence(run, additional));
+  if (fence !== undefined) {
+    if (fence.executionWorkspace !== undefined) {
+      const repository = `${run.target.owner}/${run.target.repo}`;
+      const explicitWorkspace = canonicalizeMissionEvidence({ repository, workspace: fence.executionWorkspace }).workspace;
+      // Bind the host-selected workspace and the current Run identity before
+      // accepting any workspace returned by a later plan or preparation step.
+      // Existing lane conflicts fail atomically inside strengthen().
+      fence.registry.strengthen(fence.token, runAdmissionEvidence(run, {
+        ...(additional.pullRequest === undefined ? {} : { pullRequest: additional.pullRequest }),
+        workspace: fence.executionWorkspace,
+      }));
+      if (additional.workspace !== undefined) {
+        const plannedWorkspace = canonicalizeMissionEvidence({ repository, workspace: additional.workspace }).workspace;
+        if (plannedWorkspace !== explicitWorkspace) {
+          throw new ExecutionAdmissionRefusal('Planned workspace conflicts with the explicit execution workspace.', false, {
+            cause: new Error('The canonical planned workspace differs from the host-bound execution workspace.'),
+            authorityUnknown: false,
+          });
+        }
+      }
+    }
+    fence.registry.strengthen(fence.token, runAdmissionEvidence(run, additional));
+  }
 }
 
 function assertMutationAdmission(options: WorkflowOptions, run?: Run, workspace?: string): void {
@@ -111,6 +133,40 @@ function updateIfCurrent(store: RunStore, expected: Run, next: Run): boolean {
   return store.updateIfUnchanged?.(expected, next) ?? false;
 }
 
+function assertCapturedRunAtBoundary(store: RunStore, expected: Run): void {
+  let matched: boolean;
+  try {
+    const compareAndSwap = store.updateIfUnchanged;
+    if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable.');
+    matched = compareAndSwap.call(store, expected, expected);
+  } catch (cause) {
+    throw new ExecutionAdmissionRefusal('The final host boundary could not confirm the exact Run handoff.', false, {
+      cause, authorityUnknown: true,
+    });
+  }
+  if (!matched) throw new ExecutionAdmissionRefusal('The exact Run handoff changed before the final host boundary.', true);
+}
+
+function establishInitialPlanningAdmission(store: RunStore, expected: Run, options: WorkflowOptions): void {
+  // Planning is read-only. Still bind its result to the exact Run captured
+  // before awaiting the adapter so a later plan cannot replace authority.
+  assertCapturedRunAtBoundary(store, expected);
+}
+
+function persistPlannedBootstrap(store: RunStore, expected: Run, next: Run): void {
+  const compareAndSwap = store.updateIfUnchanged;
+  if (compareAndSwap === undefined) {
+    const cause = new Error('Strict Run compare-and-swap is unavailable while persisting bootstrap identity.');
+    throw new ExecutionAdmissionRefusal('Bootstrap identity persistence could not confirm the exact Run.', false, { cause, authorityUnknown: true });
+  }
+  let matched: boolean;
+  try { matched = compareAndSwap.call(store, expected, next); }
+  catch (cause) {
+    throw new ExecutionAdmissionRefusal('Bootstrap identity persistence could not confirm the exact Run.', false, { cause, authorityUnknown: true });
+  }
+  if (!matched) throw new ExecutionAdmissionRefusal('The exact Run changed before bootstrap identity persistence.', true);
+}
+
 function assertPublicationAdmission(options: WorkflowOptions): void {
   const fence = options.admissionFence;
   if (fence !== undefined) fence.registry.assertCanPublish(fence.token, fence.productionMissionId);
@@ -122,23 +178,12 @@ function assertFinalExecutionAdmission(
   options: WorkflowOptions,
   checkPublication = false,
 ): void {
-  let matched: boolean;
-  try {
-    const compareAndSwap = store.updateIfUnchanged;
-    if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable.');
-    matched = compareAndSwap.call(store, expected, expected);
-  } catch (cause) {
-    throw new ExecutionAdmissionRefusal('The final host boundary could not confirm the exact Run handoff.', false, {
-      cause, authorityUnknown: true,
-    });
-  }
-  if (!matched) {
-    throw new ExecutionAdmissionRefusal('The exact Run handoff changed before the final host boundary.', true);
-  }
+  assertCapturedRunAtBoundary(store, expected);
   try {
     assertCurrentMutationAdmission(options);
     if (checkPublication) assertPublicationAdmission(options);
   } catch (cause) {
+    if (isExecutionAdmissionRefusal(cause)) throw cause;
     throw new ExecutionAdmissionRefusal('The final host boundary could not confirm current mission admission.', false, { cause });
   }
 }
@@ -159,6 +204,20 @@ function formatTarget(target: Target): string {
 function assertBootstrapBoundary(bootstrap: NonNullable<Run['bootstrap']>, adapter: ImplementationBootstrapAdapter): void {
   if (bootstrap.bootstrapKind !== adapter.bootstrapKind) {
     throw new Error(`Persisted ${bootstrap.bootstrapKind} workspace cannot be used by ${adapter.bootstrapKind} bootstrap transport.`);
+  }
+}
+
+function assertPlannedBootstrapIdentity(
+  bootstrap: NonNullable<Run['bootstrap']>, adapter: ImplementationBootstrapAdapter,
+  target: Target, baseBranch: string, baseSha: string, publicationBranch?: string,
+): void {
+  assertBootstrapBoundary(bootstrap, adapter);
+  if (bootstrap.owner.toLowerCase() !== target.owner.toLowerCase() || bootstrap.repo.toLowerCase() !== target.repo.toLowerCase() ||
+      (target.kind === 'issue' && bootstrap.issueNumber !== target.issueNumber) ||
+      bootstrap.baseBranch !== baseBranch || bootstrap.baseSha !== baseSha ||
+      bootstrap.branch.trim() === '' || bootstrap.workspacePath.trim() === '' ||
+      (publicationBranch !== undefined && bootstrap.publicationBranch !== publicationBranch)) {
+    throw new Error('Bootstrap plan returned an identity outside the captured target and immutable base.');
   }
 }
 
@@ -199,6 +258,19 @@ function bootstrapFailureOutcome(run: Run, error: unknown, store: RunStore, now:
     return staleWorkflowOutcome(run.id, run, store, 'Run changed while bootstrap failure was being reconciled; preserving the newer Run.');
   }
   return { outcome: 'needs_human', ...parked };
+}
+
+function bootstrapAdmissionRefusalOutcome(expected: Run, error: ExecutionAdmissionRefusal, store: RunStore, now: () => string): WorkflowOutcome {
+  if (error.authorityUnknown) throw error;
+  try {
+    const compareAndSwap = store.updateIfUnchanged;
+    if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during bootstrap refusal reconciliation.');
+    const matched = compareAndSwap.call(store, expected, expected);
+    if (!matched || error.runSuperseded) return staleWorkflowOutcome(expected.id, expected, store, 'Run changed before bootstrap mutation; preserving the newer Run.');
+    return park(expected, `Bootstrap mutation was refused at the current host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+  } catch {
+    throw error;
+  }
 }
 
 function bootstrapFailureAfterWorker(run: Run, expected: Run, error: unknown, store: RunStore, now: () => string): WorkflowOutcome {
@@ -577,38 +649,50 @@ export async function runWorkflow(
           if (existingLuna && (!sameRepository || publicationBranch === undefined || publicationBranch.trim() === '')) {
             return bootstrapFailureOutcome(run, new Error('Existing Luna PR has no safe same-repository publication branch.'), store, now);
           }
+          const plannedFrom = run;
+          let refusalRun = plannedFrom;
           try {
-            const plannedFrom = run;
+            establishInitialPlanningAdmission(store, plannedFrom, options);
             bootstrap = await bootstrapAdapter.plan({ runId: run.id, target, baseBranch: authoritativeBaseBranch,
-              baseSha: authoritativeBaseSha, ...(publicationBranch === undefined ? {} : { publicationBranch }) });
-            assertBootstrapBoundary(bootstrap, bootstrapAdapter);
+              baseSha: authoritativeBaseSha, ...(publicationBranch === undefined ? {} : { publicationBranch }),
+              beforeMutation: () => assertFinalExecutionAdmission(store, plannedFrom, options) });
+            assertCapturedRunAtBoundary(store, plannedFrom);
+            assertPlannedBootstrapIdentity(bootstrap, bootstrapAdapter, target, authoritativeBaseBranch, authoritativeBaseSha, publicationBranch);
             const plannedRun = applyTransition(plannedFrom, { type: 'bootstrap_prepared', bootstrap }, now());
-            if (!updateIfCurrent(store, plannedFrom, plannedRun)) return staleWorkflowOutcome(run.id, plannedFrom, store, 'Run changed while bootstrap planning was in flight; preserving the newer Run.');
+            persistPlannedBootstrap(store, plannedFrom, plannedRun);
             run = plannedRun;
+            refusalRun = plannedRun;
             strengthenAdmissionEvidence(options, run, {
               ...(snapshot.pullRequest === null ? {} : { pullRequest: snapshot.pullRequest.number }),
               workspace: bootstrap.workspacePath,
             });
+            assertCurrentMutationAdmission(options);
             if (pendingRepair) recoveryAuthority = { expectedHeadSha: run.headSha! };
           } catch (error) {
+            if (isExecutionAdmissionRefusal(error)) return bootstrapAdmissionRefusalOutcome(refusalRun, error, store, now);
             return bootstrapFailureOutcome(run, error, store, now);
           }
         }
         if (bootstrap !== undefined) {
           if (bootstrapAdapter === undefined) return bootstrapFailureOutcome(run, new Error('The persisted bootstrap adapter is unavailable.'), store, now);
+          const prepareFrom = run;
           try {
             assertBootstrapBoundary(bootstrap, bootstrapAdapter);
-            assertMutationAdmission(options, run, bootstrap.workspacePath);
+            assertCapturedRunAtBoundary(store, prepareFrom);
+            assertMutationAdmission(options, prepareFrom, bootstrap.workspacePath);
             options.onExecutionStart?.();
             assertCurrentMutationAdmission(options);
+            assertCapturedRunAtBoundary(store, prepareFrom);
             bootstrap = await bootstrapAdapter.prepare({
               runId: run.id, target, baseBranch: bootstrap.baseBranch, baseSha: bootstrap.baseSha,
               existing: bootstrap, ...(recoveryAuthority === undefined ? {} : { recoveryAuthority }),
+              beforeMutation: () => assertFinalExecutionAdmission(store, prepareFrom, options),
             });
             workspaceGuard = bootstrapAdapter.guard(bootstrap);
             snapshot = await github.readLiveSnapshot(target);
             if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed while bootstrap preparation and live recovery were in flight; preserving the newer Run.');
           } catch (error) {
+            if (isExecutionAdmissionRefusal(error)) return bootstrapAdmissionRefusalOutcome(prepareFrom, error, store, now);
             return bootstrapFailureOutcome(run, error, store, now);
           }
           if (snapshot.issue.state !== 'open') return park(run, `Issue ${formatTarget(target)} closed during bootstrap.`, store, now, [CANCEL_RUN_DECISION]);
@@ -1074,12 +1158,15 @@ export async function runWorkflow(
           }
           try {
             assertBootstrapBoundary(run.bootstrap, bootstrapAdapter);
+            assertCapturedRunAtBoundary(store, validationExpected);
             assertMutationAdmission(options, run, run.bootstrap.workspacePath);
             options.onExecutionStart?.();
             assertCurrentMutationAdmission(options);
+            assertCapturedRunAtBoundary(store, validationExpected);
             const identity = await bootstrapAdapter.prepare({
               runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
               existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: validationHeadSha },
+              beforeMutation: () => assertFinalExecutionAdmission(store, validationExpected, options),
             });
             const freshWorkspaceGuard = bootstrapAdapter.guard(identity);
             if (!updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while owned-workspace validation was being prepared; preserving the newer Run.');
@@ -1096,8 +1183,17 @@ export async function runWorkflow(
             assertPublicationAdmission(options);
           } catch (error) {
             if (isExecutionAdmissionRefusal(error)) {
-              if (error.runSuperseded || !updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while owned-workspace validation was being prepared; preserving the newer Run.');
-              return park(validationExpected, `Owned-workspace validation entry was refused by its host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+              if (error.authorityUnknown) throw error;
+              try {
+                const compareAndSwap = store.updateIfUnchanged;
+                if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during owned-workspace validation refusal reconciliation.');
+                if (!compareAndSwap.call(store, validationExpected, validationExpected) || error.runSuperseded) {
+                  return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while owned-workspace validation was being prepared; preserving the newer Run.');
+                }
+                return park(validationExpected, `Owned-workspace validation entry was refused by its host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+              } catch {
+                throw error;
+              }
             }
             return bootstrapFailureOutcome(run, error, store, now);
           }

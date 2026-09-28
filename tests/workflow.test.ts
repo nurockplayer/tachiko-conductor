@@ -8,6 +8,8 @@ import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } fr
 import { ExecutionAdmissionRefusal, isExecutionAdmissionRefusal, WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ImplementationBootstrapAdapter, VerifyDurableRequest } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
+import { LiveGitHubAdapter } from '../src/github/live-state.js';
+import type { GitHubApiTransport } from '../src/github/transport.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
 import { createRun } from '../src/domain/run.js';
@@ -171,7 +173,7 @@ class FakeBootstrap implements ImplementationBootstrapAdapter {
   readonly identity = {
     bootstrapKind: 'linked-worktree' as const,
     owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base',
-    branch: 'tachiko/issue-42-test', workspacePath: '/tmp/tachiko-workspace',
+    branch: 'tachiko/issue-42-test', publicationBranch: 'tachiko/issue-42-test', workspacePath: '/tmp/tachiko-workspace',
   };
   async plan() { return this.identity; }
   async prepare(..._args: unknown[]) { return this.identity; }
@@ -285,13 +287,14 @@ describe('runWorkflow', { concurrency: false }, () => {
           ...githubAdapter(mode === 'continuation' ? [HEAD] : [null]),
           async createImplementationPullRequest() { pullRequestCreates += 1; return { number: 8 }; },
         };
+        const bootstrap = new FakeBootstrap();
         const beforeEvents = run.telemetry?.events.length ?? 0;
         try {
           const outcome = await runWorkflow({
-            store, github, implementation, reviewer: new FakeReviewer([]), bootstrap: new FakeBootstrap(),
+            store, github, implementation, reviewer: new FakeReviewer([]), bootstrap,
           }, id, {
             maxReviewAttempts: 1, now: () => T0,
-            admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: '/tmp/confinement-workspace' },
+            admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: bootstrap.identity.workspacePath },
           });
 
           assert.equal(outcome.outcome, 'needs_human');
@@ -341,7 +344,9 @@ describe('runWorkflow', { concurrency: false }, () => {
       async plan(request) {
         planned.push({ baseBranch: request.baseBranch, baseSha: request.baseSha });
         return { bootstrapKind: 'standalone-isolated', owner: 'acme', repo: 'widgets', issueNumber: 42,
-          baseBranch: request.baseBranch, baseSha: request.baseSha, branch: 'tachiko/issue-42-test', workspacePath: '/tmp/luna-existing' };
+          baseBranch: request.baseBranch, baseSha: request.baseSha, branch: 'tachiko/issue-42-test',
+          ...(request.publicationBranch === undefined ? {} : { publicationBranch: request.publicationBranch }),
+          workspacePath: '/tmp/luna-existing' };
       },
       async prepare(request) { return request.existing; },
       guard() { return { assertValid: () => undefined }; },
@@ -2403,6 +2408,47 @@ describe('runWorkflow', { concurrency: false }, () => {
     });
   });
 
+  it('rechecks the immutable validation Run at owned-workspace preparation entry after host callbacks', async () => {
+    const store = new MemoryStore();
+    const id = 'owned-validation-prepare-entry-run-supersession';
+    const bootstrap = new class extends FakeBootstrap {
+      prepareCalls = 0;
+      verifyCalls = 0;
+      override async prepare(..._args: unknown[]) { this.prepareCalls += 1; return this.identity; }
+      override async verifyDurable(request: { expectedHeadSha: string }) {
+        this.verifyCalls += 1;
+        return { headSha: request.expectedHeadSha, branch: this.identity.branch };
+      }
+    }();
+    let run = reviewingRun(store, id, HEAD);
+    run = { ...run, bootstrap: bootstrap.identity };
+    store.update(run);
+    let newerRun: Run | undefined;
+    let validationCalls = 0;
+    const validation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'owned-validation-entry-v1', requiresOwnedWorkspace: true,
+      async validate(request) {
+        validationCalls += 1;
+        return { ...validationPassed(request.headSha).local, configRevision: 'owned-validation-entry-v1' };
+      },
+    };
+    const result = await runWorkflow({
+      store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation: new FakeImplementation([]),
+      reviewer: new FakeReviewer([approve(HEAD)]), validation, hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrap,
+    }, id, { maxReviewAttempts: 1, now: () => T0, onExecutionStart: () => {
+      if (store.read(id)?.state !== 'VALIDATING') return;
+      newerRun = { ...store.read(id)!, updatedAt: '2026-09-28T00:00:06.000Z' };
+      store.update(newerRun);
+    } });
+
+    assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+    assert.ok(newerRun);
+    assert.deepEqual(store.read(id), newerRun, 'the complete newer Run remains unchanged');
+    assert.equal(bootstrap.prepareCalls, 0, 'owned preparation is refused before the adapter entry');
+    assert.equal(bootstrap.verifyCalls, 0, 'durable verification does not run after stale entry authority');
+    assert.equal(validationCalls, 0, 'the validator does not run after stale entry authority');
+  });
+
   it('holds an unqualified implementation before governed worker or publication effects', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-worker-publish-fence-'));
     try {
@@ -3330,6 +3376,71 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(result.outcome, 'waiting_dependency');
     assert.equal(result.run.state, 'WAITING_DEPENDENCY');
     assert.deepEqual(result.run.interrupt?.choices, ['Retry readiness checks', 'Cancel the run']);
+  });
+
+  it('holds before bootstrap, worker, or readiness when the production live adapter rejects malformed PR state', async () => {
+    const store = new MemoryStore();
+    const run = createRun(TARGET, T0, 'workflow-invalid-pull-request-state');
+    store.create(run);
+    const calls: string[] = [];
+    const malformedPull = {
+      node_id: 'PR_7', number: 7, title: 'Fix', body: 'Closes #42',
+      draft: false, html_url: 'https://github.test/acme/widgets/pull/7',
+      updated_at: T0, merged_at: null,
+      head: { sha: HEAD, ref: 'tachiko/issue-42-test', repo: { name: 'widgets', owner: { login: 'acme' } } },
+      base: { sha: 'base', ref: 'main', repo: { name: 'widgets', owner: { login: 'acme' } } },
+    };
+    const transport: GitHubApiTransport = {
+      async get(path) {
+        calls.push(`get:${path}`);
+        if (path === 'repos/acme/widgets/issues/42') {
+          return {
+            node_id: 'I_42', number: 42, title: 'Fix', body: 'DoR-ready.', state: 'open',
+            html_url: 'https://github.test/acme/widgets/issues/42', created_at: T0, updated_at: T0,
+          };
+        }
+        if (path === 'repos/acme/widgets/pulls/7') return malformedPull;
+        throw new Error(`Unexpected GitHub route ${path}`);
+      },
+      async getPaginated(path) {
+        calls.push(`paginated:${path}`);
+        if (path === 'repos/acme/widgets/issues/42/timeline') {
+          return [{ event: 'cross-referenced', source: { issue: { number: 7, pull_request: { url: 'https://api.github.com/repos/acme/widgets/pulls/7' } } } }];
+        }
+        throw new Error(`Unexpected GitHub collection ${path}`);
+      },
+    };
+    const github = new LiveGitHubAdapter({ transport, now: () => T0 });
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+    const validation = new FakeValidation();
+    let bootstrapSelections = 0;
+    let planCalls = 0;
+    let prepareCalls = 0;
+    const bootstrap = new class extends FakeBootstrap {
+      override async plan() { planCalls += 1; return this.identity; }
+      override async prepare(..._args: unknown[]) { prepareCalls += 1; return this.identity; }
+    }();
+
+    const outcome = await runWorkflow({
+      store, github, implementation, reviewer, validation, bootstrap,
+      bootstrapForExecution() { bootstrapSelections += 1; return bootstrap; },
+    }, run.id, { maxReviewAttempts: 1, now: () => T0 });
+
+    assert.equal(outcome.outcome, 'needs_human');
+    assert.match(outcome.reason, /GitHub live state could not be read safely/);
+    assert.equal(bootstrapSelections, 0);
+    assert.equal(planCalls, 0);
+    assert.equal(prepareCalls, 0);
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(reviewer.requests.length, 0);
+    assert.equal(validation.requests.length, 0);
+    assert.deepEqual(calls, [
+      'get:repos/acme/widgets/issues/42',
+      'paginated:repos/acme/widgets/issues/42/timeline',
+      'get:repos/acme/widgets/pulls/7',
+    ], 'the production adapter refuses the malformed authority before later workflow reads');
+    assert.equal((outcome.run.telemetry?.events ?? []).some((event) => event.kind === 'spawn'), false);
   });
 
   it('fails closed when review-thread state is unavailable at the final gate', async () => {

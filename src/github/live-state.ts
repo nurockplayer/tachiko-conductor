@@ -80,9 +80,18 @@ function requireNonNegativeInt(record: Record<string, unknown>, field: string, p
   return value;
 }
 
-function normalizePullState(record: Record<string, unknown>): PullRequestSnapshot['state'] {
-  if (record.merged_at !== null && record.merged_at !== undefined) return 'merged';
-  return record.state === 'closed' ? 'closed' : 'open';
+function normalizePullState(record: Record<string, unknown>, path: string): PullRequestSnapshot['state'] {
+  const rawState = record.state;
+  if (rawState !== 'open' && rawState !== 'closed') {
+    throw invalid(path, `unrecognized pull request state "${String(rawState)}"`);
+  }
+  const mergedAt = record.merged_at;
+  if (mergedAt === null || mergedAt === undefined) return rawState;
+  if (typeof mergedAt !== 'string' || mergedAt.trim() === '') {
+    throw invalid(path, 'merged_at is not a non-empty string');
+  }
+  if (rawState !== 'closed') throw invalid(path, 'merged_at is present while pull request state is open');
+  return 'merged';
 }
 
 function normalizeReviewState(state: string): GitHubReviewSnapshot['state'] {
@@ -224,10 +233,6 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     if (requirePositiveInt(record, 'number', path) !== number) {
       throw invalid(path, `pull request number ${String(record.number)} does not match the requested ${number}`);
     }
-    if (record.merged_at !== null && record.merged_at !== undefined &&
-      (typeof record.merged_at !== 'string' || record.merged_at.trim() === '' || record.state !== 'closed')) {
-      throw invalid(path, 'merged_at and closed state are contradictory or malformed');
-    }
     return this.normalizeLivePullRequest(record, path);
   }
 
@@ -261,12 +266,14 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const record = asRecord(await this.transport.get(path));
       if (record === null) throw invalid(path, 'pull request is not an object');
+      normalizePullState(record, path);
       const association = await this.classifyPullRequestAssociation(owner, repo, target.issueNumber, number, record);
       if (association === 'not_associated') continue;
+      const normalized = this.normalizePullRequest(record, path);
       // Unknown is deliberately retained here: dispatch duplicate-writer
       // protection must fail closed when a timeline candidate cannot be
       // authoritatively disproven.
-      result.push(this.normalizePullRequest(record, path));
+      result.push(normalized);
     }
     return result;
   }
@@ -291,7 +298,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       if (requirePositiveInt(raw, 'number', path) !== number) {
         throw invalid(path, `pull request number ${String(raw.number)} does not match the referenced ${number}`);
       }
-      if (raw.state !== 'open') continue;
+      const state = normalizePullState(raw, path);
+      if (state !== 'open') continue;
       const association = await this.classifyPullRequestAssociation(owner, repo, issueNumber, number, raw);
       if (association === 'not_associated') continue;
       if (association === 'unknown') {
@@ -462,7 +470,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       number: requirePositiveInt(record, 'number', path),
       headSha: requireString(head, 'sha', path),
       baseSha: requireString(base, 'sha', path),
-      state: normalizePullState(record),
+      state: normalizePullState(record, path),
     };
   }
 
@@ -563,7 +571,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       number: requirePositiveInt(record, 'number', path),
       title: requireString(record, 'title', path),
       url: requireString(record, 'html_url', path),
-      state: normalizePullState(record),
+      state: normalizePullState(record, path),
       isDraft: record.draft,
       mergeable: typeof record.mergeable === 'boolean' ? record.mergeable : null,
       mergeStateStatus:

@@ -45,7 +45,9 @@ import { GitHubLiveStateError } from '../src/github/errors.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
 import type { WorkflowOutcome } from '../src/workflow/run.js';
-import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
+import type { ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
+import { canonicalizeMissionEvidence, MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
+import { isExecutionAdmissionRefusal } from '../src/adapters/agent.js';
 import { resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 import { readManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
@@ -2680,6 +2682,38 @@ describe('workflow run and resume commands', () => {
       store.create(createRun(TARGET, T0, runId, fixture.request.execution));
       const config: AdmissionConfig = { schemaVersion: 1, revision: 'genuine-projection-entry-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
       const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config });
+      const bootstrapOwner = fixture.bootstrap as unknown as { runner: ProcessRunner };
+      const originalBootstrapRunner = bootstrapOwner.runner;
+      let prepareFetchObserved = 0;
+      let prepareFetchCompleted = 0;
+      bootstrapOwner.runner = {
+        run: async (file: string, args: readonly string[], options: ProcessRunOptions) => {
+          const runArgs = [...args];
+          let offset = 0;
+          while (runArgs[offset] === '-c') offset += 2;
+          const gitArgs = runArgs.slice(offset);
+          const isImmutableBaseFetch = file === 'git' && gitArgs[0] === 'fetch' && gitArgs.includes('origin') && gitArgs.at(-1) === fixture.identity.baseSha;
+          if (isImmutableBaseFetch && options.beforeSpawn !== undefined) {
+            const originalBeforeSpawn = options.beforeSpawn;
+            const result = await originalBootstrapRunner.run(file, args, { ...options, beforeSpawn: () => {
+              prepareFetchObserved += 1;
+              const persisted = store.read(runId);
+              assert.ok(persisted?.bootstrap, 'the exact bootstrap identity is durable before immutable-base preparation fetch');
+              assert.deepEqual(persisted.bootstrap, fixture.identity);
+              assert.equal(persisted.dispatchClaimId, undefined, 'direct CLI execution is not assigned a queue claim');
+              const lane = registry.readLane(`run:${runId}`);
+              assert.equal(lane?.status, 'active');
+              assert.equal(lane?.evidence.workspace, canonicalizeMissionEvidence({
+                repository: `${TARGET.owner}/${TARGET.repo}`, workspace: fixture.identity.workspacePath,
+              }).workspace, 'the canonical planned workspace is bound before the actual fetch spawn');
+              originalBeforeSpawn();
+            } });
+            prepareFetchCompleted += 1;
+            return result;
+          }
+          return await originalBootstrapRunner.run(file, args, options);
+        },
+      };
       const markerRoot = path.join(fixture.root, 'ordering');
       mkdirSync(markerRoot);
       const reservationMarker = path.join(markerRoot, 'reservation');
@@ -2715,7 +2749,6 @@ describe('workflow run and resume commands', () => {
       await runIssueCommand({ ...deps(store, github, fixture.adapter, new FakeReviewer([])), bootstrapForExecution: () => fixture.bootstrap },
         'acme/widgets#42', {
           admission: registry,
-          admissionWorkspace: fixture.identity.workspacePath,
           runOwnerReceiptPath: path.join(dir, 'run-owner.json'),
           publishRuntimeProjection: (currentRegistry, runStore, update) => {
             const entered = existsSync(entryMarker);
@@ -2740,6 +2773,8 @@ describe('workflow run and resume commands', () => {
           },
         });
       assert.equal(existsSync(entryMarker), true, 'the source-qualified controlled codex executable was entered');
+      assert.equal(prepareFetchObserved, 1, 'the actual immutable-base prepare fetch is fenced after identity persistence and workspace admission');
+      assert.equal(prepareFetchCompleted, 1, 'the actual immutable-base fetch completed before executable entry');
       sequence.push('entry');
       assert.deepEqual(sequence.slice(0, 4), ['reservation', 'projection', 'release', 'entry']);
     } finally { releaseFixtureLock(); restoreEnv(); fixture.cleanup(); rmSync(dir, { recursive: true, force: true }); }
@@ -2811,7 +2846,7 @@ describe('workflow run and resume commands', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
-  it('recovers a real workflow crash after bootstrap planning persists but before lane strengthening', async () => {
+  it('releases pre-execution admission after a caught tagged CAS error following durable bootstrap planning', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-planning-gap-'));
     try {
       const store = new MemoryStore();
@@ -2843,20 +2878,23 @@ describe('workflow run and resume commands', () => {
         },
       };
       const originalUpdateIfUnchanged = store.updateIfUnchanged.bind(store);
+      const ordinaryCasCause = new Error('caught strict Run CAS error after planned bootstrap persistence');
       store.updateIfUnchanged = (expected, next) => {
         const updated = originalUpdateIfUnchanged(expected, next);
-        if (updated && next.bootstrap !== undefined) throw new Error('simulated process crash after planned Run persistence');
+        if (updated && next.bootstrap !== undefined) throw ordinaryCasCause;
         return updated;
       };
-      const originalPark = registry.park.bind(registry);
-      registry.park = () => { throw new Error('simulated process exit before workflow settlement'); };
       class NeverInvokedImplementation extends FakeImplementation {
         override async run(): Promise<AgentResult> { providerCalls += 1; throw new Error('provider must not be invoked'); }
       }
       await assert.rejects(runIssueCommand({
         ...deps(store, noPullRequestGithub, new NeverInvokedImplementation([]), new FakeReviewer([])), bootstrap,
-      }, 'acme/widgets#42', { admission: registry, runOwnerReceiptPath: receiptPath, now: () => T0 }), /simulated process exit before workflow settlement/);
-      registry.park = originalPark;
+      }, 'acme/widgets#42', { admission: registry, runOwnerReceiptPath: receiptPath, now: () => T0 }), (error: unknown) => {
+        assert.equal(isExecutionAdmissionRefusal(error), true);
+        assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, true);
+        assert.strictEqual((error as Error).cause, ordinaryCasCause, 'the caught CAS cause remains the original error object');
+        return true;
+      });
       store.updateIfUnchanged = originalUpdateIfUnchanged;
       const run = store.list()[0]!;
       const lane = registry.readLane(`run:${run.id}`)!;
@@ -2864,15 +2902,101 @@ describe('workflow run and resume commands', () => {
       assert.equal(planCalls, 1);
       assert.equal(prepareCalls, 0);
       assert.equal(providerCalls, 0);
-      assert.equal(run.bootstrap?.workspacePath, workspacePath, 'the bootstrap plan was durably persisted before the crash');
+      assert.deepEqual(run.bootstrap, identity, 'the exact bootstrap plan was durably persisted before the caught CAS error');
+      assert.equal(lane.status, 'released', 'the caught pre-execution failure legitimately releases its admission');
+      assert.equal(lane.evidence.workspace, undefined);
+      assert.equal(receipt.phase, 'released');
+      assert.equal(receipt.workspace, undefined);
+      assert.equal(recoverRunAdmission(store, registry, run.id, receipt.generation - 1, true, receiptPath), 'released');
+      assert.equal(registry.readLane(`run:${run.id}`)?.status, 'released');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.workspace, undefined);
+      assert.equal(recoverRunAdmission(store, registry, run.id, receipt.generation - 1, true, receiptPath), 'released', 'the exact post-release recovery retry is idempotent');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('retains the active pre-execution receipt when actual release cleanup is interrupted before registry publication', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-planning-cleanup-interruption-'));
+    try {
+      const store = new MemoryStore();
+      const workspacePath = path.join(directory, 'planned-worktree');
+      mkdirSync(workspacePath, { recursive: true });
+      const receiptPath = path.join(directory, 'owner-receipt.json');
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'admission.json'), config: {
+        schemaVersion: 1, revision: 'bootstrap-planning-cleanup-interruption-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 },
+      } });
+      const identity = { bootstrapKind: 'linked-worktree' as const, owner: 'acme', repo: 'widgets', issueNumber: 42,
+        baseBranch: 'main', baseSha: HEAD, branch: 'codex/bootstrap-cleanup-interruption', workspacePath };
+      let planCalls = 0;
+      let prepareCalls = 0;
+      let providerCalls = 0;
+      const bootstrap = {
+        kind: 'implementation-bootstrap' as const,
+        bootstrapKind: 'linked-worktree' as const,
+        async plan() { planCalls += 1; return identity; },
+        async prepare() { prepareCalls += 1; return identity; },
+        guard() { return { assertValid() {} }; },
+        async verifyDurable() { return { headSha: HEAD, branch: identity.branch }; },
+      };
+      const live = githubAdapter([HEAD]);
+      const noPullRequestGithub: GitHubAdapter = {
+        ...live,
+        async readLiveSnapshot(target) {
+          const snapshot = await live.readLiveSnapshot(target);
+          return { ...snapshot, repository: { ...snapshot.repository, defaultBranch: 'main', defaultBranchHeadSha: HEAD }, pullRequest: null, headSha: null };
+        },
+      };
+      const originalUpdateIfUnchanged = store.updateIfUnchanged.bind(store);
+      const originalCasCause = new Error('caught strict Run CAS error after planned bootstrap persistence');
+      store.updateIfUnchanged = (expected, next) => {
+        const updated = originalUpdateIfUnchanged(expected, next);
+        if (updated && next.bootstrap !== undefined) throw originalCasCause;
+        return updated;
+      };
+      const originalRelease = registry.release.bind(registry);
+      const cleanupInterruption = new Error('simulated cleanup interruption before registry publication');
+      let releasePublicationBoundaryReached = false;
+      registry.release = (token, stopped, beforePublish, afterPublish, validateBeforePublish) => originalRelease(
+        token,
+        stopped,
+        () => {
+          releasePublicationBoundaryReached = true;
+          throw cleanupInterruption;
+        },
+        afterPublish,
+        validateBeforePublish,
+      );
+      class NeverInvokedImplementation extends FakeImplementation {
+        override async run(): Promise<AgentResult> { providerCalls += 1; throw new Error('provider must not be invoked'); }
+      }
+      await assert.rejects(runIssueCommand({
+        ...deps(store, noPullRequestGithub, new NeverInvokedImplementation([]), new FakeReviewer([])), bootstrap,
+      }, 'acme/widgets#42', { admission: registry, runOwnerReceiptPath: receiptPath, now: () => T0 }),
+      (error: unknown) => error === cleanupInterruption,
+      'the actual cleanup interruption remains distinguishable from the original tagged CAS refusal');
+
+      // Restore both injected fixture boundaries before inspecting and recovering.
+      store.updateIfUnchanged = originalUpdateIfUnchanged;
+      registry.release = originalRelease;
+      const run = store.list()[0]!;
+      const lane = registry.readLane(`run:${run.id}`)!;
+      const receipt = readRunOwnerReceipt(receiptPath)!;
+      assert.equal(releasePublicationBoundaryReached, true, 'the actual release callback reached the pre-publication boundary');
+      assert.notStrictEqual(cleanupInterruption, originalCasCause,
+        'the cleanup interruption is distinct from the original caught CAS error');
+      assert.equal(planCalls, 1);
+      assert.equal(prepareCalls, 0);
+      assert.equal(providerCalls, 0);
+      assert.deepEqual(run.bootstrap, identity, 'the exact planned identity remains durable after cleanup interruption');
       assert.equal(lane.status, 'active');
       assert.equal(lane.evidence.workspace, undefined);
       assert.equal(receipt.phase, 'pre_execution');
       assert.equal(receipt.workspace, undefined);
+      assert.throws(() => recoverRunAdmission(store, registry, run.id, receipt.generation, false, receiptPath), /explicit --stopped/,
+        'the active receipt requires explicit stopped recovery after the real cleanup interruption');
       assert.equal(recoverRunAdmission(store, registry, run.id, receipt.generation, true, receiptPath), 'released');
       assert.equal(registry.readLane(`run:${run.id}`)?.status, 'released');
       assert.equal(readRunOwnerReceipt(receiptPath)?.workspace, undefined);
-      assert.equal(recoverRunAdmission(store, registry, run.id, receipt.generation, true, receiptPath), 'released', 'the exact post-crash recovery retry is idempotent');
+      assert.equal(recoverRunAdmission(store, registry, run.id, receipt.generation, true, receiptPath), 'released', 'the exact stopped recovery retry is idempotent');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

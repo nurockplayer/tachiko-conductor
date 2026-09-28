@@ -138,7 +138,21 @@ function updateReviewRun(store: RunStore, expected: Run, next: Run): boolean {
   return store.updateIfUnchanged?.(expected, next) ?? false;
 }
 
-function assertFinalRepairAdmission(run: Run, store: RunStore, assertCurrentMutation?: () => void): void {
+function persistRepairBootstrap(store: RunStore, expected: Run, next: Run): void {
+  const compareAndSwap = store.updateIfUnchanged;
+  if (compareAndSwap === undefined) {
+    const cause = new Error('Strict Run compare-and-swap is unavailable while persisting repair bootstrap identity.');
+    throw new ExecutionAdmissionRefusal('Repair bootstrap identity persistence could not confirm the exact Run.', false, { cause, authorityUnknown: true });
+  }
+  let matched: boolean;
+  try { matched = compareAndSwap.call(store, expected, next); }
+  catch (cause) {
+    throw new ExecutionAdmissionRefusal('Repair bootstrap identity persistence could not confirm the exact Run.', false, { cause, authorityUnknown: true });
+  }
+  if (!matched) throw new ExecutionAdmissionRefusal('The exact repair Run changed before bootstrap identity persistence.', true);
+}
+
+function assertFinalRepairAdmission(run: Run, store: RunStore, assertCurrentMutation?: () => void, requireCurrentMutation = false): void {
   let matched: boolean;
   try {
     const compareAndSwap = store.updateIfUnchanged;
@@ -151,9 +165,48 @@ function assertFinalRepairAdmission(run: Run, store: RunStore, assertCurrentMuta
   }
   if (!matched) throw new ExecutionAdmissionRefusal('The exact repair Run handoff changed before the final host boundary.', true);
   try {
+    if (requireCurrentMutation && assertCurrentMutation === undefined) throw new Error('Current repair mutation admission is unavailable.');
     assertCurrentMutation?.();
   } catch (cause) {
+    if (isExecutionAdmissionRefusal(cause)) throw cause;
     throw new ExecutionAdmissionRefusal('The final repair boundary could not confirm current mission admission.', false, { cause });
+  }
+}
+
+function establishRepairPlanningAdmission(run: Run, store: RunStore, deps: ReviewLoopDependencies): void {
+  // Planning is read-only, but its eventual identity remains bound to this
+  // exact Run. Production mutation admission is established after persistence.
+  assertFinalRepairAdmission(run, store);
+  if (deps.governedPublicationRequired === true &&
+      (deps.assertCanMutate === undefined || deps.assertCurrentMutation === undefined)) {
+    throw new ExecutionAdmissionRefusal('Governed repair planning is missing a host admission callback.', false, {
+      cause: new Error('Current repair planning admission callback is unavailable.'),
+    });
+  }
+}
+
+function assertRepairPlanIdentity(
+  identity: NonNullable<Run['bootstrap']>, adapter: ImplementationBootstrapAdapter,
+  target: Run['target'], baseBranch: string, baseSha: string, publicationBranch: string,
+): void {
+  if (identity.bootstrapKind !== adapter.bootstrapKind || identity.owner.toLowerCase() !== target.owner.toLowerCase() ||
+      identity.repo.toLowerCase() !== target.repo.toLowerCase() || target.kind !== 'issue' ||
+      identity.issueNumber !== target.issueNumber || identity.baseBranch !== baseBranch || identity.baseSha !== baseSha ||
+      identity.publicationBranch !== publicationBranch || identity.branch.trim() === '' || identity.workspacePath.trim() === '') {
+    throw new Error('Repair bootstrap plan returned an identity outside the captured target and immutable base.');
+  }
+}
+
+function repairBootstrapAdmissionRefusalOutcome(run: Run, error: ExecutionAdmissionRefusal, store: RunStore, now: () => string): ReviewLoopResult {
+  if (error.authorityUnknown) throw error;
+  try {
+    const compareAndSwap = store.updateIfUnchanged;
+    if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during repair bootstrap refusal reconciliation.');
+    const matched = compareAndSwap.call(store, run, run);
+    if (!matched || error.runSuperseded) return staleReviewOutcome(run.id, run, store);
+    return parkBootstrap(run, error, store, now, run);
+  } catch {
+    throw error;
   }
 }
 
@@ -520,18 +573,20 @@ export async function runReviewLoop(
         }
         try {
           const expected = run;
+          establishRepairPlanningAdmission(expected, store, deps);
           const bootstrap = await repairBootstrap.plan({
             runId: run.id, target, baseBranch, baseSha, publicationBranch,
+            beforeMutation: () => assertFinalRepairAdmission(expected, store, deps.assertCurrentMutation,
+              deps.governedPublicationRequired === true),
           });
-          if (!updateReviewRun(store, expected, expected)) return staleReviewOutcome(run.id, expected, store);
-          deps.assertCanMutate?.(bootstrap.workspacePath);
-          if (bootstrap.bootstrapKind !== repairBootstrap.bootstrapKind) {
-            return parkBootstrap(run, new Error('Promoted isolated Luna repair bootstrap boundary does not match its transport.'), store, now);
-          }
+          assertFinalRepairAdmission(expected, store);
+          assertRepairPlanIdentity(bootstrap, repairBootstrap, target, baseBranch, baseSha, publicationBranch);
           const prepared = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
-          if (!updateReviewRun(store, expected, prepared)) return staleReviewOutcome(run.id, expected, store);
+          persistRepairBootstrap(store, expected, prepared);
           run = prepared;
+          deps.assertCanMutate?.(bootstrap.workspacePath);
         } catch (error) {
+          if (isExecutionAdmissionRefusal(error)) return repairBootstrapAdmissionRefusalOutcome(run, error, store, now);
           return parkBootstrap(run, error, store, now);
         }
       }
@@ -542,14 +597,23 @@ export async function runReviewLoop(
         if (repairBootstrap.bootstrapKind !== run.bootstrap.bootstrapKind) {
           return parkBootstrap(run, new Error('Repair transport is incompatible with the persisted workspace boundary.'), store, now);
         }
+        const repairRun = run;
+        const repairIdentity = repairRun.bootstrap;
+        if (repairIdentity === undefined) return parkBootstrap(run, new Error('Review fix lost its persisted implementation workspace.'), store, now);
         try {
-          deps.assertCanMutate?.(run.bootstrap.workspacePath);
+          establishRepairPlanningAdmission(repairRun, store, deps);
+          deps.assertCanMutate?.(repairIdentity.workspacePath);
+          assertFinalRepairAdmission(repairRun, store, deps.assertCurrentMutation,
+            deps.governedPublicationRequired === true);
           await repairBootstrap.prepare({
-            runId: run.id, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
-            existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: progressBaseSha },
+            runId: repairRun.id, target, baseBranch: repairIdentity.baseBranch, baseSha: repairIdentity.baseSha,
+            existing: repairIdentity, recoveryAuthority: { expectedHeadSha: progressBaseSha },
+            beforeMutation: () => assertFinalRepairAdmission(repairRun, store, deps.assertCurrentMutation,
+              deps.governedPublicationRequired === true),
           });
-          workspaceGuard = repairBootstrap.guard(run.bootstrap);
+          workspaceGuard = repairBootstrap.guard(repairIdentity);
         } catch (error) {
+          if (isExecutionAdmissionRefusal(error)) return repairBootstrapAdmissionRefusalOutcome(repairRun, error, store, now);
           return parkBootstrap(run, error, store, now);
         }
         const recovered = await checkOwnedFix();

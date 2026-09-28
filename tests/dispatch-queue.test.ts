@@ -20,16 +20,18 @@ import { DispatchAdmissionWaitError, dispatchOnce, runtimeClaimFromBody } from '
 import { dispatchOnceCommand } from '../src/dispatch/command.js';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../src/dispatch/invocation-lock.js';
 import { parseDispatchConfiguration } from '../src/dispatch/config.js';
-import type { GitHubAdapter, IssueSnapshot, PullRequestSnapshot } from '../src/adapters/github.js';
+import type { GitHubAdapter, GitHubLiveSnapshot, IssueSnapshot, PullRequestSnapshot } from '../src/adapters/github.js';
 import { createRun } from '../src/domain/run.js';
 import type { Run } from '../src/domain/types.js';
 import type { RunStore } from '../src/store/json-file-store.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
-import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
+import { canonicalizeMissionEvidence, MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
 import { runIssueCommand } from '../src/cli.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
 import { LiveGitHubAdapter } from '../src/github/live-state.js';
 import type { GitHubApiTransport } from '../src/github/transport.js';
+import type { ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
+import { createGenuineLunaFixture } from './support/genuine-luna.js';
 
 const T0 = '2026-09-15T00:00:00.000Z';
 const DISPATCH_AUTHORITY = { revision: 'task-shape-v1', shape: 'interacting' } as const;
@@ -1042,6 +1044,110 @@ ready:
     assert.equal(received[0]?.profile, 'complex');
     assert.equal(received[0]?.claimId, parseDispatchRuntime(runtime.comments[0]!.body)?.claimId);
     assert.deepEqual(received[0]?.authority, { revision: 'task-shape-v1', shape: 'interacting' });
+  });
+
+  it('prepares a real workspace from a workspace-less dispatch lane before the immutable-base fetch', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-bootstrap-plan-'));
+    const queue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 42\n    route: codex\n    profile: routine\n    task-shape-revision: task-shape-v1\n    task-shape: bounded`;
+    const fixture = await createGenuineLunaFixture('dispatch-bootstrap-plan', { deferPrepare: true });
+    const admissionConfig: AdmissionConfig = {
+      schemaVersion: 1, revision: 'dispatch-bootstrap-plan-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 },
+    };
+    try {
+      const store = new JsonFileStore({ dir: path.join(directory, 'runs') });
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'host', 'admission.json'), config: admissionConfig });
+      const runtime = new CommandRuntime(queue);
+      const execution = fixture.request.execution;
+      let liveReads = 0;
+      const github: GitHubAdapter = {
+        kind: 'github',
+        async readIssue(target) { return { target, title: 'dispatch bootstrap', body: 'bounded setup', state: 'open' }; },
+        async readBranch() { throw new Error('unused'); },
+        async listPullRequests() { return []; },
+        async readLiveSnapshot(target): Promise<GitHubLiveSnapshot> {
+          liveReads += 1;
+          return {
+            repository: { owner: 'acme', repo: 'widgets', defaultBranch: fixture.identity.baseBranch, defaultBranchHeadSha: fixture.identity.baseSha },
+            issue: { id: 'I_42', number: target.issueNumber, title: 'dispatch bootstrap', body: 'bounded setup',
+              state: liveReads === 1 ? 'open' : 'closed', url: 'https://example.test/acme/widgets/issues/42',
+              createdAt: T0, updatedAt: T0 },
+            pullRequest: null, headSha: null,
+            checks: { availability: 'available', overall: 'passing', checks: [] },
+            reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
+            conversations: [], handoff: null, problems: [], observedAt: T0,
+          };
+        },
+      };
+      const workflow = {
+        store, github, implementation: fixture.adapter,
+        reviewer: { name: 'unused', async review() { throw new Error('closed issue must stop before review'); } },
+        bootstrapForExecution: () => fixture.bootstrap,
+      } as unknown as WorkflowDependencies;
+
+      const bootstrapOwner = fixture.bootstrap as unknown as { runner: ProcessRunner };
+      const originalRunner = bootstrapOwner.runner;
+      let prepareFetches = 0;
+      let completedPrepareFetches = 0;
+      bootstrapOwner.runner = {
+        async run(file: string, args: readonly string[], options: ProcessRunOptions) {
+          let offset = 0;
+          while (args[offset] === '-c') offset += 2;
+          const gitArgs = args.slice(offset);
+          const isImmutableBaseFetch = file === 'git' && gitArgs[0] === 'fetch' && gitArgs.includes('origin') && gitArgs.at(-1) === fixture.identity.baseSha;
+          if (isImmutableBaseFetch && options.beforeSpawn !== undefined) {
+            const beforeSpawn = options.beforeSpawn;
+            const result = await originalRunner.run(file, args, { ...options, beforeSpawn: () => {
+              prepareFetches += 1;
+              const run = store.list()[0];
+              assert.ok(run?.bootstrap, 'the new Run has its exact plan identity persisted before preparation');
+              assert.equal(run.dispatchClaimId, parseDispatchRuntime(runtime.comments[0]!.body)?.claimId,
+                'the exact queue claim is already bound to the persisted Run');
+              assert.notDeepEqual(run.bootstrap, fixture.identity, 'dispatch Run identity is derived from its own immutable Run id');
+              const lane = registry.snapshot().lanes.find((candidate) => candidate.laneId === `run:${run.id}`);
+              assert.equal(lane?.status, 'active');
+              assert.equal(lane?.evidence.workspace, canonicalizeMissionEvidence({
+                repository: 'acme/widgets', workspace: run.bootstrap.workspacePath,
+              }).workspace, 'the lane owns the canonical planned workspace before actual fetch spawn');
+              beforeSpawn();
+            } });
+            completedPrepareFetches += 1;
+            return result;
+          }
+          return await originalRunner.run(file, args, options);
+        },
+      };
+
+      const dispatched = await dispatchOnceCommand({ revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1,
+        queueCommentId: 2, leaseDurationMs: 60_000 }, {
+        workflow, runtime, admission: registry,
+        resolveExecutionProfile: () => execution,
+        runIssue: async (ref, selected, claimId, authority, currentRegistry) => await runIssueCommand(workflow, ref, {
+          execution: selected, dispatchClaimId: claimId, repairTaskShapeAuthority: authority,
+          admission: currentRegistry, runOwnerReceiptPath: path.join(directory, 'receipts', `${claimId}.json`),
+        }),
+        resumeClaimedRun: async () => { throw new Error('new dispatch must create the Run'); },
+        now: () => T0,
+      });
+
+      assert.equal(dispatched.outcome, 'dispatched');
+      assert.equal(prepareFetches, 1, 'the actual dispatch path reaches one immutable-base preparation fetch');
+      assert.equal(completedPrepareFetches, 1, 'the real immutable-base fetch completed before the second live snapshot and worker continuation');
+      assert.equal(liveReads, 2, 'the closed-issue stop happens only after successful preparation');
+      const run = store.read(dispatched.claim.runId!)!;
+      assert.equal(run.dispatchClaimId, dispatched.claim.claimId);
+      assert.equal(run.state, 'NEEDS_HUMAN');
+      assert.deepEqual(run.bootstrap, {
+        ...run.bootstrap,
+        bootstrapKind: 'standalone-isolated', owner: 'acme', repo: 'widgets', issueNumber: 42,
+        baseBranch: fixture.identity.baseBranch, baseSha: fixture.identity.baseSha,
+      });
+      assert.equal(registry.readLane(`run:${run.id}`)?.evidence.workspace, canonicalizeMissionEvidence({
+        repository: 'acme/widgets', workspace: run.bootstrap!.workspacePath,
+      }).workspace);
+    } finally {
+      fixture.cleanup();
+      rmSync(directory, { recursive: true, force: true });
+    }
   });
 
   it('keeps one claim-bound READY Run through capacity denial and restart, then admits that exact Run after capacity frees', async () => {

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
 
 import { ClaudeCodeAdapter } from '../src/agents/claude-code.js';
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
+import { ExecutionAdmissionRefusal, isExecutionAdmissionRefusal } from '../src/adapters/agent.js';
 import type { ProcessRunner } from '../src/github/transport.js';
 import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
@@ -19,9 +20,12 @@ import type { AgentResult, ImplementationBootstrapIdentity, LocalValidationEvide
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { resumeCommand } from '../src/cli.js';
 import { runWorkflow } from '../src/workflow/run.js';
+import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import { TARGET, T0, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 import { createBootstrapGitFixture, type BootstrapGitFixture } from './bootstrap-fixture.js';
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
+import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
+import { canonicalizeMissionEvidence, MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 
 const OLD = 'a'.repeat(40);
 const NEW = 'b'.repeat(40);
@@ -119,6 +123,43 @@ class NoopImplementation implements ImplementationAgent {
     this.requests.push(request);
     return successResult(NEW);
   }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
+  return { promise, resolve };
+}
+
+function gatedBootstrapRunner(
+  base: ProcessRunner,
+  matches: (args: readonly string[]) => boolean,
+  beforeSpawn?: () => void,
+  afterRefusal?: (error: unknown) => void,
+) {
+  const entered = deferred<void>();
+  const release = deferred<void>();
+  let blocked = false;
+  const runner: ProcessRunner = {
+    async run(file, args, options) {
+      let reachedTarget = false;
+      if (!blocked && file === 'git' && matches(args)) {
+        blocked = true;
+        reachedTarget = true;
+        entered.resolve();
+        await release.promise;
+      }
+      if (reachedTarget) beforeSpawn?.();
+      try {
+        options.beforeSpawn?.();
+      } catch (error) {
+        afterRefusal?.(error);
+        throw error;
+      }
+      return base.run(file, args, { ...options, beforeSpawn: undefined });
+    },
+  };
+  return { runner, entered: entered.promise, release: () => release.resolve(), blocked: () => blocked };
 }
 
 class ApprovingReviewer implements ReviewerAdapter {
@@ -539,6 +580,878 @@ describe('bootstrap lifecycle acceptance coverage', () => {
       assert.equal(fixture.git(prepared.workspacePath, ['rev-list', '--count', `${fixture.baseSha}..HEAD`]), '1');
       assert.deepEqual(new JsonFileStore({ dir }).read(runId)?.bootstrap, prepared);
       assert.equal(new JsonFileStore({ dir }).list().length, 1);
+    });
+  }
+});
+
+describe('bootstrap actual-spawn admission fences', () => {
+  it('establishes explicit initial workspace authority before the real immutable-base preparation fetch', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-initial-plan-admission-')); dirs.push(directory);
+    const runId = 'initial-plan-admission-establishment';
+    const workspace = path.join(fixture.workspaceRoot, TARGET.owner, TARGET.repo, `${runId}-issue-${TARGET.issueNumber}`);
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'initial-plan-admission-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+      repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId,
+    } });
+    assert.equal(admission.outcome, 'admitted');
+    if (admission.outcome !== 'admitted') return;
+    const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const initialRun = createRun(TARGET, T0, runId);
+    const store = memoryStore(initialRun);
+    const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+      owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+    } });
+    const implementation = new NoopImplementation();
+    const before = fixture.commands.length;
+    const result = await runWorkflow({
+      store, github: new QueueGithub(Array.from({ length: 12 }, () => live)), bootstrap, implementation,
+      reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+    }, runId, { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+      registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: workspace,
+    } });
+    assert.notEqual(result.outcome, 'failed', JSON.stringify(result));
+    assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' && args.includes('fetch')), true,
+      'the read-only plan is followed by a real trusted-base fetch after host admission establishment');
+    assert.equal(registry.snapshot().lanes.find((lane) => lane.laneId === runId)?.evidence.workspace, realpathSync.native(workspace),
+      'the initially workspace-less lane is strengthened with the explicit host workspace before planning');
+  });
+
+  it('binds the exact initial Run while preserving an already-admitted workspace before the real preparation fetch', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-initial-plan-existing-workspace-')); dirs.push(directory);
+    const runId = 'initial-plan-existing-workspace';
+    const workspace = path.join(fixture.workspaceRoot, TARGET.owner, TARGET.repo, `${runId}-issue-${TARGET.issueNumber}`);
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'initial-plan-existing-workspace-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+      repository: `${TARGET.owner}/${TARGET.repo}`, workspace,
+    } });
+    assert.equal(admission.outcome, 'admitted');
+    if (admission.outcome !== 'admitted') return;
+    const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const initialRun = createRun(TARGET, T0, runId);
+    const store = memoryStore(initialRun);
+    const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+      owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+    } });
+    const before = fixture.commands.length;
+    const result = await runWorkflow({
+      store, github: new QueueGithub(Array.from({ length: 12 }, () => live)), bootstrap, implementation: new NoopImplementation(),
+      reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+    }, runId, { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+      registry, token: admission.token, productionMissionId: admission.missionId,
+    } });
+    assert.notEqual(result.outcome, 'failed', JSON.stringify(result));
+    assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' && args.includes('fetch')), true,
+      'the existing workspace evidence authorizes the real preparation fetch only after expected-Run strengthening');
+    assert.equal(registry.snapshot().lanes.find((lane) => lane.laneId === runId)?.evidence.workspace,
+      realpathSync.native(workspace), 'expected repository/issue/Run evidence is added without replacing the existing workspace');
+    const lane = registry.snapshot().lanes.find((candidate) => candidate.laneId === runId);
+    assert.equal(lane?.evidence.issue, TARGET.issueNumber);
+    assert.equal(lane?.evidence.run, runId);
+  });
+
+  it('refuses existing-identity preparation when persisted workspace conflicts with the explicit host workspace', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-existing-identity-workspace-conflict-')); dirs.push(directory);
+    const runId = 'existing-identity-workspace-conflict';
+    const request = { runId, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const persistedIdentity = await bootstrap.plan(request);
+    let run = applyTransition(createRun(TARGET, T0, runId), { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: persistedIdentity }, T0);
+    const store = memoryStore(run);
+    const explicitWorkspace = path.join(directory, 'host-selected-workspace');
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'existing-identity-workspace-conflict-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+      repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId, workspace: explicitWorkspace,
+    } });
+    assert.equal(admission.outcome, 'admitted');
+    if (admission.outcome !== 'admitted') return;
+    const originalEvidence = registry.readLane(runId)?.evidence;
+    const before = fixture.commands.length;
+    const implementation = new NoopImplementation();
+    const validation = new PassingValidation();
+    const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+      owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+    } });
+
+    const result = await runWorkflow({
+      store, github: new QueueGithub(Array.from({ length: 8 }, () => live)), bootstrap, implementation,
+      reviewer: new ApprovingReviewer(), validation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+    }, runId, { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+      registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: explicitWorkspace,
+    } });
+
+    assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+    assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' &&
+      (args.includes('fetch') || args.includes('init') || args.includes('worktree'))), false,
+    'the persisted identity is checked against explicit host workspace before any prepare effect');
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(validation.requests.length, 0);
+    assert.deepEqual(store.read(runId)?.bootstrap, persistedIdentity);
+    assert.deepEqual(registry.readLane(runId)?.evidence, originalEvidence,
+      'a conflicting persisted identity cannot replace or rewrite the already-bound host workspace');
+  });
+
+  it('preserves explicit host workspace through the workflow-owned repair callback before preparation', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-repair-workspace-conflict-')); dirs.push(directory);
+    const runId = 'workflow-repair-workspace-conflict';
+    const execution = { profile: 'routine' as const, revision: 'luna-v1', executor: 'luna-isolated' as const, timeoutMs: 60_000 };
+    let run = createRun(TARGET, T0, runId, execution);
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded', agentResult: successResult(fixture.baseSha), headSha: fixture.baseSha,
+      pullRequest: { number: 7, headSha: fixture.baseSha },
+    }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed(fixture.baseSha) }, T0);
+    const repairAuthority = { revision: 'task-shape-v1', shape: 'bounded' as const };
+    run = { ...run, repairTaskShapeAuthority: repairAuthority };
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: {
+      verdict: 'request_changes', reviewerName: 'fixture-reviewer', headSha: fixture.baseSha,
+      findings: [{ severity: 'blocking', summary: 'repair required' }],
+    } }, T0, TEST_VALIDATION_AUTHORITY);
+    const repairExecution = { profile: 'routine' as const, revision: 'luna-v1', executor: 'luna-isolated' as const, timeoutMs: 60_000 };
+    const store = memoryStore(run);
+    const explicitWorkspace = path.join(directory, 'host-selected-repair-workspace');
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'workflow-repair-workspace-conflict-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+      repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId,
+      pullRequest: 7, workspace: explicitWorkspace,
+    } });
+    assert.equal(admission.outcome, 'admitted');
+    if (admission.outcome !== 'admitted') return;
+    const originalEvidence = registry.readLane(runId)?.evidence;
+    let plannedIdentity: ImplementationBootstrapIdentity | undefined;
+    const originalStrengthen = registry.strengthen.bind(registry);
+    let strengthenAfterPlanPersistence = 0;
+    registry.strengthen = (token, evidence) => {
+      if (plannedIdentity !== undefined && JSON.stringify(store.read(runId)?.bootstrap) === JSON.stringify(plannedIdentity)) {
+        strengthenAfterPlanPersistence += 1;
+      }
+      return originalStrengthen(token, evidence);
+    };
+    const before = fixture.commands.length;
+    const implementation = new NoopImplementation();
+    const validation = new PassingValidation();
+    const live = snapshot(fixture.baseSha, pr(7, fixture.baseSha, {
+      headRef: 'existing-pr', baseRef: fixture.branch, baseSha: fixture.baseSha,
+      headRepository: { owner: TARGET.owner, repo: TARGET.repo },
+    }), { repository: { owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha } });
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    let planCalls = 0;
+    let prepareCalls = 0;
+    const realPlan = bootstrap.plan.bind(bootstrap);
+    const realPrepare = bootstrap.prepare.bind(bootstrap);
+    bootstrap.plan = async (request) => {
+      planCalls += 1;
+      plannedIdentity = await realPlan(request);
+      return plannedIdentity;
+    };
+    bootstrap.prepare = async (request) => { prepareCalls += 1; return realPrepare(request); };
+
+    const result = await runWorkflow({
+      store, github: new QueueGithub(Array.from({ length: 12 }, () => live)), bootstrap, implementation,
+      reviewer: new ApprovingReviewer(), validation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+      resolveRepairExecutionProfile: () => repairExecution,
+    }, runId, { maxReviewAttempts: 2, now: () => T0, admissionFence: {
+      registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: explicitWorkspace,
+    } });
+
+    assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+    assert.equal(planCalls, 1, 'the valid repair reaches the actual read-only standalone plan');
+    assert.ok(plannedIdentity, 'the real standalone plan returns its exact identity');
+    assert.deepEqual(store.read(runId)?.bootstrap, plannedIdentity,
+      'the exact planned identity is durably retained before host workspace conflict handling');
+    assert.ok(strengthenAfterPlanPersistence > 0,
+      'the real workflow-owned review callback strengthens only after the exact plan identity is durable');
+    assert.equal(prepareCalls, 0, 'the workflow-owned repair callback refuses before prepare');
+    assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' &&
+      (args.includes('fetch') || args.includes('init') || args.includes('worktree'))), false,
+    'the refusal blocks every preparation mutation while preserving earlier read-only planning');
+    assert.equal(implementation.requests.length, 0);
+    assert.equal(validation.requests.length, 0);
+    assert.deepEqual(registry.readLane(runId)?.evidence, originalEvidence,
+      'the repair plan cannot substitute its workspace for the host-bound lane evidence');
+  });
+
+  it('holds when the real plan returns a different workspace than host admission, preserving earlier plan effects and authority', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-initial-plan-workspace-mismatch-')); dirs.push(directory);
+    const runId = 'initial-plan-workspace-mismatch';
+    const workspace = path.join(fixture.workspaceRoot, TARGET.owner, TARGET.repo, `${runId}-issue-${TARGET.issueNumber}`);
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'initial-plan-workspace-mismatch-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+      repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId,
+    } });
+    assert.equal(admission.outcome, 'admitted');
+    if (admission.outcome !== 'admitted') return;
+
+    const gitBootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const mismatchedWorkspace = path.join(workspace, 'plan-returned-different-workspace');
+    let planCalls = 0;
+    let prepareCalls = 0;
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap',
+      bootstrapKind: 'linked-worktree',
+      async plan(request) {
+        planCalls += 1;
+        const planned = await gitBootstrap.plan(request);
+        return { ...planned, workspacePath: mismatchedWorkspace };
+      },
+      async prepare() {
+        prepareCalls += 1;
+        throw new Error('prepare must not run after the plan conflicts with host admission');
+      },
+      guard: (planned) => gitBootstrap.guard(planned),
+      verifyDurable: (request) => gitBootstrap.verifyDurable(request),
+    };
+    const store = memoryStore(createRun(TARGET, T0, runId));
+    const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+      owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+    } });
+    const implementation = new NoopImplementation();
+    const validation = new PassingValidation();
+    const before = fixture.commands.length;
+    const result = await runWorkflow({
+      store, github: new QueueGithub(Array.from({ length: 12 }, () => live)), bootstrap, implementation,
+      reviewer: new ApprovingReviewer(), validation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+    }, runId, { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+      registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: workspace,
+    } });
+
+    assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+    assert.equal(result.run.state, 'NEEDS_HUMAN');
+    assert.match(result.reason, /workspace|admission|ownership/i);
+    assert.equal(planCalls, 1);
+    assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' && args.includes('fetch')), false,
+      'planning is read-only and the mismatched identity is refused before prepare');
+    assert.equal(prepareCalls, 0, 'the mismatched plan never enters prepare');
+    assert.equal(implementation.requests.length, 0, 'no worker starts after workspace evidence conflicts');
+    assert.equal(validation.requests.length, 0, 'validation does not run after the workspace conflict');
+    const lane = registry.snapshot().lanes.find((candidate) => candidate.laneId === runId);
+    const canonicalWorkspace = canonicalizeMissionEvidence({ repository: `${TARGET.owner}/${TARGET.repo}`, workspace }).workspace;
+    const canonicalMismatchedWorkspace = canonicalizeMissionEvidence({ repository: `${TARGET.owner}/${TARGET.repo}`, workspace: mismatchedWorkspace }).workspace;
+    assert.equal(lane?.evidence.workspace, canonicalWorkspace, 'the explicit host workspace is bound before comparing the returned plan');
+    assert.notEqual(lane?.evidence.workspace, canonicalMismatchedWorkspace);
+  });
+
+  it('refuses existing-workspace preparation when the exact Run changes at the final entry callback', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const runId = 'prepare-entry-run-supersession';
+    const gitBootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const planned = await gitBootstrap.plan({ runId, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+    let initial = applyTransition(createRun(TARGET, T0, runId), { type: 'start' }, T0);
+    initial = applyTransition(initial, { type: 'bootstrap_prepared', bootstrap: planned }, T0);
+    const store = memoryStore(initial);
+    let newerRun: Run | undefined;
+    let prepareCalls = 0;
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree',
+      async plan(request) { return gitBootstrap.plan(request); },
+      async prepare(request) { prepareCalls += 1; return gitBootstrap.prepare(request); },
+      guard: (identity) => gitBootstrap.guard(identity),
+      verifyDurable: (request) => gitBootstrap.verifyDurable(request),
+    };
+    const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+      owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+    } });
+    const before = fixture.commands.length;
+    const result = await runWorkflow({
+      store, github: new QueueGithub(Array.from({ length: 8 }, () => live)), bootstrap,
+      implementation: new NoopImplementation(), reviewer: new ApprovingReviewer(), validation: new PassingValidation(),
+      hostedCheckPolicy: TEST_HOSTED_POLICY,
+    }, runId, { maxReviewAttempts: 1, now: () => T0, onExecutionStart: () => {
+      newerRun = { ...store.read(runId)!, updatedAt: '2026-09-28T00:00:05.000Z' };
+      store.update(newerRun);
+    } });
+
+    assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+    assert.ok(newerRun);
+    assert.deepEqual(store.read(runId), newerRun, 'the exact newer Run survives the refused prepare entry');
+    assert.equal(prepareCalls, 0, 'the bootstrap adapter is not entered after the final Run check fails');
+    assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' && args.includes('fetch')), false);
+    assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' && args.includes('worktree')), false);
+  });
+
+  it('does not strengthen admission when the exact Run changes before the first prepare-entry check', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-prepare-first-cas-')); dirs.push(directory);
+    const runId = 'prepare-first-cas-run-supersession';
+    const gitBootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const identity = await gitBootstrap.plan({ runId, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+    let initial = applyTransition(createRun(TARGET, T0, runId), { type: 'start' }, T0);
+    initial = applyTransition(initial, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+    const store = memoryStore(initial);
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'prepare-first-cas-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+      repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId,
+    } });
+    assert.equal(admission.outcome, 'admitted');
+    if (admission.outcome !== 'admitted') return;
+    const originalLane = structuredClone(registry.readLane(runId));
+    let capturedRun: Run | undefined;
+    let capturedRunSnapshot: Run | undefined;
+    let newerRun: Run | undefined;
+    let newerRunSnapshot: Run | undefined;
+    let adapterBoundaryReads = 0;
+    const casInvocationTrace: Array<{ expected: Run; next: Run; result: boolean }> = [];
+    let strengthenCalls = 0;
+    let prepareCalls = 0;
+    const originalStrengthen = registry.strengthen.bind(registry);
+    registry.strengthen = (token, evidence) => {
+      strengthenCalls += 1;
+      return originalStrengthen(token, evidence);
+    };
+    const storeWithFirstEntrySupersession = Object.create(store) as typeof store;
+    Object.defineProperty(storeWithFirstEntrySupersession, 'updateIfUnchanged', {
+      configurable: true,
+      get: () => {
+        if (newerRun === undefined) return store.updateIfUnchanged;
+        return (expected: Run, next: Run) => {
+          const expectedSnapshot = structuredClone(expected);
+          const nextSnapshot = structuredClone(next);
+          const result = store.updateIfUnchanged(expected, next);
+          casInvocationTrace.push({ expected: expectedSnapshot, next: nextSnapshot, result });
+          return result;
+        };
+      },
+    });
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap',
+      get bootstrapKind(): 'linked-worktree' {
+        adapterBoundaryReads += 1;
+        capturedRun = store.read(runId)!;
+        capturedRunSnapshot = structuredClone(capturedRun);
+        newerRun = { ...capturedRun, updatedAt: '2026-09-28T00:00:08.000Z' };
+        store.update(newerRun);
+        newerRunSnapshot = structuredClone(newerRun);
+        return 'linked-worktree';
+      },
+      async plan(request) { return gitBootstrap.plan(request); },
+      async prepare(request) { prepareCalls += 1; return gitBootstrap.prepare(request); },
+      guard: (candidate) => gitBootstrap.guard(candidate),
+      verifyDurable: (request) => gitBootstrap.verifyDurable(request),
+    };
+    const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+      owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+    } });
+    const before = fixture.commands.length;
+    const result = await runWorkflow({
+      store: storeWithFirstEntrySupersession, github: new QueueGithub(Array.from({ length: 8 }, () => live)), bootstrap,
+      implementation: new NoopImplementation(), reviewer: new ApprovingReviewer(), validation: new PassingValidation(),
+      hostedCheckPolicy: TEST_HOSTED_POLICY,
+    }, runId, { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+      registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: identity.workspacePath,
+    } });
+
+    assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+    assert.ok(newerRun);
+    assert.ok(capturedRun, 'the complete durable Run is captured at the adapter boundary');
+    assert.ok(capturedRunSnapshot, 'the complete captured Run is snapshotted independently');
+    assert.equal(adapterBoundaryReads, 1, 'the non-persisted adapter hook ran at the existing-bootstrap identity boundary');
+    assert.equal(casInvocationTrace.length, 2, 'the strict entry CAS and refusal-reconciliation CAS both run after the adapter boundary');
+    assert.deepEqual(casInvocationTrace.map(({ expected }) => expected), [capturedRunSnapshot, capturedRunSnapshot],
+      'both ordered CAS invocations compare against the full captured Run');
+    assert.deepEqual(casInvocationTrace.map(({ next }) => next), [capturedRunSnapshot, capturedRunSnapshot],
+      'both ordered CAS invocations propose the full captured Run unchanged');
+    assert.deepEqual(casInvocationTrace.map(({ result }) => result), [false, false],
+      'the strict entry CAS and refusal-reconciliation CAS both observe the superseding Run');
+    assert.deepEqual(store.read(runId), newerRunSnapshot, 'the complete newer Run remains intact after both failed CAS invocations');
+    assert.equal(strengthenCalls, 0, 'the first entry refusal does not strengthen registry admission');
+    assert.deepEqual(registry.readLane(runId), originalLane, 'the complete original lane remains unchanged before admission strengthening');
+    assert.equal(prepareCalls, 0);
+    assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' && (args.includes('fetch') || args.includes('init') || args.includes('worktree'))), false,
+      'no fetch, initialization, or worktree effect follows the failed first-entry CAS');
+  });
+
+  for (const mode of ['missing', 'throws'] as const) {
+    it(`refuses first prepare entry when strict Run CAS is ${mode}`, async () => {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-prepare-entry-strict-cas-')); dirs.push(directory);
+      const runId = `prepare-entry-strict-cas-${mode}`;
+      const gitBootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const identity = await gitBootstrap.plan({ runId, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+      let initial = applyTransition(createRun(TARGET, T0, runId), { type: 'start' }, T0);
+      initial = applyTransition(initial, { type: 'bootstrap_prepared', bootstrap: identity }, T0);
+      const store = memoryStore(initial);
+      let armed = false;
+      let boundaryReads = 0;
+      let entryCasReads = 0;
+      let prepareCalls = 0;
+      let capturedRun: Run | undefined;
+      let capturedRunBytes: string | undefined;
+      const unavailable = new Error('first prepare-entry CAS threw');
+      const storeWithSwitchableCas = Object.create(store) as typeof store;
+      Object.defineProperty(storeWithSwitchableCas, 'updateIfUnchanged', {
+        configurable: true,
+        get: () => {
+          if (!armed) return store.updateIfUnchanged;
+          entryCasReads += 1;
+          if (mode === 'missing') return undefined;
+          return () => { throw unavailable; };
+        },
+      });
+      const bootstrap: ImplementationBootstrapAdapter = {
+        kind: 'implementation-bootstrap',
+        get bootstrapKind(): 'linked-worktree' {
+          boundaryReads += 1;
+          capturedRun = store.read(runId)!;
+          capturedRunBytes = JSON.stringify(capturedRun);
+          armed = true;
+          return 'linked-worktree';
+        },
+        async plan(request) { return gitBootstrap.plan(request); },
+        async prepare(request) { prepareCalls += 1; return gitBootstrap.prepare(request); },
+        guard: (candidate) => gitBootstrap.guard(candidate),
+        verifyDurable: (request) => gitBootstrap.verifyDurable(request),
+      };
+      const registry = new MissionAdmissionRegistry({
+        filePath: path.join(directory, 'registry.json'),
+        config: { schemaVersion: 1, revision: `prepare-entry-strict-cas-${mode}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+      });
+      const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+        repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId, workspace: identity.workspacePath,
+      } });
+      assert.equal(admission.outcome, 'admitted');
+      if (admission.outcome !== 'admitted') return;
+      const originalEvidence = registry.readLane(runId)?.evidence;
+      let strengthenCalls = 0;
+      const originalStrengthen = registry.strengthen.bind(registry);
+      registry.strengthen = (token, evidence) => {
+        strengthenCalls += 1;
+        return originalStrengthen(token, evidence);
+      };
+      const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+        owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+      } });
+
+      await assert.rejects(() => runWorkflow({
+        store: storeWithSwitchableCas, github: new QueueGithub(Array.from({ length: 8 }, () => live)), bootstrap,
+        implementation: new NoopImplementation(), reviewer: new ApprovingReviewer(), validation: new PassingValidation(),
+        hostedCheckPolicy: TEST_HOSTED_POLICY,
+      }, runId, { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+        registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: identity.workspacePath,
+      } }), (error: unknown) => {
+        assert.equal(isExecutionAdmissionRefusal(error), true);
+        assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, true);
+        assert.equal((error as { runSuperseded?: boolean }).runSuperseded, false);
+        if (mode === 'throws') assert.strictEqual((error as Error).cause, unavailable);
+        else assert.match(String((error as Error).cause), /Strict Run compare-and-swap is unavailable/);
+        return true;
+      });
+
+      assert.equal(boundaryReads, 1, 'the non-persisted adapter hook ran at the existing-bootstrap identity boundary');
+      assert.ok(armed, 'the existing-bootstrap identity boundary activated the first-entry injection');
+      assert.equal(entryCasReads, 1, 'the missing/thrown strict CAS was observed at the first prepare-entry check');
+      assert.equal(strengthenCalls, 0, 'first-entry uncertainty is discovered before admission strengthening');
+      assert.ok(capturedRun);
+      assert.equal(JSON.stringify(store.read(runId)), capturedRunBytes, 'the complete captured Run remains unchanged');
+      assert.deepEqual(store.read(runId), capturedRun, 'all captured Run fields remain unchanged');
+      assert.deepEqual(registry.readLane(runId)?.evidence, originalEvidence, 'lane evidence is unchanged before entry authority is confirmed');
+      assert.equal(prepareCalls, 0, 'the bootstrap prepare entry is never called');
+      assert.equal(fixture.commands.some(({ file, args }) => file === 'git' && (args.includes('fetch') || args.includes('init') || args.includes('worktree'))), false,
+        'no fetch, initialization, or worktree effect follows the failed first-entry CAS');
+    });
+  }
+
+  for (const mode of ['conflicting-workspace', 'conflicting-run-evidence'] as const) {
+    it(`refuses initial preparation when existing workspace admission is ${mode}`, async () => {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-initial-plan-admission-refusal-')); dirs.push(directory);
+      const runId = `initial-plan-${mode}`;
+      const workspace = path.join(fixture.workspaceRoot, TARGET.owner, TARGET.repo, `${runId}-issue-${TARGET.issueNumber}`);
+      const registry = new MissionAdmissionRegistry({
+        filePath: path.join(directory, 'registry.json'),
+        config: { schemaVersion: 1, revision: `initial-plan-${mode}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+      });
+      const conflictingWorkspace = path.join(directory, 'different-workspace');
+      const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+        repository: `${TARGET.owner}/${TARGET.repo}`,
+        issue: TARGET.issueNumber,
+        run: mode === 'conflicting-run-evidence' ? `${runId}-other` : runId,
+        ...(mode === 'conflicting-workspace'
+          ? { workspace: conflictingWorkspace }
+          : mode === 'conflicting-run-evidence' ? { workspace } : {}),
+      } });
+      assert.equal(admission.outcome, 'admitted');
+      if (admission.outcome !== 'admitted') return;
+      const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const store = memoryStore(createRun(TARGET, T0, runId));
+      const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+        owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+      } });
+      const before = fixture.commands.length;
+      const originalEvidence = registry.snapshot().lanes.find((lane) => lane.laneId === runId)?.evidence;
+      const result = await runWorkflow({
+        store, github: new QueueGithub(Array.from({ length: 12 }, () => live)), bootstrap, implementation: new NoopImplementation(),
+        reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+      }, runId, { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+        registry, token: admission.token, productionMissionId: admission.missionId,
+        ...(mode === 'conflicting-workspace' ? { executionWorkspace: workspace } : {}),
+      } });
+      assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+      assert.match(result.reason, mode === 'conflicting-workspace'
+        ? /Mission evidence conflicts on workspace/
+        : /Mission evidence conflicts on run/);
+      assert.equal(fixture.commands.slice(before).some(({ file, args }) => file === 'git' && args.includes('fetch')), false,
+        'conflicting host workspace or Run evidence refuses before the real prepare fetch');
+      assert.deepEqual(registry.snapshot().lanes.find((lane) => lane.laneId === runId)?.evidence,
+        originalEvidence, 'failed establishment leaves the full original admission evidence unchanged');
+    });
+  }
+
+  it('preserves the exact tagged refusal raised after read-only initial planning', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-initial-plan-tagged-refusal-')); dirs.push(directory);
+    const runId = 'initial-plan-tagged-refusal';
+    const workspace = path.join(fixture.workspaceRoot, TARGET.owner, TARGET.repo, `${runId}-issue-${TARGET.issueNumber}`);
+    const registry = new MissionAdmissionRegistry({
+      filePath: path.join(directory, 'registry.json'),
+      config: { schemaVersion: 1, revision: 'initial-plan-tagged-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+    });
+    const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+      repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId,
+    } });
+    assert.equal(admission.outcome, 'admitted');
+    if (admission.outcome !== 'admitted') return;
+    const primaryCause = new Error('original planning authority cause');
+    const primary = new ExecutionAdmissionRefusal('original planning admission refusal', false, {
+      cause: primaryCause, authorityUnknown: true,
+    });
+    let taggedInjectionReached = 0;
+    registry.strengthen = () => { taggedInjectionReached += 1; throw primary; };
+    const fixtureCommandsBefore = fixture.commands.length;
+    const run = createRun(TARGET, T0, runId);
+    const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+      owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+    } });
+    await assert.rejects(runWorkflow({
+      store: memoryStore(run), github: new QueueGithub(Array.from({ length: 12 }, () => live)),
+      bootstrap: new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner }),
+      implementation: new NoopImplementation(), reviewer: new ApprovingReviewer(), validation: new PassingValidation(),
+      hostedCheckPolicy: TEST_HOSTED_POLICY,
+    }, runId, { maxReviewAttempts: 1, now: () => T0, admissionFence: {
+      registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: workspace,
+    } }), (error: unknown) => {
+      assert.strictEqual(error, primary);
+      assert.strictEqual((error as Error).cause, primaryCause);
+      assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, true);
+      return true;
+    });
+    assert.equal(taggedInjectionReached, 1, 'the fixture reaches the host admission-strengthening boundary after a valid plan');
+    assert.equal(fixture.commands.slice(fixtureCommandsBefore).some(({ file, args }) => file === 'git' && args.includes('fetch')), false);
+    assert.equal(registry.snapshot().lanes.find((lane) => lane.laneId === runId)?.evidence.workspace, undefined,
+      'the tagged planning refusal prevents workspace publication');
+  });
+
+  for (const boundary of [
+    'prepare-fetch',
+    'initial-worktree-add',
+    'prepare-admission-revocation',
+    'initial-worktree-add-admission-revocation',
+    'prepare-tagged-admission-callback',
+    'prepare-missing-cas',
+    'prepare-thrown-cas',
+    'prepare-reconciliation-cas-throws',
+    'prepare-reconciliation-read-throws',
+    'prepare-reconciliation-write-throws',
+  ] as const) {
+    it(`rechecks captured Run and current admission after runner preparation at ${boundary}`, async () => {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-spawn-fence-')); dirs.push(dir);
+      const runId = `spawn-fence-${boundary}`;
+      const mutationIdentity = boundary === 'initial-worktree-add-admission-revocation'
+        ? await new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner })
+            .plan({ runId, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha })
+        : undefined;
+      const isWorktreeAdd = boundary.includes('worktree-add');
+      const match = isWorktreeAdd
+        ? (args: readonly string[]) => args[0] === 'worktree' && args[1] === 'add'
+        : (args: readonly string[]) => args[0] === 'fetch';
+      let registry: MissionAdmissionRegistry | undefined;
+      let admission: ReturnType<MissionAdmissionRegistry['admit']> | undefined;
+      const gate = gatedBootstrapRunner(fixture.runner, match, boundary === 'initial-worktree-add-admission-revocation'
+        ? () => {
+            assert.ok(registry !== undefined && admission?.outcome === 'admitted');
+            registry.release(admission.token, true);
+          }
+        : boundary === 'prepare-tagged-admission-callback'
+        ? () => {
+            assert.ok(registry !== undefined);
+            registry.assertCanMutate = () => { throw primaryRefusal; };
+          }
+        : undefined);
+      const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: gate.runner });
+      const initialRun = createRun(TARGET, T0, runId);
+      const executionWorkspace = mutationIdentity?.workspacePath ?? path.join(
+        fixture.workspaceRoot, TARGET.owner, TARGET.repo, `${runId}-issue-${TARGET.issueNumber}`,
+      );
+      const store = memoryStore(initialRun);
+      const live = snapshot(fixture.baseSha, null, {
+        headSha: null,
+        repository: { owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha },
+      });
+      const implementation = new NoopImplementation();
+      if (boundary.includes('admission-revocation') || boundary.includes('reconciliation') || boundary.includes('tagged-admission')) {
+        registry = new MissionAdmissionRegistry({
+          filePath: path.join(dir, 'registry.json'),
+          config: { schemaVersion: 1, revision: 'bootstrap-fence-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } },
+        });
+        admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+          repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber,
+          ...(mutationIdentity === undefined ? {} : { workspace: mutationIdentity.workspacePath }),
+        } });
+        assert.equal(admission.outcome, 'admitted');
+      }
+      let strictCasMode: 'available' | 'missing' | 'throws' | 'second-throws' | 'second-false' | 'third-throws' = 'available';
+      let strictCasCallsAfterBoundary = 0;
+      let failReconciliationRead = false;
+      const primaryCause = new Error('original final execution admission refusal cause');
+      const primaryRefusal = new ExecutionAdmissionRefusal('original final execution admission refusal', false, {
+        cause: primaryCause, authorityUnknown: true,
+      });
+      const storeWithSwitchableCas = Object.create(store) as typeof store;
+      Object.defineProperty(storeWithSwitchableCas, 'read', {
+        configurable: true,
+        get: () => failReconciliationRead ? () => { throw new Error('bootstrap refusal reconciliation read failed'); } : store.read,
+      });
+      Object.defineProperty(storeWithSwitchableCas, 'updateIfUnchanged', {
+        configurable: true,
+        get: () => strictCasMode === 'missing'
+          ? undefined
+          : (expected: Run, next: Run) => {
+              if (strictCasMode === 'throws') throw new Error('strict Run comparison unavailable');
+              if (strictCasMode === 'second-throws' && ++strictCasCallsAfterBoundary === 2) throw new Error('bootstrap refusal reconciliation CAS failed');
+              if (strictCasMode === 'second-false' && ++strictCasCallsAfterBoundary === 2) return false;
+              if (strictCasMode === 'third-throws' && ++strictCasCallsAfterBoundary === 3) throw new Error('bootstrap refusal reconciliation write failed');
+              return store.updateIfUnchanged(expected, next);
+            },
+      });
+      const options = { maxReviewAttempts: 1, now: () => T0,
+        ...(registry !== undefined && admission?.outcome === 'admitted'
+          ? { admissionFence: { registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace } }
+          : {}) };
+      const pending = runWorkflow({
+        store: storeWithSwitchableCas, github: new QueueGithub(Array.from({ length: 12 }, () => live)), implementation,
+        bootstrap, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+      }, runId, options);
+      await gate.entered;
+      const atBoundary = store.read(runId)!;
+      let newerRun: Run | undefined;
+      if (boundary === 'initial-worktree-add-admission-revocation') {
+        gate.release();
+      } else if (boundary.includes('reconciliation')) {
+        assert.ok(registry !== undefined && admission?.outcome === 'admitted');
+        strictCasMode = boundary.endsWith('write-throws') ? 'third-throws'
+          : boundary.endsWith('read-throws') ? 'second-false' : 'second-throws';
+        strictCasCallsAfterBoundary = 0;
+        failReconciliationRead = boundary.endsWith('read-throws');
+        registry.release(admission.token, true);
+      } else if (boundary.includes('admission-revocation')) {
+        assert.ok(registry !== undefined && admission?.outcome === 'admitted');
+        registry.release(admission.token, true);
+      } else if (boundary === 'prepare-missing-cas' || boundary === 'prepare-thrown-cas') {
+        strictCasMode = boundary === 'prepare-missing-cas' ? 'missing' : 'throws';
+      } else if (boundary === 'prepare-tagged-admission-callback') {
+        // Keep the exact Run and active lane current so the tagged refusal is
+        // raised by the real final mutation callback after its successful CAS.
+      } else {
+        newerRun = { ...atBoundary, updatedAt: '2026-09-28T00:00:01.000Z' };
+        store.update(newerRun);
+      }
+      gate.release();
+      if (boundary === 'prepare-tagged-admission-callback') {
+        await assert.rejects(pending, (error: unknown) => {
+          assert.strictEqual(error, primaryRefusal);
+          assert.strictEqual((error as Error).cause, primaryCause);
+          assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, true);
+          assert.equal((error as { runSuperseded?: boolean }).runSuperseded, false);
+          return true;
+        });
+      } else if (boundary === 'prepare-missing-cas' || boundary === 'prepare-thrown-cas' || boundary.includes('reconciliation')) {
+        await assert.rejects(pending, (error: unknown) => {
+          assert.equal(isExecutionAdmissionRefusal(error), true);
+          if (boundary.includes('reconciliation')) {
+            assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, false);
+            assert.match(String((error as Error).cause), /Admission generation token is stale/);
+          } else {
+            assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, true);
+            assert.match(String((error as Error).cause), /strict Run comparison unavailable|Strict Run compare-and-swap/);
+          }
+          return true;
+        });
+      }
+      const outcome = boundary === 'prepare-missing-cas' || boundary === 'prepare-thrown-cas' || boundary.includes('reconciliation') || boundary === 'prepare-tagged-admission-callback' ? undefined : await pending;
+      assert.equal(gate.blocked(), true);
+      const blockedCommandWasExecuted = fixture.commands.some(({ file, args }) => file === 'git' && match(args));
+      assert.equal(blockedCommandWasExecuted, false, 'the intercepted mutating command never reaches real Git');
+      assert.equal(implementation.requests.length, 0, 'no worker or later validation starts after refusal');
+      if (outcome === undefined) {
+        assert.deepEqual(store.read(runId), atBoundary, 'strict-CAS uncertainty preserves exact Run bytes');
+        return;
+      }
+      if (boundary.includes('admission-revocation')) {
+        assert.equal(outcome.outcome, 'needs_human', JSON.stringify(outcome));
+        assert.match(outcome.reason, /host admission boundary/);
+        assert.equal(store.read(runId)?.state, 'NEEDS_HUMAN');
+      } else if (boundary === 'prepare-missing-cas' || boundary === 'prepare-thrown-cas') {
+        assert.deepEqual(store.read(runId), atBoundary, 'unknown preparation authority preserves the exact persisted identity Run');
+      } else {
+        assert.ok(newerRun);
+        assert.deepEqual(store.read(runId), newerRun, 'the exact newer Run bytes survive reconciliation');
+      }
+      if (isWorktreeAdd) {
+        const planned = atBoundary.bootstrap;
+        assert.ok(planned);
+        assert.equal(existsSync(planned.workspacePath), false, 'the workspace is absent at the blocked worktree-add boundary');
+      }
+    });
+  }
+
+  for (const mode of ['run-superseded', 'admission-revoked', 'reconciliation-cas-missing', 'reconciliation-cas-throws', 'reconciliation-read-throws', 'reconciliation-write-throws'] as const) {
+    it(`rechecks validation Run and admission after runner preparation at the owned-workspace fetch (${mode})`, async () => {
+      const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-spawn-fence-')); dirs.push(dir);
+      const runId = `validation-spawn-fence-${mode}`;
+      const setup = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const request = { runId, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+      const bootstrapIdentity = await setup.plan(request);
+      await setup.prepare({ ...request, existing: bootstrapIdentity });
+      fixture.git(bootstrapIdentity.workspacePath, ['push', 'origin', bootstrapIdentity.branch]);
+      let casMode: 'available' | 'missing' | 'second-throws' | 'second-false' | 'third-throws' = 'available';
+      let primaryRefusal: unknown;
+      let primaryCause: unknown;
+      const gated = gatedBootstrapRunner(fixture.runner, (args) => args[0] === 'fetch', undefined, (error) => {
+        if (!mode.startsWith('reconciliation-')) return;
+        primaryRefusal = error;
+        primaryCause = (error as Error).cause;
+        if (mode === 'reconciliation-cas-missing') casMode = 'missing';
+      });
+      const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: gated.runner });
+      let run = applyTransition(createRun(TARGET, T0, runId), { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'bootstrap_prepared', bootstrap: bootstrapIdentity }, T0);
+      run = applyTransition(run, {
+        type: 'agent_succeeded', headSha: fixture.baseSha,
+        pullRequest: { number: 7, headSha: fixture.baseSha }, agentResult: successResult(fixture.baseSha),
+      }, T0);
+      const store = memoryStore(run);
+      const originalCas = store.updateIfUnchanged.bind(store);
+      let casCallsAfterBoundary = 0;
+      let failFollowupRead = false;
+      const storeWithSwitchableCas = Object.create(store) as typeof store;
+      Object.defineProperty(storeWithSwitchableCas, 'read', {
+        configurable: true,
+        get: () => failFollowupRead ? () => { throw new Error('validation refusal reconciliation read failed'); } : store.read,
+      });
+      Object.defineProperty(storeWithSwitchableCas, 'updateIfUnchanged', {
+        configurable: true,
+        get: () => casMode === 'missing' ? undefined : (expected: Run, next: Run) => {
+          if (casMode === 'second-throws' && ++casCallsAfterBoundary === 2) throw new Error('validation refusal reconciliation CAS failed');
+          if (casMode === 'second-false' && ++casCallsAfterBoundary === 2) return false;
+          if (casMode === 'third-throws' && ++casCallsAfterBoundary === 3) throw new Error('validation refusal reconciliation write failed');
+          return originalCas(expected, next);
+        },
+      });
+      const currentAdmission = mode !== 'run-superseded'
+        ? new MissionAdmissionRegistry({
+            filePath: path.join(dir, 'validation-registry.json'),
+            config: { schemaVersion: 1, revision: 'validation-fence-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } },
+          })
+        : undefined;
+      const admission = currentAdmission?.admit({
+        laneId: runId,
+        role: 'production_captain',
+        evidence: { repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId, workspace: bootstrapIdentity.workspacePath },
+      });
+      if (admission !== undefined) assert.equal(admission.outcome, 'admitted');
+      const live = snapshot(fixture.baseSha, pr(7, fixture.baseSha, { headRef: bootstrapIdentity.branch, baseRef: fixture.branch, baseSha: fixture.baseSha }), {
+        repository: { owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha },
+      });
+      let validations = 0;
+      const validation: ValidationAdapter = {
+        kind: 'validation', configRevision: 'owned-workspace-fence-v1', requiresOwnedWorkspace: true,
+        async validate(input) { validations += 1; return validationPassed(input.headSha).local; },
+      };
+      const implementation = new NoopImplementation();
+      const pending = runWorkflow({
+        store: storeWithSwitchableCas, bootstrap, github: new QueueGithub(Array.from({ length: 8 }, () => live)),
+        implementation, reviewer: new ApprovingReviewer(), validation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+      }, runId, {
+        maxReviewAttempts: 1, now: () => T0,
+        ...(currentAdmission !== undefined && admission?.outcome === 'admitted'
+          ? { admissionFence: { registry: currentAdmission, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: bootstrapIdentity.workspacePath } }
+          : {}),
+      });
+      const commandsBeforeFence = fixture.commands.length;
+      await gated.entered;
+      const atBoundary = store.read(runId)!;
+      let newerRun: Run | undefined;
+      if (mode === 'run-superseded') {
+        newerRun = { ...atBoundary, updatedAt: '2026-09-28T00:00:02.000Z' };
+        store.update(newerRun);
+      }
+      else {
+        if (mode.startsWith('reconciliation-')) {
+          if (mode !== 'reconciliation-cas-missing') {
+            casMode = mode === 'reconciliation-cas-throws' ? 'second-throws'
+              : mode === 'reconciliation-read-throws' ? 'second-false' : 'third-throws';
+          }
+          casCallsAfterBoundary = 0;
+          failFollowupRead = mode === 'reconciliation-read-throws';
+        }
+        assert.ok(currentAdmission !== undefined && admission?.outcome === 'admitted');
+        currentAdmission.release(admission.token, true);
+      }
+      gated.release();
+      let outcome: Awaited<typeof pending> | undefined;
+      if (mode.startsWith('reconciliation-')) {
+        await assert.rejects(pending, (error: unknown) => {
+          assert.strictEqual(error, primaryRefusal, 'reconciliation uncertainty retains the exact original refusal');
+          assert.equal(isExecutionAdmissionRefusal(error), true);
+          assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, false);
+          assert.strictEqual((error as Error).cause, primaryCause);
+          assert.match(String(primaryCause), /Admission generation token is stale/);
+          return true;
+        });
+      } else outcome = await pending;
+      assert.equal(gated.blocked(), true);
+      assert.equal(fixture.commands.slice(commandsBeforeFence).some(({ file, args }) => file === 'git' && args[0] === 'fetch'), false,
+        'the held owned-workspace fetch never reaches real Git');
+      assert.equal(validations, 0, 'local validation does not start after admission refusal');
+      assert.equal(implementation.requests.length, 0, 'no implementation worker starts after admission refusal');
+      if (mode === 'run-superseded') {
+        assert.ok(outcome);
+        assert.ok(newerRun);
+        assert.deepEqual(store.read(runId), newerRun, 'the exact newer Run survives validation reconciliation');
+        assert.notDeepEqual(outcome.run, atBoundary);
+      } else if (mode === 'admission-revoked') {
+        assert.ok(outcome);
+        assert.equal(outcome.outcome, 'needs_human', JSON.stringify(outcome));
+        assert.match(outcome.reason, /host admission boundary/);
+        assert.equal(store.read(runId)?.state, 'NEEDS_HUMAN');
+      } else {
+        assert.deepEqual(store.read(runId), atBoundary, 'failed reconciliation preserves the exact pre-effect Run bytes');
+      }
     });
   }
 });

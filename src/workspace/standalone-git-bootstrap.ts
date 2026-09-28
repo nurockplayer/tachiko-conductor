@@ -58,7 +58,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     await this.assertPublicationRemote({ owner: request.target.owner, repo: request.target.repo });
     // The live snapshot's base must be imported from the authenticated remote,
     // rather than assumed to exist in a long-lived host checkout.
-    await this.assertFetchedBase(request.baseBranch, request.baseSha);
+    await this.assertRemoteBase(request.baseBranch, request.baseSha);
     return identity;
   }
   async prepare(request: BootstrapPrepareRequest): Promise<ImplementationBootstrapIdentity> {
@@ -69,22 +69,32 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     if (!same(identity, request.existing)) this.fail('STALE_IDENTITY', 'Persisted standalone bootstrap identity changed.');
     const authorized = request.recoveryAuthority?.expectedHeadSha ?? request.existing.baseSha;
     if (!SHA.test(authorized)) this.fail('INVALID_REQUEST', 'Standalone recovery requires an exact authorized HEAD.');
+    // Preparation may happen after a read-only plan was persisted or after a
+    // restart. Revalidate the configured publication remote before even the
+    // immutable-base fetch; the earlier plan check cannot authorize this later
+    // invocation's trusted Git effects.
+    await this.assertPublicationRemote(identity);
+    // Import the immutable planned object into the trusted source before
+    // initializing or changing the worker checkout. The named branch may
+    // have advanced or been renamed since planning; identity.baseSha remains
+    // the authorized immutable source.
+    await this.fetchExactSourceSha(identity.baseSha, request.beforeMutation);
     if (!existsSync(identity.workspacePath)) {
-      await this.git(this.root, ['init', '--initial-branch', identity.branch, identity.workspacePath]);
+      await this.git(this.root, ['init', '--initial-branch', identity.branch, identity.workspacePath], [0], request.beforeMutation);
       // Fetch exactly one immutable object from the trusted host checkout, then
       // remove the temporary local source remote before the worker can start.
-      await this.git(identity.workspacePath, ['fetch', '--no-tags', this.source, identity.baseSha]);
+      await this.git(identity.workspacePath, ['fetch', '--no-tags', this.source, identity.baseSha], [0], request.beforeMutation);
       if (authorized !== identity.baseSha) {
         // Existing-PR adoption starts at the PR's separately authenticated
         // head, never at a cached default branch or an ancestor artifact.
         await this.assertPublicationRemote(identity);
-        await this.git(this.source, ['fetch', '--no-tags', 'origin', authorized]);
+        await this.git(this.source, ['fetch', '--no-tags', 'origin', authorized], [0], request.beforeMutation);
         const fetched = (await this.git(this.source, ['rev-parse', 'FETCH_HEAD'])).stdout.trim();
         if (fetched !== authorized) this.fail('STALE_IDENTITY', 'Trusted host could not fetch the authoritative PR HEAD.');
-        await this.git(identity.workspacePath, ['fetch', '--no-tags', this.source, authorized]);
+        await this.git(identity.workspacePath, ['fetch', '--no-tags', this.source, authorized], [0], request.beforeMutation);
       }
-      await this.git(identity.workspacePath, ['checkout', '--detach', authorized]);
-      await this.git(identity.workspacePath, ['switch', '-C', identity.branch, authorized]);
+      await this.git(identity.workspacePath, ['checkout', '--detach', authorized], [0], request.beforeMutation);
+      await this.git(identity.workspacePath, ['switch', '-C', identity.branch, authorized], [0], request.beforeMutation);
       const remotes = (await this.git(identity.workspacePath, ['remote'])).stdout.trim();
       if (remotes !== '') this.fail('INVALID_REQUEST', 'Standalone worker checkout unexpectedly retained a remote.');
     }
@@ -254,10 +264,15 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
   }
   private async ancestor(cwd: string, base: string, head: string): Promise<void> { if ((await this.git(cwd, ['merge-base', '--is-ancestor', base, head], [0, 1])).exitCode !== 0) this.fail('HEAD_MISMATCH', 'Worker HEAD does not descend from its authorized base.'); }
   private async tree(cwd: string, ref: string): Promise<string> { return (await this.git(cwd, ['rev-parse', `${ref}^{tree}`])).stdout.trim(); }
-  private async assertFetchedBase(branch: string, expected: string): Promise<void> {
-    await this.git(this.source, ['fetch', '--no-tags', 'origin', `refs/heads/${branch}`]);
+  private async assertRemoteBase(branch: string, expected: string): Promise<void> {
+    const ref = `refs/heads/${branch}`;
+    const actual = await this.remoteHead(ref);
+    if (actual !== expected) this.fail('BASE_DRIFT', 'Named remote base does not match the live base SHA.');
+  }
+  private async fetchExactSourceSha(expected: string, beforeMutation?: () => void): Promise<void> {
+    await this.git(this.source, ['fetch', '--no-tags', '--refetch', 'origin', expected], [0], beforeMutation);
     const fetched = (await this.git(this.source, ['rev-parse', 'FETCH_HEAD'])).stdout.trim();
-    if (fetched !== expected) this.fail('BASE_DRIFT', 'Trusted host fetch does not match the live base SHA.');
+    if (fetched !== expected) this.fail('BASE_DRIFT', 'Trusted host fetch does not match the immutable planned base SHA.');
   }
   private async assertPublicationRemote(request: Pick<ImplementationBootstrapIdentity, 'owner' | 'repo'>): Promise<void> {
     const urls = [...(await this.git(this.source, ['remote', 'get-url', '--all', 'origin'])).stdout.trim().split(/\r?\n/), ...(await this.git(this.source, ['remote', 'get-url', '--all', '--push', 'origin'])).stdout.trim().split(/\r?\n/)];
@@ -301,7 +316,13 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
       }
     }
   }
-  private async remoteHead(ref: string): Promise<string | null> { const raw = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim(); return raw === '' ? null : raw.split(/\s+/)[0] ?? null; }
+  private async remoteHead(ref: string): Promise<string | null> {
+    const raw = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim();
+    if (raw === '') return null;
+    const [sha, returnedRef, ...rest] = raw.split(/\s+/);
+    if (!SHA.test(sha ?? '') || returnedRef !== ref || rest.length !== 0) this.fail('COMMAND_FAILED', 'Git returned malformed remote ref identity.');
+    return sha ?? null;
+  }
   private assertCurrentProof(identity: ImplementationBootstrapIdentity, proof: PreparedLunaProof, authorizedHead: string): void {
     if (currentLunaProofs.get(path.resolve(identity.workspacePath)) !== proof || !same(proof.identity, identity) || proof.authorizedHead !== authorizedHead) {
       this.fail('STALE_IDENTITY', 'Standalone invocation preparation proof changed before final acceptance.');

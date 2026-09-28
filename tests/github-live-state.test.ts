@@ -941,7 +941,158 @@ PR: #7`;
 
     const malformedTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { state: 'closed', merged_at: '' }));
     const malformedAdapter = new LiveGitHubAdapter({ transport: malformedTransport, now: () => OBSERVED_AT });
-    await assert.rejects(malformedAdapter.readPullRequest('acme', 'widgets', 7), /merged_at and closed state/);
+    await assert.rejects(malformedAdapter.readPullRequest('acme', 'widgets', 7), /merged_at/);
+  });
+
+  it('rejects missing or unrecognized raw PR states before snapshot or list discovery can filter them', async () => {
+    const invalidStates: Array<{ label: string; value?: unknown; missing?: boolean }> = [
+      { label: 'missing', missing: true },
+      { label: 'null', value: null },
+      { label: 'numeric', value: 1 },
+      { label: 'unknown', value: 'merged' },
+    ];
+    for (const invalidState of invalidStates) {
+      const record = pull();
+      if (invalidState.missing) delete record.state;
+      else record.state = invalidState.value;
+
+      const snapshotTransport = new RouteTransport()
+        .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: snapshotTransport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+
+      const listTransport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: listTransport, now: () => OBSERVED_AT }).listPullRequests(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+      assert.equal(listTransport.calls.some((call) => call.kind === 'graphql'), false,
+        `${invalidState.label} state is rejected before association classification`);
+
+      const repositoryListTransport = new RouteTransport()
+        .collection('repos/acme/widgets/pulls', [record]);
+      await expectError(
+        new LiveGitHubAdapter({ transport: repositoryListTransport, now: () => OBSERVED_AT }).listPullRequests({
+          kind: 'repository', owner: 'acme', repo: 'widgets', branch: 'main',
+        }),
+        'GH_INVALID_RESPONSE', false,
+      );
+
+      const directTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: directTransport, now: () => OBSERVED_AT }).readPullRequest('acme', 'widgets', 7),
+        'GH_INVALID_RESPONSE', false,
+      );
+    }
+  });
+
+  it('rejects malformed or contradictory merged_at authority on snapshot, list, and direct reads', async () => {
+    const malformedMergeTimes: Array<{ label: string; state: string; mergedAt: unknown }> = [
+      { label: 'empty', state: 'closed', mergedAt: '' },
+      { label: 'whitespace', state: 'closed', mergedAt: '   ' },
+      { label: 'numeric', state: 'closed', mergedAt: 1 },
+      { label: 'open contradiction', state: 'open', mergedAt: '2026-08-14T02:30:00.000Z' },
+    ];
+    for (const malformed of malformedMergeTimes) {
+      const record = pull(7, HEAD, { state: malformed.state, merged_at: malformed.mergedAt });
+      const snapshotTransport = new RouteTransport()
+        .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: snapshotTransport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+
+      const listTransport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: listTransport, now: () => OBSERVED_AT }).listPullRequests(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+
+      const directTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: directTransport, now: () => OBSERVED_AT }).readPullRequest('acme', 'widgets', 7),
+        'GH_INVALID_RESPONSE', false,
+      );
+    }
+  });
+
+  it('preserves valid open and closed states and derives merged only from valid closed merged_at', async () => {
+    const validStates = [
+      { rawState: 'open', mergedAt: null, normalized: 'open' },
+      { rawState: 'open', mergedAt: undefined, normalized: 'open' },
+      { rawState: 'closed', mergedAt: null, normalized: 'closed' },
+      { rawState: 'closed', mergedAt: '2026-08-14T02:30:00.000Z', normalized: 'merged' },
+    ] as const;
+    for (const valid of validStates) {
+      const record = pull(7, HEAD, { state: valid.rawState, merged_at: valid.mergedAt });
+      if (valid.mergedAt === undefined) delete record.merged_at;
+      const directTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', record);
+      const direct = await new LiveGitHubAdapter({ transport: directTransport, now: () => OBSERVED_AT }).readPullRequest('acme', 'widgets', 7);
+      assert.equal(direct.state, valid.normalized, `${valid.rawState}/${String(valid.mergedAt)} direct normalization`);
+
+      const listTransport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record)
+        .queueGraphql(closingIssues(42));
+      const listed = await new LiveGitHubAdapter({ transport: listTransport, now: () => OBSERVED_AT }).listPullRequests(TARGET);
+      assert.equal(listed.length, 1);
+      assert.equal(listed[0]?.state, valid.normalized, `${valid.rawState}/${String(valid.mergedAt)} list normalization`);
+    }
+
+    for (const rawState of ['closed', 'merged'] as const) {
+      const record = rawState === 'closed'
+        ? pull(7, HEAD, { state: 'closed', merged_at: null })
+        : pull(7, HEAD, { state: 'closed', merged_at: '2026-08-14T02:30:00.000Z' });
+      const transport = new RouteTransport()
+        .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record)
+        .queue('repos/acme/widgets', { default_branch: 'main' })
+        .queue('repos/acme/widgets/commits/main', { sha: BASE })
+        .collection('repos/acme/widgets/issues/42/comments', []);
+      const snapshot = await new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET);
+      assert.equal(snapshot.pullRequest, null, `${rawState} PRs remain excluded from open-PR discovery`);
+      assert.equal(snapshot.headSha, null);
+    }
+  });
+
+  it('excludes conclusively unrelated PRs before requiring full list normalization', async () => {
+    const unrelated = pull(7, HEAD, { body: 'Implements #12.' });
+    delete unrelated.head;
+    delete unrelated.base;
+    const transport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue('repos/acme/widgets/pulls/7', unrelated)
+      .queueGraphql(closingIssues());
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    assert.deepEqual(await adapter.listPullRequests(TARGET), []);
+  });
+
+  it('fully normalizes associated and unknown retained list candidates after association filtering', async () => {
+    for (const association of ['associated', 'unknown'] as const) {
+      const malformed = pull(7, HEAD, { body: association === 'associated' ? 'Closes #42' : 'Implements #12.' });
+      delete malformed.head;
+      const transport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', malformed)
+        .queueGraphql(association === 'associated' ? closingIssues(42) : { errors: [{ message: 'temporary GraphQL failure' }] });
+
+      await expectError(
+        new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT }).listPullRequests(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+    }
   });
 
   it('does not pick arbitrarily when multiple cross-references are all incidental', async () => {
