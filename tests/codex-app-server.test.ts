@@ -10,13 +10,15 @@ import {
   StdioCodexAppServerClient,
   StdioCodexAppServerClientFactory,
   type AppServerThreadOptions,
+  type AppServerMutationOptions,
+  type AppServerOpenOptions,
   type AppServerModelDescriptor,
   type AppServerLifecycleEvent,
   type CodexAppServerClient,
   type CodexAppServerClientFactory,
   type NativeThreadObservation,
 } from '../src/agents/codex-app-server.js';
-import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, WorkspaceGuardFailure, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
+import { ExecutionAdmissionRefusal, GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, WorkspaceGuardFailure, type ImplementationAgent, type ImplementationRequest } from '../src/adapters/agent.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE } from '../src/execution-profiles.js';
 import type { AgentResult } from '../src/domain/types.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
@@ -41,12 +43,12 @@ class FakeClient implements CodexAppServerClient {
   private readonly listeners = new Set<(event: AppServerLifecycleEvent) => void>();
   constructor(private observation: NativeThreadObservation = { threadId: 'thread-1', status: 'idle', history: [] }) {}
   async observeThread(threadId: string): Promise<NativeThreadObservation> { this.calls.push(`read:${threadId}`); return this.observation; }
-  async startThread(options: AppServerThreadOptions): Promise<string> { this.threadOptions.push(options); this.calls.push('thread/start'); return 'thread-new'; }
-  async resumeThread(threadId: string, options: AppServerThreadOptions): Promise<string> { this.threadOptions.push(options); this.calls.push(`thread/resume:${threadId}`); return threadId; }
-  async startTurn(threadId: string, prompt: string): Promise<string> { this.prompts.push(prompt); this.calls.push(`turn/start:${threadId}`); return 'turn-1'; }
-  async steerTurn(threadId: string, turnId: string): Promise<string> { this.calls.push(`turn/steer:${threadId}:${turnId}`); return turnId; }
-  async interruptTurn(threadId: string, turnId: string): Promise<void> { this.calls.push(`turn/interrupt:${threadId}:${turnId}`); }
-  async waitForTurn(): Promise<{ status: 'completed'; summary: string }> { this.calls.push('wait'); return { status: 'completed', summary: 'done' }; }
+  async startThread(options: AppServerThreadOptions, hostOptions: AppServerMutationOptions = {}): Promise<string> { hostOptions.beforeExecution?.(); this.threadOptions.push(options); this.calls.push('thread/start'); return 'thread-new'; }
+  async resumeThread(threadId: string, options: AppServerThreadOptions, hostOptions: AppServerMutationOptions = {}): Promise<string> { hostOptions.beforeExecution?.(); this.threadOptions.push(options); this.calls.push(`thread/resume:${threadId}`); return threadId; }
+  async startTurn(threadId: string, prompt: string, hostOptions: AppServerMutationOptions = {}): Promise<string> { hostOptions.beforeExecution?.(); this.prompts.push(prompt); this.calls.push(`turn/start:${threadId}`); return 'turn-1'; }
+  async steerTurn(threadId: string, turnId: string, _prompt?: string, hostOptions: AppServerMutationOptions = {}): Promise<string> { hostOptions.beforeExecution?.(); this.calls.push(`turn/steer:${threadId}:${turnId}`); return turnId; }
+  async interruptTurn(threadId: string, turnId: string, hostOptions: AppServerMutationOptions = {}): Promise<void> { hostOptions.beforeExecution?.(); this.calls.push(`turn/interrupt:${threadId}:${turnId}`); }
+  async waitForTurn(): Promise<{ status: 'completed' | 'failed' | 'interrupted'; summary: string }> { this.calls.push('wait'); return { status: 'completed', summary: 'done' }; }
   onEvent(listener: (event: AppServerLifecycleEvent) => void): () => void { this.listeners.add(listener); return () => this.listeners.delete(listener); }
   async close(): Promise<void> { this.calls.push('close'); }
   emitEvent(event: AppServerLifecycleEvent): void { for (const listener of this.listeners) listener(event); }
@@ -55,7 +57,7 @@ class FakeClient implements CodexAppServerClient {
 class Factory implements CodexAppServerClientFactory {
   opens = 0;
   constructor(readonly client: FakeClient) {}
-  async open(): Promise<CodexAppServerClient> { this.opens += 1; return this.client; }
+  async open(options: AppServerOpenOptions = {}): Promise<CodexAppServerClient> { this.opens += 1; options.beforeExecution?.(); return this.client; }
 }
 
 class DiscoveringClient extends FakeClient {
@@ -71,8 +73,8 @@ class DiscoveringClient extends FakeClient {
 }
 
 class UsageClient extends FakeClient {
-  override async startTurn(threadId: string, prompt: string): Promise<string> {
-    const turnId = await super.startTurn(threadId, prompt);
+  override async startTurn(threadId: string, prompt: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+    const turnId = await super.startTurn(threadId, prompt, hostOptions);
     this.emitEvent({ type: 'turn_started', threadId, turnId });
     this.emitEvent({ type: 'item_completed', threadId, itemId: 'tool-1', toolResultBytes: 321 });
     this.emitEvent({
@@ -90,8 +92,16 @@ class HangingClient extends FakeClient {
   }
 }
 
+class HangingCloseClient extends FakeClient {
+  override async close(): Promise<void> {
+    this.calls.push('close');
+    return new Promise(() => {});
+  }
+}
+
 class HangingStartThreadClient extends FakeClient {
-  override async startThread(_options: AppServerThreadOptions): Promise<string> {
+  override async startThread(_options: AppServerThreadOptions, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+    hostOptions.beforeExecution?.();
     this.calls.push('thread/start');
     return new Promise(() => {});
   }
@@ -100,7 +110,8 @@ class HangingStartThreadClient extends FakeClient {
 class HangingStartTurnClient extends FakeClient {
   constructor(private readonly observedTurnId: string | undefined = undefined) { super(); }
 
-  override async startTurn(threadId: string, prompt: string): Promise<string> {
+  override async startTurn(threadId: string, prompt: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+    hostOptions.beforeExecution?.();
     this.prompts.push(prompt);
     this.calls.push(`turn/start:${threadId}`);
     if (this.observedTurnId !== undefined) {
@@ -110,8 +121,27 @@ class HangingStartTurnClient extends FakeClient {
   }
 }
 
+class HangingCloseStartTurnClient extends HangingStartTurnClient {
+  override async close(): Promise<void> {
+    this.calls.push('close');
+    return new Promise(() => {});
+  }
+}
+
+class ProtocolAndCloseFailureClient extends FakeClient {
+  override async waitForTurn(): Promise<{ status: 'failed'; summary: string }> {
+    this.calls.push('wait');
+    return { status: 'failed', summary: 'provider reported failure' };
+  }
+  override async close(): Promise<void> {
+    this.calls.push('close');
+    throw new Error('close transport failed');
+  }
+}
+
 class DelayedStartTurnClient extends FakeClient {
-  override async startTurn(threadId: string, prompt: string): Promise<string> {
+  override async startTurn(threadId: string, prompt: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+    hostOptions.beforeExecution?.();
     this.prompts.push(prompt);
     this.calls.push(`turn/start:${threadId}`);
     return new Promise(() => {});
@@ -124,17 +154,51 @@ class DelayedStartTurnClient extends FakeClient {
 }
 
 class LateNotificationClient extends FakeClient {
-  override async startTurn(threadId: string, prompt: string): Promise<string> {
+  override async startTurn(threadId: string, prompt: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+    hostOptions.beforeExecution?.();
     this.prompts.push(prompt);
     this.calls.push(`turn/start:${threadId}`);
+    setImmediate(() => {
+      this.emitEvent({ type: 'turn_started', threadId, turnId: 'turn-late-notification' });
+      this.emitEvent({ type: 'turn_completed', threadId, turnId: 'foreign-completed-notification', status: 'completed' });
+    });
     return new Promise(() => {});
   }
+}
 
-  override async observeThread(threadId: string): Promise<NativeThreadObservation> {
-    this.calls.push(`read:${threadId}`);
-    await new Promise<void>((resolve) => setImmediate(resolve));
-    this.emitEvent({ type: 'turn_started', threadId, turnId: 'turn-late' });
-    return { threadId, status: 'idle', history: [] };
+class AbortReleasedStartTurnClient extends FakeClient {
+  constructor(private readonly controller: AbortController) { super(); }
+
+  override async startTurn(threadId: string, prompt: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+    hostOptions.beforeExecution?.();
+    this.prompts.push(prompt);
+    this.calls.push(`turn/start:${threadId}`);
+    return await new Promise<string>((resolve) => {
+      this.controller.signal.addEventListener('abort', () => {
+        this.calls.push('original-response-after-cancel');
+        resolve('late-original-turn');
+      }, { once: true });
+    });
+  }
+  override async waitForTurn(): Promise<{ status: 'completed'; summary: string }> {
+    this.calls.push('wait');
+    return new Promise(() => {});
+  }
+}
+
+class ForeignTurnEvidenceClient extends FakeClient {
+  override async startTurn(threadId: string, prompt: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+    hostOptions.beforeExecution?.();
+    this.prompts.push(prompt);
+    this.calls.push(`turn/start:${threadId}`);
+    this.emitEvent({ type: 'turn_started', threadId, turnId: 'foreign-start' });
+    const ownTurnId = 'owned-response-turn';
+    setImmediate(() => this.emitEvent({ type: 'turn_completed', threadId, turnId: 'foreign-completion', status: 'completed' }));
+    return ownTurnId;
+  }
+  override async waitForTurn(): Promise<{ status: 'completed'; summary: string }> {
+    this.calls.push('wait');
+    return new Promise(() => {});
   }
 }
 
@@ -146,7 +210,7 @@ class HangingObserveClient extends FakeClient {
 }
 
 class HangingFactory implements CodexAppServerClientFactory {
-  async open(): Promise<CodexAppServerClient> {
+  async open(_options?: AppServerOpenOptions): Promise<CodexAppServerClient> {
     return new Promise(() => {});
   }
 }
@@ -265,18 +329,52 @@ describe('CodexAppServerAdapter', () => {
     const client = new FakeClient({ threadId: 'thread-1', status: 'active', activeTurnId: 'turn-1', history: [] });
     const factory = new Factory(client);
     const adapter = new CodexAppServerAdapter({ clientFactory: factory, runner: new HeadRunner() });
-    let guardCalls = 0;
+    let guardCalls = 0; let executionChecks = 0;
     const governedRequest = request({
       executor: EXECUTOR,
       governedPublication: { required: true, continuation: true },
       workspaceGuard: { assertValid() { guardCalls += 1; } },
+      beforeExecution() { executionChecks += 1; },
     });
 
     await adapter.interruptActiveTurn(governedRequest, 'turn-1');
     assert.equal(factory.opens, 1);
     assert.equal(guardCalls, 1);
+    assert.equal(executionChecks, 2, 'governed interrupt checks both component entry and the actual mutation');
     assert.deepEqual(client.calls, ['read:thread-1', 'turn/interrupt:thread-1:turn-1', 'close']);
     assert.equal(client.calls.some((call) => call.startsWith('turn/steer:') || call.startsWith('turn/start:') || call.startsWith('thread/resume:')), false);
+  });
+
+  it('keeps the tagged execution refusal primary across bounded hanging component cleanup and never falls back', async () => {
+    const client = new HangingCloseClient();
+    const factory = new Factory(client);
+    const fallback = new Fallback();
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, fallback, runner: new HeadRunner() });
+    const refusal = new ExecutionAdmissionRefusal('the durable Run was superseded at worker entry', true);
+    let checks = 0;
+    const startedAt = Date.now();
+    let thrown: unknown;
+    try {
+      await adapter.run(request({ beforeExecution() { if (++checks === 2) throw refusal; } }));
+    } catch (error) { thrown = error; }
+    assert.ok(thrown instanceof ExecutionAdmissionRefusal);
+    assert.equal(thrown.runSuperseded, true);
+    assert.equal(thrown.cause, refusal);
+    assert.match(thrown.message, /cleanup remains uncertain/i);
+    assert.equal(fallback.calls, 0);
+    assert.ok(Date.now() - startedAt < 1_500, 'a hung close is bounded independently');
+  });
+
+  it('refuses a governed exact-owned interrupt with no host callback before opening the component', async () => {
+    const client = new FakeClient({ threadId: 'thread-1', status: 'active', activeTurnId: 'turn-1', history: [] });
+    const factory = new Factory(client);
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, runner: new HeadRunner() });
+    await assert.rejects(
+      () => adapter.interruptActiveTurn(request({ executor: EXECUTOR, governedPublication: { required: true, continuation: true } }), 'turn-1'),
+      /final host execution-boundary callback is missing/i,
+    );
+    assert.equal(factory.opens, 0);
+    assert.deepEqual(client.calls, []);
   });
 
   it('keeps governed interrupt behind exact ownership, active-turn, and workspace checks', async () => {
@@ -290,7 +388,7 @@ describe('CodexAppServerAdapter', () => {
       const factory = new Factory(client);
       const adapter = new CodexAppServerAdapter({ clientFactory: factory, runner: new HeadRunner() });
       await assert.rejects(
-        () => adapter.interruptActiveTurn(request({ ...entry.extra, governedPublication: { required: true, continuation: true } }), 'turn-1'),
+        () => adapter.interruptActiveTurn(request({ ...entry.extra, governedPublication: { required: true, continuation: true }, beforeExecution() {} }), 'turn-1'),
         entry.expected,
         entry.name,
       );
@@ -306,6 +404,7 @@ describe('CodexAppServerAdapter', () => {
       () => guardedAdapter.interruptActiveTurn(request({
         executor: EXECUTOR,
         governedPublication: { required: true, continuation: true },
+        beforeExecution() {},
         workspaceGuard: { assertValid() { throw new WorkspaceGuardFailure('workspace changed'); } },
       }), 'turn-1'),
       WorkspaceGuardFailure,
@@ -345,6 +444,88 @@ describe('CodexAppServerAdapter', () => {
     assert.equal(fallback.calls, 1);
   });
 
+  it('checks injected native factories after asynchronous preparation and skips child entry on revocation', async () => {
+    const client = new FakeClient();
+    const fallback = new Fallback();
+    let opened = 0;
+    let announceOpen!: () => void;
+    let releasePreparation!: () => void;
+    const openStarted = new Promise<void>((resolve) => { announceOpen = resolve; });
+    const preparation = new Promise<void>((resolve) => { releasePreparation = resolve; });
+    const refusal = new ExecutionAdmissionRefusal('Run was replaced during native preparation', true);
+    const factory: CodexAppServerClientFactory = {
+      async open(options = {}) {
+        opened += 1;
+        announceOpen();
+        await preparation;
+        options.beforeExecution?.();
+        return client;
+      },
+    };
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, fallback, runner: new HeadRunner() });
+    const pending = adapter.run(request({ beforeExecution: () => { throw refusal; } }));
+    await openStarted;
+    releasePreparation();
+    await assert.rejects(() => pending, (error: unknown) => error === refusal);
+    assert.equal(opened, 1);
+    assert.deepEqual(client.calls, []);
+    assert.equal(fallback.calls, 0);
+  });
+
+  it('preserves tagged refusal, uncertain interrupt, and uncertain component close together', async () => {
+    const client = new HangingCloseClient();
+    const fallback = new Fallback();
+    const refusal = new ExecutionAdmissionRefusal('authority was revoked before turn start', false, { authorityUnknown: true });
+    let checks = 0;
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), fallback, runner: new HeadRunner() });
+    const startedAt = Date.now();
+    await assert.rejects(
+      () => adapter.run(request({ beforeExecution() { if (++checks === 3) throw refusal; } })),
+      (error: unknown) => {
+        assert.ok(error instanceof ExecutionAdmissionRefusal);
+        assert.equal(error.runSuperseded, false);
+        assert.equal(error.authorityUnknown, true);
+        assert.match(error.message, /Native turn cleanup is uncertain \(unknown\)/);
+        assert.match(error.message, /component close did not settle/i);
+        assert.ok(error.cause instanceof ExecutionAdmissionRefusal);
+        assert.equal(error.cause.cause, refusal);
+        return true;
+      },
+    );
+    assert.ok(Date.now() - startedAt < 1_500, 'interrupt and close cleanup stayed bounded');
+    assert.equal(fallback.calls, 0);
+    assert.deepEqual(client.calls, ['thread/start', 'close']);
+  });
+
+  it('rechecks an injected mutation after its asynchronous preparation and writes no start operation', async () => {
+    let announcePreparation!: () => void;
+    let releasePreparation!: () => void;
+    const preparationStarted = new Promise<void>((resolve) => { announcePreparation = resolve; });
+    const preparation = new Promise<void>((resolve) => { releasePreparation = resolve; });
+    class PreparedMutationClient extends FakeClient {
+      override async startThread(options: AppServerThreadOptions, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+        announcePreparation();
+        await preparation;
+        hostOptions.beforeExecution?.();
+        this.threadOptions.push(options);
+        this.calls.push('thread/start');
+        return 'thread-new';
+      }
+    }
+    const client = new PreparedMutationClient();
+    const factory = new Factory(client);
+    const fallback = new Fallback();
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, fallback, runner: new HeadRunner() });
+    const refusal = new ExecutionAdmissionRefusal('Run changed during native mutation preparation', true);
+    let checks = 0;
+    const pending = adapter.run(request({ beforeExecution() { if (++checks === 2) throw refusal; } }));
+    await preparationStarted;
+    releasePreparation();
+    await assert.rejects(() => pending, (error: unknown) => error === refusal || (error instanceof ExecutionAdmissionRefusal && error.cause === refusal));
+    assert.deepEqual(client.calls, ['close']);
+    assert.equal(fallback.calls, 0);
+  });
+
   it('bounds a stalled native turn by the selected execution timeout', async () => {
     const client = new HangingClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
@@ -352,6 +533,71 @@ describe('CodexAppServerAdapter', () => {
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
     assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'wait', 'turn/interrupt:thread-new:turn-1', 'close']);
+  });
+
+  it('preserves timeout, known executor, and unknown-turn cleanup through a failed close', async () => {
+    const client = new HangingCloseStartTurnClient();
+    const fallback = new Fallback();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), fallback, runner: new HeadRunner(), timeoutMs: 5 });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.deepEqual(result.executor, { provider: CODEX_APP_SERVER_PROVIDER, sessionId: 'thread-new', generation: OWNERSHIP.generation });
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
+    assert.match(result.diagnostics?.join('\n') ?? '', /identity was not correlated/i);
+    assert.match(result.diagnostics?.join('\n') ?? '', /component close did not settle/i);
+    assert.equal(result.headSha, undefined);
+    assert.equal(fallback.calls, 0);
+  });
+
+  it('preserves protocol failure context when component close throws', async () => {
+    const client = new ProtocolAndCloseFailureClient();
+    const fallback = new Fallback();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), fallback, runner: new HeadRunner() });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.deepEqual(result.executor, { provider: CODEX_APP_SERVER_PROVIDER, sessionId: 'thread-new', generation: OWNERSHIP.generation });
+    assert.match(result.summary, /turn turn-1 ended failed/i);
+    assert.match(result.summary, /component close did not settle/i);
+    assert.match(result.diagnostics?.join('\n') ?? '', /close transport failed/i);
+    assert.equal(result.headSha, undefined);
+    assert.equal(fallback.calls, 0);
+  });
+
+  it('starts no turn when cancellation or deadline wins during the awaited workspace guard', async () => {
+    for (const mode of ['cancel', 'timeout'] as const) {
+      const client = new FakeClient();
+      const controller = new AbortController();
+      let guardCalls = 0;
+      let announceGuard!: () => void;
+      let releaseGuard!: () => void;
+      let announceGuardSettled!: () => void;
+      const guardEntered = new Promise<void>((resolve) => { announceGuard = resolve; });
+      const guardPending = new Promise<void>((resolve) => { releaseGuard = resolve; });
+      const guardSettled = new Promise<void>((resolve) => { announceGuardSettled = resolve; });
+      const workspaceGuard = {
+        assertValid() {
+          if (++guardCalls !== 2) return;
+          announceGuard();
+          return guardPending.then(() => { announceGuardSettled(); });
+        },
+      };
+      const fallback = new Fallback();
+      const adapter = new CodexAppServerAdapter({
+        clientFactory: new Factory(client), fallback, runner: new HeadRunner(), timeoutMs: mode === 'timeout' ? 25 : 5,
+      });
+      const pending = adapter.run(request({ signal: controller.signal, workspaceGuard }));
+      await guardEntered;
+      if (mode === 'cancel') controller.abort();
+      const result = await pending;
+      assert.equal(result.exitStatus, 'failure');
+      assert.match(result.diagnostics?.join('\n') ?? '', mode === 'cancel' ? /CODEX_APP_SERVER_CANCELLED/ : /CODEX_APP_SERVER_TIMEOUT/);
+      releaseGuard();
+      await guardSettled;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(client.calls, ['thread/start', 'close']);
+      assert.equal(result.executor?.sessionId, 'thread-new');
+      assert.equal(fallback.calls, 0);
+    }
   });
 
   it('bounds a stalled thread/start RPC', async () => {
@@ -381,35 +627,88 @@ describe('CodexAppServerAdapter', () => {
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_CANCELLED/);
   });
 
-  it('bounds a stalled turn/start RPC and interrupts the exact turn observed by notification', async () => {
+  it('reports late-open cleanup uncertainty and disposes a client that resolves after timeout', async () => {
+    const client = new HangingCloseClient();
+    const fallback = new Fallback();
+    let announceOpen!: () => void;
+    let releaseOpen!: () => void;
+    const openStarted = new Promise<void>((resolve) => { announceOpen = resolve; });
+    const opening = new Promise<void>((resolve) => { releaseOpen = resolve; });
+    const factory: CodexAppServerClientFactory = {
+      async open() {
+        announceOpen();
+        await opening;
+        return client;
+      },
+    };
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, fallback, runner: new HeadRunner(), timeoutMs: 5 });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /opening or component cleanup remains unconfirmed/i);
+    assert.match(result.diagnostics?.join('\n') ?? '', /late component may still open/i);
+    assert.equal(fallback.calls, 0);
+    await openStarted;
+    releaseOpen();
+    for (let attempt = 0; attempt < 20 && !client.calls.includes('close'); attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 1));
+    }
+    assert.deepEqual(client.calls, ['close'], 'late client disposal begins independently after its resolution');
+  });
+
+  it('does not treat an unknown same-thread turn-start notification as invocation ownership', async () => {
     const client = new HangingStartTurnClient('turn-observed');
-    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 1_000 });
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
     const result = await adapter.run(request());
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
-    assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'turn/interrupt:thread-new:turn-observed', 'close']);
+    assert.match(result.diagnostics?.join('\n') ?? '', /identity was not correlated|uncertain/i);
+    assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'close']);
   });
 
-  it('discovers and interrupts an exact turn when timeout wins before the turn/start notification is processed', async () => {
+  it('does not manufacture a turn owner from thread/read activeTurnId after start timeout', async () => {
     const client = new DelayedStartTurnClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
     const result = await adapter.run(request());
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
-    assert.deepEqual(client.calls, [
-      'thread/start', 'turn/start:thread-new', 'read:thread-new', 'turn/interrupt:thread-new:turn-delayed', 'close',
-    ]);
+    assert.match(result.diagnostics?.join('\n') ?? '', /identity was not correlated|uncertain/i);
+    assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'close']);
   });
 
-  it('uses a turn/started notification that arrives during bounded cleanup discovery', async () => {
+  it('ignores late same-thread start/completion notifications during bounded cleanup', async () => {
     const client = new LateNotificationClient();
     const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
     const result = await adapter.run(request());
     assert.equal(result.exitStatus, 'failure');
     assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
-    assert.deepEqual(client.calls, [
-      'thread/start', 'turn/start:thread-new', 'read:thread-new', 'turn/interrupt:thread-new:turn-late', 'close',
-    ]);
+    assert.match(result.diagnostics?.join('\n') ?? '', /identity was not correlated|uncertain/i);
+    assert.deepEqual(client.calls, ['thread/start', 'turn/start:thread-new', 'close']);
+  });
+
+  it('interrupts only the correlated successful start response despite foreign same-thread events', async () => {
+    const client = new ForeignTurnEvidenceClient();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5 });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
+    assert.ok(client.calls.includes('turn/interrupt:thread-new:owned-response-turn'));
+    assert.equal(client.calls.some((call) => call.includes('foreign-start') || call.includes('foreign-completion')), false);
+  });
+
+  it('accepts the original correlated start response released by cancellation during bounded cleanup', async () => {
+    const controller = new AbortController();
+    const client = new AbortReleasedStartTurnClient(controller);
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner() });
+    const pending = adapter.run(request({ signal: controller.signal }));
+    await waitForCall(client, 'turn/start:thread-new');
+    controller.abort();
+    const result = await pending;
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_CANCELLED/);
+    assert.ok(client.calls.indexOf('original-response-after-cancel') >= 0);
+    assert.ok(client.calls.indexOf('original-response-after-cancel') < client.calls.indexOf('turn/interrupt:thread-new:late-original-turn'));
+    assert.ok(client.calls.includes('turn/interrupt:thread-new:late-original-turn'));
+    assert.equal(client.calls.some((call) => call.startsWith('read:')), false);
   });
 
   it('bounds native observation by the configured execution timeout', async () => {
@@ -564,6 +863,102 @@ describe('CodexAppServerAdapter', () => {
     await client.close();
   });
 
+  it('keeps a spawn-time refusal outside unavailable fallback conversion', async () => {
+    const refusal = new ExecutionAdmissionRefusal('host denied native process entry', false);
+    await assert.rejects(
+      () => new StdioCodexAppServerClientFactory().open({ beforeExecution: () => { throw refusal; } }),
+      (error: unknown) => error === refusal,
+    );
+  });
+
+  it('does not fall back when initialization fails and bounded component close also fails', async () => {
+    const child = new InitializationFailureProcess();
+    const fallback = new Fallback();
+    const adapter = new CodexAppServerAdapter({
+      clientFactory: new StdioCodexAppServerClientFactory(() => child as never),
+      fallback,
+      runner: new HeadRunner(),
+    });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /initialization failed \(App Server RPC error: .*initialize refused.*\)/i);
+    assert.match(result.diagnostics?.join('\n') ?? '', /cleanup remains uncertain/i);
+    assert.match(result.diagnostics?.join('\n') ?? '', /close refused/i);
+    assert.equal(fallback.calls, 0);
+    assert.equal(child.writes.length, 1);
+  });
+
+  it('treats initialization close rejection with an undefined reason as uncertain and disables fallback', async () => {
+    const child = new InitializationUndefinedCloseProcess();
+    const fallback = new Fallback();
+    const adapter = new CodexAppServerAdapter({
+      clientFactory: new StdioCodexAppServerClientFactory(() => child as never),
+      fallback,
+      runner: new HeadRunner(),
+    });
+    const result = await adapter.run(request());
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /initialize refused/i);
+    assert.match(result.diagnostics?.join('\n') ?? '', /cleanup remains uncertain \(undefined\)/i);
+    assert.equal(fallback.calls, 0);
+    assert.equal(child.writes.length, 1);
+  });
+
+  it('checks each mutating JSON-RPC write after serialization without putting host options on the wire', async () => {
+    const child = new FakeAppServerProcess();
+    const client = new StdioCodexAppServerClient(child as never);
+    let checks = 0;
+    const hostOptions = { beforeExecution: () => { checks += 1; } };
+    const respond = async <T>(pending: Promise<T>, result: unknown): Promise<T> => {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      const request = child.writes.at(-1) as { id: number; method: string } | undefined;
+      assert.ok(request);
+      child.stdout.write(`${JSON.stringify({ id: request.id, result })}\n`);
+      return await pending;
+    };
+    const threadStart = client.startThread({ cwd: '/tmp/worktree' }, hostOptions);
+    assert.equal(checks, 1);
+    assert.equal(await respond(threadStart, { thread: { id: 'thread-started' } }), 'thread-started');
+    const threadResume = client.resumeThread('thread-started', { cwd: '/tmp/worktree' }, hostOptions);
+    assert.equal(checks, 2);
+    assert.equal(await respond(threadResume, { thread: { id: 'thread-started' } }), 'thread-started');
+    const turnStart = client.startTurn('thread-started', 'task', hostOptions);
+    assert.equal(checks, 3);
+    assert.equal(await respond(turnStart, { turn: { id: 'turn-started' } }), 'turn-started');
+    const turnSteer = client.steerTurn('thread-started', 'turn-started', 'next', hostOptions);
+    assert.equal(checks, 4);
+    assert.equal(await respond(turnSteer, { turnId: 'turn-started' }), 'turn-started');
+    const turnInterrupt = client.interruptTurn('thread-started', 'turn-started', hostOptions);
+    assert.equal(checks, 5);
+    await respond(turnInterrupt, {});
+    assert.deepEqual((child.writes as Array<{ method: string }>).map((wire) => wire.method), [
+      'thread/start', 'thread/resume', 'turn/start', 'turn/steer', 'turn/interrupt',
+    ]);
+    assert.equal(JSON.stringify(child.writes).includes('beforeExecution'), false);
+    await client.close();
+  });
+
+  it('removes pending RPC state and writes zero bytes when a mutation callback refuses', async () => {
+    const child = new FakeAppServerProcess();
+    const client = new StdioCodexAppServerClient(child as never);
+    const refusal = new ExecutionAdmissionRefusal('Run changed before RPC write', true);
+    await assert.rejects(
+      () => client.startTurn('thread-1', 'task', { beforeExecution: () => { throw refusal; } }),
+      (error: unknown) => error === refusal,
+    );
+    assert.deepEqual(child.writes, []);
+    const subsequent = client.startTurn('thread-1', 'task');
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const rawRequest = child.writes[0];
+    assert.ok(rawRequest);
+    const request = rawRequest as { id: number; method: string };
+    assert.equal(request.id, 2, 'the refused id was allocated but its pending entry was removed');
+    assert.equal(request.method, 'turn/start');
+    child.stdout.write(`${JSON.stringify({ id: request.id, result: { turn: { id: 'turn-ok' } } })}\n`);
+    assert.equal(await subsequent, 'turn-ok');
+    await client.close();
+  });
+
   it('reports an uncapped turn count and the newest usable completed turn', async () => {
     const child = new FakeAppServerProcess();
     const client = new StdioCodexAppServerClient(child as never);
@@ -676,4 +1071,22 @@ class FakeAppServerProcess extends EventEmitter {
   }
 
   kill(): boolean { this.killed = true; return true; }
+}
+
+class InitializationFailureProcess extends FakeAppServerProcess {
+  constructor() {
+    super();
+    this.stdin.on('data', (chunk: Buffer) => {
+      const request = JSON.parse(chunk.toString()) as { id: number; method: string };
+      if (request.method === 'initialize') {
+        setImmediate(() => this.stdout.write(`${JSON.stringify({ id: request.id, error: { code: -1, message: 'initialize refused' } })}\n`));
+      }
+    });
+  }
+
+  override kill(): boolean { throw new Error('close refused'); }
+}
+
+class InitializationUndefinedCloseProcess extends InitializationFailureProcess {
+  override kill(): boolean { throw undefined; }
 }

@@ -39,6 +39,7 @@ class FakeContainer implements ContainerWorkerExecution {
   readonly specs: WorkerContainerSpec[] = [];
   constructor(private readonly outcomes: Array<ContainerWorkerResult | Error>, private readonly events: string[] = []) {}
   async run(spec: WorkerContainerSpec): Promise<ContainerWorkerResult> {
+    spec.beforeExecution?.();
     this.specs.push(spec);
     this.events.push('container:run');
     const outcome = this.outcomes.shift();
@@ -149,7 +150,7 @@ describe('WorkerRouterAdapter container boundary', () => {
       };
       const response = await adapter.run(request);
       assert.equal(response.exitStatus, 'failure');
-      assert.match(response.summary, /source-qualified publication confinement/i);
+      assert.match(response.summary, /source-qualified publication confinement|final host execution-boundary callback is missing/i);
       assert.deepEqual(response.executor, request.executor);
       assert.equal(response.sessionId, 'durable-session');
       assert.equal(guards, 0);
@@ -164,10 +165,11 @@ describe('WorkerRouterAdapter container boundary', () => {
     const ws = workspace();
     const runner = new FakeRunner([result(HEAD), result(), result('To origin\n')], events);
     const container = new FakeContainer([containerResult()], events);
-    let before = 0; let after = 0;
+    let before = 0; let after = 0; let executionBoundary = 0;
     const response = await new WorkerRouterAdapter({ runner, container, image: IMAGE, executable: '/router', timeoutMs: 9000, env: { DEEPSEEK_API_KEY: 'sk-secret' } }).run({
       ...requestFor(ws.workspacePath),
       authority: 'live-target',
+      beforeExecution: () => { executionBoundary += 1; },
       supplementalInstructions: 'Focus on the acceptance tests.',
       beforePublish: () => { events.push('before-publish'); },
       workspaceGuard: { assertValid: (phase) => { events.push(`guard:${phase ?? 'before-execution'}`); if (phase === 'after-execution') after++; else before++; } },
@@ -177,6 +179,7 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(response.headSha, HEAD);
     assert.equal(before, 1);
     assert.equal(after, 1);
+    assert.equal(executionBoundary, 1);
 
     // Terminal before guard(after) and before any Tachiko-owned Git authority work.
     const terminal = events.indexOf('container:terminal');
@@ -195,6 +198,8 @@ describe('WorkerRouterAdapter container boundary', () => {
 
     // Commit-only mounts: no bare remote, no hooks, no $HOME, no Docker socket.
     const spec = container.specs[0]!;
+    assert.equal(typeof spec.beforeExecution, 'function');
+    assert.equal(spec.stdin.includes('beforeExecution'), false, 'host-only callback is not part of worker task text');
     assert.equal(spec.entrypoint, '/router');
     assert.equal(spec.network, 'none');
     assert.equal(spec.workdir, ws.workspacePath);

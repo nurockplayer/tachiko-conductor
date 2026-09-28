@@ -4,6 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
+import { ExecutionAdmissionRefusal } from '../src/adapters/agent.js';
 import {
   ContainerWorkerBoundary,
   DockerWorkerContainerRuntime,
@@ -34,13 +35,21 @@ class FakeRuntime implements WorkerContainerRuntime {
   stopError: Error | undefined;
   killError: Error | undefined;
   removeError: Error | undefined;
+  createBarrier: Promise<void> | undefined;
+  startBarrier: Promise<void> | undefined;
+  startPreparationEntered: (() => void) | undefined;
 
-  async create(_spec: WorkerContainerSpec): Promise<string> {
+  async create(containerSpec: WorkerContainerSpec): Promise<string> {
+    await this.createBarrier;
+    containerSpec.beforeExecution?.();
     this.calls.push('create');
     if (this.createResult instanceof Error) throw this.createResult;
     return this.createResult;
   }
-  async start(id: string, _spec: WorkerContainerSpec): Promise<void> {
+  async start(id: string, containerSpec: WorkerContainerSpec): Promise<void> {
+    this.startPreparationEntered?.();
+    await this.startBarrier;
+    containerSpec.beforeExecution?.();
     this.calls.push(`start:${id}`);
     if (this.startError !== undefined) throw this.startError;
   }
@@ -93,6 +102,106 @@ const containerError = (code: (typeof WORKER_ROUTER_CONTAINER_ERROR_CODE)[keyof 
   new WorkerRouterContainerError(code, message);
 
 describe('ContainerWorkerBoundary', () => {
+  it('checks create authority before any container exists and preserves a tagged refusal', async () => {
+    const runtime = new FakeRuntime();
+    const refusal = new ExecutionAdmissionRefusal('admission was revoked before create', false);
+    await assert.rejects(
+      () => new ContainerWorkerBoundary({ runtime }).run(spec({ beforeExecution: () => { throw refusal; } })),
+      (error: unknown) => error === refusal,
+    );
+    assert.deepEqual(runtime.calls, []);
+  });
+
+  it('preserves a tagged refusal after successful exact-ID cleanup even when the invocation signal aborts', async () => {
+    const runtime = new FakeRuntime();
+    const controller = new AbortController();
+    const refusal = new ExecutionAdmissionRefusal('admission changed before start', true);
+    let checks = 0;
+    await assert.rejects(
+      () => new ContainerWorkerBoundary({ runtime }).run(spec({
+        signal: controller.signal,
+        beforeExecution() {
+          if (++checks === 2) {
+            controller.abort();
+            throw refusal;
+          }
+        },
+      })),
+      (error: unknown) => error === refusal,
+    );
+    assert.deepEqual(runtime.calls, [
+      'create',
+      `stop:${ID}:5`,
+      `wait:${ID}`,
+      `kill:${ID}`,
+      `wait:${ID}`,
+      `remove:${ID}`,
+    ]);
+  });
+
+  it('cleans the exact created ID when authority is revoked immediately before start', async () => {
+    const runtime = new FakeRuntime();
+    let checks = 0;
+    const refusal = new ExecutionAdmissionRefusal('admission was revoked before start', false);
+    await assert.rejects(
+      () => new ContainerWorkerBoundary({ runtime }).run(spec({ beforeExecution: () => { if (++checks === 2) throw refusal; } })),
+      (error: unknown) => error === refusal,
+    );
+    assert.equal(checks, 2);
+    assert.deepEqual(runtime.calls, [
+      'create',
+      `stop:${ID}:5`,
+      `wait:${ID}`,
+      `kill:${ID}`,
+      `wait:${ID}`,
+      `remove:${ID}`,
+    ]);
+  });
+
+  it('rechecks after asynchronous start preparation and contains only the exact already-created ID', async () => {
+    const runtime = new FakeRuntime();
+    let enterStart!: () => void;
+    let releaseStart!: () => void;
+    const startEntered = new Promise<void>((resolve) => { enterStart = resolve; });
+    runtime.startPreparationEntered = enterStart;
+    runtime.startBarrier = new Promise<void>((resolve) => { releaseStart = resolve; });
+    const refusal = new ExecutionAdmissionRefusal('Run changed during Docker start preparation', true);
+    let revoked = false;
+    const pending = new ContainerWorkerBoundary({ runtime }).run(spec({ beforeExecution: () => { if (revoked) throw refusal; } }));
+    await startEntered;
+    revoked = true;
+    releaseStart();
+    await assert.rejects(() => pending, (error: unknown) => error === refusal);
+    assert.deepEqual(runtime.calls, [
+      'create',
+      `stop:${ID}:5`,
+      `wait:${ID}`,
+      `kill:${ID}`,
+      `wait:${ID}`,
+      `remove:${ID}`,
+    ]);
+  });
+
+  it('keeps a tagged start refusal primary when exact-ID containment is uncertain', async () => {
+    const runtime = new FakeRuntime();
+    const refusal = new ExecutionAdmissionRefusal('admission was revoked before start', false);
+    runtime.stopError = new Error('stop unavailable');
+    runtime.killError = new Error('kill unavailable');
+    runtime.removeError = new Error('remove unavailable');
+    runtime.inspectResult = new Error('inspect unavailable');
+    let checks = 0;
+    let thrown: unknown;
+    try {
+      await new ContainerWorkerBoundary({ runtime }).run(spec({ beforeExecution: () => { if (++checks === 2) throw refusal; } }));
+    } catch (error) { thrown = error; }
+    assert.ok(thrown instanceof ExecutionAdmissionRefusal);
+    assert.equal(thrown.runSuperseded, false);
+    assert.equal(thrown.cause, refusal);
+    assert.match(thrown.message, /cleanup remains uncertain/i);
+    assert.ok(runtime.calls.includes(`remove:${ID}`));
+    assert.ok(runtime.calls.includes(`inspect:${ID}`));
+  });
+
   it('awaits the exact container terminal, then removes it by the exact ID', async () => {
     const runtime = new FakeRuntime();
     const result = await new ContainerWorkerBoundary({ runtime }).run(spec());
@@ -298,8 +407,10 @@ describe('ContainerWorkerBoundary', () => {
 
 class QueueRunner implements ProcessRunner {
   readonly calls: Array<{ file: string; args: readonly string[]; options: ProcessRunOptions }> = [];
-  constructor(private readonly outcomes: Array<ProcessResult | Error>) {}
+  constructor(private readonly outcomes: Array<ProcessResult | Error>, private readonly prepare?: () => Promise<void>) {}
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
+    await this.prepare?.();
+    options.beforeSpawn?.();
     this.calls.push({ file, args, options });
     const outcome = this.outcomes.shift();
     if (outcome === undefined) throw new Error('No fake outcome queued');
@@ -311,6 +422,46 @@ class QueueRunner implements ProcessRunner {
 const ok = (stdout = '', stderr = '', exitCode = 0): ProcessResult => ({ stdout, stderr, exitCode });
 
 describe('DockerWorkerContainerRuntime', () => {
+  it('forwards the host-only callback to actual create and start spawn options', async () => {
+    const runner = new QueueRunner([ok(`${ID}\n`), ok()]);
+    const runtime = new DockerWorkerContainerRuntime({ runner });
+    let checks = 0;
+    const beforeExecution = () => { checks += 1; };
+    const containerSpec = spec({ beforeExecution });
+    await runtime.create(containerSpec);
+    await runtime.start(ID, containerSpec);
+    assert.equal(checks, 2);
+    assert.equal(runner.calls.length, 2);
+    assert.equal(runner.calls[0]?.options.beforeSpawn, beforeExecution);
+    assert.equal(runner.calls[1]?.options.beforeSpawn, beforeExecution);
+    assert.equal(JSON.stringify(runner.calls.map((call) => call.args)).includes('beforeExecution'), false);
+  });
+
+  it('does not enter Docker create when the final process callback refuses', async () => {
+    const runner = new QueueRunner([ok(`${ID}\n`)]);
+    const runtime = new DockerWorkerContainerRuntime({ runner });
+    const refusal = new ExecutionAdmissionRefusal('final host check denied', false);
+    await assert.rejects(() => runtime.create(spec({ beforeExecution: () => { throw refusal; } })), (error: unknown) => error === refusal);
+    assert.equal(runner.calls.length, 0);
+  });
+
+  it('rechecks a revoked create after runner preparation and spawns no Docker process', async () => {
+    let announcePreparation!: () => void;
+    let releasePreparation!: () => void;
+    const preparationStarted = new Promise<void>((resolve) => { announcePreparation = resolve; });
+    const preparation = new Promise<void>((resolve) => { releasePreparation = resolve; });
+    const runner = new QueueRunner([ok(`${ID}\n`)], async () => { announcePreparation(); await preparation; });
+    const runtime = new DockerWorkerContainerRuntime({ runner });
+    const refusal = new ExecutionAdmissionRefusal('Run changed during docker command preparation', true);
+    let revoked = false;
+    const pending = runtime.create(spec({ beforeExecution: () => { if (revoked) throw refusal; } }));
+    await preparationStarted;
+    revoked = true;
+    releasePreparation();
+    await assert.rejects(() => pending, (error: unknown) => error === refusal);
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('builds an unprivileged, restart-free, digest-pinned create invocation', async () => {
     const runner = new QueueRunner([ok(`${ID}\n`)]);
     const runtime = new DockerWorkerContainerRuntime({ runner });

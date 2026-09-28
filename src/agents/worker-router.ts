@@ -1,6 +1,6 @@
 import path from 'node:path';
 
-import { assertWorkspaceGuard, governedPublicationRefusal, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import { assertWorkspaceGuard, governedPublicationRefusal, isExecutionAdmissionRefusal, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessRunner, type ProcessRunOptions } from '../github/transport.js';
 import { providerTelemetry } from './provider-telemetry.js';
@@ -134,7 +134,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     }
     let spec: WorkerContainerSpec;
     try {
-      spec = this.containerSpec(this.image, cwd, task, request.signal);
+      spec = this.containerSpec(this.image, cwd, task, request.signal, request.beforeExecution);
     } catch (error) {
       return failure(
         WORKER_ROUTER_ERROR_CODE.MOUNTS_INVALID,
@@ -146,6 +146,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     try {
       result = await this.container.run(spec);
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       return this.containerFailure(error, request.signal, startedAt, spec.env);
     }
     const provenance = workerProvenance(result.stderr);
@@ -185,7 +186,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     return { exitStatus: 'success', summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.', headSha: head, telemetry: providerTelemetry({ provider: WORKER_ROUTER_PROVIDER }), ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
   }
 
-  private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined): WorkerContainerSpec {
+  private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined, beforeExecution: (() => void) | undefined): WorkerContainerSpec {
     return {
       image,
       entrypoint: this.executable,
@@ -197,6 +198,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       stdin: task,
       timeoutMs: this.timeoutMs,
       ...(signal === undefined ? {} : { signal }),
+      ...(beforeExecution === undefined ? {} : { beforeExecution }),
     };
   }
 

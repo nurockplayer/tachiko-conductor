@@ -24,6 +24,8 @@
 import { existsSync, lstatSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 
+import { ExecutionAdmissionRefusal, isExecutionAdmissionRefusal } from '../adapters/agent.js';
+
 import { NodeProcessRunner, type ProcessRunner } from '../github/transport.js';
 
 export const WORKER_ROUTER_IMAGE_ENV = 'TACHIKO_WORKER_ROUTER_IMAGE';
@@ -92,6 +94,8 @@ export interface WorkerContainerSpec {
   readonly stdin: string;
   readonly timeoutMs: number;
   readonly signal?: AbortSignal;
+  /** Host-only check forwarded to the actual Docker create/start spawn boundary. */
+  readonly beforeExecution?: () => void;
 }
 
 export interface WorkerContainerInspection {
@@ -295,7 +299,7 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
       args.push('--volume', `${mount.host}:${mount.container}${mount.mode === 'ro' ? ':ro' : ''}`);
     }
     args.push(spec.image, spec.entrypoint, ...spec.args);
-    const result = await this.control(args, spec.signal);
+    const result = await this.control(args, spec.signal, spec.beforeExecution);
     if (result.exitCode !== 0) {
       throw new WorkerRouterContainerError(
         WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED,
@@ -321,6 +325,7 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
       timeoutMs: spec.timeoutMs,
       stdin: spec.stdin,
       ...(spec.signal === undefined ? {} : { signal: spec.signal }),
+      ...(spec.beforeExecution === undefined ? {} : { beforeSpawn: spec.beforeExecution }),
     });
   }
 
@@ -413,21 +418,27 @@ export class DockerWorkerContainerRuntime implements WorkerContainerRuntime {
     );
   }
 
-  private async control(args: readonly string[], signal?: AbortSignal) {
-    return await this.execute(args, { timeoutMs: this.controlTimeoutMs, ...(signal === undefined ? {} : { signal }) });
+  private async control(args: readonly string[], signal?: AbortSignal, beforeSpawn?: () => void) {
+    return await this.execute(args, {
+      timeoutMs: this.controlTimeoutMs,
+      ...(signal === undefined ? {} : { signal }),
+      ...(beforeSpawn === undefined ? {} : { beforeSpawn }),
+    });
   }
 
   private async execute(
     args: readonly string[],
-    options: { timeoutMs: number; stdin?: string; signal?: AbortSignal },
+    options: { timeoutMs: number; stdin?: string; signal?: AbortSignal; beforeSpawn?: () => void },
   ) {
     try {
       return await this.runner.run(this.docker, args, {
         timeoutMs: options.timeoutMs,
         ...(options.stdin === undefined ? {} : { stdin: options.stdin }),
         ...(options.signal === undefined ? {} : { signal: options.signal }),
+        ...(options.beforeSpawn === undefined ? {} : { beforeSpawn: options.beforeSpawn }),
       });
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       const code = errorCode(error);
       if (isAborted(options.signal) || code === 'ABORT_ERR') {
         throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED, 'The worker container was cancelled.', error);
@@ -492,6 +503,13 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
     } catch (error) {
       const cleanup = await this.proveQuiescent(id);
       if (!cleanup.quiescent) {
+        if (isExecutionAdmissionRefusal(error)) {
+          throw new ExecutionAdmissionRefusal(
+            `${error.message} Exact-container cleanup remains uncertain: ${cleanup.detail}`,
+            error.runSuperseded,
+            { cause: error, authorityUnknown: error.authorityUnknown },
+          );
+        }
         // Containment takes precedence over the ordinary worker failure: never
         // return while the exact container may still be alive and mutating.
         throw new WorkerRouterContainerError(
@@ -500,6 +518,7 @@ export class ContainerWorkerBoundary implements ContainerWorkerExecution {
           error,
         );
       }
+      if (isExecutionAdmissionRefusal(error)) throw error;
       if (isAborted(spec.signal)) {
         throw new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED, 'The worker container was cancelled.', error);
       }
