@@ -101,7 +101,7 @@ import {
 } from './workflow/wait-command.js';
 import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
 import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
-import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, readOperationalRuntimeProjection, registerManualLane, retireManualLane, setMaintenanceHold, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
+import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, composeOperationalRuntimeProjection, readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
 import { createHostAdmissionRegistry, resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from './mission-admission/host-registry.js';
 import { canonicalizeMissionEvidence, type AdmissionLaneView, type AdmissionResult, type AdmissionToken, type MissionAdmissionRegistry } from './mission-admission/registry.js';
 import { readManualOwnerReceipt, validateManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from './mission-admission/manual-owner-receipt.js';
@@ -801,6 +801,106 @@ export function dispatchAdmissionStatus(registry: MissionAdmissionRegistry, stor
   };
 }
 
+export interface RuntimeProjectionUpdate {
+  readonly stage: string;
+  readonly supervisor: 'running' | 'stopped' | 'parked';
+  readonly eventWakeEligible?: boolean;
+  readonly nextPollAt?: string;
+  readonly maintenanceHold?: { readonly active: boolean; readonly reason?: string };
+}
+
+/** Publish one conservative account-wide projection from one strict registry read. */
+export function publishAdmissionRuntimeProjection(
+  runsDir: string,
+  registry: MissionAdmissionRegistry,
+  store: RunStore,
+  update: RuntimeProjectionUpdate,
+): ReturnType<typeof composeOperationalRuntimeProjection> {
+  const admission = registry.snapshot({ requireExisting: true });
+  const runs = store.list();
+  const runById = new Map(runs.map((run) => [run.id, run]));
+  const durableLaneIds = new Set<string>();
+  const validatedRunIds = new Set<string>();
+  const validatedManualIds = new Set<string>();
+  const manualLanes: NonNullable<Parameters<typeof composeOperationalRuntimeProjection>[0]['manualLane']>[] = [];
+  for (const lane of admission.lanes) {
+    if ((lane.status !== 'parked' && lane.status !== 'released') || (lane.role !== 'production_captain' && lane.role !== 'delegated_mutation_writer')) continue;
+    if (lane.evidence.run !== undefined) {
+      const run = runById.get(lane.evidence.run);
+      if (run === undefined || `${run.target.owner}/${run.target.repo}`.toLowerCase() !== lane.evidence.repository) continue;
+      try {
+        const receiptPath = resolveRunOwnerReceiptPath(lane.evidence.repository, run.id, lane.evidence);
+        const receipt = readRunOwnerReceipt(receiptPath);
+        if (receipt === null) continue;
+        assertRecoveryOwnerEvidence(run, receipt, lane, lane.missionId, lane.generation - 1);
+        const expectedParkReason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
+        const parkedReceipt = lane.status === 'parked' && lane.parkedReason === expectedParkReason && receipt.generation === lane.generation && receipt.phase === 'parked' && receipt.token === undefined;
+        const releasedReceipt = lane.status === 'released' && receipt.generation === lane.generation && receipt.phase === 'released' && receipt.token === undefined;
+        if (parkedReceipt || releasedReceipt) {
+          durableLaneIds.add(lane.laneId);
+          validatedRunIds.add(run.id);
+        }
+      } catch { /* missing or inconsistent checkpoint detail is ambiguous, never absence proof */ }
+      continue;
+    }
+    if (lane.role === 'production_captain' && lane.evidence.repositoryScope === true && lane.evidence.workspace !== undefined) {
+      try {
+        const receiptPath = resolveManualOwnerReceiptPath(lane.evidence.repository, lane.evidence.workspace);
+        const receipt = readManualOwnerReceipt(receiptPath);
+        const parkedManual = lane.status === 'parked' && lane.parkedReason === 'manual_checkpoint' && receipt?.status === 'parked' && receipt.generation === lane.generation;
+        const releasedManual = lane.status === 'released' && receipt?.status === 'parked' && receipt.generation + 1 === lane.generation;
+        const legacyReleasedManual = lane.status === 'released' && receipt === null;
+        if (legacyReleasedManual) { durableLaneIds.add(lane.laneId); validatedManualIds.add(lane.laneId); }
+        if (receipt !== null && (parkedManual || releasedManual) && receipt.laneId === lane.laneId && receipt.missionId === lane.missionId &&
+          receipt.repository === lane.evidence.repository && receipt.workspace === lane.evidence.workspace) {
+          durableLaneIds.add(lane.laneId);
+          validatedManualIds.add(lane.laneId);
+          if (lane.status === 'parked') manualLanes.push({ repository: receipt.repository, worktree: receipt.workspace, branch: receipt.branch, checkpointSha: receipt.checkpointSha,
+            clean: true, state: 'parked', recoverable: true, laneId: receipt.laneId, missionId: receipt.missionId, admissionRevision: admission.revision });
+        }
+      } catch { /* missing or inconsistent checkpoint detail is ambiguous, never absence proof */ }
+    }
+  }
+  const activeManual = admission.lanes.filter((lane) => lane.status === 'active' && lane.role === 'production_captain' && lane.evidence.repositoryScope === true && lane.evidence.workspace !== undefined);
+  if (admission.counts.writers > 0 && activeManual.length === 1) {
+    const lane = activeManual[0]!;
+    try {
+      const receipt = readManualOwnerReceipt(resolveManualOwnerReceiptPath(lane.evidence.repository, lane.evidence.workspace!));
+      if (receipt !== null && receipt.status === 'active' && receipt.laneId === lane.laneId && receipt.missionId === lane.missionId &&
+        receipt.repository === lane.evidence.repository && receipt.workspace === lane.evidence.workspace && receipt.generation === lane.generation) {
+        manualLanes.push({ repository: receipt.repository, worktree: receipt.workspace, branch: receipt.branch, checkpointSha: receipt.checkpointSha,
+          clean: false, state: 'active', recoverable: false, laneId: receipt.laneId, missionId: receipt.missionId, admissionRevision: admission.revision });
+      }
+    } catch { /* active count is still authoritative; omit uncertain detail */ }
+  }
+  const prior = readOperationalRuntimeProjection(runsDir);
+  const mutationLanes = admission.lanes.filter((lane) => lane.role === 'production_captain' || lane.role === 'delegated_mutation_writer');
+  const pristine = admission.revision === 0 && admission.lanes.length === 0 && admission.lastTransition === null && runs.length === 0 &&
+    prior?.activeWriter === undefined && prior?.manualLane === undefined;
+  const noTransitionalMutationOwners = mutationLanes.every((lane) => lane.status === 'parked' || lane.status === 'released');
+  const everyMutationOwnerValidated = mutationLanes.every((lane) => lane.status === 'parked' || lane.status === 'released'
+    ? durableLaneIds.has(lane.laneId)
+    : false);
+  const hasValidatedHistory = durableLaneIds.size > 0;
+  const everyRunValidated = runs.every((run) => validatedRunIds.has(run.id));
+  const priorWriterResolved = prior?.activeWriter === undefined || validatedRunIds.has(prior.activeWriter.runId);
+  const priorManualResolved = prior?.manualLane === undefined || mutationLanes.some((lane) =>
+    lane.role === 'production_captain' && lane.evidence.repositoryScope === true && lane.evidence.repository === prior.manualLane!.repository &&
+    lane.evidence.workspace === prior.manualLane!.worktree && validatedManualIds.has(lane.laneId));
+  const reentryEvidenceComplete = pristine || (hasValidatedHistory && noTransitionalMutationOwners && everyMutationOwnerValidated && everyRunValidated && priorWriterResolved && priorManualResolved);
+  const projection = composeOperationalRuntimeProjection({
+    admission, runs, prior, now: new Date().toISOString(), stage: update.stage, supervisor: update.supervisor,
+    eventWakeEligible: update.eventWakeEligible ?? false,
+    ...(update.nextPollAt === undefined ? {} : { nextPollAt: update.nextPollAt }),
+    ...(update.maintenanceHold === undefined ? {} : { maintenanceHold: update.maintenanceHold }),
+    ...(manualLanes.length === 1 ? { manualLane: manualLanes[0]! } : {}),
+    durableLaneIds,
+    reentryEvidenceComplete,
+  });
+  writeOperationalRuntimeProjection(runsDir, projection);
+  return projection;
+}
+
 export function assertCanonicalDispatchResumeClaim(run: Run, claim: DispatchRuntimeClaim | null, config: ReturnType<typeof resolveDispatchConfiguration>, claimBoundRun: Run | null = null): asserts claim is DispatchRuntimeClaim {
   const uniqueUnboundRunProof = claimBoundRun?.id === run.id && claimBoundRun.dispatchClaimId === claim?.claimId;
   if (run.target.kind !== 'issue' || run.dispatchClaimId === undefined || run.execution === undefined ||
@@ -866,7 +966,9 @@ function sameRunReceiptIdentity(receipt: RunOwnerReceipt, run: Run, missionId: s
 
 const MISSION_EVIDENCE_FIELDS = ['repository', 'issue', 'pullRequest', 'run', 'claim', 'workspace', 'stateSurface', 'repositoryScope'] as const;
 
-function isLogicalBootstrapPlanningReservation(run: Run, receipt: RunOwnerReceipt, lane: AdmissionLaneView, generation: number): boolean {
+type RecoveryLaneEvidence = Pick<AdmissionLaneView, 'laneId' | 'missionId' | 'role' | 'evidence' | 'generation' | 'status' | 'parkedReason'>;
+
+function isLogicalBootstrapPlanningReservation(run: Run, receipt: RunOwnerReceipt, lane: RecoveryLaneEvidence, generation: number): boolean {
   const targetIssue = run.target.kind === 'issue' ? run.target.issueNumber : undefined;
   const bootstrapMatchesRun = run.bootstrap !== undefined && run.target.kind === 'issue' &&
     run.bootstrap.owner.toLowerCase() === run.target.owner.toLowerCase() && run.bootstrap.repo.toLowerCase() === run.target.repo.toLowerCase() &&
@@ -893,7 +995,7 @@ function isLogicalBootstrapPlanningReservation(run: Run, receipt: RunOwnerReceip
   return false;
 }
 
-function assertRecoveryOwnerEvidence(run: Run, receipt: RunOwnerReceipt, lane: AdmissionLaneView, missionId: string, generation: number): void {
+function assertRecoveryOwnerEvidence(run: Run, receipt: RunOwnerReceipt, lane: RecoveryLaneEvidence, missionId: string, generation: number): void {
   if (!sameRunReceiptIdentity(receipt, run, missionId) || lane.laneId !== `run:${run.id}` || lane.missionId !== missionId ||
     lane.role !== 'production_captain' || lane.evidence.repositoryScope === true) {
     throw new Error(`Run owner receipt and locked lane do not match exact Run owner identity for "${run.id}".`);
@@ -1280,6 +1382,8 @@ export interface WorkflowCommandOptions {
   readonly withRunAdmissionLock?: <T>(operation: (release: () => void) => T | Promise<T>) => Promise<T>;
   /** Atomic short-lock bridge for a canonical live dispatch claim plus Run CAS. */
   readonly commitDispatchResumeTransition?: (expected: Run, next: Run, commitRun: () => void) => Promise<void>;
+  /** Executable CLI supplies the fail-closed account-wide projection publisher. */
+  readonly publishRuntimeProjection?: (registry: MissionAdmissionRegistry, store: RunStore, update: RuntimeProjectionUpdate) => void;
 }
 
 /**
@@ -1328,6 +1432,9 @@ export async function runIssueCommand(
   let mayReleaseAsPreExecution = admissionToken !== undefined;
   try {
     if (isNewRun && !precreatedRun) deps.store.create(run);
+    if (admissionToken !== undefined && options.publishRuntimeProjection !== undefined) {
+      options.publishRuntimeProjection(options.admission!, deps.store, { stage: 'implementation_admitted', supervisor: 'running' });
+    }
     options.releaseDispatchAdmissionLock?.();
     const outcome = await runWorkflow(deps, run.id, {
       maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
@@ -1342,12 +1449,18 @@ export async function runIssueCommand(
       ...(admissionToken === undefined ? {} : { admissionFence: { registry: options.admission!, token: admissionToken, productionMissionId: options.admission!.readLane(admissionToken.laneId)!.missionId, ...(options.admissionWorkspace === undefined ? {} : { executionWorkspace: options.admissionWorkspace }) } }),
     });
     mayReleaseAsPreExecution = false;
-    if (admissionToken !== undefined) await withRunAdmissionBoundary(options, () => settleRunAdmission(options.admission!, admissionToken, outcome.run, runOwnerReceiptPath));
+    if (admissionToken !== undefined) await withRunAdmissionBoundary(options, () => {
+      settleRunAdmission(options.admission!, admissionToken, outcome.run, runOwnerReceiptPath);
+      options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: outcome.run.state.toLowerCase(), supervisor: 'stopped' });
+    });
     return outcome;
   } catch (error) {
     if (admissionToken !== undefined && mayReleaseAsPreExecution) {
       options.releaseDispatchAdmissionLock?.();
-      await withRunAdmissionBoundary(options, () => releasePreExecutionRunAdmission(options.admission!, admissionToken, runOwnerReceiptPath));
+      await withRunAdmissionBoundary(options, () => {
+        releasePreExecutionRunAdmission(options.admission!, admissionToken, runOwnerReceiptPath);
+        options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: 'pre_execution_released', supervisor: 'stopped' });
+      });
     }
     throw error;
   }
@@ -1397,10 +1510,20 @@ export async function resumeCommand(
       mayReleaseAsPreExecution = false;
     });
   } else if (run.dispatchClaimId !== undefined) updateClaimedRunIfUnchanged(deps.store, run, cancelled);
-  else deps.store.update(cancelled);
+    else deps.store.update(cancelled);
     mayReleaseAsPreExecution = false;
+    if (admissionToken !== undefined) {
+      const settleAndProject = () => {
+        settleRunAdmission(options.admission!, admissionToken, cancelled, runOwnerReceiptPath);
+        options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: 'failed', supervisor: 'stopped' });
+      };
+      // The executable caller still owns its short admission lock here. Do
+      // both durable settlement and projection before that owner releases it;
+      // helper callers without an outer lock acquire the same boundary here.
+      if (options.releaseDispatchAdmissionLock !== undefined) settleAndProject();
+      else await withRunAdmissionBoundary(options, settleAndProject);
+    }
     options.releaseDispatchAdmissionLock?.();
-    if (admissionToken !== undefined) await withRunAdmissionBoundary(options, () => settleRunAdmission(options.admission!, admissionToken, cancelled, runOwnerReceiptPath));
     return { outcome: 'failed', run: cancelled, reason: CANCEL_RUN_DECISION };
   }
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
@@ -1458,6 +1581,9 @@ export async function resumeCommand(
     });
   } else if (run.dispatchClaimId !== undefined) updateClaimedRunIfUnchanged(deps.store, run, resumed);
   else deps.store.update(resumed);
+  if (admissionToken !== undefined && options.publishRuntimeProjection !== undefined) {
+    options.publishRuntimeProjection(options.admission!, deps.store, { stage: 'implementation_admitted', supervisor: 'running' });
+  }
   options.releaseDispatchAdmissionLock?.();
   const outcome = await runWorkflow(deps, id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
@@ -1472,12 +1598,18 @@ export async function resumeCommand(
     ...(admissionToken === undefined ? {} : { admissionFence: { registry: options.admission!, token: admissionToken, productionMissionId: options.admission!.readLane(admissionToken.laneId)!.missionId, ...(options.admissionWorkspace === undefined ? {} : { executionWorkspace: options.admissionWorkspace }) } }),
   });
   mayReleaseAsPreExecution = false;
-  if (admissionToken !== undefined) await withRunAdmissionBoundary(options, () => settleRunAdmission(options.admission!, admissionToken, outcome.run, runOwnerReceiptPath));
+  if (admissionToken !== undefined) await withRunAdmissionBoundary(options, () => {
+    settleRunAdmission(options.admission!, admissionToken, outcome.run, runOwnerReceiptPath);
+    options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: outcome.run.state.toLowerCase(), supervisor: 'stopped' });
+  });
   return outcome;
   } catch (error) {
     if (admissionToken !== undefined && mayReleaseAsPreExecution) {
       options.releaseDispatchAdmissionLock?.();
-      await withRunAdmissionBoundary(options, () => releasePreExecutionRunAdmission(options.admission!, admissionToken, runOwnerReceiptPath));
+      await withRunAdmissionBoundary(options, () => {
+        releasePreExecutionRunAdmission(options.admission!, admissionToken, runOwnerReceiptPath);
+        options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: 'pre_execution_released', supervisor: 'stopped' });
+      });
     }
     throw error;
   }
@@ -2244,11 +2376,8 @@ export async function main(argv: string[]): Promise<number> {
       const laneId = `manual:${createHash('sha256').update(`${repository}\0${identity.workspace}`).digest('hex').slice(0, 32)}`;
       const receiptPath = resolveManualOwnerReceiptPath(repository, identity.workspace!);
       const now = new Date().toISOString();
-      const manualProjection = (receipt: ManualOwnerReceipt, state: 'active' | 'parked', clean: boolean, revision?: number) => registerManualLane(resolveRunsDir(), {
-        repository, worktree: identity.workspace!, branch: receipt.branch, checkpointSha: receipt.checkpointSha,
-        clean, state, recoverable: clean, laneId, missionId: receipt.missionId,
-        ...(revision === undefined ? {} : { admissionRevision: revision }),
-      }, now);
+      const manualProjection = (state: 'active' | 'parked') =>
+        publishAdmissionRuntimeProjection(resolveRunsDir(), registry, store, { stage: state === 'active' ? 'manual_implementation' : 'manual_parked', supervisor: 'parked' });
       if (action === 'register') {
         const prior = registry.readLane(laneId);
         let missionId: string;
@@ -2278,8 +2407,8 @@ export async function main(argv: string[]): Promise<number> {
         }
         const receipt = readManualOwnerReceipt(receiptPath);
         if (receipt?.status !== 'active' || receipt.generation !== token.generation || receipt.token?.token !== token.token) throw new Error(`Manual lane ${laneId} generation ${token.generation} was admitted but its exact private owner receipt is unavailable; retain the registry fence and reconcile from its private receipt.`);
-        let projection: ReturnType<typeof registerManualLane>;
-        try { projection = manualProjection(receipt, 'active', clean, revision); }
+        let projection: ReturnType<typeof composeOperationalRuntimeProjection>;
+        try { projection = manualProjection('active'); }
         catch (error) {
           const detail = error instanceof Error ? error.message : String(error);
           throw new Error(`Manual lane ${laneId} generation ${token.generation} has a private owner receipt at ${receiptPath}, but projection publication failed; preserve the fence and retry reconciliation: ${detail}`);
@@ -2295,7 +2424,7 @@ export async function main(argv: string[]): Promise<number> {
         if (current?.status !== 'active' || current.missionId !== parsed.missionId || current.generation !== parsed.generation || current.role !== 'production_captain' || current.evidence.repositoryScope !== true || current.evidence.workspace !== identity.workspace) throw new Error('Recovery receipt is stale or does not match current registry ownership.');
         registry.assertCurrentOwner(parsed.token);
         writeManualOwnerReceipt(receiptPath, parsed);
-        const projection = manualProjection(parsed, 'active', clean, registry.snapshot().revision);
+        const projection = manualProjection('active');
         console.log(JSON.stringify({ projection, laneId, missionId: parsed.missionId, ownerReceiptPath: receiptPath }));
         return 0;
       }
@@ -2304,11 +2433,14 @@ export async function main(argv: string[]): Promise<number> {
       if (receipt === null || receipt.laneId !== laneId || receipt.repository !== repository || receipt.workspace !== identity.workspace) throw new Error('Private manual owner receipt is missing or belongs to a different worktree; refusing mutation.');
       if (action === 'park') {
         if (!clean || !stopped || branch !== receipt.branch) throw new Error('Manual park requires the original branch and a clean stopped worktree.');
+        if ((receipt.status === 'parking' || receipt.status === 'parked') && checkpointSha !== receipt.checkpointSha) {
+          throw new Error('Manual park retry requires its exact recorded HEAD checkpoint.');
+        }
         let generation: number;
         let revision: number;
         if (receipt.status === 'active' || (receipt.status === 'parking' && prior?.status === 'active')) {
           if (!receipt.token || prior?.status !== 'active' || prior.generation !== receipt.generation || prior.missionId !== receipt.missionId) throw new Error('Manual owner receipt is stale or no longer matches active registry ownership.');
-          if (receipt.status === 'parking' && (branch !== receipt.branch || checkpointSha !== receipt.checkpointSha)) throw new Error('Interrupted manual park must resume from its exact recorded branch and HEAD checkpoint.');
+          if (receipt.status === 'parking' && branch !== receipt.branch) throw new Error('Interrupted manual park must resume from its exact recorded branch and HEAD checkpoint.');
           const parking: ManualOwnerReceipt = receipt.status === 'parking' ? receipt : { ...receipt, status: 'parking', branch, checkpointSha };
           if (receipt.status !== 'parking') writeManualOwnerReceipt(receiptPath, parking);
           revision = registry.parkManual(receipt.token, { worktree, branch, checkpointSha, clean, stopped });
@@ -2322,7 +2454,7 @@ export async function main(argv: string[]): Promise<number> {
           generation = receipt.generation; revision = registry.snapshot().revision;
         } else throw new Error('Manual owner receipt and registry do not establish a current active or parked generation.');
         const parkedReceipt = readManualOwnerReceipt(receiptPath)!;
-        const projection = manualProjection(parkedReceipt, 'parked', true, revision);
+        const projection = manualProjection('parked');
         console.log(JSON.stringify({ projection, laneId, missionId: receipt.missionId, admissionRevision: revision, parkedGeneration: generation, ownerReceiptPath: receiptPath }));
         return 0;
       }
@@ -2334,8 +2466,8 @@ export async function main(argv: string[]): Promise<number> {
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(`Manual retirement did not release its exact parked generation; the parked projection remains authoritative: ${detail}`);
       }
-      let projection: ReturnType<typeof retireManualLane>;
-      try { projection = retireManualLane(resolveRunsDir(), laneId, now); }
+      let projection: ReturnType<typeof composeOperationalRuntimeProjection>;
+      try { projection = publishAdmissionRuntimeProjection(resolveRunsDir(), registry, store, { stage: 'idle', supervisor: 'parked' }); }
       catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         throw new Error(`Manual lane generation ${receipt.generation} is retired in the registry, but its parked projection could not be cleared; preserve the released generation and retry exact-generation reconciliation: ${detail}`);
@@ -2350,7 +2482,11 @@ export async function main(argv: string[]): Promise<number> {
       const desired = rest[0] === 'hold';
       const { projection, wake } = await withDispatchAdmissionLock(() => {
         const wasHeld = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
-        const projection = setMaintenanceHold(resolveRunsDir(), desired, new Date().toISOString());
+        const registry = createHostAdmissionRegistry();
+        const projection = publishAdmissionRuntimeProjection(resolveRunsDir(), registry, store, {
+          stage: desired ? 'maintenance_hold' : 'idle', supervisor: desired ? 'parked' : 'stopped',
+          maintenanceHold: desired ? { active: true, reason: 'Operator restart hold' } : { active: false },
+        });
         // A meaningful release wakes the already-singleton driver exactly once.
         // Repeating an already released command is deliberately a no-op at the
         // wake boundary; it cannot manufacture another reconciliation.
@@ -2427,19 +2563,9 @@ export async function main(argv: string[]): Promise<number> {
       throw error;
     }
     try {
-      const publishRuntime = (stage: string, supervisor: 'running' | 'stopped' | 'parked', nextPollAt?: string) => writeOperationalRuntimeProjection(resolveRunsDir(), {
-        schemaVersion: OPERATIONAL_RUNTIME_PROJECTION_VERSION, updatedAt: new Date().toISOString(), supervisor, stage,
-        ...(nextPollAt === undefined ? {} : { nextPollAt }), eventWakeEligible: subcommand === 'serve',
-        maintenanceHold: readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold ?? { active: false },
-        ...(() => {
-          const active = store.list().filter((run) => !['MERGED', 'FAILED', 'MERGE_READY', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY'].includes(run.state));
-          if (active.length !== 0 && active.length !== 1) return { ownership: 'ambiguous' as const, checkpoint: 'unknown' as const };
-          if (active.length === 0) return { ownership: 'none' as const, checkpoint: 'durable' as const };
-          const run = active[0]!;
-          if (run.bootstrap === undefined) return { ownership: 'ambiguous' as const, checkpoint: 'unknown' as const };
-          return { ownership: 'active' as const, checkpoint: run.headSha === undefined ? 'in_progress' as const : 'durable' as const, activeWriter: { runId: run.id, ...(run.target.kind === 'issue' ? { issue: run.target.issueNumber } : {}), ...(run.execution === undefined ? {} : { worker: run.execution.executor }), worktree: run.bootstrap.workspacePath } };
-        })(),
-        ...(readOperationalRuntimeProjection(resolveRunsDir())?.manualLane === undefined ? {} : { manualLane: readOperationalRuntimeProjection(resolveRunsDir())!.manualLane! }),
+      const admission = createHostAdmissionRegistry();
+      const publishRuntime = (stage: string, supervisor: 'running' | 'stopped' | 'parked', nextPollAt?: string) => publishAdmissionRuntimeProjection(resolveRunsDir(), admission, store, {
+        stage, supervisor, eventWakeEligible: subcommand === 'serve', ...(nextPollAt === undefined ? {} : { nextPollAt }),
       });
       const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
       const nextPollAt = () => subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined;
@@ -2457,7 +2583,6 @@ export async function main(argv: string[]): Promise<number> {
         const transport = new GhCliTransport();
         const runtime = new GitHubDispatchRuntime(transport, config);
         const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
-        const admission = createHostAdmissionRegistry();
         return await dispatchOnceCommand(config, {
           workflow,
           runtime,
@@ -2468,6 +2593,7 @@ export async function main(argv: string[]): Promise<number> {
           runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock) => {
             return await runIssueCommand(workflow, ref, {
               ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
+              publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
             });
           },
@@ -2479,6 +2605,7 @@ export async function main(argv: string[]): Promise<number> {
               dispatchClaimId,
               ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }),
               admission: missionAdmission!,
+              publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
             });
@@ -2724,6 +2851,7 @@ export async function main(argv: string[]): Promise<number> {
       }
       return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities), id, values.decision!, {
         admission: createHostAdmissionRegistry(),
+        publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
         ...(admissionWorkspace === undefined ? {} : { admissionWorkspace }),
         releaseDispatchAdmissionLock: releaseAdmissionLock,
         withDispatchAdmissionLock: withLock,
@@ -2768,6 +2896,7 @@ export async function main(argv: string[]): Promise<number> {
       : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
     return runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, {
       execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(),
+      publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
       releaseDispatchAdmissionLock: releaseAdmissionLock,
       withDispatchAdmissionLock: async <T>(operation: () => T | Promise<T>) => await withDispatchAdmissionLock(operation),
     });

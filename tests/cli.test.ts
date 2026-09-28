@@ -14,6 +14,7 @@ import {
   LIVE_HEAD_SYNC_DECISION,
   main,
   outcomeExitCode,
+  publishAdmissionRuntimeProjection,
   printOutcome,
   parseIssueNumber,
   parseIssueRef,
@@ -37,6 +38,7 @@ import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
+import { CANCEL_RUN_DECISION } from '../src/domain/decisions.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/domain/types.js';
 import { GitHubLiveStateError } from '../src/github/errors.js';
@@ -44,11 +46,13 @@ import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
 import type { WorkflowOutcome } from '../src/workflow/run.js';
 import { MissionAdmissionRegistry, type AdmissionConfig } from '../src/mission-admission/registry.js';
-import { resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { readManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { DispatchAdmissionWaitError } from '../src/dispatch/runner.js';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../src/dispatch/invocation-lock.js';
 import type { DispatchRuntimeClaim } from '../src/dispatch/queue.js';
+import { readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
 import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 import { createGenuineLunaFixture } from './support/genuine-luna.js';
 
@@ -1432,6 +1436,367 @@ describe('workflow run and resume commands', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('publishes initial and resumed active ownership before releasing the admission lock', async () => {
+    const { dir } = tempStore();
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const workspace = path.join(dir, 'execution-workspace');
+      mkdirSync(workspace);
+      const config: AdmissionConfig = { schemaVersion: 1, revision: 'projection-order-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config });
+      const store = new MemoryStore();
+      store.create(createRun(TARGET, T0, 'projection-initial'));
+      const events: string[] = [];
+      const implementation = new FakeImplementation([]);
+      const initialGithub = githubAdapter([HEAD]);
+      const initialRead = initialGithub.readLiveSnapshot.bind(initialGithub);
+      initialGithub.readLiveSnapshot = async (target) => {
+        events.push(`entry:${readOperationalRuntimeProjection(dir)?.ownership}`);
+        return await initialRead(target);
+      };
+      const publish = (_registry: MissionAdmissionRegistry, runStore: RunStore) => {
+        const projection = publishAdmissionRuntimeProjection(dir, registry, runStore, { stage: 'admitted', supervisor: 'running' });
+        events.push(`projection:${projection.ownership}`);
+      };
+      const initial = await runIssueCommand(deps(store, initialGithub, implementation, new FakeReviewer([])), 'acme/widgets#42', {
+        admission: registry, admissionWorkspace: workspace, runOwnerReceiptPath: resolveRunOwnerReceiptPath('acme/widgets', 'projection-initial', { repository: 'acme/widgets', workspace }),
+        publishRuntimeProjection: publish,
+        releaseDispatchAdmissionLock: () => events.push('release'),
+        now: () => T0,
+      });
+      assert.equal(initial.outcome, 'needs_human');
+      assert.deepEqual(events.slice(0, 3), ['projection:active', 'release', 'entry:active']);
+      assert.equal(implementation.calls, 0, 'the source-owned adapter hold does not start the fake provider');
+      assert.equal(readOperationalRuntimeProjection(dir)?.ownership, 'ambiguous', 'unpersisted PR evidence added to admission but not the Run is not laundered into a durable restart checkpoint');
+
+      const resumeStore = new MemoryStore();
+      let parked = createRun(TARGET, T0, 'projection-resume');
+      parked = applyTransition(parked, { type: 'start' }, T0);
+      parked = applyTransition(parked, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      parked = applyTransition(parked, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+      parked = applyTransition(parked, { type: 'escalate', reason: 'operator decision', interrupt: { evidence: 'decision required', choices: ['continue'] } }, T0);
+      resumeStore.create(parked);
+      const resumeRegistry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'resume-registry.json'), config });
+      const resumeEvents: string[] = [];
+      const resumeImplementation = new FakeImplementation([]);
+      const resumeGithub = githubAdapter([HEAD]);
+      const resumeRead = resumeGithub.readLiveSnapshot.bind(resumeGithub);
+      resumeGithub.readLiveSnapshot = async (target) => {
+        resumeEvents.push(`entry:${readOperationalRuntimeProjection(dir)?.ownership}`);
+        return await resumeRead(target);
+      };
+      const resumeOutcome = await resumeCommand(deps(resumeStore, resumeGithub, resumeImplementation, new FakeReviewer([])), parked.id, 'continue', {
+        admission: resumeRegistry, admissionWorkspace: workspace, runOwnerReceiptPath: resolveRunOwnerReceiptPath('acme/widgets', parked.id, { repository: 'acme/widgets', workspace }),
+        publishRuntimeProjection: (_activeRegistry, runStore) => {
+          const projection = publishAdmissionRuntimeProjection(dir, resumeRegistry, runStore, { stage: 'resumed', supervisor: 'running' });
+          resumeEvents.push(`projection:${projection.ownership}:${runStore.read(parked.id)?.state}`);
+        },
+        releaseDispatchAdmissionLock: () => resumeEvents.push('release'),
+        now: () => T0,
+      });
+      assert.equal(resumeOutcome.run.id, parked.id, 'resume retains the existing durable Run through safe hold/failure settlement');
+      assert.deepEqual(resumeEvents.slice(0, 3), ['projection:active:REVIEWING', 'release', 'entry:active']);
+      assert.equal(resumeImplementation.calls, 0);
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('clears stale active discovery only after complete parked Run receipt evidence validates', () => {
+    const { dir } = tempStore();
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const run = mergeReadyRun('projection-reentry-proof', dir);
+      const store = new MemoryStore();
+      const setup = setupParkedMerge(dir, store, run, 'workflow_settled');
+      writeOperationalRuntimeProjection(dir, {
+        schemaVersion: 1, updatedAt: T0, supervisor: 'stopped', stage: 'prior-active', eventWakeEligible: false,
+        maintenanceHold: { active: true }, ownership: 'active', checkpoint: 'in_progress',
+        activeWriter: { runId: run.id, issue: 42, worktree: run.bootstrap!.workspacePath },
+      });
+      const projection = publishAdmissionRuntimeProjection(dir, setup.registry, store, { stage: 'settled', supervisor: 'stopped' });
+      assert.equal(projection.ownership, 'none');
+      assert.equal(projection.checkpoint, 'durable');
+      assert.equal(projection.activeWriter, undefined, 'authoritative finalized receipt and matching Run/registry identity clear stale discovery detail');
+      assert.equal(projection.maintenanceHold.active, true, 'projection refresh preserves the existing maintenance hold');
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('does not infer durable history from noninitial or contradictory empty registry metadata', () => {
+    const config: AdmissionConfig = { schemaVersion: 1, revision: 'empty-history-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+    for (const state of [
+      { schemaVersion: 1, revision: 1, config, lanes: [], lastTransition: null },
+      { schemaVersion: 1, revision: 0, config, lanes: [], lastTransition: { kind: 'released', laneId: 'orphan', at: T0 } },
+    ]) {
+      const { dir } = tempStore();
+      try {
+        const registryPath = path.join(dir, 'registry.json');
+        writeFileSync(registryPath, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+        const registry = new MissionAdmissionRegistry({ filePath: registryPath, config });
+        const projection = publishAdmissionRuntimeProjection(dir, registry, new MemoryStore(), { stage: 'empty-history', supervisor: 'stopped' });
+        assert.equal(projection.ownership, 'ambiguous');
+        assert.equal(projection.checkpoint, 'unknown');
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+
+  it('keeps missing, transitional, and mismatched parked Run receipts unknown without rewriting them', () => {
+    for (const defect of ['missing', 'transitional', 'workspace'] as const) {
+      const { dir } = tempStore();
+      const restoreEnv = isolateMergeReceiptRoot(dir);
+      try {
+        const run = mergeReadyRun(`projection-invalid-${defect}`, dir);
+        const store = new MemoryStore();
+        const setup = setupParkedMerge(dir, store, run, 'workflow_settled');
+        if (defect === 'missing') rmSync(setup.receiptPath);
+        else {
+          const receipt = readRunOwnerReceipt(setup.receiptPath)!;
+          writeRunOwnerReceipt(setup.receiptPath, defect === 'transitional'
+            ? { ...receipt, phase: 'parked_release_transition' }
+            : { ...receipt, workspace: path.join(dir, 'different-worktree') });
+        }
+        const beforeReceipt = existsSync(setup.receiptPath) ? readFileSync(setup.receiptPath, 'utf8') : null;
+        const projection = publishAdmissionRuntimeProjection(dir, setup.registry, store, { stage: 'reentry-check', supervisor: 'stopped' });
+        assert.equal(projection.ownership, 'ambiguous', `${defect} receipt cannot prove harmless settled history`);
+        assert.equal(projection.checkpoint, 'unknown');
+        assert.equal(existsSync(setup.receiptPath) ? readFileSync(setup.receiptPath, 'utf8') : null, beforeReceipt, 'projection is read-only with respect to failed recovery evidence');
+      } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+    }
+
+    for (const defect of ['missing', 'transitional', 'workspace'] as const) {
+      const { dir } = tempStore();
+      const restoreEnv = isolateMergeReceiptRoot(dir);
+      try {
+        const run = mergeReadyRun(`projection-invalid-released-${defect}`, dir);
+        const store = new MemoryStore();
+        const setup = setupParkedMerge(dir, store, run, 'workflow_settled');
+        assert.equal(recoverRunAdmission(store, setup.registry, run.id, setup.generation, true, setup.receiptPath), 'released');
+        const receiptBytes = readFileSync(setup.receiptPath, 'utf8');
+        assert.equal(readRunOwnerReceipt(setup.receiptPath)?.phase, 'released');
+        const valid = publishAdmissionRuntimeProjection(dir, setup.registry, store, { stage: 'released-valid', supervisor: 'stopped' });
+        assert.equal(valid.ownership, 'none', 'the exact finalized released receipt proves re-entry immediately after recovery');
+        assert.equal(valid.checkpoint, 'durable');
+        if (defect === 'missing') rmSync(setup.receiptPath);
+        else {
+          const receipt = readRunOwnerReceipt(setup.receiptPath)!;
+          writeRunOwnerReceipt(setup.receiptPath, defect === 'transitional'
+            ? { ...receipt, phase: 'parked_release_transition' }
+            : { ...receipt, workspace: path.join(dir, 'different-worktree') });
+        }
+        const defectiveBytes = existsSync(setup.receiptPath) ? readFileSync(setup.receiptPath, 'utf8') : null;
+        const projection = publishAdmissionRuntimeProjection(dir, setup.registry, store, { stage: 'reentry-check', supervisor: 'stopped' });
+        assert.equal(projection.ownership, 'ambiguous', `${defect} Run release evidence is never treated like harmless absence`);
+        assert.equal(projection.checkpoint, 'unknown');
+        assert.equal(existsSync(setup.receiptPath) ? readFileSync(setup.receiptPath, 'utf8') : null, defectiveBytes);
+        assert.notEqual(receiptBytes, '', 'the case began with an exact durable release receipt');
+      } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+
+  it('accepts only a persisted pristine revision-zero registry as empty durable history', () => {
+    const { dir } = tempStore();
+    try {
+      const config: AdmissionConfig = { schemaVersion: 1, revision: 'pristine-projection-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const registryPath = path.join(dir, 'registry.json');
+      const registry = new MissionAdmissionRegistry({ filePath: registryPath, config });
+      writeFileSync(registryPath, `${JSON.stringify({ schemaVersion: 1, revision: 0, config, lanes: [], lastTransition: null }, null, 2)}\n`, { mode: 0o600 });
+      const store = new MemoryStore();
+      const pristine = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'idle', supervisor: 'stopped' });
+      assert.equal(pristine.ownership, 'none');
+      assert.equal(pristine.checkpoint, 'durable');
+
+      writeOperationalRuntimeProjection(dir, {
+        schemaVersion: 1, updatedAt: T0, supervisor: 'stopped', stage: 'stale-discovery', eventWakeEligible: false,
+        maintenanceHold: { active: false }, ownership: 'active', checkpoint: 'in_progress',
+        activeWriter: { runId: 'missing-run', issue: 42, worktree: path.join(dir, 'old-worktree') },
+      });
+      const unresolved = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'reconcile', supervisor: 'stopped' });
+      assert.equal(unresolved.ownership, 'ambiguous', 'identified stale owner details cannot be discarded as an empty first boot');
+      assert.equal(unresolved.checkpoint, 'unknown');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('requires exact manual receipt identity and preserves unrelated account-wide ownership at retirement', () => {
+    const { dir } = tempStore();
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    try {
+      const workspace = path.join(dir, 'manual-workspace');
+      mkdirSync(workspace);
+      const store = new MemoryStore();
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'manual-registry.json'), config: { schemaVersion: 1, revision: 'manual-reentry-v1', limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } } });
+      const admitted = registry.admit({ laneId: 'manual:projection', role: 'production_captain', evidence: { repository: 'acme/widgets', repositoryScope: true, workspace } });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') return;
+      const canonicalWorkspace = realpathSync(workspace);
+      const receiptPath = resolveManualOwnerReceiptPath('acme/widgets', canonicalWorkspace);
+      const activeReceipt: ManualOwnerReceipt = {
+        schemaVersion: 1, laneId: admitted.token.laneId, missionId: admitted.missionId, repository: 'acme/widgets',
+        workspace: canonicalWorkspace, branch: 'main', checkpointSha: 'a'.repeat(40), status: 'active',
+        generation: admitted.token.generation, token: admitted.token,
+      };
+      writeManualOwnerReceipt(receiptPath, activeReceipt);
+      const exactActive = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'manual_active', supervisor: 'running' });
+      assert.equal(exactActive.ownership, 'active');
+      assert.equal(exactActive.manualLane?.laneId, admitted.token.laneId);
+      writeManualOwnerReceipt(receiptPath, { ...activeReceipt, repository: 'other/repo' });
+      const mismatched = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'manual_active', supervisor: 'running' });
+      assert.equal(mismatched.ownership, 'active', 'registry count remains authoritative despite bad detail');
+      assert.equal(mismatched.manualLane, undefined, 'receipt body identity must match the exact active lane before exposing details');
+      writeManualOwnerReceipt(receiptPath, activeReceipt);
+
+      registry.parkManual(admitted.token, { worktree: canonicalWorkspace, branch: 'main', checkpointSha: 'a'.repeat(40), clean: true, stopped: true });
+      const parkedLane = registry.readLane(admitted.token.laneId)!;
+      writeManualOwnerReceipt(receiptPath, {
+        schemaVersion: 1, laneId: parkedLane.laneId, missionId: parkedLane.missionId, repository: 'acme/widgets',
+        workspace: canonicalWorkspace, branch: 'main', checkpointSha: 'a'.repeat(40), status: 'parked', generation: parkedLane.generation,
+      });
+      const registryPath = path.join(dir, 'manual-registry.json');
+      const parkedRegistryBytes = readFileSync(registryPath, 'utf8');
+      const malformedReasonState = JSON.parse(parkedRegistryBytes) as { lanes: Array<Record<string, unknown>> };
+      malformedReasonState.lanes[0]!.parkedReason = 'workflow_wait';
+      writeFileSync(registryPath, `${JSON.stringify(malformedReasonState, null, 2)}\n`);
+      const wrongReason = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'manual_parked', supervisor: 'parked' });
+      assert.equal(wrongReason.ownership, 'ambiguous', 'manual receipts only prove re-entry with the manual_checkpoint lane reason');
+      assert.equal(wrongReason.checkpoint, 'unknown');
+      writeFileSync(registryPath, parkedRegistryBytes);
+      registry.retireManual(parkedLane.laneId, parkedLane.generation, { worktree: canonicalWorkspace, branch: 'main', checkpointSha: 'a'.repeat(40), clean: true, stopped: true });
+      const tombstone = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'retired_manual', supervisor: 'stopped' });
+      assert.equal(tombstone.ownership, 'none');
+      assert.equal(tombstone.checkpoint, 'durable', 'exact parked-generation tombstone proves manual retirement');
+      assert.equal(tombstone.manualLane, undefined);
+      rmSync(receiptPath);
+      const legacyRetirement = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'retired_manual', supervisor: 'stopped' });
+      assert.equal(legacyRetirement.ownership, 'none');
+      assert.equal(legacyRetirement.checkpoint, 'durable', 'verified absence preserves the supported legacy retirement representation');
+
+      const unrelated = registry.admit({ laneId: 'other-account-owner', role: 'production_captain', evidence: { repository: 'elsewhere/widgets', issue: 81 } });
+      assert.equal(unrelated.outcome, 'admitted');
+      if (unrelated.outcome !== 'admitted') return;
+      const withOtherOwner = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'retired_manual', supervisor: 'running' });
+      assert.equal(withOtherOwner.ownership, 'active', 'retiring one manual lane cannot erase a different account-wide writer');
+      assert.equal(withOtherOwner.manualLane, undefined);
+    } finally { restoreEnv(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses missing or corrupt strict registries before publishing a restart projection', () => {
+    const { dir } = tempStore();
+    try {
+      const registryPath = path.join(dir, 'missing-registry.json');
+      const registry = new MissionAdmissionRegistry({ filePath: registryPath, config: { schemaVersion: 1, revision: 'strict-projection-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      assert.throws(() => publishAdmissionRuntimeProjection(dir, registry, new MemoryStore(), { stage: 'idle', supervisor: 'stopped' }), /registry is missing/);
+      assert.equal(existsSync(path.join(dir, '.operational', 'v1', 'runtime.json')), false, 'missing registry cannot be converted into a safe-looking empty projection');
+      writeFileSync(registryPath, '{ corrupt');
+      const corruptBytes = readFileSync(registryPath, 'utf8');
+      assert.throws(() => publishAdmissionRuntimeProjection(dir, registry, new MemoryStore(), { stage: 'idle', supervisor: 'stopped' }), /unreadable or corrupt/);
+      assert.equal(readFileSync(registryPath, 'utf8'), corruptBytes, 'corrupt authority remains untouched');
+      assert.equal(existsSync(path.join(dir, '.operational', 'v1', 'runtime.json')), false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('blocks first provider entry when initial projection publication fails', async () => {
+    const { dir } = tempStore();
+    try {
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config: { schemaVersion: 1, revision: 'projection-failure-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const store = new MemoryStore();
+      const implementation = new FakeImplementation([]);
+      const github = githubAdapter([HEAD]);
+      let workflowEntries = 0;
+      const readLive = github.readLiveSnapshot.bind(github);
+      github.readLiveSnapshot = async (target) => { workflowEntries += 1; return await readLive(target); };
+      let publications = 0;
+      await assert.rejects(runIssueCommand(deps(store, github, implementation, new FakeReviewer([])), 'acme/widgets#42', {
+        admission: registry, admissionWorkspace: dir, runOwnerReceiptPath: path.join(dir, 'owner.json'),
+        publishRuntimeProjection: () => { publications += 1; throw new Error('projection disk unavailable'); },
+        now: () => T0,
+      }), /projection disk unavailable/);
+      assert.equal(publications, 2, 'failed active publication is not represented as success; bounded pre-execution cleanup also attempts its truthful projection');
+      assert.equal(implementation.calls, 0, 'workflow/provider entry is blocked by publication failure');
+      assert.equal(workflowEntries, 0, 'no GitHub/workflow entry occurs before a successful initial projection');
+      const run = store.list()[0]!;
+      assert.equal(registry.readLane(`run:${run.id}`)?.status, 'released', 'the known pre-execution admission is safely released');
+
+      let parked = createRun(TARGET, T0, 'projection-resume-failure');
+      parked = applyTransition(parked, { type: 'start' }, T0);
+      parked = applyTransition(parked, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      parked = applyTransition(parked, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+      parked = applyTransition(parked, { type: 'escalate', reason: 'operator decision', interrupt: { evidence: 'decision required', choices: ['continue'] } }, T0);
+      const resumeStore = new MemoryStore();
+      resumeStore.create(parked);
+      const resumeRegistry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'resume-registry.json'), config: { schemaVersion: 1, revision: 'projection-resume-failure-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const resumeGithub = githubAdapter([HEAD]);
+      let resumeEntries = 0;
+      const resumeRead = resumeGithub.readLiveSnapshot.bind(resumeGithub);
+      resumeGithub.readLiveSnapshot = async (target) => { resumeEntries += 1; return await resumeRead(target); };
+      const resumeImplementation = new FakeImplementation([]);
+      await assert.rejects(resumeCommand(deps(resumeStore, resumeGithub, resumeImplementation, new FakeReviewer([])), parked.id, 'continue', {
+        admission: resumeRegistry, admissionWorkspace: dir, runOwnerReceiptPath: path.join(dir, 'resume-owner.json'),
+        publishRuntimeProjection: () => { throw new Error('resume projection unavailable'); },
+        now: () => T0,
+      }), /resume projection unavailable/);
+      assert.equal(resumeEntries, 0, 'a failed resumed active projection blocks all GitHub/workflow entry');
+      assert.equal(resumeImplementation.calls, 0);
+      assert.equal(resumeRegistry.readLane(`run:${parked.id}`)?.status, 'released', 'failed pre-execution resume projection releases its known admission');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('retains finalized admission when postsettlement projection publication fails', async () => {
+    const { dir } = tempStore();
+    try {
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config: { schemaVersion: 1, revision: 'postsettlement-projection-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const store = new MemoryStore();
+      const receiptPath = path.join(dir, 'owner.json');
+      let publications = 0;
+      await assert.rejects(runIssueCommand(deps(store, githubAdapter([HEAD]), new FakeImplementation([]), new FakeReviewer([])), 'acme/widgets#42', {
+        admission: registry, admissionWorkspace: dir, runOwnerReceiptPath: receiptPath,
+        publishRuntimeProjection: (_registry, runStore, update) => {
+          publications += 1;
+          if (publications === 1) {
+            assert.equal(update.stage, 'implementation_admitted');
+            return;
+          }
+          assert.equal(update.stage, runStore.list()[0]?.state.toLowerCase());
+          assert.equal(registry.readLane(`run:${runStore.list()[0]!.id}`)?.status, 'parked', 'settlement is finalized before the second projection attempt');
+          assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked');
+          throw new Error('postsettlement projection unavailable');
+        },
+        now: () => T0,
+      }), /postsettlement projection unavailable/);
+      const run = store.list()[0]!;
+      assert.ok(run.state === 'NEEDS_HUMAN' || run.state === 'FAILED', 'the workflow outcome remains durably settled');
+      assert.equal(publications, 2);
+      assert.equal(registry.readLane(`run:${run.id}`)?.status, 'parked');
+      assert.equal(readRunOwnerReceipt(receiptPath)?.phase, 'parked');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps cancel settlement and its projection inside the same dispatch lock callback', async () => {
+    const { dir } = tempStore();
+    try {
+      let parked = createRun(TARGET, T0, 'projection-cancel-boundary');
+      parked = applyTransition(parked, { type: 'start' }, T0);
+      parked = applyTransition(parked, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      parked = applyTransition(parked, { type: 'validation_passed', validationResult: validationPassed(HEAD), pullRequest: { number: 7, headSha: HEAD } }, T0);
+      parked = applyTransition(parked, { type: 'escalate', reason: 'operator decision', interrupt: { evidence: 'decision required', choices: [CANCEL_RUN_DECISION] } }, T0);
+      const store = new MemoryStore();
+      store.create(parked);
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config: { schemaVersion: 1, revision: 'projection-cancel-boundary-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      let held = true;
+      const events: string[] = [];
+      const outcome = await resumeCommand(deps(store, githubAdapter([]), new FakeImplementation([]), new FakeReviewer([])), parked.id, CANCEL_RUN_DECISION, {
+        admission: registry, admissionWorkspace: dir, runOwnerReceiptPath: path.join(dir, 'owner.json'),
+        withDispatchAdmissionLock: async () => { throw new Error('cancel settlement must reuse its already-held short lock'); },
+        releaseDispatchAdmissionLock: () => { held = false; },
+        publishRuntimeProjection: (_registry, runStore) => {
+          assert.equal(held, true, 'cancellation settles and publishes inside the same short-lock callback');
+          assert.equal(runStore.read(parked.id)?.state, 'FAILED');
+          events.push('published');
+        },
+        now: () => T0,
+      });
+      assert.equal(outcome.outcome, 'failed');
+      assert.deepEqual(events, ['published']);
+      assert.equal(held, false);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('persists direct capacity-wait Run before admission and retries the same id after capacity release', async () => {
     const { dir } = tempStore();
     try {
@@ -2302,6 +2667,82 @@ describe('workflow run and resume commands', () => {
         'the interrupted completion can be settled with explicit stopped proof after the child is known to have finished');
       assert.equal(admission.readLane(`run:${run.id}`)?.status, 'released');
     } finally { fixture.cleanup(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('publishes a real active projection and releases the lock before a genuine Luna executable enters', async () => {
+    const { dir } = tempStore();
+    const fixture = await createGenuineLunaFixture('cli-genuine-projection-entry', { deferPrepare: true });
+    const restoreEnv = isolateMergeReceiptRoot(dir);
+    let releaseFixtureLock: () => void = () => {};
+    try {
+      const store = new MemoryStore();
+      const runId = fixture.request.runtimeOwnership.runId;
+      store.create(createRun(TARGET, T0, runId, fixture.request.execution));
+      const config: AdmissionConfig = { schemaVersion: 1, revision: 'genuine-projection-entry-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(dir, 'registry.json'), config });
+      const markerRoot = path.join(fixture.root, 'ordering');
+      mkdirSync(markerRoot);
+      const reservationMarker = path.join(markerRoot, 'reservation');
+      const projectionMarker = path.join(markerRoot, 'projection');
+      const releaseMarker = path.join(markerRoot, 'release');
+      const entryMarker = path.join(markerRoot, 'entry');
+      const fixtureLockPath = path.join(markerRoot, 'dispatch-invocation.lock');
+      const fixtureLock = acquireDispatchInvocationLock({ lockPath: fixtureLockPath });
+      let fixtureLockReleased = false;
+      releaseFixtureLock = () => {
+        if (!fixtureLockReleased) {
+          fixtureLock.release();
+          fixtureLockReleased = true;
+        }
+      };
+      const sequence: string[] = [];
+      writeFileSync(path.join(fixture.root, 'bin', 'codex'), [
+        '#!/bin/sh',
+        `test -f '${reservationMarker}' && test -f '${projectionMarker}' && test -f '${releaseMarker}' && test ! -e '${fixtureLockPath}' || exit 73`,
+        `printf entry > '${entryMarker}'`,
+        `printf '%s\\n' '{"type":"thread.started","thread_id":"genuine-projection-thread"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"genuine-projection-message","type":"agent_message","text":"bounded fixture result"}}' '{"type":"turn.completed"}'`,
+        '',
+      ].join('\n'), { mode: 0o700 });
+      const live = githubAdapter([fixture.identity.baseSha, fixture.identity.baseSha, fixture.identity.baseSha]);
+      const github: GitHubAdapter = {
+        ...live,
+        async readLiveSnapshot(target) {
+          const value = await live.readLiveSnapshot(target);
+          return { ...value, repository: { ...value.repository, defaultBranch: fixture.identity.baseBranch,
+            defaultBranchHeadSha: fixture.identity.baseSha }, pullRequest: null, headSha: null };
+        },
+      };
+      await runIssueCommand({ ...deps(store, github, fixture.adapter, new FakeReviewer([])), bootstrapForExecution: () => fixture.bootstrap },
+        'acme/widgets#42', {
+          admission: registry,
+          admissionWorkspace: fixture.identity.workspacePath,
+          runOwnerReceiptPath: path.join(dir, 'run-owner.json'),
+          publishRuntimeProjection: (currentRegistry, runStore, update) => {
+            const entered = existsSync(entryMarker);
+            if (entered) return publishAdmissionRuntimeProjection(dir, currentRegistry, runStore, update);
+            assert.equal(existsSync(fixtureLockPath), true, 'the actual dispatch invocation lock remains held while ownership is published');
+            const lane = currentRegistry.snapshot({ requireExisting: true }).lanes.find((candidate) => candidate.laneId === `run:${runId}`);
+            assert.equal(lane?.status, 'active', 'reservation is persisted before projection publication');
+            writeFileSync(reservationMarker, 'active');
+            sequence.push('reservation');
+            const projection = publishAdmissionRuntimeProjection(dir, currentRegistry, runStore, update);
+            assert.equal(readOperationalRuntimeProjection(dir)?.ownership, 'active', 'projection is read back after its actual file write');
+            writeFileSync(projectionMarker, 'active');
+            sequence.push('projection');
+            return projection;
+          },
+          releaseDispatchAdmissionLock: () => {
+            assert.equal(readOperationalRuntimeProjection(dir)?.ownership, 'active', 'lock release follows the published active projection');
+            releaseFixtureLock();
+            assert.equal(existsSync(fixtureLockPath), false, 'the actual dispatch invocation lock is released before workflow entry');
+            writeFileSync(releaseMarker, 'released');
+            sequence.push('release');
+          },
+        });
+      assert.equal(existsSync(entryMarker), true, 'the source-qualified controlled codex executable was entered');
+      sequence.push('entry');
+      assert.deepEqual(sequence.slice(0, 4), ['reservation', 'projection', 'release', 'entry']);
+    } finally { releaseFixtureLock(); restoreEnv(); fixture.cleanup(); rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('refuses uncertain Run recovery when persisted PR evidence is absent from its admission lane', async () => {

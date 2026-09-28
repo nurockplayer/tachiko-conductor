@@ -97,6 +97,16 @@ function git(directory: string, ...args: string[]): void {
 }
 
 describe('provider-neutral durable mission admission', () => {
+  it('keeps legacy empty snapshots while strict projection reads reject an absent registry', () => {
+    const value = fixture();
+    try {
+      assert.equal(value.registry.snapshot().counts.writers, 0, 'existing callers retain the legacy empty snapshot behavior');
+      assert.throws(() => value.registry.snapshot({ requireExisting: true }), /registry is missing/);
+      const admitted = value.registry.admit({ laneId: 'strict-snapshot-owner', role: 'production_captain', evidence: evidence(901) });
+      assert.equal(admitted.outcome, 'admitted');
+      assert.equal(value.registry.snapshot({ requireExisting: true }).counts.writers, 1);
+    } finally { rmSync(value.directory, { recursive: true, force: true }); }
+  });
   it('blocks registry lock and admission callbacks until every visible hierarchy edge is synced', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-admission-hierarchy-'));
     const canonicalDirectory = realpathSync(directory);
@@ -1549,6 +1559,78 @@ describe('provider-neutral durable mission admission', () => {
       const duplicateRetire = runCli(['dispatch', 'manual', 'retire', '--stopped', '--expected-generation', String(parkedResult.parkedGeneration)], workspace, env);
       assert.notEqual(duplicateRetire.status, 0);
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('requires the exact clean stopped branch and HEAD before retrying interrupted or finalized manual parking', () => {
+    for (const drift of ['head', 'branch'] as const) {
+      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-manual-park-${drift}-`));
+      const workspace = path.join(directory, 'worktree');
+      const runsDirectory = path.join(directory, 'runs');
+      const registryPath = path.join(directory, '.tachiko-conductor', 'mission-admission', 'registry.json');
+      const receipts = path.join(directory, '.tachiko-conductor', 'mission-admission', 'manual-receipts');
+      const cliConfig: AdmissionConfig = { schemaVersion: 1, revision: `manual-park-${drift}-v1`, limits: { maxCaptains: 2, maxWriters: 1, maxHighAutonomy: 2 } };
+      const env: NodeJS.ProcessEnv = { ...process.env, HOME: directory, TACHIKO_DATA_DIR: runsDirectory, TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: receipts, TACHIKO_MISSION_ADMISSION_PATH: registryPath, TACHIKO_MISSION_ADMISSION_CONFIG: JSON.stringify(cliConfig) };
+      try {
+        mkdirSync(workspace);
+        git(workspace, 'init', '-q', '--initial-branch=main');
+        git(workspace, 'config', 'user.email', 'captain@example.invalid');
+        git(workspace, 'config', 'user.name', 'Captain Test');
+        writeFileSync(path.join(workspace, 'tracked.txt'), 'checkpoint\n');
+        git(workspace, 'add', 'tracked.txt');
+        git(workspace, 'commit', '-q', '-m', 'checkpoint');
+        git(workspace, 'remote', 'add', 'origin', 'https://github.com/Acme/Widgets.git/');
+
+        const registered = runCli(['dispatch', 'manual', 'register'], workspace, env);
+        assert.equal(registered.status, 0, registered.stderr);
+        const { ownerReceiptPath } = JSON.parse(registered.stdout) as { ownerReceiptPath: string };
+        const activeReceipt = JSON.parse(readFileSync(ownerReceiptPath, 'utf8')) as ManualOwnerReceipt;
+        const parked = runCli(['dispatch', 'manual', 'park', '--stopped'], workspace, env);
+        assert.equal(parked.status, 0, parked.stderr);
+        const parkedValue = JSON.parse(parked.stdout) as { parkedGeneration: number };
+
+        if (drift === 'head') {
+          // Reconstruct the crash window after registry publication, then
+          // prove a changed HEAD cannot finish it.
+          writeFileSync(ownerReceiptPath, `${JSON.stringify({ ...activeReceipt, status: 'parking' }, null, 2)}\n`);
+          writeFileSync(path.join(workspace, 'tracked.txt'), 'advanced before interrupted retry\n');
+          git(workspace, 'add', 'tracked.txt');
+          git(workspace, 'commit', '-q', '-m', 'advance interrupted park HEAD');
+          const interruptedBytes = readFileSync(ownerReceiptPath, 'utf8');
+          const interruptedRegistry = readFileSync(registryPath, 'utf8');
+          const interruptedRetry = runCli(['dispatch', 'manual', 'park', '--stopped'], workspace, env);
+          assert.notEqual(interruptedRetry.status, 0, 'changed clean HEAD cannot finalize the registry-published parking receipt');
+          assert.match(interruptedRetry.stderr, /exact recorded HEAD checkpoint/);
+          assert.equal(readFileSync(ownerReceiptPath, 'utf8'), interruptedBytes);
+          assert.equal(readFileSync(registryPath, 'utf8'), interruptedRegistry);
+          git(workspace, 'reset', '-q', '--hard', activeReceipt.checkpointSha);
+          const crashRetry = runCli(['dispatch', 'manual', 'park', '--stopped'], workspace, env);
+          assert.equal(crashRetry.status, 0, crashRetry.stderr);
+          assert.equal((JSON.parse(readFileSync(ownerReceiptPath, 'utf8')) as ManualOwnerReceipt).status, 'parked');
+        }
+
+        if (drift === 'head') {
+          writeFileSync(path.join(workspace, 'tracked.txt'), 'new clean checkpoint\n');
+          git(workspace, 'add', 'tracked.txt');
+          git(workspace, 'commit', '-q', '-m', 'advance parked HEAD');
+        } else {
+          writeFileSync(ownerReceiptPath, `${JSON.stringify({ ...activeReceipt, status: 'parking' }, null, 2)}\n`);
+          git(workspace, 'checkout', '-q', '-b', 'codex/parked-branch-drift');
+        }
+        const beforeReceipt = readFileSync(ownerReceiptPath, 'utf8');
+        const beforeRegistry = readFileSync(registryPath, 'utf8');
+        const beforeProjection = readFileSync(path.join(runsDirectory, '.operational', 'v1', 'runtime.json'), 'utf8');
+        const retry = runCli(['dispatch', 'manual', 'park', '--stopped'], workspace, env);
+        assert.notEqual(retry.status, 0, `${drift} drift cannot republish a stale parked checkpoint`);
+        assert.match(retry.stderr, /original branch|exact recorded HEAD checkpoint/);
+        assert.equal(readFileSync(ownerReceiptPath, 'utf8'), beforeReceipt, 'failed retry does not rewrite the private receipt');
+        assert.equal(readFileSync(registryPath, 'utf8'), beforeRegistry, 'failed retry does not change the parked admission generation');
+        assert.equal(readFileSync(path.join(runsDirectory, '.operational', 'v1', 'runtime.json'), 'utf8'), beforeProjection, 'failed retry does not publish a success projection');
+        const registry = new MissionAdmissionRegistry({ filePath: registryPath, config: cliConfig });
+        const lane = registry.snapshot().lanes.find((candidate) => candidate.laneId === activeReceipt.laneId);
+        assert.equal(lane?.status, 'parked');
+        assert.equal(lane?.generation, parkedValue.parkedGeneration);
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    }
   });
 
   it('retains manual ownership when projection publication fails and blocks a competitor', () => {

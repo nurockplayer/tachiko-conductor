@@ -453,9 +453,12 @@ export class MissionAdmissionRegistry {
     } finally { unlock(); }
   }
 
-  private readState(): RegistryState {
+  private readState(requireExisting = false): RegistryState {
     this.validatePath?.();
-    if (!existsSync(this.filePath)) return initialState(this.config);
+    if (!existsSync(this.filePath)) {
+      if (requireExisting) throw new AdmissionStateError('Admission registry is missing; refusing to infer that no owner exists.');
+      return initialState(this.config);
+    }
     let raw: unknown;
     try { raw = JSON.parse(readFileSync(this.filePath, 'utf8')); } catch { throw new AdmissionStateError('Admission registry is unreadable or corrupt; refusing to reset it.'); }
     const state = validateState(raw);
@@ -788,8 +791,8 @@ export class MissionAdmissionRegistry {
     assertNoActiveDelegates(state, lane);
   }
 
-  snapshot(): AdmissionProjection {
-    return project(this.readState());
+  snapshot(options: { readonly requireExisting?: boolean } = {}): AdmissionProjection {
+    return project(this.readState(options.requireExisting === true));
   }
 }
 
