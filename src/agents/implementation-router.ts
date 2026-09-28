@@ -1,6 +1,7 @@
 import {
   GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED,
   GOVERNED_PUBLICATION_REENTRY_ACTION,
+  governedExecutionBoundaryRefusal,
   hasGovernedPublicationConfinement,
   type GovernedInvocationPreparation,
   type ImplementationAgent,
@@ -36,6 +37,8 @@ export class ImplementationAgentRegistry implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const executionBoundaryRefusal = governedExecutionBoundaryRefusal(request);
+    if (executionBoundaryRefusal !== undefined) return executionBoundaryRefusal;
     if (request.governedPublication !== undefined && request.execution === undefined &&
         request.executor === undefined && request.sessionId === undefined) {
       return governedPublicationFailure(request, 'Governed invocation has no exact execution or session identity; a fresh default provider cannot be assumed.');

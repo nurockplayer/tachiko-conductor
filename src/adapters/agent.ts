@@ -59,6 +59,24 @@ export interface WorkspaceGuard {
 }
 
 export const WORKSPACE_GUARD_FAILURE_CODE = 'WORKSPACE_GUARD_FAILURE' as const;
+export const EXECUTION_ADMISSION_REFUSAL_CODE = 'EXECUTION_ADMISSION_REFUSED' as const;
+
+/** A host-only boundary refused entry because current execution authority could not be established. */
+export class ExecutionAdmissionRefusal extends Error {
+  readonly code = EXECUTION_ADMISSION_REFUSAL_CODE;
+  override readonly cause?: unknown;
+  readonly authorityUnknown: boolean;
+  constructor(message: string, readonly runSuperseded: boolean, options: { readonly cause?: unknown; readonly authorityUnknown?: boolean } = {}) {
+    super(message);
+    this.name = 'ExecutionAdmissionRefusal';
+    this.cause = options.cause;
+    this.authorityUnknown = options.authorityUnknown ?? false;
+  }
+}
+
+export function isExecutionAdmissionRefusal(error: unknown): error is ExecutionAdmissionRefusal {
+  return error instanceof ExecutionAdmissionRefusal && error.code === EXECUTION_ADMISSION_REFUSAL_CODE;
+}
 
 export class WorkspaceGuardFailure extends Error {
   readonly code = WORKSPACE_GUARD_FAILURE_CODE;
@@ -95,6 +113,8 @@ export interface ImplementationRequest {
   readonly branch?: string;
   /** Synchronous final authority check for host publication; never persisted or sent into an executor. */
   readonly beforePublish?: () => void;
+  /** Synchronous host-only check immediately before an implementation process enters execution. */
+  readonly beforeExecution?: () => void;
   /** Must be evaluated after capability resolution and directly before spawn. */
   readonly workspaceGuard?: WorkspaceGuard;
   /** Whether the executor should read target authority live instead of from copied prose. */
@@ -143,8 +163,24 @@ export type GovernedInvocationPreparation =
 
 /** Defense in depth for adapters called directly, outside the implementation registry. */
 export function governedPublicationRefusal(adapter: object, request: ImplementationRequest): AgentResult | undefined {
+  const executionBoundaryRefusal = governedExecutionBoundaryRefusal(request);
+  if (executionBoundaryRefusal !== undefined) return executionBoundaryRefusal;
   if (request.governedPublication === undefined || hasGovernedPublicationConfinement(adapter)) return undefined;
   const detail = 'Governed mutation is held because this runtime has no source-qualified publication confinement; no model turn or worker process was started. ' + GOVERNED_PUBLICATION_REENTRY_ACTION;
+  return {
+    exitStatus: 'failure',
+    summary: detail,
+    diagnostics: [`${GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED}: ${detail}`],
+    ...(request.executor === undefined ? {} : { executor: request.executor }),
+    ...(request.sessionId === undefined ? {} : { sessionId: request.sessionId }),
+    durationMs: 0,
+  };
+}
+
+/** Preparation may happen before handoff; governed execution may not omit its final host boundary. */
+export function governedExecutionBoundaryRefusal(request: ImplementationRequest): AgentResult | undefined {
+  if (request.governedPublication === undefined || typeof request.beforeExecution === 'function') return undefined;
+  const detail = `Governed execution is held because its final host execution-boundary callback is missing; no model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`;
   return {
     exitStatus: 'failure',
     summary: detail,

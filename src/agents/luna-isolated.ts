@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
-import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, type GovernedInvocationPreparation, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, governedExecutionBoundaryRefusal, type GovernedInvocationPreparation, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
 import type { AgentResult } from '../domain/types.js';
 import { CodexCliAdapter, hasOriginalCodexCliRun } from './codex-cli.js';
 import { hasPreparedStandaloneLunaInvocation } from '../workspace/standalone-git-bootstrap.js';
@@ -67,6 +67,8 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const executionBoundaryRefusal = governedExecutionBoundaryRefusal(request);
+    if (executionBoundaryRefusal !== undefined) return executionBoundaryRefusal;
     if (request.governedPublication !== undefined && !hasPreparedStandaloneLunaInvocation(request)) {
       return failure(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED,
         `Governed isolated Luna requires the exact current standalone preparation proof. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,

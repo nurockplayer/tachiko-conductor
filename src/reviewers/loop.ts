@@ -2,6 +2,8 @@ import {
   GOVERNED_PUBLICATION_REENTRY_ACTION,
   hasGovernedPublicationConfinement,
   humanTakeoverReason,
+  ExecutionAdmissionRefusal,
+  isExecutionAdmissionRefusal,
   isWorkspaceGuardFailure,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
@@ -134,6 +136,25 @@ function staleReviewOutcome(runId: string, fallback: Run, store: RunStore): Revi
 
 function updateReviewRun(store: RunStore, expected: Run, next: Run): boolean {
   return store.updateIfUnchanged?.(expected, next) ?? false;
+}
+
+function assertFinalRepairAdmission(run: Run, store: RunStore, assertCurrentMutation?: () => void): void {
+  let matched: boolean;
+  try {
+    const compareAndSwap = store.updateIfUnchanged;
+    if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable.');
+    matched = compareAndSwap.call(store, run, run);
+  } catch (cause) {
+    throw new ExecutionAdmissionRefusal('The final repair boundary could not confirm the exact Run handoff.', false, {
+      cause, authorityUnknown: true,
+    });
+  }
+  if (!matched) throw new ExecutionAdmissionRefusal('The exact repair Run handoff changed before the final host boundary.', true);
+  try {
+    assertCurrentMutation?.();
+  } catch (cause) {
+    throw new ExecutionAdmissionRefusal('The final repair boundary could not confirm current mission admission.', false, { cause });
+  }
 }
 
 function parkBootstrap(run: Run, error: unknown, store: RunStore, now: () => string, expected: Run = run): ReviewLoopResult {
@@ -664,6 +685,14 @@ export async function runReviewLoop(
           ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           ...(capabilities === undefined ? {} : { capabilities }),
+          beforeExecution: () => {
+            assertFinalRepairAdmission(workerHandoff, store, () => {
+              if (deps.governedPublicationRequired === true && deps.assertCurrentMutation === undefined) {
+                throw new Error('Governed review repair has no current admission-generation check.');
+              }
+              deps.assertCurrentMutation?.();
+            });
+          },
           beforePublish: () => {
             if (!updateReviewRun(store, workerHandoff, workerHandoff)) {
               throw new Error('Run changed before worker-router review-fix publication.');
@@ -684,6 +713,22 @@ export async function runReviewLoop(
           ...(repairExecution === undefined ? {} : { execution: repairExecution }),
         });
       } catch (error) {
+        if (isExecutionAdmissionRefusal(error)) {
+          if (error.authorityUnknown) throw error;
+          try {
+            const compareAndSwap = store.updateIfUnchanged;
+            if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during repair refusal reconciliation.');
+            if (!compareAndSwap.call(store, workerHandoff, workerHandoff) || error.runSuperseded) {
+              return supersededRepairAdmission(run.id, workerHandoff, store);
+            }
+            const reason = `Review repair was refused at the current host admission boundary: ${error.message}`;
+            return parkRepairAuthority(workerHandoff, reason, store, now, [CANCEL_RUN_DECISION]);
+          } catch {
+            // Keep the host refusal primary when a follow-up read/CAS/write
+            // cannot safely reconcile it.
+            throw error;
+          }
+        }
         const outcome = recordWorkerInvocationFailure(error);
         if (outcome !== null) return outcome;
         throw error;

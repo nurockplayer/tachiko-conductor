@@ -5,7 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest, McpHttpCapability } from '../src/adapters/agent.js';
-import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { ExecutionAdmissionRefusal, isExecutionAdmissionRefusal, WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ImplementationBootstrapAdapter, VerifyDurableRequest } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
@@ -29,6 +29,7 @@ import { TARGET, TEST_VALIDATION_AUTHORITY, failureResult, successResult, valida
 import { createBootstrapGitFixture } from './bootstrap-fixture.js';
 import { createGenuineLunaFixture } from './support/genuine-luna.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
+import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -1298,6 +1299,328 @@ describe('runWorkflow', { concurrency: false }, () => {
     }
   });
 
+  it('rechecks the exact Run handoff after final asynchronous worker preparation', async (t) => {
+    for (const phase of ['initial', 'resumed'] as const) {
+      await t.test(phase, async () => {
+        const store = new MemoryStore();
+        let run = createRun(TARGET, T0, `execution-boundary-${phase}`);
+        if (phase === 'resumed') run = applyTransition(run, { type: 'start' }, T0);
+        store.create(run);
+        let workerReady!: () => void;
+        let allowBoundary!: () => void;
+        const ready = new Promise<void>((resolve) => { workerReady = resolve; });
+        const barrier = new Promise<void>((resolve) => { allowBoundary = resolve; });
+        let entered = 0;
+        const implementation: ImplementationAgent = {
+          kind: 'implementation-agent',
+          async run(request) {
+            workerReady();
+            await barrier;
+            request.beforeExecution?.();
+            entered += 1;
+            return successResult(HEAD);
+          },
+        };
+        const operation = runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, run.id,
+          { maxReviewAttempts: 2, now: () => T0 });
+        await ready;
+        const winner = applyTransition(store.read(run.id)!, {
+          type: 'escalate', reason: 'Concurrent cancellation after worker preparation',
+          interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
+        }, T0);
+        store.update(winner);
+        allowBoundary();
+        const result = await operation;
+        assert.equal(result.outcome, 'needs_human');
+        assert.deepEqual(store.read(run.id), winner, 'the newer Run remains byte-for-byte authoritative');
+        assert.equal(entered, 0, 'the final synchronous boundary refuses provider entry after the CAS loses');
+      });
+    }
+  });
+
+  it('rejects admission revoked after the real qualified Luna guard check and before child entry for initial, resumed, and repair workers', async (t) => {
+    for (const phase of ['initial', 'resumed', 'repair'] as const) {
+      for (const invalidation of ['run', 'admission'] as const) await t.test(`${phase}/${invalidation}`, async () => {
+        const id = `workflow-luna-admission-final-boundary-${phase}`;
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-luna-admission-final-boundary-'));
+        const luna = await createGenuineLunaFixture(id, { deferPrepare: true });
+        const marker = path.join(luna.root, 'codex-entered');
+        writeFileSync(path.join(luna.root, 'bin', 'codex'), `#!/bin/sh\nprintf entered > '${marker}'\nexit 0\n`, { mode: 0o700 });
+        const registry = new MissionAdmissionRegistry({
+          filePath: path.join(directory, 'registry.json'),
+          config: { schemaVersion: 1, revision: 'luna-admission-final-boundary-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+        });
+        try {
+          const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
+            evidence: { repository: 'acme/widgets', issue: 42, run: id, workspace: luna.identity.workspacePath } });
+          assert.equal(admitted.outcome, 'admitted');
+          if (admitted.outcome !== 'admitted') return;
+          const store = new MemoryStore();
+          const sourceHead = luna.identity.baseSha;
+          let run: Run;
+          if (phase === 'repair') {
+            run = reviewingRun(store, id, sourceHead);
+            run = { ...run, execution: luna.request.execution };
+            store.update(run);
+          } else {
+            run = createRun(TARGET, T0, id, luna.request.execution);
+            if (phase === 'resumed') {
+              run = applyTransition(run, { type: 'start' }, T0);
+              run = { ...run, executor: { provider: 'codex-cli', sessionId: 'persisted-resume-thread' } };
+            }
+            store.create(run);
+          }
+          let sourceQualified = false;
+          let fallbackCalls = 0;
+          const implementation: ImplementationAgent = {
+            kind: 'implementation-agent',
+            prepareGovernedInvocation(request) {
+              const prepared = luna.adapter.prepareGovernedInvocation(request);
+              sourceQualified = prepared.status === 'qualified' && prepared.agent === luna.adapter;
+              return prepared;
+            },
+            async run() { fallbackCalls += 1; return successResult(sourceHead); },
+          };
+          const baseGithub = githubAdapter(phase === 'repair'
+            ? [sourceHead, sourceHead, sourceHead, sourceHead]
+            : [null, null, null, null]);
+          const github: GitHubAdapter = {
+            ...baseGithub,
+            async readLiveSnapshot(target) {
+              const live = await baseGithub.readLiveSnapshot(target);
+              return { ...live, repository: { ...live.repository, defaultBranchHeadSha: sourceHead },
+                pullRequest: live.pullRequest === null ? null : { ...live.pullRequest, headSha: sourceHead, baseSha: sourceHead,
+                  headRef: luna.identity.branch, baseRef: luna.identity.baseBranch, headRepository: { owner: 'acme', repo: 'widgets' } } };
+            },
+          };
+          let revoked = false;
+          let concurrent: Run | undefined;
+          const result = await runWorkflow({
+            store, github, implementation,
+            reviewer: new FakeReviewer(phase === 'repair' ? [requestChanges(sourceHead)] : []),
+            validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+            bootstrapForExecution: () => luna.bootstrap,
+            resolveRepairExecutionProfile: () => luna.request.execution,
+          }, id, {
+            maxReviewAttempts: 2, now: () => T0,
+            admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: luna.identity.workspacePath },
+            onExecutionStart: () => {
+              if (!sourceQualified || revoked) return;
+              revoked = true;
+              // After this hook the workflow rechecks the exact live token,
+              // enters source-qualified Luna, and awaits its exact guard.
+              // The queued retirement lands before Codex's beforeSpawn callback.
+              queueMicrotask(() => {
+                if (invalidation === 'admission') registry.release(admitted.token, true);
+                else {
+                  const current = store.read(id)!;
+                  concurrent = applyTransition(current, {
+                    type: 'escalate', reason: 'Concurrent operator cancellation at the final execution boundary',
+                    interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
+                  }, T0);
+                  store.update(concurrent);
+                }
+              });
+            },
+          });
+          assert.equal(result.outcome, 'needs_human', `${phase}/${invalidation} is held before provider entry`);
+          assert.equal(sourceQualified, true, `${phase} preflight returns the real source-qualified Luna instance`);
+          assert.equal(revoked, true, `${phase} revocation is scheduled only after qualified handoff`);
+          if (invalidation === 'admission') assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released');
+          else assert.deepEqual(store.read(id), concurrent, `${phase} preserves the exact concurrent Run winner`);
+          if (invalidation === 'admission') {
+            assert.match(result.reason, /current host admission boundary/);
+            assert.doesNotMatch(result.reason, /No provider process was started/);
+            assert.deepEqual(result.run.executor, run.executor, `${phase} refusal preserves the recorded executor identity`);
+            assert.deepEqual(result.run.agentResult, run.agentResult, `${phase} refusal preserves prior execution uncertainty and result evidence`);
+          }
+          assert.equal(existsSync(marker), false, `${phase} actual controlled Codex executable is never entered`);
+          assert.equal(fallbackCalls, 0, `${phase}/${invalidation} ambient implementation cannot replace the qualified adapter`);
+        } finally {
+          luna.cleanup();
+          rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  });
+
+  it('preserves an unknown tagged refusal when strict Run CAS disappears at the final callback', async () => {
+    const backing = new MemoryStore();
+    let casAvailable = true;
+    const store: RunStore = {
+      name: 'temporarily-missing-cas',
+      create: (run) => backing.create(run),
+      read: (id) => backing.read(id),
+      update: (run) => backing.update(run),
+      list: () => backing.list(),
+      delete: (id) => backing.delete(id),
+      get updateIfUnchanged() { return casAvailable ? backing.updateIfUnchanged.bind(backing) : undefined; },
+    };
+    const run = createRun(TARGET, T0, 'missing-cas-at-execution-boundary');
+    store.create(run);
+    let workerReady!: () => void;
+    let allowBoundary!: () => void;
+    const ready = new Promise<void>((resolve) => { workerReady = resolve; });
+    const barrier = new Promise<void>((resolve) => { allowBoundary = resolve; });
+    let entered = 0;
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run(request) {
+        workerReady();
+        await barrier;
+        casAvailable = false;
+        request.beforeExecution?.();
+        entered += 1;
+        return successResult(HEAD);
+      },
+    };
+    const operation = runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, run.id,
+      { maxReviewAttempts: 1, now: () => T0 });
+    await ready;
+    const handoff = store.read(run.id)!;
+    allowBoundary();
+    await assert.rejects(operation, (error) => {
+      assert.equal(isExecutionAdmissionRefusal(error), true);
+      if (!isExecutionAdmissionRefusal(error)) return false;
+      assert.equal(error.authorityUnknown, true, 'missing CAS is unavailable authority, not a confirmed superseding Run');
+      assert.equal(error.runSuperseded, false);
+      assert.match(String(error.cause), /Strict Run compare-and-swap is unavailable/);
+      return true;
+    });
+    assert.deepEqual(store.read(run.id), handoff, 'missing CAS cannot rewrite the persisted handoff');
+    assert.equal(entered, 0, 'missing strict CAS fails closed before provider entry');
+  });
+
+  it('keeps thrown Run-store authority errors tagged and primary when refusal reconciliation also fails', async () => {
+    const backing = new MemoryStore();
+    const primary = new Error('test host admission authority refused entry');
+    const secondary = new Error('Run store lock became unavailable during refusal reconciliation');
+    let failReconciliationWrite = false;
+    let actualEntries = 0;
+    let runCalls = 0;
+    const run = createRun(TARGET, T0, 'execution-refusal-reconciliation-failure');
+    let handoff: Run | undefined;
+    const store: RunStore = {
+      name: 'refusal-reconciliation-failure',
+      create: (value) => backing.create(value),
+      read: (id) => backing.read(id),
+      update: (value) => backing.update(value),
+      list: () => backing.list(),
+      delete: (id) => backing.delete(id),
+      updateIfUnchanged(expected, next) {
+        if (failReconciliationWrite && JSON.stringify(expected) !== JSON.stringify(next)) throw secondary;
+        return backing.updateIfUnchanged(expected, next);
+      },
+    };
+    store.create(run);
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run(request) {
+        runCalls += 1;
+        handoff = store.read(run.id)!;
+        failReconciliationWrite = true;
+        request.beforeExecution?.();
+        throw new ExecutionAdmissionRefusal('Injected final host admission refusal.', false, { cause: primary });
+      },
+    };
+    let captured: unknown;
+    await assert.rejects(runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, run.id,
+      { maxReviewAttempts: 1, now: () => T0 }), (error) => {
+      captured = error;
+      assert.equal(isExecutionAdmissionRefusal(error), true);
+      if (!isExecutionAdmissionRefusal(error)) return false;
+      assert.equal(error.authorityUnknown, false);
+      assert.equal(error.cause, primary);
+      assert.notEqual(error.cause, secondary);
+      return true;
+    });
+    assert.equal(runCalls, 1);
+    assert.equal(actualEntries, 0, 'the tagged boundary refusal prevents provider entry');
+    assert.equal(store.read(run.id)?.agentResult, undefined, 'refusal reconciliation failure is not recorded as provider EXEC_FAILURE');
+    assert.deepEqual(store.read(run.id), handoff, 'the failed reconciliation performs no unconditional or fabricated Run write');
+    assert.equal(isExecutionAdmissionRefusal(captured), true, 'the tagged refusal remains the primary thrown error');
+  });
+
+  it('does not convert a thrown final Run CAS into provider failure or fallback eligibility', async () => {
+    const backing = new MemoryStore();
+    const ioError = new Error('Run JSON lock timed out at final CAS');
+    let failBoundary = false;
+    let actualEntries = 0;
+    let runCalls = 0;
+    const run = createRun(TARGET, T0, 'execution-cas-io-unknown');
+    const store: RunStore = {
+      name: 'throwing-final-cas', create: (value) => backing.create(value), read: (id) => backing.read(id),
+      update: (value) => backing.update(value), list: () => backing.list(), delete: (id) => backing.delete(id),
+      updateIfUnchanged(expected, next) {
+        if (failBoundary) throw ioError;
+        return backing.updateIfUnchanged(expected, next);
+      },
+    };
+    store.create(run);
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run(request) {
+        runCalls += 1;
+        failBoundary = true;
+        request.beforeExecution?.();
+        actualEntries += 1;
+        return successResult(HEAD);
+      },
+    };
+    await assert.rejects(runWorkflow({ store, github: githubAdapter([HEAD]), implementation, reviewer: new FakeReviewer([]) }, run.id,
+      { maxReviewAttempts: 1, now: () => T0 }), (error) => {
+      assert.equal(isExecutionAdmissionRefusal(error), true);
+      if (!isExecutionAdmissionRefusal(error)) return false;
+      assert.equal(error.authorityUnknown, true, 'a thrown CAS cannot prove that another Run won');
+      assert.equal(error.runSuperseded, false);
+      assert.equal(error.cause, ioError, 'the store I/O error remains the primary cause');
+      return true;
+    });
+    assert.equal(runCalls, 1);
+    assert.equal(actualEntries, 0);
+    assert.equal(store.read(run.id)?.agentResult, undefined, 'unknown final authority is not converted to EXEC_FAILURE');
+  });
+
+  it('keeps missing and throwing validation CAS unknown and refuses validator entry', async (t) => {
+    for (const mode of ['missing', 'throwing'] as const) await t.test(mode, async () => {
+      const backing = new MemoryStore();
+      const run = reviewingRun(backing, `validation-cas-${mode}`, HEAD);
+      let finalBoundary = false;
+      const ioError = new Error('validation Run-store lock read failed');
+      const store: RunStore = {
+        name: `validation-${mode}-cas`, create: (value) => backing.create(value), read: (id) => backing.read(id),
+        update: (value) => backing.update(value), list: () => backing.list(), delete: (id) => backing.delete(id),
+        get updateIfUnchanged() {
+          if (finalBoundary && mode === 'missing') return undefined;
+          if (finalBoundary && mode === 'throwing') return () => { throw ioError; };
+          return backing.updateIfUnchanged.bind(backing);
+        },
+      };
+      let validationCalls = 0;
+      const validation: ValidationAdapter = {
+        kind: 'validation', configRevision: `validation-cas-${mode}-v1`,
+        async validate(request) { validationCalls += 1; return { ...validationPassed(request.headSha).local, configRevision: this.configRevision }; },
+      };
+      const github = githubAdapter([HEAD, HEAD, HEAD, HEAD]);
+      await assert.rejects(runWorkflow({
+        store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(HEAD)]),
+        validation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+      }, run.id, {
+        maxReviewAttempts: 1, now: () => T0,
+        onExecutionStart: () => { if (store.read(run.id)?.state === 'VALIDATING') finalBoundary = true; },
+      }), (error) => {
+        assert.equal(isExecutionAdmissionRefusal(error), true);
+        if (!isExecutionAdmissionRefusal(error)) return false;
+        assert.equal(error.authorityUnknown, true, `${mode} validation CAS is unknown authority`);
+        assert.equal(error.runSuperseded, false);
+        if (mode === 'throwing') assert.equal(error.cause, ioError);
+        else assert.match(String(error.cause), /Strict Run compare-and-swap is unavailable/);
+        return true;
+      });
+      assert.equal(validationCalls, 0, 'unknown final validation authority prevents validator entry');
+    });
+  });
+
   it('settles a superseded repair from the CAS winner and never re-enters the review loop', async (t) => {
     const cases: Array<{ label: string; state: Run['state']; expected: string }> = [
       { label: 'waiting-dependency', state: 'WAITING_DEPENDENCY', expected: 'waiting_dependency' },
@@ -1799,8 +2122,8 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(publicationAttempts, 0);
   });
 
-  it('fences owned-workspace validation publication after awaited standalone Git checks', async (t) => {
-    for (const mode of ['run-changed', 'admission-stale', 'publication-stale', 'current'] as const) {
+  it('verifies an already-published owned workspace without publishing after awaited standalone Git checks', async (t) => {
+    for (const mode of ['run-changed', 'admission-stale', 'publication-stale', 'adoption-proof-stale', 'current'] as const) {
       await t.test(mode, async () => {
         const fixture = createBootstrapGitFixture();
         const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-publish-fence-'));
@@ -1814,7 +2137,7 @@ describe('runWorkflow', { concurrency: false }, () => {
           const runner = {
             async run(file: string, args: readonly string[], options: Parameters<NonNullable<typeof fixture.runner.run>>[2]) {
               const result = await fixture.runner.run(file, args, options);
-              if (interleave && file === 'git' && args.includes('ls-remote') && args.includes('refs/heads/existing-pr')) {
+              if (interleave && file === 'git') {
                 interleave = false;
                 interleaved = true;
                 if (mode === 'run-changed') {
@@ -1830,6 +2153,7 @@ describe('runWorkflow', { concurrency: false }, () => {
             },
           };
           const bootstrapImpl = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+          const verifyRequests: VerifyDurableRequest[] = [];
           const bootstrap: ImplementationBootstrapAdapter = {
             kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
             plan: (request) => bootstrapImpl.plan(request),
@@ -1842,13 +2166,22 @@ describe('runWorkflow', { concurrency: false }, () => {
               return prepared;
             },
             guard: (identity) => bootstrapImpl.guard(identity),
-            verifyDurable: (request) => bootstrapImpl.verifyDurable(request),
+            verifyDurable: async (request) => {
+              verifyRequests.push(request);
+              if (mode === 'adoption-proof-stale') {
+                await bootstrapImpl.prepare({ runId: id, target: TARGET, baseBranch: identity.baseBranch, baseSha: identity.baseSha,
+                  existing: identity, recoveryAuthority: { expectedHeadSha: head } });
+              }
+              return bootstrapImpl.verifyDurable(request);
+            },
           };
           const planned = await bootstrap.plan({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha, publicationBranch: 'existing-pr' });
           const identity = await bootstrap.prepare({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha, existing: planned });
           const head = fixture.commit(identity.workspacePath, 'validated-change.txt', 'validated change\n', 'validation candidate');
           fixture.git(fixture.source, ['fetch', '--no-tags', '--no-recurse-submodules', identity.workspacePath, head]);
           fixture.git(fixture.source, ['push', 'origin', `${head}:refs/heads/existing-pr`]);
+          const advancedDefaultHead = fixture.commit(fixture.source, 'advanced-default.txt', 'target advanced after PR base\n', 'advance target branch');
+          fixture.git(fixture.source, ['push', 'origin', `${advancedDefaultHead}:refs/heads/${fixture.branch}`]);
 
           let run = createRun(TARGET, T0, id, {
             profile: 'routine', revision: 'validation-luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
@@ -1882,7 +2215,7 @@ describe('runWorkflow', { concurrency: false }, () => {
             const live = snapshot(head);
             return {
               ...live,
-              repository: { ...live.repository, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha },
+              repository: { ...live.repository, defaultBranch: fixture.branch, defaultBranchHeadSha: advancedDefaultHead },
               pullRequest: {
                 ...live.pullRequest!, headSha: head, baseSha: fixture.baseSha,
                 headRef: 'existing-pr', baseRef: fixture.branch, headRepository: { owner: 'acme', repo: 'widgets' },
@@ -1918,22 +2251,37 @@ describe('runWorkflow', { concurrency: false }, () => {
 
           const remoteHead = fixture.git(fixture.remote, ['for-each-ref', '--format=%(objectname)', 'refs/heads/existing-pr']);
           const pushes = fixture.commands.slice(commandsStart).filter((command) => command.file === 'git' && command.args.includes('push'));
-          assert.equal(interleaved, true, 'the concurrent state change occurs during standalone Git verification before its push');
+          assert.equal(interleaved, mode !== 'publication-stale', 'Run/admission races occur during verification; stale publication authority is rejected before it');
+          if (mode !== 'publication-stale') {
+            assert.equal(verifyRequests.length, 1);
+            assert.equal(verifyRequests[0]?.expectedHeadSha, head, 'verification binds to the exact published Run HEAD');
+            assert.equal(verifyRequests[0]?.workspaceGuard !== undefined, true, 'verification uses a fresh physical workspace guard');
+            assert.equal(verifyRequests[0]?.beforePublish, undefined, 'verification has no publication callback');
+            assert.equal(verifyRequests[0]?.adoptExistingHead, true, 'the standalone verifier adopts the already-published HEAD');
+            assert.equal(verifyRequests[0]?.progressBaseSha, identity.baseSha, 'the accepted identity base remains the immutable progress baseline');
+            assert.notEqual(advancedDefaultHead, identity.baseSha, 'the live target branch has advanced beyond the persisted accepted base');
+          } else {
+            assert.equal(verifyRequests.length, 0, 'configured publication admission is checked before owned verification');
+          }
+          assert.equal(pushes.length, 0, 'owned validation verification never pushes');
           if (mode === 'run-changed') {
             assert.equal(outcome.outcome, 'needs_human');
             assert.deepEqual(store.read(id), concurrent, 'concurrent Run wins the pre-push CAS');
-            assert.equal(remoteHead, head, 'a stale Run cannot move the existing PR ref');
-            assert.equal(pushes.length, 0, 'no host push occurs after the stale Run is detected');
+            assert.equal(remoteHead, head, 'verification leaves the existing PR ref unchanged');
             assert.equal(validationCalls, 0);
           } else if (mode === 'admission-stale' || mode === 'publication-stale') {
             assert.equal(outcome.outcome, 'needs_human');
-            assert.equal(remoteHead, head, 'stale admission cannot move the existing PR ref');
-            assert.equal(pushes.length, 0, 'no host push occurs after admission rejects');
+            assert.equal(remoteHead, head, 'admission rejection leaves the existing PR ref unchanged');
             assert.equal(validationCalls, 0);
+          } else if (mode === 'adoption-proof-stale') {
+            assert.equal(outcome.outcome, 'needs_human', 'the stale captured source proof is rejected before validator entry');
+            assert.match(outcome.reason, /STALE_IDENTITY|source-minted workspace guard/i);
+            assert.equal(validationCalls, 0);
+            assert.equal(remoteHead, head, 'stale proof refusal does not alter the published PR head');
           } else {
             assert.equal(outcome.outcome, 'merge_ready', outcome.outcome === 'needs_human' ? outcome.reason : undefined);
             assert.equal(remoteHead, head, 'the unchanged owner verifies and retains its exact published HEAD');
-            assert.ok(pushes.length >= 1, 'the valid validation path reaches the host publication command');
+            assert.equal(remoteHead, head, 'the valid validation path keeps the exact published HEAD');
             assert.equal(validationCalls, 1);
           }
         } finally {
@@ -1942,6 +2290,117 @@ describe('runWorkflow', { concurrency: false }, () => {
         }
       });
     }
+  });
+
+  it('validates linked owned workspaces with the real published-HEAD verifier and refuses no-progress heads before validator entry', async (t) => {
+    for (const mode of ['progress', 'head-equals-base', 'same-tree-new-commit'] as const) await t.test(mode, async () => {
+      const fixture = createBootstrapGitFixture();
+      try {
+        const id = `linked-owned-validation-${mode}`;
+        const store = new MemoryStore();
+        const bootstrapImpl = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+        const planned = await bootstrapImpl.plan({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+        const identity = await bootstrapImpl.prepare({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha, existing: planned });
+        let head = fixture.baseSha;
+        if (mode === 'progress') {
+          head = fixture.commit(identity.workspacePath, 'linked-validation.txt', 'validated linked change\n', 'linked validation candidate');
+        } else if (mode === 'same-tree-new-commit') {
+          fixture.git(identity.workspacePath, ['-c', 'user.name=Tachiko', '-c', 'user.email=tachiko@example.invalid', 'commit', '--allow-empty', '-m', 'same tree validation candidate']);
+          head = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']);
+        }
+        fixture.git(identity.workspacePath, ['push', 'origin', `${head}:refs/heads/${identity.branch}`]);
+        let run = reviewingRun(store, id, head);
+        run = { ...run, bootstrap: identity };
+        store.update(run);
+        let verification: VerifyDurableRequest | undefined;
+        const bootstrap: ImplementationBootstrapAdapter = {
+          kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree',
+          plan: (request) => bootstrapImpl.plan(request), prepare: (request) => bootstrapImpl.prepare(request),
+          guard: (candidate) => bootstrapImpl.guard(candidate),
+          async verifyDurable(request) {
+            verification = request;
+            return bootstrapImpl.verifyDurable(request);
+          },
+        };
+        const github: GitHubAdapter = {
+          ...githubAdapter([head, head, head, head]),
+          async readLiveSnapshot() {
+            const live = snapshot(head);
+            return { ...live, repository: { ...live.repository, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha },
+              pullRequest: { ...live.pullRequest!, headSha: head, baseSha: fixture.baseSha, headRef: identity.branch, baseRef: fixture.branch,
+                headRepository: { owner: 'acme', repo: 'widgets' } } };
+          },
+        };
+        let validationCalls = 0;
+        const validation: ValidationAdapter = {
+          kind: 'validation', configRevision: 'linked-owned-validation-v1', requiresOwnedWorkspace: true,
+          async validate(request) {
+            validationCalls += 1;
+            assert.equal(request.headSha, head);
+            assert.equal(request.workspacePath, identity.workspacePath);
+            return { ...validationPassed(request.headSha).local, configRevision: 'linked-owned-validation-v1' };
+          },
+        };
+        const commandsStart = fixture.commands.length;
+        const result = await runWorkflow({
+          store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(head)]),
+          validation, hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrapForExecution: () => bootstrap,
+        }, id, { maxReviewAttempts: 1, now: () => T0 });
+        const pushes = fixture.commands.slice(commandsStart).filter((command) => command.file === 'git' && command.args.includes('push'));
+        assert.equal(verification?.expectedHeadSha, head);
+        assert.ok(verification?.workspaceGuard, 'the real linked verifier receives a fresh physical guard');
+        assert.equal(verification?.beforePublish, undefined);
+        assert.equal(verification?.adoptExistingHead, undefined, 'linked worktrees do not use standalone adoption semantics');
+        assert.equal(verification?.progressBaseSha, undefined, 'linked worktrees retain their established progress base');
+        assert.equal(pushes.length, 0, 'owned linked-worktree validation performs no publication');
+        if (mode === 'progress') {
+          assert.equal(result.outcome, 'merge_ready', result.outcome === 'needs_human' ? result.reason : undefined);
+          assert.equal(validationCalls, 1);
+        } else {
+          assert.equal(result.outcome, 'needs_human', 'the real verifier refuses a head without tree progress');
+          assert.match(result.reason, /HEAD_MISMATCH|tree progress/);
+          assert.equal(validationCalls, 0, 'a refused published head never enters the validator');
+        }
+      } finally { fixture.cleanup(); }
+    });
+  });
+
+  it('refuses owned validation when the PR disappears or its published HEAD differs before verification', async (t) => {
+    for (const mode of ['missing-pr', 'head-mismatch'] as const) await t.test(mode, async () => {
+      const store = new MemoryStore();
+      const id = `owned-validation-${mode}`;
+      const bootstrap = new FakeBootstrap();
+      let run = reviewingRun(store, id, HEAD);
+      run = { ...run, bootstrap: bootstrap.identity };
+      store.update(run);
+      let validationCalls = 0;
+      let verificationCalls = 0;
+      bootstrap.verifyDurable = async (request: VerifyDurableRequest) => {
+        verificationCalls += 1;
+        return { headSha: request.expectedHeadSha, branch: bootstrap.identity.branch };
+      };
+      const validation: ValidationAdapter = {
+        kind: 'validation', configRevision: `owned-validation-${mode}-v1`, requiresOwnedWorkspace: true,
+        async validate(request) { validationCalls += 1; return { ...validationPassed(request.headSha).local, configRevision: this.configRevision }; },
+      };
+      const github: GitHubAdapter = {
+        ...githubAdapter([HEAD, HEAD, HEAD, HEAD]),
+        async readLiveSnapshot() {
+          if (store.read(id)?.state !== 'VALIDATING') return snapshot(HEAD);
+          if (mode === 'missing-pr') return { ...snapshot(HEAD), pullRequest: null, headSha: null };
+          const moved = snapshot(HEAD2);
+          return moved;
+        },
+      };
+      const result = await runWorkflow({
+        store, github, implementation: new FakeImplementation([]), reviewer: new FakeReviewer([approve(HEAD)]),
+        validation, hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrapForExecution: () => bootstrap,
+      }, id, { maxReviewAttempts: 1, now: () => T0 });
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(validationCalls, 0, 'live identity refusal prevents local validation entry');
+      assert.equal(verificationCalls, 0, 'live identity refusal prevents owned-workspace verification');
+      assert.match(result.reason, mode === 'missing-pr' ? /pull request identity is unavailable|no associated open pull request/i : /does not match the implementation HEAD/i);
+    });
   });
 
   it('holds an unqualified implementation before governed worker or publication effects', async () => {

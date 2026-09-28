@@ -2,6 +2,7 @@ import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
   assertWorkspaceGuard,
   governedPublicationRefusal,
+  isExecutionAdmissionRefusal,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -147,9 +148,10 @@ export class CodexCliAdapter implements ImplementationAgent {
       result = await this.runner.run(
         'codex',
         this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort),
-        this.processOptions(request.signal, cwd),
+        this.processOptions(request.signal, cwd, request.beforeExecution),
       );
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
       if (isAborted(request.signal) || code === 'ABORT_ERR') return cancelledAgentResult(durationMs, executor);
@@ -261,10 +263,10 @@ export class CodexCliAdapter implements ImplementationAgent {
     return args;
   }
 
-  private processOptions(signal: AbortSignal | undefined, cwd = this.cwd): ProcessRunOptions {
+  private processOptions(signal: AbortSignal | undefined, cwd = this.cwd, beforeSpawn?: () => void): ProcessRunOptions {
     return signal === undefined
-      ? { timeoutMs: this.timeoutMs, cwd, ...(this.env === undefined ? {} : { env: this.env }) }
-      : { timeoutMs: this.timeoutMs, cwd, signal, ...(this.env === undefined ? {} : { env: this.env }) };
+      ? { timeoutMs: this.timeoutMs, cwd, ...(this.env === undefined ? {} : { env: this.env }), ...(beforeSpawn === undefined ? {} : { beforeSpawn }) }
+      : { timeoutMs: this.timeoutMs, cwd, signal, ...(this.env === undefined ? {} : { env: this.env }), ...(beforeSpawn === undefined ? {} : { beforeSpawn }) };
   }
 
   /**

@@ -40,9 +40,27 @@ describe('ImplementationAgentRegistry', () => {
       if (prepared.status !== 'qualified') return;
       const result = await prepared.agent.run(fixture.request);
       assert.equal(result.exitStatus, 'success');
+      assert.equal(fixture.executionEntries, 1, 'the governed callback crosses Luna and its nested Codex CLI exactly once');
       assert.equal(prepared.agent, fixture.adapter);
       assert.equal(selectedProviderCalls, 1, 'the registry selected the source-owned adapter exactly once');
       assert.equal(fallbackCalls, 0, 'a successful exact adapter preflight never selects fallback');
+    } finally { fixture.cleanup(); }
+  });
+
+  it('keeps preparation callback-free but refuses qualified governed execution without the callback', async () => {
+    const fixture = await createGenuineLunaFixture('registry-missing-execution-callback');
+    const { beforeExecution: _callback, ...request } = fixture.request;
+    const registry = new ImplementationAgentRegistry({
+      defaultProvider: 'luna-isolated',
+      providers: { 'luna-isolated': () => fixture.adapter },
+    });
+    try {
+      const prepared = registry.prepareGovernedInvocation(request);
+      assert.equal(prepared.status, 'qualified', 'preflight before worker handoff does not require an execution callback');
+      const result = await registry.run(request);
+      assert.equal(result.exitStatus, 'failure');
+      assert.match(result.diagnostics?.join('\n') ?? '', /GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED/);
+      assert.equal(fixture.executionEntries, 0);
     } finally { fixture.cleanup(); }
   });
 
@@ -151,6 +169,7 @@ describe('ImplementationAgentRegistry', () => {
     const unknownInitialRequest = {
       ...governed,
       governedPublication: { required: true as const, continuation: false },
+      beforeExecution: () => {},
     };
     const initialPreflight = unknownFresh.prepareGovernedInvocation(unknownInitialRequest);
     assert.equal(initialPreflight.status, 'held');

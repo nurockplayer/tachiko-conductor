@@ -35,6 +35,7 @@ export async function createGenuineLunaFixture(runId = 'genuine-luna-test', opti
     const identity = await bootstrap.plan(plan);
     if (options.deferPrepare !== true) await bootstrap.prepare({ ...plan, existing: identity });
     const adapter = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 30_000, path: bin });
+    let executionEntries = 0;
     const request = {
       target, baseSha: gitFixture.baseSha, workspacePath: identity.workspacePath,
       branch: identity.branch, ...(options.deferPrepare === true ? {} : { workspaceGuard: bootstrap.guard(identity) }), authority: 'embedded' as const,
@@ -44,8 +45,9 @@ export async function createGenuineLunaFixture(runId = 'genuine-luna-test', opti
         sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const },
       runtimeOwnership: { runId, generation: 'genuine-luna-generation' },
       governedPublication: { required: true as const, continuation: false },
+      beforeExecution: () => { executionEntries += 1; },
     };
-    return { adapter, request, bootstrap, identity, root, cleanup() { gitFixture.cleanup(); rmSync(root, { recursive: true, force: true }); } };
+    return { adapter, request, bootstrap, identity, root, get executionEntries() { return executionEntries; }, cleanup() { gitFixture.cleanup(); rmSync(root, { recursive: true, force: true }); } };
   } catch (error) {
     gitFixture.cleanup(); rmSync(root, { recursive: true, force: true }); throw error;
   }

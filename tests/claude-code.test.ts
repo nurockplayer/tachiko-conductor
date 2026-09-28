@@ -4,7 +4,7 @@ import { describe, it } from 'node:test';
 import { ClaudeCodeAdapter, NodeClaudeProcessRunner } from '../src/agents/claude-code.js';
 import type { ClaudeProcessRunner, ClaudeRunOptions } from '../src/agents/claude-code.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
-import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { ExecutionAdmissionRefusal, GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import type { ProcessResult } from '../src/github/transport.js';
 import { TARGET } from './helpers.js';
 
@@ -62,6 +62,34 @@ describe('ClaudeCodeAdapter', () => {
       WorkspaceGuardFailure,
     );
     assert.equal(runner.calls.length, 0);
+  });
+
+  it('forwards a host execution callback after injected-runner preparation and preserves tagged refusal', async () => {
+    const events: string[] = [];
+    let entered = false;
+    const runner: ClaudeProcessRunner = { run: async (file, _args, options) => {
+      if (file === 'claude') {
+        events.push('runner-preparation');
+        await Promise.resolve();
+        options.beforeSpawn?.();
+        events.push('provider-entry');
+        entered = true;
+        return result(claudeJson('implemented'));
+      }
+      return result(HEAD);
+    } };
+    const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo' });
+    const success = await adapter.run({ target: TARGET, baseSha: 'base', beforeExecution: () => { events.push('host-boundary'); } });
+    assert.equal(success.exitStatus, 'success');
+    assert.deepEqual(events, ['runner-preparation', 'host-boundary', 'provider-entry']);
+
+    const refusal = new ExecutionAdmissionRefusal('exact Run was superseded', true);
+    entered = false;
+    await assert.rejects(
+      () => adapter.run({ target: TARGET, baseSha: 'base', beforeExecution: () => { throw refusal; } }),
+      (error: unknown) => error === refusal,
+    );
+    assert.equal(entered, false, 'a rejected final callback cannot enter the provider');
   });
 
   it('runs claude with an argument array and converts a JSON result to a success AgentResult', async () => {

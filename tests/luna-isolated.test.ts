@@ -41,6 +41,7 @@ describe('qualified Luna runtime configuration', () => {
 
       const adapter = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 10_000, path: bin });
       assert.equal(hasGovernedPublicationConfinement(adapter), true);
+      let executionEntries = 0;
       const result = await adapter.run({
         target,
         baseSha: fixture.baseSha, workspacePath, branch: identity.branch, workspaceGuard: bootstrap.guard(identity), authority: 'embedded',
@@ -48,6 +49,7 @@ describe('qualified Luna runtime configuration', () => {
         execution: { profile: 'standard', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL, reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' },
         runtimeOwnership: { runId: 'run-luna', generation: 'luna-generation' },
         governedPublication: { required: true, continuation: false },
+        beforeExecution: () => { executionEntries += 1; },
       });
 
       assert.equal(result.exitStatus, 'success', result.summary);
@@ -55,6 +57,7 @@ describe('qualified Luna runtime configuration', () => {
       assert.equal(result.executor?.provider, 'codex-cli', 'the confined Luna wrapper reports its actual inner CLI transport');
       assert.equal(result.executor?.sessionId, 'luna-thread');
       assert.equal(existsSync(spawnMarker), true);
+      assert.equal(executionEntries, 1, 'the callback reached the nested Codex process boundary');
     } finally {
       rmSync(root, { recursive: true, force: true });
       for (const fixture of fixtures.splice(0)) fixture.cleanup();
@@ -75,7 +78,7 @@ describe('qualified Luna runtime configuration', () => {
         target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 42 }, baseSha: fixture.baseSha,
         workspacePath: workspace, branch: 'tachiko/fake', authority: 'embedded' as const, instructions: 'task',
         execution: { profile: 'standard', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL, reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' } as const,
-        runtimeOwnership: { runId: 'run-luna', generation: 'generation' }, governedPublication: { required: true as const, continuation: false },
+        runtimeOwnership: { runId: 'run-luna', generation: 'generation' }, governedPublication: { required: true as const, continuation: false }, beforeExecution: () => {},
       };
       const missing = await adapter.run(request);
       assert.equal(missing.exitStatus, 'failure');
@@ -141,6 +144,7 @@ describe('qualified Luna runtime configuration', () => {
           reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' },
         runtimeOwnership: { runId: plan.runId, generation: 'luna-generation' },
         governedPublication: { required: true, continuation: false },
+        beforeExecution: () => {},
       });
       assert.equal(result.exitStatus, 'failure');
       assert.match(result.diagnostics?.join(' ') ?? '', /GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED/);

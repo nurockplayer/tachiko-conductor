@@ -2,7 +2,9 @@ import {
   GOVERNED_PUBLICATION_REENTRY_ACTION,
   hasGovernedPublicationConfinement,
   humanTakeoverReason,
+  isExecutionAdmissionRefusal,
   isWorkspaceGuardFailure,
+  ExecutionAdmissionRefusal,
   type GovernedInvocationPreparation,
   type ImplementationAgent,
   type ImplementationCapabilityResolver,
@@ -112,6 +114,33 @@ function updateIfCurrent(store: RunStore, expected: Run, next: Run): boolean {
 function assertPublicationAdmission(options: WorkflowOptions): void {
   const fence = options.admissionFence;
   if (fence !== undefined) fence.registry.assertCanPublish(fence.token, fence.productionMissionId);
+}
+
+function assertFinalExecutionAdmission(
+  store: RunStore,
+  expected: Run,
+  options: WorkflowOptions,
+  checkPublication = false,
+): void {
+  let matched: boolean;
+  try {
+    const compareAndSwap = store.updateIfUnchanged;
+    if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable.');
+    matched = compareAndSwap.call(store, expected, expected);
+  } catch (cause) {
+    throw new ExecutionAdmissionRefusal('The final host boundary could not confirm the exact Run handoff.', false, {
+      cause, authorityUnknown: true,
+    });
+  }
+  if (!matched) {
+    throw new ExecutionAdmissionRefusal('The exact Run handoff changed before the final host boundary.', true);
+  }
+  try {
+    assertCurrentMutationAdmission(options);
+    if (checkPublication) assertPublicationAdmission(options);
+  } catch (cause) {
+    throw new ExecutionAdmissionRefusal('The final host boundary could not confirm current mission admission.', false, { cause });
+  }
 }
 
 export type WorkflowOutcome =
@@ -296,6 +325,7 @@ async function validateExactHead(
   validation: ValidationAdapter | undefined,
   hostedPolicy: HostedCheckPolicyConfiguration | undefined,
   onExecutionStart?: () => void,
+  beforeValidation?: () => void,
 ): Promise<ValidationResult> {
   if (run.headSha === undefined) throw new Error('Cannot validate a run without an exact HEAD SHA.');
   const reusable = run.validationResult;
@@ -307,6 +337,7 @@ async function validateExactHead(
       : undefined;
   if (local === undefined) {
     onExecutionStart?.();
+    beforeValidation?.();
     local = await validation!.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
   }
   return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
@@ -768,6 +799,9 @@ export async function runWorkflow(
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
             ...(capabilities === undefined ? {} : { capabilities }),
             ...(governedPublication === undefined ? {} : { governedPublication }),
+            beforeExecution: () => {
+              assertFinalExecutionAdmission(store, workerHandoff, options);
+            },
             beforePublish: () => {
               if (!updateIfCurrent(store, workerHandoff, workerHandoff)) {
                 throw new Error('Run changed before worker-router implementation publication.');
@@ -802,6 +836,25 @@ export async function runWorkflow(
             ? qualifiedGovernedAgent.run(implementationRequest)
             : implementation.run(implementationRequest));
         } catch (error) {
+          if (isExecutionAdmissionRefusal(error)) {
+            if (error.authorityUnknown) throw error;
+            try {
+              const compareAndSwap = store.updateIfUnchanged;
+              if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during refusal reconciliation.');
+              if (!compareAndSwap.call(store, workerHandoff, workerHandoff)) {
+                return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed before implementation execution; preserving the newer Run.');
+              }
+              if (error.runSuperseded) {
+                return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed before implementation execution; preserving the newer Run.');
+              }
+              return park(workerHandoff, `Implementation execution was refused at the current host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+            } catch {
+              // The refusal remains primary if its exact handoff cannot be
+              // reconciled. Never replace it with a provider failure or a
+              // write based on a fabricated current Run.
+              throw error;
+            }
+          }
           if (isWorkspaceGuardFailure(error)) {
             if (error.executor !== undefined && repairAttempt?.snapshot.attemptBinding !== undefined) {
               const failedResult: AgentResult = { exitStatus: 'failure', summary: error.message, executor: error.executor, sessionId: error.executor.sessionId };
@@ -1014,6 +1067,7 @@ export async function runWorkflow(
         // live HEAD. An accepted H synchronization can advance GitHub before
         // the local worktree is fast-forwarded, so prepare and prove it again
         // immediately before the local process boundary.
+        const validationHeadSha = run.headSha;
         if (run.bootstrap !== undefined && deps.validation?.requiresOwnedWorkspace === true) {
           if (bootstrapAdapter === undefined || run.headSha === undefined) {
             return bootstrapFailureOutcome(run, new Error('Exact-HEAD validation requires the owned workspace bootstrap.'), store, now);
@@ -1025,29 +1079,47 @@ export async function runWorkflow(
             assertCurrentMutationAdmission(options);
             const identity = await bootstrapAdapter.prepare({
               runId, target, baseBranch: run.bootstrap.baseBranch, baseSha: run.bootstrap.baseSha,
-              existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: run.headSha },
+              existing: run.bootstrap, recoveryAuthority: { expectedHeadSha: validationHeadSha },
             });
+            const freshWorkspaceGuard = bootstrapAdapter.guard(identity);
+            if (!updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while owned-workspace validation was being prepared; preserving the newer Run.');
             assertCurrentMutationAdmission(options);
+            assertPublicationAdmission(options);
             await bootstrapAdapter.verifyDurable({
               identity,
-              expectedHeadSha: run.headSha,
-              beforePublish: () => {
-                if (!updateIfCurrent(store, validationExpected, validationExpected)) {
-                  throw new Error('Run changed before owned-workspace validation publication.');
-                }
-                assertCurrentMutationAdmission(options);
-                assertPublicationAdmission(options);
-              },
+              expectedHeadSha: validationHeadSha,
+              workspaceGuard: freshWorkspaceGuard,
+              ...(identity.bootstrapKind === 'standalone-isolated' ? { adoptExistingHead: true, progressBaseSha: identity.baseSha } : {}),
             });
             if (!updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while owned-workspace validation was being prepared; preserving the newer Run.');
+            assertCurrentMutationAdmission(options);
+            assertPublicationAdmission(options);
           } catch (error) {
+            if (isExecutionAdmissionRefusal(error)) {
+              if (error.runSuperseded || !updateIfCurrent(store, validationExpected, validationExpected)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while owned-workspace validation was being prepared; preserving the newer Run.');
+              return park(validationExpected, `Owned-workspace validation entry was refused by its host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+            }
             return bootstrapFailureOutcome(run, error, store, now);
           }
         }
         let validationResult: ValidationResult;
         try {
-          validationResult = await validateExactHead(run, target, snapshot, deps.validation, deps.hostedCheckPolicy, options.onExecutionStart);
+          validationResult = await validateExactHead(run, target, snapshot, deps.validation, deps.hostedCheckPolicy, options.onExecutionStart,
+            () => assertFinalExecutionAdmission(store, validationExpected, options, true));
         } catch (error) {
+          if (isExecutionAdmissionRefusal(error)) {
+            if (error.authorityUnknown) throw error;
+            try {
+              const compareAndSwap = store.updateIfUnchanged;
+              if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during validation refusal reconciliation.');
+              if (!compareAndSwap.call(store, validationExpected, validationExpected) || error.runSuperseded) {
+                return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed before local validation execution; preserving the newer Run.');
+              }
+              return park(validationExpected, `Local validation entry was refused at the current host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+            } catch {
+              throw error;
+            }
+          }
           const reason = `Local validation could not be observed safely: ${error instanceof Error ? error.message : String(error)}`;
           validationResult = combineValidation(
             run.headSha ?? '', unavailableLocalValidation(), hostedValidation(snapshot, deps.hostedCheckPolicy),

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import type { ImplementationAgent, ImplementationRequest } from '../src/adapters/agent.js';
+import { isExecutionAdmissionRefusal } from '../src/adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
@@ -1021,6 +1022,7 @@ describe('runReviewLoop', () => {
           const store = new CasMemoryStore();
           let shouldChangeRun = false;
           let concurrent: Run | undefined;
+          let actualWorkerPushSpawns = 0;
           const runner: ProcessRunner = {
             async run(file, args, options) {
               if (shouldChangeRun && args.includes('ls-remote') && args.includes('--heads')) {
@@ -1031,6 +1033,13 @@ describe('runReviewLoop', () => {
                   interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
                 }, T0);
                 store.update(concurrent);
+              }
+              if (file === 'git' && args.includes('push')) {
+                if (options.beforeSpawn !== undefined) {
+                  options.beforeSpawn();
+                  actualWorkerPushSpawns += 1;
+                }
+                return fixture.runner.run(file, args, { ...options, beforeSpawn: undefined });
               }
               return fixture.runner.run(file, args, options);
             },
@@ -1088,13 +1097,14 @@ describe('runReviewLoop', () => {
             assert.equal(result.run.state, 'NEEDS_HUMAN', 'stale publication authority leaves a durable safe park');
             assert.equal(store.read(id)?.state, 'NEEDS_HUMAN');
             assert.equal(published, '', 'the standalone repair is not pushed when publication admission rejects');
-            assert.equal(fixture.commands.slice(commandStart).filter((command) => command.args.includes('push')).length, 0, 'no host push runs after publication admission rejects');
+            assert.equal(actualWorkerPushSpawns, 0, 'publication refusal occurs before the injected runner delegates an actual worker push');
             assert.equal(publicationChecks, 1, 'publication admission is rechecked after the awaited Git work');
           } else {
             assert.equal(result.outcome, 'revalidating');
             assert.equal(store.read(id)?.headSha, repairedHead);
             assert.equal(fixture.git(fixture.remote, ['rev-parse', `refs/heads/${identity.publicationBranch ?? identity.branch}`]), repairedHead);
             assert.equal(publicationChecks, 1, 'the valid standalone repair checks publication authority immediately before push');
+            assert.equal(actualWorkerPushSpawns, 1, 'the valid standalone repair delegates exactly one actual worker push');
             assert.ok(mutationChecks >= 2, 'mutation authority is checked before execution and again before push');
           }
         } finally {
@@ -1408,6 +1418,104 @@ describe('runReviewLoop', () => {
     assert.equal(result.run.interrupt?.reason, concurrent.interrupt?.reason);
     assert.equal(JSON.stringify(store.read(original.id)), JSON.stringify(concurrent), 'stale reconciliation must preserve the concurrent cancel decision');
     assert.equal(markers, 0, 'the first post-capability CAS loss stops before uncertainty or execution side effects');
+  });
+
+  it('rechecks the exact repair handoff after final asynchronous worker preparation', async () => {
+    const original = repairChangesRun('repair-execution-boundary-run-race');
+    const store = new CasMemoryStore();
+    store.create(original);
+    let workerReady!: () => void;
+    let allowBoundary!: () => void;
+    const ready = new Promise<void>((resolve) => { workerReady = resolve; });
+    const barrier = new Promise<void>((resolve) => { allowBoundary = resolve; });
+    let entered = 0;
+    const implementation: ImplementationAgent = {
+      kind: 'implementation-agent',
+      async run(request) {
+        workerReady();
+        await barrier;
+        request.beforeExecution?.();
+        entered += 1;
+        return successResult(HEAD2);
+      },
+    };
+    const operation = runReviewLoop({
+      store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]),
+      resolveValidationAuthority: reviewAuthority,
+      resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+    }, original.id, { maxAttempts: 3, now: () => T0 });
+    await ready;
+    const winner = applyTransition(store.read(original.id)!, {
+      type: 'escalate', reason: 'Concurrent cancellation after repair preparation',
+      interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] },
+    }, T0);
+    store.update(winner);
+    allowBoundary();
+    const result = await operation;
+    assert.equal(result.outcome, 'superseded');
+    assert.deepEqual(store.read(original.id), winner, 'repair refusal leaves the exact concurrent Run untouched');
+    assert.equal(entered, 0, 'the final synchronous boundary refuses repair provider entry after the CAS loses');
+  });
+
+  it('preserves unknown repair CAS and the primary admission refusal if reconciliation fails', async (t) => {
+    for (const mode of ['missing-cas', 'throwing-cas', 'reconciliation-write-failure'] as const) await t.test(mode, async () => {
+      const original = repairChangesRun(`repair-final-refusal-${mode}`);
+      const backing = new MemoryStore();
+      backing.create(original);
+      const primary = new Error('repair mission admission generation changed');
+      const secondary = new Error('repair Run-store reconciliation lock failed');
+      let boundary = false;
+      let failChangedWrite = false;
+      let denyAdmission = false;
+      let entered = 0;
+      let handoff: Run | undefined;
+      const store: RunStore = {
+        name: `repair-final-refusal-${mode}`,
+        create: (run) => backing.create(run), read: (id) => backing.read(id), update: (run) => backing.update(run),
+        list: () => backing.list(), delete: (id) => backing.delete(id),
+        get updateIfUnchanged() {
+          if (boundary && mode === 'missing-cas') return undefined;
+          if (boundary && mode === 'throwing-cas') return () => { throw primary; };
+          return (expected: Run, next: Run) => {
+            if (failChangedWrite && JSON.stringify(expected) !== JSON.stringify(next)) throw secondary;
+            return backing.updateIfUnchanged(expected, next);
+          };
+        },
+      };
+      const implementation: ImplementationAgent = {
+        kind: 'implementation-agent',
+        async run(request) {
+          handoff = store.read(original.id)!;
+          boundary = true;
+          if (mode === 'reconciliation-write-failure') {
+            denyAdmission = true;
+            failChangedWrite = true;
+          }
+          request.beforeExecution?.();
+          entered += 1;
+          return successResult(HEAD2);
+        },
+      };
+      const invoke = runReviewLoop({
+        store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([]),
+        resolveValidationAuthority: reviewAuthority,
+        resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+        assertCurrentMutation: () => { if (denyAdmission) throw primary; },
+      }, original.id, { maxAttempts: 3, now: () => T0 });
+      await assert.rejects(invoke, (error) => {
+        assert.equal(isExecutionAdmissionRefusal(error), true);
+        if (!isExecutionAdmissionRefusal(error)) return false;
+        assert.equal(error.authorityUnknown, mode !== 'reconciliation-write-failure');
+        if (mode === 'throwing-cas') assert.equal(error.cause, primary);
+        if (mode === 'reconciliation-write-failure') {
+          assert.equal(error.cause, primary, 'the original admission error remains primary');
+          assert.notEqual(error.cause, secondary, 'secondary reconciliation failure does not replace the tagged refusal');
+        }
+        return true;
+      });
+      assert.equal(entered, 0, 'repair worker entry remains refused');
+      assert.deepEqual(backing.read(original.id), handoff, 'failed refusal reconciliation does not write a fabricated or generic failed Run');
+    });
   });
 
   it('releases a preflight-overlap repair lane when no worker or uncertainty marker began', async () => {
