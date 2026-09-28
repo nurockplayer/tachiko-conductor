@@ -472,6 +472,133 @@ describe('CodexAppServerAdapter', () => {
     assert.equal(fallback.calls, 0);
   });
 
+  it('closes opening admission before timeout or request abort reaches a resumed factory', async () => {
+    for (const mode of ['timeout', 'cancel'] as const) {
+      let announceOpen!: () => void;
+      let announceCallbackAttempt!: () => void;
+      const openStarted = new Promise<void>((resolve) => { announceOpen = resolve; });
+      const callbackAttempted = new Promise<void>((resolve) => { announceCallbackAttempt = resolve; });
+      const client = new FakeClient();
+      let spawnCount = 0;
+      let callbackAttempts = 0;
+      const factory: CodexAppServerClientFactory = {
+        open(options = {}) {
+          announceOpen();
+          return new Promise<CodexAppServerClient>((resolve, reject) => {
+            options.signal?.addEventListener('abort', () => {
+              callbackAttempts += 1;
+              announceCallbackAttempt();
+              try {
+                options.beforeExecution?.();
+                spawnCount += 1;
+                resolve(client);
+              } catch (error) { reject(error); }
+            }, { once: true });
+          });
+        },
+      };
+      const controller = new AbortController();
+      const fallback = new Fallback();
+      const adapter = new CodexAppServerAdapter({ clientFactory: factory, fallback, runner: new HeadRunner(), timeoutMs: 25 });
+      const originalNow = Date.now;
+      Date.now = () => 4_000_000;
+      try {
+        const pending = adapter.run(request({ signal: controller.signal }));
+        await openStarted;
+        if (mode === 'cancel') controller.abort();
+        await callbackAttempted;
+        assert.equal(callbackAttempts, 1, `${mode} reaches the host callback during the factory abort event`);
+        assert.equal(spawnCount, 0, `${mode} closes admission before the factory can spawn`);
+        const result = await pending;
+        assert.equal(result.exitStatus, 'failure');
+        assert.match(result.diagnostics?.join('\n') ?? '', mode === 'timeout' ? /CODEX_APP_SERVER_TIMEOUT/ : /CODEX_APP_SERVER_CANCELLED/);
+        assert.equal(fallback.calls, 0);
+      } finally {
+        Date.now = originalNow;
+      }
+    }
+  });
+
+  it('selects the synchronous tagged refusal when the host callback aborts before waiter registration', async () => {
+    const controller = new AbortController();
+    const client = new FakeClient();
+    let opens = 0;
+    let actualSpawnCount = 0;
+    const refusalCause = new Error('registry proof changed during open');
+    const refusal = new ExecutionAdmissionRefusal('Run was superseded during native open', false, { cause: refusalCause, authorityUnknown: true });
+    const factory: CodexAppServerClientFactory = {
+      async open(options = {}) {
+        opens += 1;
+        options.beforeExecution?.();
+        actualSpawnCount += 1;
+        return client;
+      },
+    };
+    const fallback = new Fallback();
+    const adapter = new CodexAppServerAdapter({ clientFactory: factory, fallback, runner: new HeadRunner() });
+    const onUnhandled = (reason: unknown) => assert.fail(`unexpected unhandled rejection: ${String(reason)}`);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      await assert.rejects(
+        () => adapter.run(request({ signal: controller.signal, beforeExecution() { controller.abort(); throw refusal; } })),
+        (error: unknown) => {
+          assert.equal(error, refusal);
+          assert.equal(error.runSuperseded, false);
+          assert.equal(error.authorityUnknown, true);
+          assert.equal(error.cause, refusalCause);
+          return true;
+        },
+      );
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(opens, 1);
+      assert.equal(actualSpawnCount, 0);
+      assert.deepEqual(client.calls, []);
+      assert.equal(fallback.calls, 0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('preserves an in-flight tagged control refusal when its callback synchronously aborts', async () => {
+    let announcePreparation!: () => void;
+    let releasePreparation!: () => void;
+    const preparationStarted = new Promise<void>((resolve) => { announcePreparation = resolve; });
+    const preparation = new Promise<void>((resolve) => { releasePreparation = resolve; });
+    const controller = new AbortController();
+    const refusalCause = new Error('registry proof changed at steer write');
+    const refusal = new ExecutionAdmissionRefusal('Run was superseded at native steer write', false, { cause: refusalCause, authorityUnknown: true });
+    class AbortThenRefuseClient extends FakeClient {
+      override async steerTurn(threadId: string, turnId: string, _prompt?: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+        announcePreparation();
+        await preparation;
+        hostOptions.beforeExecution?.();
+        this.calls.push(`turn/steer:${threadId}:${turnId}`);
+        return 'steered';
+      }
+    }
+    const client = new AbortThenRefuseClient({ threadId: 'thread-1', status: 'active', activeTurnId: 'turn-1', history: [] });
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 5_000 });
+    const onUnhandled = (reason: unknown) => assert.fail(`unexpected unhandled rejection: ${String(reason)}`);
+    let callbackChecks = 0;
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const pending = adapter.steerActiveTurn(request({ executor: EXECUTOR, signal: controller.signal, beforeExecution() { if (++callbackChecks === 2) { controller.abort(); throw refusal; } } }), 'turn-1', 'stop safely');
+      await preparationStarted;
+      releasePreparation();
+      await assert.rejects(() => pending, (error: unknown) => {
+        assert.equal(error, refusal);
+        assert.equal((error as ExecutionAdmissionRefusal).runSuperseded, false);
+        assert.equal((error as ExecutionAdmissionRefusal).authorityUnknown, true);
+        assert.equal((error as ExecutionAdmissionRefusal).cause, refusalCause);
+        return true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(client.calls, ['read:thread-1', 'close'], 'the callback refusal blocks the actual control write');
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
   it('preserves tagged refusal, uncertain interrupt, and uncertain component close together', async () => {
     const client = new HangingCloseClient();
     const fallback = new Fallback();
@@ -585,18 +712,99 @@ describe('CodexAppServerAdapter', () => {
       const adapter = new CodexAppServerAdapter({
         clientFactory: new Factory(client), fallback, runner: new HeadRunner(), timeoutMs: mode === 'timeout' ? 25 : 5,
       });
-      const pending = adapter.run(request({ signal: controller.signal, workspaceGuard }));
-      await guardEntered;
-      if (mode === 'cancel') controller.abort();
+      const originalNow = Date.now;
+      Date.now = () => 1_000_000;
+      try {
+        const pending = adapter.run(request({ signal: controller.signal, workspaceGuard }));
+        await guardEntered;
+        if (mode === 'cancel') controller.abort();
+        const result = await pending;
+        assert.equal(result.exitStatus, 'failure');
+        assert.match(result.diagnostics?.join('\n') ?? '', mode === 'cancel' ? /CODEX_APP_SERVER_CANCELLED/ : /CODEX_APP_SERVER_TIMEOUT/);
+        releaseGuard();
+        await guardSettled;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(client.calls, ['thread/start', 'close']);
+        assert.equal(result.executor?.sessionId, 'thread-new');
+        assert.equal(fallback.calls, 0);
+      } finally {
+        Date.now = originalNow;
+      }
+    }
+  });
+
+  it('keeps a timed-out native start callback closed across delayed injected preparation', async () => {
+    let announcePreparation!: () => void;
+    let releasePreparation!: () => void;
+    const preparationStarted = new Promise<void>((resolve) => { announcePreparation = resolve; });
+    const preparation = new Promise<void>((resolve) => { releasePreparation = resolve; });
+    class DelayedPreparedTurnClient extends FakeClient {
+      override async startTurn(threadId: string, _prompt: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+        announcePreparation();
+        await preparation;
+        hostOptions.beforeExecution?.();
+        this.calls.push(`turn/start:${threadId}`);
+        return 'turn-late';
+      }
+    }
+    const client = new DelayedPreparedTurnClient();
+    const fallback = new Fallback();
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), fallback, runner: new HeadRunner(), timeoutMs: 25 });
+    const originalNow = Date.now;
+    Date.now = () => 2_000_000;
+    const onUnhandled = (reason: unknown) => assert.fail(`unexpected unhandled rejection: ${String(reason)}`);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const pending = adapter.run(request());
+      await preparationStarted;
       const result = await pending;
+      const selectedSummary = result.summary;
+      const selectedDiagnostics = result.diagnostics?.join('\n');
       assert.equal(result.exitStatus, 'failure');
-      assert.match(result.diagnostics?.join('\n') ?? '', mode === 'cancel' ? /CODEX_APP_SERVER_CANCELLED/ : /CODEX_APP_SERVER_TIMEOUT/);
-      releaseGuard();
-      await guardSettled;
-      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_APP_SERVER_TIMEOUT/);
+      assert.match(result.diagnostics?.join('\n') ?? '', /identity was not correlated/i);
       assert.deepEqual(client.calls, ['thread/start', 'close']);
+      releasePreparation();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(client.calls, ['thread/start', 'close'], 'late preparation cannot pass the closed host boundary');
+      assert.equal(result.summary, selectedSummary, 'a late operation rejection cannot rewrite the selected timeout result');
+      assert.equal(result.diagnostics?.join('\n'), selectedDiagnostics);
       assert.equal(result.executor?.sessionId, 'thread-new');
       assert.equal(fallback.calls, 0);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      Date.now = originalNow;
+    }
+  });
+
+  it('keeps an explicit control callback closed when preparation finishes after timeout cleanup', async () => {
+    let announcePreparation!: () => void;
+    let releasePreparation!: () => void;
+    const preparationStarted = new Promise<void>((resolve) => { announcePreparation = resolve; });
+    const preparation = new Promise<void>((resolve) => { releasePreparation = resolve; });
+    class DelayedPreparedControlClient extends FakeClient {
+      override async steerTurn(threadId: string, turnId: string, _prompt?: string, hostOptions: AppServerMutationOptions = {}): Promise<string> {
+        announcePreparation();
+        await preparation;
+        hostOptions.beforeExecution?.();
+        this.calls.push(`turn/steer:${threadId}:${turnId}`);
+        return 'steered';
+      }
+    }
+    const client = new DelayedPreparedControlClient({ threadId: 'thread-1', status: 'active', activeTurnId: 'turn-1', history: [] });
+    const adapter = new CodexAppServerAdapter({ clientFactory: new Factory(client), runner: new HeadRunner(), timeoutMs: 25 });
+    const originalNow = Date.now;
+    Date.now = () => 3_000_000;
+    try {
+      const pending = adapter.steerActiveTurn(request({ executor: EXECUTOR }), 'turn-1', 'stop safely');
+      await preparationStarted;
+      await assert.rejects(() => pending, /timed out/i);
+      assert.deepEqual(client.calls, ['read:thread-1', 'close']);
+      releasePreparation();
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.deepEqual(client.calls, ['read:thread-1', 'close'], 'late explicit-control preparation cannot write after close');
+    } finally {
+      Date.now = originalNow;
     }
   });
 
