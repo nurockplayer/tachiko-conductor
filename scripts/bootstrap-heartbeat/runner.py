@@ -495,6 +495,20 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or any(character not in "0123456789abcdef" for character in runner_digest)
             or Path(config["runner"]) != ROOT / ("verified-runner-" + runner_digest)):
         raise RuntimeError("invalid pinned heartbeat runner identity")
+    build_value = config.get("admission_build")
+    source_runner = build_value.get("source_runner") if isinstance(build_value, dict) else None
+    if (not isinstance(source_runner, dict)
+            or set(source_runner) != {"path", "blob", "source_mode", "sha256", "installed_mode"}
+            or source_runner.get("path") != RUNNER_SOURCE_PATH
+            or not isinstance(source_runner.get("blob"), str)
+            or not re.fullmatch(r"[0-9a-f]{40,64}", source_runner["blob"])
+            or source_runner.get("source_mode") not in {"100644", "100755"}
+            or not isinstance(source_runner.get("sha256"), str)
+            or not re.fullmatch(r"[0-9a-f]{64}", source_runner["sha256"])
+            or source_runner.get("installed_mode") != "0700"
+            or source_runner["sha256"] != runner_digest):
+        raise RuntimeError("invalid captured heartbeat runner build provenance")
+    verify_pinned_runner(Path(config["runner"]), source_runner)
     node_digest = config.get("admission_node_sha256")
     if (not isinstance(node_digest, str) or len(node_digest) != 64
             or any(character not in "0123456789abcdef" for character in node_digest)
@@ -585,6 +599,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
     )
     if (not re.fullmatch(r"[0-9a-f]{40,64}", str(parsed_build.get("source_commit", "")))
             or not re.fullmatch(r"[0-9a-f]{40,64}", str(parsed_build.get("source_tree", "")))
+            or len(source_runner["blob"]) != len(parsed_build.get("source_commit", ""))
             or parsed_build.get("pnpm_version") != "10.34.5"
             or parsed_build.get("typescript_version") != "5.9.3"
             or parsed_build.get("install_command") != ["corepack", "pnpm@10.34.5", "install", "--frozen-lockfile", "--ignore-scripts"]
@@ -592,6 +607,7 @@ def validate_config(config: dict[str, Any]) -> dict[str, Any]:
             or parsed_build.get("node_sha256") != node_digest
             or not isinstance(parsed_build.get("node_path"), str) or not Path(parsed_build["node_path"]).is_absolute()
             or parsed_build.get("node_path") != config.get("admission_node")
+            or parsed_build.get("source_runner") != source_runner
             or not provider_records_valid
             or parsed_build.get("executed_commands") != [
                 [parsed_build.get("node_path"), corepack_entry_path, "--version"],
@@ -810,6 +826,44 @@ def fd_sha256(fd: int) -> str:
     return digest.hexdigest()
 
 
+def git_blob_oid(data: bytes, oid_length: int) -> str:
+    if oid_length == 40:
+        digest = hashlib.sha1()
+    elif oid_length == 64:
+        digest = hashlib.sha256()
+    else:
+        raise RuntimeError("unsupported captured Git object identity")
+    digest.update(f"blob {len(data)}\0".encode("ascii"))
+    digest.update(data)
+    return digest.hexdigest()
+
+
+def verify_pinned_runner(path: Path, source_runner: dict[str, Any]) -> None:
+    verify_private_snapshot_root()
+    expected = ROOT / ("verified-runner-" + source_runner["sha256"])
+    if path != expected:
+        raise RuntimeError("pinned heartbeat runner path does not match its captured identity")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as error:
+        raise RuntimeError("pinned heartbeat runner is missing or unsafe") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1
+                or metadata.st_uid not in {0, os.getuid()} or stat.S_IMODE(metadata.st_mode) != 0o700):
+            raise RuntimeError("pinned heartbeat runner identity or private mode is unsafe")
+        data_digest = fd_sha256(descriptor)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        data = bytearray()
+        while chunk := os.read(descriptor, 1024 * 1024):
+            data.extend(chunk)
+        if (data_digest != source_runner["sha256"]
+                or git_blob_oid(bytes(data), len(source_runner["blob"])) != source_runner["blob"]):
+            raise RuntimeError("pinned heartbeat runner differs from its captured source blob")
+    finally:
+        os.close(descriptor)
+
+
 def verify_trusted_path(path: Path) -> None:
     absolute = path.absolute()
     for component in (absolute, *absolute.parents):
@@ -899,21 +953,24 @@ def pin_github_tool(path: Path) -> tuple[Path, str, bool]:
         os.close(source_fd)
 
 
-def pin_runner_source(path: Path) -> tuple[Path, str, bool]:
-    if not path.is_file() or path.is_symlink():
-        raise RuntimeError("heartbeat runner unavailable or unsafe: " + str(path))
-    source_fd = os.open(path, os.O_RDONLY)
-    try:
-        metadata = os.fstat(source_fd)
-        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid not in {0, os.getuid()}
-                or metadata.st_mode & 0o022):
-            raise RuntimeError("heartbeat runner ownership or permissions unsafe: " + str(path))
-        digest = fd_sha256(source_fd)
-        existed = (ROOT / ("verified-runner-" + digest)).exists()
-        target = materialize_verified_executable(source_fd, "verified-runner-" + digest)
-        return target, digest, not existed
-    finally:
-        os.close(source_fd)
+def pin_runner_source(captured: dict[str, Any]) -> tuple[Path, str, bool]:
+    source_file = captured["files"].get(RUNNER_SOURCE_PATH)
+    if not isinstance(source_file, dict) or source_file.get("mode") not in (0o100644, 0o100755):
+        raise RuntimeError("captured heartbeat runner source is missing or unsupported")
+    source_bytes = source_file["bytes"]
+    digest = hashlib.sha256(source_bytes).hexdigest()
+    if git_blob_oid(source_bytes, len(source_file["oid"])) != source_file["oid"]:
+        raise RuntimeError("captured heartbeat runner bytes do not match their Git blob")
+    target = ROOT / ("verified-runner-" + digest)
+    existed = target.exists()
+    with tempfile.TemporaryFile() as source:
+        source.write(source_bytes)
+        source.flush()
+        source.seek(0)
+        target = materialize_verified_executable(source.fileno(), target.name)
+    record = source_runner_record(captured)
+    verify_pinned_runner(target, record)
+    return target, digest, not existed
 
 
 def pin_admission_node(path: Path) -> tuple[Path, str, bool]:
@@ -946,7 +1003,8 @@ def _git_output(git: dict[str, str], repo: Path, *args: str,
 
 
 def _protected_source_path(name: str) -> bool:
-    return name.startswith("src/") or name in PROTECTED_SOURCE_FILES or name.startswith("scripts/bootstrap-heartbeat/providers/")
+    return (name.startswith("src/") or name in PROTECTED_SOURCE_FILES
+            or name.startswith("scripts/bootstrap-heartbeat/providers/") or name == RUNNER_SOURCE_PATH)
 
 
 def _parse_git_tree(data: bytes) -> dict[str, tuple[int, str, str]]:
@@ -967,8 +1025,8 @@ def _parse_git_tree(data: bytes) -> dict[str, tuple[int, str, str]]:
     return entries
 
 
-def _walk_protected_worktree(repo: Path) -> dict[str, tuple[int, bytes]]:
-    found: dict[str, tuple[int, bytes]] = {}
+def _walk_protected_worktree(repo: Path) -> dict[str, tuple[int, bytes, tuple[int, int]]]:
+    found: dict[str, tuple[int, bytes, tuple[int, int]]] = {}
 
     def read_fd(fd: int) -> bytes:
         os.lseek(fd, 0, os.SEEK_SET)
@@ -1002,7 +1060,8 @@ def _walk_protected_worktree(repo: Path) -> dict[str, tuple[int, bytes]]:
                         if ((opened.st_dev, opened.st_ino) != (metadata.st_dev, metadata.st_ino)
                                 or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
                             raise RuntimeError("protected worktree file changed or is shared during inspection")
-                        found[relative] = (stat.S_IMODE(opened.st_mode), read_fd(file_fd))
+                        found[relative] = (stat.S_IMODE(opened.st_mode), read_fd(file_fd),
+                                           (opened.st_dev, opened.st_ino))
                     finally:
                         os.close(file_fd)
                 else:
@@ -1065,9 +1124,33 @@ def _walk_protected_worktree(repo: Path) -> dict[str, tuple[int, bytes]]:
                 metadata = os.fstat(fd)
                 if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                     raise RuntimeError("protected worktree build input is unsafe or shared")
-                found[name] = (stat.S_IMODE(metadata.st_mode), read_fd(fd))
+                found[name] = (stat.S_IMODE(metadata.st_mode), read_fd(fd), (metadata.st_dev, metadata.st_ino))
             finally:
                 os.close(fd)
+        try:
+            runner_directory_fd = open_relative_directory(RUNNER_SOURCE_PARTS[:-1])
+        except OSError as error:
+            raise RuntimeError("protected heartbeat runner directory is missing or unsafe") from error
+        try:
+            name = RUNNER_SOURCE_PARTS[-1]
+            try:
+                before = os.stat(name, dir_fd=runner_directory_fd, follow_symlinks=False)
+            except OSError as error:
+                raise RuntimeError("protected heartbeat runner is missing or unsafe") from error
+            if not stat.S_ISREG(before.st_mode):
+                raise RuntimeError("protected heartbeat runner is not a regular file")
+            runner_fd = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=runner_directory_fd)
+            try:
+                opened = os.fstat(runner_fd)
+                if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                        or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
+                    raise RuntimeError("protected heartbeat runner changed during no-follow inspection")
+                found[RUNNER_SOURCE_PATH] = (stat.S_IMODE(opened.st_mode), read_fd(runner_fd),
+                                             (opened.st_dev, opened.st_ino))
+            finally:
+                os.close(runner_fd)
+        finally:
+            os.close(runner_directory_fd)
     finally:
         os.close(repo_fd)
     return found
@@ -1084,7 +1167,7 @@ def capture_committed_build_source(repo: Path, git: dict[str, str]) -> dict[str,
            for mode, _oid, kind in expected_raw.values()):
         raise RuntimeError("protected source contains a link, special object, or unsupported mode")
     expected = {name: (mode, oid) for name, (mode, oid, _kind) in expected_raw.items()}
-    required = {"package.json", "pnpm-lock.yaml", "tsconfig.json",
+    required = {"package.json", "pnpm-lock.yaml", "tsconfig.json", RUNNER_SOURCE_PATH,
                 "scripts/bootstrap-heartbeat/providers/corepack-0.34.6.json",
                 "scripts/bootstrap-heartbeat/providers/corepack-0.34.6.tgz"}
     if not required.issubset(expected) or not any(name.startswith("src/") for name in expected):
@@ -1132,21 +1215,94 @@ def capture_committed_build_source(repo: Path, git: dict[str, str]) -> dict[str,
             raise RuntimeError("Git batch returned malformed object bytes") from error
     for name in sorted(expected):
         mode, oid = expected[name]
-        work_mode, work_bytes = working[name]
+        work_mode, work_bytes, _identity = working[name]
         committed_bytes = object_bytes[oid]
         if work_mode != mode & 0o777 or work_bytes != committed_bytes:
             raise RuntimeError("protected worktree bytes or modes differ from committed source")
         digest.update(name.encode() + b"\0" + f"{mode:o}".encode() + b"\0")
         digest.update(hashlib.sha256(committed_bytes).digest())
         blobs[name] = {"mode": mode, "oid": oid, "bytes": committed_bytes}
-    return {"head": head, "tree": tree, "files": blobs, "snapshot_sha256": digest.hexdigest()}
+    runner_identity = working[RUNNER_SOURCE_PATH][2]
+    return {"head": head, "tree": tree, "files": blobs, "snapshot_sha256": digest.hexdigest(),
+            "runner_identity": runner_identity}
 
 
 def verify_build_source_unchanged(repo: Path, git: dict[str, str], captured: dict[str, Any]) -> None:
     current = capture_committed_build_source(repo, git)
     if (current["head"] != captured["head"] or current["tree"] != captured["tree"]
-            or current["snapshot_sha256"] != captured["snapshot_sha256"]):
+            or current["snapshot_sha256"] != captured["snapshot_sha256"]
+            or current["runner_identity"] != captured["runner_identity"]):
         raise RuntimeError("committed protected build inputs changed during helper preparation")
+
+
+def source_runner_record(captured: dict[str, Any]) -> dict[str, str]:
+    source_file = captured["files"].get(RUNNER_SOURCE_PATH)
+    if not isinstance(source_file, dict):
+        raise RuntimeError("captured source omits the heartbeat runner")
+    mode = source_file["mode"]
+    if mode not in (0o100644, 0o100755):
+        raise RuntimeError("captured heartbeat runner has an unsupported Git mode")
+    data = source_file["bytes"]
+    return {"path": RUNNER_SOURCE_PATH, "blob": source_file["oid"],
+            "source_mode": f"{mode:06o}", "sha256": hashlib.sha256(data).hexdigest(),
+            "installed_mode": "0700"}
+
+
+def _open_repo_source(repo: Path, relative_parts: tuple[str, ...]) -> int:
+    directory_fd = os.open(repo, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                           getattr(os, "O_NOFOLLOW", 0))
+    try:
+        for component in relative_parts[:-1]:
+            before = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if not stat.S_ISDIR(before.st_mode):
+                raise RuntimeError("heartbeat runner source path contains an intermediate symlink or non-directory")
+            child_fd = os.open(component, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                               getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+            opened = os.fstat(child_fd)
+            if (not stat.S_ISDIR(opened.st_mode)
+                    or (opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)):
+                os.close(child_fd)
+                raise RuntimeError("heartbeat runner source directory changed during no-follow inspection")
+            os.close(directory_fd)
+            directory_fd = child_fd
+        name = relative_parts[-1]
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError("heartbeat runner source is not a regular file")
+        result = os.open(name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd)
+        opened = os.fstat(result)
+        if ((opened.st_dev, opened.st_ino) != (before.st_dev, before.st_ino)
+                or not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1):
+            os.close(result)
+            raise RuntimeError("heartbeat runner source changed during no-follow inspection")
+        return result
+    finally:
+        os.close(directory_fd)
+
+
+def verify_executing_runner(repo: Path, captured: dict[str, Any]) -> None:
+    executing_path = Path(os.path.abspath(__file__))
+    expected_path = repo / RUNNER_SOURCE_PATH
+    if executing_path != expected_path:
+        raise RuntimeError("executing heartbeat runner is not the selected repository source")
+    try:
+        descriptor = _open_repo_source(repo, RUNNER_SOURCE_PARTS)
+    except OSError as error:
+        raise RuntimeError("executing heartbeat runner source is missing or unsafe") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if (metadata.st_uid not in {0, os.getuid()} or metadata.st_mode & 0o022):
+            raise RuntimeError("heartbeat runner ownership or permissions unsafe: " + str(executing_path))
+        source_file = captured["files"].get(RUNNER_SOURCE_PATH)
+        if not isinstance(source_file, dict):
+            raise RuntimeError("captured source omits the heartbeat runner")
+        mode = stat.S_IMODE(metadata.st_mode)
+        if (mode != source_file["mode"] & 0o777
+                or (metadata.st_dev, metadata.st_ino) != captured.get("runner_identity")
+                or fd_sha256(descriptor) != hashlib.sha256(source_file["bytes"]).hexdigest()):
+            raise RuntimeError("executing heartbeat runner differs from the selected committed source")
+    finally:
+        os.close(descriptor)
 
 
 def materialize_committed_source(source: dict[str, Any], destination: Path) -> None:
@@ -1208,6 +1364,8 @@ COREPACK_ARTIFACT_PATH = PROVIDER_DIRECTORY / "corepack-0.34.6.tgz"
 COREPACK_REVIEWED_MANIFEST_SHA256 = "3b998f5dc98f4376ff03e9ae47481cdd762ddc9ed590f87c96070e1121e79c68"
 COREPACK_SOURCE_MANIFEST_SHA256 = "11940f93e8f38ebd2212e30c46b1ef30b3a7d484a8b115e013283f63070e729c"
 PROTECTED_SOURCE_FILES = {"package.json", "pnpm-lock.yaml", "tsconfig.json"}
+RUNNER_SOURCE_PATH = "scripts/bootstrap-heartbeat/runner.py"
+RUNNER_SOURCE_PARTS = tuple(RUNNER_SOURCE_PATH.split("/"))
 
 
 def _safe_system_file(path: Path, *, label: str) -> Path:
@@ -1655,11 +1813,11 @@ def existing_admission_bundle(bundle: Path) -> bool:
     return True
 
 
-def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list[dict[str, str]], dict[str, Any], bool]:
+def pin_admission_helper(repo: Path, node_source: Path, source: dict[str, Any]) -> tuple[Path, str, list[dict[str, str]], dict[str, Any], bool]:
     """Build from raw committed inputs with authenticated, revalidated providers."""
     entry_relative = Path("mission-admission/heartbeat-admission-cli.js")
     git, openssl = qualified_system_providers()
-    source = capture_committed_build_source(repo, git)
+    verify_executing_runner(repo, source)
     head, tree = source["head"], source["tree"]
     package_bytes = source["files"]["package.json"]["bytes"]
     lock_bytes = source["files"]["pnpm-lock.yaml"]["bytes"]
@@ -1764,6 +1922,7 @@ def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list
         file_hashes = {relative: hashlib.sha256(data).hexdigest() for relative, data in emitted.items()}
         build_inputs = {
             "source_commit": head, "source_tree": tree, "source_snapshot_sha256": source["snapshot_sha256"],
+            "source_runner": source_runner_record(source),
             "package_json_sha256": hashlib.sha256(package_bytes).hexdigest(),
             "lockfile_sha256": hashlib.sha256(lock_bytes).hexdigest(),
             "node_path": str(node_source), "node_sha256": _hash_file(node_source), "node_version": node_version,
@@ -1781,6 +1940,7 @@ def pin_admission_helper(repo: Path, node_source: Path) -> tuple[Path, str, list
             "files": [{"path": rel.as_posix(), "sha256": file_hashes[rel]} for rel in sorted(emitted)],
         }
     verify_build_source_unchanged(repo, git, source)
+    verify_executing_runner(repo, source)
     _provider_file(git, "Apple Git")
     _provider_file(openssl, "Apple OpenSSL")
     verify_admission_node_snapshot(node_source, node_digest)
@@ -1939,6 +2099,10 @@ def process_identity(pid: int) -> str | None:
 
 
 def verify_admission_helper(config: dict[str, Any]) -> None:
+    source_runner = config.get("admission_build", {}).get("source_runner") if isinstance(config.get("admission_build"), dict) else None
+    if not isinstance(source_runner, dict):
+        raise RuntimeError("pinned admission build omits heartbeat runner provenance")
+    verify_pinned_runner(Path(config.get("runner", "")), source_runner)
     helper_root = Path(config["admission_helper"]).parents[1]
     expected_helper_root = ROOT / ("verified-admission-" + config["admission_helper_sha256"])
     if helper_root != expected_helper_root:
@@ -1951,6 +2115,15 @@ def verify_admission_helper(config: dict[str, Any]) -> None:
             or root_metadata.st_uid != os.getuid() or root_metadata.st_mode & 0o077
             or helper_root.resolve(strict=True) != helper_root):
         raise RuntimeError("pinned admission helper bundle directory is unsafe")
+    try:
+        manifest_bytes = (helper_root / "build-manifest.json").read_bytes()
+        manifest = json.loads(manifest_bytes)
+    except (OSError, json.JSONDecodeError) as error:
+        raise RuntimeError("pinned admission build manifest is missing or corrupt") from error
+    canonical_manifest = (json.dumps(manifest, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    if (canonical_manifest != manifest_bytes or manifest.get("source_runner") != source_runner
+            or config.get("admission_build") != manifest):
+        raise RuntimeError("pinned admission helper and runner provenance do not match")
     node = Path(config["admission_node"])
     verify_admission_node_snapshot(node, config["admission_node_sha256"])
     expected_paths: set[str] = set()
@@ -2973,9 +3146,19 @@ def admission_domain(repo: Path, registry_override: str | None, config_raw: str 
 def install(args: argparse.Namespace) -> int:
     os.umask(0o077)
     repo = Path(args.repo).resolve()
-    runner = Path(__file__).resolve()
+    runner = Path(os.path.abspath(__file__))
     if not repo.is_dir() or not (repo / ".git").exists():
         raise RuntimeError("repository directory is not a Git checkout: " + str(repo))
+    if runner != repo / RUNNER_SOURCE_PATH:
+        raise RuntimeError("executing heartbeat runner is not the selected repository source")
+    git_source, _openssl_source = qualified_system_providers()
+    captured_source = capture_committed_build_source(repo, git_source)
+    verify_executing_runner(repo, captured_source)
+
+    def verify_selected_source_stable() -> None:
+        verify_build_source_unchanged(repo, git_source, captured_source)
+        verify_executing_runner(repo, captured_source)
+
     if args.interval < 1 or args.safety_interval < 1:
         raise RuntimeError("intervals must be positive")
     if Path(args.codex).resolve() != DEFAULT_CODEX or Path(args.profile).resolve() != DEFAULT_PROFILE:
@@ -3046,9 +3229,17 @@ def install(args: argparse.Namespace) -> int:
     domain = f"gui/{os.getuid()}"
     try:
         gh_snapshot, gh_digest, gh_snapshot_created = pin_github_tool(gh_source)
-        runner_snapshot, runner_digest, runner_snapshot_created = pin_runner_source(runner)
+        runner_snapshot, runner_digest, runner_snapshot_created = pin_runner_source(captured_source)
         node_snapshot, node_digest, node_snapshot_created = pin_admission_node(node_source)
-        helper_entry, helper_digest, helper_files, helper_build, helper_created = pin_admission_helper(repo, node_snapshot)
+        helper_entry, helper_digest, helper_files, helper_build, helper_created = pin_admission_helper(
+            repo, node_snapshot, captured_source)
+        source_runner = source_runner_record(captured_source)
+        if (helper_build.get("source_runner") != source_runner
+                or helper_build.get("source_commit") != captured_source["head"]
+                or helper_build.get("source_tree") != captured_source["tree"]
+                or helper_build.get("source_snapshot_sha256") != captured_source["snapshot_sha256"]
+                or runner_digest != source_runner["sha256"]):
+            raise RuntimeError("admission helper and installed runner do not share one captured source")
         config_values.update(
             gh=str(gh_snapshot), gh_sha256=gh_digest,
             runner=str(runner_snapshot), runner_sha256=runner_digest,
@@ -3057,17 +3248,24 @@ def install(args: argparse.Namespace) -> int:
             admission_helper_files=helper_files, admission_build=helper_build,
         )
         plist["ProgramArguments"] = ["/usr/bin/python3", str(runner_snapshot), "run"]
+        verify_selected_source_stable()
         config = validate_config(config_values)
         verify_wake_target(config)
         prior = load_state() if STATE.exists() else {}
+        verify_selected_source_stable()
         atomic_write(CONFIG, (json.dumps(config, sort_keys=True) + "\n").encode())
+        verify_selected_source_stable()
         ensure_durable_directory(target.parent, mode=0o700)
+        verify_selected_source_stable()
         atomic_write(target, plistlib.dumps(plist, fmt=plistlib.FMT_XML))
         if not args.no_load:
+            verify_selected_source_stable()
             previous_service_loaded = bootout_if_loaded(domain)
             service_transitioned = True
+            verify_selected_source_stable()
             launchctl("bootstrap", domain, str(target))
         if not prior:
+            verify_selected_source_stable()
             prime(config, "first install")
         else:
             log("preserved valid successful state across reinstall")
@@ -3128,6 +3326,8 @@ def uninstall(args: argparse.Namespace) -> int:
 
 
 def status() -> int:
+    config = load_config()
+    verify_admission_helper(config)
     result = launchctl("print", f"gui/{os.getuid()}/{LABEL}", check=False)
     stream = sys.stdout if result.returncode == 0 else sys.stderr
     print(result.stdout if result.returncode == 0 else result.stderr, end="", file=stream)

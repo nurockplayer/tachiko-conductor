@@ -40,9 +40,16 @@ that canonical file is accepted. This keeps heartbeat, native dispatch, and manu
 one host ownership domain.
 The build requires exact committed TypeScript/build inputs, the repository's exact
 `pnpm@10.34.5` lockfile, and pinned Node/Corepack/Git/OpenSSL/TypeScript identities. Its canonical manifest
-binds commit and tree IDs, protected source/package/lockfile digests, authenticated provider
+binds commit and tree IDs, protected source/package/lockfile digests, the selected committed heartbeat
+runner blob/mode and its installed private runner digest, authenticated provider
 identities, every emitted `dist/` file, and the runtime import closure. Installation verifies and
 atomically pins exactly those bytes, reusing a bundle only when its full manifest and files match.
+The runner and helper are selected from one clean committed capture; install refuses a staged or
+modified protected runner and rechecks that source before publishing configuration, the plist, or
+service changes. Installed status and heartbeat execution validate the private runner/helper binding
+without consulting a later checkout. This provenance check does not authenticate a compromised
+installer or interpreter. The initial Node interpreter remains an operator-trusted prerequisite:
+pinned bytes and a digest do not prove who distributed Node.
 Use `--no-load` to prepare and
 validate an install without bootstrapping LaunchAgent; this does not enable the held service.
 The LaunchAgent does not inherit arbitrary admission-domain variables. `wake_env` cannot override

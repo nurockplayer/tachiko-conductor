@@ -301,7 +301,9 @@ class ProviderBuildTest(unittest.TestCase):
     def test_existing_corepack_snapshot_rejects_incomplete_or_broad_fixture_directories(self) -> None:
         corepack_bundle = self.module._corepack_bundle_path(self.manifest)
         corepack_bundle.mkdir(mode=0o755)
+        corepack_bundle.chmod(0o755)
         (corepack_bundle / "dist").mkdir(mode=0o755)
+        (corepack_bundle / "dist").chmod(0o755)
         reviewed_files = self.module.extract_corepack_package(self.manifest, self.artifact)
         entry_bytes = reviewed_files["dist/corepack.js"]
         (corepack_bundle / "dist/corepack.js").write_bytes(entry_bytes)
@@ -473,13 +475,22 @@ class ProviderBuildTest(unittest.TestCase):
         repo.mkdir()
         (repo / "src").mkdir()
         (repo / "src/entry.ts").write_text("export const value = 1;\n")
+        (repo / "src/entry.ts").chmod(0o644)
         (repo / "scripts/bootstrap-heartbeat/providers").mkdir(parents=True)
         for name in ("corepack-0.34.6.json", "corepack-0.34.6.tgz"):
-            (repo / "scripts/bootstrap-heartbeat/providers" / name).write_bytes(
-                (HERE / "providers" / name).read_bytes())
-        (repo / "package.json").write_text('{"packageManager":"pnpm@10.34.5"}\n')
-        (repo / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
-        (repo / "tsconfig.json").write_text('{"compilerOptions":{}}\n')
+            source_provider = HERE / "providers" / name
+            copied_provider = repo / "scripts/bootstrap-heartbeat/providers" / name
+            copied_provider.write_bytes(source_provider.read_bytes())
+            copied_provider.chmod(stat.S_IMODE(source_provider.stat().st_mode))
+        selected_runner = repo / "scripts/bootstrap-heartbeat/runner.py"
+        selected_runner.write_bytes(RUNNER.read_bytes())
+        selected_runner.chmod(stat.S_IMODE(RUNNER.stat().st_mode))
+        for name, contents in (("package.json", '{"packageManager":"pnpm@10.34.5"}\n'),
+                               ("pnpm-lock.yaml", "lockfileVersion: '9.0'\n"),
+                               ("tsconfig.json", '{"compilerOptions":{}}\n')):
+            candidate = repo / name
+            candidate.write_text(contents)
+            candidate.chmod(0o644)
         (repo / ".gitattributes").write_text("src/entry.ts filter=poison export-ignore export-subst\n")
         (repo / ".gitignore").write_text("src/ignored.txt\n")
         marker = self.root / "git-filter-ran"
@@ -514,9 +525,11 @@ class ProviderBuildTest(unittest.TestCase):
         self.assertEqual(snapshot["head"], subprocess.run([git["path"], "-C", str(repo), "rev-parse", "HEAD"], env=env,
                                                           check=True, stdout=subprocess.PIPE, text=True).stdout.strip())
         self.assertEqual(snapshot["files"]["src/entry.ts"]["bytes"], b"export const value = 1;\n")
+        self.assertEqual(snapshot["files"]["scripts/bootstrap-heartbeat/runner.py"]["bytes"], RUNNER.read_bytes())
         materialized = self.root / "materialized"
         self.module.materialize_committed_source(snapshot, materialized)
         self.assertEqual((materialized / "src/entry.ts").read_bytes(), b"export const value = 1;\n")
+        self.assertEqual((materialized / "scripts/bootstrap-heartbeat/runner.py").read_bytes(), RUNNER.read_bytes())
         self.assertFalse(marker.exists(), "Git clean/fsmonitor helpers must not run during raw source inspection")
         self.assertFalse(process_marker.exists(), "Git process filters must not run during raw source inspection")
         self.assertFalse(any("status" in command or "archive" in command for command in commands))
@@ -559,6 +572,33 @@ class ProviderBuildTest(unittest.TestCase):
             self.module.capture_committed_build_source(repo, git)
         bootstrap.unlink()
         bootstrap_copy.rename(bootstrap)
+
+        source_runner_before = selected_runner.read_bytes()
+        source_runner_mode = stat.S_IMODE(selected_runner.stat().st_mode)
+        selected_runner.write_bytes(source_runner_before + b"# worktree drift\n")
+        with self.assertRaisesRegex(RuntimeError, "worktree|protected"):
+            self.module.capture_committed_build_source(repo, git)
+        selected_runner.write_bytes(source_runner_before)
+        selected_runner.chmod(source_runner_mode ^ 0o111)
+        with self.assertRaisesRegex(RuntimeError, "worktree|protected"):
+            self.module.capture_committed_build_source(repo, git)
+        selected_runner.chmod(source_runner_mode)
+        selected_runner.unlink()
+        with self.assertRaisesRegex(RuntimeError, "missing or extra|runner is missing"):
+            self.module.capture_committed_build_source(repo, git)
+        selected_runner.write_bytes(source_runner_before)
+        selected_runner.chmod(source_runner_mode)
+        selected_runner.unlink()
+        selected_runner.symlink_to(repo / "src/entry.ts")
+        with self.assertRaisesRegex(RuntimeError, "regular file"):
+            self.module.capture_committed_build_source(repo, git)
+        selected_runner.unlink()
+        selected_runner.write_bytes(source_runner_before)
+        selected_runner.chmod(source_runner_mode)
+        selected_runner.write_bytes(source_runner_before + b"# staged drift\n")
+        subprocess.run([git["path"], "add", "scripts/bootstrap-heartbeat/runner.py"], cwd=repo, env=env, check=True)
+        with self.assertRaisesRegex(RuntimeError, "staged protected"):
+            self.module.capture_committed_build_source(repo, git)
 
     def test_heartbeat_log_creation_append_and_bounded_trim_use_private_file(self) -> None:
         log_path = self.module.ROOT / "heartbeat.log"
@@ -795,6 +835,7 @@ class HeartbeatTest(unittest.TestCase):
         private_parent.mkdir(mode=0o700)
         unsafe_root = private_parent / "unsafe-heartbeat"
         unsafe_root.mkdir(mode=0o755)
+        unsafe_root.chmod(0o755)
         victim = self.root / "log-victim"
         victim.write_bytes(b"victim bytes remain exact\n")
         unsafe_log = unsafe_root / "heartbeat.log"
@@ -847,6 +888,40 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("pinned heartbeat receipt directory does not match", result.stderr)
         self.assertEqual(self.records(), [])
+
+    def test_loaded_config_requires_exact_captured_runner_and_private_bytes(self) -> None:
+        config_path = self.state_root / "config.json"
+        valid = json.loads(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(self.invoke("status").returncode, 0)
+        for label, mutate in (
+            ("missing provenance", lambda candidate: candidate["admission_build"].pop("source_runner")),
+            ("extra field", lambda candidate: candidate["admission_build"]["source_runner"].update(extra="unexpected")),
+            ("digest mismatch", lambda candidate: candidate["admission_build"]["source_runner"].update(sha256="0" * 64)),
+            ("blob mismatch", lambda candidate: candidate["admission_build"]["source_runner"].update(blob="0" * 40)),
+            ("unsupported source mode", lambda candidate: candidate["admission_build"]["source_runner"].update(source_mode="100600")),
+            ("installed mode mismatch", lambda candidate: candidate["admission_build"]["source_runner"].update(installed_mode="0755")),
+        ):
+            with self.subTest(case=label):
+                candidate = json.loads(json.dumps(valid))
+                mutate(candidate)
+                config_path.write_text(json.dumps(candidate), encoding="utf-8")
+                rejected = self.invoke("status", check=False)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertIn("runner", rejected.stderr.lower())
+                config_path.write_text(json.dumps(valid), encoding="utf-8")
+
+        runner = Path(valid["runner"])
+        original = runner.read_bytes()
+        runner.write_bytes(original + b"# private snapshot tampered\n")
+        rejected = self.invoke("status", check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("runner", rejected.stderr.lower())
+        runner.write_bytes(original)
+        runner.chmod(0o755)
+        rejected = self.invoke("status", check=False)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("runner", rejected.stderr.lower())
+        runner.chmod(0o700)
 
     def test_generated_provider_identity_passes_full_config_validation(self) -> None:
         config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
@@ -1297,6 +1372,12 @@ class HeartbeatTest(unittest.TestCase):
                     "device": 1, "inode": seed, "uid": 0, "gid": 0, "mode": 0o755}
         helper_build = {
             "source_commit": "a" * 40, "source_tree": "b" * 40, "source_snapshot_sha256": "c" * 64,
+            "source_runner": {
+                "path": "scripts/bootstrap-heartbeat/runner.py",
+                "blob": hashlib.sha1(b"blob " + str(len(RUNNER.read_bytes())).encode() + b"\0" + RUNNER.read_bytes()).hexdigest(),
+                "source_mode": "100755" if stat.S_IMODE(RUNNER.stat().st_mode) & 0o111 else "100644",
+                "sha256": hashlib.sha256(RUNNER.read_bytes()).hexdigest(), "installed_mode": "0700",
+            },
             "package_json_sha256": "d" * 64, "lockfile_sha256": "e" * 64,
             "node_path": str(node_snapshot), "node_sha256": node_digest, "node_version": "v22.0.0",
             "providers": {
@@ -1367,6 +1448,42 @@ class HeartbeatTest(unittest.TestCase):
         }
         (self.state_root / "config.json").write_text(json.dumps(config), encoding="utf-8")
 
+    def selected_source_fixture(self) -> tuple[Path, Path]:
+        cached = getattr(self, "_selected_source_fixture", None)
+        if cached is not None:
+            return cached
+        repo = self.root / "selected-source-repository"
+        repo.mkdir()
+        tracked = subprocess.run(["git", "ls-files", "-z"], cwd=Path.cwd(), check=True,
+                                 stdout=subprocess.PIPE).stdout.split(b"\0")
+        for raw_name in tracked:
+            if not raw_name:
+                continue
+            name = raw_name.decode("utf-8")
+            if not (name.startswith("src/") or name in {"package.json", "pnpm-lock.yaml", "tsconfig.json"}
+                    or name.startswith("scripts/bootstrap-heartbeat/providers/")
+                    or name == "scripts/bootstrap-heartbeat/runner.py"):
+                continue
+            source = Path.cwd() / name
+            if not source.is_file() or source.is_symlink():
+                continue
+            target = repo / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            target.chmod(stat.S_IMODE(source.stat().st_mode))
+        env = dict(os.environ, GIT_AUTHOR_NAME="Heartbeat Test", GIT_AUTHOR_EMAIL="heartbeat-test@example.invalid",
+                   GIT_COMMITTER_NAME="Heartbeat Test", GIT_COMMITTER_EMAIL="heartbeat-test@example.invalid",
+                   GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        subprocess.run(["git", "init", "--quiet"], cwd=repo, env=env, check=True)
+        subprocess.run(["git", "add", "--all"], cwd=repo, env=env, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "selected heartbeat source fixture"],
+                       cwd=repo, env=env, check=True)
+        runner = repo / "scripts/bootstrap-heartbeat/runner.py"
+        if not runner.is_file():
+            raise AssertionError("selected source fixture omitted the heartbeat runner")
+        self._selected_source_fixture = (repo, runner)
+        return repo, runner
+
     def write_payload(self, oid: str, *, reverse: bool = False, truncated: bool = False) -> None:
         issues = [
             {
@@ -1430,9 +1547,18 @@ class HeartbeatTest(unittest.TestCase):
         self.payload.write_text(json.dumps(data), encoding="utf-8")
 
     def invoke(self, command: str = "run", *args: str, env: dict[str, str] | None = None,
-               check: bool = True) -> subprocess.CompletedProcess[str]:
+               check: bool = True, runner: Path | None = None) -> subprocess.CompletedProcess[str]:
+        if command == "install" and runner is None:
+            fixture_repo, fixture_runner = self.selected_source_fixture()
+            mutable_args = list(args)
+            for index, argument in enumerate(mutable_args[:-1]):
+                if argument == "--repo" and Path(mutable_args[index + 1]).resolve() == Path.cwd().resolve():
+                    mutable_args[index + 1] = str(fixture_repo)
+                    break
+            args = tuple(mutable_args)
+            runner = fixture_runner
         return subprocess.run(
-            [sys.executable, str(RUNNER), command, *args], env=env or self.env,
+            [sys.executable, str(runner or RUNNER), command, *args], env=env or self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=check,
         )
 
@@ -2551,12 +2677,13 @@ class HeartbeatTest(unittest.TestCase):
         self.assertEqual((self.state_root / "runner.lock").read_bytes(), b"", "guard may settle after state repair")
 
     def test_real_pinned_helper_competes_with_native_lane_then_guard_settles(self) -> None:
+        selected_repo, selected_runner = self.selected_source_fixture()
         saved_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
         saved_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
         os.environ["SCD_HEARTBEAT_TESTING"] = "1"
         os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
         try:
-            spec = importlib.util.spec_from_file_location("heartbeat_runner_under_test", RUNNER)
+            spec = importlib.util.spec_from_file_location("heartbeat_runner_under_test", selected_runner)
             self.assertIsNotNone(spec and spec.loader)
             module = importlib.util.module_from_spec(spec)
             assert spec and spec.loader
@@ -2580,7 +2707,12 @@ class HeartbeatTest(unittest.TestCase):
         os.environ["SCD_HEARTBEAT_TESTING"] = "1"
         os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
         try:
-            helper, helper_digest, helper_files, helper_build, _ = module.pin_admission_helper(Path.cwd().resolve(), node)
+            selected_git, _selected_openssl = module.qualified_system_providers()
+            selected_source = module.capture_committed_build_source(selected_repo, selected_git)
+            module.verify_executing_runner(selected_repo, selected_source)
+            runner_snapshot, runner_digest, _runner_created = module.pin_runner_source(selected_source)
+            helper, helper_digest, helper_files, helper_build, _ = module.pin_admission_helper(
+                selected_repo, node, selected_source)
         finally:
             if saved_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
             else: os.environ["SCD_HEARTBEAT_TESTING"] = saved_testing
@@ -2592,9 +2724,10 @@ class HeartbeatTest(unittest.TestCase):
             else:
                 ambient_entry.unlink(missing_ok=True)
         self.assertNotEqual(Path(helper).read_bytes(), poison)
-        expected_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=Path.cwd(), check=True,
+        expected_head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=selected_repo, check=True,
                                        text=True, stdout=subprocess.PIPE).stdout.strip()
         self.assertEqual(helper_build["source_commit"], expected_head)
+        self.assertEqual(helper_build["source_runner"], module.source_runner_record(selected_source))
         self.assertEqual(helper_build["pnpm_version"], "10.34.5")
         self.assertEqual(helper_build["typescript_version"], "5.9.3")
         admission = {
@@ -2608,7 +2741,8 @@ class HeartbeatTest(unittest.TestCase):
         Path(admission["workspace"]).mkdir()
         config_path = self.state_root / "config.json"
         config = json.loads(config_path.read_text(encoding="utf-8"))
-        config.update({"admission": admission, "admission_node": str(node), "admission_node_sha256": node_digest,
+        config.update({"runner": str(runner_snapshot), "runner_sha256": runner_digest,
+                       "admission": admission, "admission_node": str(node), "admission_node_sha256": node_digest,
                        "admission_helper": str(helper), "admission_helper_sha256": helper_digest,
                        "admission_helper_files": helper_files, "admission_build": helper_build})
         config_path.write_text(json.dumps(config), encoding="utf-8")
@@ -3241,7 +3375,7 @@ class HeartbeatTest(unittest.TestCase):
         config = json.loads((self.state_root / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(config["admission"]["registry"], str(canonical_registry))
         self.assertEqual(plist["StartInterval"], 180)
-        self.assertEqual(plist["WorkingDirectory"], str(Path.cwd()))
+        self.assertEqual(plist["WorkingDirectory"], str(self.selected_source_fixture()[0]))
         self.assertEqual(plist["ProgramArguments"], ["/usr/bin/python3", config["runner"], "run"])
         self.assertEqual(Path(config["runner"]).parent, self.state_root)
         self.assertEqual(Path(config["runner"]).name, "verified-runner-" + config["runner_sha256"])
@@ -3249,11 +3383,204 @@ class HeartbeatTest(unittest.TestCase):
             hashlib.sha256(Path(config["runner"]).read_bytes()).hexdigest(), config["runner_sha256"]
         )
         self.assertEqual(config["wake_command"], [str(self.wake), "future-dispatch-once"])
-        self.assertEqual(self.invoke("status").returncode, 0)
+        selected_repo, selected_runner = self.selected_source_fixture()
+        selected_runner.write_bytes(selected_runner.read_bytes() + b"# checkout moved after installation\n")
+        subprocess.run(["git", "add", "scripts/bootstrap-heartbeat/runner.py"], cwd=selected_repo, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "move checkout after installation"], cwd=selected_repo,
+                       env=dict(os.environ, GIT_AUTHOR_NAME="Heartbeat Test", GIT_AUTHOR_EMAIL="heartbeat-test@example.invalid",
+                                GIT_COMMITTER_NAME="Heartbeat Test", GIT_COMMITTER_EMAIL="heartbeat-test@example.invalid",
+                                GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull), check=True)
+        installed_runner = Path(config["runner"])
+        self.assertEqual(self.invoke("status", runner=installed_runner).returncode, 0)
+        self.assertEqual(self.invoke("run", "--prime", runner=installed_runner).returncode, 0)
         self.invoke("uninstall", "--no-load")
         self.invoke("uninstall", "--no-load")
         self.assertFalse(self.plist.exists())
         self.assertTrue((self.state_root / "state.json").exists(), "uninstall preserves evidence/state")
+
+    def test_install_rejects_other_checkout_and_dirty_selected_runner_without_publication(self) -> None:
+        self.invoke("run", "--prime")
+        selected_repo, selected_runner = self.selected_source_fixture()
+        alternate_repo = self.root / "alternate-selected-repository"
+        shutil.copytree(selected_repo, alternate_repo, ignore=shutil.ignore_patterns(".git"))
+        subprocess.run(["git", "init", "--quiet"], cwd=alternate_repo, check=True)
+        git_env = dict(os.environ, GIT_AUTHOR_NAME="Heartbeat Test", GIT_AUTHOR_EMAIL="heartbeat-test@example.invalid",
+                       GIT_COMMITTER_NAME="Heartbeat Test", GIT_COMMITTER_EMAIL="heartbeat-test@example.invalid",
+                       GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull)
+        subprocess.run(["git", "add", "--all"], cwd=alternate_repo, env=git_env, check=True)
+        subprocess.run(["git", "commit", "--quiet", "-m", "alternate source identity"], cwd=alternate_repo,
+                       env=git_env, check=True)
+        command = json.dumps([str(self.wake), "future-dispatch-once"])
+        alternate = self.invoke(
+            "install", "--repo", str(alternate_repo), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load", runner=selected_runner, check=False,
+        )
+        self.assertNotEqual(alternate.returncode, 0)
+        self.assertIn("not the selected repository source", alternate.stderr)
+
+        self.plist.parent.mkdir(parents=True, exist_ok=True)
+        self.plist.write_bytes(b"prior plist remains\n")
+        before = {
+            "config": (self.state_root / "config.json").read_bytes(),
+            "state": (self.state_root / "state.json").read_bytes(),
+            "plist": self.plist.read_bytes(),
+        }
+        original_runner = selected_runner.read_bytes()
+        selected_runner.write_bytes(original_runner + b"# dirty selected source\n")
+        dirty = self.invoke(
+            "install", "--repo", str(selected_repo), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target", "--no-load", runner=selected_runner, check=False,
+        )
+        self.assertNotEqual(dirty.returncode, 0)
+        self.assertIn("worktree", dirty.stderr)
+        self.assertEqual((self.state_root / "config.json").read_bytes(), before["config"])
+        self.assertEqual((self.state_root / "state.json").read_bytes(), before["state"])
+        self.assertEqual(self.plist.read_bytes(), before["plist"])
+
+    def test_install_rechecks_source_before_config_plist_and_service_publication(self) -> None:
+        previous_environment = os.environ.copy()
+        def restore_environment() -> None:
+            os.environ.clear()
+            os.environ.update(previous_environment)
+        self.addCleanup(restore_environment)
+        selected_repo, selected_runner = self.selected_source_fixture()
+        old_testing = os.environ.get("SCD_HEARTBEAT_TESTING")
+        old_root = os.environ.get("SCD_HEARTBEAT_TEST_ROOT")
+        os.environ["SCD_HEARTBEAT_TESTING"] = "1"
+        os.environ["SCD_HEARTBEAT_TEST_ROOT"] = str(self.state_root)
+        try:
+            spec = importlib.util.spec_from_file_location("heartbeat_install_order_under_test", selected_runner)
+            self.assertIsNotNone(spec and spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            assert spec and spec.loader
+            spec.loader.exec_module(module)
+        finally:
+            if old_testing is None: os.environ.pop("SCD_HEARTBEAT_TESTING", None)
+            else: os.environ["SCD_HEARTBEAT_TESTING"] = old_testing
+            if old_root is None: os.environ.pop("SCD_HEARTBEAT_TEST_ROOT", None)
+            else: os.environ["SCD_HEARTBEAT_TEST_ROOT"] = old_root
+
+        existing_config = (self.state_root / "config.json").read_bytes()
+        existing_state = (self.state_root / "state.json").read_bytes() if (self.state_root / "state.json").exists() else None
+        self.plist.parent.mkdir(parents=True, exist_ok=True)
+        existing_plist = b"prior plist bytes\n"
+        self.plist.write_bytes(existing_plist)
+        selected_source = module.capture_committed_build_source(selected_repo, module.qualified_system_providers()[0])
+        original_runner = selected_runner.read_bytes()
+        helper_config = json.loads(existing_config)
+        helper_source_root = Path(helper_config["admission_helper"]).parents[1]
+        helper_result_build = json.loads(json.dumps(helper_config["admission_build"]))
+        helper_result_build.update({
+            "source_commit": selected_source["head"],
+            "source_tree": selected_source["tree"],
+            "source_snapshot_sha256": selected_source["snapshot_sha256"],
+            "source_runner": module.source_runner_record(selected_source),
+        })
+        helper_manifest_bytes = (json.dumps(helper_result_build, sort_keys=True, separators=(",", ":")) + "\n").encode()
+        helper_digest = hashlib.sha256(helper_manifest_bytes).hexdigest()
+        helper_bundle = self.state_root / ("verified-admission-" + helper_digest)
+        helper_bundle.mkdir(mode=0o700)
+        helper_bundle.chmod(0o700)
+        helper_result_files: list[dict[str, str]] = []
+        for item in helper_result_build["files"]:
+            relative = Path(item["path"])
+            source_file = helper_source_root / relative
+            target_file = helper_bundle / relative
+            target_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            target_file.parent.chmod(0o700)
+            target_file.write_bytes(source_file.read_bytes())
+            target_file.chmod(0o600)
+            helper_result_files.append({"path": str(target_file), "sha256": item["sha256"]})
+        helper_manifest = helper_bundle / "build-manifest.json"
+        helper_manifest.write_bytes(helper_manifest_bytes)
+        helper_manifest.chmod(0o600)
+        helper_result_files.append({"path": str(helper_manifest), "sha256": helper_digest})
+        helper_entry = helper_bundle / "mission-admission/heartbeat-admission-cli.js"
+        helper_result = (helper_entry, helper_digest, helper_result_files, helper_result_build, False)
+        command = json.dumps([str(self.wake), "future-dispatch-once"])
+        os.environ.update(self.env)
+        args = module.parser().parse_args([
+            "install", "--repo", str(selected_repo), "--wake-command-json", command,
+            "--acknowledge-relocatable-wake-target",
+        ])
+
+        for boundary, mutation_call in (("config", 2), ("plist directory", 3),
+                                        ("plist", 4), ("service bootout", 5),
+                                        ("service bootstrap", 6)):
+            selected_runner.write_bytes(original_runner)
+            selected_runner.chmod(stat.S_IMODE(RUNNER.stat().st_mode))
+            subprocess.run(["git", "reset", "--quiet", "HEAD", "--", "scripts/bootstrap-heartbeat/runner.py"],
+                           cwd=selected_repo, check=True)
+            source_checks = 0
+            launchctl_calls: list[tuple[str, ...]] = []
+            real_check = module.verify_build_source_unchanged
+
+            def fake_launchctl(*call: str, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                launchctl_calls.append(call)
+                return subprocess.CompletedProcess(call, 0, "", "")
+
+            def move_source(repo: Path, git: dict[str, str], captured: dict[str, object]) -> None:
+                nonlocal source_checks
+                source_checks += 1
+                if source_checks == mutation_call:
+                    selected_runner.write_bytes(original_runner + f"# moved at {boundary}\n".encode())
+                real_check(repo, git, captured)
+
+            previous_umask = os.umask(0o077)
+            try:
+                with mock.patch.object(module, "pin_admission_helper", return_value=helper_result), \
+                     mock.patch.object(module, "verify_build_source_unchanged", side_effect=move_source), \
+                     mock.patch.object(module, "launchctl", side_effect=fake_launchctl):
+                    with self.assertRaisesRegex(RuntimeError, "protected worktree|runner differs"):
+                        module.install(args)
+            finally:
+                os.umask(previous_umask)
+                selected_runner.write_bytes(original_runner)
+                selected_runner.chmod(stat.S_IMODE(RUNNER.stat().st_mode))
+            self.assertEqual(source_checks, mutation_call)
+            self.assertEqual((self.state_root / "config.json").read_bytes(), existing_config)
+            if existing_state is None:
+                self.assertFalse((self.state_root / "state.json").exists())
+            else:
+                self.assertEqual((self.state_root / "state.json").read_bytes(), existing_state)
+            self.assertEqual(self.plist.read_bytes(), existing_plist)
+            if boundary == "service bootstrap":
+                self.assertEqual([call[0] for call in launchctl_calls], ["bootout", "bootout", "bootstrap"])
+            else:
+                self.assertEqual(launchctl_calls, [], "source movement must refuse before service changes")
+
+        selected_runner.write_bytes(original_runner)
+        selected_runner.chmod(stat.S_IMODE(RUNNER.stat().st_mode))
+        for field in ("source_runner.blob", "source_commit", "source_tree", "source_snapshot_sha256"):
+            with self.subTest(helper_capture_field=field):
+                mismatched_build = json.loads(json.dumps(helper_result[3]))
+                if field == "source_runner.blob":
+                    original_value = mismatched_build["source_runner"]["blob"]
+                else:
+                    original_value = mismatched_build[field]
+                replacement = "1" * len(original_value) if original_value[0] == "0" else "0" * len(original_value)
+                if field == "source_runner.blob":
+                    mismatched_build["source_runner"]["blob"] = replacement
+                else:
+                    mismatched_build[field] = replacement
+                    self.assertEqual(mismatched_build["source_runner"], module.source_runner_record(selected_source))
+                mismatched_helper = (helper_result[0], helper_result[1], helper_result[2], mismatched_build, False)
+                previous_umask = os.umask(0o077)
+                launchctl_calls: list[tuple[str, ...]] = []
+                try:
+                    with mock.patch.object(module, "pin_admission_helper", return_value=mismatched_helper), \
+                         mock.patch.object(module, "launchctl", side_effect=fake_launchctl):
+                        with self.assertRaisesRegex(RuntimeError, "do not share one captured source"):
+                            module.install(args)
+                finally:
+                    os.umask(previous_umask)
+                self.assertEqual(launchctl_calls, [], "mismatched source provenance must refuse before service changes")
+                self.assertEqual((self.state_root / "config.json").read_bytes(), existing_config)
+                if existing_state is None:
+                    self.assertFalse((self.state_root / "state.json").exists())
+                else:
+                    self.assertEqual((self.state_root / "state.json").read_bytes(), existing_state)
+                self.assertEqual(self.plist.read_bytes(), existing_plist)
 
     def test_install_rejects_noncanonical_admission_registry_paths(self) -> None:
         command = json.dumps([str(self.wake), "future-dispatch-once"])
