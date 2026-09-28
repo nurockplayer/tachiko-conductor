@@ -117,30 +117,53 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     return guard;
   }
   async verifyDurable(request: VerifyDurableRequest): Promise<DurableImplementationSnapshot> {
-    await this.assert(request.identity);
-    const head = (await this.git(request.identity.workspacePath, ['rev-parse', 'HEAD'])).stdout.trim();
-    if (head !== request.expectedHeadSha) this.fail('HEAD_MISMATCH', 'Standalone worker HEAD differs from the reported exact HEAD.');
-    if (request.adoptExistingHead === true) {
-      const progressBase = request.progressBaseSha;
-      if (progressBase === undefined || progressBase === head) this.fail('HEAD_MISMATCH', 'Existing PR adoption requires a distinct authoritative PR base.');
-      await this.ancestor(request.identity.workspacePath, progressBase, head);
-      if (await this.tree(request.identity.workspacePath, progressBase) === await this.tree(request.identity.workspacePath, head)) {
+    // Resolve the source-minted proof exactly once, before any Git operation
+    // can yield. A later guard for the same workspace must never be borrowed.
+    const identity = request.identity;
+    const expectedHead = request.expectedHeadSha;
+    const adoptionBase = request.progressBaseSha;
+    const beforePublish = request.beforePublish;
+    const guard = request.workspaceGuard;
+    const proof = guard === undefined ? undefined : preparedLunaGuards.get(guard as object);
+    if (proof === undefined || currentLunaProofs.get(path.resolve(identity.workspacePath)) !== proof || !same(proof.identity, identity)) {
+      this.fail('STALE_IDENTITY', 'Standalone durable verification requires the exact current source-minted workspace guard.');
+    }
+    const adoptingExistingHead = request.adoptExistingHead === true;
+    const progressBase = adoptionBase ?? identity.baseSha;
+    if (adoptingExistingHead) {
+      if (proof.authorizedHead !== expectedHead) this.fail('STALE_IDENTITY', 'Existing PR adoption does not match its source-authorized HEAD.');
+    } else if (proof.authorizedHead !== progressBase) {
+      this.fail('STALE_IDENTITY', 'Standalone publication base differs from its source-authorized HEAD.');
+    }
+    await this.assert(identity, undefined, proof);
+    const head = (await this.git(identity.workspacePath, ['rev-parse', 'HEAD'])).stdout.trim();
+    if (head !== expectedHead) this.fail('HEAD_MISMATCH', 'Standalone worker HEAD differs from the reported exact HEAD.');
+    if (adoptingExistingHead) {
+      if (adoptionBase === undefined || adoptionBase === head) this.fail('HEAD_MISMATCH', 'Existing PR adoption requires a distinct authoritative PR base.');
+      await this.ancestor(identity.workspacePath, adoptionBase, head);
+      if (await this.tree(identity.workspacePath, adoptionBase) === await this.tree(identity.workspacePath, head)) {
         this.fail('HEAD_MISMATCH', 'Existing PR adoption has no tree progress from the authoritative PR base.');
       }
-      return { headSha: head, branch: request.identity.branch };
+      // Adoption returns a read-only proof after asynchronous ancestry/tree
+      // checks. Revalidate the same captured proof at that final acceptance
+      // point so a successful reprepare during either await supersedes it.
+      this.assertCurrentProof(identity, proof, expectedHead);
+      return { headSha: head, branch: identity.branch };
     }
-    if (typeof request.beforePublish !== 'function') this.fail('INVALID_REQUEST', 'Standalone publication requires a synchronous host-owned beforePublish fence.');
-    const progressBase = request.progressBaseSha ?? request.identity.baseSha;
+    if (typeof beforePublish !== 'function') this.fail('INVALID_REQUEST', 'Standalone publication requires a synchronous host-owned beforePublish fence.');
     if (head === progressBase) this.fail('HEAD_MISMATCH', 'Worker result did not advance the authorized HEAD.');
-    await this.ancestor(request.identity.workspacePath, progressBase, head);
-    if (await this.tree(request.identity.workspacePath, progressBase) === await this.tree(request.identity.workspacePath, head)) this.fail('HEAD_MISMATCH', 'Worker result has no tree progress from the authorized base.');
+    await this.ancestor(identity.workspacePath, progressBase, head);
+    if (await this.tree(identity.workspacePath, progressBase) === await this.tree(identity.workspacePath, head)) this.fail('HEAD_MISMATCH', 'Worker result has no tree progress from the authorized base.');
     // This command is host-owned.  The worker has no remote, credentials, or
     // source checkout authority, so it cannot publish the branch itself.
     // Import through trusted host Git state; never run a worker checkout's
     // hooks/config for publication.  Hooks are disabled on every host action.
-    await this.git(this.source, ['fetch', '--no-tags', '--no-recurse-submodules', request.identity.workspacePath, head]);
-    await this.assertPublicationRemote(request.identity);
-    const ref = `refs/heads/${request.identity.publicationBranch ?? request.identity.branch}`;
+    await this.git(this.source, ['fetch', '--no-tags', '--no-recurse-submodules', identity.workspacePath, head]);
+    // Re-prove ancestry in trusted source state after import. Worker-local
+    // ancestry is insufficient to authorize a publication fence or push.
+    await this.ancestor(this.source, progressBase, head);
+    await this.assertPublicationRemote(identity);
+    const ref = `refs/heads/${identity.publicationBranch ?? identity.branch}`;
     const before = await this.remoteHead(ref);
     if (before !== null) {
       await this.git(this.source, ['fetch', '--no-tags', 'origin', ref]);
@@ -148,12 +171,14 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     }
     // Normal Git push is intentionally non-force. A concurrent/diverged ref
     // therefore remains untouched even if it changes after the re-read.
-    request.beforePublish();
-    await this.git(this.source, ['push', '--no-verify', 'origin', `${head}:${ref}`]);
-    await this.assertPublicationRemote(request.identity);
+    await this.git(this.source, ['push', '--no-verify', 'origin', `${head}:${ref}`], [0], () => {
+      beforePublish();
+      this.assertCurrentProof(identity, proof, progressBase);
+    });
+    await this.assertPublicationRemote(identity);
     const published = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim().split(/\s+/)[0];
     if (published !== head) this.fail('UNPUSHED_HEAD', 'Host publication did not retain the exact standalone worker HEAD.');
-    return { headSha: head, branch: request.identity.branch };
+    return { headSha: head, branch: identity.branch };
   }
   private identity(r: BootstrapPlanRequest): ImplementationBootstrapIdentity {
     const branch = `tachiko/${r.runId}`;
@@ -277,13 +302,18 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     }
   }
   private async remoteHead(ref: string): Promise<string | null> { const raw = (await this.git(this.source, ['ls-remote', '--heads', 'origin', ref])).stdout.trim(); return raw === '' ? null : raw.split(/\s+/)[0] ?? null; }
-  private async git(cwd: string, args: string[], allowed: number[] = [0]) {
+  private assertCurrentProof(identity: ImplementationBootstrapIdentity, proof: PreparedLunaProof, authorizedHead: string): void {
+    if (currentLunaProofs.get(path.resolve(identity.workspacePath)) !== proof || !same(proof.identity, identity) || proof.authorizedHead !== authorizedHead) {
+      this.fail('STALE_IDENTITY', 'Standalone invocation preparation proof changed before final acceptance.');
+    }
+  }
+  private async git(cwd: string, args: string[], allowed: number[] = [0], beforeSpawn?: () => void) {
     const env = { ...process.env } as NodeJS.ProcessEnv;
     for (const key of Object.keys(env)) if (key.startsWith('GIT_CONFIG_') || ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_ALTERNATE_OBJECT_DIRECTORIES'].includes(key)) delete env[key];
     env.GIT_CONFIG_NOSYSTEM = '1';
     env.GIT_CONFIG_GLOBAL = '/dev/null';
     env.GIT_NO_REPLACE_OBJECTS = '1';
-    const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.useReplaceRefs=false', ...args], { cwd, timeoutMs: this.timeoutMs, env });
+    const result = await this.runner.run('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.attributesFile=/dev/null', '-c', 'core.useReplaceRefs=false', '-c', 'core.commitGraph=false', ...args], { cwd, timeoutMs: this.timeoutMs, env, ...(beforeSpawn === undefined ? {} : { beforeSpawn }) });
     if (!allowed.includes(result.exitCode)) this.fail('COMMAND_FAILED', `git ${args[0]} failed.`); return result;
   }
   private fail(code: keyof typeof IMPLEMENTATION_BOOTSTRAP_ERROR_CODE, message: string): never { throw new ImplementationBootstrapError(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE[code], message); }
