@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -9,6 +9,8 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '..
 import { renderDispatchLaunchdPlist } from '../src/dispatch/launchd.js';
 import { parseDispatchConfiguration } from '../src/dispatch/config.js';
 import { main } from '../src/cli.js';
+import { DEFAULT_MISSION_ADMISSION_CONFIG, createHostAdmissionRegistry, resolveManualOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { writeManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
 import { readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
 import { syncDirectory } from '../src/durable-directory.js';
 
@@ -640,6 +642,9 @@ describe('dispatch scheduler boundary', () => {
       lock: process.env.TACHIKO_DISPATCH_LOCK_PATH,
       wake: process.env.TACHIKO_DISPATCH_WAKE_PATH,
       execution: process.env.TACHIKO_EXECUTION_PROFILE_CONFIG,
+      admissionPath: process.env.TACHIKO_MISSION_ADMISSION_PATH,
+      admissionConfig: process.env.TACHIKO_MISSION_ADMISSION_CONFIG,
+      manualReceipts: process.env.TACHIKO_MANUAL_OWNER_RECEIPTS_DIR,
     };
     const printed: string[] = [];
     const original = console.log;
@@ -647,11 +652,47 @@ describe('dispatch scheduler boundary', () => {
       process.env.TACHIKO_DATA_DIR = path.join(directory, 'runs');
       process.env.TACHIKO_DISPATCH_LOCK_PATH = path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock');
       process.env.TACHIKO_DISPATCH_WAKE_PATH = path.join(directory, 'wake');
+      const registryPath = path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'registry.json');
+      const manualReceiptsPath = path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'manual-receipts');
+      process.env.TACHIKO_MISSION_ADMISSION_PATH = registryPath;
+      process.env.TACHIKO_MISSION_ADMISSION_CONFIG = JSON.stringify(DEFAULT_MISSION_ADMISSION_CONFIG);
+      process.env.TACHIKO_MANUAL_OWNER_RECEIPTS_DIR = manualReceiptsPath;
       delete process.env.TACHIKO_EXECUTION_PROFILE_CONFIG;
+      const workspace = path.join(directory, 'manual-worktree');
+      mkdirSync(workspace);
+      const canonicalWorkspace = realpathSync.native(workspace);
+      const branch = 'held-scheduler-checkpoint';
+      const checkpointSha = 'a'.repeat(40);
+      let registryBytes = '';
+      let receiptBytes = '';
+      let manualReceiptPath = '';
+      let admissionRevision = 0;
+      let expectedManualLane: ReturnType<ReturnType<typeof createHostAdmissionRegistry>['readLane']>;
+      await withAccountHome(accountHome, async () => {
+        const registry = createHostAdmissionRegistry();
+        const admitted = registry.admit({
+          laneId: 'scheduler-held-manual-owner', role: 'production_captain',
+          evidence: { repository: 'acme/widgets', repositoryScope: true, workspace: canonicalWorkspace },
+        });
+        assert.equal(admitted.outcome, 'admitted');
+        if (admitted.outcome !== 'admitted') throw new Error('could not create the held manual owner fixture');
+        registry.parkManual(admitted.token, { worktree: canonicalWorkspace, branch, checkpointSha, clean: true, stopped: true });
+        expectedManualLane = registry.readLane(admitted.token.laneId)!;
+        manualReceiptPath = resolveManualOwnerReceiptPath('acme/widgets', canonicalWorkspace);
+        writeManualOwnerReceipt(manualReceiptPath, {
+          schemaVersion: 1, laneId: expectedManualLane.laneId, missionId: expectedManualLane.missionId,
+          repository: 'acme/widgets', workspace: canonicalWorkspace, branch, checkpointSha,
+          status: 'parked', generation: expectedManualLane.generation,
+        });
+        registryBytes = readFileSync(registryPath, 'utf8');
+        receiptBytes = readFileSync(manualReceiptPath, 'utf8');
+        const admission = registry.snapshot({ requireExisting: true });
+        admissionRevision = admission.revision;
+        assert.equal(admission.counts.writers, 0);
+      });
       writeOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR, {
         schemaVersion: 1, updatedAt: '2026-09-21T00:00:00.000Z', supervisor: 'parked', stage: 'maintenance_hold',
         eventWakeEligible: false, maintenanceHold: { active: true, reason: 'operator hold' }, ownership: 'none', checkpoint: 'durable',
-        manualLane: { repository: 'repo', worktree: '/worktree', branch: 'branch', checkpointSha: 'a'.repeat(40), clean: true, state: 'parked', recoverable: true },
       });
       console.log = (value?: unknown) => { printed.push(String(value)); };
       await withAccountHome(accountHome, async () => assert.equal(await main(['dispatch', 'once']), 0));
@@ -661,8 +702,13 @@ describe('dispatch scheduler boundary', () => {
       assert.match(printed.at(-1) ?? '', /"cycles": 2/);
       assert.match(printed.at(-1) ?? '', /"maintenance_hold"/);
       const first = readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR);
-      assert.deepEqual({ supervisor: first?.supervisor, stage: first?.stage, ownership: first?.ownership, checkpoint: first?.checkpoint, hold: first?.maintenanceHold.active, lane: first?.manualLane?.checkpointSha }, {
-        supervisor: 'parked', stage: 'maintenance_hold', ownership: 'none', checkpoint: 'durable', hold: true, lane: 'a'.repeat(40),
+      assert.deepEqual({ supervisor: first?.supervisor, stage: first?.stage, ownership: first?.ownership, checkpoint: first?.checkpoint, hold: first?.maintenanceHold.active, lane: first?.manualLane }, {
+        supervisor: 'parked', stage: 'maintenance_hold', ownership: 'none', checkpoint: 'durable', hold: true,
+        lane: {
+          repository: 'acme/widgets', worktree: canonicalWorkspace, branch, checkpointSha, clean: true, state: 'parked', recoverable: true,
+          laneId: expectedManualLane!.laneId, missionId: expectedManualLane!.missionId,
+          admissionRevision,
+        },
       });
       // A fresh supervised process sees the identical durable held state and
       // cannot manufacture another writer or claim.
@@ -671,10 +717,13 @@ describe('dispatch scheduler boundary', () => {
       const { updatedAt: _firstUpdatedAt, ...firstStable } = first!;
       const { updatedAt: _secondUpdatedAt, ...secondStable } = second!;
       assert.deepEqual(secondStable, firstStable);
+      assert.equal(readFileSync(registryPath, 'utf8'), registryBytes, 'held restart/re-entry does not mutate registry ownership or generation');
+      assert.equal(readFileSync(manualReceiptPath, 'utf8'), receiptBytes,
+        'held restart/re-entry preserves the exact private parked receipt');
     } finally {
       console.log = original;
       for (const [name, value] of Object.entries(previous)) {
-        const key = name === 'data' ? 'TACHIKO_DATA_DIR' : name === 'lock' ? 'TACHIKO_DISPATCH_LOCK_PATH' : name === 'wake' ? 'TACHIKO_DISPATCH_WAKE_PATH' : 'TACHIKO_EXECUTION_PROFILE_CONFIG';
+        const key = name === 'data' ? 'TACHIKO_DATA_DIR' : name === 'lock' ? 'TACHIKO_DISPATCH_LOCK_PATH' : name === 'wake' ? 'TACHIKO_DISPATCH_WAKE_PATH' : name === 'execution' ? 'TACHIKO_EXECUTION_PROFILE_CONFIG' : name === 'admissionPath' ? 'TACHIKO_MISSION_ADMISSION_PATH' : name === 'admissionConfig' ? 'TACHIKO_MISSION_ADMISSION_CONFIG' : 'TACHIKO_MANUAL_OWNER_RECEIPTS_DIR';
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
       }
       rmSync(directory, { recursive: true, force: true });
@@ -688,6 +737,8 @@ describe('dispatch scheduler boundary', () => {
       data: process.env.TACHIKO_DATA_DIR,
       lock: process.env.TACHIKO_DISPATCH_LOCK_PATH,
       wake: process.env.TACHIKO_DISPATCH_WAKE_PATH,
+      admissionPath: process.env.TACHIKO_MISSION_ADMISSION_PATH,
+      admissionConfig: process.env.TACHIKO_MISSION_ADMISSION_CONFIG,
     };
     const printed: string[] = [];
     const original = console.log;
@@ -697,6 +748,22 @@ describe('dispatch scheduler boundary', () => {
       process.env.TACHIKO_DATA_DIR = path.join(directory, 'runs');
       process.env.TACHIKO_DISPATCH_LOCK_PATH = lockPath;
       process.env.TACHIKO_DISPATCH_WAKE_PATH = wakePath;
+      const registryPath = path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'registry.json');
+      process.env.TACHIKO_MISSION_ADMISSION_PATH = registryPath;
+      process.env.TACHIKO_MISSION_ADMISSION_CONFIG = JSON.stringify(DEFAULT_MISSION_ADMISSION_CONFIG);
+      let registryBytes = '';
+      await withAccountHome(accountHome, async () => {
+        mkdirSync(path.dirname(registryPath), { recursive: true, mode: 0o700 });
+        writeFileSync(registryPath, `${JSON.stringify({
+          schemaVersion: 1, revision: 0, config: DEFAULT_MISSION_ADMISSION_CONFIG, lanes: [], lastTransition: null,
+        }, null, 2)}\n`, { mode: 0o600 });
+        const registry = createHostAdmissionRegistry();
+        assert.deepEqual(registry.snapshot({ requireExisting: true }), {
+          schemaVersion: 1, revision: 0, counts: { captains: 0, writers: 0, highAutonomy: 0, parked: 0 },
+          limits: DEFAULT_MISSION_ADMISSION_CONFIG.limits, omittedLaneCount: 0, lanesTruncated: false, lanes: [], lastTransition: null,
+        }, 'the fixture establishes a real pristine initial host registry with the CLI configuration');
+        registryBytes = readFileSync(registryPath, 'utf8');
+      });
       writeOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR, {
         schemaVersion: 1, updatedAt: '2026-09-21T00:00:00.000Z', supervisor: 'parked', stage: 'idle',
         eventWakeEligible: true, maintenanceHold: { active: false }, ownership: 'none', checkpoint: 'durable',
@@ -712,6 +779,7 @@ describe('dispatch scheduler boundary', () => {
       admission.release();
       assert.equal(await holding, 0);
       assert.equal(readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR)?.maintenanceHold.active, true);
+      assert.equal(readFileSync(registryPath, 'utf8'), registryBytes, 'maintenance hold does not mutate the pristine registry');
 
       printed.length = 0;
       await withAccountHome(accountHome, async () => assert.equal(await main(['dispatch', 'maintenance', 'release']), 0));
@@ -724,10 +792,11 @@ describe('dispatch scheduler boundary', () => {
       assert.equal(repeatedRelease.wake, undefined);
       assert.equal(readFileSync(wakePath, 'utf8'), firstToken);
       assert.equal(readOperationalRuntimeProjection(process.env.TACHIKO_DATA_DIR)?.maintenanceHold.active, false);
+      assert.equal(readFileSync(registryPath, 'utf8'), registryBytes, 'maintenance release and repeated release preserve the pristine registry');
     } finally {
       console.log = original;
       for (const [name, value] of Object.entries(previous)) {
-        const key = name === 'data' ? 'TACHIKO_DATA_DIR' : name === 'lock' ? 'TACHIKO_DISPATCH_LOCK_PATH' : 'TACHIKO_DISPATCH_WAKE_PATH';
+        const key = name === 'data' ? 'TACHIKO_DATA_DIR' : name === 'lock' ? 'TACHIKO_DISPATCH_LOCK_PATH' : name === 'wake' ? 'TACHIKO_DISPATCH_WAKE_PATH' : name === 'admissionPath' ? 'TACHIKO_MISSION_ADMISSION_PATH' : 'TACHIKO_MISSION_ADMISSION_CONFIG';
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
       }
       rmSync(directory, { recursive: true, force: true });
