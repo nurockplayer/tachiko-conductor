@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, it } from 'node:test';
@@ -18,6 +18,7 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import { LIVE_HEAD_SYNC_DECISION } from '../src/domain/decisions.js';
 import type { AgentResult, ImplementationBootstrapIdentity, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
+import { operationalProjectionPath } from '../src/operational/projection.js';
 import { resumeCommand } from '../src/cli.js';
 import { runWorkflow } from '../src/workflow/run.js';
 import type { ImplementationBootstrapAdapter } from '../src/adapters/bootstrap.js';
@@ -26,6 +27,7 @@ import { createBootstrapGitFixture, type BootstrapGitFixture } from './bootstrap
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 import { canonicalizeMissionEvidence, MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
+import { createGenuineLunaFixture } from './support/genuine-luna.js';
 
 const OLD = 'a'.repeat(40);
 const NEW = 'b'.repeat(40);
@@ -585,6 +587,244 @@ describe('bootstrap lifecycle acceptance coverage', () => {
 });
 
 describe('bootstrap actual-spawn admission fences', () => {
+  for (const mode of ['missing-cas', 'throwing-cas', 'known-park', 'secondary-read-failure', 'secondary-transition-failure', 'secondary-write-failure', 'parking-cas-loss'] as const) {
+    it(`reconciles a durable verification refusal after completion telemetry: ${mode}`, async (t) => {
+      const fixture = await createGenuineLunaFixture(`verify-refusal-${mode}`, { deferPrepare: true });
+      t.after(() => fixture.cleanup());
+      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-verify-refusal-${mode}-`)); dirs.push(directory);
+      const runId = `verify-refusal-${mode}`;
+      const store = new JsonFileStore({ dir: directory });
+      store.create(createRun(TARGET, T0, runId, fixture.request.execution));
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'),
+        config: { schemaVersion: 1, revision: `verify-refusal-${mode}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const admission = registry.admit({ laneId: runId, role: 'production_captain', evidence: {
+        repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: runId, workspace: fixture.identity.workspacePath,
+      } });
+      assert.equal(admission.outcome, 'admitted');
+      if (admission.outcome !== 'admitted') return;
+      const originalCas = store.updateIfUnchanged.bind(store);
+      const originalRead = store.read.bind(store);
+      let casBehavior: 'available' | 'missing' | 'throwing' = 'available';
+      let casCalls = 0;
+      let returnFalseAt: number | undefined;
+      let failRead = false;
+      let failTransition = false;
+      let newerWinner: Run | undefined;
+      let newerRunBytes: string | undefined;
+      let newerProjectionBytes: string | undefined;
+      let completedRun: Run | undefined;
+      let completedRunBytes: string | undefined;
+      let completedProjectionBytes: string | undefined;
+      let verifying = false;
+      let preparationSucceeded = false;
+      let preparedIdentity: ImplementationBootstrapIdentity | undefined;
+      const secondary = new Error('durable refusal parking write failed');
+      Object.defineProperty(store, 'updateIfUnchanged', { configurable: true, get: () => {
+        if (casBehavior === 'missing') return undefined;
+        return (expected: Run, next: Run) => {
+          if (casBehavior === 'throwing') throw new Error('durable verification strict CAS failed');
+          casCalls += 1;
+          if (mode === 'secondary-write-failure' && verifying && next.state === 'NEEDS_HUMAN') throw secondary;
+          if (mode === 'parking-cas-loss' && verifying && next.state === 'NEEDS_HUMAN') {
+            newerWinner = { ...expected, updatedAt: '2026-09-29T00:00:03.000Z' };
+            store.update(newerWinner);
+            newerRunBytes = readFileSync(path.join(directory, `${runId}.json`), 'utf8');
+            newerProjectionBytes = readFileSync(operationalProjectionPath(directory, runId), 'utf8');
+          }
+          if (casCalls === returnFalseAt) return false;
+          return originalCas(expected, next);
+        };
+      } });
+      Object.defineProperty(store, 'read', { configurable: true, get: () => (id: string) => {
+        if (failRead) throw new Error('durable refusal reconciliation read failed');
+        return originalRead(id);
+      } });
+      let primary: unknown;
+      const bootstrap: ImplementationBootstrapAdapter = {
+        kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+        async plan(request) { return fixture.bootstrap.plan(request); },
+        async prepare(request) {
+          const prepared = await fixture.bootstrap.prepare(request);
+          assert.equal(existsSync(prepared.workspacePath), true, 'the delegated workflow preparation created the planned workspace');
+          preparedIdentity = prepared;
+          preparationSucceeded = true;
+          return prepared;
+        },
+        guard(prepared) { return fixture.bootstrap.guard(prepared); },
+        async verifyDurable(request) {
+          verifying = true;
+          completedRun = originalRead(runId)!;
+          assert.ok(completedRun.telemetry?.events.some((event) => event.kind === 'completion'), 'durable verification starts after completion telemetry is persisted');
+          completedRunBytes = readFileSync(path.join(directory, `${runId}.json`), 'utf8');
+          completedProjectionBytes = readFileSync(operationalProjectionPath(directory, runId), 'utf8');
+          assert.equal(completedRun.execution?.executor, 'luna-isolated');
+          assert.equal(completedRun.telemetry?.events.some((event) => event.kind === 'completion'), true);
+          assert.equal(preparationSucceeded, true, 'real workflow preparation completed before durable verification');
+          assert.ok(preparedIdentity);
+          assert.deepEqual(request.identity, preparedIdentity, 'durable verification receives the identity returned by delegated preparation');
+          if (mode === 'missing-cas') casBehavior = 'missing';
+          if (mode === 'throwing-cas') casBehavior = 'throwing';
+          const wrapped = { ...request, beforeMutation: () => {
+            try {
+              if (mode === 'known-park' || mode.startsWith('secondary-') || mode === 'parking-cas-loss') {
+                registry.release(admission.token, true);
+                casCalls = 0;
+                if (mode === 'secondary-read-failure') returnFalseAt = 3;
+              }
+              request.beforeMutation?.();
+            } catch (error) {
+              primary = error;
+              if (mode === 'secondary-read-failure') failRead = true;
+              if (mode === 'secondary-transition-failure') failTransition = true;
+              throw error;
+            }
+          } };
+          return fixture.bootstrap.verifyDurable(wrapped);
+        },
+      };
+      const headFile = path.join(fixture.root, 'worker-head');
+      const workerScript = path.join(fixture.root, 'bin', 'codex');
+      writeFileSync(workerScript, [
+        '#!/bin/sh', 'set -e', "printf 'durable result\\n' > durable.txt", 'git add durable.txt >/dev/null 2>&1',
+        'git commit -m "durable fixture result" >/dev/null 2>&1', `git rev-parse HEAD > '${headFile}'`,
+        `printf '%s\\n' '${JSON.stringify({ type: 'thread.started', thread_id: 'verify-refusal-thread' })}'`,
+        `printf '%s\\n' '${JSON.stringify({ type: 'turn.started' })}'`,
+        `printf '%s\\n' '${JSON.stringify({ type: 'item.completed', item: { id: 'verify-refusal-message', type: 'agent_message', text: 'durable result' } })}'`,
+        `printf '%s\\n' '${JSON.stringify({ type: 'turn.completed' })}'`, '',
+      ].join('\n'));
+      chmodSync(workerScript, 0o700);
+      let head: string | undefined;
+      const github = new QueueGithub(Array.from({ length: 12 }, () => () => {
+        if (!existsSync(headFile)) return snapshot(fixture.identity.baseSha, null, { headSha: null, repository: { owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.identity.baseBranch, defaultBranchHeadSha: fixture.identity.baseSha } });
+        head = readFileSync(headFile, 'utf8').trim();
+        return snapshot(head, pr(74, head, { headRef: fixture.identity.branch, baseRef: fixture.identity.baseBranch, baseSha: fixture.identity.baseSha }));
+      }));
+      assert.equal(existsSync(fixture.identity.workspacePath), false, 'the genuine planned workspace is absent before workflow entry');
+      const pending = runWorkflow({ store, github, bootstrap, implementation: fixture.adapter, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, {
+        maxReviewAttempts: 1, now: () => { if (failTransition) throw new Error('durable refusal transition construction failed'); return T0; }, admissionFence: { registry, token: admission.token, productionMissionId: admission.missionId, executionWorkspace: fixture.identity.workspacePath },
+      });
+      if (mode === 'missing-cas' || mode === 'throwing-cas' || mode === 'secondary-read-failure' || mode === 'secondary-transition-failure' || mode === 'secondary-write-failure') {
+        await assert.rejects(pending, (error: unknown) => {
+          assert.strictEqual(error, primary, 'the original durable-verification refusal remains primary');
+          assert.equal(isExecutionAdmissionRefusal(error), true);
+          if (mode === 'missing-cas' || mode === 'throwing-cas') {
+            assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, true);
+            assert.match(String((error as Error).cause), /Strict Run compare-and-swap|durable verification strict CAS/);
+          }
+          else {
+            assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, false);
+            assert.notStrictEqual((error as Error).cause, secondary);
+          }
+          return true;
+        });
+      } else {
+        const result = await pending;
+        if (mode === 'parking-cas-loss') {
+          assert.equal(result.outcome, 'needs_human');
+          assert.ok(newerWinner);
+          assert.ok(verifying && completedRun !== undefined && completedRunBytes !== undefined && completedProjectionBytes !== undefined,
+            'the parking CAS race follows completed durable verification');
+          assert.deepEqual(new JsonFileStore({ dir: directory }).read(runId), JSON.parse(JSON.stringify(newerWinner)), 'a lost exact parking CAS preserves the persisted concurrent winner');
+          assert.equal(readFileSync(path.join(directory, `${runId}.json`), 'utf8'), newerRunBytes, 'the final parking-write race preserves exact winner Run bytes');
+          assert.equal(readFileSync(operationalProjectionPath(directory, runId), 'utf8'), newerProjectionBytes, 'the final parking-write race preserves exact winner projection bytes');
+          return;
+        }
+        assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+        assert.equal(result.run.state, 'NEEDS_HUMAN');
+        assert.equal(store.read(runId)?.state, 'NEEDS_HUMAN');
+        assert.deepEqual(JSON.parse(JSON.stringify(result.run.history.slice(0, completedRun?.history.length))), completedRun?.history, 'strict conditional parking retains the completed history prefix');
+        assert.deepEqual(result.run.executor === undefined ? undefined : JSON.parse(JSON.stringify(result.run.executor)), completedRun?.executor, 'parking retains the captured executor identity');
+        assert.deepEqual(result.run.agentResult === undefined ? undefined : JSON.parse(JSON.stringify(result.run.agentResult)), completedRun?.agentResult, 'parking retains the captured provider result');
+        assert.deepEqual(result.run.telemetry, completedRun?.telemetry, 'parking retains all completed telemetry without resetting execution markers');
+      }
+      assert.ok(verifying && completedRun !== undefined && completedRunBytes !== undefined && completedProjectionBytes !== undefined,
+        'the refusal was armed only inside completed durable verification');
+      const persisted = new JsonFileStore({ dir: directory }).read(runId)!;
+      if (mode === 'known-park') {
+        assert.deepEqual(persisted.history.slice(0, completedRun!.history.length), completedRun!.history,
+          'a successful conditional park retains the completed history prefix');
+      } else {
+        assert.deepEqual(persisted.history, completedRun?.history, 'a failed secondary reconciliation preserves the exact completed history');
+      }
+      assert.deepEqual(persisted.telemetry, completedRun?.telemetry, 'a failed secondary reconciliation preserves the exact completion and execution evidence');
+      if (mode !== 'known-park') {
+        assert.equal(persisted.state, 'IMPLEMENTING', 'failed reconciliation leaves the completed primary Run untouched');
+        assert.equal(readFileSync(path.join(directory, `${runId}.json`), 'utf8'), completedRunBytes, 'failed reconciliation does not rewrite completed Run bytes');
+        assert.equal(readFileSync(operationalProjectionPath(directory, runId), 'utf8'), completedProjectionBytes, 'failed reconciliation does not rewrite completed projection bytes');
+        assert.deepEqual(persisted.executor, completedRun?.executor, 'failed reconciliation preserves captured executor identity');
+        assert.deepEqual(persisted.agentResult, completedRun?.agentResult, 'failed reconciliation preserves captured provider result');
+      }
+    });
+  }
+
+  it('refuses initial durable publication at the actual first import spawn and preserves the concurrent JSON Run', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-durable-first-import-cas-')); dirs.push(directory);
+    const runId = 'durable-first-import-cas';
+    const store = new JsonFileStore({ dir: directory });
+    store.create(createRun(TARGET, T0, runId));
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    let verificationPhase = false;
+    let importRunnerEntered = false;
+    let importEffects = 0;
+    let pushEffects = 0;
+    let newerRun: Run | undefined;
+    const runner: ProcessRunner = {
+      async run(file, args, options) {
+        const trustedSource = file === 'git' && options.cwd === realpathSync(fixture.source);
+        const importsWorkerHead = trustedSource && args.includes('fetch') && args.includes('--no-recurse-submodules');
+        const pushes = trustedSource && args.includes('push');
+        if (verificationPhase && importsWorkerHead && !importRunnerEntered) {
+          importRunnerEntered = true;
+          assert.ok(new JsonFileStore({ dir: directory }).read(runId)?.telemetry?.events.some((event) => event.kind === 'completion'),
+            'the actual initial verification fence follows durable completion telemetry');
+          entered.resolve();
+          await release.promise;
+        }
+        options.beforeSpawn?.();
+        const result = await fixture.runner.run(file, args, { ...options, beforeSpawn: undefined });
+        if (verificationPhase && importsWorkerHead) importEffects += 1;
+        if (verificationPhase && pushes) pushEffects += 1;
+        return result;
+      },
+    };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    let head: string | undefined;
+    const github = new QueueGithub(Array.from({ length: 12 }, () => () => head === undefined
+      ? snapshot(fixture.baseSha, null, { headSha: null, repository: { owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha } })
+      : snapshot(head, pr(74, head, { headRef: `tachiko/${runId}` }))));
+    const implementation: ImplementationAgent = { kind: 'implementation-agent', async run(request) {
+      head = fixture.commit(request.workspacePath!, 'durable.txt', 'real durable result\n');
+      verificationPhase = true;
+      return successResult(head);
+    } };
+    const pending = runWorkflow({ store, github, bootstrap, implementation, reviewer: new ApprovingReviewer(), validation: new PassingValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, runId, { maxReviewAttempts: 1, now: () => T0 });
+    const settlement = pending.then((outcome) => ({ kind: 'settled' as const, outcome }), (error: unknown) => ({ kind: 'rejected' as const, error }));
+    const gate = await Promise.race([entered.promise.then(() => ({ kind: 'entered' as const })), settlement]);
+    assert.equal(gate.kind, 'entered', gate.kind === 'settled' ? `workflow settled before first import gate: ${JSON.stringify(gate.outcome)}` : gate.kind === 'rejected' ? `workflow rejected before first import gate: ${String(gate.error)}` : undefined);
+    try {
+    const captured = new JsonFileStore({ dir: directory }).read(runId)!;
+    newerRun = { ...captured, updatedAt: '2026-09-29T00:00:01.000Z' };
+    store.update(newerRun);
+    const exactNewer = new JsonFileStore({ dir: directory }).read(runId)!;
+    const exactNewerRunBytes = readFileSync(path.join(directory, `${runId}.json`), 'utf8');
+    const exactNewerProjection = readFileSync(operationalProjectionPath(directory, runId), 'utf8');
+    release.resolve();
+    const outcome = await settlement.then((result) => { if (result.kind === 'rejected') throw result.error; return result.outcome; });
+    assert.equal(outcome.outcome, 'needs_human', JSON.stringify(outcome));
+    assert.ok(importRunnerEntered, 'the actual trusted Git runner reached its asynchronous preparation boundary');
+    assert.equal(importEffects, 0, 'the first trusted-source worker import never crossed beforeSpawn');
+    assert.equal(pushEffects, 0, 'no push follows the refused first import');
+    assert.deepEqual(new JsonFileStore({ dir: directory }).read(runId), exactNewer, 'a fresh JsonFileStore preserves the exact concurrent Run');
+    assert.equal(readFileSync(path.join(directory, `${runId}.json`), 'utf8'), exactNewerRunBytes, 'the exact concurrent Run bytes are preserved');
+    assert.equal(readFileSync(operationalProjectionPath(directory, runId), 'utf8'), exactNewerProjection, 'the concurrent Run projection bytes are preserved');
+    } finally {
+      release.resolve();
+      await settlement;
+    }
+  });
+
   it('establishes explicit initial workspace authority before the real immutable-base preparation fetch', async () => {
     const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-initial-plan-admission-')); dirs.push(directory);
@@ -984,6 +1224,61 @@ describe('bootstrap actual-spawn admission fences', () => {
       'no fetch, initialization, or worktree effect follows the failed first-entry CAS');
   });
 
+  it('preserves a real newer Run when a persisted field changes before production prepare entry', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-prepare-real-store-cas-')); dirs.push(directory);
+    const runId = 'prepare-real-store-cas-run-supersession';
+    const gitBootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+    const planned = await gitBootstrap.plan({ runId, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+    let initial = applyTransition(createRun(TARGET, T0, runId), { type: 'start' }, T0);
+    initial = applyTransition(initial, { type: 'bootstrap_prepared', bootstrap: planned }, T0);
+    const store = new JsonFileStore({ dir: directory });
+    store.create(initial);
+
+    let newerRun: Run | undefined;
+    let newerRunBytes: string | undefined;
+    let newerProjectionBytes: string | undefined;
+    let prepareCalls = 0;
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree',
+      async plan(request) { return gitBootstrap.plan(request); },
+      async prepare(request) { prepareCalls += 1; return gitBootstrap.prepare(request); },
+      guard: (candidate) => gitBootstrap.guard(candidate),
+      verifyDurable: (request) => gitBootstrap.verifyDurable(request),
+    };
+    const live = snapshot(fixture.baseSha, null, { headSha: null, repository: {
+      owner: TARGET.owner, repo: TARGET.repo, defaultBranch: fixture.branch, defaultBranchHeadSha: fixture.baseSha,
+    } });
+    const fixtureCommandsBefore = fixture.commands.length;
+    const implementation = new NoopImplementation();
+    const result = await runWorkflow({
+      store, github: new QueueGithub(Array.from({ length: 8 }, () => live)), bootstrap,
+      implementation, reviewer: new ApprovingReviewer(), validation: new PassingValidation(),
+      hostedCheckPolicy: TEST_HOSTED_POLICY,
+    }, runId, { maxReviewAttempts: 1, now: () => T0, onExecutionStart: () => {
+      const current = store.read(runId);
+      assert.ok(current);
+      newerRun = { ...current, dispatchClaimId: 'superseding-durable-dispatch-claim' };
+      store.update(newerRun);
+      newerRunBytes = readFileSync(path.join(directory, `${runId}.json`), 'utf8');
+      newerProjectionBytes = readFileSync(operationalProjectionPath(directory, runId), 'utf8');
+    } });
+
+    assert.equal(result.outcome, 'needs_human', JSON.stringify(result));
+    assert.ok(newerRun);
+    assert.ok(newerRunBytes);
+    assert.ok(newerProjectionBytes);
+    assert.deepEqual(store.read(runId), newerRun, 'the exact newer durable Run remains after production prepare-entry refusal');
+    assert.equal(readFileSync(path.join(directory, `${runId}.json`), 'utf8'), newerRunBytes,
+      'no refusal reconciliation rewrites the newer durable Run');
+    assert.equal(readFileSync(operationalProjectionPath(directory, runId), 'utf8'), newerProjectionBytes,
+      'no refusal reconciliation rewrites the newer projection');
+    assert.equal(prepareCalls, 0, 'the production bootstrap prepare closure is never entered');
+    assert.equal(fixture.commands.length, fixtureCommandsBefore,
+      'the fixture runner records no Git or child-process calls after the superseding store update');
+    assert.equal(implementation.requests.length, 0, 'no worker starts after prepare-entry refusal');
+  });
+
   for (const mode of ['missing', 'throws'] as const) {
     it(`refuses first prepare entry when strict Run CAS is ${mode}`, async () => {
       const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
@@ -1307,18 +1602,19 @@ describe('bootstrap actual-spawn admission fences', () => {
       assert.equal(blockedCommandWasExecuted, false, 'the intercepted mutating command never reaches real Git');
       assert.equal(implementation.requests.length, 0, 'no worker or later validation starts after refusal');
       if (outcome === undefined) {
-        assert.deepEqual(store.read(runId), atBoundary, 'strict-CAS uncertainty preserves exact Run bytes');
+        assert.deepEqual(store.read(runId), atBoundary, 'strict-CAS uncertainty preserves the complete Run value');
         return;
       }
       if (boundary.includes('admission-revocation')) {
         assert.equal(outcome.outcome, 'needs_human', JSON.stringify(outcome));
-        assert.match(outcome.reason, /host admission boundary/);
+        assert.match(outcome.reason, /EXECUTION_ADMISSION_REFUSED/);
+        assert.match(outcome.reason, /could not confirm current mission admission/);
         assert.equal(store.read(runId)?.state, 'NEEDS_HUMAN');
       } else if (boundary === 'prepare-missing-cas' || boundary === 'prepare-thrown-cas') {
         assert.deepEqual(store.read(runId), atBoundary, 'unknown preparation authority preserves the exact persisted identity Run');
       } else {
         assert.ok(newerRun);
-        assert.deepEqual(store.read(runId), newerRun, 'the exact newer Run bytes survive reconciliation');
+        assert.deepEqual(store.read(runId), newerRun, 'the complete newer Run value survives reconciliation');
       }
       if (isWorktreeAdd) {
         const planned = atBoundary.bootstrap;
@@ -1342,7 +1638,6 @@ describe('bootstrap actual-spawn admission fences', () => {
       let primaryRefusal: unknown;
       let primaryCause: unknown;
       const gated = gatedBootstrapRunner(fixture.runner, (args) => args[0] === 'fetch', undefined, (error) => {
-        if (!mode.startsWith('reconciliation-')) return;
         primaryRefusal = error;
         primaryCause = (error as Error).cause;
         if (mode === 'reconciliation-cas-missing') casMode = 'missing';
@@ -1442,15 +1737,21 @@ describe('bootstrap actual-spawn admission fences', () => {
       if (mode === 'run-superseded') {
         assert.ok(outcome);
         assert.ok(newerRun);
-        assert.deepEqual(store.read(runId), newerRun, 'the exact newer Run survives validation reconciliation');
+        assert.deepEqual(store.read(runId), newerRun, 'the complete newer Run value survives validation reconciliation');
         assert.notDeepEqual(outcome.run, atBoundary);
       } else if (mode === 'admission-revoked') {
         assert.ok(outcome);
         assert.equal(outcome.outcome, 'needs_human', JSON.stringify(outcome));
-        assert.match(outcome.reason, /host admission boundary/);
-        assert.equal(store.read(runId)?.state, 'NEEDS_HUMAN');
+        assert.match(outcome.reason, /Owned-workspace validation entry was refused by its host admission boundary/);
+        assert.match(outcome.reason, /could not confirm current mission admission/);
+        assert.equal(isExecutionAdmissionRefusal(primaryRefusal), true, 'the runner callback captured the actual tagged validation refusal');
+        assert.equal((primaryRefusal as { authorityUnknown?: boolean }).authorityUnknown, false, 'revocation is known at this boundary');
+        assert.equal((primaryRefusal as { runSuperseded?: boolean }).runSuperseded, false);
+        assert.match(String(primaryCause), /Admission generation token is stale/);
+        assert.equal(outcome.run.state, 'NEEDS_HUMAN');
+        assert.deepEqual(store.read(runId), outcome.run, 'the memory store contains the full parked Run returned by validation reconciliation');
       } else {
-        assert.deepEqual(store.read(runId), atBoundary, 'failed reconciliation preserves the exact pre-effect Run bytes');
+        assert.deepEqual(store.read(runId), atBoundary, 'failed reconciliation preserves the complete pre-effect Run value');
       }
     });
   }

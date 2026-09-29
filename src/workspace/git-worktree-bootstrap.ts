@@ -37,24 +37,30 @@ function isInside(parent: string, candidate: string): boolean {
 }
 
 function remoteDestination(value: string): { host: string; owner: string; repo: string } | null {
-  const text = value.trim();
-  let host = '';
-  let pathname = '';
-  try {
-    const parsed = new URL(text);
-    host = parsed.hostname;
-    pathname = parsed.pathname;
-  } catch {
-    const match = /^(?:[^@\s]+@)?([^:\s]+):([^\s]+)$/.exec(text);
-    if (match === null) return null;
-    host = match[1] ?? '';
-    pathname = match[2] ?? '';
+  if (/\s/.test(value)) return null;
+  const https = /^https:\/\/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/i.exec(value);
+  const scp = /^git@github\.com:([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/.exec(value);
+  const match = https ?? scp;
+  if (match === null) return null;
+  const owner = match[1] ?? '';
+  const rawRepo = match[2] ?? '';
+  const repo = rawRepo.replace(/\.git$/i, '');
+  if (owner === '' || repo === '' || repo === '.' || repo === '..') return null;
+
+  // The exact forms above reject URL credentials, ports, query/fragment data,
+  // encoded components, path normalization, extra slashes, and other schemes.
+  // Parse HTTPS once more so URL parser behavior cannot silently broaden them.
+  if (https !== null) {
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'github.com' || parsed.port !== '' ||
+        parsed.username !== '' || parsed.password !== '' || parsed.search !== '' || parsed.hash !== '' ||
+        parsed.pathname !== `/${owner}/${rawRepo}`) return null;
+    } catch {
+      return null;
+    }
   }
-  const parts = pathname.replace(/^\/+|\/+$/g, '').split('/');
-  if (host.toLowerCase().replace(/\.$/, '') !== 'github.com' || parts.length !== 2) return null;
-  const owner = parts[0] ?? '';
-  const repo = (parts[1] ?? '').replace(/\.git$/i, '');
-  return owner === '' || repo === '' ? null : { host: 'github.com', owner, repo };
+  return { host: 'github.com', owner, repo };
 }
 
 function sameIdentity(a: ImplementationBootstrapIdentity, b: ImplementationBootstrapIdentity): boolean {
@@ -218,9 +224,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   }
 
   private async assertRemote(owner: string, repo: string, cwd: string): Promise<void> {
-    const fetch = (await this.git(['remote', 'get-url', this.remote], cwd)).stdout.trim();
+    const fetchOutput = (await this.git(['remote', 'get-url', this.remote], cwd)).stdout;
+    const fetch = fetchOutput.endsWith('\n') ? fetchOutput.slice(0, -1) : fetchOutput;
     const pushOutput = (await this.git(['remote', 'get-url', '--all', '--push', this.remote], cwd)).stdout;
-    const urls = pushOutput.split(/\r?\n/);
+    const urls = pushOutput.split('\n');
     if (urls.at(-1) === '') urls.pop();
     const valid = (url: string): boolean => {
       const parsed = remoteDestination(url);

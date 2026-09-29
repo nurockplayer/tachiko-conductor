@@ -132,6 +132,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     const identity = request.identity;
     const expectedHead = request.expectedHeadSha;
     const adoptionBase = request.progressBaseSha;
+    const beforeMutation = request.beforeMutation;
     const beforePublish = request.beforePublish;
     const guard = request.workspaceGuard;
     const proof = guard === undefined ? undefined : preparedLunaGuards.get(guard as object);
@@ -160,6 +161,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
       this.assertCurrentProof(identity, proof, expectedHead);
       return { headSha: head, branch: identity.branch };
     }
+    if (typeof beforeMutation !== 'function') this.fail('INVALID_REQUEST', 'Standalone publication requires a synchronous host-owned beforeMutation fence.');
     if (typeof beforePublish !== 'function') this.fail('INVALID_REQUEST', 'Standalone publication requires a synchronous host-owned beforePublish fence.');
     if (head === progressBase) this.fail('HEAD_MISMATCH', 'Worker result did not advance the authorized HEAD.');
     await this.ancestor(identity.workspacePath, progressBase, head);
@@ -168,7 +170,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     // source checkout authority, so it cannot publish the branch itself.
     // Import through trusted host Git state; never run a worker checkout's
     // hooks/config for publication.  Hooks are disabled on every host action.
-    await this.git(this.source, ['fetch', '--no-tags', '--no-recurse-submodules', identity.workspacePath, head]);
+    await this.git(this.source, ['fetch', '--no-tags', '--no-recurse-submodules', identity.workspacePath, head], [0], beforeMutation);
     // Re-prove ancestry in trusted source state after import. Worker-local
     // ancestry is insufficient to authorize a publication fence or push.
     await this.ancestor(this.source, progressBase, head);
@@ -176,7 +178,7 @@ export class StandaloneGitBootstrap implements ImplementationBootstrapAdapter {
     const ref = `refs/heads/${identity.publicationBranch ?? identity.branch}`;
     const before = await this.remoteHead(ref);
     if (before !== null) {
-      await this.git(this.source, ['fetch', '--no-tags', 'origin', ref]);
+      await this.git(this.source, ['fetch', '--no-tags', 'origin', ref], [0], beforeMutation);
       await this.ancestor(this.source, before, head);
     }
     // Normal Git push is intentionally non-force. A concurrent/diverged ref

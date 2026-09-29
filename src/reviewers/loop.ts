@@ -204,9 +204,25 @@ function repairBootstrapAdmissionRefusalOutcome(run: Run, error: ExecutionAdmiss
     if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during repair bootstrap refusal reconciliation.');
     const matched = compareAndSwap.call(store, run, run);
     if (!matched || error.runSuperseded) return staleReviewOutcome(run.id, run, store);
-    return parkBootstrap(run, error, store, now, run);
+    const parked = createBootstrapFailureRun(run, error, now, run.executor);
+    if (!compareAndSwap.call(store, run, parked.run)) return staleReviewOutcome(run.id, run, store);
+    return { outcome: 'needs_human', ...parked };
   } catch {
     throw error;
+  }
+}
+
+function assertFinalRepairPublicationAdmission(run: Run, store: RunStore, deps: ReviewLoopDependencies): void {
+  assertFinalRepairAdmission(run, store, deps.assertCurrentMutation,
+    deps.governedPublicationRequired === true);
+  try {
+    if (deps.governedPublicationRequired === true && deps.assertCanPublish === undefined) {
+      throw new Error('Governed repair publication admission is unavailable.');
+    }
+    deps.assertCanPublish?.();
+  } catch (cause) {
+    if (isExecutionAdmissionRefusal(cause)) throw cause;
+    throw new ExecutionAdmissionRefusal('The final repair boundary could not confirm publication admission.', false, { cause });
   }
 }
 
@@ -758,11 +774,7 @@ export async function runReviewLoop(
             });
           },
           beforePublish: () => {
-            if (!updateReviewRun(store, workerHandoff, workerHandoff)) {
-              throw new Error('Run changed before worker-router review-fix publication.');
-            }
-            deps.assertCurrentMutation?.();
-            deps.assertCanPublish?.();
+            assertFinalRepairPublicationAdmission(workerHandoff, store, deps);
           },
           ...(repairStartsWithFreshExecutor || isolatedLuna || run.agentResult?.sessionId === undefined ? {} : { sessionId: run.agentResult.sessionId }),
           ...(repairStartsWithFreshExecutor || isolatedLuna || physicalPredecessor === undefined ? {} : { executor: physicalPredecessor }),
@@ -869,20 +881,17 @@ export async function runReviewLoop(
         if (repairBootstrap === undefined || progressBaseSha === undefined) {
           return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now, run);
         }
+        const publicationRun = run;
         try {
-          const publicationRun = run;
           await repairBootstrap.verifyDurable({
             identity: run.bootstrap, expectedHeadSha: fixResult.headSha, progressBaseSha, workspaceGuard,
-            beforePublish: () => {
-              if (!updateReviewRun(store, publicationRun, publicationRun)) {
-                throw new Error('Run changed before standalone review-fix publication.');
-              }
-              deps.assertCurrentMutation?.();
-              deps.assertCanPublish?.();
-            },
+            beforeMutation: () => assertFinalRepairAdmission(publicationRun, store, deps.assertCurrentMutation,
+              deps.governedPublicationRequired === true),
+            beforePublish: () => assertFinalRepairPublicationAdmission(publicationRun, store, deps),
           });
         } catch (error) {
-          return parkBootstrap(run, error, store, now, run);
+          if (isExecutionAdmissionRefusal(error)) return repairBootstrapAdmissionRefusalOutcome(publicationRun, error, store, now);
+          return parkBootstrap(run, error, store, now, publicationRun);
         }
       }
 

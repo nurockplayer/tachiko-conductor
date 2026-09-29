@@ -101,7 +101,7 @@ import {
 } from './workflow/wait-command.js';
 import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
 import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
-import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, composeOperationalRuntimeProjection, readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
+import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, composeOperationalRuntimeProjection, readOperationalRuntimeProjection, readOperationalRuntimeProjectionState, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
 import { createHostAdmissionRegistry, resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from './mission-admission/host-registry.js';
 import { canonicalizeMissionEvidence, type AdmissionLaneView, type AdmissionResult, type AdmissionToken, type MissionAdmissionRegistry } from './mission-admission/registry.js';
 import { readManualOwnerReceipt, validateManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from './mission-admission/manual-owner-receipt.js';
@@ -816,6 +816,9 @@ export function publishAdmissionRuntimeProjection(
   store: RunStore,
   update: RuntimeProjectionUpdate,
 ): ReturnType<typeof composeOperationalRuntimeProjection> {
+  const priorRead = readOperationalRuntimeProjectionState(runsDir);
+  if (priorRead.status === 'invalid') throw new Error('Existing operational runtime projection is unreadable or malformed; refusing to overwrite it.');
+  const prior = priorRead.status === 'valid' ? priorRead.projection : null;
   const admission = registry.snapshot({ requireExisting: true });
   const runs = store.list();
   const runById = new Map(runs.map((run) => [run.id, run]));
@@ -873,7 +876,6 @@ export function publishAdmissionRuntimeProjection(
       }
     } catch { /* active count is still authoritative; omit uncertain detail */ }
   }
-  const prior = readOperationalRuntimeProjection(runsDir);
   const mutationLanes = admission.lanes.filter((lane) => lane.role === 'production_captain' || lane.role === 'delegated_mutation_writer');
   const pristine = admission.revision === 0 && admission.lanes.length === 0 && admission.lastTransition === null && runs.length === 0 &&
     prior?.activeWriter === undefined && prior?.manualLane === undefined;

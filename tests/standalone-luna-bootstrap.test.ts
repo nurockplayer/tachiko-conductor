@@ -210,7 +210,7 @@ describe('standalone Luna bootstrap', () => {
     fixture.git(identity.workspacePath, ['-c', 'user.name=Luna', '-c', 'user.email=luna@example.invalid', 'commit', '-m', 'luna commit']);
     const head = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim();
     tracePublication = true;
-    const durable = await bootstrap.verifyDurable({ identity, expectedHeadSha: head, workspaceGuard: bootstrap.guard(identity), beforePublish: () => { order.push('fence'); } });
+    const durable = await bootstrap.verifyDurable({ identity, expectedHeadSha: head, workspaceGuard: bootstrap.guard(identity), beforeMutation: () => {}, beforePublish: () => { order.push('fence'); } });
     const importIndex = order.indexOf('trusted-import-complete');
     const ancestryIndex = order.indexOf('trusted-source-ancestry');
     const fenceIndex = order.indexOf('fence');
@@ -243,12 +243,106 @@ describe('standalone Luna bootstrap', () => {
     const ordered: string[] = [];
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: bootstrap.guard(identity),
-      beforePublish: () => { ordered.push('fence'); throw new Error('stale durable Run'); },
+      beforeMutation: () => {}, beforePublish: () => { ordered.push('fence'); throw new Error('stale durable Run'); },
     }), /stale durable Run/);
     const publicationCommands = fixture.commands.slice(before).filter((command) => command.args.includes('push'));
     assert.deepEqual(ordered, ['fence']);
     assert.equal(publicationCommands.length, 0);
     assert.equal(fixture.git(fixture.remote, ['for-each-ref', 'refs/heads/tachiko/luna-pre-push-fence']).trim(), '');
+  });
+
+  it('rechecks both mutation callbacks at real trusted fetch boundaries and publishes with an existing ref', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const phases: string[] = [];
+    let verifyPhase = false;
+    const runner: ProcessRunner = {
+      async run(file, args, options) {
+        const sourceCommand = file === 'git' && options.cwd === realpathSync(fixture.source);
+        const sourceFetch = sourceCommand && args.includes('fetch');
+        const workerImport = sourceFetch && args.includes('--no-recurse-submodules');
+        const publicationImport = sourceFetch && args.includes('origin') && !workerImport;
+        const sourcePush = sourceCommand && args.includes('push');
+        if (verifyPhase && (sourceFetch || sourcePush)) {
+          options.beforeSpawn?.();
+          phases.push(workerImport ? 'worker-import' : publicationImport ? 'publication-import' : 'push');
+          return fixture.runner.run(file, args, { ...options, beforeSpawn: undefined });
+        }
+        return fixture.runner.run(file, args, options);
+      },
+    };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: 'luna-two-real-fetch-fences', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request);
+    await bootstrap.prepare({ ...request, existing: identity });
+    const publicationRef = `refs/heads/${identity.publicationBranch ?? identity.branch}`;
+    fixture.git(fixture.remote, ['update-ref', publicationRef, fixture.baseSha]);
+    const head = fixture.commit(identity.workspacePath, 'two-fences.txt', 'publish both imports\n');
+    verifyPhase = true;
+    const mutationFenceEvents: string[] = [];
+    let publishFenceCalls = 0;
+    const result = await bootstrap.verifyDurable({
+      identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: bootstrap.guard(identity),
+      beforeMutation: () => mutationFenceEvents.push('mutation'),
+      beforePublish: () => { publishFenceCalls += 1; mutationFenceEvents.push('publish'); },
+    });
+    assert.equal(result.headSha, head);
+    assert.deepEqual(phases, ['worker-import', 'publication-import', 'push'], 'both real imports and the final publication execute through runner fences');
+    assert.deepEqual(mutationFenceEvents, ['mutation', 'mutation', 'publish'], 'both fetch callbacks and the publication callback run at their respective actual boundaries');
+    assert.equal(publishFenceCalls, 1);
+    assert.equal(fixture.git(fixture.remote, ['rev-parse', publicationRef]).trim(), head, 'the exact candidate HEAD is published');
+  });
+
+  it('retains the first authorized worker import but fences the existing publication-ref import after authority changes', async () => {
+    const fixture = createBootstrapGitFixture(); fixtures.push(fixture);
+    const id = 'luna-successive-import-fence';
+    const refusal = new ExecutionAdmissionRefusal('authority changed during remote-head read', true, { cause: new Error('captured publication Run superseded') });
+    let revoked = false;
+    let firstImportEffects = 0;
+    let secondImportEffects = 0;
+    let pushEffects = 0;
+    let remoteHeadRead = false;
+    let verificationPhase = false;
+    let publicationRef: string | undefined;
+    const runner: ProcessRunner = {
+      async run(file, args, options) {
+        const trustedSource = file === 'git' && options.cwd === realpathSync(fixture.source);
+        const sourceFetch = trustedSource && args.includes('fetch');
+        const workerImport = sourceFetch && args.includes('--no-recurse-submodules');
+        const remoteRefImport = verificationPhase && trustedSource && args.includes('fetch') && args.includes('origin') && !workerImport && args.at(-1) === publicationRef;
+        const push = verificationPhase && trustedSource && args.includes('push');
+        const remoteHead = verificationPhase && trustedSource && args.includes('ls-remote') && args[args.length - 1] === publicationRef;
+        if (remoteHead && !remoteHeadRead) {
+          remoteHeadRead = true;
+          assert.equal(firstImportEffects, 1, 'the first worker-head import completed before the targeted remote-head read');
+          const result = await fixture.runner.run(file, args, options);
+          revoked = true;
+          return result;
+        }
+        options.beforeSpawn?.();
+        const result = await fixture.runner.run(file, args, { ...options, beforeSpawn: undefined });
+        if (verificationPhase && workerImport) firstImportEffects += 1;
+        if (remoteRefImport) secondImportEffects += 1;
+        if (push) pushEffects += 1;
+        return result;
+      },
+    };
+    const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+    const request = { runId: id, target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
+    const identity = await bootstrap.plan(request);
+    await bootstrap.prepare({ ...request, existing: identity });
+    publicationRef = `refs/heads/${identity.publicationBranch ?? identity.branch}`;
+    fixture.git(fixture.remote, ['update-ref', publicationRef, fixture.baseSha]);
+    const head = fixture.commit(identity.workspacePath, 'successive.txt', 'worker import\n');
+    verificationPhase = true;
+    await assert.rejects(() => bootstrap.verifyDurable({
+      identity, expectedHeadSha: head, workspaceGuard: bootstrap.guard(identity),
+      beforeMutation: () => { if (revoked) throw refusal; },
+      beforePublish: () => { if (revoked) throw refusal; },
+    }), (error: unknown) => error === refusal);
+    assert.equal(remoteHeadRead, true, 'the existing publication ref was actually read after the first import');
+    assert.equal(firstImportEffects, 1, 'the first authorized trusted-source worker import completed and remains an earlier effect');
+    assert.equal(secondImportEffects, 0, 'the second trusted-source publication-ref import is blocked before spawn');
+    assert.equal(pushEffects, 0, 'no push follows the refused second import');
   });
 
   it('rejects missing publication authority without pushing and preserves callback-free adoption', async () => {
@@ -258,7 +352,10 @@ describe('standalone Luna bootstrap', () => {
     const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
     const head = fixture.commit(identity.workspacePath, 'candidate.txt', 'candidate\n');
     const before = fixture.commands.length;
-    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, beforePublish: () => {} }), /requires the exact current source-minted workspace guard/);
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: bootstrap.guard(identity), beforePublish: () => {} }), /requires a synchronous host-owned beforeMutation fence/);
+    assert.equal(fixture.commands.slice(before).some((command) => command.args.includes('fetch')), false, 'missing mutation authority is rejected before either trusted-source import');
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: bootstrap.guard(identity), beforeMutation: () => {} }), /requires a synchronous host-owned beforePublish fence/);
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, beforeMutation: () => {}, beforePublish: () => {} }), /requires the exact current source-minted workspace guard/);
     await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: bootstrap.guard(identity) }), /requires a synchronous host-owned/);
     assert.equal(fixture.commands.slice(before).some((command) => command.args.includes('push')), false);
     assert.equal(fixture.git(fixture.remote, ['for-each-ref', 'refs/heads/tachiko/luna-required-fence']).trim(), '');
@@ -288,29 +385,29 @@ describe('standalone Luna bootstrap', () => {
     const before = fixture.commands.length;
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha,
-      workspaceGuard: Object.freeze({ assertValid() {} }), beforePublish: () => assert.fail('forged proof reached publication fence'),
+      workspaceGuard: Object.freeze({ assertValid() {} }), beforeMutation: () => {}, beforePublish: () => assert.fail('forged proof reached publication fence'),
     }), /exact current source-minted workspace guard/);
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: fixture.baseSha, progressBaseSha: fixture.baseSha, workspaceGuard: oldGuard,
-      beforePublish: () => assert.fail('superseded proof reached publication fence'),
+      beforeMutation: () => {}, beforePublish: () => assert.fail('superseded proof reached publication fence'),
     }), /exact current source-minted workspace guard/);
     const freshGuard = bootstrap.guard(identity);
     const beforeWrongBase = fixture.commands.length;
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: head, progressBaseSha: 'f'.repeat(40), workspaceGuard: freshGuard,
-      beforePublish: () => assert.fail('mismatched proof base reached publication fence'),
+      beforeMutation: () => {}, beforePublish: () => assert.fail('mismatched proof base reached publication fence'),
     }), /publication base differs from its source-authorized HEAD/);
     assert.equal(fixture.commands.length, beforeWrongBase, 'source authority mismatches fail before the first asynchronous Git check');
     let fenceCalls = 0;
     sourceAncestryFailure = 'exit';
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: freshGuard,
-      beforePublish: () => { fenceCalls += 1; },
+      beforeMutation: () => {}, beforePublish: () => { fenceCalls += 1; },
     }), /does not descend from its authorized base/);
     sourceAncestryFailure = 'throw';
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: freshGuard,
-      beforePublish: () => { fenceCalls += 1; },
+      beforeMutation: () => {}, beforePublish: () => { fenceCalls += 1; },
     }), /injected source ancestry transport failure/);
     assert.equal(fenceCalls, 0);
     assert.equal(fixture.commands.slice(before).some((command) => command.args.includes('push')), false);
@@ -334,7 +431,7 @@ describe('standalone Luna bootstrap', () => {
     const before = fixture.commands.length;
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: head, workspaceGuard: bootstrap.guard(identity),
-      beforePublish: () => { fenceCalls += 1; },
+      beforeMutation: () => {}, beforePublish: () => { fenceCalls += 1; },
     }), /does not descend from its authorized base/);
     assert.equal(fenceCalls, 0);
     assert.equal(fixture.commands.slice(before).some((command) => command.args.includes('push')), false);
@@ -364,7 +461,7 @@ describe('standalone Luna bootstrap', () => {
     let fenced = false;
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: guard,
-      beforePublish: () => {
+      beforeMutation: () => {}, beforePublish: () => {
         fenced = true;
         // prepare() revokes the current proof synchronously before its first await.
         reprepare = bootstrap.prepare({ ...request, existing: identity, recoveryAuthority: { expectedHeadSha: head } });
@@ -406,7 +503,7 @@ describe('standalone Luna bootstrap', () => {
     const head = fixture.commit(identity.workspacePath, 'async-proof.txt', 'candidate\n');
     await assert.rejects(() => bootstrap.verifyDurable({
       identity, expectedHeadSha: head, progressBaseSha: fixture.baseSha, workspaceGuard: guard,
-      beforePublish: () => {},
+      beforeMutation: () => {}, beforePublish: () => {},
     }), /proof changed before final acceptance/);
     await reprepare;
     await assert.doesNotReject(async () => await bootstrap.guard(identity).assertValid(), 'the asynchronous overlap completed a successful replacement proof');
@@ -641,7 +738,7 @@ describe('standalone Luna bootstrap', () => {
     const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
     const request = { runId: 'luna-99-empty', target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 99 }, baseBranch: fixture.branch, baseSha: fixture.baseSha };
     const identity = await bootstrap.plan(request); await bootstrap.prepare({ ...request, existing: identity });
-    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: fixture.baseSha, workspaceGuard: bootstrap.guard(identity), beforePublish: () => {} }), /did not advance/);
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: fixture.baseSha, workspaceGuard: bootstrap.guard(identity), beforeMutation: () => {}, beforePublish: () => {} }), /did not advance/);
   });
 
   it('rejects every effective origin push URL before host publication', async () => {
@@ -667,7 +764,7 @@ describe('standalone Luna bootstrap', () => {
     fixture.git(identity.workspacePath, ['-c', 'user.name=Luna', '-c', 'user.email=luna@example.invalid', 'commit', '-m', 'candidate']);
     const head = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim();
     extraPushUrl = true;
-    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, workspaceGuard: bootstrap.guard(identity), beforePublish: () => {} }), /publication remote/);
+    await assert.rejects(() => bootstrap.verifyDurable({ identity, expectedHeadSha: head, workspaceGuard: bootstrap.guard(identity), beforeMutation: () => {}, beforePublish: () => {} }), /publication remote/);
     assert.equal(calls.some((args) => args.includes('push')), false);
     assert.equal(fixture.git(fixture.remote, ['for-each-ref', 'refs/heads/tachiko/luna-99-extra-push']).trim(), '');
   });
@@ -685,7 +782,7 @@ describe('standalone Luna bootstrap', () => {
     assert.notEqual(identity.branch, identity.publicationBranch);
     fixture.commit(identity.workspacePath, 'repair.txt', 'repair\n');
     const repaired = fixture.git(identity.workspacePath, ['rev-parse', 'HEAD']).trim();
-    await bootstrap.verifyDurable({ identity, expectedHeadSha: repaired, progressBaseSha: adoptedHead, workspaceGuard: bootstrap.guard(identity), beforePublish: () => {} });
+    await bootstrap.verifyDurable({ identity, expectedHeadSha: repaired, progressBaseSha: adoptedHead, workspaceGuard: bootstrap.guard(identity), beforeMutation: () => {}, beforePublish: () => {} });
     assert.equal(fixture.git(fixture.remote, ['rev-parse', 'refs/heads/tachiko/existing-pr']).trim(), repaired);
     fixture.git(identity.workspacePath, ['reset', '--hard', fixture.baseSha]);
     await assert.rejects(
@@ -750,7 +847,7 @@ describe('standalone Luna bootstrap', () => {
     const repairIdentity = await bootstrap.prepare({ ...request, existing: validationIdentity, recoveryAuthority: { expectedHeadSha: repaired } });
     assert.equal(repairIdentity.publicationBranch, 'tachiko/existing-pr');
     const followup = fixture.commit(identity.workspacePath, 'repair-followup.txt', 'follow-up\n');
-    await bootstrap.verifyDurable({ identity: repairIdentity, expectedHeadSha: followup, progressBaseSha: repaired, workspaceGuard: bootstrap.guard(repairIdentity), beforePublish: () => {} });
+    await bootstrap.verifyDurable({ identity: repairIdentity, expectedHeadSha: followup, progressBaseSha: repaired, workspaceGuard: bootstrap.guard(repairIdentity), beforeMutation: () => {}, beforePublish: () => {} });
     assert.equal(fixture.git(fixture.remote, ['rev-parse', 'refs/heads/tachiko/existing-pr']).trim(), followup);
   });
 

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -54,7 +54,7 @@ import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admiss
 import { DispatchAdmissionWaitError } from '../src/dispatch/runner.js';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../src/dispatch/invocation-lock.js';
 import type { DispatchRuntimeClaim } from '../src/dispatch/queue.js';
-import { readOperationalRuntimeProjection, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
+import { operationalRuntimeProjectionPath, readOperationalRuntimeProjection, readOperationalRuntimeProjectionState, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
 import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 import { createGenuineLunaFixture } from './support/genuine-luna.js';
 
@@ -1613,6 +1613,64 @@ describe('workflow run and resume commands', () => {
       const unresolved = publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'reconcile', supervisor: 'stopped' });
       assert.equal(unresolved.ownership, 'ambiguous', 'identified stale owner details cannot be discarded as an empty first boot');
       assert.equal(unresolved.checkpoint, 'unknown');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses to overwrite a present rejected projection before mutating pristine publication state', () => {
+    const { dir } = tempStore();
+    try {
+      const config: AdmissionConfig = { schemaVersion: 1, revision: 'rejected-prior-projection-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const registryPath = path.join(dir, 'registry.json');
+      const registry = new MissionAdmissionRegistry({ filePath: registryPath, config });
+      writeFileSync(registryPath, `${JSON.stringify({ schemaVersion: 1, revision: 0, config, lanes: [], lastTransition: null }, null, 2)}\n`, { mode: 0o600 });
+      const registryBytes = readFileSync(registryPath, 'utf8');
+      const store = new MemoryStore();
+      writeOperationalRuntimeProjection(dir, {
+        schemaVersion: 1, updatedAt: T0, supervisor: 'stopped', stage: 'stale-discovery', eventWakeEligible: false,
+        maintenanceHold: { active: false }, ownership: 'active', checkpoint: 'in_progress',
+        activeWriter: { runId: 'missing-run', issue: 42, worktree: path.join(dir, 'old-worktree'), worker: '' },
+      });
+      const projectionPath = operationalRuntimeProjectionPath(dir);
+      const rejectedBytes = readFileSync(projectionPath, 'utf8');
+      assert.throws(() => publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'idle', supervisor: 'stopped' }), /unreadable or malformed/);
+      assert.equal(readFileSync(projectionPath, 'utf8'), rejectedBytes, 'rejected owner evidence is preserved byte for byte');
+      assert.equal(readFileSync(registryPath, 'utf8'), registryBytes, 'refusal leaves pristine admission state unchanged');
+      assert.deepEqual(store.list(), [], 'refusal does not create or alter Run state');
+      assert.equal(existsSync(`${projectionPath}.tmp`), false, 'refusal does not start a replacement projection write');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses a dangling projection symlink without changing its identity or target text', () => {
+    const { dir } = tempStore();
+    try {
+      const config: AdmissionConfig = { schemaVersion: 1, revision: 'dangling-prior-projection-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } };
+      const registryPath = path.join(dir, 'registry.json');
+      const registry = new MissionAdmissionRegistry({ filePath: registryPath, config });
+      writeFileSync(registryPath, `${JSON.stringify({ schemaVersion: 1, revision: 0, config, lanes: [], lastTransition: null }, null, 2)}\n`, { mode: 0o600 });
+      const registryBytes = readFileSync(registryPath, 'utf8');
+      const store = new MemoryStore();
+      writeOperationalRuntimeProjection(dir, {
+        schemaVersion: 1, updatedAt: T0, supervisor: 'stopped', stage: 'existing', eventWakeEligible: false,
+        maintenanceHold: { active: false }, ownership: 'none', checkpoint: 'durable',
+      });
+      const projectionPath = operationalRuntimeProjectionPath(dir);
+      const absentTarget = path.join(dir, 'absent-projection-target.json');
+      rmSync(projectionPath);
+      symlinkSync(absentTarget, projectionPath);
+      const linkBefore = lstatSync(projectionPath);
+      const targetTextBefore = readlinkSync(projectionPath);
+      assert.equal(readOperationalRuntimeProjectionState(dir).status, 'invalid');
+      assert.equal(readOperationalRuntimeProjection(dir), null);
+      assert.throws(() => publishAdmissionRuntimeProjection(dir, registry, store, { stage: 'idle', supervisor: 'stopped' }), /unreadable or malformed/);
+      const linkAfter = lstatSync(projectionPath);
+      assert.equal(linkAfter.isSymbolicLink(), true);
+      assert.deepEqual({ dev: linkAfter.dev, ino: linkAfter.ino, mode: linkAfter.mode }, { dev: linkBefore.dev, ino: linkBefore.ino, mode: linkBefore.mode },
+        'refusal preserves the existing symlink identity');
+      assert.equal(readlinkSync(projectionPath), targetTextBefore, 'refusal preserves the symlink target text');
+      assert.equal(existsSync(absentTarget), false, 'the dangling target is not created');
+      assert.equal(readFileSync(registryPath, 'utf8'), registryBytes, 'refusal leaves pristine admission state unchanged');
+      assert.deepEqual(store.list(), [], 'refusal does not create or alter Run state');
+      assert.equal(existsSync(`${projectionPath}.tmp`), false, 'refusal does not start a replacement projection write');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 

@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import type { Run } from '../domain/types.js';
 import type { AdmissionProjection } from '../mission-admission/registry.js';
@@ -38,9 +38,74 @@ export interface OperationalRuntimeProjectionInput {
   readonly reentryEvidenceComplete: boolean;
 }
 
+export type OperationalRuntimeProjectionRead =
+  | { readonly status: 'missing' }
+  | { readonly status: 'invalid' }
+  | { readonly status: 'valid'; readonly projection: OperationalRuntimeProjectionV1 };
+
+function record(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function nonblank(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+function canonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const milliseconds = Date.parse(value);
+  if (!Number.isFinite(milliseconds)) return false;
+  try { return new Date(milliseconds).toISOString() === value; } catch { return false; }
+}
+
+function optionalMember(recordValue: Record<string, unknown>, key: string, valid: (value: unknown) => boolean): boolean {
+  return !Object.prototype.hasOwnProperty.call(recordValue, key) || valid(recordValue[key]);
+}
+
+function adverseParkedLane(value: unknown): boolean {
+  return record(value) && value.state === 'parked' && (value.clean === false || value.recoverable === false);
+}
+
+/** Validate the complete supported V1 structure and its summary consistency. */
+function isOperationalRuntimeProjection(value: unknown): value is OperationalRuntimeProjectionV1 {
+  if (!record(value)) return false;
+  const maintenanceHold = value.maintenanceHold;
+  if (value.schemaVersion !== 1 ||
+    !canonicalTimestamp(value.updatedAt) || !['running', 'stopped', 'parked'].includes(value.supervisor as string) ||
+    !nonblank(value.stage) || !optionalMember(value, 'nextPollAt', canonicalTimestamp) ||
+    typeof value.eventWakeEligible !== 'boolean' || !record(maintenanceHold) ||
+    typeof maintenanceHold.active !== 'boolean' ||
+    !optionalMember(maintenanceHold, 'reason', nonblank) ||
+    !['none', 'active', 'ambiguous'].includes(value.ownership as string) ||
+    !['durable', 'in_progress', 'unknown'].includes(value.checkpoint as string)) return false;
+
+  if (Object.prototype.hasOwnProperty.call(value, 'activeWriter')) {
+    const writer = value.activeWriter;
+    if (!record(writer) || !nonblank(writer.runId) || !nonblank(writer.worktree) ||
+      !optionalMember(writer, 'worker', nonblank) ||
+      !optionalMember(writer, 'issue', (issue) => Number.isSafeInteger(issue) && (issue as number) > 0)) return false;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(value, 'manualLane')) {
+    const lane = value.manualLane;
+    if (!record(lane) || !nonblank(lane.repository) || !nonblank(lane.worktree) || !nonblank(lane.branch) ||
+      typeof lane.checkpointSha !== 'string' || !/^[0-9a-f]{40}$/i.test(lane.checkpointSha) ||
+      typeof lane.clean !== 'boolean' || !['active', 'parked'].includes(lane.state as string) ||
+      typeof lane.recoverable !== 'boolean' || !optionalMember(lane, 'laneId', nonblank) ||
+      !optionalMember(lane, 'missionId', nonblank) ||
+      !optionalMember(lane, 'admissionRevision', (revision) => Number.isSafeInteger(revision) && (revision as number) >= 0)) return false;
+  }
+
+  const hasActiveOwnerDetail = (record(value.manualLane) && value.manualLane.state === 'active') || value.activeWriter !== undefined;
+  if (hasActiveOwnerDetail && value.ownership !== 'active') return false;
+  if (adverseParkedLane(value.manualLane) && value.ownership === 'none' && value.checkpoint === 'durable') return false;
+  return true;
+}
+
 /** Compose one account-wide observation from a single validated admission snapshot. */
 export function composeOperationalRuntimeProjection(input: OperationalRuntimeProjectionInput): OperationalRuntimeProjectionV1 {
   const { admission, runs } = input;
+  const suppliedManualLane = input.manualLane;
   const mutationLanes = admission.lanes.filter((lane) =>
     lane.role === 'production_captain' || lane.role === 'delegated_mutation_writer');
   const activeRunIds = new Set(runs.filter((run) => !['MERGED', 'FAILED', 'MERGE_READY', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY'].includes(run.state)).map((run) => run.id));
@@ -73,6 +138,14 @@ export function composeOperationalRuntimeProjection(input: OperationalRuntimePro
     }
   }
 
+  if (admission.counts.writers === 0 && adverseParkedLane(suppliedManualLane)) {
+    if (ownership === 'none' && checkpoint === 'durable') {
+      ownership = 'ambiguous';
+      checkpoint = 'unknown';
+    }
+    if (ownership !== 'active') manualLane = suppliedManualLane;
+  }
+
   return {
     schemaVersion: 1,
     updatedAt: input.now,
@@ -100,15 +173,32 @@ export function writeOperationalRuntimeProjection(runsDir: string, projection: O
   renameSync(tempPath, filePath);
 }
 
+/** Distinguish a confirmed missing file from present malformed or unreadable state. */
+export function readOperationalRuntimeProjectionState(runsDir: string): OperationalRuntimeProjectionRead {
+  let raw: string;
+  try { raw = readFileSync(operationalRuntimeProjectionPath(runsDir), 'utf8'); }
+  catch (error) {
+    if (record(error) && error.code === 'ENOENT') {
+      try {
+        lstatSync(operationalRuntimeProjectionPath(runsDir));
+        return { status: 'invalid' };
+      } catch (entryError) {
+        return record(entryError) && entryError.code === 'ENOENT' ? { status: 'missing' } : { status: 'invalid' };
+      }
+    }
+    return { status: 'invalid' };
+  }
+  let value: unknown;
+  try { value = JSON.parse(raw) as unknown; } catch { return { status: 'invalid' }; }
+  return isOperationalRuntimeProjection(value)
+    ? { status: 'valid', projection: value }
+    : { status: 'invalid' };
+}
+
 /** Read only a complete typed projection; malformed state is never adopted. */
 export function readOperationalRuntimeProjection(runsDir: string): OperationalRuntimeProjectionV1 | null {
-  try {
-    const value: unknown = JSON.parse(readFileSync(operationalRuntimeProjectionPath(runsDir), 'utf8'));
-    if (typeof value !== 'object' || value === null) return null;
-    const v = value as Record<string, unknown>;
-    if (v.schemaVersion !== 1 || !['running', 'stopped', 'parked'].includes(v.supervisor as string) || !['none', 'active', 'ambiguous'].includes(v.ownership as string) || !['durable', 'in_progress', 'unknown'].includes(v.checkpoint as string) || typeof v.stage !== 'string' || typeof v.updatedAt !== 'string' || typeof v.eventWakeEligible !== 'boolean' || typeof v.maintenanceHold !== 'object' || v.maintenanceHold === null || typeof (v.maintenanceHold as Record<string, unknown>).active !== 'boolean') return null;
-    return value as OperationalRuntimeProjectionV1;
-  } catch { return null; }
+  const result = readOperationalRuntimeProjectionState(runsDir);
+  return result.status === 'valid' ? result.projection : null;
 }
 
 /** Idempotently persist a restart admission fence; no queue or Run state is inferred. */
@@ -120,10 +210,7 @@ export function setMaintenanceHold(runsDir: string, active: boolean, now: string
 }
 
 export function restartVerdict(projection: OperationalRuntimeProjectionV1 | null): { verdict: string; reason: string } {
-  if (projection === null) return { verdict: 'UNKNOWN — CANNOT PROVE SAFE', reason: 'Typed runtime projection is missing or malformed.' };
-  if ((projection.manualLane?.state === 'active' || projection.activeWriter !== undefined) && projection.ownership !== 'active') {
-    return { verdict: 'UNKNOWN — CANNOT PROVE SAFE', reason: 'Projection contains active owner details that contradict its ownership summary.' };
-  }
+  if (!isOperationalRuntimeProjection(projection)) return { verdict: 'UNKNOWN — CANNOT PROVE SAFE', reason: 'Typed runtime projection is missing, malformed, or internally contradictory.' };
   if (projection.ownership === 'active') return { verdict: 'WAIT FOR CURRENT CHECKPOINT', reason: 'The latest validated snapshot shows an account-wide writer; this observation is not a complete mutation freeze.' };
   if (projection.ownership !== 'none' || projection.checkpoint !== 'durable') return { verdict: 'UNKNOWN — CANNOT PROVE SAFE', reason: 'Writer ownership or durable restart checkpoint is ambiguous.' };
   if (!projection.maintenanceHold.active) return { verdict: 'SAFE NOW · WINDOW NOT GUARANTEED', reason: 'No writer is active, but new dispatch admission is not held.' };

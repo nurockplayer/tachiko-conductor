@@ -267,7 +267,9 @@ function bootstrapAdmissionRefusalOutcome(expected: Run, error: ExecutionAdmissi
     if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during bootstrap refusal reconciliation.');
     const matched = compareAndSwap.call(store, expected, expected);
     if (!matched || error.runSuperseded) return staleWorkflowOutcome(expected.id, expected, store, 'Run changed before bootstrap mutation; preserving the newer Run.');
-    return park(expected, `Bootstrap mutation was refused at the current host admission boundary: ${error.message}`, store, now, [CANCEL_RUN_DECISION]);
+    const parked = createBootstrapFailureRun(expected, error, now);
+    if (!compareAndSwap.call(store, expected, parked.run)) return staleWorkflowOutcome(expected.id, expected, store, 'Run changed before bootstrap refusal was parked; preserving the newer Run.');
+    return { outcome: 'needs_human', ...parked };
   } catch {
     throw error;
   }
@@ -887,11 +889,7 @@ export async function runWorkflow(
               assertFinalExecutionAdmission(store, workerHandoff, options);
             },
             beforePublish: () => {
-              if (!updateIfCurrent(store, workerHandoff, workerHandoff)) {
-                throw new Error('Run changed before worker-router implementation publication.');
-              }
-              assertCurrentMutationAdmission(options);
-              assertPublicationAdmission(options);
+              assertFinalExecutionAdmission(store, workerHandoff, options, true);
             },
             // #92 deliberately qualifies fresh bounded Luna workers.  A
             // repair/re-entry therefore cannot pretend its prior CLI thread
@@ -1039,11 +1037,8 @@ export async function runWorkflow(
             assertCurrentMutationAdmission(options);
             await bootstrapAdapter.verifyDurable({
               identity: bootstrap, expectedHeadSha: result.headSha, progressBaseSha: pendingRepair ? run.headSha : undefined, workspaceGuard,
-              beforePublish: () => {
-                if (!updateIfCurrent(store, publicationRun, publicationRun)) throw new Error('Run changed before standalone implementation publication.');
-                assertCurrentMutationAdmission(options);
-                assertPublicationAdmission(options);
-              },
+              beforeMutation: () => assertFinalExecutionAdmission(store, publicationRun, options),
+              beforePublish: () => assertFinalExecutionAdmission(store, publicationRun, options, true),
             });
             if ((run.execution?.executor === 'worker-router' || run.execution?.executor === 'luna-isolated') && snapshot.pullRequest === null) {
               if (deps.github.createImplementationPullRequest === undefined) {
@@ -1062,7 +1057,8 @@ export async function runWorkflow(
             }
             snapshot = await github.readLiveSnapshot(target);
           } catch (error) {
-            return bootstrapFailureAfterWorker(run, run, error, store, now);
+            if (isExecutionAdmissionRefusal(error)) return bootstrapAdmissionRefusalOutcome(publicationRun, error, store, now);
+            return bootstrapFailureAfterWorker(run, publicationRun, error, store, now);
           }
           const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
           if (conflict !== null || snapshot.pullRequest === null || snapshot.headSha !== result.headSha) {

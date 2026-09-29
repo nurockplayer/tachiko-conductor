@@ -464,7 +464,7 @@ describe('DockerWorkerContainerRuntime', () => {
 
   it('builds an unprivileged, restart-free, digest-pinned create invocation', async () => {
     const runner = new QueueRunner([ok(`${ID}\n`)]);
-    const runtime = new DockerWorkerContainerRuntime({ runner });
+    const runtime = new DockerWorkerContainerRuntime({ runner, env: { HOME: '/host/home' } });
     const id = await runtime.create(spec({
       mounts: [
         { host: '/ws', container: '/ws', mode: 'rw' },
@@ -483,7 +483,7 @@ describe('DockerWorkerContainerRuntime', () => {
       '--interactive',
       '--workdir', '/ws',
       '--env', 'HOME=/root',
-      '--env', 'WORKER_FORCE=deepseek',
+      '--env', 'WORKER_FORCE',
       '--volume', '/ws:/ws',
       '--volume', '/source/.git/config:/source/.git/config:ro',
       IMAGE,
@@ -492,6 +492,8 @@ describe('DockerWorkerContainerRuntime', () => {
     assert.equal(args.includes('--privileged'), false);
     assert.equal(args.some((arg) => arg.includes('docker.sock')), false);
     assert.equal(args.includes('ps'), false);
+    assert.equal(runner.calls[0]?.options.env?.WORKER_FORCE, 'deepseek');
+    assert.equal(runner.calls[0]?.options.env?.HOME, '/host/home', 'container HOME never replaces host HOME in Docker CLI environment');
   });
 
   it('addresses every lifecycle call by the exact ID and reads terminal state', async () => {
@@ -523,6 +525,65 @@ describe('DockerWorkerContainerRuntime', () => {
       ['rm', '--force', ID],
     ]);
     assert.equal(runner.calls[0]?.options.stdin, 'task\n');
+  });
+
+  it('captures exactly the Docker control environment once and keeps worker values create-only', async () => {
+    const source: NodeJS.ProcessEnv = {
+      PATH: '/host/bin', HOME: '/host/home', DOCKER_CONFIG: '/host/docker', DOCKER_CONTEXT: 'operator-context',
+      DOCKER_HOST: 'tcp://docker.example.invalid:2376', DOCKER_TLS: '1', DOCKER_TLS_VERIFY: '1', DOCKER_CERT_PATH: '/host/certs',
+      HTTP_PROXY: 'ambient-proxy-sentinel', AWS_SECRET_ACCESS_KEY: 'ambient-secret-sentinel',
+      WORKER_FORCE: 'ambient-worker-force-sentinel', DEEPSEEK_API_KEY: 'ambient-worker-key-sentinel',
+    };
+    const runner = new QueueRunner([ok(`${ID}\n`), ok(), ok('0\n'), ok(JSON.stringify({ Id: ID, State: { Status: 'exited', Running: false, ExitCode: 0 }, HostConfig: { RestartPolicy: { Name: 'no' } } })), ok(''), ok(), ok(), ok()]);
+    const runtime = new DockerWorkerContainerRuntime({ runner, env: source });
+    await runtime.create(spec({ env: { HOME: '/root', DEEPSEEK_API_KEY: 'worker-secret', WORKER_FORCE: '' } }));
+    source.DOCKER_HOST = 'tcp://changed.invalid:2376';
+    source.HOME = '/changed/home';
+    await runtime.start(ID, spec());
+    await runtime.wait(ID);
+    await runtime.inspect(ID);
+    await runtime.logs(ID);
+    await runtime.stop(ID, 5);
+    await runtime.kill(ID);
+    await runtime.remove(ID);
+
+    const [create, ...lifecycle] = runner.calls;
+    const expectedControls = {
+      PATH: '/host/bin', HOME: '/host/home', DOCKER_CONFIG: '/host/docker', DOCKER_CONTEXT: 'operator-context',
+      DOCKER_HOST: 'tcp://docker.example.invalid:2376', DOCKER_TLS: '1', DOCKER_TLS_VERIFY: '1', DOCKER_CERT_PATH: '/host/certs',
+    };
+    assert.equal(create?.options.env?.WORKER_FORCE, undefined, 'empty selected inputs do not fall back to ambient host values');
+    assert.deepEqual(create?.options.env, { ...expectedControls, DEEPSEEK_API_KEY: 'worker-secret' });
+    assert.equal(create?.options.env?.DOCKER_HOST, 'tcp://docker.example.invalid:2376');
+    assert.equal(create?.options.env?.HOME, '/host/home');
+    assert.equal(create?.options.env?.DEEPSEEK_API_KEY, 'worker-secret');
+    for (const secret of ['worker-secret', 'ambient-worker-key-sentinel', 'ambient-worker-force-sentinel', 'ambient-secret-sentinel']) {
+      assert.ok(runner.calls.every((call) => call.args.every((arg) => !arg.includes(secret))),
+        `secret substring ${secret} never appears in any Docker argument`);
+    }
+    assert.equal(create?.args.includes('DEEPSEEK_API_KEY'), true);
+    assert.equal(create?.args.includes('WORKER_FORCE'), false, 'empty worker inputs have no flag or ambient fallback');
+    assert.equal(create?.args.includes('HOME=/root'), true, 'container HOME remains a literal separate setting');
+    assert.equal(JSON.stringify(create?.options.env).includes('ambient-proxy-sentinel'), false);
+    assert.equal(JSON.stringify(create?.options.env).includes('ambient-secret-sentinel'), false);
+    assert.equal(JSON.stringify(create?.options.env).includes('ambient-worker-force-sentinel'), false);
+    assert.ok(lifecycle.every((call) => JSON.stringify(call.options.env) === JSON.stringify(expectedControls)),
+      'every lifecycle call receives exactly the once-captured eight control variables');
+    const absentRunner = new QueueRunner([ok(`${ID}\n`)]);
+    const missingSource = { ...source, HOME: '/host/home', DOCKER_HOST: 'tcp://docker.example.invalid:2376' };
+    const absentRuntime = new DockerWorkerContainerRuntime({ runner: absentRunner, env: missingSource });
+    await absentRuntime.create(spec({ env: {} }));
+    assert.equal(absentRunner.calls[0]?.args.includes('DEEPSEEK_API_KEY'), false, 'a missing selected worker input has no flag');
+    assert.equal(absentRunner.calls[0]?.args.includes('WORKER_FORCE'), false, 'a missing selected worker input has no flag');
+    assert.deepEqual(absentRunner.calls[0]?.options.env, expectedControls, 'missing inputs never fall back to ambient worker secrets');
+    assert.ok(absentRunner.calls[0]?.args.every((arg) => !arg.includes('ambient-worker-key-sentinel') && !arg.includes('ambient-worker-force-sentinel')));
+  });
+
+  it('rejects selected worker keys that collide with Docker controls before create', async () => {
+    const runner = new QueueRunner([]);
+    const runtime = new DockerWorkerContainerRuntime({ runner, env: { DOCKER_HOST: 'tcp://operator.invalid:2376' } });
+    await assert.rejects(() => runtime.create(spec({ env: { DOCKER_HOST: 'tcp://worker.invalid:2376' } })), /collides with Docker host control/);
+    assert.equal(runner.calls.length, 0);
   });
 
   it('refuses lifecycle calls without an exact 64-hex container id', async () => {

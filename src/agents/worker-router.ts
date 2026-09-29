@@ -280,6 +280,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     try {
       beforePublish();
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       return {
         ok: false, cancelled: false,
         detail: `Pre-publication authority check rejected: ${boundedMessage(error)}`, diagnostics: [],
@@ -289,7 +290,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       const result = await this.runner.run(
         'git',
         ['push', '--porcelain', 'origin', `${head}:refs/heads/${branch}`],
-        this.options(signal, cwd, ''),
+        { ...this.options(signal, cwd, ''), beforeSpawn: beforePublish },
       );
       if (result.exitCode === 0) return { ok: true };
       return {
@@ -299,6 +300,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: boundedDiagnostics(result.stderr, result.stdout, undefined),
       };
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       const code = errorCode(error);
       if (isAborted(signal) || code === 'ABORT_ERR') {
         return { ok: false, cancelled: true, detail: 'git push was cancelled.', diagnostics: [] };

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { hasGovernedPublicationConfinement, WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { ExecutionAdmissionRefusal, hasGovernedPublicationConfinement, WorkspaceGuardFailure } from '../src/adapters/agent.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import {
   WORKER_ROUTER_ERROR_CODE,
@@ -494,6 +494,62 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED));
     assert.equal(runner.calls.some((call) => call.args[0] === 'push'), false);
+  });
+
+  it('rechecks the exact tagged publication refusal at the actual delayed push spawn', async () => {
+    const ws = workspace();
+    let release!: () => void;
+    let announce!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { announce = resolve; });
+    let checks = 0;
+    let actualPushEffects = 0;
+    const refusal = new ExecutionAdmissionRefusal('publication authority changed after runner preparation', true, { cause: new Error('captured Run superseded') });
+    const runner: ProcessRunner = {
+      async run(_file, args, options) {
+        if (args[0] === 'push') {
+          announce();
+          await gate;
+          options.beforeSpawn?.();
+          actualPushEffects += 1;
+          return result();
+        }
+        return args[0] === 'rev-parse' ? result(HEAD) : result();
+      },
+    };
+    const pending = new WorkerRouterAdapter({ runner, container: new FakeContainer([containerResult()]), image: IMAGE }).run({
+      ...requestFor(ws.workspacePath),
+      beforePublish: () => { if (++checks === 2) throw refusal; },
+    });
+    await entered;
+    release();
+    await assert.rejects(pending, (error: unknown) => {
+      assert.strictEqual(error, refusal, 'the production actual-spawn catch preserves tagged refusal identity');
+      assert.strictEqual((error as Error).cause, refusal.cause);
+      return true;
+    });
+    assert.equal(checks, 2, 'eager and actual-spawn checks both run');
+    assert.equal(actualPushEffects, 0, 'the delayed runner never crosses its actual push effect boundary');
+  });
+
+  it('preserves the exact tagged refusal at the eager publication check without invoking the push runner', async () => {
+    const ws = workspace();
+    const refusal = new ExecutionAdmissionRefusal('eager publication authority was revoked', false, { cause: new Error('captured admission generation is stale') });
+    const runner = new FakeRunner([result(HEAD), result()]);
+    let eagerChecks = 0;
+    await assert.rejects(
+      () => new WorkerRouterAdapter({ runner, container: new FakeContainer([containerResult()]), image: IMAGE }).run({
+        ...requestFor(ws.workspacePath),
+        beforePublish: () => { eagerChecks += 1; throw refusal; },
+      }),
+      (error: unknown) => {
+        assert.strictEqual(error, refusal, 'the eager catch preserves the exact tagged refusal');
+        assert.strictEqual((error as Error).cause, refusal.cause);
+        return true;
+      },
+    );
+    assert.equal(eagerChecks, 1);
+    assert.equal(runner.calls.some((call) => call.args[0] === 'push'), false, 'eager refusal does not invoke the push runner');
   });
 
   it('returns cancellation when HEAD verification is aborted after the container is terminal', async () => {

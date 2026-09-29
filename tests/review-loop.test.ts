@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -11,7 +11,7 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.j
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import type { ProcessRunner } from '../src/github/transport.js';
 import { WorkerRouterAdapter } from '../src/agents/worker-router.js';
-import type { ContainerWorkerExecution } from '../src/agents/worker-router-container.js';
+import type { ContainerWorkerExecution, WorkerContainerSpec } from '../src/agents/worker-router-container.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition, type ActiveValidationConfiguration } from '../src/domain/state-machine.js';
 import { activeRepairAdmission, createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
@@ -22,6 +22,7 @@ import { ReviewerError } from '../src/reviewers/deepseek.js';
 import { runReviewLoop, type ReviewLoopDependencies, type ReviewLoopResult } from '../src/reviewers/loop.js';
 import { canonicalizeMissionEvidence, MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
+import { operationalProjectionPath } from '../src/operational/projection.js';
 import { TARGET, failureResult, successResult, validationFailed, validationPassed } from './helpers.js';
 import { createBootstrapGitFixture } from './bootstrap-fixture.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
@@ -41,6 +42,10 @@ function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((resolvePromise) => { resolve = resolvePromise; });
   return { promise, resolve };
+}
+
+function persistedJson<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
 }
 
 function reviewAuthority() {
@@ -1590,6 +1595,582 @@ describe('runReviewLoop', () => {
           }
         } finally {
           fixture.cleanup();
+        }
+      });
+    }
+  });
+
+  it('fences the successive repair trusted-source import with the production closure and preserves a newer JSON Run', async () => {
+    const fixture = createBootstrapGitFixture();
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-repair-first-import-'));
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    let pendingSettlement: Promise<{ kind: 'resolved'; value: any } | { kind: 'rejected'; error: unknown }> | undefined;
+    try {
+      const id = 'repair-first-import-json-cas';
+      const durableStore = new JsonFileStore({ dir: directory });
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const identity = await bootstrap.plan({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+      fixture.git(fixture.remote, ['update-ref', `refs/heads/${identity.publicationBranch ?? identity.branch}`, fixture.baseSha]);
+      let initial: Run = {
+        ...reviewingRun(fixture.baseSha, id),
+        repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' as const },
+        bootstrap: identity,
+      };
+      initial = applyTransition(initial, { type: 'changes_requested', reviewResult: requestChanges(fixture.baseSha) }, T0, reviewAuthority());
+      durableStore.create(initial);
+      let verificationPhase = false;
+      let importReached = false;
+      let firstImportCompleted = false;
+      let importEffects = 0;
+      let publicationRefImportEffects = 0;
+      let pushEffects = 0;
+      const publicationRef = `refs/heads/${identity.publicationBranch ?? identity.branch}`;
+      const runner: ProcessRunner = {
+        async run(file, args, options) {
+          const trustedSource = file === 'git' && options.cwd === realpathSync(fixture.source);
+          const importsWorkerHead = trustedSource && args.includes('fetch') && args.includes('--no-recurse-submodules');
+          const importsPublicationRef = verificationPhase && trustedSource && args.includes('fetch') && args.includes('origin') && args.at(-1) === publicationRef;
+          const pushes = verificationPhase && trustedSource && args.includes('push');
+          if (verificationPhase && trustedSource && args.includes('ls-remote') && args.at(-1) === publicationRef && !importReached) {
+            importReached = true;
+            assert.equal(firstImportCompleted, true, 'the intended remote-head read occurs after the first authorized worker import');
+            assert.equal(importEffects, 1, 'the real first trusted-source fetch returned successfully before authority changes');
+            const result = await fixture.runner.run(file, args, options);
+            entered.resolve();
+            await release.promise;
+            return result;
+          }
+          options.beforeSpawn?.();
+          const result = await fixture.runner.run(file, args, { ...options, beforeSpawn: undefined });
+          if (verificationPhase && importsWorkerHead) { importEffects += 1; firstImportCompleted = true; }
+          if (importsPublicationRef) publicationRefImportEffects += 1;
+          if (pushes) pushEffects += 1;
+          return result;
+        },
+      };
+      const guardedBootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+      const luna: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000 };
+      let repairedHead: string | undefined;
+      const implementation: ImplementationAgent = { kind: 'implementation-agent', async run(request) {
+        repairedHead = fixture.commit(request.workspacePath!, 'repair.txt', 'repair effect\n');
+        verificationPhase = true;
+        const sessionId = 'repair-successive-git-session';
+        const runtimeGeneration = request.runtimeOwnership?.generation;
+        assert.ok(runtimeGeneration, 'the actual repair handoff retains its captured runtime generation');
+        return { ...successResult(repairedHead), sessionId, executor: { provider: 'codex-cli', sessionId, generation: runtimeGeneration } };
+      } };
+      const github = githubAdapter([fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha]);
+      const readLiveSnapshot = github.readLiveSnapshot.bind(github);
+      github.readLiveSnapshot = async (target) => {
+        const live = await readLiveSnapshot(target);
+        return { ...live, pullRequest: live.pullRequest === null ? null : {
+          ...live.pullRequest, headRef: identity.publicationBranch ?? identity.branch, baseRef: fixture.branch,
+          headRepository: { owner: TARGET.owner, repo: TARGET.repo },
+        } };
+      };
+      const pending = runReviewLoop({
+        store: durableStore, github, implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+        bootstrapForExecution: () => guardedBootstrap, resolveRepairExecutionProfile: () => luna,
+      }, id, { maxAttempts: 2, now: () => T0 });
+      pendingSettlement = pending.then((value) => ({ kind: 'resolved' as const, value }), (error: unknown) => ({ kind: 'rejected' as const, error }));
+      const gate = await Promise.race([entered.promise.then(() => ({ kind: 'entered' as const })), pendingSettlement]);
+      assert.equal(gate.kind, 'entered', gate.kind === 'resolved' ? `repair settled before successive import gate: ${JSON.stringify(gate.value)}` : gate.kind === 'rejected' ? `repair rejected before successive import gate: ${String(gate.error)}` : undefined);
+      const captured = new JsonFileStore({ dir: directory }).read(id)!;
+      const newer = { ...captured, updatedAt: '2026-09-29T00:00:02.000Z' };
+      durableStore.update(newer);
+      const exactNewer = new JsonFileStore({ dir: directory }).read(id)!;
+      const exactNewerRunBytes = readFileSync(path.join(directory, `${id}.json`), 'utf8');
+      const exactNewerProjection = readFileSync(operationalProjectionPath(directory, id), 'utf8');
+      release.resolve();
+      const settled = await pendingSettlement;
+      if (settled?.kind === 'rejected') throw settled.error;
+      const result = settled?.kind === 'resolved' ? settled.value : await pending;
+      assert.equal(result.outcome, 'superseded', JSON.stringify(result));
+      assert.ok(repairedHead);
+      assert.equal(importReached, true, 'the production repair producer completed the remote-head read before authority changed');
+      assert.equal(importEffects, 1, 'the first authorized repair worker-head import completed and remains an earlier effect');
+      assert.equal(publicationRefImportEffects, 0, 'the second trusted-source import is refused before real Git execution');
+      assert.equal(pushEffects, 0, 'no repair publication follows the refused second import');
+      assert.deepEqual(new JsonFileStore({ dir: directory }).read(id), exactNewer, 'a fresh store preserves the exact concurrent repair Run');
+      assert.equal(readFileSync(path.join(directory, `${id}.json`), 'utf8'), exactNewerRunBytes, 'the exact concurrent repair Run bytes remain unchanged');
+      assert.equal(readFileSync(operationalProjectionPath(directory, id), 'utf8'), exactNewerProjection, 'the exact concurrent repair projection bytes remain untouched');
+    } finally {
+      release.resolve();
+      await pendingSettlement;
+      rmSync(directory, { recursive: true, force: true });
+      fixture.cleanup();
+    }
+  });
+
+  it('fences the repair first trusted-source import at the actual runner boundary and preserves Run and projection bytes', async () => {
+    const fixture = createBootstrapGitFixture();
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-repair-first-fetch-cas-'));
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    let pendingSettlement: Promise<{ kind: 'resolved'; value: any } | { kind: 'rejected'; error: unknown }> | undefined;
+    try {
+      const id = 'repair-first-fetch-json-cas';
+      const durableStore = new JsonFileStore({ dir: directory });
+      const setupBootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+      const identity = await setupBootstrap.plan({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+      const publicationRef = `refs/heads/${identity.publicationBranch ?? identity.branch}`;
+      fixture.git(fixture.remote, ['update-ref', publicationRef, fixture.baseSha]);
+      let initial: Run = {
+        ...reviewingRun(fixture.baseSha, id),
+        repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' },
+        bootstrap: identity,
+      };
+      initial = applyTransition(initial, { type: 'changes_requested', reviewResult: requestChanges(fixture.baseSha) }, T0, reviewAuthority());
+      durableStore.create(initial);
+      let verificationPhase = false;
+      let importRunnerEntered = false;
+      let importEffects = 0;
+      let pushEffects = 0;
+      const runner: ProcessRunner = {
+        async run(file, args, options) {
+          const trustedSource = file === 'git' && options.cwd === realpathSync(fixture.source);
+          const importsWorkerHead = trustedSource && args.includes('fetch') && args.includes('--no-recurse-submodules');
+          const pushes = trustedSource && args.includes('push');
+          if (verificationPhase && importsWorkerHead && !importRunnerEntered) {
+            importRunnerEntered = true;
+            assert.ok(durableStore.read(id)?.telemetry?.events.some((event) => event.kind === 'completion'),
+              'the actual first trusted fetch is reached after completion telemetry is durable');
+            entered.resolve();
+            await release.promise;
+          }
+          options.beforeSpawn?.();
+          const result = await fixture.runner.run(file, args, { ...options, beforeSpawn: undefined });
+          if (verificationPhase && importsWorkerHead) importEffects += 1;
+          if (verificationPhase && pushes) pushEffects += 1;
+          return result;
+        },
+      };
+      const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner });
+      let repairedHead: string | undefined;
+      const implementation: ImplementationAgent = { kind: 'implementation-agent', async run(request) {
+        repairedHead = fixture.commit(request.workspacePath!, 'repair.txt', 'repair first fetch\n');
+        verificationPhase = true;
+        const sessionId = 'repair-first-fetch-session';
+        const runtimeGeneration = request.runtimeOwnership?.generation;
+        assert.ok(runtimeGeneration, 'the actual repair handoff retains its captured runtime generation');
+        return { ...successResult(repairedHead), sessionId, executor: { provider: 'codex-cli', sessionId, generation: runtimeGeneration } };
+      } };
+      const github = githubAdapter([fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha]);
+      const readLiveSnapshot = github.readLiveSnapshot.bind(github);
+      github.readLiveSnapshot = async (target) => {
+        const live = await readLiveSnapshot(target);
+        return { ...live, pullRequest: live.pullRequest === null ? null : {
+          ...live.pullRequest, headRef: publicationRef.replace(/^refs\/heads\//, ''), baseRef: fixture.branch,
+          headRepository: { owner: TARGET.owner, repo: TARGET.repo },
+        } };
+      };
+      const pending = runReviewLoop({
+        store: durableStore, github, implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+        bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => ({
+          profile: 'routine', revision: 'luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+        }),
+      }, id, { maxAttempts: 2, now: () => T0 });
+      pendingSettlement = pending.then((value) => ({ kind: 'resolved' as const, value }), (error: unknown) => ({ kind: 'rejected' as const, error }));
+      const gate = await Promise.race([entered.promise.then(() => ({ kind: 'entered' as const })), pendingSettlement]);
+      assert.equal(gate.kind, 'entered', gate.kind === 'resolved' ? `repair settled before first-fetch gate: ${JSON.stringify(gate.value)}` : gate.kind === 'rejected' ? `repair rejected before first-fetch gate: ${String(gate.error)}` : undefined);
+      const captured = new JsonFileStore({ dir: directory }).read(id)!;
+      const newer = { ...captured, updatedAt: '2026-09-29T00:00:05.000Z' };
+      durableStore.update(newer);
+      const exactNewer = new JsonFileStore({ dir: directory }).read(id)!;
+      const exactNewerRunBytes = readFileSync(path.join(directory, `${id}.json`), 'utf8');
+      const exactNewerProjection = readFileSync(operationalProjectionPath(directory, id), 'utf8');
+      release.resolve();
+      const settled = await pendingSettlement;
+      if (settled.kind === 'rejected') throw settled.error;
+      const result = settled.value;
+      assert.equal(result.outcome, 'superseded', JSON.stringify(result));
+      assert.ok(repairedHead);
+      assert.equal(importRunnerEntered, true, 'the production durable-verification producer reached the actual fetch runner');
+      assert.equal(importEffects, 0, 'authority is checked before the first worker-head import effect');
+      assert.equal(pushEffects, 0, 'no repair push follows the refused first import');
+      assert.deepEqual(new JsonFileStore({ dir: directory }).read(id), exactNewer, 'a fresh Run reader retains the exact concurrent winner');
+      assert.equal(readFileSync(path.join(directory, `${id}.json`), 'utf8'), exactNewerRunBytes, 'the exact concurrent Run bytes remain unchanged');
+      assert.equal(readFileSync(operationalProjectionPath(directory, id), 'utf8'), exactNewerProjection, 'the exact concurrent projection bytes remain unchanged');
+    } finally {
+      release.resolve();
+      await pendingSettlement;
+      rmSync(directory, { recursive: true, force: true });
+      fixture.cleanup();
+    }
+  });
+
+  it('reconciles repair durable-verification refusals only after completed evidence is durable', async (t) => {
+    for (const mode of ['authority-unknown', 'known-current', 'missing-cas', 'throwing-cas', 'secondary-identity-failure', 'secondary-failure', 'parking-cas-loss'] as const) {
+      await t.test(mode, async () => {
+        const id = `repair-durable-refusal-${mode}`;
+        const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-repair-durable-${mode}-`));
+        try {
+          const store = new JsonFileStore({ dir: directory });
+          const identity: ImplementationBootstrapIdentity = {
+            bootstrapKind: 'linked-worktree', owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+            baseBranch: 'main', baseSha: HEAD, branch: `tachiko/${id}`, workspacePath: path.join(directory, 'workspace'),
+          };
+          let initial: Run = { ...repairChangesRun(id), bootstrap: identity };
+          store.create(initial);
+          const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'),
+            config: { schemaVersion: 1, revision: `repair-durable-${mode}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+          const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', evidence: {
+            repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: id, workspace: identity.workspacePath,
+          } });
+          assert.equal(admitted.outcome, 'admitted');
+          if (admitted.outcome !== 'admitted') return;
+
+          const primaryCause = new Error(`repair ${mode} cause`);
+          const primary = new ExecutionAdmissionRefusal(`repair durable ${mode}`, false, {
+            cause: primaryCause, ...(mode === 'authority-unknown' ? { authorityUnknown: true } : {}),
+          });
+          let verifying = false;
+          let verificationCasCalls = 0;
+          let capturedPrimary: unknown;
+          let completedRun: Run | undefined;
+          let completedRunBytes: string | undefined;
+          let completedProjectionBytes: string | undefined;
+          let winner: Run | undefined;
+          let winnerRunBytes: string | undefined;
+          let winnerProjectionBytes: string | undefined;
+          const originalCas = store.updateIfUnchanged.bind(store);
+          Object.defineProperty(store, 'updateIfUnchanged', { configurable: true, get: () => {
+            if (verifying && mode === 'missing-cas') return undefined;
+            return (expected: Run, next: Run) => {
+              if (verifying) {
+                verificationCasCalls += 1;
+                if (mode === 'throwing-cas') throw new Error('repair durable strict CAS unavailable');
+                if (mode === 'secondary-identity-failure' && verificationCasCalls === 2) throw new Error('repair refusal identity CAS failed');
+                if (mode === 'secondary-failure' && verificationCasCalls === 3) throw new Error('repair parking write CAS failed');
+                if (mode === 'parking-cas-loss' && next.state === 'NEEDS_HUMAN') {
+                  winner = { ...expected, updatedAt: '2026-09-29T00:00:04.000Z' };
+                  store.update(winner);
+                  winnerRunBytes = readFileSync(path.join(directory, `${id}.json`), 'utf8');
+                  winnerProjectionBytes = readFileSync(operationalProjectionPath(directory, id), 'utf8');
+                }
+              }
+              return originalCas(expected, next);
+            };
+          } });
+          const bootstrap: ImplementationBootstrapAdapter = {
+            kind: 'implementation-bootstrap', bootstrapKind: 'linked-worktree',
+            async plan() { return identity; },
+            async prepare(request) { request.beforeMutation?.(); return identity; },
+            guard() { return { assertValid() {} }; },
+            async verifyDurable(request) {
+              verifying = true;
+              completedRun = store.read(id)!;
+              assert.ok(completedRun.telemetry?.events.some((event) => event.kind === 'completion'), 'the durable producer begins after worker completion was stored');
+              assert.deepEqual(completedRun.repairTaskShapeAuthority, initial.repairTaskShapeAuthority, 'the explicit task-shape authority survives into durable verification');
+              assert.equal(completedRun.repairAdmissions?.at(-1)?.executionProfile, 'routine', 'the durable producer is entered under the admitted routine repair profile');
+              assert.deepEqual(completedRun.repairAdmissions?.at(-1)?.execution, ROUTINE_REPAIR_EXECUTION, 'the admitted execution ledger remains exact');
+              assert.ok(completedRun.history.some((event) => event.type === 'repair_executor_handoff'), 'the selected codex-cli handoff is durably recorded before verification');
+              assert.equal(completedRun.agentResult?.sessionId, completedRun.executor?.sessionId, 'the top-level result session matches the persisted executor identity');
+              completedRunBytes = readFileSync(path.join(directory, `${id}.json`), 'utf8');
+              completedProjectionBytes = readFileSync(operationalProjectionPath(directory, id), 'utf8');
+              try {
+                if (mode === 'known-current' || mode === 'parking-cas-loss') registry.release(admitted.token, true);
+                request.beforeMutation?.();
+                request.beforePublish?.();
+              } catch (error) {
+                capturedPrimary = error;
+                throw error;
+              }
+              return { headSha: HEAD2, branch: identity.branch };
+            },
+          };
+          const implementation: ImplementationAgent = { kind: 'implementation-agent', async run(request) {
+            const sessionId = `repair-session-${mode}`;
+            const runtimeGeneration = request.runtimeOwnership?.generation;
+            assert.ok(runtimeGeneration, 'the fault fixture returns the generation selected by repair admission');
+            return { ...successResult(HEAD2), sessionId, executor: { provider: 'codex-cli', sessionId, generation: runtimeGeneration } };
+          } };
+          const assertCurrentMutation = () => {
+            if (!verifying) return;
+            if (mode === 'known-current' || mode === 'parking-cas-loss') registry.assertCanMutate(admitted.token);
+            if (mode === 'authority-unknown' || mode === 'secondary-identity-failure' || mode === 'secondary-failure') throw primary;
+          };
+          const liveGithub = githubAdapter(Array.from({ length: 12 }, () => HEAD));
+          const readLiveSnapshot = liveGithub.readLiveSnapshot.bind(liveGithub);
+          let liveSnapshotReads = 0;
+          liveGithub.readLiveSnapshot = async (target) => {
+            const live = await readLiveSnapshot(target);
+            liveSnapshotReads += 1;
+            return {
+              ...live,
+              issue: { ...live.issue, number: TARGET.issueNumber, title: 'Fix the widget', body: 'Original bounded requirement.' },
+              repository: { ...live.repository, owner: TARGET.owner, repo: TARGET.repo, defaultBranch: identity.baseBranch, defaultBranchHeadSha: HEAD },
+              pullRequest: live.pullRequest === null ? null : {
+                ...live.pullRequest, number: initial.pullRequest?.number ?? 7, headSha: HEAD, baseSha: HEAD,
+                headRef: identity.publicationBranch ?? identity.branch, baseRef: identity.baseBranch,
+                headRepository: { owner: TARGET.owner, repo: TARGET.repo },
+              },
+            };
+          };
+          const pending = runReviewLoop({
+            store, github: liveGithub, implementation, reviewer: new FakeReviewer([]),
+            resolveValidationAuthority: reviewAuthority, bootstrapForExecution: () => bootstrap,
+            resolveRepairExecutionProfile: () => ROUTINE_REPAIR_EXECUTION,
+            assertCurrentMutation,
+          }, id, { maxAttempts: 2, now: () => T0 });
+
+          if (mode === 'authority-unknown' || mode === 'missing-cas' || mode === 'throwing-cas' || mode === 'secondary-identity-failure' || mode === 'secondary-failure') {
+            await assert.rejects(pending, (error: unknown) => {
+              assert.strictEqual(error, capturedPrimary, 'the primary repair verification refusal escapes unchanged');
+              if (mode === 'authority-unknown' || mode === 'secondary-identity-failure' || mode === 'secondary-failure') {
+                assert.strictEqual(error, primary);
+                assert.strictEqual((error as Error).cause, primaryCause);
+                assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, mode === 'authority-unknown');
+              } else {
+                assert.equal(isExecutionAdmissionRefusal(error), true);
+                assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, true);
+                assert.match(String((error as Error).cause), /strict Run compare-and-swap|repair durable strict CAS unavailable/i);
+              }
+              return true;
+            });
+            const persisted = new JsonFileStore({ dir: directory }).read(id)!;
+            assert.equal(persisted.state, 'IMPLEMENTING', 'a refused repair verification cannot overwrite the completed Run');
+            assert.deepEqual(persisted.history, completedRun?.history, 'a failed reconciliation preserves exact completed repair history');
+            assert.deepEqual(persisted.repairTaskShapeAuthority, completedRun?.repairTaskShapeAuthority, 'a failed reconciliation preserves task-shape authority');
+            assert.deepEqual(persisted.repairAdmissions, completedRun?.repairAdmissions, 'a failed reconciliation preserves the admitted repair ledger');
+            assert.deepEqual(persisted.telemetry, completedRun?.telemetry, 'a failed reconciliation preserves full completion and execution evidence');
+            assert.equal(persisted.executor?.sessionId, completedRun?.executor?.sessionId);
+            assert.equal(readFileSync(path.join(directory, `${id}.json`), 'utf8'), completedRunBytes);
+            assert.equal(readFileSync(operationalProjectionPath(directory, id), 'utf8'), completedProjectionBytes);
+            if (mode === 'secondary-identity-failure') assert.equal(verificationCasCalls, 2, 'the primary refusal reached the secondary captured-Run comparison failure');
+            if (mode === 'secondary-failure') assert.equal(verificationCasCalls, 3, 'the primary refusal reached the secondary parking-write CAS');
+          } else {
+            const result = await pending;
+            if (mode === 'parking-cas-loss') {
+              assert.equal(result.outcome, 'superseded');
+              assert.ok(winner);
+              assert.deepEqual(new JsonFileStore({ dir: directory }).read(id), persistedJson(winner));
+              assert.equal(readFileSync(path.join(directory, `${id}.json`), 'utf8'), winnerRunBytes);
+              assert.equal(readFileSync(operationalProjectionPath(directory, id), 'utf8'), winnerProjectionBytes);
+            } else {
+              assert.equal(result.outcome, 'needs_human');
+              assert.equal(result.run.state, 'NEEDS_HUMAN');
+              assert.deepEqual(persistedJson(result.run.history.slice(0, completedRun?.history.length)), completedRun?.history, 'parking preserves the exact completed repair history prefix');
+              assert.deepEqual(result.run.repairTaskShapeAuthority, completedRun?.repairTaskShapeAuthority, 'parking preserves task-shape authority');
+              assert.deepEqual(result.run.repairAdmissions, completedRun?.repairAdmissions, 'parking preserves the admitted repair ledger');
+              assert.equal(result.run.executor?.sessionId, completedRun?.executor?.sessionId, 'parking preserves the completed repair executor');
+              assert.deepEqual(result.run.telemetry, completedRun?.telemetry, 'parking preserves full completion and execution evidence');
+              assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released', 'the refusal is tied to the exact current admission generation');
+            }
+          }
+          assert.ok(liveSnapshotReads >= 3, 'repair ownership was revalidated before admission, after start_fix, and after workspace preparation');
+          assert.ok(verifying && completedRun !== undefined && completedRunBytes !== undefined && completedProjectionBytes !== undefined,
+            'the tested refusal is raised inside durable verification after completion persistence');
+        } finally {
+          rmSync(directory, { recursive: true, force: true });
+        }
+      });
+    }
+  });
+
+  it('passes the production captured-Run and admission publication fence through a terminal WorkerRouter container', async (t) => {
+    for (const mode of ['run-superseded', 'admission-revoked'] as const) {
+      await t.test(mode, async () => {
+        const fixture = createBootstrapGitFixture();
+        const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-router-producer-fence-${mode}-`));
+        const pushEntered = deferred<void>();
+        const releasePush = deferred<void>();
+        let pendingSettlement: Promise<{ kind: 'resolved'; value: any } | { kind: 'rejected'; error: unknown }> | undefined;
+        try {
+          const id = `router-producer-fence-${mode}`;
+          const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: fixture.source, workspaceRoot: fixture.workspaceRoot, runner: fixture.runner });
+          const identity = await bootstrap.plan({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha });
+          await bootstrap.prepare({ runId: id, target: TARGET, baseBranch: fixture.branch, baseSha: fixture.baseSha, existing: identity });
+          fixture.git(fixture.remote, ['update-ref', `refs/heads/${identity.publicationBranch ?? identity.branch}`, fixture.baseSha]);
+          let initial: Run = { ...reviewingRun(fixture.baseSha, id, undefined, ROUTINE_REPAIR_EXECUTION), bootstrap: identity };
+          initial = applyTransition(initial, { type: 'changes_requested', reviewResult: requestChanges(fixture.baseSha) }, T0, reviewAuthority());
+          const store = new JsonFileStore({ dir: directory });
+          store.create(initial);
+          const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'),
+            config: { schemaVersion: 1, revision: `router-producer-${mode}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+          const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', evidence: {
+            repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: id, workspace: identity.workspacePath,
+          } });
+          assert.equal(admitted.outcome, 'admitted');
+          if (admitted.outcome !== 'admitted') return;
+          let pushEffects = 0;
+          let terminalReached = false;
+          const runner: ProcessRunner = { async run(_file, args, options) {
+            if (args[0] === 'rev-parse') return { stdout: `${HEAD2}\n`, stderr: '', exitCode: 0 };
+            if (args[0] === 'merge-base') return { stdout: '', stderr: '', exitCode: 0 };
+            if (args[0] === 'push') {
+              assert.equal(typeof options.beforeSpawn, 'function', 'the production publication closure reaches the actual WorkerRouter process boundary');
+              pushEntered.resolve();
+              await releasePush.promise;
+              options.beforeSpawn?.();
+              pushEffects += 1;
+              return { stdout: '', stderr: '', exitCode: 0 };
+            }
+            throw new Error(`unexpected router command ${args[0] ?? ''}`);
+          } };
+          const container: ContainerWorkerExecution = { async run(spec: WorkerContainerSpec) {
+            spec.beforeExecution?.();
+            terminalReached = true;
+            return { containerId: 'f'.repeat(64), exitCode: 0, terminalState: 'exited' as const, restartPolicy: 'no' as const, stdout: '', stderr: '' };
+          } };
+          const implementation = new WorkerRouterAdapter({ runner, container, image: `tachiko/worker-router@sha256:${'a'.repeat(64)}`, env: {} });
+          const github = githubAdapter([fixture.baseSha, fixture.baseSha, fixture.baseSha, fixture.baseSha]);
+          const readLiveSnapshot = github.readLiveSnapshot.bind(github);
+          github.readLiveSnapshot = async (target) => {
+            const live = await readLiveSnapshot(target);
+            return { ...live, pullRequest: live.pullRequest === null ? null : {
+              ...live.pullRequest, headRef: identity.branch, baseRef: fixture.branch,
+              headRepository: { owner: TARGET.owner, repo: TARGET.repo },
+            } };
+          };
+          const pending = runReviewLoop({
+            store, github, implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+            bootstrapForExecution: () => bootstrap,
+            assertCanMutate: () => registry.assertCanMutate(admitted.token),
+            assertCurrentMutation: () => registry.assertCanMutate(admitted.token),
+          }, id, { maxAttempts: 2, now: () => T0 });
+          pendingSettlement = pending.then((value) => ({ kind: 'resolved' as const, value }), (error: unknown) => ({ kind: 'rejected' as const, error }));
+          const gate = await Promise.race([pushEntered.promise.then(() => ({ kind: 'entered' as const })), pendingSettlement]);
+          assert.equal(gate.kind, 'entered', gate.kind === 'resolved' ? `repair settled before WorkerRouter push gate: ${JSON.stringify(gate.value)}` : gate.kind === 'rejected' ? `repair rejected before WorkerRouter push gate: ${String(gate.error)}` : undefined);
+          let winningRun: Run | undefined;
+          let winningRunBytes: string | undefined;
+          let winningProjectionBytes: string | undefined;
+          if (mode === 'run-superseded') {
+            const current = store.read(id)!;
+            winningRun = applyTransition(current, { type: 'escalate', reason: 'operator superseded repair during actual push preparation',
+              interrupt: { evidence: 'operator decision during actual push', choices: ['Cancel the run'] } }, T0);
+            store.update(winningRun);
+            winningRunBytes = readFileSync(path.join(directory, `${id}.json`), 'utf8');
+            winningProjectionBytes = readFileSync(operationalProjectionPath(directory, id), 'utf8');
+          } else {
+            registry.release(admitted.token, true);
+          }
+          releasePush.resolve();
+          const settled = await pendingSettlement;
+          if (settled.kind === 'rejected') throw settled.error;
+          const result = settled.value;
+          assert.equal(terminalReached, true, 'the simulated container reaches a terminal state before publication admission');
+          assert.equal(pushEffects, 0, 'the captured production closure rejects before the actual WorkerRouter push');
+          if (mode === 'run-superseded') {
+            assert.equal(result.outcome, 'superseded');
+            assert.deepEqual(new JsonFileStore({ dir: directory }).read(id), winningRun);
+            assert.equal(readFileSync(path.join(directory, `${id}.json`), 'utf8'), winningRunBytes);
+            assert.equal(readFileSync(operationalProjectionPath(directory, id), 'utf8'), winningProjectionBytes);
+            assert.equal(store.read(id)?.state, 'NEEDS_HUMAN');
+          } else {
+            assert.equal(result.outcome, 'needs_human');
+            assert.equal(result.run.state, 'NEEDS_HUMAN');
+            assert.equal(registry.readLane(admitted.token.laneId)?.status, 'released');
+          }
+        } finally {
+          releasePush.resolve();
+          await pendingSettlement;
+          rmSync(directory, { recursive: true, force: true });
+          fixture.cleanup();
+        }
+      });
+    }
+  });
+
+  it('holds governed repair when a durable producer callback becomes unavailable after worker completion', async (t) => {
+    for (const mode of ['missing-mutation', 'missing-publication'] as const) {
+      await t.test(mode, async () => {
+        const id = `governed-durable-omission-${mode}`;
+        const luna = await createGenuineLunaFixture(id);
+        const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-governed-durable-${mode}-`));
+        try {
+          const store = new JsonFileStore({ dir: directory });
+          const workerScript = path.join(luna.root, 'bin', 'codex');
+          writeFileSync(workerScript, [
+            '#!/bin/sh',
+            'set -e',
+            "printf 'bounded repair\\n' > governed-repair.txt",
+            'git add governed-repair.txt >/dev/null 2>&1',
+            'git commit -m "bounded governed fixture repair" >/dev/null 2>&1',
+            `printf '%s\\n' '${JSON.stringify({ type: 'thread.started', thread_id: 'genuine-luna-thread' })}'`,
+            `printf '%s\\n' '${JSON.stringify({ type: 'turn.started' })}'`,
+            `printf '%s\\n' '${JSON.stringify({ type: 'item.completed', item: { id: 'genuine-luna-message', type: 'agent_message', text: 'bounded fixture result' } })}'`,
+            `printf '%s\\n' '${JSON.stringify({ type: 'turn.completed' })}'`,
+            '',
+          ].join('\n'));
+          chmodSync(workerScript, 0o700);
+
+          const baseBootstrap = luna.bootstrap;
+          let verifying = false;
+          let beforeMutationReached = false;
+          let beforePublishReached = false;
+          let authorizedImportEffects = 0;
+          let publicationEffects = 0;
+          let completedRun: Run | undefined;
+          const bootstrap: ImplementationBootstrapAdapter = {
+            kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+            async plan(request) { return baseBootstrap.plan(request); },
+            async prepare(request) { return baseBootstrap.prepare(request); },
+            guard(identity) { return baseBootstrap.guard(identity); },
+            async verifyDurable(request) {
+              verifying = true;
+              completedRun = store.read(id)!;
+              assert.ok(completedRun.telemetry?.events.some((event) => event.kind === 'completion'), 'governed callback omission is injected only after worker completion is durable');
+              beforeMutationReached = true;
+              request.beforeMutation?.();
+              authorizedImportEffects += 1;
+              beforePublishReached = true;
+              request.beforePublish?.();
+              publicationEffects += 1;
+              return { headSha: request.expectedHeadSha, branch: luna.identity.branch };
+            },
+          };
+          const execution = luna.request.execution!;
+          let initial: Run = {
+            ...reviewingRun(luna.identity.baseSha, id, undefined, execution as ResolvedExecutionConfiguration),
+            bootstrap: luna.identity,
+            repairTaskShapeAuthority: { revision: 'task-shape-v1', shape: 'bounded' },
+          };
+          initial = applyTransition(initial, { type: 'changes_requested', reviewResult: requestChanges(luna.identity.baseSha) }, T0, reviewAuthority());
+          store.create(initial);
+          const github = githubAdapter([luna.identity.baseSha, luna.identity.baseSha, luna.identity.baseSha]);
+          const readLiveSnapshot = github.readLiveSnapshot.bind(github);
+          github.readLiveSnapshot = async (target) => {
+            const live = await readLiveSnapshot(target);
+            return { ...live, issue: { ...live.issue, title: 'Fix the widget', body: 'Original bounded requirement.' }, pullRequest: live.pullRequest === null ? null : {
+              ...live.pullRequest, headRef: luna.identity.branch, baseRef: luna.identity.baseBranch,
+              baseSha: luna.identity.baseSha, headRepository: { owner: TARGET.owner, repo: TARGET.repo },
+            } };
+          };
+          const implementation: ImplementationAgent = {
+            kind: 'implementation-agent',
+            prepareGovernedInvocation(request) { return luna.adapter.prepareGovernedInvocation(request); },
+            async run() { throw new Error('ambient implementation fallback must not run'); },
+          };
+          const validMutation = () => undefined;
+          const validPublication = () => undefined;
+          const dependencies: ReviewLoopDependencies = {
+            store, github, implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+            bootstrapForExecution: () => bootstrap,
+            resolveRepairExecutionProfile: () => execution as ResolvedExecutionConfiguration,
+            governedPublicationRequired: true,
+            assertCanMutate: validMutation,
+            get assertCurrentMutation() { return verifying && mode === 'missing-mutation' ? undefined : validMutation; },
+            get assertCanPublish() { return verifying && mode === 'missing-publication' ? undefined : validPublication; },
+          };
+          const result = await runReviewLoop(dependencies, id, { maxAttempts: 2, now: () => T0 });
+          assert.equal(verifying, true, 'the actual durable producer reached the targeted verification callback');
+          assert.equal(beforeMutationReached, true);
+          assert.equal(beforePublishReached, mode === 'missing-publication', 'missing mutation admission blocks before the publication callback');
+          assert.equal(authorizedImportEffects, mode === 'missing-publication' ? 1 : 0, 'only the mutation-admitted case reaches the simulated trusted import');
+          assert.equal(publicationEffects, 0, 'no publication effect crosses a missing governed callback');
+          assert.equal(result.outcome, 'needs_human');
+          assert.equal(result.run.state, 'NEEDS_HUMAN');
+          assert.ok(completedRun);
+          assert.deepEqual(persistedJson(result.run.history.slice(0, completedRun.history.length)), completedRun.history, 'conditional parking retains the completed repair history');
+          assert.deepEqual(result.run.telemetry, completedRun.telemetry, 'conditional parking retains completed execution uncertainty and telemetry');
+          assert.deepEqual(result.run.executor, completedRun.executor, 'conditional parking retains executor identity');
+          assert.deepEqual(result.run.execution, completedRun.execution, 'conditional parking retains the exact selected execution profile');
+          assert.deepEqual(result.run.agentResult, completedRun.agentResult, 'conditional parking retains the completed provider result');
+        } finally {
+          rmSync(directory, { recursive: true, force: true });
+          luna.cleanup();
         }
       });
     }

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
@@ -42,6 +43,159 @@ class RemoteIdentityRunner implements ProcessRunner {
 }
 
 describe('GitWorktreeBootstrap', () => {
+  const invalidRemoteUrls = [
+    'http://github.com/acme/widgets.git',
+    'git://github.com/acme/widgets.git',
+    'ssh://git@github.com/acme/widgets.git',
+    'https://user:secret@github.com/acme/widgets.git',
+    'https://github.com.evil.example/acme/widgets.git',
+    'https://github.com:443/acme/widgets.git',
+    'https://github.com/acme/widgets.git/',
+    'https://github.com/acme/widgets.git/extra',
+    'https://github.com/acme%2Fother/widgets.git',
+    'https://github.com/acme/widgets.git?redirect=elsewhere',
+    'https://github.com/acme/widgets.git#fragment',
+    'https://github.com/acme/widgets.git\n',
+    'https://github.com/acme/widgets.git\r',
+    ' https://github.com/acme/widgets.git',
+    'https://github.com/acme/widgets.git ',
+  ];
+
+  function policyRunner() {
+    const calls: string[][] = [];
+    let fetchUrl = 'https://github.com/acme/widgets.git';
+    let pushUrls = ['git@github.com:acme/widgets.git'];
+    let expectedLocalRef: string | null = null;
+    const runner: ProcessRunner = {
+      async run(file, args) {
+        calls.push([...args]);
+        if (args.join(' ') === 'check-ref-format --branch main') return { stdout: 'main\n', stderr: '', exitCode: 0 };
+        if (args.join(' ') === 'remote get-url origin') return { stdout: `${fetchUrl}\n`, stderr: '', exitCode: 0 };
+        if (args.join(' ') === 'remote get-url --all --push origin') return { stdout: `${pushUrls.join('\n')}\n`, stderr: '', exitCode: 0 };
+        if (file === 'git' && expectedLocalRef !== null && args.length === 4 && args[0] === 'show-ref' &&
+          args[1] === '--verify' && args[2] === '--quiet' && args[3] === expectedLocalRef) {
+          return { stdout: '', stderr: '', exitCode: 1 };
+        }
+        if (args[0] === 'ls-remote') return { stdout: args.at(-1) === 'refs/heads/main' ? `${BASE}\trefs/heads/main\n` : '', stderr: '', exitCode: 0 };
+        throw new Error(`unexpected command ${args.join(' ')}`);
+      },
+    };
+    return {
+      calls,
+      runner,
+      setFetch(url: string) { fetchUrl = url; },
+      setPush(urls: string[]) { pushUrls = urls; },
+      setExpectedLocalRef(runId: string, issueNumber: number) {
+        const suffix = createHash('sha256').update(runId).digest('hex').slice(0, 16);
+        expectedLocalRef = `refs/heads/tachiko/issue-${issueNumber}-${suffix}`;
+        return expectedLocalRef;
+      },
+    };
+  }
+
+  function assertExpectedLocalRefProbe(calls: readonly string[][], expectedRef: string): void {
+    assert.equal(calls.some((args) => args.length === 4 && args[0] === 'show-ref' && args[1] === '--verify' &&
+      args[2] === '--quiet' && args[3] === expectedRef), true, `planning probes only the expected local branch ${expectedRef}`);
+  }
+
+  function noRemoteReadOrWorkspaceMutation(calls: readonly string[][], workspacePath: string): void {
+    assert.equal(calls.some((args) => args[0] === 'ls-remote' || args[0] === 'fetch'), false,
+      'invalid remote is rejected before any remote read or import');
+    assert.equal(calls.some((args) => args[0] === 'update-ref' || args[0] === 'worktree' || args[0] === 'merge'), false,
+      'invalid remote is rejected before Git workspace mutation');
+    assert.equal(existsSync(workspacePath), false, 'no implementation worktree is created');
+  }
+
+  it('rejects every unsupported fetch transport and URL variation during initial planning', async () => {
+    for (const invalid of invalidRemoteUrls) {
+      const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-invalid-fetch-'));
+      tempDirs.push(root);
+      const source = path.join(root, 'source');
+      mkdirSync(source);
+      const remote = policyRunner();
+      remote.setFetch(invalid);
+      const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: source, workspaceRoot: path.join(root, 'workspaces'), runner: remote.runner });
+      const request = { runId: 'invalid-initial-remote', target: TARGET, baseBranch: 'main', baseSha: BASE };
+      await assert.rejects(() => bootstrap.plan(request), code(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH), invalid);
+      noRemoteReadOrWorkspaceMutation(remote.calls, path.join(root, 'workspaces', TARGET.owner, TARGET.repo, `${request.runId}-issue-${TARGET.issueNumber}`));
+    }
+  });
+
+  it('plans successfully with supported HTTPS and SCP forms, optional suffixes, and case-insensitive identity', async () => {
+    const accepted = [
+      { fetch: 'https://github.com/acme/widgets', pushes: ['git@github.com:acme/widgets.git'] },
+      { fetch: 'https://github.com/acme/widgets.git', pushes: ['https://github.com/acme/widgets'] },
+      { fetch: 'git@github.com:acme/widgets', pushes: ['https://github.com/acme/widgets.git'] },
+      { fetch: 'git@github.com:AcMe/WIDGETS.GIT', pushes: ['git@github.com:ACME/widgets'] },
+    ];
+    for (const [index, urls] of accepted.entries()) {
+      const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-valid-remote-'));
+      tempDirs.push(root);
+      const source = path.join(root, 'source');
+      mkdirSync(source);
+      const remote = policyRunner();
+      remote.setFetch(urls.fetch);
+      remote.setPush(urls.pushes);
+      const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: source, workspaceRoot: path.join(root, 'workspaces'), runner: remote.runner });
+      const request = { runId: `valid-remote-${index}`, target: TARGET, baseBranch: 'main', baseSha: BASE };
+      const expectedLocalRef = remote.setExpectedLocalRef(request.runId, request.target.issueNumber);
+      const identity = await bootstrap.plan(request);
+      assertExpectedLocalRefProbe(remote.calls, expectedLocalRef);
+      assert.equal(identity.owner, TARGET.owner);
+      assert.equal(identity.repo, TARGET.repo);
+      assert.equal(existsSync(identity.workspacePath), false, 'planning does not create the target worktree');
+      assert.equal(remote.calls.some((args) => args[0] === 'fetch' || args[0] === 'worktree' || args[0] === 'update-ref'), false,
+        'positive planning validates identity without importing or mutating a workspace');
+    }
+  });
+
+  it('revalidates changed fetch and push destinations after plan before remote reads or workspace mutation', async () => {
+    for (const invalid of invalidRemoteUrls) {
+      const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-changed-remote-'));
+      tempDirs.push(root);
+      const source = path.join(root, 'source');
+      mkdirSync(source);
+      const remote = policyRunner();
+      const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: source, workspaceRoot: path.join(root, 'workspaces'), runner: remote.runner });
+      const request = { runId: 'remote-changed-after-plan', target: TARGET, baseBranch: 'main', baseSha: BASE };
+      const expectedLocalRef = remote.setExpectedLocalRef(request.runId, request.target.issueNumber);
+      const identity = await bootstrap.plan(request);
+      assertExpectedLocalRefProbe(remote.calls, expectedLocalRef);
+      remote.calls.length = 0;
+      remote.setFetch(invalid);
+      await assert.rejects(() => bootstrap.prepare({ ...request, existing: identity }), code(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH), `fetch: ${invalid}`);
+      noRemoteReadOrWorkspaceMutation(remote.calls, identity.workspacePath);
+    }
+
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-changed-push-'));
+    tempDirs.push(root);
+    const source = path.join(root, 'source');
+    mkdirSync(source);
+    const remote = policyRunner();
+    const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: source, workspaceRoot: path.join(root, 'workspaces'), runner: remote.runner });
+    const request = { runId: 'extra-push-after-plan', target: TARGET, baseBranch: 'main', baseSha: BASE };
+    const expectedLocalRef = remote.setExpectedLocalRef(request.runId, request.target.issueNumber);
+    const identity = await bootstrap.plan(request);
+    assertExpectedLocalRefProbe(remote.calls, expectedLocalRef);
+    remote.calls.length = 0;
+    remote.setPush(['https://github.com/acme/widgets.git', 'http://github.com/acme/widgets.git']);
+    await assert.rejects(() => bootstrap.prepare({ ...request, existing: identity }), code(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH));
+    noRemoteReadOrWorkspaceMutation(remote.calls, identity.workspacePath);
+  });
+
+  it('rejects a valid first push destination followed by an invalid additional push destination during planning', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-extra-push-'));
+    tempDirs.push(root);
+    const source = path.join(root, 'source');
+    mkdirSync(source);
+    const remote = policyRunner();
+    remote.setPush(['https://github.com/acme/widgets.git', 'git://github.com/acme/widgets.git']);
+    const bootstrap = new GitWorktreeBootstrap({ repositoryRoot: source, workspaceRoot: path.join(root, 'workspaces'), runner: remote.runner });
+    const request = { runId: 'invalid-additional-push', target: TARGET, baseBranch: 'main', baseSha: BASE };
+    await assert.rejects(() => bootstrap.plan(request), code(IMPLEMENTATION_BOOTSTRAP_ERROR_CODE.REPOSITORY_MISMATCH));
+    noRemoteReadOrWorkspaceMutation(remote.calls, path.join(root, 'workspaces', TARGET.owner, TARGET.repo, `${request.runId}-issue-${TARGET.issueNumber}`));
+  });
+
   it('rejects nested ..workspaces but accepts a sibling root with the same ordinary child name', () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-bootstrap-path-'));
     tempDirs.push(root);

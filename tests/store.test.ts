@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
+import type { Run } from '../src/domain/types.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import { isCurrentAccountPathApplicable } from '../src/account-home.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
@@ -32,6 +33,34 @@ function tempStore(): { store: JsonFileStore; dir: string } {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-'));
   tmpDirs.push(dir);
   return { store: new JsonFileStore({ dir }), dir };
+}
+
+function reverseObjectKeyOrder(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reverseObjectKeyOrder);
+  if (typeof value !== 'object' || value === null) return value;
+  const reversed = Object.fromEntries(Object.keys(value).sort().reverse().map((key) => [key, reverseObjectKeyOrder((value as Record<string, unknown>)[key])]));
+  return reversed;
+}
+
+function casFixture(id: string): Run {
+  const run = {
+    ...newRun(id),
+    state: 'NEEDS_HUMAN' as const,
+    interruptedFrom: 'REVIEWING' as const,
+  };
+  Object.defineProperty(run, 'futureUnknown', {
+    configurable: true,
+    enumerable: true,
+    value: { metadata: { second: 2, first: 1 }, ordered: ['first', 'second'] },
+    writable: true,
+  });
+  Object.defineProperty(run, '__proto__', {
+    configurable: true,
+    enumerable: true,
+    value: { readerAcceptedFutureField: true },
+    writable: true,
+  });
+  return run as Run;
 }
 
 afterEach(() => {
@@ -859,6 +888,95 @@ describe('JsonFileStore — persistence round-trips', () => {
     const expected = staleTelemetryLikeWrite;
     assert.equal(waitWriter.updateIfUnchanged(expected, { ...expected, headSha: 'stale-head' }), false);
     assert.equal(new JsonFileStore({ dir }).read(initial.id)?.state, 'IMPLEMENTING');
+  });
+
+  it('rejects stale JSON-file CAS for previously omitted and reader-accepted unknown persisted fields', () => {
+    const cases: Array<[string, (run: Run) => Run]> = [
+      ['target', (run) => ({ ...run, target: { ...run.target, repo: `${run.target.repo}-newer` } })],
+      ['createdAt', (run) => ({ ...run, createdAt: '2026-09-27T00:00:01.000Z' })],
+      ['dispatchClaimId', (run) => ({ ...run, dispatchClaimId: 'newer-dispatch-claim' })],
+      ['execution', (run) => ({ ...run, execution: { profile: 'routine', revision: 'cas-v1', executor: 'claude-code', timeoutMs: 30_000 } })],
+      ['interruptedFrom', (run) => ({ ...run, interruptedFrom: 'IMPLEMENTING' })],
+      ['bootstrap', (run) => ({ ...run, bootstrap: {
+        bootstrapKind: 'linked-worktree', owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+        baseBranch: 'main', baseSha: 'b'.repeat(40), branch: `tachiko/${run.id}`, workspacePath: `/tmp/${run.id}`,
+      } })],
+      ['reader-accepted unknown field', (run) => ({ ...run, futureUnknown: { changed: true } } as Run)],
+      ['reader-accepted unknown array order', (run) => ({ ...run, futureUnknown: { ...(run as Run & { futureUnknown: { ordered: string[] } }).futureUnknown, ordered: ['second', 'first'] } } as Run)],
+      ['reader-accepted own __proto__ property', (run) => {
+        const changed = { ...run };
+        Object.defineProperty(changed, '__proto__', {
+          configurable: true,
+          enumerable: true,
+          value: { readerAcceptedFutureField: 'changed' },
+          writable: true,
+        });
+        return changed as Run;
+      }],
+    ];
+
+    for (const [field, mutate] of cases) {
+      for (const proposal of ['expected', 'next'] as const) {
+        const { store, dir } = tempStore();
+        const expected = casFixture(`full-json-cas-${field.replaceAll(/[^a-z0-9]+/gi, '-')}-${proposal}`);
+        store.create(expected);
+        const newer = mutate(expected);
+        store.update(newer);
+        const readerResult = store.read(expected.id);
+        assert.deepEqual(readerResult, newer, `${field} fixture is accepted by the production reader`);
+        if (field === 'reader-accepted own __proto__ property') {
+          assert.ok(readerResult);
+          assert.equal(Object.prototype.hasOwnProperty.call(readerResult, '__proto__'), true,
+            'the production reader retains __proto__ as an own persisted key');
+          assert.deepEqual((readerResult as unknown as Record<string, unknown>)['__proto__'],
+            { readerAcceptedFutureField: 'changed' }, 'the production reader exposes its changed persisted value');
+        }
+
+        const runPath = path.join(dir, `${expected.id}.json`);
+        const projectionPath = operationalProjectionPath(dir, expected.id);
+        const newerRunBytes = readFileSync(runPath, 'utf8');
+        const newerProjectionBytes = readFileSync(projectionPath, 'utf8');
+        const staleNext = proposal === 'expected'
+          ? expected
+          : { ...expected, updatedAt: '2026-09-27T00:00:02.000Z' };
+
+        assert.equal(store.updateIfUnchanged(expected, staleNext), false,
+          `${field} makes the ${proposal === 'expected' ? 'stale no-op' : 'stale transition'} CAS fail`);
+        assert.equal(readFileSync(runPath, 'utf8'), newerRunBytes, `${field} newer Run bytes survive`);
+        assert.equal(readFileSync(projectionPath, 'utf8'), newerProjectionBytes, `${field} newer projection bytes survive`);
+      }
+    }
+  });
+
+  it('uses persisted JSON semantics for unchanged, key-reordered, undefined, and legacy-normalized snapshots', () => {
+    const { store, dir } = tempStore();
+    const initial = casFixture('full-json-cas-json-semantics');
+    store.create(initial);
+    assert.equal(store.updateIfUnchanged(initial, initial), true, 'unchanged complete Run snapshots compare equal');
+
+    const runPath = path.join(dir, `${initial.id}.json`);
+    const parsed = JSON.parse(readFileSync(runPath, 'utf8')) as unknown;
+    writeFileSync(runPath, `${JSON.stringify(reverseObjectKeyOrder(parsed), null, 2)}\n`, 'utf8');
+    assert.equal(store.updateIfUnchanged(initial, initial), true, 'object-key order is irrelevant to the durable snapshot');
+
+    const undefinedExpected = { ...initial, futureUndefined: undefined } as Run;
+    assert.equal(store.updateIfUnchanged(undefinedExpected, initial), true, 'undefined object properties are omitted by persistence semantics');
+
+    const legacyStore = tempStore();
+    const legacyBootstrap = {
+      owner: TARGET.owner,
+      repo: TARGET.repo,
+      issueNumber: TARGET.issueNumber,
+      baseBranch: 'main',
+      baseSha: 'a'.repeat(40),
+      branch: 'tachiko/full-json-cas-legacy-normalized',
+      workspacePath: '/tmp/full-json-cas-legacy-normalized',
+    } as unknown as NonNullable<Run['bootstrap']>;
+    delete (legacyBootstrap as { bootstrapKind?: string }).bootstrapKind;
+    const legacy = { ...initial, id: 'full-json-cas-legacy-normalized', bootstrap: legacyBootstrap } as Run;
+    legacyStore.store.create(legacy);
+    assert.equal(legacyStore.store.read(legacy.id)?.bootstrap?.bootstrapKind, 'linked-worktree', 'the production reader applies legacy bootstrap normalization');
+    assert.equal(legacyStore.store.updateIfUnchanged(legacy, legacy), true, 'legacy expected values compare after the reader’s normalization');
   });
 
   it('persists updates across store instances (simulated restart)', () => {

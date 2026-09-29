@@ -417,23 +417,30 @@ function readRun(filePath: string, id: string): Run {
  */
 function runFingerprint(run: Run | null): string {
   if (run === null) return 'absent';
-  return JSON.stringify({
-    state: run.state,
-    updatedAt: run.updatedAt,
-    headSha: run.headSha ?? null,
-    history: run.history,
-    agentResult: run.agentResult ?? null,
-    reviewResult: run.reviewResult ?? null,
-    validationResult: run.validationResult ?? null,
-    pullRequest: run.pullRequest ?? null,
-    executor: run.executor ?? null,
-    interrupt: run.interrupt ?? null,
-    // Telemetry can change on its own without touching `updatedAt`, so a
-    // concurrent telemetry append must invalidate the comparison too.
-    telemetry: run.telemetry ?? null,
-    repairTaskShapeAuthority: run.repairTaskShapeAuthority ?? null,
-    repairAdmissions: run.repairAdmissions ?? null,
-  });
+  // Compare what the durable JSON reader observes, rather than a selected set
+  // of currently-known Run fields. JSON round-tripping gives undefined object
+  // properties the same omission semantics as persistence, while preserving
+  // array order and every reader-accepted unknown field.
+  const persisted = JSON.parse(JSON.stringify(run)) as unknown;
+  const durable = persisted as Run;
+  const normalized = durable.bootstrap?.bootstrapKind === undefined
+    ? { ...durable, ...(durable.bootstrap === undefined ? {} : {
+      bootstrap: { ...durable.bootstrap, bootstrapKind: 'linked-worktree' as const },
+    }) }
+    : durable;
+
+  const canonicalJson = (value: unknown): string => {
+    if (Array.isArray(value)) return `[${value.map((entry) => canonicalJson(entry)).join(',')}]`;
+    if (typeof value === 'object' && value !== null) {
+      const record = value as Record<string, unknown>;
+      const fields = Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(record[key])}`);
+      return `{${fields.join(',')}}`;
+    }
+    // Values are already JSON-round-tripped, so this serializes a JSON scalar.
+    return JSON.stringify(value);
+  };
+
+  return canonicalJson(normalized);
 }
 
 /** Repair admissions are an audit ledger, never mutable workflow scratch data. */

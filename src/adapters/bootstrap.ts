@@ -28,6 +28,8 @@ export interface VerifyDurableRequest {
   readonly workspaceGuard?: WorkspaceGuard;
   /** Existing authoritative PR recovery, not a newly produced worker result. */
   readonly adoptExistingHead?: boolean;
+  /** Synchronous host-owned fence immediately before every trusted-host mutation. */
+  readonly beforeMutation?: () => void;
   /** Synchronous host-owned fence called immediately before a publication push. */
   readonly beforePublish?: () => void;
 }
