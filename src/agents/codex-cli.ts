@@ -1,6 +1,8 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
   assertWorkspaceGuard,
+  governedPublicationRefusal,
+  isExecutionAdmissionRefusal,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -112,6 +114,8 @@ export class CodexCliAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) return publicationRefusal;
     const executor = request.executor;
     if (executor !== undefined && !isUsableCodexExecutor(executor)) {
       return failureAgentResult(
@@ -144,9 +148,10 @@ export class CodexCliAdapter implements ImplementationAgent {
       result = await this.runner.run(
         'codex',
         this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort),
-        this.processOptions(request.signal, cwd),
+        this.processOptions(request.signal, cwd, request.beforeExecution),
       );
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
       if (isAborted(request.signal) || code === 'ABORT_ERR') return cancelledAgentResult(durationMs, executor);
@@ -258,10 +263,10 @@ export class CodexCliAdapter implements ImplementationAgent {
     return args;
   }
 
-  private processOptions(signal: AbortSignal | undefined, cwd = this.cwd): ProcessRunOptions {
+  private processOptions(signal: AbortSignal | undefined, cwd = this.cwd, beforeSpawn?: () => void): ProcessRunOptions {
     return signal === undefined
-      ? { timeoutMs: this.timeoutMs, cwd, ...(this.env === undefined ? {} : { env: this.env }) }
-      : { timeoutMs: this.timeoutMs, cwd, signal, ...(this.env === undefined ? {} : { env: this.env }) };
+      ? { timeoutMs: this.timeoutMs, cwd, ...(this.env === undefined ? {} : { env: this.env }), ...(beforeSpawn === undefined ? {} : { beforeSpawn }) }
+      : { timeoutMs: this.timeoutMs, cwd, signal, ...(this.env === undefined ? {} : { env: this.env }), ...(beforeSpawn === undefined ? {} : { beforeSpawn }) };
   }
 
   /**
@@ -290,6 +295,16 @@ export class CodexCliAdapter implements ImplementationAgent {
       return null;
     }
   }
+}
+
+const ORIGINAL_CODEX_CLI_RUN = CodexCliAdapter.prototype.run;
+
+/** Read-only origin check for Luna's privately confined nested CLI adapter. */
+export function hasOriginalCodexCliRun(adapter: object): boolean {
+  if (!(adapter instanceof CodexCliAdapter) || Object.getPrototypeOf(adapter) !== CodexCliAdapter.prototype ||
+      Object.getOwnPropertyDescriptor(adapter, 'run') !== undefined) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(CodexCliAdapter.prototype, 'run');
+  return descriptor !== undefined && 'value' in descriptor && descriptor.value === ORIGINAL_CODEX_CLI_RUN;
 }
 
 function buildPrompt(request: ImplementationRequest): string {

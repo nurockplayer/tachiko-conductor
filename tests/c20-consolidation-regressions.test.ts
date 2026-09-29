@@ -79,6 +79,11 @@ class RecordingJsonStore implements RunStore {
   create(run: Run): void { this.store.create(run); }
   read(id: string): Run | null { return this.store.read(id); }
   update(run: Run): void { this.updates.push(run); this.store.update(run); }
+  updateIfUnchanged(expected: Run, next: Run): boolean {
+    if (!this.store.updateIfUnchanged(expected, next)) return false;
+    this.updates.push(next);
+    return true;
+  }
   list(): Run[] { return this.store.list(); }
   delete(id: string): void { this.store.delete(id); }
 }
@@ -93,7 +98,7 @@ function validationRepairRun(id: string): Run {
   run = applyTransition(run, { type: 'start' }, T0);
   run = applyTransition(run, {
     type: 'agent_succeeded', headSha: HEAD,
-    agentResult: { ...successResult(HEAD), sessionId: 'validation-session', executor: { provider: 'codex-cli', sessionId: 'validation-thread' } },
+    agentResult: { ...successResult(HEAD), sessionId: 'validation-session', executor: { provider: 'codex-cli', sessionId: 'validation-session' } },
     pullRequest: { number: 7, headSha: HEAD },
   }, T0);
   run = applyTransition(run, {
@@ -202,7 +207,7 @@ describe('C20 consolidation regressions', () => {
     assert.match(implementation.requests[0]?.instructions ?? '', /Exact-HEAD validation failed/);
     assert.doesNotMatch(implementation.requests[0]?.instructions ?? '', /Original issue instructions/);
     assert.equal(implementation.requests[0]?.sessionId, 'validation-session');
-    assert.deepEqual(implementation.requests[0]?.executor, { provider: 'codex-cli', sessionId: 'validation-thread' });
+    assert.deepEqual(implementation.requests[0]?.executor, { provider: 'codex-cli', sessionId: 'validation-session' });
     const persisted = new JsonFileStore({ dir }).read('validation-restart');
     assert.equal(persisted?.history.filter((entry) => entry.type === 'start_fix').length, 1);
     assert.deepEqual(persisted?.pullRequest, { number: 7, headSha: NEXT_HEAD });
