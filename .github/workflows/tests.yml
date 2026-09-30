@@ -23,6 +23,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Prepare Git for isolated local test fixtures
+        run: |
+          git config --global user.name "Tachiko CI"
+          git config --global user.email "tachiko-ci@example.invalid"
+          git switch --create ci-validation
+
       - uses: actions/setup-node@v7
         with:
           node-version: 24.19.0
