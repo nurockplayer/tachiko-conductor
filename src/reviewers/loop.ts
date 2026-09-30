@@ -32,6 +32,7 @@ import type { RunStore } from '../store/json-file-store.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUEST_DECISION } from '../domain/decisions.js';
 import { createBootstrapFailureRun } from '../workflow/bootstrap-failure.js';
 import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
+import { acceptedScopeFromHandoff, buildImplementationPacket, preflightImplementationPacket, type ImplementationPacket, type ImplementationPacketInput } from '../agents/implementation-packet.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
@@ -89,6 +90,82 @@ function renderBlockingFindings(review: ReviewResult): string {
     .filter((finding) => finding.severity === 'blocking')
     .map((finding, index) => `${index + 1}. [${finding.severity}] ${finding.summary}${finding.detail === undefined ? '' : ` — ${finding.detail}`}`)
     .join('\n');
+}
+
+function lunaRepairPacketInput(
+  run: Run,
+  target: Target,
+  snapshot: GitHubLiveSnapshot,
+  execution: ResolvedExecutionConfiguration | undefined,
+  validationFailure: boolean,
+  pendingReview: ReviewResult | undefined,
+): ImplementationPacketInput {
+  const validValidation = isValidationResultCoherent(run.validationResult) &&
+    run.validationResult.status === 'failed' && run.validationResult.headSha === run.headSha &&
+    run.validationResult.hosted.pullRequestNumber === snapshot.pullRequest?.number
+    ? run.validationResult
+    : undefined;
+  const validReview = pendingReview?.verdict === 'request_changes' && pendingReview.headSha === run.headSha
+    ? pendingReview
+    : undefined;
+  const validationRepair = validationFailure && validReview === undefined;
+  const kind = validationRepair ? 'validation-repair' : 'review-repair';
+  const pullRequestNumber = snapshot.pullRequest?.number ?? 0;
+  return {
+    kind,
+    identity: {
+      runId: run.id,
+      target,
+      workspacePath: run.bootstrap?.workspacePath ?? '',
+      branch: run.bootstrap?.branch ?? '',
+      baseSha: run.headSha ?? '',
+      execution: {
+        profile: execution?.profile ?? '',
+        revision: execution?.revision ?? '',
+        executor: execution?.executor ?? '',
+        timeoutMs: execution?.timeoutMs ?? 0,
+        ...(execution?.model === undefined ? {} : { model: execution.model }),
+        ...(execution?.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+        ...(execution?.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+        ...(execution?.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+      },
+    },
+    authority: {
+      repository: { owner: snapshot.repository.owner, repo: snapshot.repository.repo },
+      issue: {
+        id: snapshot.issue.id,
+        number: snapshot.issue.number,
+        updatedAt: snapshot.issue.updatedAt,
+        title: snapshot.issue.title,
+        body: snapshot.issue.body,
+      },
+      acceptedScope: acceptedScopeFromHandoff(snapshot.handoff, snapshot.problems) ?? {
+        sourceId: '', sourceScope: 'issue', sourceUpdatedAt: '', freshness: 'current', text: '',
+      },
+    },
+    repair: {
+      headSha: run.headSha ?? '',
+      pullRequestNumber,
+      evidenceRef: validationRepair
+        ? `run:${run.id}:validation:${run.headSha ?? ''}`
+        : `run:${run.id}:review:${run.headSha ?? ''}`,
+      evidence: validationRepair
+        ? JSON.stringify(validValidation) ?? ''
+        : JSON.stringify({ verdict: validReview?.verdict, headSha: validReview?.headSha, pullRequestNumber }),
+      evidenceKind: validationRepair ? 'validation' : 'review',
+      evidenceHeadSha: validationRepair ? validValidation?.headSha ?? '' : validReview?.headSha ?? '',
+      evidencePullRequestNumber: validationRepair
+        ? validValidation?.hosted.pullRequestNumber ?? 0
+        : pullRequestNumber,
+      evidenceStatus: validationRepair
+        ? validValidation?.status === 'failed' ? 'failed' : 'request_changes'
+        : validReview?.verdict === 'request_changes' ? 'request_changes' : 'failed',
+      blockingFindings: validationRepair
+        ? []
+        : (validReview?.findings ?? []).filter((finding) => finding.severity === 'blocking')
+          .map((finding) => `[blocking] ${finding.summary}${finding.detail === undefined ? '' : ` — ${finding.detail}`}`),
+    },
+  };
 }
 
 /**
@@ -529,6 +606,12 @@ export async function runReviewLoop(
         const finding: RepairFindingKind = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
           ? 'validation_failed'
           : 'review_blocking';
+        if (repairExecution?.executor === 'luna-isolated' && repairSnapshot !== undefined) {
+          const preflightPacket = preflightImplementationPacket(lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview));
+          if (preflightPacket.kind === 'refusal') {
+            return parkRepairAuthority(run, preflightPacket.reason, store, now, [CANCEL_RUN_DECISION]);
+          }
+        }
         const admission = { ...createRepairAdmissionSnapshot(
           authority, finding, run.headSha, run.pullRequest.number, repairExecution, now(),
         ), attemptBinding };
@@ -551,6 +634,12 @@ export async function runReviewLoop(
         repairStartsWithFreshExecutor = repairAttempt.snapshot.attemptBinding?.freshExecutor === true && repairAttempt.handoff === undefined;
       }
       if (authority === undefined) {
+        if (repairExecution?.executor === 'luna-isolated' && repairSnapshot !== undefined) {
+          const preflightPacket = preflightImplementationPacket(lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview));
+          if (preflightPacket.kind === 'refusal') {
+            return parkRepairAuthority(run, preflightPacket.reason, store, now, [CANCEL_RUN_DECISION]);
+          }
+        }
         const startedFix = applyTransition(run, { type: 'start_fix' }, now());
         if (!updateReviewRun(store, run, startedFix)) return staleReviewOutcome(run.id, run, store);
         run = startedFix;
@@ -570,6 +659,7 @@ export async function runReviewLoop(
       const repairInstructions = isolatedLuna
         ? `Task title: ${repairSnapshot!.issue.title}\n\nTask requirements:\n${repairSnapshot!.issue.body}\n\nRepair requirements:\n${blockingFindings}\n\nIsolated Luna contract: implement only the host-bounded task and repair; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.`
         : blockingFindings;
+      let implementationPacket: ImplementationPacket | undefined;
       if (run.bootstrap?.bootstrapKind === 'standalone-isolated' && !isolatedLuna) {
         return parkBootstrap(run, new Error('A standalone Luna workspace cannot transition to a non-Luna repair transport.'), store, now);
       }
@@ -634,6 +724,26 @@ export async function runReviewLoop(
         }
         const recovered = await checkOwnedFix();
         if (recovered !== null) return recovered;
+      }
+      if (isolatedLuna) {
+        const packetInput = repairSnapshot === undefined
+          ? null
+          : lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview);
+        const packet = packetInput === null
+          ? { kind: 'refusal' as const, reason: 'Isolated Luna repair lost its fresh bounded Issue packet.', code: 'PACKET_AUTHORITY_MISSING' as const }
+          : buildImplementationPacket({
+            ...packetInput,
+            identity: {
+              ...packetInput.identity,
+              workspacePath: run.bootstrap?.workspacePath ?? '',
+              branch: run.bootstrap?.branch ?? '',
+              baseSha: progressBaseSha ?? '',
+            },
+          });
+        if (packet.kind === 'refusal') {
+          return parkRepairAuthority(run, packet.reason, store, now, [CANCEL_RUN_DECISION]);
+        }
+        implementationPacket = packet.packet;
       }
       let governedRepairAgent: ImplementationAgent | undefined;
       if (deps.governedPublicationRequired === true) {
@@ -761,7 +871,9 @@ export async function runReviewLoop(
       let fixResult;
       try {
         fixResult = await (governedRepairAgent ?? implementation).run({
-          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target', instructions: repairInstructions,
+          target, baseSha: progressBaseSha ?? '', authority: isolatedLuna ? 'embedded' : 'live-target',
+          instructions: implementationPacket?.rendered ?? repairInstructions,
+          ...(implementationPacket === undefined ? {} : { packet: implementationPacket }),
           ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           ...(capabilities === undefined ? {} : { capabilities }),

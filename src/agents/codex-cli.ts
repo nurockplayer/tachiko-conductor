@@ -30,6 +30,7 @@ import {
   tokenUsageFromProviderValue,
   toolResultBytesFromItem,
 } from './provider-telemetry.js';
+import { IMPLEMENTATION_PACKET_LIMITS, renderFinalCliPacket } from './implementation-packet.js';
 import {
   NodeProcessRunner,
   type ProcessResult,
@@ -51,6 +52,7 @@ export const CODEX_ERROR_CODE = {
   RESUME_IDENTITY_INVALID: 'CODEX_RESUME_IDENTITY_INVALID',
   RESUME_IDENTITY_MISMATCH: 'CODEX_RESUME_IDENTITY_MISMATCH',
   HEAD_READ_FAILED: 'HEAD_READ_FAILED',
+  PACKET_REFUSED: 'CODEX_PACKET_REFUSED',
 } as const;
 
 export type CodexErrorCode = (typeof CODEX_ERROR_CODE)[keyof typeof CODEX_ERROR_CODE];
@@ -124,6 +126,10 @@ export class CodexCliAdapter implements ImplementationAgent {
         0,
         executor,
       );
+    }
+    const packetRefusal = implementationPacketRefusal(request);
+    if (packetRefusal !== undefined) {
+      return failureAgentResult(CODEX_ERROR_CODE.PACKET_REFUSED, packetRefusal, 0, executor);
     }
     // Normalize and validate the exact model/effort pair before any Codex
     // process exists, so an unsupported configuration starts zero model turns.
@@ -308,6 +314,7 @@ export function hasOriginalCodexCliRun(adapter: object): boolean {
 }
 
 function buildPrompt(request: ImplementationRequest): string {
+  if (request.packet !== undefined) return request.packet.finalCliText;
   const instructions = request.authority === 'live-target'
     ? request.supplementalInstructions
     : request.instructions;
@@ -330,6 +337,37 @@ function buildPrompt(request: ImplementationRequest): string {
     );
   }
   return lines.join('\n');
+}
+
+function implementationPacketRefusal(request: ImplementationRequest): string | undefined {
+  const packet = request.packet;
+  if (packet === undefined) return undefined;
+  const rendered = renderFinalCliPacket(packet);
+  if (rendered.kind === 'refusal') return rendered.reason;
+  const target = formatTarget(request.target);
+  const packetTarget = formatTarget(packet.identity.target);
+  const expectedFinal = [
+    `Implement ${target} from base ${request.baseSha}.`,
+    'Treat the supplied bounded task packet as the only target authority; do not use network or MCP to rediscover it.',
+    'Run repository-required validation before reporting success.',
+    packet.rendered,
+  ].join('\n');
+  const execution = request.execution;
+  const packetExecution = packet.identity.execution;
+  if (request.authority !== 'embedded' || request.instructions !== packet.rendered ||
+      packet.version !== 'tachiko.implementation-packet.v1' || (request.capabilities?.length ?? 0) !== 0 ||
+      request.supplementalInstructions !== undefined || request.sessionId !== undefined || request.executor !== undefined ||
+      packetTarget !== target || packet.identity.baseSha !== request.baseSha ||
+      packet.identity.workspacePath !== request.workspacePath || packet.identity.branch !== request.branch ||
+      request.runtimeOwnership?.runId !== packet.identity.runId || execution === undefined ||
+      execution.profile !== packetExecution.profile || execution.revision !== packetExecution.revision ||
+      execution.executor !== packetExecution.executor || execution.model !== packetExecution.model ||
+      execution.reasoningEffort !== packetExecution.reasoningEffort || execution.timeoutMs !== packetExecution.timeoutMs ||
+      execution.sandboxMode !== packetExecution.sandboxMode || execution.approvalPolicy !== packetExecution.approvalPolicy ||
+      packet.finalCliText !== expectedFinal || Buffer.byteLength(expectedFinal, 'utf8') > IMPLEMENTATION_PACKET_LIMITS.finalCliBytes) {
+    return 'PACKET_IDENTITY_MISMATCH: final CLI packet does not match its exact target, base, workspace, branch, or rendered content. No model turn or publication is authorized.';
+  }
+  return undefined;
 }
 
 function formatTarget(target: Target): string {

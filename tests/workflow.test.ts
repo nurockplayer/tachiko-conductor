@@ -88,7 +88,8 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
     checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
     conversations: [],
-    handoff: null,
+    handoff: { sourceId: 'IC_test-scope', sourceScope: 'issue', sourceUpdatedAt: T0,
+      sections: { 'Accepted scope': 'Test scope for isolated worker tests.' }, freshness: 'current' },
     problems: [],
     observedAt: T0,
   };
@@ -2639,8 +2640,10 @@ describe('runWorkflow', { concurrency: false }, () => {
     );
     assert.equal(resolved, 0);
     assert.equal(implementation.requests[0]?.capabilities, undefined);
-    assert.equal(implementation.requests[0]?.instructions,
-      'Task title: Fix the widget\n\nTask requirements:\nDoR-ready.\n\nIsolated Luna contract: implement only the host-bounded task and its tests; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.');
+    assert.match(implementation.requests[0]?.instructions ?? '', /Packet: tachiko\.implementation-packet\.v1/);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Accepted scope and instructions:\nTest scope for isolated worker tests\./);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Issue requirements:\nDoR-ready\./);
+    assert.equal(implementation.requests[0]?.packet?.kind, 'initial');
     assert.doesNotMatch(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
     assert.equal(implementation.requests[0]?.supplementalInstructions, undefined);
   });
@@ -2978,8 +2981,9 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.deepEqual((prepared[0] as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
     assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
     assert.match(implementation.requests[0]?.instructions ?? '', /Task title: Fix the widget/);
-    assert.match(implementation.requests[0]?.instructions ?? '', /Task requirements:\nDoR-ready\./);
-    assert.match(implementation.requests[0]?.instructions ?? '', /Repair requirements:\n1\. \[blocking\] the diff has a bug/);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Issue requirements:\nDoR-ready\./);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Blocking findings:\n1\. \[blocking\] the diff has a bug/);
+    assert.equal(implementation.requests[0]?.packet?.kind, 'review-repair');
     assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
   });
 

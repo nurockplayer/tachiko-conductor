@@ -720,7 +720,8 @@ describe('workflow run and resume commands', () => {
       checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
       reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
       conversations: [],
-      handoff: null,
+      handoff: { sourceId: 'IC_cli-accepted-scope', sourceScope: 'issue', sourceUpdatedAt: T0,
+        sections: { 'Accepted #48-A scope': 'Test accepted implementation scope.' }, freshness: 'current' },
       problems: [],
       observedAt: T0,
     };

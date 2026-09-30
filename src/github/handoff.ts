@@ -105,7 +105,17 @@ export function parseAgentHandoffs(
       });
       continue;
     }
-    const sections = parseSections(entry.body.slice(entry.body.indexOf(HANDOFF_MARKER) + HANDOFF_MARKER.length));
+    const markedBody = entry.body.slice(entry.body.indexOf(HANDOFF_MARKER) + HANDOFF_MARKER.length);
+    const headings = [...markedBody.matchAll(/^##\s+(.+?)\s*$/gm)].map((match) => match[1]?.trim().toLowerCase()).filter((name): name is string => name !== undefined);
+    if (new Set(headings).size !== headings.length) {
+      problems.push({
+        code: 'AMBIGUOUS_HANDOFF',
+        message: `Comment ${entry.id} contains duplicate level-two handoff sections; refusing to overwrite authority sections.`,
+        sourceId: entry.id,
+      });
+      continue;
+    }
+    const sections = parseSections(markedBody);
     if (Object.keys(sections).length === 0 || Object.values(sections).every((value) => value === '')) {
       malformed.push(entry);
       problems.push(malformedProblem(entry));
