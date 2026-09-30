@@ -1,6 +1,7 @@
 import type { AgentResult, ExecutorIdentity, Target } from '../domain/types.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import { hasGovernedPublicationConfinement } from '../agents/luna-isolated.js';
+import type { ImplementationPacket } from '../agents/implementation-packet.js';
 
 export const HUMAN_TAKEOVER_DIAGNOSTIC = 'TACHIKO_NEEDS_HUMAN:';
 export const GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED = 'GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED' as const;
@@ -120,6 +121,8 @@ export interface ImplementationRequest {
   /** Whether the executor should read target authority live instead of from copied prose. */
   readonly authority?: 'embedded' | 'live-target';
   readonly instructions?: string;
+  /** Versioned source-owned bounded task authority for isolated implementation workers. */
+  readonly packet?: ImplementationPacket;
   /** Small Conductor/review instructions that remain relevant with live authority. */
   readonly supplementalInstructions?: string;
   /** Per-invocation capabilities; never persisted in Conductor run state. */

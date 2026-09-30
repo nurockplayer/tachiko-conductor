@@ -9,6 +9,7 @@ import { ExecutionAdmissionRefusal, isExecutionAdmissionRefusal, WorkspaceGuardF
 import type { ImplementationBootstrapAdapter, VerifyDurableRequest } from '../src/adapters/bootstrap.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import { LiveGitHubAdapter } from '../src/github/live-state.js';
+import { parseAgentHandoffs } from '../src/github/handoff.js';
 import type { GitHubApiTransport } from '../src/github/transport.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import type { ValidationAdapter, ValidationRequest } from '../src/adapters/validation.js';
@@ -88,7 +89,8 @@ function snapshot(headSha: string, baseSha = 'base'): GitHubLiveSnapshot {
     checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: T0 }] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
     conversations: [],
-    handoff: null,
+    handoff: { sourceId: 'IC_test-scope', sourceScope: 'issue', sourceUpdatedAt: T0,
+      sections: { 'Accepted scope': 'Test scope for isolated worker tests.' }, freshness: 'current' },
     problems: [],
     observedAt: T0,
   };
@@ -2613,6 +2615,71 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.match(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
   });
 
+  it('refuses conflicting parsed identity claims before Luna bootstrap, model, or PR publication', async () => {
+    const claimedHeadA = '1111111111111111111111111111111111111111';
+    const claimedHeadB = '2222222222222222222222222222222222222222';
+    const entry = {
+      id: 'comment-conflicting-identity',
+      scope: 'issue' as const,
+      kind: 'comment' as const,
+      author: 'steward',
+      body: `<!-- agent-handoff:v1 -->\n\n## Accepted #48-A scope\n\nOnly the bounded packet builder slice.\n\n## Branch / PR\n\nHEAD: \`${claimedHeadA}\`\nOther candidate: \`${claimedHeadB}\`\nPR: #7\nPrevious PR: #8`,
+      createdAt: T0,
+      updatedAt: T0,
+      url: 'https://github.test/issues/42#comment-conflicting-identity',
+    };
+    const parsed = parseAgentHandoffs([entry], { headSha: null, pullRequestNumber: null });
+    const live: GitHubLiveSnapshot = {
+      ...snapshot(HEAD),
+      pullRequest: null,
+      headSha: null,
+      conversations: [entry],
+      handoff: parsed.handoff,
+      problems: parsed.problems,
+    };
+    const store = new MemoryStore();
+    const execution = { profile: 'routine' as const, revision: 'luna-test', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 1, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+    store.create(createRun(TARGET, T0, 'ambiguous-handoff-initial', execution));
+
+    class CountingBootstrap extends FakeBootstrap {
+      planCalls = 0;
+      prepareCalls = 0;
+      override async plan() { this.planCalls += 1; return this.identity; }
+      override async prepare(..._args: unknown[]) { this.prepareCalls += 1; return this.identity; }
+    }
+    const bootstrap = new CountingBootstrap();
+    const implementation = new FakeImplementation([successResult(HEAD)]);
+    let publications = 0;
+    const github: GitHubAdapter = {
+      ...githubAdapter([null]),
+      async readLiveSnapshot() { return live; },
+      async createImplementationPullRequest() { publications += 1; return { number: 8 }; },
+    };
+
+    const result = await runWorkflow(
+      { store, github, implementation, reviewer: new FakeReviewer([]), bootstrapForExecution: () => bootstrap },
+      'ambiguous-handoff-initial',
+      { maxReviewAttempts: 1, now: () => T0 },
+    );
+
+    const observedSideEffects = {
+      bootstrapPlan: bootstrap.planCalls,
+      bootstrapPrepare: bootstrap.prepareCalls,
+      governedPreflight: implementation.preflightRequests.length,
+      modelTurn: implementation.requests.length,
+      publication: publications,
+    };
+    assert.deepEqual(observedSideEffects, {
+      bootstrapPlan: 0,
+      bootstrapPrepare: 0,
+      governedPreflight: 0,
+      modelTurn: 0,
+      publication: 0,
+    }, `conflicting identity must refuse before effects; outcome=${result.outcome}; reason=${'reason' in result ? result.reason : ''}`);
+    assert.equal(result.outcome, 'needs_human');
+    assert.match('reason' in result ? result.reason : '', /PACKET_AUTHORITY_MISSING/);
+  });
+
   it('binds an existing Luna PR head as recovery authority before standalone prepare', async () => {
     class RecordingBootstrap extends FakeBootstrap {
       prepareRequest: unknown;
@@ -2639,8 +2706,10 @@ describe('runWorkflow', { concurrency: false }, () => {
     );
     assert.equal(resolved, 0);
     assert.equal(implementation.requests[0]?.capabilities, undefined);
-    assert.equal(implementation.requests[0]?.instructions,
-      'Task title: Fix the widget\n\nTask requirements:\nDoR-ready.\n\nIsolated Luna contract: implement only the host-bounded task and its tests; run the required tests; commit one clean exact HEAD. Do not push and do not create or associate a pull request; the trusted host owns publication and pull-request actions.');
+    assert.match(implementation.requests[0]?.instructions ?? '', /Packet: tachiko\.implementation-packet\.v1/);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Accepted scope and instructions:\nTest scope for isolated worker tests\./);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Issue requirements:\nDoR-ready\./);
+    assert.equal(implementation.requests[0]?.packet?.kind, 'initial');
     assert.doesNotMatch(implementation.requests[0]?.instructions ?? '', /create and associate an open implementation pull request/);
     assert.equal(implementation.requests[0]?.supplementalInstructions, undefined);
   });
@@ -2978,8 +3047,9 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.deepEqual((prepared[0] as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
     assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
     assert.match(implementation.requests[0]?.instructions ?? '', /Task title: Fix the widget/);
-    assert.match(implementation.requests[0]?.instructions ?? '', /Task requirements:\nDoR-ready\./);
-    assert.match(implementation.requests[0]?.instructions ?? '', /Repair requirements:\n1\. \[blocking\] the diff has a bug/);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Issue requirements:\nDoR-ready\./);
+    assert.match(implementation.requests[0]?.instructions ?? '', /Blocking findings:\n1\. \[blocking\] the diff has a bug/);
+    assert.equal(implementation.requests[0]?.packet?.kind, 'review-repair');
     assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
   });
 

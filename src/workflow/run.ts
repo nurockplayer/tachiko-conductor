@@ -34,9 +34,87 @@ import { createBootstrapFailureRun } from './bootstrap-failure.js';
 import { pullRequestIdentityConflict } from './pull-request-identity.js';
 import { evaluateHostedCheckPolicy } from '../validation/hosted-policy.js';
 import { canonicalizeMissionEvidence, type AdmissionToken, type MissionAdmissionRegistry, type MissionEvidence } from '../mission-admission/registry.js';
+import { acceptedScopeFromHandoff, buildImplementationPacket, preflightImplementationPacket, type ImplementationPacket, type ImplementationPacketInput } from '../agents/implementation-packet.js';
 
 export { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION as SYNC_LIVE_HEAD_DECISION } from '../domain/decisions.js';
 export const RETRY_READINESS_DECISION = 'Retry readiness checks';
+
+function lunaPacketInput(
+  run: Run,
+  target: Target,
+  snapshot: GitHubLiveSnapshot,
+  baseSha: string,
+  execution: ResolvedExecutionConfiguration,
+  pendingRepair: boolean,
+  pendingReviewFix: boolean,
+  pendingValidationRepair: boolean,
+  workspacePath = '',
+  branch = '',
+): ImplementationPacketInput {
+  const kind = pendingReviewFix || (pendingRepair && run.reviewResult?.verdict === 'request_changes')
+    ? 'review-repair'
+    : pendingValidationRepair || pendingRepair
+      ? 'validation-repair'
+      : 'initial';
+  const pullRequestNumber = snapshot.pullRequest?.number ?? run.pullRequest?.number ?? 0;
+  const validationRepair = kind === 'validation-repair' && pendingRepair;
+  return {
+    kind,
+    identity: {
+      runId: run.id,
+      target,
+      workspacePath,
+      branch,
+      baseSha,
+      execution: {
+        profile: execution.profile,
+        revision: execution.revision,
+        executor: execution.executor,
+        timeoutMs: execution.timeoutMs,
+        ...(execution.model === undefined ? {} : { model: execution.model }),
+        ...(execution.reasoningEffort === undefined ? {} : { reasoningEffort: execution.reasoningEffort }),
+        ...(execution.sandboxMode === undefined ? {} : { sandboxMode: execution.sandboxMode }),
+        ...(execution.approvalPolicy === undefined ? {} : { approvalPolicy: execution.approvalPolicy }),
+      },
+    },
+    authority: {
+      repository: { owner: snapshot.repository.owner, repo: snapshot.repository.repo },
+      issue: {
+        id: snapshot.issue.id,
+        number: snapshot.issue.number,
+        updatedAt: snapshot.issue.updatedAt,
+        title: snapshot.issue.title,
+        body: snapshot.issue.body,
+      },
+      acceptedScope: acceptedScopeFromHandoff(snapshot.handoff, snapshot.problems,
+        kind === 'initial' && snapshot.pullRequest === null && snapshot.headSha === null) ?? {
+        sourceId: '', sourceScope: 'issue', sourceUpdatedAt: '', freshness: 'current', text: '',
+      },
+    },
+    repair: !pendingRepair ? null : {
+      headSha: run.headSha ?? '',
+      pullRequestNumber,
+      evidenceRef: kind === 'review-repair'
+        ? `run:${run.id}:review:${run.headSha ?? ''}`
+        : `run:${run.id}:validation:${run.headSha ?? ''}`,
+      evidence: kind === 'review-repair'
+        ? JSON.stringify({ verdict: run.reviewResult?.verdict, headSha: run.reviewResult?.headSha, pullRequestNumber })
+        : JSON.stringify(run.validationResult) ?? '',
+      evidenceKind: kind === 'review-repair' ? 'review' : 'validation',
+      evidenceHeadSha: kind === 'review-repair' ? run.reviewResult?.headSha ?? '' : run.validationResult?.headSha ?? '',
+      evidencePullRequestNumber: kind === 'review-repair'
+        ? pullRequestNumber
+        : run.validationResult?.hosted.pullRequestNumber ?? 0,
+      evidenceStatus: kind === 'review-repair'
+        ? run.reviewResult?.verdict === 'request_changes' ? 'request_changes' : 'failed'
+        : run.validationResult?.status === 'failed' ? 'failed' : 'request_changes',
+      blockingFindings: validationRepair
+        ? []
+        : (run.reviewResult?.findings ?? []).filter((finding) => finding.severity === 'blocking')
+          .map((finding) => `[blocking] ${finding.summary}${finding.detail === undefined ? '' : ` — ${finding.detail}`}`),
+    },
+  };
+}
 
 export interface WorkflowDependencies {
   readonly store: RunStore;
@@ -579,6 +657,21 @@ export async function runWorkflow(
             );
           }
         }
+        if (effectiveExecution?.executor === 'luna-isolated') {
+          const packetBaseSha = pendingRepair
+            ? run.headSha
+            : snapshot.pullRequest?.baseSha ?? snapshot.repository.defaultBranchHeadSha;
+          if (packetBaseSha !== null && packetBaseSha !== undefined && packetBaseSha !== '') {
+            const packetPreflight = preflightImplementationPacket(lunaPacketInput(
+              run, target, snapshot, packetBaseSha, effectiveExecution,
+              pendingRepair, pendingReviewFix, pendingValidationRepair,
+              run.bootstrap?.workspacePath ?? '', run.bootstrap?.branch ?? '',
+            ));
+            if (packetPreflight.kind === 'refusal') {
+              return park(run, packetPreflight.reason, store, now, [CANCEL_RUN_DECISION]);
+            }
+          }
+        }
         let bootstrap = run.bootstrap;
         let recoveryAuthority: BootstrapRecoveryAuthority | undefined;
         let initialRecoveryCandidate: { number: number; baseSha: string; headSha: string } | undefined;
@@ -770,7 +863,7 @@ export async function runWorkflow(
           : isIsolatedLuna
             ? `Task title: ${snapshot.issue.title}\n\n${instructions}\n\nIsolated Luna contract: implement only this bounded task and its tests; run the required tests; commit one clean exact HEAD. The trusted host, not this worker, owns every push and pull-request action.`
           : instructions;
-        const supplementalInstructions = isIsolatedLuna && snapshot.pullRequest === null
+        const supplementalInstructions = isIsolatedLuna
           ? undefined
           : pendingFixInstructions ?? (
           snapshot.pullRequest === null
@@ -785,6 +878,16 @@ export async function runWorkflow(
           : run.agentResult === undefined && run.executor === undefined
             ? 'initial'
             : 'resume';
+        let implementationPacket: ImplementationPacket | undefined;
+        if (isIsolatedLuna) {
+          const packetInput = lunaPacketInput(run, target, snapshot, baseSha, effectiveExecution!, pendingRepair,
+            pendingReviewFix, pendingValidationRepair, bootstrap?.workspacePath ?? '', bootstrap?.branch ?? '');
+          const packet = buildImplementationPacket(packetInput);
+          if (packet.kind === 'refusal') {
+            return park(run, packet.reason, store, now, [CANCEL_RUN_DECISION]);
+          }
+          implementationPacket = packet.packet;
+        }
         const governedPublication = options.admissionFence === undefined
           ? undefined
           : Object.freeze({ required: true as const, continuation: workerAttemptKind !== 'initial' });
@@ -880,7 +983,9 @@ export async function runWorkflow(
             return staleWorkflowOutcome(run.id, workerHandoff, store, 'Run changed while implementation capabilities were resolving; preserving the newer Run.');
           }
           const implementationRequest: ImplementationRequest = {
-            target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target', instructions: boundedInstructions,
+            target, baseSha, authority: isIsolatedLuna ? 'embedded' : 'live-target',
+            instructions: implementationPacket?.rendered ?? boundedInstructions,
+            ...(implementationPacket === undefined ? {} : { packet: implementationPacket }),
             ...(bootstrap === undefined ? {} : { workspacePath: bootstrap.workspacePath, branch: bootstrap.branch, workspaceGuard }),
             ...(supplementalInstructions === undefined ? {} : { supplementalInstructions }),
             ...(capabilities === undefined ? {} : { capabilities }),

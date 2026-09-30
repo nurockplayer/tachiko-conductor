@@ -157,7 +157,8 @@ function snapshot(headSha: string | null): GitHubLiveSnapshot {
     checks: { availability: 'unavailable', overall: 'unavailable', checks: [] },
     reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: null },
     conversations: [],
-    handoff: null,
+    handoff: { sourceId: 'IC_test-scope', sourceScope: 'issue', sourceUpdatedAt: T0,
+      sections: { 'Accepted scope': 'Test scope for isolated worker tests.' }, freshness: 'current' },
     problems: [],
     observedAt: T0,
   };
@@ -208,6 +209,7 @@ class FakeImplementation implements ImplementationAgent {
     executor: ImplementationRequest['executor'];
     execution: ImplementationRequest['execution'];
     capabilities: ImplementationRequest['capabilities'];
+    packet: ImplementationRequest['packet'];
     workspacePath: string | undefined;
     branch: string | undefined;
     workspaceGuard: ImplementationRequest['workspaceGuard'];
@@ -228,6 +230,7 @@ class FakeImplementation implements ImplementationAgent {
       executor: request.executor,
       execution: request.execution,
       capabilities: request.capabilities,
+      packet: request.packet,
       workspacePath: request.workspacePath,
       branch: request.branch,
       workspaceGuard: request.workspaceGuard,
@@ -1010,7 +1013,7 @@ describe('runReviewLoop', () => {
       run.id, { maxAttempts: 3, now: () => T0 },
     );
 
-    assert.equal(result.outcome, 'revalidating');
+    assert.equal(result.outcome, 'revalidating', 'Luna repair packet should pass bounded admission: ' + ('reason' in result ? result.reason : ''));
     assert.equal(planned.length, 1);
     assert.deepEqual({
       runId: (planned[0] as { runId: string }).runId,
@@ -1023,7 +1026,43 @@ describe('runReviewLoop', () => {
     assert.deepEqual((prepared[0] as { recoveryAuthority?: unknown }).recoveryAuthority, { expectedHeadSha: HEAD });
     assert.equal(implementation.requests[0]?.workspacePath, identity.workspacePath);
     assert.equal(implementation.requests[0]?.branch, identity.branch);
+    assert.equal(implementation.requests[0]?.packet?.kind, 'review-repair');
     assert.equal(store.read(run.id)?.bootstrap?.bootstrapKind, 'standalone-isolated');
+  });
+
+  it('refuses an oversized Luna repair packet before spending a repair attempt or preparing a workspace', async () => {
+    const store = new CasMemoryStore();
+    const run = repairChangesRun('luna-oversized-repair-packet');
+    store.create(run);
+    const luna: ResolvedExecutionConfiguration = {
+      profile: 'routine', revision: 'luna-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', timeoutMs: 60_000,
+    };
+    let prepared = 0;
+    const bootstrap: ImplementationBootstrapAdapter = {
+      kind: 'implementation-bootstrap', bootstrapKind: 'standalone-isolated',
+      async plan() { throw new Error('oversized packet must refuse before workspace planning'); },
+      async prepare() { prepared += 1; throw new Error('oversized packet must refuse before workspace preparation'); },
+      guard() { return { assertValid: () => undefined }; },
+      async verifyDurable(request) { return { headSha: request.expectedHeadSha, branch: 'unused' }; },
+    };
+    const github = githubAdapter([HEAD, HEAD]);
+    const readLive = github.readLiveSnapshot.bind(github);
+    github.readLiveSnapshot = async (target) => {
+      const live = await readLive(target);
+      return { ...live, issue: { ...live.issue, body: 'x'.repeat(32 * 1024 + 1) } };
+    };
+    const implementation = new FakeImplementation([]);
+
+    const result = await runReviewLoop(
+      { store, github, implementation, reviewer: new FakeReviewer([]), resolveValidationAuthority: reviewAuthority,
+        bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => luna },
+      run.id, { maxAttempts: 3, now: () => T0 },
+    );
+
+    assert.equal(result.outcome, 'needs_human');
+    assert.equal(result.run.history.some((record) => record.type === 'start_fix'), false);
+    assert.equal(prepared, 0);
+    assert.equal(implementation.requests.length, 0);
   });
 
   it('strengthens a workspace-less repair lane from the read-only plan before the real preparation fetch', async () => {

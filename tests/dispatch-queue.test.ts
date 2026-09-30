@@ -1074,7 +1074,8 @@ ready:
             pullRequest: null, headSha: null,
             checks: { availability: 'available', overall: 'passing', checks: [] },
             reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 },
-            conversations: [], handoff: null, problems: [], observedAt: T0,
+            conversations: [], handoff: { sourceId: 'IC_dispatch-accepted-scope', sourceScope: 'issue', sourceUpdatedAt: T0,
+              sections: { 'Accepted #48-A scope': 'Test accepted implementation scope.' }, freshness: 'current' }, problems: [], observedAt: T0,
           };
         },
       };

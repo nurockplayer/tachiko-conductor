@@ -5,6 +5,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
+import { IMPLEMENTATION_PACKET_LIMITS, buildImplementationPacket } from '../src/agents/implementation-packet.js';
 import {
   CODEX_CAPABILITY_FALLBACK_REVISION,
   runtimeCapabilityCatalog,
@@ -47,6 +48,43 @@ function codexJsonl(
 }
 
 describe('CodexCliAdapter', () => {
+  it('refuses an oversized final implementation packet before any CLI or Git child process', async () => {
+    const built = buildImplementationPacket({
+      kind: 'initial',
+      identity: {
+        runId: 'packet-run', target: TARGET, workspacePath: '/tmp/packet-worktree', branch: 'codex/packet', baseSha: 'b'.repeat(40),
+        execution: { profile: 'complex', revision: 'profile-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', reasoningEffort: 'high', timeoutMs: 60_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' },
+      },
+      authority: {
+        repository: { owner: TARGET.owner, repo: TARGET.repo },
+        issue: { id: 'I_packet', number: TARGET.issueNumber, updatedAt: '2026-09-30T00:00:00Z', title: 'Bounded packet', body: 'Exact task.' },
+        acceptedScope: { sourceId: 'IC_scope', sourceScope: 'issue', sourceUpdatedAt: '2026-09-30T00:00:00Z', freshness: 'current', text: 'Keep exact scope.' },
+      },
+      repair: null,
+    });
+    assert.equal(built.kind, 'packet');
+    if (built.kind !== 'packet') return;
+    const runner = new FakeRunner([]);
+    const adapter = new CodexCliAdapter({ runner });
+    const result = await adapter.run({
+      target: TARGET,
+      baseSha: 'b'.repeat(40),
+      workspacePath: '/tmp/packet-worktree',
+      branch: 'codex/packet',
+      authority: 'embedded',
+      instructions: built.packet.rendered,
+      packet: { ...built.packet, finalCliText: '☃'.repeat(IMPLEMENTATION_PACKET_LIMITS.finalCliBytes) },
+      execution: {
+        profile: 'complex', revision: 'profile-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna',
+        reasoningEffort: 'high', timeoutMs: 60_000,
+      },
+      runtimeOwnership: { runId: 'packet-run', generation: 'packet-generation' },
+    });
+    assert.equal(result.exitStatus, 'failure');
+    assert.match(result.diagnostics?.join('\n') ?? '', /CODEX_PACKET_REFUSED/);
+    assert.equal(runner.calls.length, 0);
+  });
+
   it('refuses a governed ambient invocation before any CLI or Git child process', async () => {
     const runner = new FakeRunner([]);
     const executor = { provider: 'codex-cli', sessionId: 'durable-thread', generation: 'run-generation' } as const;
