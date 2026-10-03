@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -23,6 +23,7 @@ import { EXECUTION_CONFIGURATION_ERROR_CODE, type ResolvedExecutionConfiguration
 import { runWorkflow } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
+import { operationalProjectionPath } from '../src/operational/projection.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import { AppServerUnavailableError, CodexAppServerAdapter } from '../src/agents/codex-app-server.js';
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
@@ -723,6 +724,432 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.ok(store.read('run-1')?.history.some((entry) => entry.type === 'final_gate_verified'));
   });
 
+  it('wires real mission fences into governed review without strengthening evidence', async (t) => {
+    for (const mode of ['active-delegate', 'uncertain-delegate', 'stale-captain', 'wrong-mission', 'missing-workspace', 'stopped-delegate-release'] as const) {
+      await t.test(mode, async () => {
+        const id = `review-admission-${mode}`;
+        const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-review-admission-${mode}-`));
+        try {
+          const store = new JsonFileStore({ dir: path.join(directory, 'runs') });
+          reviewingRun(store, id, HEAD);
+          const workspace = path.join(directory, 'workspace');
+          const registry = new MissionAdmissionRegistry({
+            filePath: path.join(directory, 'registry.json'),
+            config: { schemaVersion: 1, revision: `review-admission-${mode}-v1`, limits: { maxCaptains: 2, maxWriters: 2, maxHighAutonomy: 2 } },
+          });
+          const owner = registry.admit({ laneId: `run:${id}`, role: 'production_captain', evidence: {
+            repository: 'acme/widgets', issue: 42, run: id,
+            ...(mode === 'missing-workspace' ? {} : { workspace }),
+          } });
+          assert.equal(owner.outcome, 'admitted');
+          if (owner.outcome !== 'admitted') return;
+
+          if (mode === 'stale-captain') registry.release(owner.token, true);
+          if (mode === 'active-delegate' || mode === 'uncertain-delegate' || mode === 'stopped-delegate-release') {
+            const delegated = registry.admit({
+              laneId: `delegate:${id}`, role: 'delegated_mutation_writer', delegatedFromLaneId: owner.token.laneId,
+              delegatedFromToken: owner.token,
+              evidence: { repository: 'acme/widgets', issue: 42, run: id, workspace },
+            });
+            assert.equal(delegated.outcome, 'admitted');
+            if (delegated.outcome !== 'admitted') return;
+            if (mode === 'uncertain-delegate') {
+              assert.throws(() => registry.release(delegated.token, false), /explicit evidence that execution and children have stopped/);
+              assert.equal(registry.readLane(delegated.token.laneId)?.status, 'active', 'missing stopped proof retains the delegated writer as blocking');
+            }
+            if (mode === 'stopped-delegate-release') {
+              registry.release(delegated.token, true);
+              assert.equal(registry.readLane(delegated.token.laneId)?.status, 'released', 'explicit stopped proof releases the exact delegated generation');
+            }
+          }
+
+          const admissionBeforeReview = registry.snapshot();
+          const reviewer = new FakeReviewer([mode === 'stopped-delegate-release' ? requestChanges(HEAD) : approve(HEAD)]);
+          const result = await runWorkflow({
+            store, github: githubAdapter(Array.from({ length: 8 }, () => HEAD)),
+            implementation: new FakeImplementation([]), reviewer,
+            validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+          }, id, {
+            maxReviewAttempts: 1, now: () => T0,
+            admissionFence: {
+              registry, token: owner.token,
+              productionMissionId: mode === 'wrong-mission' ? 'mission-deliberately-wrong' : owner.missionId,
+              ...(mode === 'missing-workspace' ? {} : { executionWorkspace: workspace }),
+            },
+          });
+
+          if (mode === 'stopped-delegate-release') {
+            assert.equal(reviewer.requests.length, 1, 'the same exact validated candidate is reviewable after explicit delegate stop/release');
+            assert.equal(result.outcome, 'needs_human', 'the admitted change request reaches the ordinary exhausted repair boundary');
+            assert.equal(result.run.history.some((event) => event.type === 'changes_requested'), true,
+              'the unchanged candidate receives and durably accepts the review verdict');
+            assert.equal(result.run.history.some((event) => event.type === 'start_fix'), false,
+              'the bounded test stops before any repair worker can alter the candidate');
+            assert.deepEqual(registry.snapshot(), admissionBeforeReview,
+              'review admission does not strengthen PR/workspace evidence or mutate the remaining captain admission');
+          } else {
+            assert.equal(result.outcome, 'needs_human', 'governed review fails closed for missing or conflicting current authority');
+            assert.equal(reviewer.requests.length, 0, 'no reviewer execution begins without both live assertions');
+            assert.equal(result.run.telemetry?.events.some((event) => event.kind === 'spawn' && event.role === 'reviewer'), false,
+              'a refusal at the first boundary precedes reviewer bookkeeping');
+            assert.equal(result.run.history.some((event) => event.type === 'review_approved' || event.type === 'changes_requested'), false,
+              'a refused review has no accepted verdict');
+            if (mode !== 'stale-captain') {
+              assert.deepEqual(registry.snapshot(), admissionBeforeReview, 'review admission does not strengthen evidence or mutate registry state');
+            }
+            if (mode === 'missing-workspace') {
+              assert.equal(registry.readLane(owner.token.laneId)?.evidence.workspace, undefined,
+                'missing workspace evidence remains missing rather than being strengthened to make review pass');
+            }
+          }
+          assert.equal(new JsonFileStore({ dir: path.join(directory, 'runs') }).read(id)?.headSha, HEAD,
+            'all outcomes remain bound to the captured candidate HEAD');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+    }
+  });
+
+  it('rechecks governed review admission when the execution-start callback throws', async (t) => {
+    for (const mode of ['revocation-and-renew', 'unrelated-callback', 'secondary-cas-failure', 'concurrent-run-winner'] as const) {
+      await t.test(mode, async () => {
+        const id = `review-callback-failure-${mode}`;
+        const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-review-callback-failure-${mode}-`));
+        try {
+          const runsDir = path.join(directory, 'runs');
+          const store = new JsonFileStore({ dir: runsDir });
+          reviewingRun(store, id, HEAD);
+          const workspace = path.join(directory, 'workspace');
+          const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'),
+            config: { schemaVersion: 1, revision: `review-callback-failure-${mode}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+          const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', evidence: {
+            repository: 'acme/widgets', issue: 42, run: id, workspace,
+          } });
+          assert.equal(admitted.outcome, 'admitted');
+          if (admitted.outcome !== 'admitted') return;
+
+          const reviewer = new FakeReviewer([approve(HEAD)]);
+          const originalCas = store.updateIfUnchanged.bind(store);
+          const secondaryCasError = new Error('callback refusal parking CAS failed');
+          let afterExecutionStart = false;
+          let casCallsAfterStart = 0;
+          let preRefusalRunBytes: string | undefined;
+          let preRefusalProjectionBytes: string | undefined;
+          if (mode === 'secondary-cas-failure') {
+            Object.defineProperty(store, 'updateIfUnchanged', { configurable: true, get: () => {
+              if (!afterExecutionStart) return originalCas;
+              return (expected: Run, next: Run): boolean => {
+                casCallsAfterStart += 1;
+                if (casCallsAfterStart === 3) throw secondaryCasError;
+                return originalCas(expected, next);
+              };
+            } });
+          }
+
+          const operation = runWorkflow({
+            store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]),
+            implementation: new FakeImplementation([]), reviewer,
+            validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+          }, id, {
+            maxReviewAttempts: 1, now: () => T0,
+            admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: workspace },
+            onExecutionStart: () => {
+              afterExecutionStart = true;
+              if (mode === 'unrelated-callback') throw new Error('unrelated callback logic failure');
+              if (mode === 'concurrent-run-winner') {
+                const current = store.read(id)!;
+                const winner = applyTransition(current, { type: 'escalate', reason: 'operator winner during execution-start callback',
+                  interrupt: { evidence: 'operator cancellation', choices: ['Cancel the run'] } }, T0);
+                store.update(winner);
+                preRefusalRunBytes = readFileSync(path.join(runsDir, `${id}.json`), 'utf8');
+                preRefusalProjectionBytes = readFileSync(operationalProjectionPath(runsDir, id), 'utf8');
+                throw new Error('callback failed after concurrent Run winner');
+              }
+              if (mode === 'secondary-cas-failure') {
+                preRefusalRunBytes = readFileSync(path.join(runsDir, `${id}.json`), 'utf8');
+                preRefusalProjectionBytes = readFileSync(operationalProjectionPath(runsDir, id), 'utf8');
+              }
+              // Match the production CLI callback: revocation followed by
+              // renewal of the captured token throws before returning.
+              registry.release(admitted.token, true);
+              registry.renew(admitted.token);
+            },
+          });
+
+          let result: Awaited<typeof operation> | undefined;
+          let capturedRefusal: unknown;
+          try { result = await operation; } catch (error) { capturedRefusal = error; }
+          assert.equal(reviewer.requests.length, 0, 'no reviewer invocation crosses a throwing execution-start callback');
+
+          if (mode === 'unrelated-callback') {
+            assert.equal(capturedRefusal, undefined);
+            assert.equal(result?.outcome, 'failed', 'a callback exception with valid current authority keeps ordinary failure semantics');
+            assert.match(result?.reason ?? '', /unrelated callback logic failure/);
+            assert.ok(result?.run.telemetry?.events.some((event) => event.kind === 'completion' && event.role === 'reviewer' && event.outcome === 'failed'),
+              'ordinary callback failure retains its normal reviewer failure bookkeeping');
+          } else if (mode === 'concurrent-run-winner') {
+            assert.equal(capturedRefusal, undefined);
+            assert.equal(result?.outcome, 'needs_human');
+            assert.equal(result?.run.interrupt?.reason, 'operator winner during execution-start callback');
+            assert.equal(readFileSync(path.join(runsDir, `${id}.json`), 'utf8'), preRefusalRunBytes,
+              'the exact concurrent Run winner remains byte-for-byte unchanged');
+            assert.equal(readFileSync(operationalProjectionPath(runsDir, id), 'utf8'), preRefusalProjectionBytes,
+              'the concurrent winner projection remains byte-for-byte unchanged');
+          } else if (mode === 'secondary-cas-failure') {
+            assert.ok(capturedRefusal !== undefined, 'a secondary reconciliation failure preserves the primary tagged refusal');
+            assert.equal(isExecutionAdmissionRefusal(capturedRefusal), true);
+            assert.equal((capturedRefusal as { authorityUnknown?: boolean }).authorityUnknown, false);
+            assert.match((capturedRefusal as Error).message, /could not confirm current mission and publication authority/);
+            assert.match(String((capturedRefusal as Error).cause), /stale/);
+            assert.equal(casCallsAfterStart, 3, 'the third strict CAS is the failed secondary park write');
+            assert.equal(readFileSync(path.join(runsDir, `${id}.json`), 'utf8'), preRefusalRunBytes,
+              'failed secondary reconciliation never falls back to an unguarded Run write');
+            assert.equal(readFileSync(operationalProjectionPath(runsDir, id), 'utf8'), preRefusalProjectionBytes,
+              'failed secondary reconciliation leaves the Run projection untouched');
+          } else {
+            assert.equal(capturedRefusal, undefined);
+            assert.equal(result?.outcome, 'needs_human');
+            assert.equal(result?.run.state, 'NEEDS_HUMAN', 'stale renewal is classified as a host admission refusal, not reviewer failure');
+            assert.match(result?.reason ?? '', /Review admission was refused by its host authority boundary/);
+            assert.equal(result?.run.telemetry?.events.some((event) => event.kind === 'completion' && event.role === 'reviewer'), false,
+              'no reviewer-failure completion is recorded for a refused admission');
+          }
+          if (mode !== 'unrelated-callback' && mode !== 'concurrent-run-winner') {
+            const runToCheck = mode === 'secondary-cas-failure'
+              ? JSON.parse(preRefusalRunBytes!) as Run
+              : result?.run;
+            assert.equal(runToCheck?.history.some((event) => event.type === 'review_approved' || event.type === 'changes_requested'), false,
+              'no verdict is admitted after callback failure or authority loss');
+          }
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+    }
+  });
+
+  it('rejects approve and request_changes when governed review authority is lost at any async boundary', async (t) => {
+    for (const phase of ['onExecutionStart', 'review-pending', 'post-review-read'] as const) {
+      for (const verdict of ['approve', 'request_changes'] as const) {
+        await t.test(`${phase}/${verdict}`, async () => {
+          const id = `review-admission-drift-${phase}-${verdict}`;
+          const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-review-admission-drift-${phase}-`));
+          let finishReview = () => {};
+          try {
+            const store = new JsonFileStore({ dir: path.join(directory, 'runs') });
+            reviewingRun(store, id, HEAD);
+            const workspace = path.join(directory, 'workspace');
+            const registry = new MissionAdmissionRegistry({
+              filePath: path.join(directory, 'registry.json'),
+              config: { schemaVersion: 1, revision: `review-drift-${phase}-${verdict}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } },
+            });
+            const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', evidence: {
+              repository: 'acme/widgets', issue: 42, run: id, workspace,
+            } });
+            assert.equal(admitted.outcome, 'admitted');
+            if (admitted.outcome !== 'admitted') return;
+
+            let enterReview!: () => void;
+            const reviewEntered = new Promise<void>((resolve) => { enterReview = resolve; });
+            const reviewRelease = new Promise<void>((resolve) => { finishReview = resolve; });
+            let reviewerCalls = 0;
+            const reviewer: ReviewerAdapter = {
+              kind: 'reviewer',
+              async review() {
+                reviewerCalls += 1;
+                enterReview();
+                if (phase === 'review-pending') await reviewRelease;
+                return verdict === 'approve' ? approve(HEAD) : requestChanges(HEAD);
+              },
+            };
+            const github = githubAdapter(Array.from({ length: 8 }, () => HEAD));
+            const readLive = github.readLiveSnapshot.bind(github);
+            let snapshotReads = 0;
+            github.readLiveSnapshot = async (target) => {
+              snapshotReads += 1;
+              const result = await readLive(target);
+              if (phase === 'post-review-read' && snapshotReads === 2) registry.release(admitted.token, true);
+              return result;
+            };
+            let executionStarts = 0;
+            const implementation = new FakeImplementation([]);
+            const running = runWorkflow({
+              store, github, implementation, reviewer,
+              validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+            }, id, {
+              maxReviewAttempts: 1, now: () => T0,
+              admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: workspace },
+              onExecutionStart: () => {
+                executionStarts += 1;
+                if (phase === 'onExecutionStart') registry.release(admitted.token, true);
+              },
+            });
+
+            if (phase === 'review-pending') {
+              await reviewEntered;
+              registry.release(admitted.token, true);
+              finishReview();
+            }
+            const result = await running;
+            assert.equal(result.outcome, 'needs_human', 'authority drift is a tagged admission hold, never a reviewer failure');
+            assert.equal(result.run.state, 'NEEDS_HUMAN');
+            assert.equal(result.run.history.some((event) => event.type === 'review_approved' || event.type === 'changes_requested'), false,
+              `the ${verdict} verdict cannot be persisted after authority loss`);
+            assert.equal(reviewerCalls, phase === 'onExecutionStart' ? 0 : 1,
+              'revocation after execution-start blocks invocation; later revocation blocks only verdict admission');
+            assert.equal(executionStarts, 1);
+            assert.equal(implementation.requests.length, 0, 'the rejected result never starts a repair worker');
+            assert.equal(result.run.headSha, HEAD, 'the held Run still names the unchanged candidate');
+            if (verdict === 'request_changes') {
+              assert.equal(result.run.history.some((event) => event.type === 'start_fix'), false,
+                'a request_changes verdict rejected by admission cannot authorize a repair');
+            }
+          } finally {
+            finishReview?.();
+            rmSync(directory, { recursive: true, force: true });
+          }
+        });
+      }
+    }
+  });
+
+  it('preserves the exact concurrent Run and operational projection when final review CAS loses', async () => {
+    const id = 'review-admission-cas-winner';
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-review-admission-cas-winner-'));
+    try {
+      const runsDir = path.join(directory, 'runs');
+      const store = new JsonFileStore({ dir: runsDir });
+      reviewingRun(store, id, HEAD);
+      const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'),
+        config: { schemaVersion: 1, revision: 'review-admission-cas-winner-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+      const workspace = path.join(directory, 'workspace');
+      const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', evidence: {
+        repository: 'acme/widgets', issue: 42, run: id, workspace,
+      } });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') return;
+      const github = githubAdapter([HEAD, HEAD, HEAD, HEAD]);
+      const readLive = github.readLiveSnapshot.bind(github);
+      let reads = 0;
+      let winner: Run | undefined;
+      let winnerRunBytes: string | undefined;
+      let winnerProjectionBytes: string | undefined;
+      github.readLiveSnapshot = async (target) => {
+        reads += 1;
+        const snapshot = await readLive(target);
+        if (reads === 2) {
+          const current = store.read(id)!;
+          winner = applyTransition(current, { type: 'escalate', reason: 'concurrent operator winner during post-review read',
+            interrupt: { evidence: 'operator decision', choices: ['Cancel the run'] } }, T0);
+          store.update(winner);
+          winnerRunBytes = readFileSync(path.join(runsDir, `${id}.json`), 'utf8');
+          winnerProjectionBytes = readFileSync(operationalProjectionPath(runsDir, id), 'utf8');
+        }
+        return snapshot;
+      };
+      const reviewer = new FakeReviewer([approve(HEAD)]);
+      const result = await runWorkflow({ store, github, implementation: new FakeImplementation([]), reviewer,
+        validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY }, id, {
+        maxReviewAttempts: 1, now: () => T0,
+        admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: workspace },
+      });
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(reviewer.requests.length, 1, 'review runs, but the post-read Run winner blocks verdict admission');
+      assert.ok(winner);
+      assert.deepEqual(result.run, winner);
+      assert.deepEqual(new JsonFileStore({ dir: runsDir }).read(id), winner);
+      assert.equal(readFileSync(path.join(runsDir, `${id}.json`), 'utf8'), winnerRunBytes, 'the complete winning Run bytes remain unchanged');
+      assert.equal(readFileSync(operationalProjectionPath(runsDir, id), 'utf8'), winnerProjectionBytes,
+        'the matching operational projection remains byte-for-byte unchanged');
+      assert.equal(result.run.history.some((event) => event.type === 'review_approved' || event.type === 'changes_requested'), false,
+        'a losing exact-Run CAS never accepts the verdict');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('preserves tagged review refusals when the boundary or secondary reconciliation CAS is unavailable', async (t) => {
+    for (const mode of ['missing-boundary-cas', 'throwing-boundary-cas', 'missing-secondary-identity-cas', 'throwing-secondary-park-cas'] as const) {
+      await t.test(mode, async () => {
+        const id = `review-admission-cas-${mode}`;
+        const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-review-admission-cas-${mode}-`));
+        try {
+          const runsDir = path.join(directory, 'runs');
+          const store = new JsonFileStore({ dir: runsDir });
+          reviewingRun(store, id, HEAD);
+          const workspace = path.join(directory, 'workspace');
+          const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'),
+            config: { schemaVersion: 1, revision: `review-admission-cas-${mode}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+          const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', evidence: {
+            repository: 'acme/widgets', issue: 42, run: id, workspace,
+          } });
+          assert.equal(admitted.outcome, 'admitted');
+          if (admitted.outcome !== 'admitted') return;
+
+          const originalCas = store.updateIfUnchanged.bind(store);
+          const boundaryCasError = new Error('review boundary strict CAS failed');
+          const secondaryCasError = new Error('review refusal parking CAS failed');
+          let afterExecutionStart = false;
+          let getterCallsAfterStart = 0;
+          let casCallsAfterStart = 0;
+          let beforeRefusalRunBytes: string | undefined;
+          let beforeRefusalProjectionBytes: string | undefined;
+          Object.defineProperty(store, 'updateIfUnchanged', { configurable: true, get: () => {
+            if (!afterExecutionStart) return originalCas;
+            getterCallsAfterStart += 1;
+            if (mode === 'missing-boundary-cas' && getterCallsAfterStart === 1) return undefined;
+            if (mode === 'throwing-boundary-cas' && getterCallsAfterStart === 1) return () => { throw boundaryCasError; };
+            if (mode === 'missing-secondary-identity-cas' && getterCallsAfterStart === 2) return undefined;
+            return (expected: Run, next: Run): boolean => {
+              casCallsAfterStart += 1;
+              if (mode === 'throwing-secondary-park-cas' && casCallsAfterStart === 3) throw secondaryCasError;
+              return originalCas(expected, next);
+            };
+          } });
+
+          const reviewer = new FakeReviewer([approve(HEAD)]);
+          const operation = runWorkflow({
+            store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]),
+            implementation: new FakeImplementation([]), reviewer,
+            validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY,
+          }, id, {
+            maxReviewAttempts: 1, now: () => T0,
+            admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: workspace },
+            onExecutionStart: () => {
+              beforeRefusalRunBytes = readFileSync(path.join(runsDir, `${id}.json`), 'utf8');
+              beforeRefusalProjectionBytes = readFileSync(operationalProjectionPath(runsDir, id), 'utf8');
+              afterExecutionStart = true;
+              if (mode === 'missing-secondary-identity-cas' || mode === 'throwing-secondary-park-cas') {
+                registry.release(admitted.token, true);
+              }
+            },
+          });
+          let capturedRefusal: unknown;
+          let unexpectedOutcome: string | undefined;
+          try { unexpectedOutcome = (await operation).outcome; } catch (error) { capturedRefusal = error; }
+          assert.ok(capturedRefusal !== undefined,
+            `expected tagged refusal for ${mode}, got ${unexpectedOutcome ?? 'no result'}; authority ${registry.readLane(admitted.token.laneId)?.status}, reviewer calls ${reviewer.requests.length}, CAS getter calls ${getterCallsAfterStart}, CAS invocations ${casCallsAfterStart}`);
+          const error = capturedRefusal;
+          assert.equal(isExecutionAdmissionRefusal(error), true);
+          if (mode === 'missing-boundary-cas' || mode === 'throwing-boundary-cas') {
+            assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, true);
+            assert.match((error as Error).message, /could not confirm the exact Run handoff/);
+            if (mode === 'throwing-boundary-cas') assert.strictEqual((error as Error).cause, boundaryCasError);
+            else assert.match(String((error as Error).cause), /Strict Run compare-and-swap is unavailable/);
+          } else {
+            assert.equal((error as { authorityUnknown?: boolean }).authorityUnknown, false);
+            assert.match((error as Error).message, /could not confirm current mission and publication authority/,
+              'the primary host-admission refusal survives a secondary reconciliation failure');
+            assert.match(String((error as Error).cause), /stale/);
+          }
+          assert.equal(reviewer.requests.length, 0, 'no reviewer invocation crosses the failed boundary');
+          assert.ok(beforeRefusalRunBytes && beforeRefusalProjectionBytes, 'the exact pre-refusal durable state was captured');
+          assert.equal(readFileSync(path.join(runsDir, `${id}.json`), 'utf8'), beforeRefusalRunBytes,
+            'missing or throwing strict CAS never falls back to an unguarded Run write');
+          assert.equal(readFileSync(operationalProjectionPath(runsDir, id), 'utf8'), beforeRefusalProjectionBytes,
+            'the operational projection remains byte-for-byte aligned with the untouched Run');
+          if (mode === 'missing-secondary-identity-cas') assert.equal(getterCallsAfterStart, 2);
+          if (mode === 'throwing-secondary-park-cas') assert.equal(casCallsAfterStart, 3);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+    }
+  });
+
   it('propagates the host publication requirement into admission-backed review repair preflight', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-review-repair-governed-'));
     const registry = new MissionAdmissionRegistry({
@@ -731,7 +1158,10 @@ describe('runWorkflow', { concurrency: false }, () => {
     });
     const store = new MemoryStore();
     reviewingRun(store, 'workflow-governed-review-repair', HEAD);
-    const admitted = registry.admit({ laneId: 'run:workflow-governed-review-repair', role: 'production_captain', highAutonomy: true, evidence: { repository: 'acme/widgets', issue: 42, run: 'workflow-governed-review-repair' } });
+    const workspace = path.join(directory, 'workspace');
+    const admitted = registry.admit({ laneId: 'run:workflow-governed-review-repair', role: 'production_captain', highAutonomy: true, evidence: {
+      repository: 'acme/widgets', issue: 42, run: 'workflow-governed-review-repair', workspace,
+    } });
     assert.equal(admitted.outcome, 'admitted');
     if (admitted.outcome !== 'admitted') return;
     try {
@@ -739,7 +1169,7 @@ describe('runWorkflow', { concurrency: false }, () => {
       const result = await runWorkflow(
         { store, github: githubAdapter([HEAD, HEAD, HEAD, HEAD]), implementation, reviewer: new FakeReviewer([requestChanges(HEAD)]), validation: new FakeValidation(), hostedCheckPolicy: TEST_HOSTED_POLICY, bootstrap: new FakeBootstrap() },
         'workflow-governed-review-repair',
-        { maxReviewAttempts: 3, now: () => T0, admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: '/tmp/governed-review-repair' } },
+        { maxReviewAttempts: 3, now: () => T0, admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: workspace } },
       );
       assert.equal(result.outcome, 'needs_human', 'the selected fake adapter cannot claim source-owned governed confinement');
       assert.equal(implementation.preflightRequests.length, 1);
@@ -764,7 +1194,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     const initial = reviewingRun(store, id, sourceHead);
     store.update({ ...initial, execution: luna.request.execution });
     const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
-      evidence: { repository: 'acme/widgets', issue: 42, run: id } });
+      evidence: { repository: 'acme/widgets', issue: 42, run: id, workspace: luna.identity.workspacePath } });
     assert.equal(admitted.outcome, 'admitted');
     if (admitted.outcome !== 'admitted') { luna.cleanup(); rmSync(directory, { recursive: true, force: true }); return; }
     let replacementCalls = 0;
@@ -834,7 +1264,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     const initial = reviewingRun(store, id, sourceHead);
     store.update({ ...initial, execution: luna.request.execution });
     const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
-      evidence: { repository: 'acme/widgets', issue: 42, run: id } });
+      evidence: { repository: 'acme/widgets', issue: 42, run: id, workspace: luna.identity.workspacePath } });
     assert.equal(admitted.outcome, 'admitted');
     if (admitted.outcome !== 'admitted') { luna.cleanup(); rmSync(directory, { recursive: true, force: true }); return; }
     let replacementCalls = 0;
@@ -901,7 +1331,7 @@ describe('runWorkflow', { concurrency: false }, () => {
     const spawnMarker = path.join(luna.root, 'worker-spawned');
     writeFileSync(path.join(luna.root, 'bin', 'codex'), `#!/bin/sh\nprintf x > '${spawnMarker}'\nprintf '%s\\n' '{"type":"thread.started","thread_id":"unexpected"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"message","type":"agent_message","text":"unexpected"}}' '{"type":"turn.completed"}'\n`, { mode: 0o700 });
     const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', highAutonomy: true,
-      evidence: { repository: 'acme/widgets', issue: 42, run: id } });
+      evidence: { repository: 'acme/widgets', issue: 42, run: id, workspace: luna.identity.workspacePath } });
     assert.equal(admitted.outcome, 'admitted');
     if (admitted.outcome !== 'admitted') { luna.cleanup(); rmSync(directory, { recursive: true, force: true }); return; }
     let replacementCalls = 0;
