@@ -9,6 +9,7 @@
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
+import type { ToolOutputEnvelope } from '../evidence/tool-output.js';
 import type { RepairAdmissionSnapshot, RepairExecutorHandoff, RepairHandoffRecord, RepairTaskShapeAuthority } from './repair-admission.js';
 
 /** The work item a run operates on. */
@@ -153,9 +154,11 @@ export interface LocalValidationCommandEvidence {
   readonly outcome: 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed';
   readonly exitCode: number | null;
   readonly durationMs: number;
+  /** Caller-sanitized, supplemental bounded evidence; never validation authority. */
+  readonly output?: ToolOutputEnvelope;
 }
 
-/** Durable provenance for deterministic local validation. It intentionally excludes command output. */
+/** Durable validation provenance; raw command output is excluded and bounded evidence is supplemental. */
 export interface LocalValidationEvidence {
   readonly status: Exclude<ValidationStatus, 'waiting'>;
   readonly configRevision: string | null;

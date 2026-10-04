@@ -1,5 +1,6 @@
-import { execFile, type ExecFileException } from 'node:child_process';
+import { execFile, spawn, type ExecFileException } from 'node:child_process';
 
+import { boundToolOutputFromCapture, captureToolOutput, type ToolOutputEnvelope, type ToolOutputPolicy, type ToolOutputStore } from '../evidence/tool-output.js';
 import { GitHubLiveStateError } from './errors.js';
 
 export interface GitHubApiTransport {
@@ -20,6 +21,8 @@ export interface ProcessResult {
   readonly stdout: string;
   readonly stderr: string;
   readonly exitCode: number;
+  /** Only explicit evidence commands return this bounded, drillable view. */
+  readonly output?: ToolOutputEnvelope;
 }
 
 export interface ProcessRunOptions {
@@ -36,10 +39,23 @@ export interface ProcessRunOptions {
    * directly before delegating to the real child-process boundary.
    */
   readonly beforeSpawn?: () => void;
+  /**
+   * Opt in only for command output safe to retain. This switches stdout/stderr
+   * to bounded previews; machine-readable/provider transcripts must use the
+   * default non-durable path. The owner retains/deletes the returned artifact.
+   */
+  readonly outputStore?: ToolOutputStore;
+  readonly outputPolicy?: ToolOutputPolicy;
 }
 
 export interface ProcessRunner {
   run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult>;
+}
+
+export interface NodeProcessRunnerOptions {
+  /** Explicitly opt in to bounded evidence commands; no default durable capture. */
+  readonly outputStore?: ToolOutputStore;
+  readonly outputPolicy?: ToolOutputPolicy;
 }
 
 interface ProcessError extends ExecFileException {
@@ -48,7 +64,11 @@ interface ProcessError extends ExecFileException {
 
 /** Production process boundary. Commands are always an executable plus args. */
 export class NodeProcessRunner implements ProcessRunner {
+  constructor(private readonly options: NodeProcessRunnerOptions = {}) {}
+
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
+    const store = options.outputStore ?? this.options.outputStore;
+    if (store !== undefined) return this.runCaptured(file, args, options, store);
     return await new Promise<ProcessResult>((resolve, reject) => {
       let settled = false;
       let stdinError: unknown;
@@ -109,6 +129,124 @@ export class NodeProcessRunner implements ProcessRunner {
       } catch (error) {
         stdinError ??= error;
       }
+    });
+  }
+
+  /** Stream evidence-bearing commands without execFile's buffered 16 MiB cap. */
+  private async runCaptured(
+    file: string, args: readonly string[], options: ProcessRunOptions, store: ToolOutputStore,
+  ): Promise<ProcessResult> {
+    if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 0) {
+      throw new RangeError('timeoutMs must be a nonnegative safe integer.');
+    }
+    const policy = options.outputPolicy ?? this.options.outputPolicy;
+    const capture = captureToolOutput(store, policy);
+    const isAborted = (): boolean => options.signal?.aborted === true;
+    return new Promise<ProcessResult>((resolve, reject) => {
+      let stdinError: unknown;
+      let processError: Error | undefined;
+      let stopReason: 'timed_out' | 'cancelled' | undefined;
+      let settled = false;
+      let stopping = false;
+      let exitObserved = false;
+      let observedExitCode: number | null = null;
+      let observedSignal: NodeJS.Signals | null = null;
+      let incompleteCapture = false;
+      let timer: NodeJS.Timeout | undefined;
+      let forceTimer: NodeJS.Timeout | undefined;
+      let settlementTimer: NodeJS.Timeout | undefined;
+      let child: ReturnType<typeof spawn> | undefined;
+      const finish = (cleanupUnproven = false): void => {
+        if (settled) return;
+        settled = true;
+        if (timer !== undefined) clearTimeout(timer);
+        if (forceTimer !== undefined) clearTimeout(forceTimer);
+        if (settlementTimer !== undefined) clearTimeout(settlementTimer);
+        options.signal?.removeEventListener('abort', onAbort);
+        const outcome = stopReason ?? (processError !== undefined || !exitObserved || observedExitCode === null ||
+          (observedExitCode === 0 && stdinError !== undefined) ? 'unknown' : observedExitCode === 0 ? 'passed' : 'failed');
+        // Outcome describes cancellation/deadline; exitCode describes the
+        // independently observed exit event, including a numeric TERM handler.
+        const output = boundToolOutputFromCapture({ outcome, exitCode: observedExitCode,
+          capture: capture.finish(), policy, captureTruncated: incompleteCapture });
+        if (cleanupUnproven) {
+          reject(Object.assign(new Error(`Command ${file} cleanup could not prove closed output streams and a stopped direct child.`), {
+            code: 'ECHILD_CLEANUP_UNPROVEN', output, directChildExitObserved: exitObserved,
+          }));
+        } else if (stopReason === 'cancelled') {
+          reject(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR', output }));
+        } else if (stopReason === 'timed_out') {
+          reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT', output }));
+        } else if (processError !== undefined) {
+          reject(Object.assign(processError, { output }));
+        } else if (observedExitCode === 0 && stdinError !== undefined) {
+          reject(Object.assign(stdinError instanceof Error ? stdinError : new Error('Command stdin failed.'), { output }));
+        } else if (!exitObserved || observedExitCode === null) {
+          reject(Object.assign(new Error(`Command ${file} terminated by ${observedSignal ?? 'an unknown signal'}.`), {
+            code: null, signal: observedSignal, output,
+          }));
+        } else {
+          resolve({ stdout: output.stdout.preview, stderr: output.stderr.preview, exitCode: observedExitCode, output });
+        }
+      };
+      const requestStop = (reason: 'timed_out' | 'cancelled'): void => {
+        if (settled) return;
+        if (reason === 'cancelled' || stopReason === undefined) stopReason = reason;
+        if (stopping) return;
+        stopping = true;
+        if (timer !== undefined) clearTimeout(timer);
+        // Only this exact ChildProcess handle is signalled. No inferred or
+        // unrelated process group is killed, and tree quiescence is not claimed.
+        if (!exitObserved) { try { child?.kill('SIGTERM'); } catch { /* bounded fallback below */ } }
+        forceTimer = setTimeout(() => {
+          if (!exitObserved) { try { child?.kill('SIGKILL'); } catch { /* final refusal below */ } }
+        }, 250);
+        settlementTimer = setTimeout(() => {
+          // A descendant may keep inherited pipes open after the direct child
+          // exits. Close only our handles, mark evidence incomplete, and refuse
+          // with an explicit unproven-cleanup error instead of hanging forever.
+          incompleteCapture = true;
+          child?.stdout?.destroy();
+          child?.stderr?.destroy();
+          child?.stdin?.destroy();
+          finish(true);
+        }, 1_000);
+      };
+      const onAbort = (): void => { requestStop('cancelled'); };
+      if (isAborted()) {
+        stopReason = 'cancelled';
+        finish();
+        return;
+      }
+      try {
+        // Same synchronous admission contract as the default execFile path.
+        // No asynchronous work may intervene before the actual spawn.
+        options.beforeSpawn?.();
+        if (isAborted()) { stopReason = 'cancelled'; finish(); return; }
+        child = spawn(file, [...args], {
+          shell: false, stdio: ['pipe', 'pipe', 'pipe'], cwd: options.cwd,
+          ...(options.env === undefined ? {} : { env: options.env }),
+        });
+      } catch (error) {
+        capture.abort?.();
+        reject(error);
+        return;
+      }
+      child.stdout?.setEncoding('utf8');
+      child.stderr?.setEncoding('utf8');
+      child.stdout?.on('data', (chunk: string) => { if (!settled) capture.write('stdout', chunk); });
+      child.stderr?.on('data', (chunk: string) => { if (!settled) capture.write('stderr', chunk); });
+      child.stdin?.on('error', (error) => { stdinError ??= error; });
+      child.once('error', (error) => { processError = error; });
+      child.once('exit', (code, signal) => {
+        exitObserved = true; observedExitCode = code; observedSignal = signal;
+      });
+      child.once('close', () => { finish(incompleteCapture); });
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+      // The synchronous admission callback may have aborted the request.
+      if (isAborted()) onAbort();
+      else if (options.timeoutMs > 0) timer = setTimeout(() => { requestStop('timed_out'); }, options.timeoutMs);
+      try { child.stdin?.end(options.stdin); } catch (error) { stdinError ??= error; }
     });
   }
 }
