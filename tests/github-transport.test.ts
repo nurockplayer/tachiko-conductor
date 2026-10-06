@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { ChildProcess } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -281,15 +282,258 @@ describe('NodeProcessRunner', () => {
   it('keeps captured numeric nonzero exit authoritative over stdin EPIPE, but rejects EPIPE on zero exit', async () => {
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-captured-stdin-epipe-'));
     try {
-      const store = new FileToolOutputStore(root);
-      const failed = await new NodeProcessRunner().run(process.execPath,
-        ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(23), 25)'],
-        { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024), outputStore: store });
-      assert.equal(failed.exitCode, 23);
-      await assert.rejects(new NodeProcessRunner().run(process.execPath,
-        ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(0), 25)'],
-        { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024), outputStore: store }),
-      (error: unknown) => (error as NodeJS.ErrnoException).code === 'EPIPE');
+      for (const mode of ['ordinary', 'captured'] as const) {
+        const failed = await new NodeProcessRunner().run(process.execPath,
+          ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(23), 25)'],
+          { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024), ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}) });
+        assert.equal(failed.exitCode, 23, `${mode}: numeric nonzero child exit outranks incidental EPIPE`);
+      }
+      for (const mode of ['ordinary', 'captured'] as const) {
+        await assert.rejects(new NodeProcessRunner().run(process.execPath,
+          ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(0), 25)'],
+          { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024), ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}) }),
+        (error: unknown) => {
+          const value = error as NodeJS.ErrnoException & { readonly output?: { readonly outcome?: unknown; readonly exitCode?: unknown } };
+          assert.equal(value.code, 'EPIPE');
+          if (mode === 'captured') {
+            assert.equal(value.output?.outcome, 'failed', 'a rejected zero-exit EPIPE invocation cannot advertise a passed outcome');
+            assert.equal(value.output?.exitCode, 0);
+          }
+          return true;
+        });
+      }
     } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('matches execFile timeout admission and treats zero as no deadline', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-timeout-admission-'));
+    const marker = path.join(directory, 'child-ran');
+    try {
+      const script = `setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran'); process.stdout.write('TIMEOUT-ZERO-OK'); }, 50)`;
+      const ordinary = await new NodeProcessRunner().run(process.execPath, ['-e', script], { timeoutMs: 0 });
+      assert.equal(ordinary.exitCode, 0);
+      assert.equal(ordinary.stdout, 'TIMEOUT-ZERO-OK');
+      assert.equal(readFileSync(marker, 'utf8'), 'ran');
+
+      rmSync(marker);
+      const evidenceRoot = path.join(directory, 'evidence');
+      const captured = await new NodeProcessRunner().run(process.execPath, ['-e', script], {
+        timeoutMs: 0, outputStore: new FileToolOutputStore(evidenceRoot),
+      });
+      assert.equal(captured.exitCode, ordinary.exitCode);
+      assert.equal(captured.stdout, 'TIMEOUT-ZERO-OK');
+      assert.equal(captured.output?.outcome, 'passed');
+      assert.equal(existsSync(marker), true);
+
+      for (const timeoutMs of [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const invalidMarker = path.join(directory, `invalid-${String(timeoutMs)}`);
+        const invalidRoot = path.join(directory, `evidence-${String(timeoutMs)}`);
+        const invalidScript = `require('node:fs').writeFileSync(${JSON.stringify(invalidMarker)}, 'ran')`;
+        await assert.rejects(new NodeProcessRunner().run(process.execPath, ['-e', invalidScript], { timeoutMs }),
+          (error: unknown) => (error as NodeJS.ErrnoException).code === 'ERR_OUT_OF_RANGE');
+        await assert.rejects(new NodeProcessRunner().run(process.execPath, ['-e', invalidScript], {
+          timeoutMs, outputStore: new FileToolOutputStore(invalidRoot),
+        }), (error: unknown) => (error as NodeJS.ErrnoException).code === 'ERR_OUT_OF_RANGE');
+        assert.equal(existsSync(invalidMarker), false, `invalid timeout ${String(timeoutMs)} launches no child`);
+        assert.equal(existsSync(invalidRoot), false, `invalid timeout ${String(timeoutMs)} prepares no capture`);
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('matches execFile actual-result precedence for handled timeout, genuine abort, and late abort', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-process-truth-'));
+    const code = (error: unknown): unknown => (error as NodeJS.ErrnoException).code;
+    try {
+      for (const mode of ['ordinary', 'captured'] as const) {
+        const root = path.join(directory, `${mode}-timeout-zero-exit`);
+        const runner = new NodeProcessRunner();
+        const result = await runner.run(process.execPath, ['-e', "process.on('SIGTERM', () => { process.stdout.write('TIMEOUT-HANDLED'); process.exit(0); }); setInterval(() => {}, 1000)"], {
+          timeoutMs: 300, ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
+        });
+        assert.equal(result.exitCode, 0, `${mode}: a handled timeout signal with exit 0 is successful`);
+        if (mode === 'captured') {
+          assert.equal(result.captureStatus, 'partial', 'deadline-closed streams cannot advertise a complete artifact');
+          assert.equal(result.output, undefined);
+        }
+      }
+
+      for (const mode of ['ordinary', 'captured'] as const) {
+        const root = path.join(directory, `${mode}-timeout-nonzero-exit`);
+        await assert.rejects(new NodeProcessRunner().run(process.execPath, ['-e', "process.on('SIGTERM', () => process.exit(9)); setInterval(() => {}, 1000)"], {
+          timeoutMs: 300, ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
+        }), (error: unknown) => {
+          const value = error as NodeJS.ErrnoException & { readonly output?: { readonly outcome?: unknown } };
+          assert.equal(value.code, 'ETIMEDOUT');
+          if (mode === 'captured') {
+            assert.equal((value as NodeJS.ErrnoException & { readonly captureStatus?: unknown }).captureStatus, 'partial');
+            assert.equal(value.output, undefined);
+          }
+          return true;
+        });
+      }
+
+      for (const mode of ['ordinary', 'captured'] as const) {
+        const controller = new AbortController();
+        const root = path.join(directory, `${mode}-abort-zero-exit`);
+        const pending = new NodeProcessRunner().run(process.execPath, ['-e', "process.on('SIGTERM', () => { process.stdout.write('ABORT-HANDLED'); process.exit(0); }); setInterval(() => {}, 1000)"], {
+          timeoutMs: 5_000, signal: controller.signal,
+          ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
+        });
+        setTimeout(() => controller.abort(), 100);
+        await assert.rejects(pending, (error: unknown) => {
+          const value = error as NodeJS.ErrnoException & { readonly output?: { readonly outcome?: unknown } };
+          assert.equal(code(error), 'ABORT_ERR');
+          if (mode === 'captured') {
+            assert.equal((value as NodeJS.ErrnoException & { readonly captureStatus?: unknown }).captureStatus, 'partial');
+            assert.equal(value.output, undefined);
+          }
+          return true;
+        });
+      }
+
+      for (const mode of ['ordinary', 'captured'] as const) {
+        const controller = new AbortController();
+        const root = path.join(directory, `${mode}-late-abort`);
+        const script = [
+          "const { spawn } = require('node:child_process');",
+          `spawn(process.execPath, ['-e', "setTimeout(() => process.stdout.write('LATE-PIPE-DONE'), 250)"], { stdio: 'inherit' });`,
+          'process.exit(0);',
+        ].join(' ');
+        const pending = new NodeProcessRunner().run(process.execPath, ['-e', script], {
+          timeoutMs: 5_000, signal: controller.signal,
+          ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
+        });
+        setTimeout(() => controller.abort(), 75);
+        const result = await pending;
+        assert.equal(result.exitCode, 0, `${mode}: late abort after direct exit cannot change successful child truth`);
+        assert.match(result.stdout, /LATE-PIPE-DONE/);
+        if (mode === 'captured') assert.equal(result.output?.outcome, 'passed');
+      }
+
+      for (const mode of ['ordinary', 'captured'] as const) {
+        const controller = new AbortController();
+        const root = path.join(directory, `${mode}-late-abort-nonzero`);
+        const script = [
+          "const { spawn } = require('node:child_process');",
+          `spawn(process.execPath, ['-e', "setTimeout(() => process.stdout.write('LATE-NONZERO-DONE'), 250)"], { stdio: 'inherit' });`,
+          'process.exit(17);',
+        ].join(' ');
+        const pending = new NodeProcessRunner().run(process.execPath, ['-e', script], {
+          timeoutMs: 5_000, signal: controller.signal,
+          ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
+        });
+        setTimeout(() => controller.abort(), 75);
+        await assert.rejects(pending, (error: unknown) => {
+          const value = error as NodeJS.ErrnoException & { readonly output?: { readonly outcome?: unknown } };
+          assert.equal(code(error), 'ABORT_ERR');
+          if (mode === 'captured') assert.equal(value.output?.outcome, 'cancelled');
+          return true;
+        });
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('settles a successful genuine abort immediately even when the child handles SIGTERM slowly', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-abort-slow-handler-'));
+    try {
+      for (const mode of ['ordinary', 'captured'] as const) {
+        const controller = new AbortController();
+        const root = path.join(directory, mode);
+        const pending = new NodeProcessRunner().run(process.execPath, ['-e', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 1000)); process.stderr.write('ABORT-OBSERVED\\n'); setInterval(() => {}, 1000)"], {
+          timeoutMs: 2_000,
+          signal: controller.signal,
+          ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
+        });
+        const startedAt = Date.now();
+        setTimeout(() => controller.abort(), 100);
+        await assert.rejects(pending, (error: unknown) => {
+          assert.equal((error as NodeJS.ErrnoException).code, 'ABORT_ERR');
+          if (mode === 'captured') {
+            const value = error as NodeJS.ErrnoException & { readonly captureStatus?: unknown; readonly output?: unknown;
+              readonly captureObservation?: { readonly status?: unknown; readonly diagnostics?: readonly string[] } };
+            assert.equal(value.captureStatus, 'partial');
+            assert.equal(value.captureObservation?.status, 'partial');
+            assert.ok(value.captureObservation?.diagnostics?.some((line) => line.includes('ABORT-OBSERVED')));
+            assert.equal(value.output, undefined);
+          }
+          return true;
+        });
+        const elapsedMs = Date.now() - startedAt;
+        assert.ok(elapsedMs < 650, `${mode}: successful abort kill settles without waiting for the child close (observed ${elapsedMs}ms)`);
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('does not terminate before spawn admission and lets the spawn event reconsider an aborted signal', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-abort-spawn-admission-'));
+    const originalKill = ChildProcess.prototype.kill;
+    const invalidPidAttempts: Array<number | undefined> = [];
+    ChildProcess.prototype.kill = function safeObservedKill(signal?: NodeJS.Signals | number): boolean {
+      const pid = this.pid;
+      if (!Number.isSafeInteger(pid) || (pid as number) <= 0) {
+        invalidPidAttempts.push(pid);
+        return false;
+      }
+      return originalKill.call(this, signal);
+    };
+    try {
+      const missingExecutable = path.join(directory, 'missing-command');
+      const missingController = new AbortController();
+      const missingError = await new NodeProcessRunner().run(missingExecutable, [], {
+        timeoutMs: 2_000,
+        signal: missingController.signal,
+        outputStore: new FileToolOutputStore(path.join(directory, 'missing-evidence')),
+        beforeSpawn: () => missingController.abort(),
+      }).then(
+        () => undefined,
+        (failure: unknown) => failure,
+      );
+
+      const marker = path.join(directory, 'spawned-child-ran');
+      const controller = new AbortController();
+      const spawnedResult = await new NodeProcessRunner().run(process.execPath, ['-e', `setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran'); process.exit(0); }, 300)`], {
+        timeoutMs: 2_000,
+        signal: controller.signal,
+        outputStore: new FileToolOutputStore(path.join(directory, 'spawned-evidence')),
+        beforeSpawn: () => controller.abort(),
+      }).then(
+        (result) => ({ result }),
+        (error: unknown) => ({ error }),
+      );
+      assert.deepEqual(invalidPidAttempts, [], 'manual termination is never attempted until spawn supplies a valid PID');
+      assert.equal((missingError as NodeJS.ErrnoException | undefined)?.code, 'ABORT_ERR', 'current abort state takes precedence over captured failed spawn');
+      const missingValue = missingError as NodeJS.ErrnoException & { readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown } };
+      assert.equal(missingValue.captureStatus, 'unavailable');
+      assert.equal(missingValue.captureObservation?.status, 'unavailable');
+      const value = 'error' in spawnedResult ? spawnedResult.error as NodeJS.ErrnoException & { readonly captureStatus?: unknown; readonly output?: unknown } : undefined;
+      assert.equal(value?.code, 'ABORT_ERR', 'the successful spawn event reconsiders an abort raised before child creation');
+      assert.equal(value?.captureStatus, 'partial');
+      assert.equal(value?.output, undefined);
+      assert.equal(existsSync(marker), false, 'the child is terminated before its delayed side effect');
+    } finally {
+      ChildProcess.prototype.kill = originalKill;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves uninstrumented missing-executable errors with and without a synchronous abort', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-missing-executable-smoke-'));
+    const missingExecutable = path.join(directory, 'missing-command');
+    try {
+      await assert.rejects(new NodeProcessRunner().run(missingExecutable, [], { timeoutMs: 2_000 }), (error: unknown) => {
+        assert.equal((error as NodeJS.ErrnoException).code, 'ENOENT');
+        return true;
+      });
+
+      const controller = new AbortController();
+      await assert.rejects(new NodeProcessRunner().run(missingExecutable, [], {
+        timeoutMs: 2_000,
+        signal: controller.signal,
+        beforeSpawn: () => controller.abort(),
+      }), (error: unknown) => {
+        assert.equal((error as NodeJS.ErrnoException).code, 'ABORT_ERR');
+        return true;
+      });
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 });

@@ -89,6 +89,20 @@ function attachCapture(error: unknown, summary: FinishedCapture): unknown {
   return error;
 }
 
+function validateCapturedTimeout(timeoutMs: number | null | undefined): void {
+  if (timeoutMs == null) return;
+  if (!Number.isInteger(timeoutMs)) {
+    throw Object.assign(new RangeError(`The value of "timeout" is out of range. It must be an integer. Received ${String(timeoutMs)}`), {
+      code: 'ERR_OUT_OF_RANGE',
+    });
+  }
+  if (timeoutMs < 0) {
+    throw Object.assign(new RangeError(`The value of "timeout" is out of range. It must be >= 0. Received ${String(timeoutMs)}`), {
+      code: 'ERR_OUT_OF_RANGE',
+    });
+  }
+}
+
 /** Production process boundary. Commands are always an executable plus args. */
 export class NodeProcessRunner implements ProcessRunner {
   private readonly outputPolicy: ToolOutputPolicy | undefined;
@@ -98,7 +112,10 @@ export class NodeProcessRunner implements ProcessRunner {
   }
 
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
-    if (options.outputStore !== undefined) return await this.runCaptured(file, args, options);
+    if (options.outputStore !== undefined) {
+      validateCapturedTimeout(options.timeoutMs);
+      return await this.runCaptured(file, args, options);
+    }
     return await new Promise<ProcessResult>((resolve, reject) => {
       let settled = false;
       let stdinError: unknown;
@@ -203,45 +220,84 @@ export class NodeProcessRunner implements ProcessRunner {
       let settled = false;
       let timedOut = false;
       let cancelled = false;
+      let directExitObserved = false;
+      let childSpawned = false;
+      let stdoutNaturalEof = child.stdout === null;
+      let stderrNaturalEof = child.stderr === null;
+      let captureForcedIncomplete = false;
+      let writerAborted = false;
       let stdinError: unknown;
       const stdoutDecoder = new StringDecoder('utf8');
       const stderrDecoder = new StringDecoder('utf8');
-      const kill = (): void => { try { child.kill('SIGTERM'); } catch { /* child truth is decided by close */ } };
-      const timer = setTimeout(() => { timedOut = true; kill(); }, options.timeoutMs);
-      const onAbort = (): void => { cancelled = true; kill(); };
-      options.signal?.addEventListener('abort', onAbort, { once: true });
-      if (options.signal?.aborted === true) onAbort();
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const kill = (): boolean => {
+        if (settled || !childSpawned || directExitObserved || !Number.isSafeInteger(child.pid) || child.pid! <= 0) return false;
+        try { return child.kill('SIGTERM'); }
+        catch (error) {
+          // Match child_process.execFile's treatment of a kill failure as a
+          // process error, while keeping it on the contained event path.
+          queueMicrotask(() => { if (!settled) child.emit('error', error as Error); });
+          return false;
+        }
+      };
+      const abandonWriter = (): void => {
+        if (captureForcedIncomplete) return;
+        captureForcedIncomplete = true;
+        if (!writerAborted && writer !== undefined) {
+          writerAborted = true;
+          try { writer.abort?.(); } catch { /* forced pipe closure cannot escape */ }
+        }
+      };
+      const closeUnfinishedPipes = (): void => {
+        if (stdoutNaturalEof && stderrNaturalEof) return;
+        abandonWriter();
+        if (!stdoutNaturalEof) { try { child.stdout?.destroy(); } catch { /* settlement continues */ } }
+        if (!stderrNaturalEof) { try { child.stderr?.destroy(); } catch { /* settlement continues */ } }
+      };
       const capture = (channel: 'stdout' | 'stderr', chunk: Buffer, decoder: StringDecoder): void => {
         const text = decoder.write(chunk);
-        if (text !== '') session.write(writer, channel, text);
+        if (text !== '') session.write(captureForcedIncomplete ? undefined : writer, channel, text);
       };
       child.stdout?.on('data', (chunk: Buffer) => capture('stdout', chunk, stdoutDecoder));
       child.stderr?.on('data', (chunk: Buffer) => capture('stderr', chunk, stderrDecoder));
+      child.stdout?.once('end', () => { stdoutNaturalEof = true; });
+      child.stderr?.once('end', () => { stderrNaturalEof = true; });
       child.stdin?.on('error', (error) => { stdinError ??= error; });
+      child.once('spawn', () => {
+        childSpawned = true;
+        if (options.signal?.aborted === true) onAbort();
+      });
+      child.once('exit', () => { directExitObserved = true; });
       child.once('error', (error) => {
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
         options.signal?.removeEventListener('abort', onAbort);
         if (settled) return;
         settled = true;
-        try { writer?.abort?.(); } catch { /* spawn failure remains authoritative */ }
-        const summary = this.finishCapture(undefined, session);
-        reject(attachCapture(error, summary));
+        const aborted = options.signal?.aborted === true;
+        if (childSpawned) closeUnfinishedPipes();
+        else { try { writer?.abort?.(); } catch { /* spawn failure remains authoritative */ } }
+        const summary = this.finishCapture(childSpawned ? writer : undefined, session, aborted ? 'cancelled' : 'unknown', null, policy, captureForcedIncomplete);
+        const reported = aborted ? Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }) : error;
+        reject(attachCapture(reported, summary));
       });
       child.once('close', (rawCode, signal) => {
-        clearTimeout(timer);
+        if (timer !== undefined) clearTimeout(timer);
         options.signal?.removeEventListener('abort', onAbort);
         if (settled) return;
         settled = true;
         const stdoutFinal = stdoutDecoder.end();
         const stderrFinal = stderrDecoder.end();
-        if (stdoutFinal !== '') session.write(writer, 'stdout', stdoutFinal);
-        if (stderrFinal !== '') session.write(writer, 'stderr', stderrFinal);
+        if (stdoutFinal !== '') session.write(captureForcedIncomplete ? undefined : writer, 'stdout', stdoutFinal);
+        if (stderrFinal !== '') session.write(captureForcedIncomplete ? undefined : writer, 'stderr', stderrFinal);
         const exitCode = typeof rawCode === 'number' ? rawCode : null;
-        const outcome = cancelled || options.signal?.aborted === true ? 'cancelled' : timedOut ? 'timed_out' : exitCode === 0 ? 'passed' : exitCode === null ? 'unknown' : 'failed';
-        const summary = this.finishCapture(writer, session, outcome, exitCode, policy);
-        if (cancelled || options.signal?.aborted === true) {
+        const cleanZeroExit = exitCode === 0 && signal === null;
+        const cancelledError = cancelled || (!cleanZeroExit && options.signal?.aborted === true);
+        const timedOutError = !cleanZeroExit && timedOut;
+        const outcome = cancelledError ? 'cancelled' : timedOutError ? 'timed_out' : signal !== null || exitCode === null ? 'unknown' : exitCode !== 0 || stdinError !== undefined ? 'failed' : 'passed';
+        const summary = this.finishCapture(writer, session, outcome, exitCode, policy, captureForcedIncomplete);
+        if (cancelledError) {
           reject(attachCapture(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }), summary));
-        } else if (timedOut) {
+        } else if (timedOutError) {
           reject(attachCapture(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT' }), summary));
         } else if (signal !== null) {
           reject(attachCapture(Object.assign(new Error(`Command ${file} terminated by signal ${signal}.`), { code: null, signal }), summary));
@@ -254,6 +310,36 @@ export class NodeProcessRunner implements ProcessRunner {
           else resolve({ stdout: summary.stdout, stderr: summary.stderr, exitCode, ...(summary.output === undefined ? {} : { output: summary.output }), captureStatus: summary.captureStatus, captureObservation: summary.captureObservation });
         }
       });
+      if (options.timeoutMs != null && options.timeoutMs > 0) {
+        timer = setTimeout(() => {
+          timedOut = true;
+          closeUnfinishedPipes();
+          kill();
+        }, options.timeoutMs);
+      }
+      const onAbort = (): void => {
+        // AbortSignal intent after direct exit does not change its child truth.
+        if (directExitObserved) return;
+        if (kill()) {
+          cancelled = true;
+          closeUnfinishedPipes();
+          // execFile treats a successful abort kill as an immediate process
+          // error. Do not wait for a SIGTERM handler that can keep the child
+          // alive; incomplete streams have already been closed and purged.
+          if (settled) return;
+          settled = true;
+          if (timer !== undefined) clearTimeout(timer);
+          options.signal?.removeEventListener('abort', onAbort);
+          const stdoutFinal = stdoutDecoder.end();
+          const stderrFinal = stderrDecoder.end();
+          if (stdoutFinal !== '') session.write(captureForcedIncomplete ? undefined : writer, 'stdout', stdoutFinal);
+          if (stderrFinal !== '') session.write(captureForcedIncomplete ? undefined : writer, 'stderr', stderrFinal);
+          const summary = this.finishCapture(writer, session, 'cancelled', null, policy, captureForcedIncomplete);
+          reject(attachCapture(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }), summary));
+        }
+      };
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+      if (options.signal?.aborted === true) onAbort();
       try { child.stdin?.end(options.stdin); } catch (error) { stdinError ??= error; }
     });
   }
@@ -264,20 +350,22 @@ export class NodeProcessRunner implements ProcessRunner {
     outcome: ToolOutputEnvelope['outcome'] = 'unknown',
     exitCode: number | null = null,
     policy: ToolOutputPolicy = DEFAULT_TOOL_OUTPUT_POLICY,
+    forcedIncomplete = false,
   ): FinishedCapture {
-    const result = session.finish(writer);
-    const captureObservation = { status: result.status, stdout: result.stdout, stderr: result.stderr,
+    const result = session.finish(forcedIncomplete ? undefined : writer);
+    const status = forcedIncomplete && writer !== undefined ? 'partial' : result.status;
+    const captureObservation = { status, stdout: result.stdout, stderr: result.stderr,
       diagnostics: result.diagnostics, diagnosticsTruncated: result.diagnosticsTruncated } as const;
-    if (result.status === 'complete' && result.capture !== undefined) {
+    if (!forcedIncomplete && result.status === 'complete' && result.capture !== undefined) {
       return {
         output: boundToolOutputFromCapture({ outcome, exitCode, capture: result.capture, policy }),
         stdout: result.stdout.preview,
         stderr: result.stderr.preview,
-        captureStatus: result.status,
+        captureStatus: status,
         captureObservation,
       };
     }
-    return { stdout: result.stdout.preview, stderr: result.stderr.preview, captureStatus: result.status, captureObservation };
+    return { stdout: result.stdout.preview, stderr: result.stderr.preview, captureStatus: status, captureObservation };
   }
 
   private result(stdout: string, stderr: string, exitCode: number, options: ProcessRunOptions): ProcessResult {

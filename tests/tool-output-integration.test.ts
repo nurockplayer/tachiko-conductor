@@ -23,7 +23,7 @@ describe('bounded output integration', () => {
     assert.equal(result.output?.artifact.stdoutBytes, 20_000);
   });
 
-  it('keeps bounded timeout evidence available to the caller', async () => {
+  it('keeps bounded partial timeout observations when the deadline closes output pipes', async () => {
     const store = new InMemoryToolOutputStore();
     await assert.rejects(
       new NodeProcessRunner().run(
@@ -32,10 +32,13 @@ describe('bounded output integration', () => {
         { timeoutMs: 200, outputStore: store },
       ),
       (error: unknown) => {
-        const value = error as { readonly code?: unknown; readonly output?: { readonly outcome?: unknown; readonly diagnostics?: readonly string[] } };
+        const value = error as { readonly code?: unknown; readonly output?: unknown; readonly captureStatus?: unknown;
+          readonly captureObservation?: { readonly status?: unknown; readonly diagnostics?: readonly string[] } };
         assert.equal(value.code, 'ETIMEDOUT');
-        assert.equal(value.output?.outcome, 'timed_out');
-        assert.ok(value.output?.diagnostics?.some((line) => line.includes('timeout evidence')));
+        assert.equal(value.captureStatus, 'partial');
+        assert.equal(value.captureObservation?.status, 'partial');
+        assert.equal(value.output, undefined, 'the force-closed transcript cannot be advertised as a complete artifact');
+        assert.ok(value.captureObservation?.diagnostics?.some((line) => line.includes('timeout evidence')));
         return true;
       },
     );
@@ -170,6 +173,63 @@ describe('bounded output integration', () => {
       { timeoutMs: 5_000, outputStore: new FileToolOutputStore(directory) });
       assert.equal(result.output?.stdout.bytes, 4);
       assert.equal(readToolOutput(result.output!, new FileToolOutputStore(directory), { channel: 'stdout', offset: 0, length: 1 }).text, '😀');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('closes inherited pipes at a positive deadline without confusing child success and capture completeness', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-inherited-pipe-deadline-'));
+    const childHoldingPipe = (holdMs: number, emit = true): string => {
+      const descendant = emit
+        ? `setTimeout(() => { process.stdout.write('DESCENDANT-EOF-MARKER'); process.stderr.write('DESCENDANT-ERR-MARKER'); }, ${holdMs})`
+        : `setTimeout(() => {}, ${holdMs})`;
+      return `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'inherit' }); process.stdout.write('PARENT-OUT'); process.stderr.write('PARENT-ERR'); setImmediate(() => process.exit(0));`;
+    };
+    try {
+      for (const mode of ['ordinary', 'captured'] as const) {
+        const evidenceRoot = path.join(directory, `${mode}-deadline`);
+        const startedAt = Date.now();
+        const result = await new NodeProcessRunner().run(process.execPath, ['-e', childHoldingPipe(850, false)], {
+          timeoutMs: 250,
+          ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(evidenceRoot) } : {}),
+        });
+        const elapsedMs = Date.now() - startedAt;
+        assert.equal(result.exitCode, 0, `${mode}: direct child completed successfully before its descendant released inherited pipes`);
+        assert.ok(elapsedMs < 650, `${mode}: unfinished inherited pipes settle near the positive deadline (observed ${elapsedMs}ms)`);
+        if (mode === 'captured') {
+          assert.equal(result.captureStatus, 'partial', 'forced pipe closure cannot claim complete capture');
+          assert.equal(result.captureObservation?.status, 'partial');
+          assert.ok(result.captureObservation?.stdout.bytes > 0);
+          assert.ok(result.captureObservation?.stdout.preview.includes('PARENT-OUT'));
+          assert.ok(result.captureObservation?.stderr.bytes > 0);
+          assert.ok(result.captureObservation?.stderr.preview.includes('PARENT-ERR'));
+          assert.equal(result.output, undefined, 'a forced incomplete capture cannot publish a complete artifact');
+          assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [], 'incomplete durable streams are purged');
+        }
+      }
+
+      const lateAbortRoot = path.join(directory, 'late-abort-natural-drain');
+      const lateAbort = new AbortController();
+      const lateAbortPromise = new NodeProcessRunner().run(process.execPath, ['-e', childHoldingPipe(400)], {
+        timeoutMs: 2_000, signal: lateAbort.signal, outputStore: new FileToolOutputStore(lateAbortRoot),
+      });
+      setTimeout(() => lateAbort.abort(), 150);
+      const lateAbortResult = await lateAbortPromise;
+      assert.equal(lateAbortResult.exitCode, 0);
+      assert.equal(lateAbortResult.captureStatus, 'complete', 'late abort does not destroy pipes before their natural EOF');
+      assert.equal(lateAbortResult.output?.outcome, 'passed');
+      assert.equal(readToolOutput(lateAbortResult.output!, new FileToolOutputStore(lateAbortRoot), {
+        channel: 'stdout', offset: 0, length: 128,
+      }).text, 'PARENT-OUTDESCENDANT-EOF-MARKER');
+
+      const naturalEofRoot = path.join(directory, 'natural-eof-before-deadline');
+      const naturalEof = await new NodeProcessRunner().run(process.execPath, ['-e', childHoldingPipe(150)], {
+        timeoutMs: 1_000, outputStore: new FileToolOutputStore(naturalEofRoot),
+      });
+      assert.equal(naturalEof.exitCode, 0);
+      assert.equal(naturalEof.captureStatus, 'complete', 'natural EOF observed before the timer remains complete');
+      assert.equal(readToolOutput(naturalEof.output!, new FileToolOutputStore(naturalEofRoot), {
+        channel: 'stderr', offset: 0, length: 128,
+      }).text, 'PARENT-ERRDESCENDANT-ERR-MARKER');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
