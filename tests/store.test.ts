@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -8,8 +8,14 @@ import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
+import type { Run } from '../src/domain/types.js';
+import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
+import { isCurrentAccountPathApplicable } from '../src/account-home.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
-import { T0, TARGET, newRun, successResult, validationPassed } from './helpers.js';
+import type { ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
+import { ensureDurableDirectory, syncDirectory } from '../src/durable-directory.js';
+import { OPERATIONAL_RUN_PROJECTION_VERSION, operationalProjectionPath, operationalRunProjection, sha256 } from '../src/operational/projection.js';
+import { T0, TARGET, TEST_VALIDATION_AUTHORITY, changesRequested, newRun, successResult, validationFailed, validationPassed } from './helpers.js';
 
 const tmpDirs: string[] = [];
 const REPO_ROOT = path.resolve(import.meta.dirname, '..');
@@ -24,11 +30,38 @@ function waitForFile(filePath: string, timeoutMs = 5_000): void {
   }
 }
 
-
 function tempStore(): { store: JsonFileStore; dir: string } {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-'));
   tmpDirs.push(dir);
   return { store: new JsonFileStore({ dir }), dir };
+}
+
+function reverseObjectKeyOrder(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(reverseObjectKeyOrder);
+  if (typeof value !== 'object' || value === null) return value;
+  const reversed = Object.fromEntries(Object.keys(value).sort().reverse().map((key) => [key, reverseObjectKeyOrder((value as Record<string, unknown>)[key])]));
+  return reversed;
+}
+
+function casFixture(id: string): Run {
+  const run = {
+    ...newRun(id),
+    state: 'NEEDS_HUMAN' as const,
+    interruptedFrom: 'REVIEWING' as const,
+  };
+  Object.defineProperty(run, 'futureUnknown', {
+    configurable: true,
+    enumerable: true,
+    value: { metadata: { second: 2, first: 1 }, ordered: ['first', 'second'] },
+    writable: true,
+  });
+  Object.defineProperty(run, '__proto__', {
+    configurable: true,
+    enumerable: true,
+    value: { readerAcceptedFutureField: true },
+    writable: true,
+  });
+  return run as Run;
 }
 
 afterEach(() => {
@@ -38,10 +71,764 @@ afterEach(() => {
 });
 
 describe('JsonFileStore — persistence round-trips', () => {
+  it('rejects an external alias to canonical storage during store construction without creating through it', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-alias-'));
+    tmpDirs.push(home);
+    const runs = path.join(home, '.tachiko-conductor', 'runs');
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(home, 0o700);
+    chmodSync(path.join(home, '.tachiko-conductor'), 0o755);
+    chmodSync(runs, 0o755);
+    const alias = path.join(home, 'external-runs-alias');
+    symlinkSync(runs, alias, 'dir');
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      assert.throws(() => new JsonFileStore({ dir: alias }), /canonical account-home spelling/);
+      assert.equal(readdirSync(runs).length, 0, 'constructor rejection creates no files through the alias');
+      assert.equal(statSync(runs).mode & 0o777, 0o755);
+    } finally {
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('keeps independent temp stores usable and rejects one retargeted into canonical storage', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-retarget-home-'));
+    const externalRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-independent-temp-'));
+    tmpDirs.push(home, externalRoot);
+    const runs = path.join(home, '.tachiko-conductor', 'runs');
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const canonical = new JsonFileStore({ dir: runs });
+      const protectedRun = newRun('canonical-retarget-protected');
+      canonical.create(protectedRun);
+      const protectedBytes = readFileSync(path.join(runs, `${protectedRun.id}.json`), 'utf8');
+
+      const external = path.join(externalRoot, 'runs');
+      mkdirSync(external, { mode: 0o700 });
+      const independent = new JsonFileStore({ dir: external });
+      const independentRun = newRun('independent-temp-run');
+      independent.create(independentRun);
+      assert.equal(isCurrentAccountPathApplicable(external), false, 'ordinary platform temp storage remains independent');
+      assert.deepEqual(independent.read(independentRun.id), independentRun);
+
+      const preservedExternal = path.join(externalRoot, 'preserved-independent-runs');
+      renameSync(external, preservedExternal);
+      symlinkSync(runs, external, 'dir');
+      assert.throws(() => independent.read(independentRun.id), /canonical account-home spelling/);
+      assert.equal(readFileSync(path.join(runs, `${protectedRun.id}.json`), 'utf8'), protectedBytes,
+        'cached external-store rejection leaves canonical Run bytes unchanged');
+      assert.deepEqual(new JsonFileStore({ dir: preservedExternal }).read(independentRun.id), independentRun,
+        'the original independent data remains intact at its preserved path');
+    } finally {
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('rechecks canonical Run ancestry after the CAS callback and preserves committed bytes on unsafe drift', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-'));
+    tmpDirs.push(home);
+    const conductor = path.join(home, '.tachiko-conductor');
+    const runs = path.join(conductor, 'runs');
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(conductor, 0o755);
+    chmodSync(runs, 0o755);
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const initial = newRun('canonical-permission-cas');
+      const store = new JsonFileStore({ dir: runs });
+      store.create(initial);
+      const filePath = path.join(runs, `${initial.id}.json`);
+      const committed = readFileSync(filePath, 'utf8');
+      const candidate = { ...initial, updatedAt: '2026-09-27T00:00:01.000Z' };
+      const guarded = new JsonFileStore({ dir: runs, beforeConditionalWrite: () => chmodSync(runs, 0o777) });
+      assert.throws(() => guarded.updateIfUnchanged(initial, candidate), /Unsafe/);
+      assert.equal(readFileSync(filePath, 'utf8'), committed);
+      assert.equal(statSync(runs).mode & 0o777, 0o777);
+      chmodSync(runs, 0o755);
+    } finally {
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('rejects an unsafe Run before publishing or taking over its mutation lock', async () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-foreign-run-'));
+    tmpDirs.push(home);
+    const conductor = path.join(home, '.tachiko-conductor');
+    const runs = path.join(conductor, 'runs');
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(conductor, 0o755);
+    chmodSync(runs, 0o755);
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const initial = newRun('canonical-foreign-run');
+      const store = new JsonFileStore({ dir: runs });
+      store.create(initial);
+      const runPath = path.join(runs, `${initial.id}.json`);
+      const lockPath = `${runPath}.mutation.lock`;
+      const candidate = { ...initial, updatedAt: '2026-09-27T00:00:01.000Z' };
+      chmodSync(runPath, 0o666);
+      const runBytes = readFileSync(runPath);
+      const runBefore = statSync(runPath);
+      assert.throws(() => store.update(candidate), /Unsafe/);
+      assert.equal(existsSync(lockPath), false, 'unsafe Run must be rejected before publishing a lock');
+      assert.deepEqual(readFileSync(runPath), runBytes);
+      assert.equal(statSync(runPath).mode & 0o7777, runBefore.mode & 0o7777);
+      assert.equal(statSync(runPath).mtimeMs, runBefore.mtimeMs);
+
+      const staleChild = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60000)'], { stdio: 'ignore' });
+      await new Promise<void>((resolve, reject) => {
+        staleChild.once('spawn', resolve);
+        staleChild.once('error', reject);
+      });
+      const stalePid = staleChild.pid;
+      assert.ok(stalePid !== undefined);
+      staleChild.kill('SIGKILL');
+      await new Promise<void>((resolve) => staleChild.once('close', () => resolve()));
+      writeFileSync(lockPath, `${JSON.stringify({ nonce: `stale-${stalePid}`, pid: stalePid })}\n`, { mode: 0o600 });
+      chmodSync(lockPath, 0o600);
+      const lockBytes = readFileSync(lockPath);
+      const lockBefore = statSync(lockPath);
+      const entriesBefore = readdirSync(runs).sort();
+      assert.throws(() => store.update(candidate), /Unsafe/);
+      const lockAfter = statSync(lockPath);
+      assert.deepEqual(readFileSync(lockPath), lockBytes);
+      assert.equal(lockAfter.mode & 0o7777, lockBefore.mode & 0o7777);
+      assert.equal(lockAfter.mtimeMs, lockBefore.mtimeMs);
+      assert.deepEqual(readdirSync(runs).sort(), entriesBefore, 'unsafe Run must not create a takeover claim');
+    } finally {
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('publishes canonical Run JSON with a safe mode under umask 002', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-umask-'));
+    tmpDirs.push(home);
+    const conductor = path.join(home, '.tachiko-conductor');
+    const runs = path.join(conductor, 'runs');
+    const originalUserInfo = os.userInfo;
+    const originalUmask = process.umask(0o002);
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const store = new JsonFileStore({ dir: runs });
+      assert.equal(statSync(conductor).mode & 0o777, 0o700);
+      assert.equal(statSync(runs).mode & 0o777, 0o700);
+      const initial = newRun('canonical-umask-run');
+      store.create(initial);
+      const filePath = path.join(runs, `${initial.id}.json`);
+      assert.equal(statSync(filePath).mode & 0o777, 0o644);
+      store.update(applyTransition(initial, { type: 'start' }, T0));
+      assert.equal(statSync(filePath).mode & 0o777, 0o644);
+      store.read(initial.id);
+    } finally {
+      process.umask(originalUmask);
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('rejects a cached canonical Run store after its conductor root is retargeted', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-retarget-'));
+    tmpDirs.push(home);
+    const conductor = path.join(home, '.tachiko-conductor');
+    const runs = path.join(conductor, 'runs');
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(conductor, 0o755);
+    chmodSync(runs, 0o755);
+    const originalUserInfo = os.userInfo;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const store = new JsonFileStore({ dir: runs });
+      const run = newRun('cached-canonical-store');
+      store.create(run);
+      const committed = readFileSync(path.join(runs, `${run.id}.json`), 'utf8');
+      const preserved = path.join(home, 'preserved-conductor');
+      const alternate = path.join(home, 'alternate-conductor');
+      mkdirSync(alternate, { mode: 0o755 });
+      renameSync(conductor, preserved);
+      symlinkSync(alternate, conductor, 'dir');
+      assert.throws(() => store.read(run.id), /symlink.*wrong filesystem type/);
+      assert.equal(readFileSync(path.join(preserved, 'runs', `${run.id}.json`), 'utf8'), committed);
+      assert.equal(existsSync(path.join(alternate, 'runs')), false);
+      rmSync(conductor);
+      renameSync(preserved, conductor);
+    } finally {
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('normalizes a legacy persisted bootstrap to linked-worktree after restart', () => {
+    const { dir } = tempStore();
+    const legacy = { ...newRun('legacy-bootstrap'), bootstrap: {
+      owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+      baseBranch: 'main', baseSha: 'a'.repeat(40), branch: 'legacy', workspacePath: '/tmp/legacy-workspace',
+    } };
+    writeFileSync(path.join(dir, 'legacy-bootstrap.json'), JSON.stringify(legacy), 'utf8');
+    const restarted = new JsonFileStore({ dir }).read('legacy-bootstrap');
+    assert.equal(restarted?.bootstrap?.bootstrapKind, 'linked-worktree');
+  });
   it('persists a created run and reads it back intact', () => {
     const { store } = tempStore();
     store.create(newRun('r1'));
     assert.deepEqual(store.read('r1'), newRun('r1'));
+  });
+
+  it('rejects rewriting an existing history record even when its length is unchanged', () => {
+    const { store } = tempStore();
+    const initial = newRun('history-immutable');
+    store.create(initial);
+    const started = applyTransition(initial, { type: 'start' }, T0);
+    store.update(started);
+    const rewritten = {
+      ...started,
+      history: started.history.map((event, index) => index === 0 ? { ...event, reason: 'forged same-length history' } : event),
+    };
+    assert.throws(() => store.update(rewritten), /Run history is append-only/);
+    assert.equal(store.read(initial.id)?.history[0]?.reason, undefined);
+  });
+
+  it('syncs Run files before rename and reports uncertain parent-sync failures without rolling back visible bytes', () => {
+    const { dir } = tempStore();
+    const initial = newRun('durability-run');
+    new JsonFileStore({ dir }).create(initial);
+    const filePath = path.join(dir, `${initial.id}.json`);
+    const originalBytes = readFileSync(filePath, 'utf8');
+    const next = applyTransition(initial, { type: 'start' }, T0);
+
+    const preRenameFailure = new JsonFileStore({ dir, syncForDurability: (_fd, target) => {
+      if (target === 'file') throw new Error('injected Run file sync failure');
+    } });
+    assert.throws(() => preRenameFailure.update(next), /Run file sync failure/);
+    assert.equal(readFileSync(filePath, 'utf8'), originalBytes, 'pre-rename failure preserves destination bytes');
+    assert.equal(readdirSync(dir).some((name) => name.startsWith(`${initial.id}.json.`) && name.endsWith('.tmp')), false, 'pre-rename failure removes only the attempt temp');
+
+    const postRenameFailure = new JsonFileStore({ dir, syncForDurability: (_fd, target) => {
+      if (target === 'directory') throw new Error('injected Run parent sync failure');
+    } });
+    assert.throws(() => postRenameFailure.update(next), /Run parent sync failure/);
+    const durableNext = new JsonFileStore({ dir }).read(initial.id);
+    assert.equal(durableNext?.state, next.state, 'post-rename failure preserves the visible committed candidate');
+    assert.equal(durableNext?.history.at(-1)?.type, 'start');
+    const projection = JSON.parse(readFileSync(operationalProjectionPath(dir, initial.id), 'utf8')) as { sourceDigest: string };
+    assert.equal(projection.sourceDigest, sha256(originalBytes), 'projection remains at the last confirmed durable Run write');
+
+    if (durableNext === null) throw new Error('expected durable Run after rename');
+    const casNext = { ...durableNext, updatedAt: '2026-09-24T00:00:01.000Z' };
+    assert.throws(() => postRenameFailure.updateIfUnchanged(durableNext, casNext), /Run parent sync failure/);
+    assert.equal(new JsonFileStore({ dir }).read(initial.id)?.updatedAt, casNext.updatedAt, 'CAS durability uncertainty is thrown, never reported as mismatch');
+  });
+
+  it('does not admit or project a Run when create file sync fails, and preserves unrelated temp files', () => {
+    const { dir } = tempStore();
+    const run = newRun('create-sync-failure');
+    const unrelatedTemp = path.join(dir, `${run.id}.json.other-attempt.tmp`);
+    writeFileSync(unrelatedTemp, 'preserve this unrelated temp');
+    const store = new JsonFileStore({ dir, syncForDurability: (_fd, target) => {
+      if (target === 'file') throw new Error('injected create file sync failure');
+    } });
+
+    assert.throws(() => store.create(run), /create file sync failure/);
+    assert.equal(existsSync(path.join(dir, `${run.id}.json`)), false, 'failed pre-admission create leaves no Run destination');
+    assert.equal(existsSync(operationalProjectionPath(dir, run.id)), false, 'failed pre-admission create emits no projection');
+    assert.deepEqual(readdirSync(dir).filter((name) => name.startsWith(`${run.id}.json.`) && name.endsWith('.tmp')), [path.basename(unrelatedTemp)]);
+  });
+
+  it('does not make a fresh Run store available until each visible hierarchy edge can be synced', () => {
+    const { dir } = tempStore();
+    const runsDir = path.join(dir, 'runs', 'nested');
+    const failedParent = path.join(dir, 'runs');
+    const observedParents: string[] = [];
+    let fail = true;
+    const syncHierarchy = (parent: string) => {
+      observedParents.push(parent);
+      if (fail && parent === failedParent) throw new Error('injected Run hierarchy sync failure');
+      syncDirectory(parent);
+    };
+
+    assert.throws(() => new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy }), /Run hierarchy sync failure/);
+    assert.equal(existsSync(runsDir), true, 'created directories remain visible after uncertain parent sync');
+    assert.equal(existsSync(path.join(runsDir, 'run.json')), false);
+    assert.equal(observedParents.at(-1), failedParent);
+
+    observedParents.length = 0;
+    assert.throws(() => new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy }), /Run hierarchy sync failure/);
+    assert.equal(observedParents.at(-1), failedParent, 'retry re-syncs the parent even though the child is already visible');
+
+    fail = false;
+    const store = new JsonFileStore({ dir: runsDir, syncDirectoryHierarchy: syncHierarchy });
+    store.create(newRun('durable-tree-run'));
+    assert.equal(store.read('durable-tree-run')?.id, 'durable-tree-run');
+  });
+
+  it('validates store options before hierarchy creation and rejects regular-file path components before Run publication', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-hierarchy-shape-'));
+    tmpDirs.push(directory);
+    const invalidOptionsDir = path.join(directory, 'invalid-options', 'runs');
+    let hierarchySyncs = 0;
+    assert.throws(() => new JsonFileStore({
+      dir: invalidOptionsDir,
+      mutationLockTimeoutMs: -1,
+      syncDirectoryHierarchy: () => { hierarchySyncs += 1; },
+    }), /mutationLockTimeoutMs/);
+    assert.equal(existsSync(path.dirname(invalidOptionsDir)), false, 'invalid options do not create a partial hierarchy');
+    assert.equal(hierarchySyncs, 0, 'invalid options do not sync hierarchy edges');
+
+    const blocker = path.join(directory, 'regular-file');
+    writeFileSync(blocker, 'preserve this file');
+    const blockedDir = path.join(blocker, 'nested-runs');
+    const run = newRun('blocked-hierarchy-run');
+    assert.throws(() => new JsonFileStore({ dir: blockedDir }));
+    assert.equal(readFileSync(blocker, 'utf8'), 'preserve this file', 'the existing regular file is preserved');
+    assert.equal(existsSync(path.join(blockedDir, `${run.id}.json`)), false, 'no Run destination is published');
+    assert.equal(existsSync(operationalProjectionPath(blockedDir, run.id)), false, 'no operational projection is published');
+  });
+
+  it('syncs the containing parent in order for every absolute directory component', () => {
+    const { dir } = tempStore();
+    const target = path.join(dir, 'outer', 'middle', 'leaf');
+    const parents: string[] = [];
+    const root = path.parse(target).root;
+    let componentPath = root;
+    const expectedParents = target.slice(root.length).split(path.sep).filter(Boolean).map((component) => {
+      const parent = componentPath;
+      componentPath = path.join(componentPath, component);
+      return parent;
+    });
+    ensureDurableDirectory(target, { syncDirectoryHierarchy: (parent) => { parents.push(parent); syncDirectory(parent); } });
+    assert.deepEqual(parents, expectedParents);
+  });
+
+  it('writes a secret-free operational projection bound to the committed raw bytes', () => {
+    const { store, dir } = tempStore();
+    let run = applyTransition(newRun('projected'), { type: 'start' }, T0);
+    run = applyTransition(run, {
+      type: 'bootstrap_prepared',
+      bootstrap: {
+        bootstrapKind: 'linked-worktree',
+        owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+        baseBranch: 'main', baseSha: 'base-sha', branch: 'codex/projected', workspacePath: '/tmp/projected',
+      },
+    }, T0);
+    run = applyTransition(run, {
+      type: 'agent_succeeded',
+      agentResult: { ...successResult('head-sha'), executor: { provider: 'codex-cli', sessionId: 'secret-session' } },
+      pullRequest: { number: 7, headSha: 'head-sha' },
+    }, T0);
+    store.create(run);
+
+    const raw = readFileSync(path.join(dir, 'projected.json'), 'utf8');
+    const projection = JSON.parse(readFileSync(operationalProjectionPath(dir, 'projected'), 'utf8')) as Record<string, unknown>;
+    assert.equal(projection.schemaVersion, OPERATIONAL_RUN_PROJECTION_VERSION);
+    assert.equal(projection.sourceDigest, sha256(raw));
+    assert.equal(projection.workflowState, 'VALIDATING');
+    assert.deepEqual(projection.target, { owner: 'acme', repo: 'widgets', issueNumber: 42 });
+    assert.deepEqual(projection.bootstrap, { workspacePath: '/tmp/projected', branch: 'codex/projected', baseBranch: 'main', baseSha: 'base-sha' });
+    assert.deepEqual(projection.executor, { provider: 'codex-cli' });
+    assert.equal(JSON.stringify(projection).includes('secret-session'), false);
+  });
+
+  it('marks only an active review-repair implementation for bounded live-head correlation', () => {
+    const run = {
+      ...newRun('review-fix-projection'),
+      state: 'IMPLEMENTING' as const,
+      history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 }],
+    };
+    assert.equal(operationalRunProjection(run, '{}').reviewFixActive, true);
+    assert.equal(operationalRunProjection(newRun('not-a-review-fix'), '{}').reviewFixActive, undefined);
+  });
+
+  it('rejects orphaned or mismatched new-format repair admission markers on JSON read', () => {
+    const { store, dir } = tempStore();
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const predecessor = {
+      ...newRun('orphan-repair-marker'), state: 'IMPLEMENTING' as const, headSha: 'head-sha',
+      pullRequest: { number: 7, headSha: 'head-sha' }, repairTaskShapeAuthority: authority,
+      reviewResult: { verdict: 'request_changes' as const, reviewerName: 'reviewer', headSha: 'head-sha', findings: [] },
+    };
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+    const binding = createRepairAttemptBinding(predecessor, execution);
+    const valid = {
+      ...predecessor,
+      history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0, repairAdmissionIndex: 0 }],
+      repairAdmissions: [{ ...receipt, attemptBinding: binding }],
+    };
+    store.create(valid);
+    const file = path.join(dir, 'orphan-repair-marker.json');
+    for (const damage of [
+      (json: Record<string, any>) => { delete json.repairAdmissions[0].attemptBinding; },
+      (json: Record<string, any>) => { json.history[0].repairAdmissionIndex = 1; },
+    ]) {
+      const json = JSON.parse(readFileSync(file, 'utf8')) as Record<string, any>;
+      damage(json);
+      writeFileSync(file, JSON.stringify(json), 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(valid.id), /corrupt or incompatible/);
+      writeFileSync(file, JSON.stringify(valid), 'utf8');
+    }
+  });
+
+  it('replays every repair handoff against the exact previous executor identity', () => {
+    const { store, dir } = tempStore();
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const predecessor = { provider: 'codex-app-server', sessionId: 'session-A', generation: 'run-generation' } as const;
+    let run = newRun('repair-handoff-ledger-replay');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('head-sha'), headSha: 'head-sha' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('head-sha'), pullRequest: { number: 7, headSha: 'head-sha' } }, T0);
+    run = {
+      ...run, repairTaskShapeAuthority: authority,
+      executor: predecessor,
+      agentResult: { ...run.agentResult!, executor: predecessor, sessionId: predecessor.sessionId },
+    };
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'head-sha') }, T0, TEST_VALIDATION_AUTHORITY);
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+    const binding = createRepairAttemptBinding(run, execution);
+    assert.equal(binding.freshExecutor, false);
+    run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+    const preHandoff = { ...run, id: 'generationless-appserver-active-binding' };
+    store.create(preHandoff);
+    const preHandoffFile = path.join(dir, `${preHandoff.id}.json`);
+    const preHandoffOriginal = readFileSync(preHandoffFile, 'utf8');
+    const generationlessAdmission = JSON.parse(preHandoffOriginal) as Record<string, any>;
+    delete generationlessAdmission.repairAdmissions[0].attemptBinding.predecessorExecutor.generation;
+    const generationlessBytes = JSON.stringify(generationlessAdmission);
+    writeFileSync(preHandoffFile, generationlessBytes, 'utf8');
+    assert.throws(() => new JsonFileStore({ dir }).read(preHandoff.id), /corrupt or incompatible/,
+      'an active nonfresh App Server admission without a generation is invalid even before handoff');
+    assert.equal(readFileSync(preHandoffFile, 'utf8'), generationlessBytes, 'rejected pre-handoff admission bytes remain unchanged');
+    writeFileSync(preHandoffFile, preHandoffOriginal, 'utf8');
+    const predecessorContradictions = [
+      {
+        label: 'Run executor session changed before first handoff',
+        change: (json: Record<string, any>) => { json.executor.sessionId = 'session-B'; },
+      },
+      {
+        label: 'coherent Run and result session changed before first handoff',
+        change: (json: Record<string, any>) => {
+          json.executor.sessionId = 'session-B';
+          json.agentResult.executor.sessionId = 'session-B';
+          json.agentResult.sessionId = 'session-B';
+        },
+      },
+      {
+        label: 'result-only executor replaced before first handoff',
+        change: (json: Record<string, any>) => {
+          delete json.executor;
+          json.agentResult.executor.sessionId = 'session-B';
+          json.agentResult.sessionId = 'session-B';
+        },
+      },
+      {
+        label: 'coherent Run and result generation changed before first handoff',
+        change: (json: Record<string, any>) => {
+          json.executor.generation = 'generation-B';
+          json.agentResult.executor.generation = 'generation-B';
+        },
+      },
+      {
+        label: 'coherent Run and result generation removed before first handoff',
+        change: (json: Record<string, any>) => {
+          delete json.executor.generation;
+          delete json.agentResult.executor.generation;
+        },
+      },
+    ];
+    for (const contradiction of predecessorContradictions) {
+      const altered = JSON.parse(preHandoffOriginal) as Record<string, any>;
+      contradiction.change(altered);
+      const corruptedBytes = JSON.stringify(altered);
+      writeFileSync(preHandoffFile, corruptedBytes, 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(preHandoff.id), /corrupt or incompatible/, contradiction.label);
+      assert.equal(readFileSync(preHandoffFile, 'utf8'), corruptedBytes, `${contradiction.label}: rejected bytes remain unchanged`);
+    }
+    writeFileSync(preHandoffFile, preHandoffOriginal, 'utf8');
+    const exact = { ...successResult('fixed-sha'), executor: predecessor, sessionId: predecessor.sessionId };
+    run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: exact }, T0);
+    run = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: exact }, T0);
+    run = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: exact }, T0);
+    store.create(run);
+
+    const restarted = new JsonFileStore({ dir });
+    const replayed = restarted.read(run.id);
+    assert.equal(replayed?.history.length, run.history.length, 'exact logical codex-cli/App Server identity remains valid after restart');
+    assert.deepEqual(replayed?.history.map((event) => event.repairHandoff).filter(Boolean), run.history.map((event) => event.repairHandoff).filter(Boolean));
+    const file = path.join(dir, `${run.id}.json`);
+    const original = readFileSync(file, 'utf8');
+    const corruptions = [
+      {
+        label: 'session-only continuation substitution followed by a return to A',
+        eventType: 'repair_executor_continued',
+        change: (identity: Record<string, unknown>) => { identity.sessionId = 'session-B'; },
+      },
+      {
+        label: 'generation-only continuation change',
+        eventType: 'repair_executor_continued',
+        change: (identity: Record<string, unknown>) => { identity.generation = 'other-generation'; },
+      },
+      {
+        label: 'generation-only continuation removal',
+        eventType: 'repair_executor_continued',
+        change: (identity: Record<string, unknown>) => { delete identity.generation; },
+      },
+      {
+        label: 'first handoff session substitution followed by a return to A',
+        eventType: 'repair_executor_handoff',
+        change: (identity: Record<string, unknown>) => { identity.sessionId = 'session-B'; },
+      },
+      {
+        label: 'first handoff identity extra on valid App Server identity',
+        eventType: 'repair_executor_handoff',
+        change: (identity: Record<string, unknown>) => { identity.extra = true; },
+      },
+      {
+        label: 'continuation identity extra on valid App Server identity',
+        eventType: 'repair_executor_continued',
+        change: (identity: Record<string, unknown>) => { identity.extra = true; },
+      },
+    ];
+    for (const { label, eventType, change } of corruptions) {
+      const damaged = JSON.parse(original) as Record<string, any>;
+      const event = damaged.history.find((candidate: { type: string }) => candidate.type === eventType);
+      change(event.repairHandoff.outcome.identity);
+      const corruptBytes = JSON.stringify(damaged);
+      writeFileSync(file, corruptBytes, 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/, label);
+      assert.equal(readFileSync(file, 'utf8'), corruptBytes, 'rejected replay leaves persisted corrupt bytes untouched');
+    }
+    const missingCanonicalExecutor = JSON.parse(original) as Record<string, any>;
+    delete missingCanonicalExecutor.executor;
+    const missingCanonicalBytes = JSON.stringify(missingCanonicalExecutor);
+    writeFileSync(file, missingCanonicalBytes, 'utf8');
+    assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/,
+      'a post-handoff result carrier cannot substitute for the canonical Run executor');
+    assert.equal(readFileSync(file, 'utf8'), missingCanonicalBytes, 'rejected post-handoff history is never rewritten');
+    const generationless = JSON.parse(original) as Record<string, any>;
+    delete generationless.repairAdmissions[0].attemptBinding.predecessorExecutor.generation;
+    const invalidAdmissionBytes = JSON.stringify(generationless);
+    writeFileSync(file, invalidAdmissionBytes, 'utf8');
+    assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/, 'persisted generationless App Server binding is rejected on restart');
+    assert.equal(readFileSync(file, 'utf8'), invalidAdmissionBytes, 'rejected admission bytes remain untouched');
+    assert.equal(run.history.at(-1)?.repairHandoff?.outcome.kind, 'executor', 'replay rejection did not mutate the caller-owned history');
+    writeFileSync(file, original, 'utf8');
+  });
+
+  it('rejects active bound repair restarts missing their required authority or finding carrier without rewriting bytes', () => {
+    const { dir } = tempStore();
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const reviewRun = (() => {
+      const predecessor = {
+        ...newRun('bound-review-carrier'), state: 'IMPLEMENTING' as const, headSha: 'head-sha',
+        pullRequest: { number: 7, headSha: 'head-sha' }, repairTaskShapeAuthority: authority,
+        reviewResult: { verdict: 'request_changes' as const, reviewerName: 'reviewer', headSha: 'head-sha', findings: [] },
+      };
+      const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+      const binding = createRepairAttemptBinding(predecessor, execution);
+      return {
+        ...predecessor,
+        history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0, repairAdmissionIndex: 0 }],
+        repairAdmissions: [{ ...receipt, attemptBinding: binding }],
+      };
+    })();
+    const validationRun = (() => {
+      const predecessor = {
+        ...newRun('bound-validation-carrier'), state: 'IMPLEMENTING' as const, headSha: 'head-sha',
+        pullRequest: { number: 7, headSha: 'head-sha' }, repairTaskShapeAuthority: authority,
+        validationResult: validationFailed('head-sha'),
+      };
+      const receipt = createRepairAdmissionSnapshot(authority, 'validation_failed', 'head-sha', 7, execution, T0);
+      const binding = createRepairAttemptBinding(predecessor, execution);
+      return {
+        ...predecessor,
+        history: [{ type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0, repairAdmissionIndex: 0 }],
+        repairAdmissions: [{ ...receipt, attemptBinding: binding }],
+      };
+    })();
+    const store = new JsonFileStore({ dir });
+    for (const run of [reviewRun, validationRun]) store.create(run);
+    const cases = [
+      { id: reviewRun.id, label: 'task-shape authority', mutate: (json: Record<string, any>) => { delete json.repairTaskShapeAuthority; } },
+      { id: reviewRun.id, label: 'review finding', mutate: (json: Record<string, any>) => { delete json.reviewResult; } },
+      { id: validationRun.id, label: 'validation finding', mutate: (json: Record<string, any>) => { delete json.validationResult; } },
+    ];
+    for (const { id, label, mutate } of cases) {
+      const file = path.join(dir, `${id}.json`);
+      const json = JSON.parse(readFileSync(file, 'utf8')) as Record<string, any>;
+      mutate(json);
+      const bytes = JSON.stringify(json);
+      writeFileSync(file, bytes, 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(id), /corrupt or incompatible/, label);
+      assert.equal(readFileSync(file, 'utf8'), bytes, `${label}: failed restart read leaves bytes untouched`);
+    }
+  });
+
+  it('retains result-only predecessors, completed repair history, and legacy unbound start_fix records', () => {
+    const { store, dir } = tempStore();
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'codex-cli', timeoutMs: 30_000 };
+    const resultOnlyExecutor = { provider: 'codex-app-server', sessionId: 'result-only-session', generation: 'runtime-generation' } as const;
+
+    let resultOnly = newRun('valid-result-only-predecessor');
+    resultOnly = applyTransition(resultOnly, { type: 'start' }, T0);
+    resultOnly = applyTransition(resultOnly, {
+      type: 'agent_succeeded',
+      agentResult: { ...successResult('head-sha'), executor: resultOnlyExecutor, sessionId: resultOnlyExecutor.sessionId },
+      headSha: 'head-sha',
+    }, T0);
+    resultOnly = applyTransition(resultOnly, { type: 'validation_passed', validationResult: validationPassed('head-sha'), pullRequest: { number: 7, headSha: 'head-sha' } }, T0);
+    resultOnly = { ...resultOnly, executor: undefined, repairTaskShapeAuthority: authority };
+    resultOnly = applyTransition(resultOnly, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'head-sha') }, T0, TEST_VALIDATION_AUTHORITY);
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+    const binding = createRepairAttemptBinding(resultOnly, execution);
+    assert.equal(binding.predecessorExecutor?.sessionId, resultOnlyExecutor.sessionId);
+    resultOnly = applyTransition(resultOnly, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+    store.create(resultOnly);
+    assert.equal(JSON.stringify(new JsonFileStore({ dir }).read(resultOnly.id)), JSON.stringify(resultOnly),
+      'legacy result-only identity remains a valid predecessor on restart');
+
+    const completed = { ...applyTransition(resultOnly, {
+      type: 'agent_succeeded', agentResult: successResult('fixed-head'), headSha: 'fixed-head',
+      pullRequest: { number: 7, headSha: 'fixed-head' },
+    }, T0), id: 'completed-historical-repair' };
+    assert.equal(completed.state, 'VALIDATING');
+    assert.equal(completed.reviewResult, undefined, 'completed repair clears the old finding projection');
+    store.create(completed);
+
+    let legacy = newRun('legacy-unbound-start-fix');
+    legacy = applyTransition(legacy, { type: 'start' }, T0);
+    legacy = applyTransition(legacy, { type: 'agent_succeeded', agentResult: successResult('legacy-head'), headSha: 'legacy-head' }, T0);
+    legacy = applyTransition(legacy, { type: 'validation_passed', validationResult: validationPassed('legacy-head'), pullRequest: { number: 7, headSha: 'legacy-head' } }, T0);
+    legacy = applyTransition(legacy, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'legacy-head') }, T0, TEST_VALIDATION_AUTHORITY);
+    legacy = applyTransition(legacy, { type: 'start_fix' }, T0);
+    store.create(legacy);
+
+    const restarted = new JsonFileStore({ dir });
+    assert.equal(JSON.stringify(restarted.read(completed.id)), JSON.stringify(completed),
+      'completed history remains valid after its finding is cleared');
+    assert.equal(JSON.stringify(restarted.read(legacy.id)), JSON.stringify(legacy),
+      'legacy unbound attempt remains readable without manufacturing an admission');
+  });
+
+  it('replays WorkerRouter repair handoffs as sessionless and rejects executor-kind ledger history', () => {
+    const { store, dir } = tempStore();
+    const authority = { revision: 'shape-v1', shape: 'bounded' as const };
+    const execution: ResolvedExecutionConfiguration = { profile: 'routine', revision: 'repair-v1', executor: 'worker-router', timeoutMs: 30_000 };
+    let run = newRun('worker-router-sessionless-ledger');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('head-sha'), headSha: 'head-sha' }, T0);
+    run = applyTransition(run, { type: 'validation_passed', validationResult: validationPassed('head-sha'), pullRequest: { number: 7, headSha: 'head-sha' } }, T0);
+    run = { ...run, repairTaskShapeAuthority: authority };
+    run = applyTransition(run, { type: 'changes_requested', reviewResult: changesRequested('reviewer-1', 'head-sha') }, T0, TEST_VALIDATION_AUTHORITY);
+    const receipt = createRepairAdmissionSnapshot(authority, 'review_blocking', 'head-sha', 7, execution, T0);
+    const binding = createRepairAttemptBinding(run, execution);
+    run = applyTransition(run, { type: 'start_fix', repairAdmission: { ...receipt, attemptBinding: binding } }, T0);
+    run = applyTransition(run, { type: 'repair_executor_handoff', repairAgentResult: successResult('fixed-sha') }, T0);
+    run = applyTransition(run, { type: 'repair_executor_continued', repairAgentResult: successResult('fixed-sha') }, T0);
+    store.create(run);
+    assert.equal(new JsonFileStore({ dir }).read(run.id)?.history.at(-1)?.repairHandoff?.outcome.kind, 'sessionless');
+
+    const file = path.join(dir, `${run.id}.json`);
+    const original = readFileSync(file, 'utf8');
+    const forged = { kind: 'executor', identity: { provider: 'worker-router', sessionId: 'invented-session' } };
+    const corruptions: Array<[string, (handoffs: any[]) => void]> = [
+      ['first-only executor-kind WorkerRouter', (handoffs) => { handoffs[0].repairHandoff.outcome = forged; }],
+      ['continuation-only executor-kind WorkerRouter', (handoffs) => { handoffs[1].repairHandoff.outcome = forged; }],
+      ['first-only record extra', (handoffs) => { handoffs[0].repairHandoff.extra = true; }],
+      ['continuation-only record extra', (handoffs) => { handoffs[1].repairHandoff.extra = true; }],
+      ['first-only outcome extra', (handoffs) => { handoffs[0].repairHandoff.outcome.extra = true; }],
+      ['continuation-only outcome extra', (handoffs) => { handoffs[1].repairHandoff.outcome.extra = true; }],
+    ];
+    for (const [corruption, mutate] of corruptions) {
+      const damaged = JSON.parse(original) as Record<string, any>;
+      const handoffs = damaged.history.filter((entry: { type: string }) => entry.type === 'repair_executor_handoff' || entry.type === 'repair_executor_continued');
+      mutate(handoffs);
+      if (corruption === 'continuation-only executor-kind WorkerRouter') {
+        damaged.executor = forged.identity;
+        damaged.agentResult.executor = forged.identity;
+        damaged.agentResult.sessionId = forged.identity.sessionId;
+      }
+      const corruptBytes = JSON.stringify(damaged);
+      writeFileSync(file, corruptBytes, 'utf8');
+      assert.throws(() => new JsonFileStore({ dir }).read(run.id), /corrupt or incompatible/, `${corruption} persisted handoff is rejected`);
+      assert.equal(readFileSync(file, 'utf8'), corruptBytes, `${corruption} rejected history is not rewritten`);
+    }
+  });
+
+  it('projects the selected provider and profile before an agent session exists', () => {
+    const run = {
+      ...newRun('initial-execution-projection'),
+      state: 'IMPLEMENTING' as const,
+      execution: { profile: 'standard' as const, revision: 'profiles-v1', executor: 'claude-code', timeoutMs: 1_000 },
+    };
+
+    assert.deepEqual(operationalRunProjection(run, '{}').executor, { provider: 'claude-code', profile: 'standard' });
+  });
+
+  it('retains the active review-repair marker after a parked repair resumes', () => {
+    const run = {
+      ...newRun('resumed-review-fix-projection'),
+      state: 'IMPLEMENTING' as const,
+      history: [
+        { type: 'start_fix' as const, from: 'CHANGES_REQUESTED' as const, to: 'IMPLEMENTING' as const, at: T0 },
+        { type: 'escalate' as const, from: 'IMPLEMENTING' as const, to: 'NEEDS_HUMAN' as const, at: T0 },
+        { type: 'human_resolved' as const, from: 'NEEDS_HUMAN' as const, to: 'IMPLEMENTING' as const, at: T0 },
+      ],
+    };
+
+    assert.equal(operationalRunProjection(run, '{}').reviewFixActive, true);
+  });
+
+  it('keeps a committed raw transition successful when derived projection emission fails', () => {
+    const { store, dir } = tempStore();
+    let run = newRun('projection-best-effort');
+    store.create(run);
+    rmSync(path.join(dir, '.operational'), { recursive: true, force: true });
+    writeFileSync(path.join(dir, '.operational'), 'not a directory', 'utf8');
+
+    run = applyTransition(run, { type: 'start' }, T0);
+    assert.doesNotThrow(() => store.update(run));
+    assert.equal(new JsonFileStore({ dir }).read(run.id)?.state, 'IMPLEMENTING');
+    assert.throws(() => readFileSync(operationalProjectionPath(dir, run.id), 'utf8'));
+
+    rmSync(path.join(dir, '.operational'), { force: true });
+    assert.equal(store.rebuildOperationalProjections(), 1);
+    assert.equal(
+      JSON.parse(readFileSync(operationalProjectionPath(dir, run.id), 'utf8')).workflowState,
+      'IMPLEMENTING',
+    );
+  });
+
+  it('rebuilds valid legacy projections and removes a projection with its run', () => {
+    const { store, dir } = tempStore();
+    const run = newRun('legacy-projection');
+    writeFileSync(path.join(dir, 'legacy-projection.json'), `${JSON.stringify(run, null, 2)}\n`, 'utf8');
+    assert.equal(store.rebuildOperationalProjections(), 1);
+    assert.deepEqual(JSON.parse(readFileSync(operationalProjectionPath(dir, run.id), 'utf8')) as Record<string, unknown>, {
+      schemaVersion: 1,
+      runId: run.id,
+      sourceUpdatedAt: T0,
+      sourceDigest: sha256(readFileSync(path.join(dir, 'legacy-projection.json'), 'utf8')),
+      target: { owner: 'acme', repo: 'widgets', issueNumber: 42 },
+      workflowState: 'READY',
+      createdAt: T0,
+    });
+    store.delete(run.id);
+    assert.throws(() => readFileSync(operationalProjectionPath(dir, run.id), 'utf8'));
+  });
+
+  it('deletes the authoritative run when derived projection cleanup fails', () => {
+    const { store, dir } = tempStore();
+    const run = newRun('projection-delete-best-effort');
+    store.create(run);
+    rmSync(operationalProjectionPath(dir, run.id));
+    mkdirSync(operationalProjectionPath(dir, run.id));
+
+    assert.doesNotThrow(() => store.delete(run.id));
+    assert.equal(store.read(run.id), null);
+    assert.equal(readdirSync(operationalProjectionPath(dir, run.id)).length, 0);
   });
 
   it('serializes a cross-process workflow update with CAS across the compare/write window', () => {
@@ -102,6 +889,95 @@ describe('JsonFileStore — persistence round-trips', () => {
     const expected = staleTelemetryLikeWrite;
     assert.equal(waitWriter.updateIfUnchanged(expected, { ...expected, headSha: 'stale-head' }), false);
     assert.equal(new JsonFileStore({ dir }).read(initial.id)?.state, 'IMPLEMENTING');
+  });
+
+  it('rejects stale JSON-file CAS for previously omitted and reader-accepted unknown persisted fields', () => {
+    const cases: Array<[string, (run: Run) => Run]> = [
+      ['target', (run) => ({ ...run, target: { ...run.target, repo: `${run.target.repo}-newer` } })],
+      ['createdAt', (run) => ({ ...run, createdAt: '2026-09-27T00:00:01.000Z' })],
+      ['dispatchClaimId', (run) => ({ ...run, dispatchClaimId: 'newer-dispatch-claim' })],
+      ['execution', (run) => ({ ...run, execution: { profile: 'routine', revision: 'cas-v1', executor: 'claude-code', timeoutMs: 30_000 } })],
+      ['interruptedFrom', (run) => ({ ...run, interruptedFrom: 'IMPLEMENTING' })],
+      ['bootstrap', (run) => ({ ...run, bootstrap: {
+        bootstrapKind: 'linked-worktree', owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+        baseBranch: 'main', baseSha: 'b'.repeat(40), branch: `tachiko/${run.id}`, workspacePath: `/tmp/${run.id}`,
+      } })],
+      ['reader-accepted unknown field', (run) => ({ ...run, futureUnknown: { changed: true } } as Run)],
+      ['reader-accepted unknown array order', (run) => ({ ...run, futureUnknown: { ...(run as Run & { futureUnknown: { ordered: string[] } }).futureUnknown, ordered: ['second', 'first'] } } as Run)],
+      ['reader-accepted own __proto__ property', (run) => {
+        const changed = { ...run };
+        Object.defineProperty(changed, '__proto__', {
+          configurable: true,
+          enumerable: true,
+          value: { readerAcceptedFutureField: 'changed' },
+          writable: true,
+        });
+        return changed as Run;
+      }],
+    ];
+
+    for (const [field, mutate] of cases) {
+      for (const proposal of ['expected', 'next'] as const) {
+        const { store, dir } = tempStore();
+        const expected = casFixture(`full-json-cas-${field.replaceAll(/[^a-z0-9]+/gi, '-')}-${proposal}`);
+        store.create(expected);
+        const newer = mutate(expected);
+        store.update(newer);
+        const readerResult = store.read(expected.id);
+        assert.deepEqual(readerResult, newer, `${field} fixture is accepted by the production reader`);
+        if (field === 'reader-accepted own __proto__ property') {
+          assert.ok(readerResult);
+          assert.equal(Object.prototype.hasOwnProperty.call(readerResult, '__proto__'), true,
+            'the production reader retains __proto__ as an own persisted key');
+          assert.deepEqual((readerResult as unknown as Record<string, unknown>)['__proto__'],
+            { readerAcceptedFutureField: 'changed' }, 'the production reader exposes its changed persisted value');
+        }
+
+        const runPath = path.join(dir, `${expected.id}.json`);
+        const projectionPath = operationalProjectionPath(dir, expected.id);
+        const newerRunBytes = readFileSync(runPath, 'utf8');
+        const newerProjectionBytes = readFileSync(projectionPath, 'utf8');
+        const staleNext = proposal === 'expected'
+          ? expected
+          : { ...expected, updatedAt: '2026-09-27T00:00:02.000Z' };
+
+        assert.equal(store.updateIfUnchanged(expected, staleNext), false,
+          `${field} makes the ${proposal === 'expected' ? 'stale no-op' : 'stale transition'} CAS fail`);
+        assert.equal(readFileSync(runPath, 'utf8'), newerRunBytes, `${field} newer Run bytes survive`);
+        assert.equal(readFileSync(projectionPath, 'utf8'), newerProjectionBytes, `${field} newer projection bytes survive`);
+      }
+    }
+  });
+
+  it('uses persisted JSON semantics for unchanged, key-reordered, undefined, and legacy-normalized snapshots', () => {
+    const { store, dir } = tempStore();
+    const initial = casFixture('full-json-cas-json-semantics');
+    store.create(initial);
+    assert.equal(store.updateIfUnchanged(initial, initial), true, 'unchanged complete Run snapshots compare equal');
+
+    const runPath = path.join(dir, `${initial.id}.json`);
+    const parsed = JSON.parse(readFileSync(runPath, 'utf8')) as unknown;
+    writeFileSync(runPath, `${JSON.stringify(reverseObjectKeyOrder(parsed), null, 2)}\n`, 'utf8');
+    assert.equal(store.updateIfUnchanged(initial, initial), true, 'object-key order is irrelevant to the durable snapshot');
+
+    const undefinedExpected = { ...initial, futureUndefined: undefined } as Run;
+    assert.equal(store.updateIfUnchanged(undefinedExpected, initial), true, 'undefined object properties are omitted by persistence semantics');
+
+    const legacyStore = tempStore();
+    const legacyBootstrap = {
+      owner: TARGET.owner,
+      repo: TARGET.repo,
+      issueNumber: TARGET.issueNumber,
+      baseBranch: 'main',
+      baseSha: 'a'.repeat(40),
+      branch: 'tachiko/full-json-cas-legacy-normalized',
+      workspacePath: '/tmp/full-json-cas-legacy-normalized',
+    } as unknown as NonNullable<Run['bootstrap']>;
+    delete (legacyBootstrap as { bootstrapKind?: string }).bootstrapKind;
+    const legacy = { ...initial, id: 'full-json-cas-legacy-normalized', bootstrap: legacyBootstrap } as Run;
+    legacyStore.store.create(legacy);
+    assert.equal(legacyStore.store.read(legacy.id)?.bootstrap?.bootstrapKind, 'linked-worktree', 'the production reader applies legacy bootstrap normalization');
+    assert.equal(legacyStore.store.updateIfUnchanged(legacy, legacy), true, 'legacy expected values compare after the reader’s normalization');
   });
 
   it('persists updates across store instances (simulated restart)', () => {
@@ -255,7 +1131,9 @@ describe('JsonFileStore — persistence round-trips', () => {
     store.create(run);
     run = applyTransition(run, { type: 'start' }, T0);
     store.update(run);
-    assert.deepEqual(readdirSync(dir), ['r1.json']);
+    assert.deepEqual(readdirSync(dir), ['.operational', 'r1.json']);
+    assert.deepEqual(readdirSync(path.join(dir, '.operational')), ['v1']);
+    assert.deepEqual(readdirSync(path.join(dir, '.operational', 'v1')), ['r1.json']);
   });
 
   it('reports corrupt run files with an actionable error', () => {

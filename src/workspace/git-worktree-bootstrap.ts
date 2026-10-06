@@ -12,6 +12,7 @@ import {
   type VerifyDurableRequest,
 } from '../adapters/bootstrap.js';
 import type { WorkspaceGuard } from '../adapters/agent.js';
+import { isExecutionAdmissionRefusal } from '../adapters/agent.js';
 import type { ImplementationBootstrapIdentity } from '../domain/types.js';
 import { NodeProcessRunner, type ProcessResult, type ProcessRunner } from '../github/transport.js';
 
@@ -36,24 +37,30 @@ function isInside(parent: string, candidate: string): boolean {
 }
 
 function remoteDestination(value: string): { host: string; owner: string; repo: string } | null {
-  const text = value.trim();
-  let host = '';
-  let pathname = '';
-  try {
-    const parsed = new URL(text);
-    host = parsed.hostname;
-    pathname = parsed.pathname;
-  } catch {
-    const match = /^(?:[^@\s]+@)?([^:\s]+):([^\s]+)$/.exec(text);
-    if (match === null) return null;
-    host = match[1] ?? '';
-    pathname = match[2] ?? '';
+  if (/\s/.test(value)) return null;
+  const https = /^https:\/\/github\.com\/([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/i.exec(value);
+  const scp = /^git@github\.com:([A-Za-z0-9-]+)\/([A-Za-z0-9._-]+)$/.exec(value);
+  const match = https ?? scp;
+  if (match === null) return null;
+  const owner = match[1] ?? '';
+  const rawRepo = match[2] ?? '';
+  const repo = rawRepo.replace(/\.git$/i, '');
+  if (owner === '' || repo === '' || repo === '.' || repo === '..') return null;
+
+  // The exact forms above reject URL credentials, ports, query/fragment data,
+  // encoded components, path normalization, extra slashes, and other schemes.
+  // Parse HTTPS once more so URL parser behavior cannot silently broaden them.
+  if (https !== null) {
+    try {
+      const parsed = new URL(value);
+      if (parsed.protocol !== 'https:' || parsed.hostname.toLowerCase() !== 'github.com' || parsed.port !== '' ||
+        parsed.username !== '' || parsed.password !== '' || parsed.search !== '' || parsed.hash !== '' ||
+        parsed.pathname !== `/${owner}/${rawRepo}`) return null;
+    } catch {
+      return null;
+    }
   }
-  const parts = pathname.replace(/^\/+|\/+$/g, '').split('/');
-  if (host.toLowerCase().replace(/\.$/, '') !== 'github.com' || parts.length !== 2) return null;
-  const owner = parts[0] ?? '';
-  const repo = (parts[1] ?? '').replace(/\.git$/i, '');
-  return owner === '' || repo === '' ? null : { host: 'github.com', owner, repo };
+  return { host: 'github.com', owner, repo };
 }
 
 function sameIdentity(a: ImplementationBootstrapIdentity, b: ImplementationBootstrapIdentity): boolean {
@@ -68,6 +75,7 @@ function sameIdentity(a: ImplementationBootstrapIdentity, b: ImplementationBoots
  */
 export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   readonly kind = 'implementation-bootstrap' as const;
+  readonly bootstrapKind = 'linked-worktree' as const;
   private readonly repositoryRoot: string;
   private readonly workspaceRoot: string;
   private readonly remote: string;
@@ -93,7 +101,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   async plan(request: BootstrapPlanRequest): Promise<ImplementationBootstrapIdentity> {
     await this.assertRequest(request);
     await this.assertRemote(request.target.owner, request.target.repo, this.repositoryRoot);
-    await this.assertFetchedRef(request.baseBranch, request.baseSha);
+    await this.assertRemoteBaseRef(request.baseBranch, request.baseSha);
     const identity = this.identityFor(request);
     if (existsSync(identity.workspacePath) || await this.localRef(identity.branch) !== null || await this.remoteRef(identity.branch) !== null) {
       fail('COLLISION', `Bootstrap identity for ${identity.branch} already has local Git state.`);
@@ -124,8 +132,12 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     if (authority === undefined && local !== null && remote !== null && local !== remote) {
       fail('STALE_IDENTITY', 'Pre-PR local and remote checkpoints disagree.');
     }
+    // Import the immutable planned base only during preparation, after the
+    // workflow has persisted the exact identity and established admission.
+    // This must precede any branch-ref or worktree mutation.
+    await this.fetchExactBaseSha(expected.baseSha, request.beforeMutation);
     const candidate = authority ?? remote ?? local ?? expected.baseSha;
-    if (remote !== null) await this.fetchExactBranch(expected.branch, remote);
+    if (remote !== null) await this.fetchExactBranch(expected.branch, remote, request.beforeMutation);
     if (!await this.isAncestor(expected.baseSha, candidate)) {
       fail('STALE_IDENTITY', 'Recovery candidate does not descend from the immutable bootstrap base.');
     }
@@ -144,14 +156,14 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     }
 
     if (present) {
-      if (local !== candidate) await this.git(['merge', '--ff-only', candidate], expected.workspacePath);
+      if (local !== candidate) await this.git(['merge', '--ff-only', candidate], expected.workspacePath, [0], request.beforeMutation);
     } else {
       if (local !== candidate) {
         // Zero expected-old creates only an absent branch; neither this CAS nor
         // worktree add relies on remote-tracking guesses.
-        await this.git(['update-ref', `refs/heads/${expected.branch}`, candidate, local ?? '0'.repeat(40)], this.repositoryRoot);
+        await this.git(['update-ref', `refs/heads/${expected.branch}`, candidate, local ?? '0'.repeat(40)], this.repositoryRoot, [0], request.beforeMutation);
       }
-      await this.addWorktree(expected, force);
+      await this.addWorktree(expected, force, request.beforeMutation);
     }
     await this.assertWorkspace(expected, candidate, true);
     if (await this.localRef(expected.branch) !== candidate || await this.remoteRef(expected.branch) !== remote) {
@@ -187,6 +199,7 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   private identityFor(request: BootstrapPlanRequest): ImplementationBootstrapIdentity {
     const suffix = createHash('sha256').update(request.runId).digest('hex').slice(0, 16);
     return {
+      bootstrapKind: 'linked-worktree',
       owner: request.target.owner,
       repo: request.target.repo,
       issueNumber: request.target.issueNumber,
@@ -211,9 +224,10 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
   }
 
   private async assertRemote(owner: string, repo: string, cwd: string): Promise<void> {
-    const fetch = (await this.git(['remote', 'get-url', this.remote], cwd)).stdout.trim();
+    const fetchOutput = (await this.git(['remote', 'get-url', this.remote], cwd)).stdout;
+    const fetch = fetchOutput.endsWith('\n') ? fetchOutput.slice(0, -1) : fetchOutput;
     const pushOutput = (await this.git(['remote', 'get-url', '--all', '--push', this.remote], cwd)).stdout;
-    const urls = pushOutput.split(/\r?\n/);
+    const urls = pushOutput.split('\n');
     if (urls.at(-1) === '') urls.pop();
     const valid = (url: string): boolean => {
       const parsed = remoteDestination(url);
@@ -224,10 +238,15 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     }
   }
 
-  private async assertFetchedRef(branch: string, expected: string): Promise<void> {
-    await this.git(['fetch', '--no-tags', this.remote, `refs/heads/${branch}`], this.repositoryRoot);
+  private async assertRemoteBaseRef(branch: string, expected: string): Promise<void> {
+    const actual = await this.remoteRef(branch);
+    if (actual !== expected) fail('BASE_DRIFT', `Named remote base ${this.remote}/${branch} does not match the live base SHA.`);
+  }
+
+  private async fetchExactBaseSha(expected: string, beforeMutation?: () => void): Promise<void> {
+    await this.git(['fetch', '--no-tags', '--refetch', this.remote, expected], this.repositoryRoot, [0], beforeMutation);
     const fetched = (await this.git(['rev-parse', 'FETCH_HEAD'], this.repositoryRoot)).stdout.trim();
-    if (fetched !== expected) fail('BASE_DRIFT', `Fetched ${this.remote}/${branch} does not match the live base SHA.`);
+    if (fetched !== expected) fail('BASE_DRIFT', `Fetched immutable base from ${this.remote} does not match the planned SHA.`);
   }
 
   private async assertWorkspace(identity: ImplementationBootstrapIdentity, expectedHead?: string, clean = false): Promise<void> {
@@ -248,12 +267,13 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     }
   }
 
-  private async addWorktree(identity: ImplementationBootstrapIdentity, force: boolean): Promise<void> {
+  private async addWorktree(identity: ImplementationBootstrapIdentity, force: boolean, beforeMutation?: () => void): Promise<void> {
+    beforeMutation?.();
     mkdirSync(path.dirname(identity.workspacePath), { recursive: true });
     if (existsSync(identity.workspacePath) || this.canonicalFuturePath(identity.workspacePath) !== identity.workspacePath) {
       fail('COLLISION', 'Workspace path appeared or changed before linked worktree creation.');
     }
-    await this.git(['worktree', 'add', ...(force ? ['--force'] : []), identity.workspacePath, identity.branch], this.repositoryRoot);
+    await this.git(['worktree', 'add', ...(force ? ['--force'] : []), identity.workspacePath, identity.branch], this.repositoryRoot, [0], beforeMutation);
   }
 
   private async assertRegistration(identity: ImplementationBootstrapIdentity, localHead: string, missing: boolean): Promise<boolean> {
@@ -297,8 +317,8 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     return sha ?? null;
   }
 
-  private async fetchExactBranch(branch: string, expected: string): Promise<void> {
-    await this.git(['fetch', '--no-tags', this.remote, `refs/heads/${branch}`], this.repositoryRoot);
+  private async fetchExactBranch(branch: string, expected: string, beforeMutation?: () => void): Promise<void> {
+    await this.git(['fetch', '--no-tags', this.remote, `refs/heads/${branch}`], this.repositoryRoot, [0], beforeMutation);
     const fetched = (await this.git(['rev-parse', 'FETCH_HEAD'], this.repositoryRoot)).stdout.trim();
     if (fetched !== expected) fail('STALE_IDENTITY', 'Fetched recovery branch changed from its authorized remote head.');
   }
@@ -319,11 +339,12 @@ export class GitWorktreeBootstrap implements ImplementationBootstrapAdapter {
     return path.join(realpathSync(current), ...absent);
   }
 
-  private async git(args: readonly string[], cwd: string, allowed: readonly number[] = [0]): Promise<ProcessResult> {
+  private async git(args: readonly string[], cwd: string, allowed: readonly number[] = [0], beforeSpawn?: () => void): Promise<ProcessResult> {
     let result: ProcessResult;
     try {
-      result = await this.runner.run('git', args, { cwd, timeoutMs: this.timeoutMs });
+      result = await this.runner.run('git', args, { cwd, timeoutMs: this.timeoutMs, ...(beforeSpawn === undefined ? {} : { beforeSpawn }) });
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       fail('COMMAND_FAILED', `Git command failed: ${error instanceof Error ? error.message : String(error)}`);
     }
     if (!allowed.includes(result.exitCode)) fail('COMMAND_FAILED', `Git command ${args[0] ?? '(unknown)'} exited with ${result.exitCode}.`);

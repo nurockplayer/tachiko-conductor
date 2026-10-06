@@ -56,17 +56,21 @@ function uniqueMatch<T>(values: readonly T[]): T | undefined {
 }
 
 function extractClaims(sections: Readonly<Record<string, string>>): {
+  ambiguous: boolean;
   claimedHeadSha?: string;
   claimedPullRequestNumber?: number;
 } {
   const identityText = identitySectionText(sections);
-  const claimedHeadSha = uniqueMatch((identityText.match(FULL_SHA_PATTERN) ?? []).map((sha) => sha.toLowerCase()));
+  const headClaims = [...new Set((identityText.match(FULL_SHA_PATTERN) ?? []).map((sha) => sha.toLowerCase()))];
   const prNumbers = [
     ...[...identityText.matchAll(/\bPR\s*:\s*#?(\d+)\b/gi)].map((match) => Number(match[1])),
     ...[...identityText.matchAll(/\/pull\/(\d+)\b/gi)].map((match) => Number(match[1])),
   ].filter((number) => Number.isSafeInteger(number) && number > 0);
-  const claimedPullRequestNumber = uniqueMatch(prNumbers);
+  const uniquePrNumbers = [...new Set(prNumbers)];
+  const claimedHeadSha = uniqueMatch(headClaims);
+  const claimedPullRequestNumber = uniqueMatch(uniquePrNumbers);
   return {
+    ambiguous: headClaims.length > 1 || uniquePrNumbers.length > 1,
     ...(claimedHeadSha === undefined ? {} : { claimedHeadSha }),
     ...(claimedPullRequestNumber === undefined ? {} : { claimedPullRequestNumber }),
   };
@@ -105,13 +109,33 @@ export function parseAgentHandoffs(
       });
       continue;
     }
-    const sections = parseSections(entry.body.slice(entry.body.indexOf(HANDOFF_MARKER) + HANDOFF_MARKER.length));
+    const markedBody = entry.body.slice(entry.body.indexOf(HANDOFF_MARKER) + HANDOFF_MARKER.length);
+    const headings = [...markedBody.matchAll(/^##\s+(.+?)\s*$/gm)].map((match) => match[1]?.trim().toLowerCase()).filter((name): name is string => name !== undefined);
+    if (new Set(headings).size !== headings.length) {
+      problems.push({
+        code: 'AMBIGUOUS_HANDOFF',
+        message: `Comment ${entry.id} contains duplicate level-two handoff sections; refusing to overwrite authority sections.`,
+        sourceId: entry.id,
+      });
+      continue;
+    }
+    const sections = parseSections(markedBody);
     if (Object.keys(sections).length === 0 || Object.values(sections).every((value) => value === '')) {
       malformed.push(entry);
       problems.push(malformedProblem(entry));
       continue;
     }
-    valid.push({ entry, sections, ...extractClaims(sections) });
+    const claims = extractClaims(sections);
+    if (claims.ambiguous) {
+      problems.push({
+        code: 'AMBIGUOUS_HANDOFF',
+        message: `Comment ${entry.id} contains conflicting branch or pull request identity claims.`,
+        sourceId: entry.id,
+      });
+      continue;
+    }
+    const { ambiguous: _ambiguous, ...identity } = claims;
+    valid.push({ entry, sections, ...identity });
   }
 
   valid.sort((a, b) => compareEntries(a.entry, b.entry));

@@ -105,6 +105,7 @@ export interface GitHubLivePullRequestSnapshot extends PullRequestSnapshot {
   readonly headRef?: string;
   readonly headRepository?: { readonly owner: string; readonly repo: string } | null;
   readonly baseRef?: string;
+  readonly baseRepository?: { readonly owner: string; readonly repo: string } | null;
 }
 
 export interface GitHubLiveSnapshot {
@@ -150,6 +151,8 @@ export interface GitHubAdapter {
   readBranch(target: RepositoryTarget): Promise<BranchSnapshot>;
   /** Pull request discovery for either an issue or a branch. */
   listPullRequests(target: Target): Promise<readonly PullRequestSnapshot[]>;
+  /** Direct read by persisted PR number, including closed and merged PRs. */
+  readPullRequest?(owner: string, repo: string, number: number): Promise<GitHubLivePullRequestSnapshot>;
   /** Full normalized live state for an issue-target run. */
   readLiveSnapshot(target: IssueTarget): Promise<GitHubLiveSnapshot>;
   /** Conductor-owned association of a newly published implementation branch. */

@@ -10,6 +10,7 @@
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
 import type { ToolOutputEnvelope } from '../evidence/tool-output.js';
+import type { RepairAdmissionSnapshot, RepairExecutorHandoff, RepairHandoffRecord, RepairTaskShapeAuthority } from './repair-admission.js';
 
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;

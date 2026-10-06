@@ -80,9 +80,18 @@ function requireNonNegativeInt(record: Record<string, unknown>, field: string, p
   return value;
 }
 
-function normalizePullState(record: Record<string, unknown>): PullRequestSnapshot['state'] {
-  if (record.merged_at !== null && record.merged_at !== undefined) return 'merged';
-  return record.state === 'closed' ? 'closed' : 'open';
+function normalizePullState(record: Record<string, unknown>, path: string): PullRequestSnapshot['state'] {
+  const rawState = record.state;
+  if (rawState !== 'open' && rawState !== 'closed') {
+    throw invalid(path, `unrecognized pull request state "${String(rawState)}"`);
+  }
+  const mergedAt = record.merged_at;
+  if (mergedAt === null || mergedAt === undefined) return rawState;
+  if (typeof mergedAt !== 'string' || mergedAt.trim() === '') {
+    throw invalid(path, 'merged_at is not a non-empty string');
+  }
+  if (rawState !== 'closed') throw invalid(path, 'merged_at is present while pull request state is open');
+  return 'merged';
 }
 
 function normalizeReviewState(state: string): GitHubReviewSnapshot['state'] {
@@ -214,6 +223,19 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     };
   }
 
+  /** Read the persisted PR identity directly; discovery endpoints intentionally omit closed PRs. */
+  async readPullRequest(owner: string, repo: string, number: number): Promise<GitHubLivePullRequestSnapshot> {
+    if (owner.trim() === '' || repo.trim() === '' || !Number.isSafeInteger(number) || number <= 0) {
+      throw new GitHubLiveStateError('GH_INVALID_RESPONSE', 'A direct pull-request read requires an exact owner, repository, and positive PR number.');
+    }
+    const path = `repos/${owner}/${repo}/pulls/${number}`;
+    const record = asRecordOrThrow(await this.transport.get(path), path);
+    if (requirePositiveInt(record, 'number', path) !== number) {
+      throw invalid(path, `pull request number ${String(record.number)} does not match the requested ${number}`);
+    }
+    return this.normalizeLivePullRequest(record, path);
+  }
+
   async readBranch(target: RepositoryTarget): Promise<BranchSnapshot> {
     const path = `repos/${target.owner}/${target.repo}/branches/${encodeURIComponent(target.branch)}`;
     const record = asRecord(await this.transport.get(path));
@@ -244,12 +266,14 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const record = asRecord(await this.transport.get(path));
       if (record === null) throw invalid(path, 'pull request is not an object');
+      normalizePullState(record, path);
       const association = await this.classifyPullRequestAssociation(owner, repo, target.issueNumber, number, record);
       if (association === 'not_associated') continue;
+      const normalized = this.normalizePullRequest(record, path);
       // Unknown is deliberately retained here: dispatch duplicate-writer
       // protection must fail closed when a timeline candidate cannot be
       // authoritatively disproven.
-      result.push(this.normalizePullRequest(record, path));
+      result.push(normalized);
     }
     return result;
   }
@@ -274,7 +298,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       if (requirePositiveInt(raw, 'number', path) !== number) {
         throw invalid(path, `pull request number ${String(raw.number)} does not match the referenced ${number}`);
       }
-      if (raw.state !== 'open') continue;
+      const state = normalizePullState(raw, path);
+      if (state !== 'open') continue;
       const association = await this.classifyPullRequestAssociation(owner, repo, issueNumber, number, raw);
       if (association === 'not_associated') continue;
       if (association === 'unknown') {
@@ -445,7 +470,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       number: requirePositiveInt(record, 'number', path),
       headSha: requireString(head, 'sha', path),
       baseSha: requireString(base, 'sha', path),
-      state: normalizePullState(record),
+      state: normalizePullState(record, path),
     };
   }
 
@@ -516,6 +541,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const head = asRecord(record.head);
     const base = asRecord(record.base);
     if (head === null || base === null) throw invalid(path, 'missing head/base object');
+    if (typeof record.draft !== 'boolean') throw invalid(path, 'draft is not a boolean');
     const headSha = typeof head.sha === 'string' && head.sha.trim() !== '' ? head.sha : null;
     if (headSha === null) {
       throw new GitHubLiveStateError(
@@ -525,6 +551,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       );
     }
     const headRepository = asRecord(head.repo);
+    const baseRepository = asRecord(base.repo);
     const headRef = typeof head.ref === 'string' && head.ref !== '' ? head.ref : undefined;
     const baseRef = typeof base.ref === 'string' && base.ref !== '' ? base.ref : undefined;
     const owner = headRepository === null ? undefined : asRecord(headRepository.owner);
@@ -533,13 +560,19 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       typeof headRepository?.name === 'string' && headRepository.name !== ''
       ? { owner: owner.login, repo: headRepository.name }
       : headRepository === null ? null : undefined;
+    const baseOwner = baseRepository === null ? undefined : asRecord(baseRepository.owner);
+    const baseRepositoryIdentity = baseOwner !== null && baseOwner !== undefined &&
+      typeof baseOwner.login === 'string' && baseOwner.login !== '' &&
+      typeof baseRepository?.name === 'string' && baseRepository.name !== ''
+      ? { owner: baseOwner.login, repo: baseRepository.name }
+      : baseRepository === null ? null : undefined;
     return {
       id: requireString(record, 'node_id', path),
       number: requirePositiveInt(record, 'number', path),
       title: requireString(record, 'title', path),
       url: requireString(record, 'html_url', path),
-      state: normalizePullState(record),
-      isDraft: record.draft === true,
+      state: normalizePullState(record, path),
+      isDraft: record.draft,
       mergeable: typeof record.mergeable === 'boolean' ? record.mergeable : null,
       mergeStateStatus:
         typeof record.mergeable_state === 'string'
@@ -553,6 +586,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       ...(headRef === undefined ? {} : { headRef }),
       ...(headRepositoryIdentity === undefined ? {} : { headRepository: headRepositoryIdentity }),
       ...(baseRef === undefined ? {} : { baseRef }),
+      ...(baseRepositoryIdentity === undefined ? {} : { baseRepository: baseRepositoryIdentity }),
     };
   }
 
@@ -744,8 +778,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     for (const item of raw) {
       const record = asRecord(item);
       if (record === null) throw invalid(path, 'review entry is not an object');
-      const submittedAt = typeof record.submitted_at === 'string' ? record.submitted_at : '';
-      if (submittedAt === '' || record.state === 'PENDING') continue;
+      const submittedAt = this.normalizeReviewSubmittedAt(record, path);
+      if (submittedAt === null) continue;
       entries.push({
         id: requireString(record, 'node_id', path),
         scope: 'pull_request',
@@ -758,6 +792,14 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       });
     }
     return entries;
+  }
+
+  private normalizeReviewSubmittedAt(record: Record<string, unknown>, path: string): string | null {
+    if (record.state === 'PENDING') return null;
+    if (typeof record.submitted_at !== 'string' || record.submitted_at.trim() === '') {
+      throw invalid(path, 'non-PENDING review has no nonblank submitted_at value');
+    }
+    return record.submitted_at;
   }
 
   private authorLogin(record: Record<string, unknown>, path: string): string | null {
@@ -836,9 +878,8 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     for (const item of raw) {
       const record = asRecord(item);
       if (record === null) throw invalid(path, 'review entry is not an object');
-      if (record.state === 'PENDING') continue;
-      const submittedAt = typeof record.submitted_at === 'string' ? record.submitted_at : '';
-      if (submittedAt === '') continue;
+      const submittedAt = this.normalizeReviewSubmittedAt(record, path);
+      if (submittedAt === null) continue;
       const commitSha = typeof record.commit_id === 'string' && record.commit_id !== '' ? record.commit_id : null;
       const review: GitHubReviewSnapshot = {
         id: requireString(record, 'node_id', path),
@@ -863,7 +904,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const latestByAuthor = new Map<string, GitHubReviewSnapshot>();
     const byAuthor = new Map<string, GitHubReviewSnapshot[]>();
     for (const review of reviews) {
-      const key = review.author ?? '';
+      const key = review.author === null ? `review-id:${review.id}` : `author:${review.author}`;
       const entries = byAuthor.get(key) ?? [];
       entries.push(review);
       byAuthor.set(key, entries);

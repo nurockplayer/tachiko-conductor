@@ -43,6 +43,10 @@ export interface ProcessRunOptions {
   readonly outputPolicy?: ToolOutputPolicy;
   /** Optional evidence store for explicit full/range drill-down. */
   readonly outputStore?: ToolOutputStore;
+  /** Deliberately narrowed environment for an isolated implementation runtime. */
+  readonly env?: NodeJS.ProcessEnv;
+  /** Synchronous host check called immediately before child creation. */
+  readonly beforeSpawn?: () => void;
 }
 
 export interface ProcessRunner {

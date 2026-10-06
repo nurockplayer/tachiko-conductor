@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { EXECUTION_PROFILE_NAMES } from '../execution-profiles.js';
+import { isRepairTaskShapeAuthority, type RepairTaskShapeAuthority } from '../domain/repair-admission.js';
 
 /** The Steward-owned, read-only queue marker. */
 export const DISPATCH_QUEUE_MARKER = '<!-- issue-dispatch-queue:v1 -->';
@@ -11,6 +12,8 @@ export interface DispatchQueueEntry {
   readonly issue: number;
   readonly route: 'codex' | 'chatgpt' | 'work' | 'human';
   readonly profile: string;
+  /** Explicit Steward/Oracle repair authority for a new unattended Codex run. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
 }
 
 export interface DispatchRuntimeClaim {
@@ -18,10 +21,33 @@ export interface DispatchRuntimeClaim {
   readonly claimId: string;
   readonly runId: string | null;
   readonly profile: string;
+  /** Immutable authority carried from the queue before a new Run exists. Absent only on legacy claims. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
   readonly state: 'claimed' | 'running' | 'merge_ready' | 'needs_human' | 'failed' | 'retired';
   readonly claimedAt: string;
   readonly heartbeatAt: string;
   readonly leaseUntil: string;
+}
+
+function sameAuthority(
+  left: RepairTaskShapeAuthority | undefined,
+  right: RepairTaskShapeAuthority | undefined,
+): boolean {
+  return left === undefined || right === undefined
+    ? left === right
+    : left.revision === right.revision && left.shape === right.shape;
+}
+
+/** Compare every immutable and mutable claim field; callers also compare comment identity. */
+export function sameDispatchRuntimeClaim(left: DispatchRuntimeClaim, right: DispatchRuntimeClaim): boolean {
+  return left.issue === right.issue && left.claimId === right.claimId && left.runId === right.runId &&
+    left.profile === right.profile && sameAuthority(left.repairTaskShapeAuthority, right.repairTaskShapeAuthority) &&
+    left.state === right.state && left.claimedAt === right.claimedAt && left.heartbeatAt === right.heartbeatAt &&
+    left.leaseUntil === right.leaseUntil;
+}
+
+export function hasValidDispatchAuthority(entry: DispatchQueueEntry): entry is DispatchQueueEntry & { readonly repairTaskShapeAuthority: RepairTaskShapeAuthority } {
+  return exactRepairTaskShapeAuthority(entry.repairTaskShapeAuthority);
 }
 
 export class DispatchProtocolError extends Error {
@@ -35,6 +61,11 @@ function record(value: unknown): Record<string, unknown> | null {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
+}
+
+function exactRepairTaskShapeAuthority(value: unknown): value is RepairTaskShapeAuthority {
+  const authority = record(value);
+  return authority !== null && Object.keys(authority).sort().join(',') === 'revision,shape' && isRepairTaskShapeAuthority(authority);
 }
 
 function positiveInteger(value: string): number | null {
@@ -63,12 +94,14 @@ export function parseDispatchQueue(body: string): readonly DispatchQueueEntry[] 
   }
   const lines = body.slice(marker + DISPATCH_QUEUE_MARKER.length).split(/\r?\n/);
   let started = false;
-  let current: Partial<Record<'issue' | 'route' | 'profile', string>> | undefined;
+  let current: Partial<Record<'issue' | 'route' | 'profile' | 'task-shape-revision' | 'task-shape', string>> | undefined;
   const result: DispatchQueueEntry[] = [];
   const finish = () => {
     if (current === undefined) return;
     const keys = Object.keys(current).sort();
-    if (keys.join(',') !== 'issue,profile,route') throw new DispatchProtocolError('Every queue record must contain exactly issue, route, and profile.');
+    if (keys.join(',') !== 'issue,profile,route' && keys.join(',') !== 'issue,profile,route,task-shape,task-shape-revision') {
+      throw new DispatchProtocolError('Every queue record must contain issue, route, and profile, with task-shape and task-shape-revision supplied together.');
+    }
     const issue = positiveInteger(current.issue ?? '');
     if (issue === null) throw new DispatchProtocolError('Queue issue must be a positive safe integer.');
     if (!['codex', 'chatgpt', 'work', 'human'].includes(current.route ?? '')) {
@@ -81,7 +114,13 @@ export function parseDispatchQueue(body: string): readonly DispatchQueueEntry[] 
       throw new DispatchProtocolError(`Queue issue #${issue} has an unsupported execution profile "${current.profile}".`);
     }
     if (result.some((entry) => entry.issue === issue)) throw new DispatchProtocolError(`Queue contains duplicate issue #${issue}.`);
-    result.push({ issue, route: current.route as DispatchQueueEntry['route'], profile: current.profile });
+    const repairTaskShapeAuthority = current['task-shape'] === undefined
+      ? undefined
+      : { revision: current['task-shape-revision'] ?? '', shape: current['task-shape'] };
+    if (repairTaskShapeAuthority !== undefined && !isRepairTaskShapeAuthority(repairTaskShapeAuthority)) {
+      throw new DispatchProtocolError(`Queue issue #${issue} has invalid task-shape authority.`);
+    }
+    result.push({ issue, route: current.route as DispatchQueueEntry['route'], profile: current.profile, ...(repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority }) });
     current = undefined;
   };
   for (const raw of lines) {
@@ -92,15 +131,15 @@ export function parseDispatchQueue(body: string): readonly DispatchQueueEntry[] 
       started = true;
       continue;
     }
-    const item = /^\s*-\s+(issue|route|profile):\s*([^\s]+)\s*$/.exec(line);
+    const item = /^\s*-\s+(issue|route|profile|task-shape-revision|task-shape):\s*([^\s]+)\s*$/.exec(line);
     if (item !== null) {
       finish();
-      current = { [item[1] as 'issue' | 'route' | 'profile']: item[2] ?? '' };
+      current = { [item[1] as 'issue' | 'route' | 'profile' | 'task-shape-revision' | 'task-shape']: item[2] ?? '' };
       continue;
     }
-    const property = /^\s+(issue|route|profile):\s*([^\s]+)\s*$/.exec(line);
+    const property = /^\s+(issue|route|profile|task-shape-revision|task-shape):\s*([^\s]+)\s*$/.exec(line);
     if (property === null || current === undefined) throw new DispatchProtocolError(`Invalid queue syntax: "${line.trim()}".`);
-    const key = property[1] as 'issue' | 'route' | 'profile';
+    const key = property[1] as 'issue' | 'route' | 'profile' | 'task-shape-revision' | 'task-shape';
     if (current[key] !== undefined) throw new DispatchProtocolError(`Duplicate ${key} in one queue record.`);
     current[key] = property[2] ?? '';
   }
@@ -122,8 +161,14 @@ export function parseDispatchRuntime(body: string): DispatchRuntimeClaim | null 
   try { value = JSON.parse(raw); } catch { throw new DispatchProtocolError('Dispatch runtime comment contains invalid JSON.'); }
   const parsed = record(value);
   if (parsed === null) throw new DispatchProtocolError('Dispatch runtime comment must contain an object.');
-  const expected = ['claimId', 'claimedAt', 'heartbeatAt', 'issue', 'leaseUntil', 'profile', 'runId', 'state'];
-  if (Object.keys(parsed).sort().join(',') !== expected.join(',')) throw new DispatchProtocolError('Dispatch runtime comment has unknown or missing fields.');
+  const legacyFields = ['claimId', 'claimedAt', 'heartbeatAt', 'issue', 'leaseUntil', 'profile', 'runId', 'state'];
+  const extendedFields = [...legacyFields, 'repairTaskShapeAuthority'].sort();
+  const fields = Object.keys(parsed).sort();
+  const hasAuthority = Object.hasOwn(parsed, 'repairTaskShapeAuthority');
+  if (fields.join(',') !== (hasAuthority ? extendedFields : legacyFields).join(',')) throw new DispatchProtocolError('Dispatch runtime comment has unknown or missing fields.');
+  if (hasAuthority && !exactRepairTaskShapeAuthority(parsed.repairTaskShapeAuthority)) {
+    throw new DispatchProtocolError('Dispatch runtime comment has invalid task-shape authority.');
+  }
   if (!Number.isSafeInteger(parsed.issue) || (parsed.issue as number) < 1 || !nonEmpty(parsed.claimId) || !nonEmpty(parsed.profile) || !supportedProfile(parsed.profile) ||
     !(parsed.runId === null || nonEmpty(parsed.runId)) || !nonEmpty(parsed.claimedAt) || !nonEmpty(parsed.heartbeatAt) || !nonEmpty(parsed.leaseUntil) ||
     !['claimed', 'running', 'merge_ready', 'needs_human', 'failed', 'retired'].includes(parsed.state as string)) {
@@ -173,6 +218,7 @@ export async function claimDispatchEntry(
   options: DispatchClaimOptions,
 ): Promise<{ readonly commentId: string; readonly claim: DispatchRuntimeClaim }> {
   if (entry.route !== 'codex') throw new DispatchProtocolError(`Queue issue #${entry.issue} is not routed to Codex.`);
+  if (!hasValidDispatchAuthority(entry)) throw new DispatchProtocolError(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
   if (!Number.isSafeInteger(options.leaseDurationMs) || options.leaseDurationMs < 1) {
     throw new DispatchProtocolError('Dispatch lease duration must be a positive safe integer.');
   }
@@ -185,6 +231,7 @@ export async function claimDispatchEntry(
     claimId: (options.createClaimId ?? randomUUID)(),
     runId: null,
     profile: entry.profile,
+    repairTaskShapeAuthority: { revision: entry.repairTaskShapeAuthority.revision, shape: entry.repairTaskShapeAuthority.shape },
     state: 'claimed',
     claimedAt: now,
     heartbeatAt: now,
@@ -192,7 +239,7 @@ export async function claimDispatchEntry(
   };
   const created = await api.createRuntimeComment(renderDispatchRuntime(claim));
   const reread = selectDispatchRuntime(await api.listRuntimeComments());
-  if (reread === null || reread.claim.claimId !== claim.claimId || reread.id !== created.id) {
+  if (reread === null || reread.id !== created.id || !sameDispatchRuntimeClaim(reread.claim, claim)) {
     throw new DispatchProtocolError('Dispatch claim was not the sole canonical runtime claim after write.');
   }
   return { commentId: reread.id, claim: reread.claim };

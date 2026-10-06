@@ -378,6 +378,67 @@ PR: #7`;
     assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED', 'R_CHANGES']);
   });
 
+  it('keeps unidentified decisive reviews in distinct review-id namespaces regardless of order', async () => {
+    const changes = {
+      node_id: 'R_NULL_CHANGES', user: null, state: 'CHANGES_REQUESTED', commit_id: HEAD,
+      submitted_at: '2026-08-14T01:00:00.000Z', html_url: 'https://github.test/reviews/null-changes',
+    };
+    const approval = {
+      node_id: 'R_NULL_APPROVED', user: null, state: 'APPROVED', commit_id: HEAD,
+      submitted_at: '2026-08-14T02:00:00.000Z', html_url: 'https://github.test/reviews/null-approved',
+    };
+    for (const ordered of [[changes, approval], [approval, changes]]) {
+      const snapshot = await new LiveGitHubAdapter({
+        transport: prTransport().collection('repos/acme/widgets/pulls/7/reviews', ordered), now: () => OBSERVED_AT,
+      }).readLiveSnapshot(TARGET);
+      assert.equal(snapshot.reviews.decision, 'changes_requested');
+      assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id).sort(), ['R_NULL_APPROVED', 'R_NULL_CHANGES']);
+      assert.ok(snapshot.reviews.latestByAuthor.every((review) => review.author === null));
+    }
+  });
+
+  it('preserves PENDING review exclusion when submission time is absent', async () => {
+    const snapshot = await new LiveGitHubAdapter({
+      transport: prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
+        { node_id: 'R_PENDING', user: { login: 'alice' }, state: 'PENDING', html_url: 'https://github.test/reviews/pending' },
+        { node_id: 'R_APPROVED', user: { login: 'alice' }, state: 'APPROVED', commit_id: HEAD,
+          submitted_at: '2026-08-14T02:00:00.000Z', html_url: 'https://github.test/reviews/approved' },
+      ]), now: () => OBSERVED_AT,
+    }).readLiveSnapshot(TARGET);
+    assert.equal(snapshot.reviews.decision, 'approved');
+    assert.deepEqual(snapshot.reviews.latestByAuthor.map((review) => review.id), ['R_APPROVED']);
+    assert.equal(snapshot.conversations.some((entry) => entry.id === 'R_PENDING'), false);
+  });
+
+  it('rejects malformed pull-request draft values instead of coercing them to non-draft', async (t) => {
+    const cases: Array<{ readonly name: string; readonly draft?: unknown; readonly missing?: boolean }> = [
+      { name: 'missing', missing: true }, { name: 'undefined', draft: undefined },
+      { name: 'null', draft: null }, { name: 'string', draft: 'false' }, { name: 'number', draft: 0 },
+    ];
+    for (const scenario of cases) {
+      await t.test(scenario.name, async () => {
+        const malformed = pull(7, HEAD, scenario.missing ? {} : { draft: scenario.draft });
+        if (scenario.missing) delete (malformed as { draft?: boolean }).draft;
+        const transport = prTransport().queue('repos/acme/widgets/pulls/7', malformed, malformed);
+        await expectError(new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET), 'GH_INVALID_RESPONSE', false);
+      });
+    }
+  });
+
+  it('rejects blank or non-string submission evidence for every non-PENDING review', async (t) => {
+    for (const submittedAt of [undefined, null, '', '   ', 123]) {
+      await t.test(String(submittedAt), async () => {
+        const review: Record<string, unknown> = {
+          node_id: 'R_BAD_TIME', user: { login: 'alice' }, state: 'CHANGES_REQUESTED', commit_id: HEAD,
+          html_url: 'https://github.test/reviews/bad-time',
+        };
+        if (submittedAt !== undefined) review.submitted_at = submittedAt;
+        const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [review]);
+        await expectError(new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET), 'GH_INVALID_RESPONSE', false);
+      });
+    }
+  });
+
   it('keeps a current-HEAD change request active across a later comment-only review from the same author', async () => {
     const transport = prTransport().collection('repos/acme/widgets/pulls/7/reviews', [
       {
@@ -857,6 +918,181 @@ PR: #7`;
     assert.equal(pulls.length, 1);
     assert.equal(pulls[0]?.number, 7);
     assert.equal(pulls[0]?.state, 'open');
+  });
+
+  it('reads the exact persisted pull request directly, including merged state and repository branch identities', async () => {
+    const exact = pull(7, HEAD, {
+      state: 'closed',
+      merged_at: '2026-08-14T02:30:00.000Z',
+      head: { sha: HEAD, ref: 'feature/42', repo: { name: 'widgets', owner: { login: 'acme' } } },
+      base: { sha: BASE, ref: 'main', repo: { name: 'widgets', owner: { login: 'acme' } } },
+    });
+    const transport = new RouteTransport().queue('repos/acme/widgets/pulls/7', exact);
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+    const live = await adapter.readPullRequest('acme', 'widgets', 7);
+    assert.equal(live.number, 7);
+    assert.equal(live.state, 'merged');
+    assert.equal(live.headSha, HEAD);
+    assert.equal(live.headRef, 'feature/42');
+    assert.deepEqual(live.headRepository, { owner: 'acme', repo: 'widgets' });
+    assert.equal(live.baseRef, 'main');
+    assert.deepEqual(live.baseRepository, { owner: 'acme', repo: 'widgets' });
+    assert.deepEqual(transport.calls, [{ kind: 'get', path: 'repos/acme/widgets/pulls/7' }]);
+
+    const malformedTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { state: 'closed', merged_at: '' }));
+    const malformedAdapter = new LiveGitHubAdapter({ transport: malformedTransport, now: () => OBSERVED_AT });
+    await assert.rejects(malformedAdapter.readPullRequest('acme', 'widgets', 7), /merged_at/);
+  });
+
+  it('rejects missing or unrecognized raw PR states before snapshot or list discovery can filter them', async () => {
+    const invalidStates: Array<{ label: string; value?: unknown; missing?: boolean }> = [
+      { label: 'missing', missing: true },
+      { label: 'null', value: null },
+      { label: 'numeric', value: 1 },
+      { label: 'unknown', value: 'merged' },
+    ];
+    for (const invalidState of invalidStates) {
+      const record = pull();
+      if (invalidState.missing) delete record.state;
+      else record.state = invalidState.value;
+
+      const snapshotTransport = new RouteTransport()
+        .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: snapshotTransport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+
+      const listTransport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: listTransport, now: () => OBSERVED_AT }).listPullRequests(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+      assert.equal(listTransport.calls.some((call) => call.kind === 'graphql'), false,
+        `${invalidState.label} state is rejected before association classification`);
+
+      const repositoryListTransport = new RouteTransport()
+        .collection('repos/acme/widgets/pulls', [record]);
+      await expectError(
+        new LiveGitHubAdapter({ transport: repositoryListTransport, now: () => OBSERVED_AT }).listPullRequests({
+          kind: 'repository', owner: 'acme', repo: 'widgets', branch: 'main',
+        }),
+        'GH_INVALID_RESPONSE', false,
+      );
+
+      const directTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: directTransport, now: () => OBSERVED_AT }).readPullRequest('acme', 'widgets', 7),
+        'GH_INVALID_RESPONSE', false,
+      );
+    }
+  });
+
+  it('rejects malformed or contradictory merged_at authority on snapshot, list, and direct reads', async () => {
+    const malformedMergeTimes: Array<{ label: string; state: string; mergedAt: unknown }> = [
+      { label: 'empty', state: 'closed', mergedAt: '' },
+      { label: 'whitespace', state: 'closed', mergedAt: '   ' },
+      { label: 'numeric', state: 'closed', mergedAt: 1 },
+      { label: 'open contradiction', state: 'open', mergedAt: '2026-08-14T02:30:00.000Z' },
+    ];
+    for (const malformed of malformedMergeTimes) {
+      const record = pull(7, HEAD, { state: malformed.state, merged_at: malformed.mergedAt });
+      const snapshotTransport = new RouteTransport()
+        .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: snapshotTransport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+
+      const listTransport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: listTransport, now: () => OBSERVED_AT }).listPullRequests(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+
+      const directTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', record);
+      await expectError(
+        new LiveGitHubAdapter({ transport: directTransport, now: () => OBSERVED_AT }).readPullRequest('acme', 'widgets', 7),
+        'GH_INVALID_RESPONSE', false,
+      );
+    }
+  });
+
+  it('preserves valid open and closed states and derives merged only from valid closed merged_at', async () => {
+    const validStates = [
+      { rawState: 'open', mergedAt: null, normalized: 'open' },
+      { rawState: 'open', mergedAt: undefined, normalized: 'open' },
+      { rawState: 'closed', mergedAt: null, normalized: 'closed' },
+      { rawState: 'closed', mergedAt: '2026-08-14T02:30:00.000Z', normalized: 'merged' },
+    ] as const;
+    for (const valid of validStates) {
+      const record = pull(7, HEAD, { state: valid.rawState, merged_at: valid.mergedAt });
+      if (valid.mergedAt === undefined) delete record.merged_at;
+      const directTransport = new RouteTransport().queue('repos/acme/widgets/pulls/7', record);
+      const direct = await new LiveGitHubAdapter({ transport: directTransport, now: () => OBSERVED_AT }).readPullRequest('acme', 'widgets', 7);
+      assert.equal(direct.state, valid.normalized, `${valid.rawState}/${String(valid.mergedAt)} direct normalization`);
+
+      const listTransport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record)
+        .queueGraphql(closingIssues(42));
+      const listed = await new LiveGitHubAdapter({ transport: listTransport, now: () => OBSERVED_AT }).listPullRequests(TARGET);
+      assert.equal(listed.length, 1);
+      assert.equal(listed[0]?.state, valid.normalized, `${valid.rawState}/${String(valid.mergedAt)} list normalization`);
+    }
+
+    for (const rawState of ['closed', 'merged'] as const) {
+      const record = rawState === 'closed'
+        ? pull(7, HEAD, { state: 'closed', merged_at: null })
+        : pull(7, HEAD, { state: 'closed', merged_at: '2026-08-14T02:30:00.000Z' });
+      const transport = new RouteTransport()
+        .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', record)
+        .queue('repos/acme/widgets', { default_branch: 'main' })
+        .queue('repos/acme/widgets/commits/main', { sha: BASE })
+        .collection('repos/acme/widgets/issues/42/comments', []);
+      const snapshot = await new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT }).readLiveSnapshot(TARGET);
+      assert.equal(snapshot.pullRequest, null, `${rawState} PRs remain excluded from open-PR discovery`);
+      assert.equal(snapshot.headSha, null);
+    }
+  });
+
+  it('excludes conclusively unrelated PRs before requiring full list normalization', async () => {
+    const unrelated = pull(7, HEAD, { body: 'Implements #12.' });
+    delete unrelated.head;
+    delete unrelated.base;
+    const transport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue('repos/acme/widgets/pulls/7', unrelated)
+      .queueGraphql(closingIssues());
+    const adapter = new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT });
+
+    assert.deepEqual(await adapter.listPullRequests(TARGET), []);
+  });
+
+  it('fully normalizes associated and unknown retained list candidates after association filtering', async () => {
+    for (const association of ['associated', 'unknown'] as const) {
+      const malformed = pull(7, HEAD, { body: association === 'associated' ? 'Closes #42' : 'Implements #12.' });
+      delete malformed.head;
+      const transport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', malformed)
+        .queueGraphql(association === 'associated' ? closingIssues(42) : { errors: [{ message: 'temporary GraphQL failure' }] });
+
+      await expectError(
+        new LiveGitHubAdapter({ transport, now: () => OBSERVED_AT }).listPullRequests(TARGET),
+        'GH_INVALID_RESPONSE', false,
+      );
+    }
   });
 
   it('does not pick arbitrarily when multiple cross-references are all incidental', async () => {

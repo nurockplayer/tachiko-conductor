@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
@@ -12,13 +13,13 @@ import {
   type CodexCliAdapterOptions,
 } from './agents/codex-cli.js';
 import { CODEX_APP_SERVER_PROVIDER, CodexAppServerAdapter, type NativeThreadObservation } from './agents/codex-app-server.js';
+import { IsolatedLunaAdapter, LUNA_ISOLATED_PROVIDER } from './agents/luna-isolated.js';
 import { ImplementationAgentRegistry } from './agents/implementation-router.js';
 import { WORKER_ROUTER_PROVIDER, WorkerRouterAdapter } from './agents/worker-router.js';
 import type { ImplementationCapabilityResolver, McpHttpCapability } from './adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from './adapters/bootstrap.js';
-import type { GitHubAdapter, GitHubLiveSnapshot } from './adapters/github.js';
+import type { GitHubAdapter, GitHubLivePullRequestSnapshot, GitHubLiveSnapshot } from './adapters/github.js';
 import type { HostedCheckPolicyConfiguration, LocalValidationConfiguration } from './adapters/validation.js';
-import type { ToolOutputPolicy } from './evidence/tool-output.js';
 import {
   ConfiguredLocalValidationAdapter,
   MAX_LOCAL_VALIDATION_TIMEOUT_MS,
@@ -37,6 +38,7 @@ import {
   type StartBrowserRuntimeOptions,
 } from './browser/playwright-mcp-runtime.js';
 import { createRun } from './domain/run.js';
+import { parseRepairTaskShapeAuthority, type RepairTaskShapeAuthority } from './domain/repair-admission.js';
 import {
   assertExecutionSupportedByProvider,
   normalizeReasoningEffort,
@@ -71,11 +73,17 @@ import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
+import { StandaloneGitBootstrap } from './workspace/standalone-git-bootstrap.js';
 import { resolveDispatchConfiguration } from './dispatch/config.js';
 import { dispatchOnceCommand } from './dispatch/command.js';
+import { claimedRun, DispatchAdmissionWaitError, type DispatchAdmissionObservation } from './dispatch/runner.js';
+import { DEFAULT_DISPATCH_IDLE_POLL_MS, dispatchContinuously } from './dispatch/continuous.js';
 import { GitHubDispatchRuntime } from './dispatch/github-runtime.js';
 import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './dispatch/invocation-lock.js';
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
+import { preflightProductionPolicy } from './production-policy.js';
+import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
+import { assertSafeAccountOwnedPath, resolveAccountHomeDirectory } from './account-home.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -93,19 +101,35 @@ import {
 } from './workflow/wait-command.js';
 import { WaitLedgerFileStore } from './workflow/wait-ledger-store.js';
 import { NativeThreadWaitObserver, gitHeadReader } from './workflow/wait-observation.js';
+import { OPERATIONAL_RUNTIME_PROJECTION_VERSION, composeOperationalRuntimeProjection, readOperationalRuntimeProjection, readOperationalRuntimeProjectionState, writeOperationalRuntimeProjection } from './operational/runtime-projection.js';
+import { createHostAdmissionRegistry, resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from './mission-admission/host-registry.js';
+import { canonicalizeMissionEvidence, type AdmissionLaneView, type AdmissionResult, type AdmissionToken, type MissionAdmissionRegistry } from './mission-admission/registry.js';
+import { readManualOwnerReceipt, validateManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from './mission-admission/manual-owner-receipt.js';
+import { readRunOwnerReceipt, writeRunOwnerReceipt, type RunOwnerReceipt, type RunOwnerReceiptPhase } from './mission-admission/run-owner-receipt.js';
+import { selectDispatchRuntime, renderDispatchRuntime, sameDispatchRuntimeClaim, type DispatchRuntimeClaim } from './dispatch/queue.js';
 
 const USAGE = `Tachiko Conductor — local orchestration core.
 
 Usage:
-  tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> [--browser-profile <profile>]
+  tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> --repair-task-shape-authority <json> [--browser-profile <profile>]
   tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
-  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical>
+  tachiko run admission recover <id> --generation <n> [--stopped]
+  tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical> --repair-task-shape-authority <json>
   tachiko run show <id>
   tachiko run inspect <id>
   tachiko run transition <id> <transition> [--reason <text>]
   tachiko run list
+  tachiko run projections rebuild
   tachiko dispatch once
-  tachiko dispatch launchd render --program <absolute-wrapper> --working-directory <absolute-path> [--minute <0-59>]
+  tachiko dispatch serve [--idle-poll-ms <n>] [--max-cycles <n>]
+  tachiko dispatch admission status
+  tachiko dispatch manual register
+  tachiko dispatch manual park --stopped
+  tachiko dispatch manual retire --stopped --expected-generation <n>
+  tachiko dispatch manual recover --receipt-stdin
+  tachiko dispatch wake
+  tachiko production preflight
+  tachiko dispatch launchd render --program <absolute-driver-wrapper> --node-program <stable-absolute-node> --pnpm-program <absolute-pnpm> --dependency-artifact-path <absolute-lockfile-bound-store> --luna-codex-home <absolute-path> --playwright-browsers-path <absolute-host-artifact-path> --working-directory <absolute-path>
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
@@ -132,7 +156,10 @@ locally authenticated gh CLI: {"ok":true,"snapshot":...} on success, or
 {"ok":false,"error":...} on stderr with a non-zero exit code.
 
 Run state is stored under $TACHIKO_DATA_DIR (default ~/.tachiko-conductor/runs).
-New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value;
+Operational projections are secret-free sidecars under
+$TACHIKO_DATA_DIR/.operational/v1; rebuild them only from validated persisted runs.
+New runs require a revisioned TACHIKO_EXECUTION_PROFILE_CONFIG JSON value.
+New unattended runs also require strict revisioned repair-task-shape authority JSON.
 the selected --execution-profile is persisted with the run.
 wait observe/await are deterministic and model-free: they read native/runtime
 state, coalesce it into the durable wait ledger, and report whether the
@@ -149,7 +176,7 @@ in the foreground; use status/stop from another terminal.
 export const DEFAULT_MAX_REVIEW_ATTEMPTS = 3;
 export { LIVE_HEAD_SYNC_DECISION } from './domain/decisions.js';
 
-export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER | typeof WORKER_ROUTER_PROVIDER;
+export type ImplementationProvider = typeof CLAUDE_CODE_PROVIDER | typeof CODEX_CLI_PROVIDER | typeof WORKER_ROUTER_PROVIDER | typeof LUNA_ISOLATED_PROVIDER;
 export type CodexExecutionConfig = Pick<
   CodexCliAdapterOptions,
   'model' | 'reasoningEffort' | 'sandboxMode' | 'approvalPolicy' | 'timeoutMs'
@@ -165,7 +192,7 @@ export function resolveSelectedExecutionProfile(
   const execution = resolveExecutionProfile(
     parseExecutionProfileConfiguration(raw),
     selected,
-    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER, WORKER_ROUTER_PROVIDER],
+    [CLAUDE_CODE_PROVIDER, CODEX_CLI_PROVIDER, WORKER_ROUTER_PROVIDER, LUNA_ISOLATED_PROVIDER],
   );
   assertExecutionSupportedByProvider(execution);
   return execution;
@@ -180,17 +207,97 @@ export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOn
   if (settled) console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
 }
 
+function canonicalPhysicalPath(candidate: string): string {
+  let cursor = path.resolve(candidate);
+  const suffix: string[] = [];
+  while (!existsSync(cursor)) {
+    const parent = path.dirname(cursor);
+    if (parent === cursor) throw new Error('Cannot resolve a physical dispatch lock path.');
+    suffix.unshift(path.basename(cursor));
+    cursor = parent;
+  }
+  return path.resolve(realpathSync.native(cursor), ...suffix);
+}
+
+function canonicalDispatchLockPath(kind: 'once' | 'admission', homeDirectory: string): string {
+  const base = path.join(homeDirectory, '.tachiko-conductor', 'dispatch');
+  return path.join(base, kind === 'once' ? 'once.lock' : 'once.lock.admission');
+}
+
 function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env.TACHIKO_DISPATCH_LOCK_PATH ?? path.join(os.homedir(), '.tachiko-conductor', 'dispatch', 'once.lock');
+  const homeDirectory = resolveAccountHomeDirectory();
+  const lexicalCanonical = canonicalDispatchLockPath('once', homeDirectory);
+  assertSafeAccountOwnedPath(homeDirectory, lexicalCanonical, 'file');
+  const canonical = canonicalPhysicalPath(lexicalCanonical);
+  const configured = env.TACHIKO_DISPATCH_LOCK_PATH;
+  if (configured === undefined) return canonical;
+  if (!path.isAbsolute(configured) || canonicalPhysicalPath(configured) !== canonical) {
+    throw new Error('TACHIKO_DISPATCH_LOCK_PATH must resolve to the canonical per-account dispatch lock.');
+  }
+  return canonical;
+}
+
+/**
+ * A short, independent fence for admission-state transitions.  The long-lived
+ * serve lock deliberately cannot be used here: an operator must be able to
+ * place a hold while that singleton is asleep.  Instead, reconcile holds this
+ * fence only while it can read the queue, claim work, or cross a provider
+ * boundary; hold/release serializes with that interval.
+ */
+function dispatchAdmissionLockPath(env: NodeJS.ProcessEnv = process.env): string {
+  const homeDirectory = resolveAccountHomeDirectory();
+  // Validate both configurable aliases against the same account root even
+  // when this caller needs only the short admission fence.
+  dispatchLockPath(env);
+  const lexicalCanonical = canonicalDispatchLockPath('admission', homeDirectory);
+  assertSafeAccountOwnedPath(homeDirectory, lexicalCanonical, 'file');
+  const canonical = canonicalPhysicalPath(lexicalCanonical);
+  const configured = env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH;
+  if (configured === undefined) return canonical;
+  if (!path.isAbsolute(configured) || canonicalPhysicalPath(configured) !== canonical) {
+    throw new Error('TACHIKO_DISPATCH_ADMISSION_LOCK_PATH must resolve to the canonical per-account admission lock.');
+  }
+  return canonical;
+}
+
+async function withDispatchAdmissionLock<T>(operation: (release: () => void) => Promise<T> | T): Promise<T> {
+  for (;;) {
+    try {
+      const lockPath = dispatchAdmissionLockPath();
+      assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
+      const lock = acquireDispatchInvocationLock({ lockPath });
+      assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
+      let released = false;
+      const release = () => { if (!released) { released = true; lock.release(); } };
+      try {
+        return await operation(release);
+      } finally {
+        release();
+      }
+    } catch (error) {
+      if (!(error instanceof DispatchInvocationLockedError)) throw error;
+      // A transition waits for a current reconciliation boundary rather than
+      // racing its projection write or allowing a second admission.
+      await new Promise<void>((resolve) => setTimeout(resolve, 10));
+    }
+  }
 }
 
 /** Provider selection is external to adapters; the stateless local router is the default path. */
 export function resolveImplementationProvider(env: NodeJS.ProcessEnv = process.env): ImplementationProvider {
   const value = env.TACHIKO_IMPLEMENTATION_AGENT ?? WORKER_ROUTER_PROVIDER;
-  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER || value === WORKER_ROUTER_PROVIDER) return value;
+  if (value === CLAUDE_CODE_PROVIDER || value === CODEX_CLI_PROVIDER || value === WORKER_ROUTER_PROVIDER || value === LUNA_ISOLATED_PROVIDER) return value;
   throw new Error(
-    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER}, ${CODEX_CLI_PROVIDER}, or ${WORKER_ROUTER_PROVIDER}.`,
+    `Invalid TACHIKO_IMPLEMENTATION_AGENT "${value}": expected ${CLAUDE_CODE_PROVIDER}, ${CODEX_CLI_PROVIDER}, ${WORKER_ROUTER_PROVIDER}, or ${LUNA_ISOLATED_PROVIDER}.`,
   );
+}
+
+function requiredLunaHome(env: NodeJS.ProcessEnv): string {
+  const value = env.TACHIKO_LUNA_CODEX_HOME;
+  if (value === undefined || !path.isAbsolute(value) || value.trim() === '') {
+    throw new Error('luna-isolated requires TACHIKO_LUNA_CODEX_HOME to name the qualified absolute CODEX_HOME.');
+  }
+  return value;
 }
 
 /** Read already-selected Codex execution values without inventing policy defaults. */
@@ -288,31 +395,37 @@ export function resolveLocalValidationConfiguration(
     (typeof record.workspacePath !== 'string' || record.workspacePath.trim() === '' || !path.isAbsolute(record.workspacePath))) {
     throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.workspacePath must be an absolute non-empty path when supplied.');
   }
-  const outputPolicy = record.outputPolicy === undefined ? undefined : parseToolOutputPolicy(record.outputPolicy);
+  if (record.trustedIgnoredBaselinePath !== undefined &&
+    (typeof record.trustedIgnoredBaselinePath !== 'string' || record.trustedIgnoredBaselinePath.trim() === '' || !path.isAbsolute(record.trustedIgnoredBaselinePath))) {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.trustedIgnoredBaselinePath must be an absolute non-empty path when supplied.');
+  }
+  if (record.playwrightBrowsersPathEnvironment !== undefined && record.playwrightBrowsersPathEnvironment !== 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH') {
+    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.playwrightBrowsersPathEnvironment must be TACHIKO_PLAYWRIGHT_BROWSERS_PATH when supplied.');
+  }
+  if (record.nodeProgramEnvironment !== undefined && record.nodeProgramEnvironment !== 'TACHIKO_NODE_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.nodeProgramEnvironment must be TACHIKO_NODE_PROGRAM when supplied.');
+  if (record.pnpmProgramEnvironment !== undefined && record.pnpmProgramEnvironment !== 'TACHIKO_PNPM_PROGRAM') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.pnpmProgramEnvironment must be TACHIKO_PNPM_PROGRAM when supplied.');
+  if (record.dependencyArtifactPathEnvironment !== undefined && record.dependencyArtifactPathEnvironment !== 'TACHIKO_PNPM_DEPENDENCY_ARTIFACT') throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.dependencyArtifactPathEnvironment must be TACHIKO_PNPM_DEPENDENCY_ARTIFACT when supplied.');
+  if ((record.nodeProgramEnvironment === undefined) !== (record.pnpmProgramEnvironment === undefined)) throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG must configure both Node and pnpm toolchain paths together.');
+  const nodeProgram = record.nodeProgramEnvironment === undefined ? undefined : env.TACHIKO_NODE_PROGRAM;
+  const pnpmProgram = record.pnpmProgramEnvironment === undefined ? undefined : env.TACHIKO_PNPM_PROGRAM;
+  const dependencyArtifactPath = record.dependencyArtifactPathEnvironment === undefined ? undefined : env.TACHIKO_PNPM_DEPENDENCY_ARTIFACT;
+  if (record.nodeProgramEnvironment !== undefined && (typeof nodeProgram !== 'string' || nodeProgram.trim() === '' || !path.isAbsolute(nodeProgram))) throw new Error('TACHIKO_NODE_PROGRAM must be an absolute host-provisioned runtime.');
+  if (record.pnpmProgramEnvironment !== undefined && (typeof pnpmProgram !== 'string' || pnpmProgram.trim() === '' || !path.isAbsolute(pnpmProgram))) throw new Error('TACHIKO_PNPM_PROGRAM must be an absolute host-provisioned pnpm executable.');
+  if (record.dependencyArtifactPathEnvironment !== undefined && (typeof dependencyArtifactPath !== 'string' || dependencyArtifactPath.trim() === '' || !path.isAbsolute(dependencyArtifactPath))) throw new Error('TACHIKO_PNPM_DEPENDENCY_ARTIFACT must be an absolute host-provisioned dependency artifact.');
+  const playwrightBrowsersPath = record.playwrightBrowsersPathEnvironment === undefined ? undefined : env.TACHIKO_PLAYWRIGHT_BROWSERS_PATH;
+  if (record.playwrightBrowsersPathEnvironment !== undefined &&
+    (typeof playwrightBrowsersPath !== 'string' || playwrightBrowsersPath.trim() === '' || !path.isAbsolute(playwrightBrowsersPath))) {
+    throw new Error('TACHIKO_PLAYWRIGHT_BROWSERS_PATH must be an absolute non-empty host-owned browser artifact directory.');
+  }
   return {
     revision: record.revision,
-    commands,
+    commands: commands.map((command) => ({ ...command, argv: command.argv[0] === 'pnpm' && pnpmProgram !== undefined ? [pnpmProgram, ...command.argv.slice(1)] : command.argv })),
     ...(record.workspacePath === undefined ? {} : { workspacePath: record.workspacePath }),
-    ...(outputPolicy === undefined ? {} : { outputPolicy }),
-  };
-}
-
-function parseToolOutputPolicy(value: unknown): ToolOutputPolicy {
-  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-    throw new Error('TACHIKO_LOCAL_VALIDATION_CONFIG.outputPolicy must be an object.');
-  }
-  const policy = value as Record<string, unknown>;
-  const fields = ['previewBytes', 'diagnosticBytes', 'maxDiagnostics', 'readBytes'] as const;
-  for (const field of fields) {
-    if (!Number.isSafeInteger(policy[field]) || (policy[field] as number) < 1) {
-      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.outputPolicy.${field} must be a positive safe integer.`);
-    }
-  }
-  return {
-    previewBytes: policy.previewBytes as number,
-    diagnosticBytes: policy.diagnosticBytes as number,
-    maxDiagnostics: policy.maxDiagnostics as number,
-    readBytes: policy.readBytes as number,
+    ...(record.trustedIgnoredBaselinePath === undefined ? {} : { trustedIgnoredBaselinePath: record.trustedIgnoredBaselinePath }),
+    ...(playwrightBrowsersPath === undefined ? {} : { playwrightBrowsersPath }),
+    ...(nodeProgram === undefined ? {} : { nodeProgram }),
+    ...(pnpmProgram === undefined ? {} : { pnpmProgram }),
+    ...(dependencyArtifactPath === undefined ? {} : { dependencyArtifactPath }),
   };
 }
 
@@ -359,7 +472,7 @@ export function resolveHostedCheckPolicyConfiguration(
 
 /** Resolve the directory where run JSON files are stored. */
 export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
-  return env.TACHIKO_DATA_DIR ?? path.join(os.homedir(), '.tachiko-conductor', 'runs');
+  return env.TACHIKO_DATA_DIR ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'runs');
 }
 
 export interface BrowserRoots {
@@ -369,7 +482,7 @@ export interface BrowserRoots {
 
 export function resolveBrowserRoots(
   env: NodeJS.ProcessEnv = process.env,
-  homeDirectory: string = os.homedir(),
+  homeDirectory: string = resolveAccountHomeDirectory(),
 ): BrowserRoots {
   const root = path.join(homeDirectory, '.tachiko-conductor', 'browser');
   return {
@@ -582,10 +695,11 @@ export function parseIssueRef(raw: string): IssueTarget {
   if (match === null) {
     throw new Error(`Invalid issue reference "${raw}": expected owner/repo#123.`);
   }
+  const repository = canonicalizeMissionEvidence({ repository: `${match[1] ?? ''}/${match[2] ?? ''}`, issue: 1 }).repository.split('/');
   return {
     kind: 'issue',
-    owner: match[1] ?? '',
-    repo: match[2] ?? '',
+    owner: repository[0]!,
+    repo: repository[1]!,
     issueNumber: parseIssueNumber(match[3] ?? ''),
   };
 }
@@ -614,16 +728,636 @@ export async function githubSnapshotCommand(adapter: GitHubAdapter, ref: string)
 }
 
 function targetsEqual(a: Target, b: Target): boolean {
-  if (a.kind !== b.kind || a.owner !== b.owner || a.repo !== b.repo) return false;
+  const canonicalRepository = (target: Target) => canonicalizeMissionEvidence({ repository: `${target.owner}/${target.repo}`, issue: 1 }).repository;
+  if (a.kind !== b.kind || canonicalRepository(a) !== canonicalRepository(b)) return false;
   if (a.kind === 'issue') return (b as IssueTarget).issueNumber === (a as IssueTarget).issueNumber;
   return (b as RepositoryTarget).branch === (a as RepositoryTarget).branch;
 }
 
-/** Find an active persisted run whose target matches exactly, if any. */
+/** Find a unique active persisted run whose target matches exactly, if any. */
 export function findRunByTarget(store: RunStore, target: Target): Run | null {
-  return store.list().find((run) =>
+  const matches = store.list().filter((run) =>
     targetsEqual(run.target, target) && run.state !== 'MERGED' && run.state !== 'FAILED',
-  ) ?? null;
+  );
+  if (matches.length > 1) throw new Error(`Multiple active durable Runs overlap target ${target.kind === 'issue' ? `${target.owner}/${target.repo}#${target.issueNumber}` : `${target.owner}/${target.repo}:${target.branch}`}; refusing ambiguous ownership.`);
+  return matches[0] ?? null;
+}
+
+function evidenceForRun(run: Run, additional: { readonly pullRequest?: number; readonly workspace?: string } = {}): ReturnType<typeof canonicalizeMissionEvidence> {
+  const shared = {
+    repository: `${run.target.owner}/${run.target.repo}`,
+    run: run.id,
+    ...(run.dispatchClaimId === undefined ? {} : { claim: run.dispatchClaimId }),
+    ...(run.pullRequest === undefined ? {} : { pullRequest: run.pullRequest.number }),
+    ...(run.bootstrap === undefined ? {} : { workspace: run.bootstrap.workspacePath }),
+    ...(additional.pullRequest === undefined ? {} : { pullRequest: additional.pullRequest }),
+    ...(additional.workspace === undefined ? {} : { workspace: additional.workspace }),
+  };
+  return canonicalizeMissionEvidence(run.target.kind === 'issue'
+    ? { ...shared, issue: run.target.issueNumber }
+    : { ...shared, claim: `branch:${run.target.branch}` });
+}
+
+/** Resume from the workspace already bound to this Run, never from the caller's ambient cwd. */
+function persistedRunWorkspace(run: Run): string | undefined {
+  if (run.bootstrap !== undefined) return run.bootstrap.workspacePath;
+  const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  const receiptPath = resolveRunOwnerReceiptPath(repository, run.id, evidenceForRun(run));
+  const receipt = readRunOwnerReceipt(receiptPath);
+  if (receipt === null) return undefined;
+  if (receipt.runId !== run.id || receipt.laneId !== `run:${run.id}` || receipt.repository !== repository ||
+    receipt.issue !== (run.target.kind === 'issue' ? run.target.issueNumber : undefined) || receipt.claimId !== run.dispatchClaimId) {
+    throw new Error(`Run owner receipt does not match Run "${run.id}"; refusing workspace recovery.`);
+  }
+  return receipt.workspace;
+}
+
+/** Public, bounded admission status. Physical surfaces and capability tokens are intentionally omitted. */
+export function dispatchAdmissionStatus(registry: MissionAdmissionRegistry, store?: RunStore) {
+  const snapshot = registry.snapshot();
+  return {
+    schemaVersion: snapshot.schemaVersion,
+    revision: snapshot.revision,
+    counts: snapshot.counts,
+    limits: snapshot.limits,
+    omittedLaneCount: snapshot.omittedLaneCount,
+    lanesTruncated: snapshot.lanesTruncated,
+    lanes: snapshot.lanes.map(({ laneId, missionId, evidence, role, status, generation, highAutonomy, parkedReason }) => ({
+      laneId, missionId, role, status, generation, highAutonomy,
+      ...(evidence.run === undefined ? {} : { runState: store?.read(evidence.run)?.state ?? 'unknown' }),
+      evidence: {
+        repository: evidence.repository,
+        ...(evidence.run === undefined ? {} : { run: evidence.run }),
+        ...(evidence.claim === undefined ? {} : { claim: evidence.claim }),
+        ...(evidence.issue === undefined ? {} : { issue: evidence.issue }),
+        ...(evidence.pullRequest === undefined ? {} : { pullRequest: evidence.pullRequest }),
+        ...(evidence.workspace === undefined ? {} : { workspace: evidence.workspace }),
+        ...(evidence.repositoryScope === true ? { repositoryScope: true as const } : {}),
+      },
+      reason: parkedReason ?? (status === 'active' ? 'active_owner' : status),
+      ...(parkedReason === undefined ? {} : { parkedReason }),
+    })),
+    lastTransition: snapshot.lastTransition,
+  };
+}
+
+export interface RuntimeProjectionUpdate {
+  readonly stage: string;
+  readonly supervisor: 'running' | 'stopped' | 'parked';
+  readonly eventWakeEligible?: boolean;
+  readonly nextPollAt?: string;
+  readonly maintenanceHold?: { readonly active: boolean; readonly reason?: string };
+}
+
+/** Publish one conservative account-wide projection from one strict registry read. */
+export function publishAdmissionRuntimeProjection(
+  runsDir: string,
+  registry: MissionAdmissionRegistry,
+  store: RunStore,
+  update: RuntimeProjectionUpdate,
+): ReturnType<typeof composeOperationalRuntimeProjection> {
+  const priorRead = readOperationalRuntimeProjectionState(runsDir);
+  if (priorRead.status === 'invalid') throw new Error('Existing operational runtime projection is unreadable or malformed; refusing to overwrite it.');
+  const prior = priorRead.status === 'valid' ? priorRead.projection : null;
+  const admission = registry.snapshot({ requireExisting: true });
+  const runs = store.list();
+  const runById = new Map(runs.map((run) => [run.id, run]));
+  const durableLaneIds = new Set<string>();
+  const validatedRunIds = new Set<string>();
+  const validatedManualIds = new Set<string>();
+  const manualLanes: NonNullable<Parameters<typeof composeOperationalRuntimeProjection>[0]['manualLane']>[] = [];
+  for (const lane of admission.lanes) {
+    if ((lane.status !== 'parked' && lane.status !== 'released') || (lane.role !== 'production_captain' && lane.role !== 'delegated_mutation_writer')) continue;
+    if (lane.evidence.run !== undefined) {
+      const run = runById.get(lane.evidence.run);
+      if (run === undefined || `${run.target.owner}/${run.target.repo}`.toLowerCase() !== lane.evidence.repository) continue;
+      try {
+        const receiptPath = resolveRunOwnerReceiptPath(lane.evidence.repository, run.id, lane.evidence);
+        const receipt = readRunOwnerReceipt(receiptPath);
+        if (receipt === null) continue;
+        assertRecoveryOwnerEvidence(run, receipt, lane, lane.missionId, lane.generation - 1);
+        const expectedParkReason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
+        const parkedReceipt = lane.status === 'parked' && lane.parkedReason === expectedParkReason && receipt.generation === lane.generation && receipt.phase === 'parked' && receipt.token === undefined;
+        const releasedReceipt = lane.status === 'released' && receipt.generation === lane.generation && receipt.phase === 'released' && receipt.token === undefined;
+        if (parkedReceipt || releasedReceipt) {
+          durableLaneIds.add(lane.laneId);
+          validatedRunIds.add(run.id);
+        }
+      } catch { /* missing or inconsistent checkpoint detail is ambiguous, never absence proof */ }
+      continue;
+    }
+    if (lane.role === 'production_captain' && lane.evidence.repositoryScope === true && lane.evidence.workspace !== undefined) {
+      try {
+        const receiptPath = resolveManualOwnerReceiptPath(lane.evidence.repository, lane.evidence.workspace);
+        const receipt = readManualOwnerReceipt(receiptPath);
+        const parkedManual = lane.status === 'parked' && lane.parkedReason === 'manual_checkpoint' && receipt?.status === 'parked' && receipt.generation === lane.generation;
+        const releasedManual = lane.status === 'released' && receipt?.status === 'parked' && receipt.generation + 1 === lane.generation;
+        const legacyReleasedManual = lane.status === 'released' && receipt === null;
+        if (legacyReleasedManual) { durableLaneIds.add(lane.laneId); validatedManualIds.add(lane.laneId); }
+        if (receipt !== null && (parkedManual || releasedManual) && receipt.laneId === lane.laneId && receipt.missionId === lane.missionId &&
+          receipt.repository === lane.evidence.repository && receipt.workspace === lane.evidence.workspace) {
+          durableLaneIds.add(lane.laneId);
+          validatedManualIds.add(lane.laneId);
+          if (lane.status === 'parked') manualLanes.push({ repository: receipt.repository, worktree: receipt.workspace, branch: receipt.branch, checkpointSha: receipt.checkpointSha,
+            clean: true, state: 'parked', recoverable: true, laneId: receipt.laneId, missionId: receipt.missionId, admissionRevision: admission.revision });
+        }
+      } catch { /* missing or inconsistent checkpoint detail is ambiguous, never absence proof */ }
+    }
+  }
+  const activeManual = admission.lanes.filter((lane) => lane.status === 'active' && lane.role === 'production_captain' && lane.evidence.repositoryScope === true && lane.evidence.workspace !== undefined);
+  if (admission.counts.writers > 0 && activeManual.length === 1) {
+    const lane = activeManual[0]!;
+    try {
+      const receipt = readManualOwnerReceipt(resolveManualOwnerReceiptPath(lane.evidence.repository, lane.evidence.workspace!));
+      if (receipt !== null && receipt.status === 'active' && receipt.laneId === lane.laneId && receipt.missionId === lane.missionId &&
+        receipt.repository === lane.evidence.repository && receipt.workspace === lane.evidence.workspace && receipt.generation === lane.generation) {
+        manualLanes.push({ repository: receipt.repository, worktree: receipt.workspace, branch: receipt.branch, checkpointSha: receipt.checkpointSha,
+          clean: false, state: 'active', recoverable: false, laneId: receipt.laneId, missionId: receipt.missionId, admissionRevision: admission.revision });
+      }
+    } catch { /* active count is still authoritative; omit uncertain detail */ }
+  }
+  const mutationLanes = admission.lanes.filter((lane) => lane.role === 'production_captain' || lane.role === 'delegated_mutation_writer');
+  const pristine = admission.revision === 0 && admission.lanes.length === 0 && admission.lastTransition === null && runs.length === 0 &&
+    prior?.activeWriter === undefined && prior?.manualLane === undefined;
+  const noTransitionalMutationOwners = mutationLanes.every((lane) => lane.status === 'parked' || lane.status === 'released');
+  const everyMutationOwnerValidated = mutationLanes.every((lane) => lane.status === 'parked' || lane.status === 'released'
+    ? durableLaneIds.has(lane.laneId)
+    : false);
+  const hasValidatedHistory = durableLaneIds.size > 0;
+  const everyRunValidated = runs.every((run) => validatedRunIds.has(run.id));
+  const priorWriterResolved = prior?.activeWriter === undefined || validatedRunIds.has(prior.activeWriter.runId);
+  const priorManualResolved = prior?.manualLane === undefined || mutationLanes.some((lane) =>
+    lane.role === 'production_captain' && lane.evidence.repositoryScope === true && lane.evidence.repository === prior.manualLane!.repository &&
+    lane.evidence.workspace === prior.manualLane!.worktree && validatedManualIds.has(lane.laneId));
+  const reentryEvidenceComplete = pristine || (hasValidatedHistory && noTransitionalMutationOwners && everyMutationOwnerValidated && everyRunValidated && priorWriterResolved && priorManualResolved);
+  const projection = composeOperationalRuntimeProjection({
+    admission, runs, prior, now: new Date().toISOString(), stage: update.stage, supervisor: update.supervisor,
+    eventWakeEligible: update.eventWakeEligible ?? false,
+    ...(update.nextPollAt === undefined ? {} : { nextPollAt: update.nextPollAt }),
+    ...(update.maintenanceHold === undefined ? {} : { maintenanceHold: update.maintenanceHold }),
+    ...(manualLanes.length === 1 ? { manualLane: manualLanes[0]! } : {}),
+    durableLaneIds,
+    reentryEvidenceComplete,
+  });
+  writeOperationalRuntimeProjection(runsDir, projection);
+  return projection;
+}
+
+export function assertCanonicalDispatchResumeClaim(run: Run, claim: DispatchRuntimeClaim | null, config: ReturnType<typeof resolveDispatchConfiguration>, claimBoundRun: Run | null = null): asserts claim is DispatchRuntimeClaim {
+  const uniqueUnboundRunProof = claimBoundRun?.id === run.id && claimBoundRun.dispatchClaimId === claim?.claimId;
+  if (run.target.kind !== 'issue' || run.dispatchClaimId === undefined || run.execution === undefined ||
+    (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') ||
+    `${run.target.owner}/${run.target.repo}`.toLowerCase() !== `${config.owner}/${config.repo}`.toLowerCase() ||
+    claim === null || claim.state !== 'needs_human' || (claim.runId !== run.id && !(claim.runId === null && uniqueUnboundRunProof)) || claim.claimId !== run.dispatchClaimId ||
+    claim.issue !== run.target.issueNumber || claim.profile !== run.execution.profile ||
+    (claim.repairTaskShapeAuthority !== undefined &&
+      (run.repairTaskShapeAuthority?.revision !== claim.repairTaskShapeAuthority.revision ||
+        run.repairTaskShapeAuthority.shape !== claim.repairTaskShapeAuthority.shape))) {
+    throw new Error(`Dispatch runtime claim for Run "${run.id}" is missing, stale, replaced, or differently bound; refusing human resume.`);
+  }
+}
+
+export function assertDispatchRuntimeClaimReadback(
+  commentId: string,
+  expected: DispatchRuntimeClaim,
+  observed: { readonly id: string; readonly claim: DispatchRuntimeClaim } | null,
+): asserts observed is { readonly id: string; readonly claim: DispatchRuntimeClaim } {
+  if (observed === null || observed.id !== commentId || !sameDispatchRuntimeClaim(observed.claim, expected)) {
+    throw new Error('Dispatch runtime claim changed after the human Run decision was committed; retained Run and claim require reconciliation.');
+  }
+}
+
+function runReceiptFor(run: Run, missionId: string, token: AdmissionToken, phase: RunOwnerReceiptPhase, workspace?: string): RunOwnerReceipt {
+  return {
+    schemaVersion: 1,
+    laneId: token.laneId,
+    missionId,
+    repository: `${run.target.owner}/${run.target.repo}`.toLowerCase(),
+    runId: run.id,
+    ...(run.target.kind === 'issue' ? { issue: run.target.issueNumber } : {}),
+    ...(run.dispatchClaimId === undefined ? {} : { claimId: run.dispatchClaimId }),
+    ...(workspace === undefined ? {} : { workspace }),
+    token,
+    generation: token.generation,
+    phase,
+  };
+}
+
+function receiptForCurrentToken(receiptPath: string, token: AdmissionToken, phase: RunOwnerReceiptPhase): RunOwnerReceipt {
+  const receipt = readRunOwnerReceipt(receiptPath);
+  if (receipt === null || receipt.laneId !== token.laneId || receipt.generation !== token.generation || receipt.token?.token !== token.token) {
+    throw new Error(`Run owner receipt does not match exact admission generation ${token.generation}.`);
+  }
+  return { ...receipt, phase, token };
+}
+
+function finalizeRunOwnerReceipt(receiptPath: string | undefined, token: AdmissionToken, phase: 'parked' | 'released', generation: number): void {
+  if (receiptPath === undefined) return;
+  const current = readRunOwnerReceipt(receiptPath);
+  if (current === null || current.laneId !== token.laneId || current.generation !== token.generation || current.token?.token !== token.token) {
+    throw new Error(`Run owner receipt does not match exact admission generation ${token.generation} after registry settlement.`);
+  }
+  const { token: _token, ...withoutToken } = current;
+  writeRunOwnerReceipt(receiptPath, { ...withoutToken, phase, generation });
+}
+
+function sameRunReceiptIdentity(receipt: RunOwnerReceipt, run: Run, missionId: string): boolean {
+  return receipt.laneId === `run:${run.id}` && receipt.runId === run.id && receipt.repository === `${run.target.owner}/${run.target.repo}`.toLowerCase() &&
+    receipt.issue === (run.target.kind === 'issue' ? run.target.issueNumber : undefined) && receipt.claimId === run.dispatchClaimId && receipt.missionId === missionId;
+}
+
+const MISSION_EVIDENCE_FIELDS = ['repository', 'issue', 'pullRequest', 'run', 'claim', 'workspace', 'stateSurface', 'repositoryScope'] as const;
+
+type RecoveryLaneEvidence = Pick<AdmissionLaneView, 'laneId' | 'missionId' | 'role' | 'evidence' | 'generation' | 'status' | 'parkedReason'>;
+
+function isLogicalBootstrapPlanningReservation(run: Run, receipt: RunOwnerReceipt, lane: RecoveryLaneEvidence, generation: number): boolean {
+  const targetIssue = run.target.kind === 'issue' ? run.target.issueNumber : undefined;
+  const bootstrapMatchesRun = run.bootstrap !== undefined && run.target.kind === 'issue' &&
+    run.bootstrap.owner.toLowerCase() === run.target.owner.toLowerCase() && run.bootstrap.repo.toLowerCase() === run.target.repo.toLowerCase() &&
+    run.bootstrap.issueNumber === targetIssue;
+  const noExecutionEvidence = run.state === 'IMPLEMENTING' && run.interruptedFrom === undefined && run.interrupt === undefined &&
+    run.pullRequest === undefined && run.headSha === undefined && run.executor === undefined && run.agentResult === undefined &&
+    run.reviewResult === undefined && run.validationResult === undefined && (run.repairAdmissions?.length ?? 0) === 0 &&
+    !(run.telemetry?.events.some((event) => (event.kind === 'spawn' || event.kind === 'completion') && event.role === 'worker') ?? false) &&
+    run.history.some((record) => record.type === 'start') && run.history.some((record) => record.type === 'bootstrap_prepared') &&
+    run.history.every((record) => (record.type === 'start' || record.type === 'bootstrap_prepared') && record.repairHandoff === undefined);
+  if (!bootstrapMatchesRun || !noExecutionEvidence || lane.evidence.workspace !== undefined || receipt.workspace !== undefined ||
+    lane.evidence.stateSurface !== undefined || lane.evidence.repositoryScope !== undefined) return false;
+  if (receipt.phase === 'pre_execution') {
+    return lane.status === 'active' && lane.generation === generation && receipt.generation === generation &&
+      receipt.token?.laneId === lane.laneId && receipt.token.generation === generation;
+  }
+  if (receipt.phase === 'release_transition') {
+    return receipt.generation === generation && receipt.token?.laneId === lane.laneId && receipt.token.generation === generation &&
+      ((lane.status === 'active' && lane.generation === generation) || (lane.status === 'released' && lane.generation === generation + 1));
+  }
+  if (receipt.phase === 'released') {
+    return lane.status === 'released' && lane.generation === generation + 1 && receipt.generation === generation + 1 && receipt.token === undefined;
+  }
+  return false;
+}
+
+function assertRecoveryOwnerEvidence(run: Run, receipt: RunOwnerReceipt, lane: RecoveryLaneEvidence, missionId: string, generation: number): void {
+  if (!sameRunReceiptIdentity(receipt, run, missionId) || lane.laneId !== `run:${run.id}` || lane.missionId !== missionId ||
+    lane.role !== 'production_captain' || lane.evidence.repositoryScope === true) {
+    throw new Error(`Run owner receipt and locked lane do not match exact Run owner identity for "${run.id}".`);
+  }
+  const expected = evidenceForRun(run);
+  let observed: ReturnType<typeof canonicalizeMissionEvidence>;
+  try { observed = canonicalizeMissionEvidence(lane.evidence); } catch {
+    throw new Error(`Locked registry evidence for Run "${run.id}" is not canonical.`);
+  }
+  const expectedWorkspace = expected.workspace;
+  const observedWorkspace = observed.workspace;
+  const logicalBootstrapGap = expectedWorkspace !== undefined && observedWorkspace === undefined && receipt.workspace === undefined &&
+    isLogicalBootstrapPlanningReservation(run, receipt, lane, generation);
+  const receiptWorkspace = receipt.workspace === undefined
+    ? undefined
+    : canonicalizeMissionEvidence({ repository: expected.repository, workspace: receipt.workspace }).workspace;
+
+  for (const field of MISSION_EVIDENCE_FIELDS) {
+    if (field === 'workspace') continue;
+    if (observed[field] !== expected[field]) {
+      throw new Error(`Locked registry ${field} evidence does not match durable Run "${run.id}".`);
+    }
+  }
+
+  if (expectedWorkspace !== undefined) {
+    if (observedWorkspace !== undefined && observedWorkspace !== expectedWorkspace) {
+      throw new Error(`Locked registry workspace conflicts with durable bootstrap for Run "${run.id}".`);
+    }
+    if (observedWorkspace === undefined && !logicalBootstrapGap) {
+      throw new Error(`Locked registry workspace is missing outside the exact logical pre-execution phase for Run "${run.id}".`);
+    }
+    if (receiptWorkspace !== undefined && receiptWorkspace !== expectedWorkspace) {
+      throw new Error(`Run owner receipt workspace conflicts with durable bootstrap for Run "${run.id}".`);
+    }
+    if (receiptWorkspace === undefined && !logicalBootstrapGap && !canBindMissingReceiptWorkspace(receipt, run, observedWorkspace)) {
+      throw new Error(`Run owner receipt has no supported workspace provenance for Run "${run.id}".`);
+    }
+  } else if (receiptWorkspace !== observedWorkspace) {
+    throw new Error(`Explicit workspace requires the exact canonical Run receipt and locked lane for Run "${run.id}".`);
+  }
+}
+
+function readRecoveryEvidence(
+  store: RunStore,
+  receiptPath: string,
+  lockedLane: AdmissionLaneView,
+  runId: string,
+  missionId: string,
+  generation: number,
+): { readonly run: Run; readonly receipt: RunOwnerReceipt } {
+  const run = store.read(runId);
+  const receipt = readRunOwnerReceipt(receiptPath);
+  if (run === null || receipt === null) throw new Error(`Run owner evidence disappeared while recovering Run "${runId}".`);
+  assertRecoveryOwnerEvidence(run, receipt, lockedLane, missionId, generation);
+  return { run, receipt };
+}
+
+function assertLockedLaneUnchanged(expected: AdmissionLaneView, observed: AdmissionLaneView, status: 'active' | 'parked'): void {
+  if (observed.laneId !== expected.laneId || observed.missionId !== expected.missionId || observed.role !== 'production_captain' ||
+    observed.status !== status || observed.generation !== expected.generation || observed.parkedReason !== expected.parkedReason ||
+    JSON.stringify(observed.evidence) !== JSON.stringify(expected.evidence)) {
+    throw new Error(`Locked ${status} Run lane changed identity, evidence, generation, or settlement reason before stopped recovery.`);
+  }
+}
+
+function assertActiveReceiptGeneration(receipt: RunOwnerReceipt, laneId: string, generation: number, tokenSecret: string): void {
+  if (!['pre_execution', 'execution_possible', 'park_transition', 'release_transition'].includes(receipt.phase) ||
+    receipt.laneId !== laneId || receipt.generation !== generation || receipt.token?.laneId !== laneId || receipt.token.generation !== generation || receipt.token.token !== tokenSecret) {
+    throw new Error('Run owner receipt does not identify the exact active capability generation.');
+  }
+}
+
+function assertActiveReleaseTransition(receipt: RunOwnerReceipt, laneId: string, generation: number, tokenSecret: string): void {
+  if (receipt.phase !== 'release_transition' || receipt.laneId !== laneId || receipt.generation !== generation ||
+    receipt.token?.laneId !== laneId || receipt.token.generation !== generation || receipt.token.token !== tokenSecret) {
+    throw new Error('Run owner receipt transition does not match the exact active generation.');
+  }
+}
+
+function assertParkedReleaseTransition(receipt: RunOwnerReceipt, run: Run, missionId: string, generation: number, workflowSettledOrigin: boolean): void {
+  if (!sameRunReceiptIdentity(receipt, run, missionId) || receipt.phase !== 'parked_release_transition' ||
+    receipt.generation !== generation || receipt.token !== undefined ||
+    (receipt.settlementReason !== undefined && (!workflowSettledOrigin || receipt.settlementReason !== 'workflow_settled'))) {
+    throw new Error(`Run owner receipt does not identify the exact parked release transition for generation ${generation}.`);
+  }
+}
+
+function canBindMissingReceiptWorkspace(receipt: RunOwnerReceipt, run: Run, registryWorkspace: string | undefined): boolean {
+  if (receipt.workspace !== undefined || registryWorkspace === undefined || run.bootstrap === undefined) return false;
+  const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  const persistedWorkspace = canonicalizeMissionEvidence({ repository, workspace: run.bootstrap.workspacePath }).workspace;
+  return persistedWorkspace === registryWorkspace;
+}
+
+function canonicalReceiptWorkspace(receipt: RunOwnerReceipt): string | undefined {
+  return receipt.workspace === undefined
+    ? undefined
+    : canonicalizeMissionEvidence({ repository: receipt.repository, workspace: receipt.workspace }).workspace;
+}
+
+/** Re-read and reconcile only the exact parked generation while its registry lock is held. */
+function writeParkedReleaseTransition(
+  receiptPath: string,
+  run: Run,
+  missionId: string,
+  parkedGeneration: number,
+  workspace: string | undefined,
+  allowMissingWorkspaceBinding: boolean,
+  workflowSettledOrigin: boolean,
+): void {
+  const current = readRunOwnerReceipt(receiptPath);
+  const currentWorkspace = current === null ? undefined : canonicalReceiptWorkspace(current);
+  if (current === null || !sameRunReceiptIdentity(current, run, missionId) ||
+    (currentWorkspace !== workspace && !(allowMissingWorkspaceBinding && currentWorkspace === undefined && workspace !== undefined && current.phase !== 'pre_execution'))) {
+    throw new Error(`Run owner receipt does not match parked generation ${parkedGeneration} under the registry transaction.`);
+  }
+  const exactParkTransition = current.phase === 'park_transition' && current.generation === parkedGeneration - 1 &&
+    current.token?.laneId === current.laneId && current.token.generation === parkedGeneration - 1;
+  const exactParked = current.phase === 'parked' && current.generation === parkedGeneration && current.token === undefined;
+  const exactReleaseRetry = current.phase === 'parked_release_transition' && current.generation === parkedGeneration && current.token === undefined;
+  const interruptedReadmission = current.phase === 'pre_execution' && current.generation === parkedGeneration + 1 &&
+    current.token?.laneId === current.laneId && current.token.generation === parkedGeneration + 1;
+  if (!exactParkTransition && !exactParked && !exactReleaseRetry && !interruptedReadmission) {
+    throw new Error(`Run owner receipt phase and generation do not match parked registry generation ${parkedGeneration}.`);
+  }
+  if (current.settlementReason !== undefined && (!workflowSettledOrigin || current.settlementReason !== 'workflow_settled')) {
+    throw new Error(`Run owner receipt settlement provenance conflicts with parked generation ${parkedGeneration}.`);
+  }
+  const { token: _token, ...withoutToken } = current;
+  writeRunOwnerReceipt(receiptPath, {
+    ...withoutToken,
+    ...(workspace === undefined ? {} : { workspace }),
+    ...(workflowSettledOrigin ? { settlementReason: 'workflow_settled' as const } : {}),
+    phase: 'parked_release_transition', generation: parkedGeneration,
+  });
+}
+
+function finalizeParkedRunOwnerReceipt(receiptPath: string, run: Run, missionId: string, parkedGeneration: number, workspace: string | undefined): void {
+  const current = readRunOwnerReceipt(receiptPath);
+  if (current === null || !sameRunReceiptIdentity(current, run, missionId) || canonicalReceiptWorkspace(current) !== workspace) {
+    throw new Error(`Run owner receipt does not match parked generation ${parkedGeneration} after registry settlement.`);
+  }
+  const releasedGeneration = parkedGeneration + 1;
+  if (current.phase === 'released' && current.generation === releasedGeneration && current.token === undefined) return;
+  if (current.phase !== 'parked_release_transition' || current.generation !== parkedGeneration || current.token !== undefined) {
+    throw new Error(`Run owner receipt does not match parked generation ${parkedGeneration} after registry settlement.`);
+  }
+  writeRunOwnerReceipt(receiptPath, { ...current, phase: 'released', generation: releasedGeneration });
+}
+
+function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, receiptPath?: string, workspace?: string): AdmissionToken {
+  const laneId = `run:${run.id}`;
+  const evidence = evidenceForRun(run, workspace === undefined ? {} : { workspace });
+  const result = registry.admit({ laneId, role: 'production_captain', evidence, highAutonomy: true }, {
+    ...(receiptPath === undefined ? {} : { beforePublish: (candidate: Extract<AdmissionResult, { outcome: 'admitted' }>) => {
+      writeRunOwnerReceipt(receiptPath, runReceiptFor(run, candidate.missionId, candidate.token, 'pre_execution', evidence.workspace));
+    } }),
+  });
+  if (result.outcome !== 'admitted') {
+    const snapshot = registry.snapshot();
+    const observation: DispatchAdmissionObservation = {
+      schemaVersion: 1,
+      revision: snapshot.revision,
+      decisionRevision: result.revision,
+      missionId: result.missionId,
+      laneId,
+      runId: run.id,
+      ...(run.dispatchClaimId === undefined ? {} : { claimId: run.dispatchClaimId }),
+      repository: evidence.repository,
+      ...(evidence.issue === undefined ? {} : { issue: evidence.issue }),
+      ...(evidence.pullRequest === undefined ? {} : { pullRequest: evidence.pullRequest }),
+      ...(evidence.workspace === undefined ? {} : { workspace: evidence.workspace }),
+      role: 'production_captain',
+      counts: snapshot.counts,
+      limits: snapshot.limits,
+      result: result.outcome,
+      reason: result.outcome === 'parked' ? result.reason : `overlaps:${result.conflictingLaneId}`,
+      lastTransition: snapshot.lastTransition,
+    };
+    if (result.outcome === 'parked') {
+      const detail = `Run "${run.id}" is waiting for mission admission capacity (${result.reason}).`;
+      if (run.dispatchClaimId !== undefined) throw new DispatchAdmissionWaitError(run.id, laneId, 'capacity', detail, observation);
+      throw new Error(`Run "${run.id}" cannot enter mission admission: ${detail}`);
+    }
+    const conflict = registry.readLane(result.conflictingLaneId);
+    if (conflict?.role === 'production_captain' && conflict.evidence.repositoryScope === true && conflict.evidence.repository === `${run.target.owner}/${run.target.repo}`.toLowerCase()) {
+      const detail = `Run "${run.id}" is waiting for repository ownership held by manual lane "${conflict.laneId}".`;
+      if (run.dispatchClaimId !== undefined) throw new DispatchAdmissionWaitError(run.id, laneId, 'owner', detail, observation);
+      throw new Error(`Run "${run.id}" cannot enter mission admission: ${detail}`);
+    }
+    throw new Error(`Run "${run.id}" cannot enter mission admission: overlaps active or parked lane "${result.conflictingLaneId}".`);
+  }
+  return result.token;
+}
+
+function settleRunAdmission(registry: MissionAdmissionRegistry, token: AdmissionToken, run: Run, receiptPath?: string): void {
+  if (run.state === 'FAILED' || run.state === 'MERGED') {
+    registry.release(token, true, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'release_transition')),
+      receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1));
+  } else {
+    const reason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
+    registry.park(token, reason, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'park_transition')),
+      receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'parked', token.generation + 1));
+  }
+}
+
+function releasePreExecutionRunAdmission(registry: MissionAdmissionRegistry, token: AdmissionToken, receiptPath?: string): void {
+  registry.release(token, true, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'release_transition')),
+    receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1));
+}
+
+/** Settle only the exact receipt generation. This retires authority and never resumes or spawns work. */
+export function recoverRunAdmission(
+  store: RunStore,
+  registry: MissionAdmissionRegistry,
+  runId: string,
+  expectedGeneration: number,
+  operatorStopped: boolean,
+  receiptPath?: string,
+  crashAfter?: { readonly parkReceiptNormalization?: () => void; readonly parkReceiptFinalization?: () => void },
+): 'released' {
+  if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw new Error('Run admission recovery requires --generation <positive integer>.');
+  const run = store.read(runId);
+  if (run === null) throw new Error(`No run with id "${runId}" found.`);
+  const laneId = `run:${run.id}`;
+  const repo = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  const canonicalReceiptPath = receiptPath ?? resolveRunOwnerReceiptPath(repo, run.id, evidenceForRun(run));
+  const receipt = readRunOwnerReceipt(canonicalReceiptPath);
+  if (receipt === null || receipt.laneId !== laneId || receipt.runId !== run.id || receipt.repository !== repo ||
+    receipt.issue !== (run.target.kind === 'issue' ? run.target.issueNumber : undefined) || receipt.claimId !== run.dispatchClaimId) {
+    throw new Error(`Run "${run.id}" has no matching private owner receipt; refusing recovery.`);
+  }
+  const operationTokenSecret = receipt.token?.token;
+  if (receipt.generation !== expectedGeneration &&
+    !(receipt.phase === 'released' && receipt.generation === expectedGeneration + 1) &&
+    !(receipt.phase === 'pre_execution' && receipt.generation === expectedGeneration + 1) &&
+    !(receipt.phase === 'park_transition' && receipt.generation === expectedGeneration - 1)) {
+    throw new Error(`Run owner receipt generation ${receipt.generation} does not match expected generation ${expectedGeneration}.`);
+  }
+  const lane = registry.readLane(laneId);
+  if (lane === null || lane.missionId !== receipt.missionId) {
+    throw new Error(`Run owner receipt does not match the canonical registry owner for Run "${run.id}".`);
+  }
+  assertRecoveryOwnerEvidence(run, receipt, lane, lane.missionId, expectedGeneration);
+  if (lane.status === 'released' && lane.generation === expectedGeneration + 1) {
+    registry.withExactReleasedLane(laneId, expectedGeneration + 1, (releasedLane) => {
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
+      const current = fresh.receipt;
+      if (current.phase === 'released' && current.generation === expectedGeneration + 1 && current.token === undefined) return;
+      if (current.phase !== 'release_transition' && current.phase !== 'parked_release_transition') throw new Error('Run owner receipt phase is not an exact released transition.');
+      const exactActiveTransition = current.phase === 'release_transition' && current.generation === expectedGeneration && current.token?.laneId === laneId && current.token.generation === expectedGeneration && current.token.token === operationTokenSecret;
+      const exactParkedTransition = current.phase === 'parked_release_transition' && current.generation === expectedGeneration && current.token === undefined;
+      if (!exactActiveTransition && !exactParkedTransition) throw new Error('Run owner receipt transition does not match the exact released generation.');
+      const canBindWorkspace = current.phase === 'release_transition' || current.phase === 'parked_release_transition'
+        ? canBindMissingReceiptWorkspace(current, fresh.run, releasedLane.evidence.workspace)
+        : false;
+      const { token: _token, ...withoutToken } = current;
+      writeRunOwnerReceipt(canonicalReceiptPath, {
+        ...withoutToken,
+        ...(canBindWorkspace ? { workspace: releasedLane.evidence.workspace } : {}),
+        phase: 'released', generation: expectedGeneration + 1,
+      });
+    });
+    return 'released';
+  }
+  if (lane.status === 'parked') {
+    const expectedParkReason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
+    const normalizedReceiptWorkspace = canonicalReceiptWorkspace(receipt);
+    const workspaceMatches = normalizedReceiptWorkspace === lane.evidence.workspace ||
+      (receipt.workspace === undefined && ['park_transition', 'parked', 'parked_release_transition'].includes(receipt.phase) &&
+        canBindMissingReceiptWorkspace(receipt, run, lane.evidence.workspace));
+    const interruptedParkPublication = receipt.phase === 'park_transition' && receipt.generation === expectedGeneration - 1 &&
+      receipt.token?.laneId === laneId && receipt.token.generation === expectedGeneration - 1 &&
+      lane.generation === expectedGeneration && lane.parkedReason === expectedParkReason &&
+      workspaceMatches;
+    const normalizedParkRetry = receipt.generation === expectedGeneration && lane.generation === expectedGeneration &&
+      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && receipt.token === undefined && lane.parkedReason === expectedParkReason &&
+      workspaceMatches;
+    const interruptedParkedReadmission = lane.generation === expectedGeneration && receipt.generation === expectedGeneration + 1 &&
+      ((receipt.phase === 'pre_execution' && receipt.token?.laneId === laneId && receipt.token.generation === expectedGeneration + 1) ||
+        (receipt.phase === 'parked_release_transition' && receipt.token === undefined)) && normalizedReceiptWorkspace === lane.evidence.workspace;
+    const exactParkedGeneration = lane.generation === expectedGeneration && receipt.generation === expectedGeneration &&
+      (receipt.phase === 'parked' || receipt.phase === 'parked_release_transition') && receipt.token === undefined && workspaceMatches;
+    if (!interruptedParkPublication && !normalizedParkRetry && !interruptedParkedReadmission && !exactParkedGeneration) throw new Error('Parked registry lane does not match the Run owner receipt phase and generation.');
+    if (!operatorStopped) throw new Error('Parked Run recovery requires explicit --stopped operator attestation that the provider and children have stopped.');
+    registry.releaseParked(laneId, lane.generation, true,
+      (lockedParkedLane) => {
+        assertLockedLaneUnchanged(lane, lockedParkedLane, 'parked');
+        const fresh = readRecoveryEvidence(store, canonicalReceiptPath, lockedParkedLane, run.id, lane.missionId, expectedGeneration);
+        writeParkedReleaseTransition(canonicalReceiptPath, fresh.run, lane.missionId, lane.generation, lockedParkedLane.evidence.workspace,
+          canBindMissingReceiptWorkspace(fresh.receipt, fresh.run, lockedParkedLane.evidence.workspace), lockedParkedLane.parkedReason === 'workflow_settled');
+        if (interruptedParkPublication) crashAfter?.parkReceiptNormalization?.();
+      },
+      (releasedLane) => {
+        const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
+        finalizeParkedRunOwnerReceipt(canonicalReceiptPath, fresh.run, lane.missionId, lane.generation, releasedLane.evidence.workspace);
+        crashAfter?.parkReceiptFinalization?.();
+      },
+      (lockedParkedLane) => {
+        assertLockedLaneUnchanged(lane, lockedParkedLane, 'parked');
+        const fresh = readRecoveryEvidence(store, canonicalReceiptPath, lockedParkedLane, run.id, lane.missionId, expectedGeneration);
+        assertParkedReleaseTransition(fresh.receipt, fresh.run, lane.missionId, lane.generation, lockedParkedLane.parkedReason === 'workflow_settled');
+      });
+    return 'released';
+  }
+  if (lane.status !== 'active' || receipt.token === undefined || receipt.token.generation !== expectedGeneration || receipt.token.laneId !== laneId) {
+    throw new Error('Run owner receipt and registry do not identify the exact recoverable active generation.');
+  }
+  if (!operatorStopped) throw new Error('External recovery requires explicit --stopped operator attestation that the provider and children have stopped; receipt phase alone cannot prove supervisor death.');
+  registry.assertCurrentOwner(receipt.token);
+  registry.release(receipt.token, true,
+    (activeLane) => {
+      assertLockedLaneUnchanged(lane, activeLane, 'active');
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, activeLane, run.id, lane.missionId, expectedGeneration);
+      assertActiveReceiptGeneration(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
+      writeRunOwnerReceipt(canonicalReceiptPath, { ...fresh.receipt, phase: 'release_transition', token: fresh.receipt.token });
+    },
+    (releasedLane) => {
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
+      assertActiveReleaseTransition(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
+      finalizeRunOwnerReceipt(canonicalReceiptPath, receipt.token!, 'released', expectedGeneration + 1);
+    },
+    (activeLane) => {
+      assertLockedLaneUnchanged(lane, activeLane, 'active');
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, activeLane, run.id, lane.missionId, expectedGeneration);
+      assertActiveReleaseTransition(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
+    });
+  return 'released';
+}
+
+function updateClaimedRunIfUnchanged(store: RunStore, expected: Run, next: Run): void {
+  if (store.updateIfUnchanged === undefined) throw new Error(`Run store cannot compare-and-swap dispatch-bound Run "${expected.id}"; refusing to overwrite a concurrent decision.`);
+  if (!store.updateIfUnchanged(expected, next)) throw new Error(`Dispatch-bound Run "${expected.id}" changed while the decision was being prepared; reload before retrying.`);
+}
+
+async function withRunAdmissionBoundary<T>(options: WorkflowCommandOptions, operation: () => T): Promise<T> {
+  return options.withDispatchAdmissionLock === undefined ? operation() : options.withDispatchAdmissionLock(operation);
+}
+
+export function parseGitHubRepositoryRemote(remote: string): string {
+  const trimmed = remote.trim();
+  let ownerRepo: string | null = null;
+  const scp = /^git@github\.com:([^?#]+)$/i.exec(trimmed);
+  if (scp) ownerRepo = scp[1]!;
+  else {
+    try {
+      const url = new URL(trimmed);
+      const validCredentials = url.protocol === 'https:' ? url.username === '' && url.password === '' : (url.username === '' || url.username === 'git') && url.password === '';
+      if (url.hostname.toLowerCase() !== 'github.com' || !validCredentials || url.search !== '' || url.hash !== '' || (url.protocol !== 'https:' && url.protocol !== 'ssh:')) {
+        throw new Error('remote must be a direct GitHub HTTPS or SSH URL');
+      }
+      ownerRepo = url.pathname.replace(/^\//, '');
+    } catch (error) {
+      if (error instanceof Error && error.message === 'remote must be a direct GitHub HTTPS or SSH URL') throw error;
+      throw new Error('Cannot resolve repository identity from git remote.origin.url.');
+    }
+  }
+  const normalized = ownerRepo?.replace(/\/+$/, '').replace(/\.git$/i, '').toLowerCase();
+  if (!normalized || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(normalized)) throw new Error('Git remote does not identify exactly one GitHub owner/repository.');
+  return normalized;
 }
 
 export interface WorkflowCommandOptions {
@@ -633,8 +1367,25 @@ export interface WorkflowCommandOptions {
   readonly execution?: ResolvedExecutionConfiguration;
   /** Immutable queue-claim identity when this run is created by dispatch once. */
   readonly dispatchClaimId?: string;
+  /** Explicit revisioned task-shape authority for a newly created unattended run. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
   /** Optional run-scoped efficiency-signal thresholds. */
   readonly telemetryThresholds?: WorkflowOptions['telemetryThresholds'];
+  /** Optional seam for helper-level tests; executable CLI always supplies the host registry. */
+  readonly admission?: MissionAdmissionRegistry;
+  /** Physical ambient provider cwd when execution has no prepared workspace. */
+  readonly admissionWorkspace?: string;
+  /** Private owner-only receipt path; executable CLI always supplies it with admission. */
+  readonly runOwnerReceiptPath?: string;
+  /** Release a surrounding short dispatch admission lock after durable admission/Run transition, before workflow execution. */
+  readonly releaseDispatchAdmissionLock?: () => void;
+  readonly withDispatchAdmissionLock?: <T>(operation: () => T | Promise<T>) => Promise<T>;
+  /** Serialize the direct Run lookup/profile/create/admit boundary and hand its short-lock release to the admission path. */
+  readonly withRunAdmissionLock?: <T>(operation: (release: () => void) => T | Promise<T>) => Promise<T>;
+  /** Atomic short-lock bridge for a canonical live dispatch claim plus Run CAS. */
+  readonly commitDispatchResumeTransition?: (expected: Run, next: Run, commitRun: () => void) => Promise<void>;
+  /** Executable CLI supplies the fail-closed account-wide projection publisher. */
+  readonly publishRuntimeProjection?: (registry: MissionAdmissionRegistry, store: RunStore, update: RuntimeProjectionUpdate) => void;
 }
 
 /**
@@ -647,24 +1398,74 @@ export async function runIssueCommand(
   ref: string,
   options: WorkflowCommandOptions = {},
 ): Promise<WorkflowOutcome> {
+  if (options.withRunAdmissionLock !== undefined && options.releaseDispatchAdmissionLock === undefined) {
+    return options.withRunAdmissionLock((release) => runIssueCommand(deps, ref, {
+      ...options,
+      withRunAdmissionLock: undefined,
+      releaseDispatchAdmissionLock: release,
+    }));
+  }
   const target = parseIssueRef(ref);
-  let run = deps.store.list().find((candidate) =>
-    targetsEqual(candidate.target, target) && candidate.state !== 'MERGED' && candidate.state !== 'FAILED',
-  ) ?? null;
-  if (options.dispatchClaimId !== undefined && run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
+  let run = findRunByTarget(deps.store, target);
+  if (run !== null && run.dispatchClaimId !== options.dispatchClaimId) {
     throw new Error(`Active durable run "${run.id}" is not bound to dispatch claim "${options.dispatchClaimId}"; refusing ambiguous recovery.`);
   }
+  const isNewRun = run === null;
   if (run === null) {
-    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId);
-    deps.store.create(run);
-  } else if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
-    throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
+    run = createRun(target, undefined, undefined, options.execution, options.dispatchClaimId, options.repairTaskShapeAuthority);
+  } else {
+    if (options.execution !== undefined && JSON.stringify(options.execution) !== JSON.stringify(run.execution)) {
+      throw new Error(`Run "${run.id}" already has an immutable execution profile snapshot; refusing to replace it.`);
+    }
+    if (options.repairTaskShapeAuthority !== undefined &&
+      (run.repairTaskShapeAuthority?.revision !== options.repairTaskShapeAuthority.revision ||
+        run.repairTaskShapeAuthority?.shape !== options.repairTaskShapeAuthority.shape)) {
+      throw new Error(`Run "${run.id}" already has an immutable repair task-shape authority; refusing to replace it.`);
+    }
   }
-  return runWorkflow(deps, run.id, {
-    maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
-    now: options.now,
-    ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
-  });
+  const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
+  // Resolve and validate the private owner root before persisting a new
+  // admission-backed Run, so a divergent root cannot leave a READY orphan.
+  // Persist the exact intent before admission for both direct and dispatch
+  // callers; capacity denial and a crash can retry this immutable Run id.
+  const precreatedRun = isNewRun && (options.dispatchClaimId !== undefined || options.admission !== undefined);
+  if (precreatedRun) deps.store.create(run);
+  const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
+  let mayReleaseAsPreExecution = admissionToken !== undefined;
+  try {
+    if (isNewRun && !precreatedRun) deps.store.create(run);
+    if (admissionToken !== undefined && options.publishRuntimeProjection !== undefined) {
+      options.publishRuntimeProjection(options.admission!, deps.store, { stage: 'implementation_admitted', supervisor: 'running' });
+    }
+    options.releaseDispatchAdmissionLock?.();
+    const outcome = await runWorkflow(deps, run.id, {
+      maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
+      now: options.now,
+      ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
+      onExecutionStart: () => {
+        mayReleaseAsPreExecution = false;
+        if (admissionToken !== undefined && runOwnerReceiptPath !== undefined) {
+          options.admission!.renew(admissionToken, () => writeRunOwnerReceipt(runOwnerReceiptPath, receiptForCurrentToken(runOwnerReceiptPath, admissionToken, 'execution_possible')));
+        }
+      },
+      ...(admissionToken === undefined ? {} : { admissionFence: { registry: options.admission!, token: admissionToken, productionMissionId: options.admission!.readLane(admissionToken.laneId)!.missionId, ...(options.admissionWorkspace === undefined ? {} : { executionWorkspace: options.admissionWorkspace }) } }),
+    });
+    mayReleaseAsPreExecution = false;
+    if (admissionToken !== undefined) await withRunAdmissionBoundary(options, () => {
+      settleRunAdmission(options.admission!, admissionToken, outcome.run, runOwnerReceiptPath);
+      options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: outcome.run.state.toLowerCase(), supervisor: 'stopped' });
+    });
+    return outcome;
+  } catch (error) {
+    if (admissionToken !== undefined && mayReleaseAsPreExecution) {
+      options.releaseDispatchAdmissionLock?.();
+      await withRunAdmissionBoundary(options, () => {
+        releasePreExecutionRunAdmission(options.admission!, admissionToken, runOwnerReceiptPath);
+        options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: 'pre_execution_released', supervisor: 'stopped' });
+      });
+    }
+    throw error;
+  }
 }
 
 /**
@@ -682,6 +1483,9 @@ export async function resumeCommand(
 ): Promise<WorkflowOutcome> {
   const run = deps.store.read(id);
   if (run === null) throw new Error(`No run with id "${id}" found.`);
+  if (run.dispatchClaimId !== options.dispatchClaimId) {
+    throw new Error(`Run "${id}" is bound to dispatch claim "${run.dispatchClaimId}"; matching dispatch ownership is required to resume it.`);
+  }
   if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') {
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
@@ -690,13 +1494,38 @@ export async function resumeCommand(
   if (choices.length > 0 && !choices.includes(decision)) {
     throw new Error(`Invalid decision "${decision}". Choose exactly one of: ${choices.join(' | ')}.`);
   }
+  const targetOwner = findRunByTarget(deps.store, run.target);
+  if (targetOwner !== null && targetOwner.id !== id) throw new Error(`Run "${id}" is not the unique active durable Run for its target.`);
+  const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
+  const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
+  let mayReleaseAsPreExecution = admissionToken !== undefined;
+  try {
   const now = options.now ?? (() => new Date().toISOString());
   if (
     decision.trim() === CANCEL_RUN_DECISION &&
     run.interrupt?.choices?.includes(CANCEL_RUN_DECISION) === true
   ) {
     const cancelled = applyTransition(run, { type: 'fail', reason: CANCEL_RUN_DECISION }, now());
-    deps.store.update(cancelled);
+  if (run.dispatchClaimId !== undefined && options.commitDispatchResumeTransition !== undefined) {
+    await options.commitDispatchResumeTransition(run, cancelled, () => {
+      updateClaimedRunIfUnchanged(deps.store, run, cancelled);
+      mayReleaseAsPreExecution = false;
+    });
+  } else if (run.dispatchClaimId !== undefined) updateClaimedRunIfUnchanged(deps.store, run, cancelled);
+    else deps.store.update(cancelled);
+    mayReleaseAsPreExecution = false;
+    if (admissionToken !== undefined) {
+      const settleAndProject = () => {
+        settleRunAdmission(options.admission!, admissionToken, cancelled, runOwnerReceiptPath);
+        options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: 'failed', supervisor: 'stopped' });
+      };
+      // The executable caller still owns its short admission lock here. Do
+      // both durable settlement and projection before that owner releases it;
+      // helper callers without an outer lock acquire the same boundary here.
+      if (options.releaseDispatchAdmissionLock !== undefined) settleAndProject();
+      else await withRunAdmissionBoundary(options, settleAndProject);
+    }
+    options.releaseDispatchAdmissionLock?.();
     return { outcome: 'failed', run: cancelled, reason: CANCEL_RUN_DECISION };
   }
   const transition = run.state === 'NEEDS_HUMAN' ? 'human_resolved' : 'dependency_satisfied';
@@ -747,12 +1576,45 @@ export async function resumeCommand(
     },
     now(),
   );
-  deps.store.update(resumed);
-  return runWorkflow(deps, id, {
+  if (run.dispatchClaimId !== undefined && options.commitDispatchResumeTransition !== undefined) {
+    await options.commitDispatchResumeTransition(run, resumed, () => {
+      updateClaimedRunIfUnchanged(deps.store, run, resumed);
+      mayReleaseAsPreExecution = false;
+    });
+  } else if (run.dispatchClaimId !== undefined) updateClaimedRunIfUnchanged(deps.store, run, resumed);
+  else deps.store.update(resumed);
+  if (admissionToken !== undefined && options.publishRuntimeProjection !== undefined) {
+    options.publishRuntimeProjection(options.admission!, deps.store, { stage: 'implementation_admitted', supervisor: 'running' });
+  }
+  options.releaseDispatchAdmissionLock?.();
+  const outcome = await runWorkflow(deps, id, {
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
     now: options.now,
     ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
+    onExecutionStart: () => {
+      mayReleaseAsPreExecution = false;
+      if (admissionToken !== undefined && runOwnerReceiptPath !== undefined) {
+        options.admission!.renew(admissionToken, () => writeRunOwnerReceipt(runOwnerReceiptPath, receiptForCurrentToken(runOwnerReceiptPath, admissionToken, 'execution_possible')));
+      }
+    },
+    ...(admissionToken === undefined ? {} : { admissionFence: { registry: options.admission!, token: admissionToken, productionMissionId: options.admission!.readLane(admissionToken.laneId)!.missionId, ...(options.admissionWorkspace === undefined ? {} : { executionWorkspace: options.admissionWorkspace }) } }),
   });
+  mayReleaseAsPreExecution = false;
+  if (admissionToken !== undefined) await withRunAdmissionBoundary(options, () => {
+    settleRunAdmission(options.admission!, admissionToken, outcome.run, runOwnerReceiptPath);
+    options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: outcome.run.state.toLowerCase(), supervisor: 'stopped' });
+  });
+  return outcome;
+  } catch (error) {
+    if (admissionToken !== undefined && mayReleaseAsPreExecution) {
+      options.releaseDispatchAdmissionLock?.();
+      await withRunAdmissionBoundary(options, () => {
+        releasePreExecutionRunAdmission(options.admission!, admissionToken, runOwnerReceiptPath);
+        options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: 'pre_execution_released', supervisor: 'stopped' });
+      });
+    }
+    throw error;
+  }
 }
 
 export function resumeCommandHint(runId: string, browserProfile?: string): string {
@@ -761,7 +1623,7 @@ export function resumeCommandHint(runId: string, browserProfile?: string): strin
   }`;
 }
 
-function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
+export function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
   const { run } = outcome;
   if (outcome.outcome === 'merge_ready') {
     console.log(
@@ -781,12 +1643,20 @@ function printOutcome(outcome: WorkflowOutcome, browserProfile?: string): void {
     console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
     return;
   }
+  if (outcome.outcome === 'unsupported_cas') {
+    console.error(`Run ${run.id}: HELD — ${outcome.reason} Durable state remains ${run.state}; no park was written.`);
+    return;
+  }
   if (outcome.outcome === 'waiting_dependency') {
     console.log(`Run ${run.id}: WAITING_DEPENDENCY — ${outcome.reason}`);
     console.log(`Resume with: ${resumeCommandHint(run.id, browserProfile)}`);
     return;
   }
   console.error(`Run ${run.id}: FAILED — ${outcome.reason}`);
+}
+
+export function outcomeExitCode(outcome: WorkflowOutcome): number {
+  return outcome.outcome === 'failed' ? 1 : outcome.outcome === 'unsupported_cas' ? 2 : 0;
 }
 
 /** Production wiring: durable implementation routing, local gh, and independent review. */
@@ -800,19 +1670,21 @@ function buildWorkflowDeps(
   const localValidation = resolveLocalValidationConfiguration(env);
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
   let bootstrap: ImplementationBootstrapAdapter | undefined;
+  let lunaBootstrap: ImplementationBootstrapAdapter | undefined;
   const lazyBootstrap: ImplementationBootstrapAdapter = {
     kind: 'implementation-bootstrap',
+    bootstrapKind: 'linked-worktree',
     plan: async (request) => {
       bootstrap ??= new GitWorktreeBootstrap({
         repositoryRoot: resolveRepositoryRoot(),
-        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'workspaces'),
       });
       return bootstrap.plan(request);
     },
     prepare: async (request) => {
       bootstrap ??= new GitWorktreeBootstrap({
         repositoryRoot: resolveRepositoryRoot(),
-        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(os.homedir(), '.tachiko-conductor', 'workspaces'),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'workspaces'),
       });
       return bootstrap.prepare(request);
     },
@@ -885,6 +1757,9 @@ function buildWorkflowDeps(
           cwd: process.cwd(),
           ...(execution === undefined ? {} : { timeoutMs: execution.timeoutMs }),
         }),
+        [LUNA_ISOLATED_PROVIDER]: (execution) => new IsolatedLunaAdapter({
+          codexHome: requiredLunaHome(env), timeoutMs: execution?.timeoutMs ?? 10 * 60_000,
+        }),
       },
     }),
     reviewer: new DeepSeekReviewer({
@@ -893,9 +1768,27 @@ function buildWorkflowDeps(
       client: new DeepSeekApiClient(),
     }),
     bootstrap: lazyBootstrap,
+    bootstrapForExecution: (execution) => {
+      if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;
+      lunaBootstrap ??= new StandaloneGitBootstrap({
+        repositoryRoot: resolveRepositoryRoot(),
+        workspaceRoot: env.TACHIKO_WORKSPACE_ROOT ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'workspaces'),
+      });
+      return lunaBootstrap;
+    },
     ...(localValidation === undefined ? {} : { validation: new ConfiguredLocalValidationAdapter(localValidation) }),
     ...(hostedCheckPolicy === undefined ? {} : { hostedCheckPolicy }),
     resolveImplementationCapabilities,
+    // A run carrying explicit repair authority is admitted only against this
+    // same revisioned execution-profile configuration. Missing or invalid
+    // configuration is intentionally surfaced as an unavailable profile.
+    resolveRepairExecutionProfile: (profile) => {
+      try {
+        return resolveSelectedExecutionProfile(profile, env);
+      } catch {
+        return undefined;
+      }
+    },
   };
 }
 
@@ -905,8 +1798,11 @@ export function runCreateCommand(
   store: RunStore,
   owner: string,
   repo: string,
-  opts: { issue?: number; branch?: string; execution?: ResolvedExecutionConfiguration },
+  opts: { issue?: number; branch?: string; execution?: ResolvedExecutionConfiguration; repairTaskShapeAuthority?: RepairTaskShapeAuthority },
 ): Run {
+  if (opts.repairTaskShapeAuthority === undefined) {
+    throw new Error('run create requires explicit revisioned repair task-shape authority.');
+  }
   const hasIssue = opts.issue !== undefined;
   const hasBranch = opts.branch !== undefined;
   if (hasIssue && hasBranch) {
@@ -921,7 +1817,7 @@ export function runCreateCommand(
   } else {
     target = { kind: 'repository', owner, repo, branch: opts.branch ?? 'main' };
   }
-  const run = createRun(target, undefined, undefined, opts.execution);
+  const run = createRun(target, undefined, undefined, opts.execution, undefined, opts.repairTaskShapeAuthority);
   store.create(run);
   return run;
 }
@@ -932,7 +1828,7 @@ export function runShowCommand(store: RunStore, id: string): Run {
   return run;
 }
 
-export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string): Run {
+export function runTransitionCommand(store: RunStore, id: string, type: TransitionType, reason?: string, admission?: MissionAdmissionRegistry): Run {
   if (type === 'bootstrap_prepared') {
     throw new Error('Transition "bootstrap_prepared" requires durable bootstrap identity that this CLI cannot supply. Drive it through the workflow.');
   }
@@ -943,11 +1839,201 @@ export function runTransitionCommand(store: RunStore, id: string, type: Transiti
         `Drive it through the domain API (applyTransition) instead.`,
     );
   }
-  const current = store.read(id);
-  if (current === null) throw new Error(`No run with id "${id}" found.`);
-  const next = applyTransition(current, { type, reason });
-  store.update(next);
+  const transition = (): Run => {
+    const current = store.read(id);
+    if (current === null) throw new Error(`No run with id "${id}" found.`);
+    const next = applyTransition(current, { type, reason });
+    if (type === 'merged') {
+      throw new Error('Transition "merged" requires an exact live GitHub merged pull-request proof; use the CLI merge reconciliation path.');
+    }
+    if (store.updateIfUnchanged !== undefined) {
+      if (!store.updateIfUnchanged(current, next)) throw new Error(`Run "${id}" changed concurrently; refusing to apply a stale transition.`);
+    } else if (admission !== undefined) {
+      throw new Error('Admission-backed Run transitions require compare-and-swap Run storage; refusing an unfenced write.');
+    } else {
+      store.update(next);
+    }
+    return next;
+  };
+  return admission === undefined ? transition() : admission.withRunTransitionFence(id, transition);
+}
+
+function assertExactMergedPullRequest(run: Run, pullRequest: GitHubLivePullRequestSnapshot): void {
+  const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  const bootstrap = run.bootstrap;
+  const persisted = run.pullRequest;
+  if (bootstrap === undefined || persisted === undefined || run.headSha === undefined || run.headSha === '' ||
+    pullRequest.state !== 'merged' || pullRequest.number !== persisted.number ||
+    pullRequest.headSha !== run.headSha || persisted.headSha !== run.headSha ||
+    bootstrap.owner.toLowerCase() !== run.target.owner.toLowerCase() || bootstrap.repo.toLowerCase() !== run.target.repo.toLowerCase() ||
+    (run.target.kind === 'issue' && bootstrap.issueNumber !== run.target.issueNumber) ||
+    pullRequest.headRef !== (bootstrap.publicationBranch ?? bootstrap.branch) ||
+    pullRequest.baseRef !== bootstrap.baseBranch ||
+    pullRequest.headRepository === undefined || pullRequest.headRepository === null ||
+    `${pullRequest.headRepository.owner}/${pullRequest.headRepository.repo}`.toLowerCase() !== repository ||
+    pullRequest.baseRepository === undefined || pullRequest.baseRepository === null ||
+    `${pullRequest.baseRepository.owner}/${pullRequest.baseRepository.repo}`.toLowerCase() !== repository) {
+    throw new Error(`Live pull request proof does not match Run "${run.id}" persisted PR, HEAD, branch, and base identity, or the PR is not merged.`);
+  }
+  // The base branch is mutable and may advance (including after a squash
+  // merge); repository and branch identity are the stable base proof.
+}
+
+function assertMergeLaneIdentity(run: Run, lane: AdmissionLaneView): string | undefined {
+  const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  if (lane.laneId !== `run:${run.id}` || lane.evidence.run !== run.id || lane.evidence.repository !== repository ||
+    lane.evidence.issue !== (run.target.kind === 'issue' ? run.target.issueNumber : undefined) ||
+    lane.evidence.claim !== run.dispatchClaimId || lane.evidence.pullRequest !== run.pullRequest?.number) {
+    throw new Error(`Admission lane identity for Run "${run.id}" does not match the persisted merge identity.`);
+  }
+  if (run.bootstrap === undefined) throw new Error(`Run "${run.id}" has no persisted bootstrap identity for merge reconciliation.`);
+  const persistedWorkspace = canonicalizeMissionEvidence({ repository, workspace: run.bootstrap.workspacePath }).workspace;
+  if (lane.evidence.workspace !== persistedWorkspace) {
+    throw new Error(`Admission lane workspace for Run "${run.id}" does not match its persisted bootstrap workspace.`);
+  }
+  return lane.evidence.workspace;
+}
+
+function readMergeReceipt(receiptPath: string, run: Run, missionId: string, workspace: string | undefined): RunOwnerReceipt {
+  const receipt = readRunOwnerReceipt(receiptPath);
+  if (receipt === null || !sameRunReceiptIdentity(receipt, run, missionId) ||
+    (receipt.workspace !== workspace && !(receipt.workspace === undefined && canBindMissingReceiptWorkspace(receipt, run, workspace)))) {
+    throw new Error(`Run owner receipt does not match exact merge lane identity for Run "${run.id}".`);
+  }
+  return receipt;
+}
+
+function writeMergeReleaseTransition(receiptPath: string, run: Run, missionId: string, lane: AdmissionLaneView): number {
+  const workspace = assertMergeLaneIdentity(run, lane);
+  const receipt = readMergeReceipt(receiptPath, run, missionId, workspace);
+  const generation = lane.generation;
+  const alreadyTransitioning = receipt.phase === 'parked_release_transition' && receipt.generation === generation && receipt.token === undefined;
+  if (alreadyTransitioning) {
+    if (receipt.settlementReason !== 'workflow_settled') throw new Error(`Run owner receipt lacks workflow_settled merge authority for Run "${run.id}".`);
+    return generation;
+  }
+  const initialParked = receipt.phase === 'parked' && receipt.generation === generation && receipt.token === undefined;
+  if (!initialParked) throw new Error(`Run owner receipt phase and generation do not match workflow_settled lane generation ${generation}.`);
+  const { token: _token, ...withoutToken } = receipt;
+  writeRunOwnerReceipt(receiptPath, {
+    ...withoutToken,
+    ...(workspace === undefined ? {} : { workspace }),
+    phase: 'parked_release_transition',
+    generation,
+    settlementReason: 'workflow_settled',
+  });
+  return generation;
+}
+
+function finalizeMergeReleaseReceipt(receiptPath: string, run: Run, missionId: string, workspace: string | undefined, parkedGeneration: number): void {
+  const receipt = readMergeReceipt(receiptPath, run, missionId, workspace);
+  const releasedGeneration = parkedGeneration + 1;
+  if (receipt.phase === 'released' && receipt.generation === releasedGeneration && receipt.token === undefined && receipt.settlementReason === 'workflow_settled') {
+    if (workspace !== undefined && receipt.workspace === undefined) writeRunOwnerReceipt(receiptPath, { ...receipt, workspace });
+    return;
+  }
+  if (receipt.phase !== 'parked_release_transition' || receipt.generation !== parkedGeneration || receipt.token !== undefined || receipt.settlementReason !== 'workflow_settled') {
+    throw new Error(`Run owner receipt does not match workflow_settled merge generation ${parkedGeneration}.`);
+  }
+  writeRunOwnerReceipt(receiptPath, { ...receipt, ...(workspace === undefined ? {} : { workspace }), phase: 'released', generation: releasedGeneration });
+}
+
+function casMergedRun(store: RunStore, current: Run): Run {
+  if (current.state === 'MERGED') return current;
+  if (current.state !== 'MERGE_READY') throw new Error(`Run "${current.id}" is ${current.state}; only MERGE_READY can be merged.`);
+  if (store.updateIfUnchanged === undefined) throw new Error(`Run store cannot compare-and-swap merged Run "${current.id}"; refusing an unfenced transition.`);
+  const next = applyTransition(current, { type: 'merged' });
+  if (!store.updateIfUnchanged(current, next)) throw new Error(`Run "${current.id}" changed concurrently; refusing to publish merge settlement.`);
   return next;
+}
+
+/** Apply a normal merged transition only after exact live GitHub proof. Caller holds the canonical dispatch lock. */
+export async function runMergedTransitionCommand(
+  store: RunStore,
+  id: string,
+  github: GitHubAdapter,
+  admission: MissionAdmissionRegistry,
+  withDispatchAdmissionLock: <T>(operation: () => T | Promise<T>) => Promise<T>,
+): Promise<Run> {
+  const initial = store.read(id);
+  if (initial === null) throw new Error(`No run with id "${id}" found.`);
+  if (initial.state !== 'MERGE_READY' && initial.state !== 'MERGED') {
+    throw new Error(`Run "${id}" is ${initial.state}; only MERGE_READY or an exact merged retry may be reconciled.`);
+  }
+  if (initial.pullRequest === undefined) throw new Error(`Run "${id}" has no persisted pull request identity; refusing an operator-claimed merge.`);
+  if (github.readPullRequest === undefined) throw new Error('GitHub adapter cannot directly read the persisted pull request; refusing an operator-claimed merge.');
+  const proof = await github.readPullRequest(initial.target.owner, initial.target.repo, initial.pullRequest.number);
+  assertExactMergedPullRequest(initial, proof);
+
+  const reconcile = (): Run => {
+    let parkedGeneration: number | undefined;
+    let workspace: string | undefined;
+    let firstReconciliation = true;
+    const result = admission.reconcileMergedRun(id, (lane, phase) => {
+    const current = store.read(id);
+    if (current === null) throw new Error(`No run with id "${id}" found during merge reconciliation.`);
+    if (firstReconciliation) {
+      firstReconciliation = false;
+      if (JSON.stringify(current) !== JSON.stringify(initial)) {
+        throw new Error(`Run "${id}" changed after live merge proof and before locked reconciliation; refusing a stale transition.`);
+      }
+    }
+    assertExactMergedPullRequest(current, proof);
+    if (current.state !== 'MERGE_READY' && current.state !== 'MERGED') throw new Error(`Run "${id}" changed to ${current.state} during merge reconciliation.`);
+
+    if (lane === null) {
+      if (phase !== 'unadmitted') throw new Error('Admission lane disappeared during merge reconciliation.');
+      if (readRunOwnerReceipt(resolveRunOwnerReceiptPath(`${current.target.owner}/${current.target.repo}`.toLowerCase(), current.id, evidenceForRun(current))) !== null) {
+        throw new Error(`Run owner receipt exists without its admission lane for Run "${id}"; refusing merge reconciliation.`);
+      }
+      return casMergedRun(store, current);
+    }
+    const laneWorkspace = assertMergeLaneIdentity(current, lane);
+    workspace = laneWorkspace;
+    const repository = `${current.target.owner}/${current.target.repo}`.toLowerCase();
+    const receiptPath = resolveRunOwnerReceiptPath(repository, current.id, evidenceForRun(current, laneWorkspace === undefined ? {} : { workspace: laneWorkspace }));
+    const storedReceipt = readRunOwnerReceipt(receiptPath);
+    if (storedReceipt === null && current.state === 'MERGED' && phase === 'already_released') return current;
+    const receipt = readMergeReceipt(receiptPath, current, lane.missionId, laneWorkspace);
+    if (phase === 'before_publish') {
+      parkedGeneration = writeMergeReleaseTransition(receiptPath, current, lane.missionId, lane);
+      return casMergedRun(store, current);
+    }
+    if (phase === 'after_publish') {
+      const generation = parkedGeneration ?? lane.generation;
+      const settled = store.read(id);
+      if (settled === null || settled.state !== 'MERGED') throw new Error(`Run "${id}" was not durably merged before its lane release.`);
+      assertExactMergedPullRequest(settled, proof);
+      finalizeMergeReleaseReceipt(receiptPath, settled, lane.missionId, laneWorkspace, generation);
+      return settled;
+    }
+    if (phase !== 'already_released') throw new Error('Merge reconciliation reached an invalid admission phase.');
+
+    if (current.state === 'MERGE_READY') {
+      const exactFinalizedTransition = receipt.phase === 'released' && receipt.generation === lane.generation &&
+        receipt.token === undefined && receipt.settlementReason === 'workflow_settled';
+      if (exactFinalizedTransition) return casMergedRun(store, current);
+      const exactPriorTransition = receipt.phase === 'parked_release_transition' && receipt.generation === lane.generation - 1 &&
+        receipt.token === undefined && receipt.settlementReason === 'workflow_settled';
+      if (!exactPriorTransition) throw new Error(`Released lane for Run "${id}" lacks the exact workflow_settled merge transition receipt.`);
+      parkedGeneration = lane.generation - 1;
+      const merged = casMergedRun(store, current);
+      finalizeMergeReleaseReceipt(receiptPath, merged, lane.missionId, laneWorkspace, parkedGeneration);
+      return merged;
+    }
+    const exactFinalReceipt = receipt.phase === 'released' && receipt.generation === lane.generation && receipt.token === undefined &&
+      receipt.settlementReason === 'workflow_settled';
+    const exactInterruptedTransition = receipt.phase === 'parked_release_transition' && receipt.generation === lane.generation - 1 &&
+      receipt.token === undefined && receipt.settlementReason === 'workflow_settled';
+    if (!exactFinalReceipt && !exactInterruptedTransition) {
+      throw new Error(`Released lane for merged Run "${id}" lacks its exact workflow_settled merge receipt.`);
+    }
+    if (exactInterruptedTransition) finalizeMergeReleaseReceipt(receiptPath, current, lane.missionId, laneWorkspace, lane.generation - 1);
+    return current;
+    });
+    return result;
+  };
+  return await withDispatchAdmissionLock(reconcile);
 }
 
 export function runListCommand(store: RunStore): Run[] {
@@ -1262,40 +2348,215 @@ export async function main(argv: string[]): Promise<number> {
   }
 
   if (command === 'dispatch') {
+    if (subcommand === 'admission' && rest[0] === 'status' && rest.length === 1) {
+      console.log(JSON.stringify(dispatchAdmissionStatus(createHostAdmissionRegistry(), store), null, 2));
+      return 0;
+    }
+    if (subcommand === 'manual' && ['register', 'park', 'retire', 'recover'].includes(rest[0] ?? '')) {
+      const action = rest[0];
+      const stopped = rest.includes('--stopped');
+      const expectedFlag = rest.indexOf('--expected-generation');
+      const receiptStdin = rest.includes('--receipt-stdin');
+      const expectedRaw = expectedFlag >= 0 ? rest[expectedFlag + 1] : undefined;
+      if ((action === 'register' && (rest.length !== 1)) ||
+        (action === 'park' && (!stopped || rest.some((item) => item !== 'park' && item !== '--stopped'))) ||
+        (action === 'retire' && (!stopped || expectedFlag < 0 || expectedRaw === undefined || rest.length !== 4 || rest.filter((item) => item === '--expected-generation').length !== 1)) ||
+        (action === 'recover' && (!receiptStdin || rest.length !== 2))) {
+        throw new Error('Manual commands require register; park --stopped; retire --stopped --expected-generation <n>; or recover --receipt-stdin.');
+      }
+      const expectedGeneration = expectedRaw === undefined ? undefined : Number(expectedRaw);
+      if (action === 'retire' && (!Number.isSafeInteger(expectedGeneration) || expectedGeneration! <= 0)) throw new Error('--expected-generation must be a positive integer.');
+      return await withDispatchAdmissionLock(async () => {
+      const worktree = execFileSync('git', ['rev-parse', '--show-toplevel'], { encoding: 'utf8' }).trim();
+      const branch = execFileSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { encoding: 'utf8' }).trim();
+      const checkpointSha = execFileSync('git', ['rev-parse', 'HEAD'], { encoding: 'utf8' }).trim();
+      const clean = execFileSync('git', ['status', '--porcelain'], { encoding: 'utf8' }).trim() === '';
+      const remote = execFileSync('git', ['config', '--get', 'remote.origin.url'], { encoding: 'utf8' }).trim();
+      const repository = parseGitHubRepositoryRemote(remote);
+      const registry = createHostAdmissionRegistry();
+      const identity = canonicalizeMissionEvidence({ repository, repositoryScope: true, workspace: worktree });
+      const laneId = `manual:${createHash('sha256').update(`${repository}\0${identity.workspace}`).digest('hex').slice(0, 32)}`;
+      const receiptPath = resolveManualOwnerReceiptPath(repository, identity.workspace!);
+      const now = new Date().toISOString();
+      const manualProjection = (state: 'active' | 'parked') =>
+        publishAdmissionRuntimeProjection(resolveRunsDir(), registry, store, { stage: state === 'active' ? 'manual_implementation' : 'manual_parked', supervisor: 'parked' });
+      if (action === 'register') {
+        const prior = registry.readLane(laneId);
+        let missionId: string;
+        let revision: number;
+        let token: AdmissionToken;
+        if (prior?.status === 'active') {
+          throw new Error(`Manual lane already has active ownership at generation ${prior.generation}; a second registration cannot reuse that capability.`);
+        } else if (prior?.status === 'parked' && (prior.parkedReason === undefined || !['capacity_captains', 'capacity_writers', 'capacity_high_autonomy', 'capacity_repository'].includes(prior.parkedReason))) {
+          throw new Error(`Manual lane remains reserved at parked generation ${prior.generation} (${prior.parkedReason}); retire its exact clean checkpoint before registering again.`);
+        } else {
+          const admission = registry.admit({ laneId, role: 'production_captain', evidence: identity, highAutonomy: true }, {
+            beforePublish: (candidate) => {
+              const receipt: ManualOwnerReceipt = { schemaVersion: 1, laneId, missionId: candidate.missionId, repository, workspace: identity.workspace!, branch, checkpointSha, status: 'active', generation: candidate.token.generation, token: candidate.token };
+              try { writeManualOwnerReceipt(receiptPath, receipt); }
+              catch (error) {
+                const detail = error instanceof Error ? error.message : String(error);
+                throw new Error(`Manual owner receipt could not be durably published before admission: ${detail}`);
+              }
+            },
+          });
+          if (admission.outcome !== 'admitted') throw new Error(admission.outcome === 'duplicate'
+            ? `Manual production lane overlaps active or parked lane "${admission.conflictingLaneId}".`
+            : `Manual production lane is parked by ${admission.reason}.`);
+          missionId = admission.missionId;
+          revision = admission.revision;
+          token = admission.token;
+        }
+        const receipt = readManualOwnerReceipt(receiptPath);
+        if (receipt?.status !== 'active' || receipt.generation !== token.generation || receipt.token?.token !== token.token) throw new Error(`Manual lane ${laneId} generation ${token.generation} was admitted but its exact private owner receipt is unavailable; retain the registry fence and reconcile from its private receipt.`);
+        let projection: ReturnType<typeof composeOperationalRuntimeProjection>;
+        try { projection = manualProjection('active'); }
+        catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          throw new Error(`Manual lane ${laneId} generation ${token.generation} has a private owner receipt at ${receiptPath}, but projection publication failed; preserve the fence and retry reconciliation: ${detail}`);
+        }
+        console.log(JSON.stringify({ projection, laneId, missionId, admissionRevision: revision, ownerReceiptPath: receiptPath }));
+        return 0;
+      }
+      if (action === 'recover') {
+        let parsed: unknown;
+        try { parsed = JSON.parse(readFileSync(0, 'utf8')); } catch { throw new Error('Manual recovery stdin must contain one strict JSON ManualOwnerReceipt.'); }
+        if (!validateManualOwnerReceipt(parsed) || parsed.status !== 'active' || parsed.laneId !== laneId || parsed.repository !== repository || parsed.workspace !== identity.workspace || parsed.token === undefined) throw new Error('Recovery receipt does not identify this active manual owner.');
+        const current = registry.readLane(laneId);
+        if (current?.status !== 'active' || current.missionId !== parsed.missionId || current.generation !== parsed.generation || current.role !== 'production_captain' || current.evidence.repositoryScope !== true || current.evidence.workspace !== identity.workspace) throw new Error('Recovery receipt is stale or does not match current registry ownership.');
+        registry.assertCurrentOwner(parsed.token);
+        writeManualOwnerReceipt(receiptPath, parsed);
+        const projection = manualProjection('active');
+        console.log(JSON.stringify({ projection, laneId, missionId: parsed.missionId, ownerReceiptPath: receiptPath }));
+        return 0;
+      }
+      const prior = registry.readLane(laneId);
+      const receipt = readManualOwnerReceipt(receiptPath);
+      if (receipt === null || receipt.laneId !== laneId || receipt.repository !== repository || receipt.workspace !== identity.workspace) throw new Error('Private manual owner receipt is missing or belongs to a different worktree; refusing mutation.');
+      if (action === 'park') {
+        if (!clean || !stopped || branch !== receipt.branch) throw new Error('Manual park requires the original branch and a clean stopped worktree.');
+        if ((receipt.status === 'parking' || receipt.status === 'parked') && checkpointSha !== receipt.checkpointSha) {
+          throw new Error('Manual park retry requires its exact recorded HEAD checkpoint.');
+        }
+        let generation: number;
+        let revision: number;
+        if (receipt.status === 'active' || (receipt.status === 'parking' && prior?.status === 'active')) {
+          if (!receipt.token || prior?.status !== 'active' || prior.generation !== receipt.generation || prior.missionId !== receipt.missionId) throw new Error('Manual owner receipt is stale or no longer matches active registry ownership.');
+          if (receipt.status === 'parking' && branch !== receipt.branch) throw new Error('Interrupted manual park must resume from its exact recorded branch and HEAD checkpoint.');
+          const parking: ManualOwnerReceipt = receipt.status === 'parking' ? receipt : { ...receipt, status: 'parking', branch, checkpointSha };
+          if (receipt.status !== 'parking') writeManualOwnerReceipt(receiptPath, parking);
+          revision = registry.parkManual(receipt.token, { worktree, branch, checkpointSha, clean, stopped });
+          const parkedLane = registry.readLane(laneId)!;
+          generation = parkedLane.generation;
+          writeManualOwnerReceipt(receiptPath, { schemaVersion: 1, laneId, missionId: receipt.missionId, repository, workspace: identity.workspace!, branch, checkpointSha, status: 'parked', generation });
+        } else if (receipt.status === 'parking' && prior?.status === 'parked' && prior.generation === receipt.generation + 1 && prior.parkedReason === 'manual_checkpoint') {
+          generation = prior.generation; revision = registry.snapshot().revision;
+          writeManualOwnerReceipt(receiptPath, { schemaVersion: 1, laneId, missionId: receipt.missionId, repository, workspace: identity.workspace!, branch: receipt.branch, checkpointSha: receipt.checkpointSha, status: 'parked', generation });
+        } else if (receipt.status === 'parked' && prior?.status === 'parked' && prior.generation === receipt.generation && prior.parkedReason === 'manual_checkpoint') {
+          generation = receipt.generation; revision = registry.snapshot().revision;
+        } else throw new Error('Manual owner receipt and registry do not establish a current active or parked generation.');
+        const parkedReceipt = readManualOwnerReceipt(receiptPath)!;
+        const projection = manualProjection('parked');
+        console.log(JSON.stringify({ projection, laneId, missionId: receipt.missionId, admissionRevision: revision, parkedGeneration: generation, ownerReceiptPath: receiptPath }));
+        return 0;
+      }
+      if (receipt.status !== 'parked' || expectedGeneration !== receipt.generation || !clean || !stopped || branch !== receipt.branch || checkpointSha !== receipt.checkpointSha ||
+        !((prior?.status === 'parked' && prior.generation === receipt.generation) || (prior?.status === 'released' && prior.generation === receipt.generation + 1))) throw new Error('Manual retirement requires the exact parked receipt generation and unchanged clean stopped branch/HEAD checkpoint.');
+      let revision: number;
+      try { revision = registry.retireManual(laneId, receipt.generation, { worktree, branch, checkpointSha, clean, stopped }); }
+      catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Manual retirement did not release its exact parked generation; the parked projection remains authoritative: ${detail}`);
+      }
+      let projection: ReturnType<typeof composeOperationalRuntimeProjection>;
+      try { projection = publishAdmissionRuntimeProjection(resolveRunsDir(), registry, store, { stage: 'idle', supervisor: 'parked' }); }
+      catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new Error(`Manual lane generation ${receipt.generation} is retired in the registry, but its parked projection could not be cleared; preserve the released generation and retry exact-generation reconciliation: ${detail}`);
+      }
+      // Retain the parked private receipt as a harmless generation tombstone.
+      // The next authorized register replaces it while holding this same lock.
+      console.log(JSON.stringify({ projection, laneId, missionId: receipt.missionId, admissionRevision: revision, retiredGeneration: receipt.generation + 1 }));
+      return 0;
+      });
+    }
+    if (subcommand === 'maintenance' && (rest[0] === 'hold' || rest[0] === 'release') && rest.length === 1) {
+      const desired = rest[0] === 'hold';
+      const { projection, wake } = await withDispatchAdmissionLock(() => {
+        const wasHeld = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
+        const registry = createHostAdmissionRegistry();
+        const projection = publishAdmissionRuntimeProjection(resolveRunsDir(), registry, store, {
+          stage: desired ? 'maintenance_hold' : 'idle', supervisor: desired ? 'parked' : 'stopped',
+          maintenanceHold: desired ? { active: true, reason: 'Operator restart hold' } : { active: false },
+        });
+        // A meaningful release wakes the already-singleton driver exactly once.
+        // Repeating an already released command is deliberately a no-op at the
+        // wake boundary; it cannot manufacture another reconciliation.
+        return { projection, wake: !desired && wasHeld ? signalDispatchWake(dispatchWakePath()) : undefined };
+      });
+      console.log(JSON.stringify({ projection, ...(wake === undefined ? {} : { wake }) }));
+      return 0;
+    }
+    if (subcommand === 'wake' && rest.length === 0) {
+      console.log(JSON.stringify({ outcome: 'wake_signaled', token: signalDispatchWake(dispatchWakePath()) }));
+      return 0;
+    }
     if (subcommand === 'launchd' && rest[0] === 'render') {
       const { values, positionals } = parseArgs({
         args: rest.slice(1),
         options: {
           program: { type: 'string' },
+          'node-program': { type: 'string' },
+          'pnpm-program': { type: 'string' },
+          'dependency-artifact-path': { type: 'string' },
+          'luna-codex-home': { type: 'string' },
+          'playwright-browsers-path': { type: 'string' },
           'working-directory': { type: 'string' },
-          minute: { type: 'string' },
           label: { type: 'string' },
           'stdout-path': { type: 'string' },
           'stderr-path': { type: 'string' },
         },
       });
-      if (positionals.length > 0 || values.program === undefined || values['working-directory'] === undefined) {
-        throw new Error('dispatch launchd render requires --program and --working-directory.');
+      if (positionals.length > 0 || values.program === undefined || values['node-program'] === undefined || values['pnpm-program'] === undefined || values['dependency-artifact-path'] === undefined || values['luna-codex-home'] === undefined || values['playwright-browsers-path'] === undefined || values['working-directory'] === undefined) {
+        throw new Error('dispatch launchd render requires --program, --node-program, --pnpm-program, --dependency-artifact-path, --luna-codex-home, --playwright-browsers-path, and --working-directory.');
       }
-      const minute = values.minute === undefined ? undefined : Number(values.minute);
       console.log(renderDispatchLaunchdPlist({
         program: values.program,
+        nodeProgram: values['node-program'],
+        pnpmProgram: values['pnpm-program'],
+        dependencyArtifactPath: values['dependency-artifact-path'],
+        lunaCodexHome: values['luna-codex-home'],
+        playwrightBrowsersPath: values['playwright-browsers-path'],
         workingDirectory: values['working-directory'],
-        ...(minute === undefined ? {} : { minute }),
         ...(values.label === undefined ? {} : { label: values.label }),
         ...(values['stdout-path'] === undefined ? {} : { standardOutPath: values['stdout-path'] }),
         ...(values['stderr-path'] === undefined ? {} : { standardErrorPath: values['stderr-path'] }),
       }));
       return 0;
     }
-    if (subcommand !== 'once' || rest.length > 0) {
+    if (subcommand !== 'once' && subcommand !== 'serve') {
+      console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    const { values, positionals } = parseArgs({
+      args: rest,
+      options: {
+        'idle-poll-ms': { type: 'string' },
+        'max-cycles': { type: 'string' },
+      },
+    });
+    if (positionals.length > 0 || (subcommand === 'once' && (values['idle-poll-ms'] !== undefined || values['max-cycles'] !== undefined))) {
       console.error(`Unknown command: dispatch ${subcommand ?? ''}\n`);
       console.error(USAGE);
       return 1;
     }
     let lock;
     try {
-      lock = acquireDispatchInvocationLock({ lockPath: dispatchLockPath() });
+      const lockPath = dispatchLockPath();
+      assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
+      lock = acquireDispatchInvocationLock({ lockPath });
+      assertSafeAccountOwnedPath(resolveAccountHomeDirectory(), lockPath, 'file');
     } catch (error) {
       if (error instanceof DispatchInvocationLockedError) {
         console.log(JSON.stringify({ outcome: 'already_running', reason: error.message }));
@@ -1304,22 +2565,87 @@ export async function main(argv: string[]): Promise<number> {
       throw error;
     }
     try {
-      const config = resolveDispatchConfiguration();
-      const transport = new GhCliTransport();
-      const runtime = new GitHubDispatchRuntime(transport, config);
-      const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
-      const result = await dispatchOnceCommand(config, {
-        workflow,
-        runtime,
-        resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-        runIssue: async (ref, execution, dispatchClaimId) => await runIssueCommand(workflow, ref, execution === undefined ? { dispatchClaimId } : { execution, dispatchClaimId }),
-        resumeClaimedRun: async (run) => await runWorkflow(workflow, run.id, { maxReviewAttempts: DEFAULT_MAX_REVIEW_ATTEMPTS }),
+      const admission = createHostAdmissionRegistry();
+      const publishRuntime = (stage: string, supervisor: 'running' | 'stopped' | 'parked', nextPollAt?: string) => publishAdmissionRuntimeProjection(resolveRunsDir(), admission, store, {
+        stage, supervisor, eventWakeEligible: subcommand === 'serve', ...(nextPollAt === undefined ? {} : { nextPollAt }),
       });
-      printDispatchResult(result);
+      const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
+      const nextPollAt = () => subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined;
+      const reconcile = async () => await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
+        // This durable typed fence precedes queue reads, configuration, GitHub,
+        // workflow construction, and every model-capable boundary. The same
+        // admission lock serializes an operator hold/release with this entire
+        // interval, so a transition cannot be overwritten mid-reconcile.
+        if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) {
+          publishRuntime('maintenance_hold', 'parked', nextPollAt());
+          return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
+        }
+        publishRuntime('scanning', 'running', nextPollAt());
+        const config = resolveDispatchConfiguration();
+        const transport = new GhCliTransport();
+        const runtime = new GitHubDispatchRuntime(transport, config);
+        const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+        return await dispatchOnceCommand(config, {
+          workflow,
+          runtime,
+          admission,
+          releaseAdmissionLock,
+          withAdmissionLock: async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation),
+          resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
+          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock) => {
+            return await runIssueCommand(workflow, ref, {
+              ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
+              publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
+              releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
+            });
+          },
+          resumeClaimedRun: async (run, dispatchClaimId, missionAdmission, release, withLock) => {
+            if (run.target.kind !== 'issue') throw new Error(`Dispatch claimed Run ${run.id} is not an issue Run.`);
+            const workspace = persistedRunWorkspace(run);
+            return await runIssueCommand(workflow, `${run.target.owner}/${run.target.repo}#${run.target.issueNumber}`, {
+              ...(run.execution === undefined ? {} : { execution: run.execution }),
+              dispatchClaimId,
+              ...(run.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: run.repairTaskShapeAuthority }),
+              admission: missionAdmission!,
+              publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
+              ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
+              releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
+            });
+          },
+        });
+      });
+      const publishSettledRuntime = async (result: Awaited<ReturnType<typeof reconcile>>) => await withDispatchAdmissionLock(() => {
+        const held = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
+        publishRuntime(held || result.outcome === 'maintenance_hold' ? 'maintenance_hold' : result.outcome === 'dispatched' ? result.execution.state.toLowerCase() : 'idle', held || result.outcome === 'maintenance_hold' ? 'parked' : 'stopped');
+      });
+      if (subcommand === 'once') {
+        const result = await reconcile();
+        await publishSettledRuntime(result);
+        printDispatchResult(result);
+        return 0;
+      }
+      const result = await dispatchContinuously({
+        dispatchOnce: reconcile,
+        sleep: createDispatchWakeWaiter(dispatchWakePath()),
+        idlePollMs,
+        ...(values['max-cycles'] === undefined ? {} : { maxCycles: Number(values['max-cycles']) }),
+      });
+      if (result.last !== null) await publishSettledRuntime(result.last);
+      console.log(JSON.stringify(result, null, 2));
       return 0;
     } finally {
       lock.release();
     }
+  }
+
+  if (command === 'production') {
+    if (subcommand !== 'preflight' || rest.length !== 0) {
+      console.error(`Unknown command: production ${subcommand ?? ''}\n`);
+      console.error(USAGE);
+      return 1;
+    }
+    console.log(JSON.stringify({ ok: true, preflight: preflightProductionPolicy(process.env) }, null, 2));
+    return 0;
   }
 
   if (command === 'wait') {
@@ -1392,6 +2718,7 @@ export async function main(argv: string[]): Promise<number> {
         issue: { type: 'string' },
         branch: { type: 'string' },
         'execution-profile': { type: 'string' },
+        'repair-task-shape-authority': { type: 'string' },
       },
     });
     const { owner, repo } = values;
@@ -1402,8 +2729,12 @@ export async function main(argv: string[]): Promise<number> {
     if (values['execution-profile'] === undefined) {
       throw new Error('run create requires --execution-profile <routine|standard|complex|critical>.');
     }
+    if (values['repair-task-shape-authority'] === undefined) {
+      throw new Error('run create requires --repair-task-shape-authority <strict-json>.');
+    }
     const execution = resolveSelectedExecutionProfile(values['execution-profile']);
-    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch, execution });
+    const repairTaskShapeAuthority = parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
+    const run = runCreateCommand(store, owner, repo, { issue, branch: values.branch, execution, repairTaskShapeAuthority });
     console.log(`Created run ${run.id} (${run.state}).`);
     printRun(run);
     return 0;
@@ -1413,6 +2744,20 @@ export async function main(argv: string[]): Promise<number> {
     const id = rest[0];
     if (id === undefined) throw new Error('run show requires a run id.');
     printRun(runShowCommand(store, id));
+    return 0;
+  }
+
+  if (subcommand === 'admission' && rest[0] === 'recover') {
+    const { values, positionals } = parseArgs({
+      args: rest.slice(1), allowPositionals: true,
+      options: { generation: { type: 'string' }, stopped: { type: 'boolean' } },
+    });
+    const [id] = positionals;
+    if (id === undefined || values.generation === undefined) throw new Error('run admission recover requires <run-id> --generation <n>.');
+    const generation = Number(values.generation);
+    if (!Number.isSafeInteger(generation) || generation < 1) throw new Error('--generation must be a positive safe integer.');
+    const disposition = await withDispatchAdmissionLock(() => recoverRunAdmission(store, createHostAdmissionRegistry(), id, generation, values.stopped === true));
+    console.log(JSON.stringify({ outcome: disposition, runId: id, generation }));
     return 0;
   }
 
@@ -1436,7 +2781,9 @@ export async function main(argv: string[]): Promise<number> {
     if (!TRANSITION_TYPES.includes(type as TransitionType)) {
       throw new Error(`Unknown transition "${type}". Valid transitions: ${TRANSITION_TYPES.join(', ')}.`);
     }
-    const next = runTransitionCommand(store, id, type as TransitionType, values.reason);
+    const next = type === 'merged'
+      ? await runMergedTransitionCommand(store, id, new LiveGitHubAdapter({ transport: new GhCliTransport() }), createHostAdmissionRegistry(), withDispatchAdmissionLock)
+      : await withDispatchAdmissionLock(() => runTransitionCommand(store, id, type as TransitionType, values.reason, createHostAdmissionRegistry()));
     console.log(`Run ${next.id}: ${next.state}.`);
     printRun(next);
     return 0;
@@ -1446,6 +2793,11 @@ export async function main(argv: string[]): Promise<number> {
     for (const run of runListCommand(store)) {
       console.log(`${run.id}\t${run.state}\t${JSON.stringify(run.target)}`);
     }
+    return 0;
+  }
+
+  if (subcommand === 'projections' && rest[0] === 'rebuild' && rest.length === 1) {
+    console.log(JSON.stringify({ ok: true, rebuilt: store.rebuildOperationalProjections() }));
     return 0;
   }
 
@@ -1462,13 +2814,54 @@ export async function main(argv: string[]): Promise<number> {
     if (id === undefined) throw new Error('run resume requires a run id.');
     if (values.decision === undefined) throw new Error('run resume requires --decision <choice>.');
     const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
-    const outcome = await resumeCommand(
-      buildWorkflowDeps(store, resolveCapabilities),
-      id,
-      values.decision,
-    );
+    const outcome = await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
+      const run = store.read(id);
+      if (run === null) throw new Error(`No run with id "${id}" found.`);
+      const admissionWorkspace = persistedRunWorkspace(run);
+      const withLock = async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation);
+      let commitDispatchResumeTransition: WorkflowCommandOptions['commitDispatchResumeTransition'];
+      if (run.dispatchClaimId !== undefined) {
+        if (run.target.kind !== 'issue' || run.execution === undefined) throw new Error(`Dispatch-bound Run "${id}" has no canonical issue/profile binding.`);
+        const config = resolveDispatchConfiguration();
+        if (`${run.target.owner}/${run.target.repo}`.toLowerCase() !== `${config.owner}/${config.repo}`.toLowerCase()) throw new Error('Dispatch-bound Run does not belong to the configured canonical runtime repository.');
+        const runtime = new GitHubDispatchRuntime(new GhCliTransport(), config);
+        const assertLiveClaim = async (expectedRun: Run) => {
+          const selected = selectDispatchRuntime(await runtime.listRuntimeComments());
+          if (selected === null) throw new Error('Dispatch runtime claim is missing.');
+          const claim = selected.claim;
+          const claimBoundRun = claim.runId === null && expectedRun.target.kind === 'issue'
+            ? claimedRun(store, claim, { issue: expectedRun.target.issueNumber, route: 'codex', profile: expectedRun.execution!.profile }, { owner: config.owner, repo: config.repo })
+            : null;
+          assertCanonicalDispatchResumeClaim(expectedRun, claim, config, claimBoundRun);
+          return selected;
+        };
+        await assertLiveClaim(run);
+        commitDispatchResumeTransition = async (expectedRun, nextRun, commitRun) => {
+          const live = await assertLiveClaim(expectedRun);
+          const now = new Date().toISOString();
+          const transitionClaim: DispatchRuntimeClaim = { ...live.claim, runId: expectedRun.id, state: nextRun.state === 'FAILED' ? 'failed' : 'running', heartbeatAt: now, leaseUntil: new Date(Date.parse(now) + config.leaseDurationMs).toISOString() };
+          // Persist the exact Run decision first while the short lock still
+          // excludes competing decisions. If the following GitHub write fails
+          // or the process dies, the retained claim plus active Run can be
+          // reconciled by dispatch; a claim-only `running` state could strand
+          // the still-parked Run from its public resume path.
+          commitRun();
+          await runtime.updateRuntimeComment(live.id, renderDispatchRuntime(transitionClaim));
+          const observed = selectDispatchRuntime(await runtime.listRuntimeComments());
+          assertDispatchRuntimeClaimReadback(live.id, transitionClaim, observed);
+        };
+      }
+      return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities), id, values.decision!, {
+        admission: createHostAdmissionRegistry(),
+        publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
+        ...(admissionWorkspace === undefined ? {} : { admissionWorkspace }),
+        releaseDispatchAdmissionLock: releaseAdmissionLock,
+        withDispatchAdmissionLock: withLock,
+        ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId, commitDispatchResumeTransition }),
+      });
+    });
     printOutcome(outcome, values['browser-profile']);
-    return outcome.outcome === 'failed' ? 1 : 0;
+    return outcomeExitCode(outcome);
   }
 
   if (subcommand === undefined) {
@@ -1481,24 +2874,37 @@ export async function main(argv: string[]): Promise<number> {
   const { values, positionals } = parseArgs({
     args: [subcommand, ...rest],
     allowPositionals: true,
-    options: { 'browser-profile': { type: 'string' }, 'execution-profile': { type: 'string' } },
+    options: { 'browser-profile': { type: 'string' }, 'execution-profile': { type: 'string' }, 'repair-task-shape-authority': { type: 'string' } },
   });
   const [ref, extra] = positionals;
   if (ref === undefined || extra !== undefined) {
     throw new Error('run requires exactly one owner/repo#123 reference.');
   }
-  const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
-  const target = parseIssueRef(ref);
-  const existing = findRunByTarget(store, target);
-  if (existing === null && values['execution-profile'] === undefined) {
-    throw new Error('run owner/repo#123 requires --execution-profile <routine|standard|complex|critical> for a new run.');
-  }
-  const execution = values['execution-profile'] === undefined
-    ? undefined
-    : resolveSelectedExecutionProfile(values['execution-profile']);
-  const outcome = await runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, { execution });
+  const outcome = await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
+    const resolveCapabilities = buildBrowserCapabilityResolver(values['browser-profile']);
+    const target = parseIssueRef(ref);
+    const existing = findRunByTarget(store, target);
+    if (existing === null && values['execution-profile'] === undefined) {
+      throw new Error('run owner/repo#123 requires --execution-profile <routine|standard|complex|critical> for a new run.');
+    }
+    if (existing === null && values['repair-task-shape-authority'] === undefined) {
+      throw new Error('run owner/repo#123 requires --repair-task-shape-authority <strict-json> for a new run.');
+    }
+    const execution = values['execution-profile'] === undefined
+      ? undefined
+      : resolveSelectedExecutionProfile(values['execution-profile']);
+    const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
+      ? undefined
+      : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
+    return runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, {
+      execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(),
+      publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
+      releaseDispatchAdmissionLock: releaseAdmissionLock,
+      withDispatchAdmissionLock: async <T>(operation: () => T | Promise<T>) => await withDispatchAdmissionLock(operation),
+    });
+  });
   printOutcome(outcome, values['browser-profile']);
-  return outcome.outcome === 'failed' ? 1 : 0;
+  return outcomeExitCode(outcome);
 }
 
 // Run directly (`node dist/cli.js ...` or `node --import tsx src/cli.ts ...`)

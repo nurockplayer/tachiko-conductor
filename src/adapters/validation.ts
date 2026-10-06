@@ -1,6 +1,5 @@
 import type { LocalValidationEvidence } from '../domain/types.js';
 import type { IssueTarget } from '../domain/types.js';
-import type { ToolOutputPolicy, ToolOutputStore } from '../evidence/tool-output.js';
 import type { HostedCheckPolicy } from '../validation/hosted-policy.js';
 
 /** One explicitly configured executable and its bounded wall-clock limit. */
@@ -13,15 +12,26 @@ export interface LocalValidationCommandConfiguration {
 export interface LocalValidationConfiguration {
   readonly revision: string;
   readonly commands: readonly LocalValidationCommandConfiguration[];
+  /** Host-owned browser artifacts; never inferred from a user cache. */
+  readonly playwrightBrowsersPath?: string;
+  /** Absolute host-provisioned runtime used by the macOS sandboxed lane. */
+  readonly nodeProgram?: string;
+  /** Absolute host-provisioned pnpm executable; never resolved from PATH. */
+  readonly pnpmProgram?: string;
+  /** Read-only host artifact containing a lockfile-bound pnpm store. */
+  readonly dependencyArtifactPath?: string;
   /**
    * Explicit clean checkout for a supported pre-existing-PR run. It is never
    * inferred from the conductor process cwd and must prove target repository
    * identity before commands execute.
    */
   readonly workspacePath?: string;
-  /** Optional task-specific preview budget and evidence destination. */
-  readonly outputPolicy?: ToolOutputPolicy;
-  readonly outputStore?: ToolOutputStore;
+  /**
+   * Host-owned clean checkout used to prove that ignored dependencies in an
+   * owned worker workspace pre-date the worker.  Its ignored-state manifest
+   * must exactly match before local commands may consume those bytes.
+   */
+  readonly trustedIgnoredBaselinePath?: string;
 }
 
 /** Explicit repository/run policy used to interpret the live hosted check list. */

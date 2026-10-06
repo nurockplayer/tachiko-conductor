@@ -31,6 +31,7 @@ const RESUME_WORKSPACE_DECISION = 'Resolve the workspace identity and retry';
 type Provider = 'claude-code' | 'codex-cli';
 
 const identity: ImplementationBootstrapIdentity = {
+  bootstrapKind: 'linked-worktree',
   owner: TARGET.owner,
   repo: TARGET.repo,
   issueNumber: TARGET.issueNumber,
@@ -92,6 +93,7 @@ class PostRunGuard implements WorkspaceGuard {
 
 class ContinuityBootstrap implements ImplementationBootstrapAdapter {
   readonly kind = 'implementation-bootstrap' as const;
+  readonly bootstrapKind = 'linked-worktree' as const;
   readonly guardForRun = new PostRunGuard();
 
   async plan(): Promise<ImplementationBootstrapIdentity> { return identity; }

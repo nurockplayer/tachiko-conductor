@@ -1,6 +1,8 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
   assertWorkspaceGuard,
+  governedPublicationRefusal,
+  isExecutionAdmissionRefusal,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -28,6 +30,7 @@ import {
   tokenUsageFromProviderValue,
   toolResultBytesFromItem,
 } from './provider-telemetry.js';
+import { IMPLEMENTATION_PACKET_LIMITS, renderFinalCliPacket } from './implementation-packet.js';
 import {
   NodeProcessRunner,
   type ProcessResult,
@@ -49,6 +52,7 @@ export const CODEX_ERROR_CODE = {
   RESUME_IDENTITY_INVALID: 'CODEX_RESUME_IDENTITY_INVALID',
   RESUME_IDENTITY_MISMATCH: 'CODEX_RESUME_IDENTITY_MISMATCH',
   HEAD_READ_FAILED: 'HEAD_READ_FAILED',
+  PACKET_REFUSED: 'CODEX_PACKET_REFUSED',
 } as const;
 
 export type CodexErrorCode = (typeof CODEX_ERROR_CODE)[keyof typeof CODEX_ERROR_CODE];
@@ -61,11 +65,11 @@ export interface CodexCliAdapterOptions {
   readonly reasoningEffort?: ExecutionReasoningEffort;
   readonly sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   readonly approvalPolicy?: 'untrusted' | 'on-request' | 'never';
-  /** Optional larger per-execution bounded-output budget and evidence store. */
-  readonly outputPolicy?: ProcessRunOptions['outputPolicy'];
-  readonly outputStore?: ProcessRunOptions['outputStore'];
   /** Provider-boundary capability source; defaults to the versioned Codex fallback. */
   readonly capabilityCatalog?: ModelCapabilityCatalog;
+  /** Optional explicit runtime environment; never merge this with ambient env. */
+  readonly env?: NodeJS.ProcessEnv;
+  readonly requiredConfig?: readonly string[];
 }
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
@@ -95,8 +99,8 @@ export class CodexCliAdapter implements ImplementationAgent {
   private readonly sandboxMode: CodexCliAdapterOptions['sandboxMode'];
   private readonly approvalPolicy: CodexCliAdapterOptions['approvalPolicy'];
   private readonly capabilityCatalog: ModelCapabilityCatalog;
-  private readonly outputPolicy: ProcessRunOptions['outputPolicy'];
-  private readonly outputStore: ProcessRunOptions['outputStore'];
+  private readonly env: NodeJS.ProcessEnv | undefined;
+  private readonly requiredConfig: readonly string[];
 
   constructor(options: CodexCliAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
@@ -107,11 +111,13 @@ export class CodexCliAdapter implements ImplementationAgent {
     this.sandboxMode = options.sandboxMode;
     this.approvalPolicy = options.approvalPolicy;
     this.capabilityCatalog = options.capabilityCatalog ?? codexFallbackCapabilityCatalog();
-    this.outputPolicy = options.outputPolicy;
-    this.outputStore = options.outputStore;
+    this.env = options.env;
+    this.requiredConfig = options.requiredConfig ?? [];
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) return publicationRefusal;
     const executor = request.executor;
     if (executor !== undefined && !isUsableCodexExecutor(executor)) {
       return failureAgentResult(
@@ -120,6 +126,10 @@ export class CodexCliAdapter implements ImplementationAgent {
         0,
         executor,
       );
+    }
+    const packetRefusal = implementationPacketRefusal(request);
+    if (packetRefusal !== undefined) {
+      return failureAgentResult(CODEX_ERROR_CODE.PACKET_REFUSED, packetRefusal, 0, executor);
     }
     // Normalize and validate the exact model/effort pair before any Codex
     // process exists, so an unsupported configuration starts zero model turns.
@@ -144,21 +154,19 @@ export class CodexCliAdapter implements ImplementationAgent {
       result = await this.runner.run(
         'codex',
         this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort),
-        this.processOptions(request.signal, cwd),
+        this.processOptions(request.signal, cwd, request.beforeExecution),
       );
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
-      const output = processOutput(error);
-      if (isAborted(request.signal) || code === 'ABORT_ERR') return cancelledAgentResult(durationMs, executor, output);
+      if (isAborted(request.signal) || code === 'ABORT_ERR') return cancelledAgentResult(durationMs, executor);
       if (code === 'ETIMEDOUT') {
         return failureAgentResult(
           CODEX_ERROR_CODE.TIMEOUT,
           `Codex CLI timed out after ${this.timeoutMs}ms.`,
           durationMs,
           executor,
-          undefined,
-          output,
         );
       }
       if (code === 'ENOENT') {
@@ -167,8 +175,6 @@ export class CodexCliAdapter implements ImplementationAgent {
           'Codex CLI executable "codex" was not found.',
           durationMs,
           executor,
-          undefined,
-          output,
         );
       }
       return failureAgentResult(
@@ -176,8 +182,6 @@ export class CodexCliAdapter implements ImplementationAgent {
         `Failed to run Codex CLI: ${errorMessage(error)}`,
         durationMs,
         executor,
-        undefined,
-        output,
       );
     }
 
@@ -185,7 +189,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     if (result.exitCode !== 0) {
       const code = executor === undefined ? CODEX_ERROR_CODE.EXIT_FAILURE : CODEX_ERROR_CODE.RESUME_FAILED;
       const action = executor === undefined ? 'execution' : 'resume';
-      return failureAgentResult(code, `Codex ${action} exited with status ${result.exitCode}.`, durationMs, executor, undefined, result.output);
+      return failureAgentResult(code, `Codex ${action} exited with status ${result.exitCode}.`, durationMs, executor);
     }
 
     const parsed = parseCodexJsonl(result.stdout, {
@@ -194,19 +198,13 @@ export class CodexCliAdapter implements ImplementationAgent {
       ...(preflight.reasoningEffort === undefined ? {} : { reasoningEffort: preflight.reasoningEffort }),
       ...(capability === undefined ? {} : { capability }),
     });
-    if (!parsed.ok) return failureAgentResult(parsed.code, parsed.detail, durationMs, executor, parsed.telemetry, result.output);
-    // The parser's per-item measurement is the tool-result metric. The
-    // process envelope is the complete JSONL transcript and must not inflate
-    // largestToolResultBytes.
-    const telemetry = parsed.outcome.telemetry;
+    if (!parsed.ok) return failureAgentResult(parsed.code, parsed.detail, durationMs, executor, parsed.telemetry);
     if (executor !== undefined && parsed.outcome.executor.sessionId !== executor.sessionId) {
       return failureAgentResult(
         CODEX_ERROR_CODE.RESUME_IDENTITY_MISMATCH,
         `Codex resume returned thread ${parsed.outcome.executor.sessionId}, expected ${executor.sessionId}.`,
         durationMs,
         executor,
-        undefined,
-        result.output,
       );
     }
     const takeoverReason = parseHumanTakeover(parsed.outcome.summary);
@@ -216,8 +214,7 @@ export class CodexCliAdapter implements ImplementationAgent {
         summary: takeoverReason,
         diagnostics: [`${HUMAN_TAKEOVER_DIAGNOSTIC} ${takeoverReason}`],
         executor: parsed.outcome.executor,
-        telemetry,
-        ...(result.output === undefined ? {} : { output: result.output }),
+        telemetry: parsed.outcome.telemetry,
         durationMs,
       };
     }
@@ -232,8 +229,7 @@ export class CodexCliAdapter implements ImplementationAgent {
         `Codex completed, but an exact 40-hex HEAD could not be read from ${this.cwd}.`,
         durationMs,
         parsed.outcome.executor,
-        telemetry,
-        result.output,
+        parsed.outcome.telemetry,
       );
     }
     return {
@@ -241,8 +237,7 @@ export class CodexCliAdapter implements ImplementationAgent {
       summary: parsed.outcome.summary,
       headSha: sha,
       executor: parsed.outcome.executor,
-      telemetry,
-      ...(result.output === undefined ? {} : { output: result.output }),
+      telemetry: parsed.outcome.telemetry,
       durationMs,
     };
   }
@@ -268,19 +263,16 @@ export class CodexCliAdapter implements ImplementationAgent {
     if (this.approvalPolicy !== undefined) {
       args.push('-c', `approval_policy=${JSON.stringify(this.approvalPolicy)}`);
     }
+    for (const config of this.requiredConfig) args.push('-c', config);
     if (executor !== undefined) args.push(executor.sessionId);
     args.push(prompt);
     return args;
   }
 
-  private processOptions(signal: AbortSignal | undefined, cwd = this.cwd): ProcessRunOptions {
-    return {
-      timeoutMs: this.timeoutMs,
-      cwd,
-      ...(signal === undefined ? {} : { signal }),
-      ...(this.outputPolicy === undefined ? {} : { outputPolicy: this.outputPolicy }),
-      ...(this.outputStore === undefined ? {} : { outputStore: this.outputStore }),
-    };
+  private processOptions(signal: AbortSignal | undefined, cwd = this.cwd, beforeSpawn?: () => void): ProcessRunOptions {
+    return signal === undefined
+      ? { timeoutMs: this.timeoutMs, cwd, ...(this.env === undefined ? {} : { env: this.env }), ...(beforeSpawn === undefined ? {} : { beforeSpawn }) }
+      : { timeoutMs: this.timeoutMs, cwd, signal, ...(this.env === undefined ? {} : { env: this.env }), ...(beforeSpawn === undefined ? {} : { beforeSpawn }) };
   }
 
   /**
@@ -311,13 +303,26 @@ export class CodexCliAdapter implements ImplementationAgent {
   }
 }
 
+const ORIGINAL_CODEX_CLI_RUN = CodexCliAdapter.prototype.run;
+
+/** Read-only origin check for Luna's privately confined nested CLI adapter. */
+export function hasOriginalCodexCliRun(adapter: object): boolean {
+  if (!(adapter instanceof CodexCliAdapter) || Object.getPrototypeOf(adapter) !== CodexCliAdapter.prototype ||
+      Object.getOwnPropertyDescriptor(adapter, 'run') !== undefined) return false;
+  const descriptor = Object.getOwnPropertyDescriptor(CodexCliAdapter.prototype, 'run');
+  return descriptor !== undefined && 'value' in descriptor && descriptor.value === ORIGINAL_CODEX_CLI_RUN;
+}
+
 function buildPrompt(request: ImplementationRequest): string {
+  if (request.packet !== undefined) return request.packet.finalCliText;
   const instructions = request.authority === 'live-target'
     ? request.supplementalInstructions
     : request.instructions;
   const lines = [
     `Implement ${formatTarget(request.target)} from base ${request.baseSha}.`,
-    'Read the live target and repository-local instructions as authority.',
+    request.authority === 'live-target'
+      ? 'Read the live target and repository-local instructions as authority.'
+      : 'Treat the supplied bounded task packet as the only target authority; do not use network or MCP to rediscover it.',
     'Run repository-required validation before reporting success.',
     instructions,
   ].filter((line): line is string => line !== undefined && line !== '');
@@ -332,6 +337,37 @@ function buildPrompt(request: ImplementationRequest): string {
     );
   }
   return lines.join('\n');
+}
+
+function implementationPacketRefusal(request: ImplementationRequest): string | undefined {
+  const packet = request.packet;
+  if (packet === undefined) return undefined;
+  const rendered = renderFinalCliPacket(packet);
+  if (rendered.kind === 'refusal') return rendered.reason;
+  const target = formatTarget(request.target);
+  const packetTarget = formatTarget(packet.identity.target);
+  const expectedFinal = [
+    `Implement ${target} from base ${request.baseSha}.`,
+    'Treat the supplied bounded task packet as the only target authority; do not use network or MCP to rediscover it.',
+    'Run repository-required validation before reporting success.',
+    packet.rendered,
+  ].join('\n');
+  const execution = request.execution;
+  const packetExecution = packet.identity.execution;
+  if (request.authority !== 'embedded' || request.instructions !== packet.rendered ||
+      packet.version !== 'tachiko.implementation-packet.v1' || (request.capabilities?.length ?? 0) !== 0 ||
+      request.supplementalInstructions !== undefined || request.sessionId !== undefined || request.executor !== undefined ||
+      packetTarget !== target || packet.identity.baseSha !== request.baseSha ||
+      packet.identity.workspacePath !== request.workspacePath || packet.identity.branch !== request.branch ||
+      request.runtimeOwnership?.runId !== packet.identity.runId || execution === undefined ||
+      execution.profile !== packetExecution.profile || execution.revision !== packetExecution.revision ||
+      execution.executor !== packetExecution.executor || execution.model !== packetExecution.model ||
+      execution.reasoningEffort !== packetExecution.reasoningEffort || execution.timeoutMs !== packetExecution.timeoutMs ||
+      execution.sandboxMode !== packetExecution.sandboxMode || execution.approvalPolicy !== packetExecution.approvalPolicy ||
+      packet.finalCliText !== expectedFinal || Buffer.byteLength(expectedFinal, 'utf8') > IMPLEMENTATION_PACKET_LIMITS.finalCliBytes) {
+    return 'PACKET_IDENTITY_MISMATCH: final CLI packet does not match its exact target, base, workspace, branch, or rendered content. No model turn or publication is authorized.';
+  }
+  return undefined;
 }
 
 function formatTarget(target: Target): string {
@@ -478,7 +514,6 @@ function failureAgentResult(
   durationMs: number,
   executor?: ExecutorIdentity,
   telemetry?: ProviderExecutionTelemetry,
-  output?: ProcessResult['output'],
 ): AgentResult {
   return {
     exitStatus: 'failure',
@@ -487,12 +522,11 @@ function failureAgentResult(
     durationMs,
     ...(executor === undefined ? {} : { executor }),
     ...(telemetry === undefined ? {} : { telemetry }),
-    ...(output === undefined ? {} : { output }),
   };
 }
 
-function cancelledAgentResult(durationMs: number, executor?: ExecutorIdentity, output?: ProcessResult['output']): AgentResult {
-  return failureAgentResult(CODEX_ERROR_CODE.CANCELLED, 'Codex CLI execution was cancelled.', durationMs, executor, undefined, output);
+function cancelledAgentResult(durationMs: number, executor?: ExecutorIdentity): AgentResult {
+  return failureAgentResult(CODEX_ERROR_CODE.CANCELLED, 'Codex CLI execution was cancelled.', durationMs, executor);
 }
 
 function isAborted(signal: AbortSignal | undefined): boolean {
@@ -509,10 +543,4 @@ function errorCode(error: unknown): unknown {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function processOutput(error: unknown): ProcessResult['output'] {
-  return typeof error === 'object' && error !== null && 'output' in error
-    ? (error as { output?: ProcessResult['output'] }).output
-    : undefined;
 }

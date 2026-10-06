@@ -1,15 +1,30 @@
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn, spawnSync, type SpawnSyncReturns } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
 import type { LocalValidationConfiguration, ValidationAdapter, ValidationRequest } from '../adapters/validation.js';
-import { boundToolOutputFromCapture, DEFAULT_TOOL_OUTPUT_POLICY, FileToolOutputStore, type ToolOutputPolicy, type ToolOutputStore } from '../evidence/tool-output.js';
 
 function malformed(commandIndex: number, executable = ''): LocalValidationCommandEvidence {
   return { commandIndex, executable, outcome: 'malformed', exitCode: null, durationMs: 0 };
 }
 
 const TERMINATION_GRACE_MS = 1_000;
+// Snapshot materialization is part of the validation authority boundary, not
+// the validation command itself. Keep it independently bounded so a valid
+// short command budget cannot make ordinary repository reconstruction
+// impossible.
+const RECONSTRUCTION_TIMEOUT_MS = 30_000;
+const IGNORED_MANIFEST_TIMEOUT_MS = 30_000;
 const SETTLEMENT_POLL_MS = 25;
+// `git status --ignored --untracked-files=all` can legitimately enumerate a
+// large trusted dependency baseline. Keep this bounded, but well above the
+// small default intended for compact command output.
+const GIT_STATUS_MAX_BUFFER = 8 * 1024 * 1024;
+const TOOL_VERSION_TIMEOUT_MS = 5_000;
+const REQUIRED_PNPM_PACKAGE_MANAGER = 'pnpm@10.34.5';
 /** A validation command must be long enough to make termination observable, but never unattended indefinitely. */
 export const MIN_LOCAL_VALIDATION_TIMEOUT_MS = 100;
 export const MAX_LOCAL_VALIDATION_TIMEOUT_MS = 60 * 60_000;
@@ -34,21 +49,248 @@ function remoteMatchesTarget(remote: string, request: ValidationRequest): boolea
     repo?.replace(/\.git$/i, '').toLowerCase() === request.target.repo.toLowerCase();
 }
 
-function workspaceMatches(request: ValidationRequest, workspacePath: string, requireRepositoryIdentity: boolean): boolean {
-  if (workspacePath.trim() === '') return false;
-  const invoke = (args: readonly string[]) => spawnSync('git', ['-C', workspacePath, ...args], {
-    encoding: 'utf8', shell: false, timeout: TERMINATION_GRACE_MS, maxBuffer: 512,
-  });
+type GitInvoke = (args: readonly string[], timeoutMs?: number) => SpawnSyncReturns<string>;
+
+function ignoredManifest(workspacePath: string, invoke: GitInvoke): string[] | null {
+  const status = invoke(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored'], IGNORED_MANIFEST_TIMEOUT_MS);
+  if (status.status !== 0) return null;
+  const ignored = status.stdout.split('\0').filter((entry) => entry.startsWith('!! ')).map((entry) => entry.slice(3));
+  const visible = status.stdout.split('\0').filter((entry) => entry !== '' && !entry.startsWith('!! '));
+  if (visible.length > 0) return null;
+  const root = path.resolve(workspacePath);
+  const fingerprint = (relative: string): string | null => {
+    const target = path.resolve(root, relative);
+    if (target !== root && !target.startsWith(`${root}${path.sep}`)) return null;
+    let stat;
+    try { stat = lstatSync(target); } catch { return null; }
+    const mode = stat.mode.toString(8);
+    if (stat.isSymbolicLink()) {
+      try { return `link ${relative} ${mode} ${createHash('sha256').update(readlinkSync(target)).digest('hex')}`; } catch { return null; }
+    }
+    if (stat.isFile()) {
+      try { return `file ${relative} ${mode} ${createHash('sha256').update(readFileSync(target)).digest('hex')}`; } catch { return null; }
+    }
+    if (!stat.isDirectory()) return null;
+    let children: readonly string[];
+    try { children = readdirSync(target).sort(); } catch { return null; }
+    const nested = children.map((name) => fingerprint(path.join(relative, name)));
+    if (nested.some((entry) => entry === null)) return null;
+    return `directory ${relative} ${mode} ${createHash('sha256').update(nested.join('\n')).digest('hex')}`;
+  };
+  const entries = ignored.map(fingerprint);
+  return entries.some((entry) => entry === null) ? null : entries.filter((entry): entry is string => entry !== null).sort();
+}
+
+function hasHiddenIndexFlags(invoke: GitInvoke): boolean | null {
+  const entries = invoke(['ls-files', '-v', '-z']);
+  if (entries.status !== 0) return null;
+  // `git ls-files -v` uses lowercase tags for assume-unchanged entries and
+  // `S` for skip-worktree entries.  Both can conceal tracked-byte changes
+  // from status, so neither is admissible evidence of a clean workspace.
+  return entries.stdout.split('\0').some((entry) => /^[a-zS] /.test(entry));
+}
+
+function workspaceMatches(
+  request: ValidationRequest,
+  workspacePath: string,
+  requireRepositoryIdentity: boolean,
+  trustedIgnoredBaselinePath?: string,
+): string[] | null {
+  if (workspacePath.trim() === '') return null;
+  // This verification reads candidate Git metadata.  A candidate-controlled
+  // core.fsmonitor program must never gain execution authority merely because
+  // the host is proving the candidate clean.
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], {
+    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+  }) as SpawnSyncReturns<string>;
   const head = invoke(['rev-parse', 'HEAD']);
-  const status = invoke(['status', '--porcelain']);
-  if (head.status !== 0 || status.status !== 0 || head.stdout.trim() !== request.headSha || status.stdout.trim() !== '') return false;
-  if (!requireRepositoryIdentity) return true;
+  const manifest = ignoredManifest(workspacePath, invoke);
+  const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
+  if (head.status !== 0 || head.stdout.trim() !== request.headSha || manifest === null || hiddenIndexFlags !== false) return null;
+  if (trustedIgnoredBaselinePath !== undefined) {
+    // A configured baseline becomes the command cwd, even when both ignored
+    // manifests are empty.  Prove it is a separate, clean checkout of this
+    // exact implementation before it gains any execution authority.
+    let baselinePath: string;
+    let workerPath: string;
+    try {
+      baselinePath = realpathSync(trustedIgnoredBaselinePath);
+      workerPath = realpathSync(workspacePath);
+    } catch { return null; }
+    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) return null;
+    const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', baselinePath, '-c', 'core.fsmonitor=false', ...args], {
+      encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    }) as SpawnSyncReturns<string>;
+    const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
+    const baselineManifest = ignoredManifest(baselinePath, baselineInvoke);
+    const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
+    if (baselineHead.status !== 0 || baselineHead.stdout.trim() !== request.headSha || baselineManifest === null ||
+      baselineManifest.join('\n') !== manifest.join('\n') || baselineHiddenIndexFlags !== false) return null;
+  } else if (manifest.length > 0) {
+    // Never globally ignore ignored paths. They are admissible only when a
+    // separate host-owned clean checkout at this exact HEAD proves identical
+    // bytes existed before the worker could have written its workspace.
+    return null;
+  }
+  if (!requireRepositoryIdentity) return manifest;
   const remote = invoke(['remote', 'get-url', 'origin']);
-  return remote.status === 0 && remoteMatchesTarget(remote.stdout, request);
+  return remote.status === 0 && remoteMatchesTarget(remote.stdout, request) ? manifest : null;
+}
+
+/** The reconstructed checkout has no remote by design.  Bind command evidence
+ * to its immutable exact commit and reject any tracked/index mutation. */
+function commandWorkspaceManifest(workspacePath: string, headSha: string): string[] | null {
+  // The reconstructed checkout contains candidate history.  Every trusted
+  // host-side probe pins fsmonitor off so a copied or otherwise planted local
+  // config cannot execute while evidence is being verified.
+  const invoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync('git', ['-C', workspacePath, '-c', 'core.fsmonitor=false', ...args], {
+    encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER,
+  }) as SpawnSyncReturns<string>;
+  const head = invoke(['rev-parse', 'HEAD']);
+  const tracked = invoke(['diff', '--quiet', '--exit-code', 'HEAD', '--']);
+  const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
+  if (head.status !== 0 || head.stdout.trim() !== headSha || tracked.status !== 0 || hiddenIndexFlags !== false) return null;
+  return ignoredManifest(workspacePath, invoke);
+}
+
+function commandWorkspaceMatches(workspacePath: string, headSha: string, expectedIgnored: readonly string[] = []): boolean {
+  const manifest = commandWorkspaceManifest(workspacePath, headSha);
+  return manifest !== null && manifest.join('\n') === expectedIgnored.join('\n');
+}
+
+function lockfileBoundDependencyArtifact(workspacePath: string, artifactPath: string | undefined): string | null {
+  if (artifactPath === undefined || !path.isAbsolute(artifactPath)) return null;
+  try {
+    // Keep the configured spelling for the child environment.  On macOS,
+    // `/tmp` resolves to `/private/tmp`; both name the same host-owned store,
+    // but a real pnpm invocation (and its configuration) must receive the
+    // configured store path rather than a rewritten one.  Validate through
+    // the canonical path below so this does not admit a symlinked artifact.
+    const configuredArtifact = path.resolve(artifactPath);
+    const artifact = realpathSync(artifactPath);
+    const stat = lstatSync(artifact);
+    const store = path.join(artifact, 'store');
+    const metadata = path.join(artifact, 'pnpm-lock.yaml.sha256');
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o022) !== 0 ||
+      !lstatSync(store).isDirectory() || lstatSync(store).isSymbolicLink() ||
+      !lstatSync(metadata).isFile() || lstatSync(metadata).isSymbolicLink() || (lstatSync(metadata).mode & 0o022) !== 0) return null;
+    const expected = readFileSync(metadata, 'utf8').trim();
+    const actual = createHash('sha256').update(readFileSync(path.join(workspacePath, 'pnpm-lock.yaml'))).digest('hex');
+    return /^[a-f0-9]{64}$/i.test(expected) && expected === actual ? path.join(configuredArtifact, 'store') : null;
+  } catch { return null; }
+}
+
+function isHydratedDependencyManifest(manifest: readonly string[]): boolean {
+  // `git status --ignored --untracked-files=all` may report either the
+  // ignored directory itself or its individual contents.  Admit only a
+  // nonempty manifest wholly rooted in node_modules, then freeze those exact
+  // fingerprints for every subsequent command and final settlement.
+  return manifest.length > 0 && manifest.every((entry) => /^(?:file|link|directory) node_modules(?:\/|\s)/.test(entry));
 }
 
 function workspaceUnavailable(commandIndex: number): LocalValidationCommandEvidence {
   return { commandIndex, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 };
+}
+
+interface ValidationWorkspace {
+  readonly path: string;
+  dispose(): void;
+}
+
+function containsGitlinks(workspacePath: string, invoke: (args: readonly string[]) => SpawnSyncReturns<string>): boolean | null {
+  const entries = invoke(['-C', workspacePath, 'ls-files', '--stage', '-z']);
+  if (entries.status !== 0) return null;
+  return entries.stdout.split('\0').some((entry) => entry.startsWith('160000 '));
+}
+
+function declaresFilterAttribute(contents: string): boolean {
+  return contents.split(/\r?\n/).some((line) => {
+    const trimmed = line.trim();
+    return trimmed !== '' && !trimmed.startsWith('#') && /(?:^|\s)[!-]?filter(?:=|\s|$)/.test(trimmed);
+  });
+}
+
+function hasTrackedFilterAttributes(
+  workspacePath: string,
+  headSha: string,
+  invoke: (args: readonly string[]) => SpawnSyncReturns<string>,
+): boolean | null {
+  const entries = invoke(['-C', workspacePath, 'ls-tree', '-r', '-z', headSha]);
+  if (entries.status !== 0) return null;
+  for (const entry of entries.stdout.split('\0')) {
+    const separator = entry.indexOf('\t');
+    if (separator === -1 || path.posix.basename(entry.slice(separator + 1)) !== '.gitattributes') continue;
+    const [mode, type, objectId] = entry.slice(0, separator).split(' ');
+    if (mode === undefined || type !== 'blob' || objectId === undefined || !/^[0-9a-f]{40,64}$/i.test(objectId)) return null;
+    const contents = invoke(['-C', workspacePath, 'cat-file', 'blob', objectId]);
+    if (contents.status !== 0) return null;
+    if (declaresFilterAttribute(contents.stdout)) return true;
+  }
+  return false;
+}
+
+function reconstructionEnvironment(): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  for (const key of Object.keys(environment)) {
+    if (key.startsWith('GIT_CONFIG_') || key === 'GIT_DIR' || key === 'GIT_WORK_TREE' || key === 'GIT_INDEX_FILE' || key === 'GIT_ALTERNATE_OBJECT_DIRECTORIES') {
+      delete environment[key];
+    }
+  }
+  environment.GIT_CONFIG_NOSYSTEM = '1';
+  environment.GIT_CONFIG_GLOBAL = os.devNull;
+  return environment;
+}
+
+/**
+ * Materialize command input outside the worker checkout.  In particular, a
+ * clean exact HEAD does not authorize files under that checkout's .git
+ * directory: Git status deliberately does not report them, but a tracked
+ * validation script can still load them.  A no-local clone gives commands a
+ * newly-created Git directory containing only host-created clone metadata and
+ * the cryptographically addressed exact commit.
+ */
+function reconstructedWorkspace(sourcePath: string, headSha: string): ValidationWorkspace | null {
+  const snapshot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-snapshot-'));
+  const invoke = (args: readonly string[]) => spawnSync('git', [
+    '-c', `core.hooksPath=${os.devNull}`,
+    '-c', 'core.fsmonitor=false',
+    '-c', `core.attributesFile=${os.devNull}`,
+    ...args,
+  ], {
+    encoding: 'utf8', shell: false, timeout: RECONSTRUCTION_TIMEOUT_MS, maxBuffer: GIT_STATUS_MAX_BUFFER,
+    env: reconstructionEnvironment(),
+  });
+  try {
+    const cloned = invoke(['clone', '--no-local', '--no-checkout', sourcePath, snapshot]);
+    // `clone` records the source path as origin. That path is worker-owned for
+    // isolated executions, so discard it before a validator can discover and
+    // read worker-controlled `.git` state through the reconstructed checkout.
+    const disconnected = cloned.status === 0
+      ? invoke(['-C', snapshot, 'remote', 'remove', 'origin'])
+      : undefined;
+    // A tracked attributes file is part of the candidate tree.  Inspect it
+    // through immutable blobs before checkout: otherwise an ambient filter
+    // configuration could execute a smudge command while materializing the
+    // validation snapshot.
+    const trackedFilters = disconnected?.status === 0
+      ? hasTrackedFilterAttributes(snapshot, headSha, invoke)
+      : null;
+    const checkedOut = trackedFilters === false
+      ? invoke(['-C', snapshot, 'checkout', '--detach', '--force', headSha])
+      : undefined;
+    // A plain detached checkout deliberately does not populate gitlinks. Do
+    // not misreport an incomplete tree as a validator failure; submodule
+    // provenance needs its own host-qualified reconstruction boundary.
+    const gitlinks = checkedOut?.status === 0 ? containsGitlinks(snapshot, invoke) : null;
+    if (cloned.status !== 0 || disconnected?.status !== 0 || trackedFilters !== false || checkedOut?.status !== 0 || gitlinks !== false) {
+      rmSync(snapshot, { recursive: true, force: true });
+      return null;
+    }
+    return { path: snapshot, dispose: () => rmSync(snapshot, { recursive: true, force: true }) };
+  } catch {
+    rmSync(snapshot, { recursive: true, force: true });
+    return null;
+  }
 }
 
 function isCommand(value: unknown): value is { readonly argv: readonly string[]; readonly timeoutMs: number } {
@@ -115,13 +357,11 @@ async function execute(
   commandIndex: number,
   command: { readonly argv: readonly string[]; readonly timeoutMs: number },
   workspacePath: string,
-  outputStore: ToolOutputStore,
-  outputPolicy: ToolOutputPolicy | undefined,
+  environment: NodeJS.ProcessEnv,
+  sandboxProfile?: string,
 ): Promise<LocalValidationCommandEvidence> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
-  const capturePolicy = outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY;
-  const capture = outputStore.startCapture(capturePolicy);
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
@@ -133,14 +373,7 @@ async function execute(
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       if (forceTimer !== undefined) clearTimeout(forceTimer);
-      const evidence = capture.finish();
-      resolve({
-        commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
-        output: boundToolOutputFromCapture({
-          outcome: outcome === 'passed' ? 'passed' : outcome === 'failed' ? 'failed' : outcome === 'timed_out' ? 'timed_out' : 'unknown',
-          exitCode, capture: evidence, policy: capturePolicy,
-        }),
-      });
+      resolve({ commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt });
     };
     const settleTimedOutProcess = async (child: ReturnType<typeof spawn>): Promise<void> => {
       if (settling || settled) return;
@@ -158,17 +391,17 @@ async function execute(
     };
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(executable, command.argv.slice(1), {
-        shell: false, stdio: ['ignore', 'pipe', 'pipe'], cwd: workspacePath, detached: process.platform !== 'win32',
+      child = sandboxProfile === undefined
+        ? spawn(executable, command.argv.slice(1), {
+          shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
+        })
+        : spawn('/usr/bin/sandbox-exec', ['-p', sandboxProfile, executable, ...command.argv.slice(1)], {
+        shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
       });
     } catch {
       finish('unavailable', null);
       return;
     }
-    child.stdout?.setEncoding('utf8');
-    child.stderr?.setEncoding('utf8');
-    child.stdout?.on('data', (chunk: string) => { capture.write('stdout', chunk); });
-    child.stderr?.on('data', (chunk: string) => { capture.write('stderr', chunk); });
     timer = setTimeout(() => {
       timedOut = true;
       if (process.platform === 'win32') {
@@ -191,16 +424,124 @@ async function execute(
   });
 }
 
+function sandboxLiteral(value: string): string { return JSON.stringify(value); }
+
+/**
+ * Build a host-side seatbelt profile. This is intentionally not an environment
+ * convention: default filesystem and all networking are denied by the kernel.
+ * The only broad system reads are macOS's loader/library roots; host-provided
+ * toolchain executables and their immediate dependency directories are named
+ * absolutely, and candidate code receives no other host paths.
+ */
+function macosValidationSandboxProfile(
+  workspacePath: string,
+  runtimeRoot: string,
+  browserArtifacts: string | undefined,
+  dependencyArtifactPath: string | undefined,
+  nodeProgram: string,
+  pnpmProgram: string,
+): string | null {
+  if (process.platform !== 'darwin' || !existsSync('/usr/bin/sandbox-exec')) return null;
+  let workspace: string; let node: string; let pnpm: string;
+  try {
+    workspace = realpathSync(workspacePath); node = realpathSync(nodeProgram); pnpm = realpathSync(pnpmProgram);
+  } catch { return null; }
+  if (!path.isAbsolute(node) || !path.isAbsolute(pnpm) || !existsSync(node) || !existsSync(pnpm)) return null;
+  const reads = [
+    workspace, runtimeRoot, node, pnpm, pnpmProgram, path.dirname(node), path.dirname(path.dirname(node)), path.dirname(pnpm), path.dirname(path.dirname(pnpm)),
+    // pnpm launchers commonly use env/sh before entering the pinned Node
+    // runtime. These are fixed macOS executables, not PATH-discovered tools.
+    '/usr/bin/env', '/bin/sh', '/usr/lib', '/System/Library', '/usr/share',
+    // Small fixed OS metadata/device set required by real Node startup. These
+    // are not user homes, caches, credentials, or configuration directories.
+    '/dev/null', '/dev/urandom', '/var/db/timezone', '/private/var/db/timezone',
+  ];
+  if (browserArtifacts !== undefined) {
+    try { reads.push(realpathSync(browserArtifacts)); } catch { return null; }
+  }
+  if (dependencyArtifactPath !== undefined) {
+    try { reads.push(realpathSync(dependencyArtifactPath)); } catch { return null; }
+  }
+  const clauses = reads.map((entry) => `(allow file-read* (subpath ${sandboxLiteral(entry)}))`).join('\n');
+  return `(version 1)\n(deny default)\n(deny network*)\n(allow process*)\n${clauses}\n(allow file-write* (subpath ${sandboxLiteral(workspace)}))\n(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))`;
+}
+
+/**
+ * Validation commands are candidate-controlled code and must not receive the
+ * dispatcher's credentials.  Keep only command resolution and a fresh,
+ * host-created home/cache root; notably no GitHub, SSH, ChatGPT/Codex/Luna,
+ * npm, Git, or generic inherited secret variables cross this boundary.
+ */
+function credentialFreeValidationEnvironment(runtimeRoot: string, playwrightBrowsersPath?: string, nodeProgram?: string, pnpmProgram?: string, dependencyStore?: string): NodeJS.ProcessEnv {
+  const home = path.join(runtimeRoot, 'home');
+  const cache = path.join(runtimeRoot, 'cache');
+  const config = path.join(runtimeRoot, 'config');
+  // These are host-created directories, not a dispatcher-owned HOME where
+  // pnpm/npm configuration or auth could reside.
+  for (const directory of [home, cache, config]) {
+    try { mkdirSync(directory, { recursive: true, mode: 0o700 }); } catch { /* handled by command failure */ }
+  }
+  const environment: NodeJS.ProcessEnv = {
+    PATH: nodeProgram === undefined || pnpmProgram === undefined
+      ? process.env.PATH ?? (process.platform === 'win32' ? process.env.Path : undefined)
+      : [path.dirname(pnpmProgram), path.dirname(nodeProgram)].filter((entry, index, all) => all.indexOf(entry) === index).join(path.delimiter),
+    HOME: home,
+    XDG_CACHE_HOME: cache,
+    XDG_CONFIG_HOME: config,
+    // Avoid an interactive prompt in the isolated pnpm invocation.
+    CI: 'true',
+  };
+  if (process.platform === 'win32') {
+    environment.USERPROFILE = home;
+    if (process.env.SystemRoot !== undefined) environment.SystemRoot = process.env.SystemRoot;
+    if (process.env.COMSPEC !== undefined) environment.COMSPEC = process.env.COMSPEC;
+    if (process.env.PATHEXT !== undefined) environment.PATHEXT = process.env.PATHEXT;
+  }
+  if (playwrightBrowsersPath !== undefined) environment.PLAYWRIGHT_BROWSERS_PATH = playwrightBrowsersPath;
+  if (dependencyStore !== undefined) {
+    environment.npm_config_store_dir = dependencyStore;
+    environment.npm_config_offline = 'true';
+  }
+  return environment;
+}
+
+/**
+ * The configured pnpm path is host-provisioned, but its authority still comes
+ * from the immutable candidate package manifest.  Prove both sides before any
+ * candidate validation command can run; a missing, altered, or unverifiable
+ * version has no fallback to PATH or an ambient package-manager selection.
+ */
+export function hasPinnedPnpmAuthority(workspacePath: string, pnpmProgram: string, environment: NodeJS.ProcessEnv): boolean {
+  try {
+    const manifest = JSON.parse(readFileSync(path.join(workspacePath, 'package.json'), 'utf8')) as { packageManager?: unknown };
+    if (manifest === null || typeof manifest !== 'object' || manifest.packageManager !== REQUIRED_PNPM_PACKAGE_MANAGER) return false;
+    const version = spawnSync(pnpmProgram, ['--version'], {
+      encoding: 'utf8', shell: false, cwd: path.dirname(workspacePath), env: environment, timeout: TOOL_VERSION_TIMEOUT_MS,
+    });
+    return version.status === 0 && version.signal === null && version.stdout.trim() === REQUIRED_PNPM_PACKAGE_MANAGER.slice('pnpm@'.length);
+  } catch {
+    return false;
+  }
+}
+
+function validHostBrowserArtifacts(directory: string | undefined): directory is string {
+  if (directory === undefined || !path.isAbsolute(directory)) return directory === undefined;
+  try {
+    const stat = lstatSync(directory);
+    return stat.isDirectory() && !stat.isSymbolicLink() && (stat.mode & 0o022) === 0;
+  } catch {
+    return false;
+  }
+}
+
 /** Runs only the explicitly supplied repository/run validation commands. */
 export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
   readonly kind = 'validation' as const;
   readonly configRevision: string;
-  private readonly outputStore: ToolOutputStore;
   readonly requiresOwnedWorkspace = true;
 
   constructor(private readonly configuration: LocalValidationConfiguration) {
     this.configRevision = configuration.revision;
-    this.outputStore = configuration.outputStore ?? new FileToolOutputStore();
   }
 
   async validate(request: ValidationRequest): Promise<LocalValidationEvidence> {
@@ -214,33 +555,93 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const evidence: LocalValidationCommandEvidence[] = [];
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
+    // Only a configured pre-existing workspace must prove its GitHub target.
+    // An explicitly supplied workspace is bootstrap-owned; its exact HEAD,
+    // clean state, hidden-index state, and ignored manifest are instead bound
+    // to the detached command reconstruction at creation and final settlement.
     const requiresRepositoryIdentity = request.workspacePath === undefined && configuredWorkspace !== undefined;
-    if (workspacePath === undefined || !workspaceMatches(request, workspacePath, requiresRepositoryIdentity)) {
+    if (workspacePath === undefined) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
-    for (let index = 0; index < configured.length; index += 1) {
-      const command = configured[index];
-      if (!isCommand(command)) {
-        evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
+    const admittedIgnoredManifest = workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath);
+    if (admittedIgnoredManifest === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+    // A configured baseline is host-owned and already proved byte-identical
+    // for every ignored dependency.  It is therefore the only place those
+    // dependencies may be executed.  Otherwise reconstruct fresh command
+    // input so worker-controlled .git bytes have no validation authority.
+    const baseline = this.configuration.trustedIgnoredBaselinePath;
+    const commandWorkspace = baseline === undefined
+      ? reconstructedWorkspace(workspacePath, request.headSha)
+      : { path: baseline, dispose: () => {} };
+    if (commandWorkspace === null) {
+      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+    }
+    if (!validHostBrowserArtifacts(this.configuration.playwrightBrowsersPath)) {
+      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+    }
+    const dependencyStore = lockfileBoundDependencyArtifact(commandWorkspace.path, this.configuration.dependencyArtifactPath);
+    if (this.configuration.dependencyArtifactPath !== undefined && dependencyStore === null) {
+      commandWorkspace.dispose();
+      return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+    }
+    const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
+    const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, dependencyStore ?? undefined);
+    const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
+    try {
+      // A production plan has one host-provisioned pnpm authority.  Reject a
+      // substituted executable before probing a tool or starting validation.
+      if (this.configuration.pnpmProgram !== undefined && configured.some((command) => !isCommand(command) || command.argv[0] !== this.configuration.pnpmProgram)) {
+        return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
+      }
+      if (this.configuration.pnpmProgram !== undefined && !hasPinnedPnpmAuthority(commandWorkspace.path, this.configuration.pnpmProgram, environment)) {
+        return { status: 'unknown', configRevision: revision, commands: [malformed(0, this.configuration.pnpmProgram)] };
+      }
+      const sandboxProfile = configuredToolchain && this.configuration.nodeProgram !== undefined && this.configuration.pnpmProgram !== undefined
+        ? macosValidationSandboxProfile(commandWorkspace.path, runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.dependencyArtifactPath, this.configuration.nodeProgram, this.configuration.pnpmProgram) ?? undefined
+        : undefined;
+      // The production lane is meaningful only with a real macOS kernel
+      // boundary. Do not silently degrade to environment scrubbing.
+      if (configuredToolchain && (sandboxProfile === null || sandboxProfile === undefined)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      // A nonempty ignored manifest is executable only when the separate
+      // trusted baseline just proved those exact bytes.  The worker workspace
+      // itself never grants this authority, and later checks pin this same
+      // manifest (or the separately captured cold-hydration manifest).
+      const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      let hydratedManifest: readonly string[] = initialIgnoredManifest;
+      for (let index = 0; index < configured.length; index += 1) {
+        const command = configured[index];
+        if (!isCommand(command)) {
+          evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
+          return { status: 'unknown', configRevision: revision, commands: evidence };
+        }
+        const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile);
+        evidence.push(result);
+        if (result.outcome === 'failed' || result.outcome === 'timed_out') {
+          return { status: 'failed', configRevision: revision, commands: evidence };
+        }
+        if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+        const manifest = commandWorkspaceManifest(commandWorkspace.path, request.headSha);
+        if (manifest === null || (index === 0 && this.configuration.dependencyArtifactPath !== undefined
+          ? !isHydratedDependencyManifest(manifest)
+          : manifest.join('\n') !== hydratedManifest.join('\n'))) {
+          evidence.push(workspaceUnavailable(evidence.length));
+          return { status: 'unknown', configRevision: revision, commands: evidence };
+        }
+        if (index === 0 && this.configuration.dependencyArtifactPath !== undefined) hydratedManifest = manifest;
+      }
+      if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, hydratedManifest)) {
+        evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      const result = await execute(
-        index,
-        command,
-        workspacePath,
-        this.outputStore,
-        this.configuration.outputPolicy,
-      );
-      evidence.push(result);
-      if (result.outcome === 'failed' || result.outcome === 'timed_out') {
-        return { status: 'failed', configRevision: revision, commands: evidence };
+      if (workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath) === null) {
+        evidence.push(workspaceUnavailable(evidence.length));
+        return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+      return { status: 'passed', configRevision: revision, commands: evidence };
+    } finally {
+      rmSync(runtimeRoot, { recursive: true, force: true });
+      commandWorkspace.dispose();
     }
-    if (!workspaceMatches(request, workspacePath, requiresRepositoryIdentity)) {
-      evidence.push(workspaceUnavailable(evidence.length));
-      return { status: 'unknown', configRevision: revision, commands: evidence };
-    }
-    return { status: 'passed', configRevision: revision, commands: evidence };
   }
 }

@@ -4,7 +4,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { ExecutionAdmissionRefusal, hasGovernedPublicationConfinement, WorkspaceGuardFailure } from '../src/adapters/agent.js';
+import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
 import {
   WORKER_ROUTER_ERROR_CODE,
   WORKER_ROUTER_EXECUTABLE_ENV,
@@ -39,6 +40,7 @@ class FakeContainer implements ContainerWorkerExecution {
   readonly specs: WorkerContainerSpec[] = [];
   constructor(private readonly outcomes: Array<ContainerWorkerResult | Error>, private readonly events: string[] = []) {}
   async run(spec: WorkerContainerSpec): Promise<ContainerWorkerResult> {
+    spec.beforeExecution?.();
     this.specs.push(spec);
     this.events.push('container:run');
     const outcome = this.outcomes.shift();
@@ -95,21 +97,82 @@ function requestFor(workspacePath: string): {
   readonly baseSha: string;
   readonly workspacePath: string;
   readonly branch: string;
+  readonly beforePublish: () => void;
 } {
-  return { target: TARGET, baseSha: BASE, workspacePath, branch: 'worker-router-test' };
+  return { target: TARGET, baseSha: BASE, workspacePath, branch: 'worker-router-test', beforePublish: () => undefined };
 }
 
 describe('WorkerRouterAdapter container boundary', () => {
+  it('holds governed fresh and continued routes even when the production container boundary is selected', () => {
+    const freshRequest = {
+      target: TARGET,
+      baseSha: BASE,
+      execution: { profile: 'standard' as const, revision: 'profiles-v1', executor: 'worker-router', timeoutMs: 9_000 },
+      runtimeOwnership: { runId: 'run-held-router', generation: 'router-generation' },
+      governedPublication: { required: true as const, continuation: false },
+    };
+    const realBoundaryRegistry = new ImplementationAgentRegistry({
+      defaultProvider: 'worker-router',
+      providers: { 'worker-router': () => new WorkerRouterAdapter({ runner: new FakeRunner([]), image: IMAGE, executable: '/router', env: {} }) },
+    });
+    const freshPreparation = realBoundaryRegistry.prepareGovernedInvocation(freshRequest);
+    assert.equal(freshPreparation.status, 'held');
+
+    const continuedPreparation = realBoundaryRegistry.prepareGovernedInvocation({
+      ...freshRequest,
+      sessionId: 'existing-worker-session',
+      executor: { provider: 'worker-router', sessionId: 'existing-worker-session', generation: 'router-generation' },
+      governedPublication: { required: true, continuation: true },
+    });
+    assert.equal(continuedPreparation.status, 'held', 'an existing WorkerRouter executor/session is preserved behind the governed hold');
+  });
+
+  it('refuses direct governed production and injected calls before guards, container, runner, or publication', async () => {
+    for (const injected of [false, true]) {
+      const runner = new FakeRunner([]);
+      const container = new FakeContainer([]);
+      let guards = 0;
+      let publication = 0;
+      const adapter = new WorkerRouterAdapter({
+        runner,
+        ...(injected ? { container } : {}),
+        // Missing image must not hide the governed-confinement diagnostic.
+        env: {},
+      });
+      if (!injected) assert.equal(hasGovernedPublicationConfinement(adapter), false);
+      const request = {
+        target: TARGET,
+        baseSha: BASE,
+        governedPublication: { required: true as const, continuation: true },
+        executor: { provider: 'worker-router', sessionId: 'durable-session', generation: 'durable-generation' },
+        sessionId: 'durable-session',
+        workspaceGuard: { assertValid() { guards++; } },
+        beforePublish() { publication++; },
+      };
+      const response = await adapter.run(request);
+      assert.equal(response.exitStatus, 'failure');
+      assert.match(response.summary, /source-qualified publication confinement|final host execution-boundary callback is missing/i);
+      assert.deepEqual(response.executor, request.executor);
+      assert.equal(response.sessionId, 'durable-session');
+      assert.equal(guards, 0);
+      assert.equal(container.specs.length, 0);
+      assert.equal(runner.calls.length, 0);
+      assert.equal(publication, 0);
+    }
+  });
+
   it('runs the containerized worker, then proves HEAD and publishes it only after container terminal', async () => {
     const events: string[] = [];
     const ws = workspace();
     const runner = new FakeRunner([result(HEAD), result(), result('To origin\n')], events);
     const container = new FakeContainer([containerResult()], events);
-    let before = 0; let after = 0;
+    let before = 0; let after = 0; let executionBoundary = 0;
     const response = await new WorkerRouterAdapter({ runner, container, image: IMAGE, executable: '/router', timeoutMs: 9000, env: { DEEPSEEK_API_KEY: 'sk-secret' } }).run({
       ...requestFor(ws.workspacePath),
       authority: 'live-target',
+      beforeExecution: () => { executionBoundary += 1; },
       supplementalInstructions: 'Focus on the acceptance tests.',
+      beforePublish: () => { events.push('before-publish'); },
       workspaceGuard: { assertValid: (phase) => { events.push(`guard:${phase ?? 'before-execution'}`); if (phase === 'after-execution') after++; else before++; } },
     });
 
@@ -117,6 +180,7 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(response.headSha, HEAD);
     assert.equal(before, 1);
     assert.equal(after, 1);
+    assert.equal(executionBoundary, 1);
 
     // Terminal before guard(after) and before any Tachiko-owned Git authority work.
     const terminal = events.indexOf('container:terminal');
@@ -125,6 +189,8 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.ok(terminal < events.indexOf('guard:after-execution'), 'guard(after) must follow container terminal');
     assert.ok(terminal < events.indexOf('git:rev-parse'));
     assert.ok(terminal < events.indexOf('git:merge-base'));
+    assert.ok(events.indexOf('git:merge-base') < events.indexOf('before-publish'));
+    assert.ok(events.indexOf('before-publish') < events.indexOf('git:push'));
     assert.ok(terminal < events.indexOf('git:push'));
 
     // The exact container terminal is awaited exactly once; no replay/fallback.
@@ -133,6 +199,8 @@ describe('WorkerRouterAdapter container boundary', () => {
 
     // Commit-only mounts: no bare remote, no hooks, no $HOME, no Docker socket.
     const spec = container.specs[0]!;
+    assert.equal(typeof spec.beforeExecution, 'function');
+    assert.equal(spec.stdin.includes('beforeExecution'), false, 'host-only callback is not part of worker task text');
     assert.equal(spec.entrypoint, '/router');
     assert.equal(spec.network, 'none');
     assert.equal(spec.workdir, ws.workspacePath);
@@ -433,6 +501,72 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(response.exitStatus, 'failure');
     assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED));
     assert.equal(response.diagnostics?.join('\n').includes('rejected'), false);
+  });
+
+  it('fails closed before host push when direct callers omit the publication authority callback', async () => {
+    const ws = workspace();
+    const { beforePublish: _ignored, ...request } = requestFor(ws.workspacePath);
+    const runner = new FakeRunner([result(HEAD), result()]);
+    const response = await new WorkerRouterAdapter({ runner, container: new FakeContainer([containerResult()]), image: IMAGE }).run(request);
+    assert.equal(response.exitStatus, 'failure');
+    assert.match(response.diagnostics?.[0] ?? '', new RegExp(WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED));
+    assert.equal(runner.calls.some((call) => call.args[0] === 'push'), false);
+  });
+
+  it('rechecks the exact tagged publication refusal at the actual delayed push spawn', async () => {
+    const ws = workspace();
+    let release!: () => void;
+    let announce!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const entered = new Promise<void>((resolve) => { announce = resolve; });
+    let checks = 0;
+    let actualPushEffects = 0;
+    const refusal = new ExecutionAdmissionRefusal('publication authority changed after runner preparation', true, { cause: new Error('captured Run superseded') });
+    const runner: ProcessRunner = {
+      async run(_file, args, options) {
+        if (args[0] === 'push') {
+          announce();
+          await gate;
+          options.beforeSpawn?.();
+          actualPushEffects += 1;
+          return result();
+        }
+        return args[0] === 'rev-parse' ? result(HEAD) : result();
+      },
+    };
+    const pending = new WorkerRouterAdapter({ runner, container: new FakeContainer([containerResult()]), image: IMAGE }).run({
+      ...requestFor(ws.workspacePath),
+      beforePublish: () => { if (++checks === 2) throw refusal; },
+    });
+    await entered;
+    release();
+    await assert.rejects(pending, (error: unknown) => {
+      assert.strictEqual(error, refusal, 'the production actual-spawn catch preserves tagged refusal identity');
+      assert.strictEqual((error as Error).cause, refusal.cause);
+      return true;
+    });
+    assert.equal(checks, 2, 'eager and actual-spawn checks both run');
+    assert.equal(actualPushEffects, 0, 'the delayed runner never crosses its actual push effect boundary');
+  });
+
+  it('preserves the exact tagged refusal at the eager publication check without invoking the push runner', async () => {
+    const ws = workspace();
+    const refusal = new ExecutionAdmissionRefusal('eager publication authority was revoked', false, { cause: new Error('captured admission generation is stale') });
+    const runner = new FakeRunner([result(HEAD), result()]);
+    let eagerChecks = 0;
+    await assert.rejects(
+      () => new WorkerRouterAdapter({ runner, container: new FakeContainer([containerResult()]), image: IMAGE }).run({
+        ...requestFor(ws.workspacePath),
+        beforePublish: () => { eagerChecks += 1; throw refusal; },
+      }),
+      (error: unknown) => {
+        assert.strictEqual(error, refusal, 'the eager catch preserves the exact tagged refusal');
+        assert.strictEqual((error as Error).cause, refusal.cause);
+        return true;
+      },
+    );
+    assert.equal(eagerChecks, 1);
+    assert.equal(runner.calls.some((call) => call.args[0] === 'push'), false, 'eager refusal does not invoke the push runner');
   });
 
   it('returns cancellation when HEAD verification is aborted after the container is terminal', async () => {

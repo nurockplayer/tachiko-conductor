@@ -56,6 +56,7 @@ describe('state machine — happy path', () => {
     let run = newRun();
     run = applyTransition(run, { type: 'start' }, T0);
     const bootstrap = {
+      bootstrapKind: 'linked-worktree' as const,
       owner: 'acme', repo: 'widgets', issueNumber: 42, baseBranch: 'main', baseSha: 'base',
       branch: 'tachiko/issue-42-test', workspacePath: '/tmp/tachiko-workspace',
     };

@@ -1,0 +1,61 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - 'codex/**'
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Prepare Git for isolated local test fixtures
+        run: |
+          git config --global user.name "Tachiko CI"
+          git config --global user.email "tachiko-ci@example.invalid"
+          git switch --create ci-validation
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24.19.0
+
+      - name: Activate the repository pnpm version with Corepack
+        run: |
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+          test "$(pnpm --version)" = "10.34.5"
+
+      - name: Install dependencies from the lockfile
+        run: pnpm install --frozen-lockfile
+
+      - name: Install lockfile Playwright Chromium and system dependencies
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run unit and contract tests
+        run: pnpm test
+
+      - name: Run browser integration tests
+        run: pnpm test:integration
+
+      - name: Type-check source and tests
+        run: pnpm typecheck
+
+      - name: Build the root package
+        run: pnpm build
+
+      - name: Build Control Tower
+        run: pnpm --dir apps/control-tower build
