@@ -192,13 +192,12 @@ function isCanonicalTimestamp(value: unknown): value is string {
 
 function dispatchLockMatchesOwner(value: Record<string, unknown>, nonce: string): boolean {
   const keys = Object.keys(value).sort().join(',');
-  const legacy = keys === 'nonce,pid' && typeof value.nonce === 'string' && Number.isSafeInteger(value.pid) && (value.pid as number) > 0;
   const versioned = keys === 'bootId,hostId,nonce,pid,processStartId,schemaVersion' && value.schemaVersion === 1 &&
     typeof value.nonce === 'string' && Number.isSafeInteger(value.pid) && (value.pid as number) > 0 &&
     typeof value.hostId === 'string' && /^[0-9a-f]{64}$/.test(value.hostId) &&
     typeof value.bootId === 'string' && /^[0-9a-f]{64}$/.test(value.bootId) &&
     typeof value.processStartId === 'string' && value.processStartId.length > 0 && value.processStartId.length <= 256;
-  return (legacy || versioned) && value.nonce === nonce;
+  return versioned && value.nonce === nonce;
 }
 
 function validOperationMetadata(value: Record<string, unknown>, id: string, slot: number): boolean {
@@ -831,10 +830,9 @@ export class FileToolOutputStore implements ToolOutputStore {
           const lockStats = lstatSync(lockPath);
           lockExisted = lockStats.isFile() && !lockStats.isSymbolicLink();
           if (!lockExisted) { protectedCount += 1; continue; }
-          if (!slotRecord.deleting) {
-            const lockRecord = readBoundedJson(lockPath, 4096, accountMetadataRead);
-            if (!dispatchLockMatchesOwner(lockRecord, expectedOwnerNonce as string)) { protectedCount += 1; continue; }
-          }
+          const lockRecord = readBoundedJson(lockPath, 4096, accountMetadataRead);
+          const expectedNonce = slotRecord.deleting ? lockRecord.nonce : expectedOwnerNonce;
+          if (typeof expectedNonce !== 'string' || !dispatchLockMatchesOwner(lockRecord, expectedNonce)) { protectedCount += 1; continue; }
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
             if (metadata.state === 'active') { protectedCount += 1; continue; }

@@ -392,7 +392,11 @@ export function resolveLocalValidationConfiguration(
         `${MIN_LOCAL_VALIDATION_TIMEOUT_MS} and ${MAX_LOCAL_VALIDATION_TIMEOUT_MS}.`,
       );
     }
-    return { argv: command.argv as string[], timeoutMs: command.timeoutMs as number };
+    if (command.captureOutput !== undefined && typeof command.captureOutput !== 'boolean') {
+      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].captureOutput must be a boolean when supplied.`);
+    }
+    return { argv: command.argv as string[], timeoutMs: command.timeoutMs as number,
+      ...(command.captureOutput === undefined ? {} : { captureOutput: command.captureOutput }) };
   });
   if (record.workspacePath !== undefined &&
     (typeof record.workspacePath !== 'string' || record.workspacePath.trim() === '' || !path.isAbsolute(record.workspacePath))) {
@@ -483,7 +487,7 @@ export function resolveToolOutputRoot(env: NodeJS.ProcessEnv = process.env): str
   if (configured !== undefined && (!path.isAbsolute(configured) || configured.trim() === '')) {
     throw new Error('TACHIKO_EVIDENCE_DIR must be an absolute non-empty path.');
   }
-  return configured ?? path.join(resolveRunsDir(env), '.evidence', 'v1');
+  return configured ?? path.join(path.resolve(resolveRunsDir(env)), '.evidence', 'v1');
 }
 
 export function resolveToolOutputPolicy(env: NodeJS.ProcessEnv = process.env): ToolOutputPolicy {
@@ -1695,7 +1699,9 @@ function buildWorkflowDeps(
   const localValidationConfiguration = resolveLocalValidationConfiguration(env);
   const localValidation = localValidationConfiguration === undefined ? undefined : {
     ...localValidationConfiguration,
-    outputStore: new FileToolOutputStore(resolveToolOutputRoot(env)),
+    ...(localValidationConfiguration.commands.some((command) => command.captureOutput === true)
+      ? { outputStore: new FileToolOutputStore(resolveToolOutputRoot(env)) }
+      : {}),
     outputPolicy: resolveToolOutputPolicy(env),
   };
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);

@@ -194,6 +194,43 @@ describe('bounded output integration', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('attaches bounded partial observations to actual timeout, cancel, and signal rejections after sink failure', async () => {
+    for (const terminal of ['timeout', 'cancel', 'signal'] as const) {
+      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-${terminal}-partial-observation-`));
+      const controller = new AbortController();
+      try {
+        const store = new FileToolOutputStore(directory, { testFaults: {
+          writeSync: () => { throw new Error('injected durable sink failure'); },
+        } });
+        const args = terminal === 'signal'
+          ? ['-e', "process.stderr.write('ROOT-CAUSE-OBSERVED\\n'); process.kill(process.pid, 'SIGTERM')"]
+          : ['-e', "process.stderr.write('ROOT-CAUSE-OBSERVED\\n'); setInterval(() => {}, 1000)"];
+        if (terminal === 'cancel') setTimeout(() => controller.abort(), 250);
+        await assert.rejects(new NodeProcessRunner().run(process.execPath, args, {
+          timeoutMs: terminal === 'timeout' ? 200 : 5_000,
+          ...(terminal === 'cancel' ? { signal: controller.signal } : {}),
+          outputStore: store,
+          outputPolicy: { previewBytes: 64, diagnosticBytes: 128, maxDiagnostics: 3, readBytes: 32 },
+        }), (error: unknown) => {
+          const value = error as { readonly code?: unknown; readonly signal?: unknown; readonly output?: unknown;
+            readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown; readonly stderr?: { readonly bytes: number; readonly preview: string }; readonly diagnostics?: readonly string[] } };
+          assert.equal(value.captureStatus, 'partial');
+          assert.equal(value.captureObservation?.status, 'partial');
+          const observedStderr = value.captureObservation?.stderr;
+          assert.ok(observedStderr !== undefined && observedStderr.bytes > 0);
+          assert.ok(observedStderr.preview.includes('ROOT-CAUSE-OBSERVED'));
+          assert.ok(value.captureObservation?.diagnostics?.some((line) => line.includes('ROOT-CAUSE-OBSERVED')));
+          assert.equal(value.output, undefined, 'a failed sink never advertises durable evidence');
+          if (terminal === 'timeout') assert.equal(value.code, 'ETIMEDOUT');
+          if (terminal === 'cancel') assert.equal(value.code, 'ABORT_ERR');
+          if (terminal === 'signal') assert.equal(value.signal, 'SIGTERM');
+          return true;
+        });
+        assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    }
+  });
+
   it('observes aborts that occur synchronously inside beforeSpawn', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-before-spawn-abort-'));
     const marker = path.join(directory, 'launched');
@@ -209,6 +246,34 @@ describe('bounded output integration', () => {
         (error: unknown) => (error as { readonly code?: unknown }).code === 'ABORT_ERR',
       );
       assert.equal(existsSync(marker), false, 'the newly aborted command is killed before it can perform work');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('purges prepared captures on pre-abort and spawn failure while preserving their typed process errors', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-prepared-capture-purge-'));
+    try {
+      const store = new FileToolOutputStore(directory);
+      const controller = new AbortController();
+      controller.abort();
+      await assert.rejects(new NodeProcessRunner().run(process.execPath, ['-e', 'process.exit(0)'], {
+        timeoutMs: 1_000, signal: controller.signal, outputStore: store,
+      }), (error: unknown) => {
+        const value = error as { readonly code?: unknown; readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown } };
+        assert.equal(value.code, 'ABORT_ERR');
+        assert.equal(value.captureStatus, 'unavailable');
+        assert.equal(value.captureObservation?.status, 'unavailable');
+        return true;
+      });
+      await assert.rejects(new NodeProcessRunner().run(path.join(directory, 'missing-executable'), [], {
+        timeoutMs: 1_000, outputStore: store,
+      }), (error: unknown) => {
+        const value = error as { readonly code?: unknown; readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown } };
+        assert.equal(value.code, 'ENOENT');
+        assert.equal(value.captureStatus, 'unavailable');
+        assert.equal(value.captureObservation?.status, 'unavailable');
+        return true;
+      });
+      assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

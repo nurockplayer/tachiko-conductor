@@ -393,6 +393,9 @@ describe('CLI command layer', () => {
 
   it('resolves a stable private evidence root and validates byte budgets', () => {
     assert.equal(resolveToolOutputRoot({ TACHIKO_DATA_DIR: '/tmp/x' }), '/tmp/x/.evidence/v1');
+    const relativeDataRoot = resolveToolOutputRoot({ TACHIKO_DATA_DIR: 'relative-data-dir' });
+    assert.ok(path.isAbsolute(relativeDataRoot));
+    assert.doesNotThrow(() => new FileToolOutputStore(relativeDataRoot), 'the production store accepts its resolved default root');
     assert.equal(resolveToolOutputRoot({ TACHIKO_EVIDENCE_DIR: '/private/evidence' }), '/private/evidence');
     assert.deepEqual(resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: JSON.stringify({ previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 16 }) }),
       { previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 16 });
@@ -464,6 +467,15 @@ describe('CLI command layer', () => {
       }),
       { revision: 'repo-v1', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
     );
+    assert.deepEqual(resolveLocalValidationConfiguration({
+      TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [
+        { argv: ['tool', 'test'], timeoutMs: 5_000, captureOutput: true },
+        { argv: ['tool', 'lint'], timeoutMs: 5_000, captureOutput: false },
+      ] }),
+    })?.commands.map((command) => command.captureOutput), [true, false]);
+    assert.throws(() => resolveLocalValidationConfiguration({
+      TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [{ argv: ['tool'], timeoutMs: 5_000, captureOutput: 'yes' }] }),
+    }), /captureOutput must be a boolean/);
     assert.deepEqual(
       resolveLocalValidationConfiguration({
         TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({

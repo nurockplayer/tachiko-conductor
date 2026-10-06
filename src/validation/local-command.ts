@@ -295,11 +295,12 @@ function reconstructedWorkspace(sourcePath: string, headSha: string): Validation
   }
 }
 
-function isCommand(value: unknown): value is { readonly argv: readonly string[]; readonly timeoutMs: number } {
+function isCommand(value: unknown): value is { readonly argv: readonly string[]; readonly timeoutMs: number; readonly captureOutput?: boolean } {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const command = value as { argv?: unknown; timeoutMs?: unknown };
+  const command = value as { argv?: unknown; timeoutMs?: unknown; captureOutput?: unknown };
   return Array.isArray(command.argv) && command.argv.length > 0 &&
     command.argv.every((part) => typeof part === 'string' && part.trim() !== '') &&
+    (command.captureOutput === undefined || typeof command.captureOutput === 'boolean') &&
     Number.isSafeInteger(command.timeoutMs) &&
     (command.timeoutMs as number) >= MIN_LOCAL_VALIDATION_TIMEOUT_MS &&
     (command.timeoutMs as number) <= MAX_LOCAL_VALIDATION_TIMEOUT_MS;
@@ -357,7 +358,7 @@ async function waitForProcessGroupSettlement(pid: number | undefined): Promise<b
 
 async function execute(
   commandIndex: number,
-  command: { readonly argv: readonly string[]; readonly timeoutMs: number },
+  command: { readonly argv: readonly string[]; readonly timeoutMs: number; readonly captureOutput?: boolean },
   workspacePath: string,
   environment: NodeJS.ProcessEnv,
   sandboxProfile?: string,
@@ -365,16 +366,18 @@ async function execute(
   outputStore?: LocalValidationConfiguration['outputStore'],
   outputPolicy?: LocalValidationConfiguration['outputPolicy'],
   beforeSpawn?: () => void,
-  captureRequested = outputStore !== undefined,
+  captureRequested = command.captureOutput === true,
 ): Promise<LocalValidationCommandEvidence & { readonly pendingCapture?: ToolOutputCaptureSummary }> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
   const policy = outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY;
   const captureSession = captureRequested ? new ContainedToolOutputCaptureSession(policy) : undefined;
   let writer: ToolOutputCaptureWriter | undefined;
-  try {
-    writer = outputOperation?.startCapture(policy, { commandIndex, executable }) ?? outputStore?.startCapture(policy);
-  } catch { writer = undefined; }
+  if (captureRequested) {
+    try {
+      writer = outputOperation?.startCapture(policy, { commandIndex, executable }) ?? outputStore?.startCapture(policy);
+    } catch { writer = undefined; }
+  }
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
@@ -662,13 +665,6 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
       if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       const outputStore = this.configuration.outputStore;
-      try {
-        outputOperation = outputStore?.beginOperation?.({
-          kind: 'validation', owner: request.target.owner, repo: request.target.repo,
-          issueNumber: request.target.issueNumber, headSha: request.headSha,
-          configRevision: revision, ...(request.runId === undefined ? {} : { runId: request.runId }),
-        });
-      } catch { operationFailed = true; }
       const pending = new Map<number, ToolOutputCaptureSummary>();
       const finishValidation = (status: LocalValidationEvidence['status']): LocalValidationEvidence => {
         const managedOperation = outputOperation !== undefined;
@@ -696,7 +692,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         });
         return { status, configRevision: revision, commands };
       };
-      const captureStore = operationFailed ? undefined : outputStore;
+      const captureStore = (): LocalValidationConfiguration['outputStore'] => operationFailed ? undefined : outputStore;
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
@@ -704,8 +700,17 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
           evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
           return finishValidation('unknown');
         }
+        if (command.captureOutput === true && outputOperation === undefined && !operationFailed) {
+          try {
+            outputOperation = outputStore?.beginOperation?.({
+              kind: 'validation', owner: request.target.owner, repo: request.target.repo,
+              issueNumber: request.target.issueNumber, headSha: request.headSha,
+              configRevision: revision, ...(request.runId === undefined ? {} : { runId: request.runId }),
+            });
+          } catch { operationFailed = true; }
+        }
         const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile,
-          outputOperation, captureStore, this.configuration.outputPolicy, request.beforeSpawn, outputStore !== undefined);
+          outputOperation, captureStore(), this.configuration.outputPolicy, request.beforeSpawn, command.captureOutput === true);
         if (result.pendingCapture !== undefined) pending.set(index, result.pendingCapture);
         const { pendingCapture: _pendingCapture, ...commandEvidence } = result;
         evidence.push(commandEvidence);

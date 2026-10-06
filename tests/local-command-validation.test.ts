@@ -579,6 +579,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     let beforeSpawnCalls = 0;
     const evidence = await new ConfiguredLocalValidationAdapter({
       ...configuration([process.execPath, '-e', "process.stdout.write('VALIDATION-MARKER\\n')"]),
+      commands: [{ argv: [process.execPath, '-e', "process.stdout.write('VALIDATION-MARKER\\n')"], timeoutMs: 1_000, captureOutput: true }],
       outputStore,
       outputPolicy: { previewBytes: 16, diagnosticBytes: 64, maxDiagnostics: 4, readBytes: 32 },
     }).validate({ ...owned, runId: 'run-attribution-only', beforeSpawn: () => { beforeSpawnCalls += 1; } });
@@ -601,6 +602,63 @@ describe('ConfiguredLocalValidationAdapter', () => {
     });
   });
 
+  it('captures only explicitly opted-in commands and starts the operation only when reached', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-opt-in-'));
+    dirs.push(root);
+    const storeRoot = path.join(root, 'store');
+    const evidence = await new ConfiguredLocalValidationAdapter({
+      revision: 'opt-in-v1',
+      commands: [
+        { argv: [process.execPath, '-e', "process.stdout.write('TRANSIENT-ONLY')"], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', "process.stdout.write('EXPLICIT-EVIDENCE')"], timeoutMs: 1_000, captureOutput: true },
+      ],
+      outputStore: new FileToolOutputStore(storeRoot),
+    }).validate(owned);
+    assert.equal(evidence.status, 'passed');
+    assert.equal(evidence.commands[0]?.captureStatus, undefined);
+    assert.equal(evidence.commands[0]?.output, undefined);
+    assert.equal(evidence.commands[1]?.captureStatus, 'complete');
+    assert.equal(readToolOutput(evidence.commands[1]!.output!, new FileToolOutputStore(storeRoot), { channel: 'stdout' }).text, 'EXPLICIT-EVIDENCE');
+    assert.equal(readdirSync(storeRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')).length, 2);
+
+    const unreachedRoot = path.join(root, 'unreached-store');
+    const unreached = await new ConfiguredLocalValidationAdapter({
+      revision: 'unreached-v1',
+      commands: [
+        { argv: [process.execPath, '-e', 'process.exit(9)'], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000, captureOutput: true },
+      ],
+      outputStore: new FileToolOutputStore(unreachedRoot),
+    }).validate(owned);
+    assert.equal(unreached.status, 'failed');
+    assert.equal(existsSync(unreachedRoot), false, 'a later opted-in command that is never reached starts no operation');
+  });
+
+  it('observes opted-in output as unavailable when no evidence store is provided', async () => {
+    const owned = request();
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'missing-store-v1',
+      commands: [{ argv: [process.execPath, '-e', "process.stdout.write('bounded-without-store')"], timeoutMs: 1_000, captureOutput: true }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(result.commands[0]?.captureStatus, 'unavailable');
+    assert.ok(result.commands[0]?.capturePreview?.stdout.preview.includes('bounded-without-store'));
+  });
+
+  it('rejects a nonboolean direct-adapter capture authority before spawning', async () => {
+    const owned = request();
+    let spawned = false;
+    const malformed = {
+      revision: 'malformed-capture-v1',
+      commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000, captureOutput: 'yes' }],
+    } as unknown as LocalValidationConfiguration;
+    const result = await new ConfiguredLocalValidationAdapter(malformed).validate({ ...owned, beforeSpawn: () => { spawned = true; } });
+    assert.equal(result.status, 'unknown');
+    assert.equal(spawned, false);
+    assert.equal(result.commands[0]?.outcome, 'malformed');
+  });
+
   it('keeps bounded local validation diagnostics when a real file-backed write fails', async () => {
     const owned = request();
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-capture-fault-'));
@@ -615,6 +673,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     } });
     const evidence = await new ConfiguredLocalValidationAdapter({
       ...configuration([process.execPath, '-e', "process.stdout.write('VALIDATION-FAULT-MARKER\\n'); process.stderr.write('ERROR: retained-root-cause\\n')"]),
+      commands: [{ argv: [process.execPath, '-e', "process.stdout.write('VALIDATION-FAULT-MARKER\\n'); process.stderr.write('ERROR: retained-root-cause\\n')"], timeoutMs: 1_000, captureOutput: true }],
       outputStore, outputPolicy: { previewBytes: 64, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 32 },
     }).validate(owned);
     const command = evidence.commands[0]!;

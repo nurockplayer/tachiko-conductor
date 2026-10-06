@@ -387,8 +387,10 @@ TACHIKO_CODEX_APP_SERVER_SMOKE=1 node --import tsx --test tests/codex-app-server
 
 `VALIDATING` requires a persisted `ValidationResult` for the current exact
 HEAD. Conductor retains compact local-command and hosted-check provenance;
-when an explicit local validation plan runs, its output is captured as bounded
-summaries plus a private, hashed file artifact. The artifact reference carries
+when an individual local validation command opts in, its output is captured as
+bounded summaries plus a private, hashed file artifact. Commands default to
+transient output; configuring validation or an evidence store alone does not
+authorize retention. The artifact reference carries
 a fixed seven-day deadline measured from the end of the whole validation
 operation. The library store allows a finite `retentionMs` override (default
 seven days), and each operation persists its deadline once; reopening a store
@@ -426,13 +428,13 @@ Issue text. Set `TACHIKO_LOCAL_VALIDATION_CONFIG` to a stable revision and
 bounded argv-array commands, for example:
 
 ```bash
-export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","commands":[{"argv":["pnpm","test"],"timeoutMs":120000,"captureOutput":true}]}'
 ```
 
 `commands` 必須至少有一個項目。既存 PR（沒有 Conductor bootstrap 記錄）必須在同一設定中明確提供絕對 `workspacePath`；Conductor 會在執行前後驗證其 clean exact HEAD 與 `origin` 的 GitHub owner/repo，絕不使用 ambient cwd。例如：
 
 ```bash
-export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","workspacePath":"/absolute/clean/worktree","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","workspacePath":"/absolute/clean/worktree","commands":[{"argv":["pnpm","test"],"timeoutMs":120000,"captureOutput":true}]}'
 ```
 
 Hosted checks are independently policy-controlled. Set

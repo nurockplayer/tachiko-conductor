@@ -7,6 +7,8 @@ import type { ToolOutputPolicy, ToolOutputStore } from '../evidence/tool-output.
 export interface LocalValidationCommandConfiguration {
   readonly argv: readonly string[];
   readonly timeoutMs: number;
+  /** Explicit authorization to retain this command's raw output as evidence. */
+  readonly captureOutput?: boolean;
 }
 
 /** Repository/run-owned local validation configuration. */

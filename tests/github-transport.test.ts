@@ -225,16 +225,47 @@ describe('NodeProcessRunner', () => {
       assert.equal(existsSync(launched), false);
 
       const evidenceRoot = path.join(directory, 'evidence');
+      const admissionError = new Error('captured host check rejected');
       await assert.rejects(() => runner.run(process.execPath, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(launched)}, 'yes')`], {
         timeoutMs: 1_000,
         outputStore: new FileToolOutputStore(evidenceRoot),
-        beforeSpawn: () => { throw new Error('captured host check rejected'); },
-      }), /captured host check rejected/);
+        beforeSpawn: () => { throw admissionError; },
+      }), (error: unknown) => {
+        const value = error as { readonly message?: string; readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown } };
+        assert.equal(error, admissionError, 'capture cleanup preserves admission-error identity');
+        assert.match(value.message ?? '', /captured host check rejected/);
+        assert.equal(value.captureStatus, 'unavailable');
+        assert.equal(value.captureObservation?.status, 'unavailable');
+        return true;
+      });
       assert.equal(existsSync(launched), false, 'captured refusal rejects without creating child');
       assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it('preserves frozen Error and primitive beforeSpawn refusals when capture observation cannot be attached', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-immutable-admission-refusal-'));
+    try {
+      const marker = path.join(directory, 'child-ran');
+      const frozenRefusal = Object.freeze(Object.assign(new Error('frozen host refusal'), { code: 'HOST_REFUSAL' }));
+      const refusals: readonly unknown[] = [frozenRefusal, 'primitive host refusal'];
+      for (const [index, refusal] of refusals.entries()) {
+        const evidenceRoot = path.join(directory, `evidence-${index}`);
+        const store = new FileToolOutputStore(evidenceRoot);
+        await assert.rejects(new NodeProcessRunner().run(process.execPath,
+          ['-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started')`],
+          { timeoutMs: 1_000, outputStore: store, beforeSpawn: () => { throw refusal; } }),
+        (error: unknown) => {
+          assert.equal(error, refusal, 'metadata attachment must not replace the original thrown value');
+          if (refusal === frozenRefusal) assert.equal((error as NodeJS.ErrnoException).code, 'HOST_REFUSAL');
+          return true;
+        });
+        assert.equal(existsSync(marker), false, 'admission refusal occurs before child creation');
+        assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [], 'prepared capture files are purged');
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('waits for child settlement after stdin EPIPE instead of leaving an orphan', async () => {
@@ -245,5 +276,20 @@ describe('NodeProcessRunner', () => {
     );
 
     assert.equal(result.exitCode, 7);
+  });
+
+  it('keeps captured numeric nonzero exit authoritative over stdin EPIPE, but rejects EPIPE on zero exit', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-captured-stdin-epipe-'));
+    try {
+      const store = new FileToolOutputStore(root);
+      const failed = await new NodeProcessRunner().run(process.execPath,
+        ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(23), 25)'],
+        { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024), outputStore: store });
+      assert.equal(failed.exitCode, 23);
+      await assert.rejects(new NodeProcessRunner().run(process.execPath,
+        ['-e', 'process.stdin.destroy(); setTimeout(() => process.exit(0), 25)'],
+        { timeoutMs: 1_000, stdin: 'x'.repeat(1024 * 1024), outputStore: store }),
+      (error: unknown) => (error as NodeJS.ErrnoException).code === 'EPIPE');
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 });

@@ -410,6 +410,46 @@ describe('UTF-8 tool output ranges', () => {
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
+      it('file: protects active evidence from a matching-nonce legacy PID-only owner lock', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-legacy-owner-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); const operation = store.beginOperation({ kind: 'legacy-owner-test' }); const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'legacy-must-stay'); const summary = writer.finish(); console.log(JSON.stringify({ id: operation.id, artifactId: summary.artifact.id })); process.exit(0);`;
+          const active = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly id: string; readonly artifactId: string };
+          const metadata = JSON.parse(readFileSync(path.join(directory, 'operations', `${active.id}.json`), 'utf8')) as { readonly ownerNonce: string };
+          writeFileSync(path.join(directory, 'operations', `${active.id}.lock`), JSON.stringify({ nonce: metadata.ownerNonce, pid: 2_147_483_647 }));
+          const result = new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1 });
+          assert.equal(result.deleted, 0);
+          assert.equal(result.protected, 1);
+          assert.ok(existsSync(path.join(directory, `${active.artifactId}.stdout`)));
+          assert.ok(existsSync(path.join(directory, 'operations', 'slot-0000.json')));
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: protects deleting tombstones from legacy PID-only locks and cannot reuse their slot', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-legacy-tombstone-'));
+        try {
+          const old = new Date('2026-09-01T00:00:00.000Z');
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => old });
+          const artifact = store.save({ stdout: 'legacy-tombstone-payload', stderr: '' });
+          const operations = path.join(directory, 'operations');
+          const metadataPath = path.join(operations, `${artifact.operationId}.json`);
+          const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { readonly ownerNonce: string };
+          unlinkSync(metadataPath);
+          writeFileSync(path.join(operations, 'slot-0000.json'), JSON.stringify({ schemaVersion: 1, capacity: 1, slot: 0,
+            id: artifact.operationId, deleting: true, artifactIds: [artifact.id] }));
+          writeFileSync(path.join(operations, `${artifact.operationId}.lock`), JSON.stringify({ nonce: metadata.ownerNonce, pid: 2_147_483_647 }));
+          const result = new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1 });
+          assert.equal(result.deleted, 0);
+          assert.equal(result.protected, 1);
+          assert.ok(existsSync(path.join(directory, `${artifact.id}.stdout`)));
+          assert.ok(existsSync(path.join(operations, 'slot-0000.json')));
+          assert.throws(() => new FileToolOutputStore(directory, { capacity: 1 }).beginOperation({ kind: 'must-not-reuse' }), /capacity|slot/i);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
       it('file: resumes a durable deletion tombstone after a simulated cleanup interruption', () => {
         const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-cleanup-resume-'));
         try {
@@ -459,18 +499,76 @@ describe('UTF-8 tool output ranges', () => {
             ids.push(writer.finish().artifact.id);
           }
           operation.close();
+          const operations = path.join(directory, 'operations');
+          const metadataPath = path.join(operations, `${operation.id}.json`);
+          unlinkSync(metadataPath);
+          writeFileSync(path.join(operations, 'slot-0000.json'), JSON.stringify({ schemaVersion: 1, capacity: 1, slot: 0,
+            id: operation.id, deleting: true, artifactIds: ids }));
+          unlinkSync(path.join(directory, `${ids[0]}.stdout`)); // simulate interruption after one owned unlink
           let passes = 0;
           let deleted = 0;
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `const { FileToolOutputStore } = await import(${JSON.stringify(moduleUrl)}); const { existsSync } = await import('node:fs'); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); const result = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 10 }); console.log(JSON.stringify({ result, slotExists: existsSync(${JSON.stringify(path.join(operations, 'slot-0000.json'))}) }));`;
+          const childResults: Array<{ readonly result: { readonly deleted: number; readonly attempted: number; readonly probed: number }; readonly slotExists: boolean }> = [];
           while (existsSync(path.join(directory, 'operations', 'slot-0000.json')) && passes < 16) {
-            const result = new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 10 });
-            passes += 1; deleted += result.deleted;
+            const output = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+              cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            const result = JSON.parse(output.trim()) as typeof childResults[number];
+            childResults.push(result);
+            assert.ok(result.result.attempted <= 10, 'each fresh-process pass respects the physical deletion-attempt budget');
+            assert.ok(result.result.probed <= 1, 'each fresh-process pass respects the slot-probe budget');
+            passes += 1; deleted += result.result.deleted;
+            if (passes < 10) assert.equal(result.slotExists, true, 'capacity-one tombstone remains occupied across a fresh-process bounded pass');
           }
           assert.equal(passes, 10, 'the bounded cursor revisits the retained tombstone until every artifact is reclaimed');
-          assert.equal(deleted, 82, '80 stream files, operation metadata and stable slot are bounded physical deletions');
+          assert.equal(deleted, 80, 'the simulated pre-pass unlink is absent from the bounded physical deletion count');
+          assert.equal(childResults.at(-1)?.slotExists, false);
+          const reused = new FileToolOutputStore(directory, { capacity: 1 }).beginOperation({ kind: 'after-complete-reclaim' });
+          reused.abort();
           for (const id of ids) {
             assert.equal(existsSync(path.join(directory, id + '.stdout')), false);
             assert.equal(existsSync(path.join(directory, id + '.stderr')), false);
           }
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: refuses capacity-one registration while a large tombstone remains and succeeds only after bounded reclaim', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-capacity-no-reuse-'));
+        try {
+          const old = new Date('2026-09-01T00:00:00.000Z');
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => old });
+          const operation = store.beginOperation({ kind: 'capacity-no-premature-reuse' });
+          for (let index = 0; index < 40; index += 1) {
+            const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY, { commandIndex: index });
+            writer.write('stdout', `capacity-payload-${index}`);
+            writer.finish();
+          }
+          operation.close();
+          const first = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 10 });
+          assert.ok(first.attempted <= 10);
+          assert.ok(first.probed <= 1);
+          const slotPath = path.join(directory, 'operations', 'slot-0000.json');
+          assert.ok(existsSync(slotPath));
+          assert.throws(() => new FileToolOutputStore(directory, { capacity: 1 }).beginOperation({ kind: 'premature-reuse' }), /capacity is full/);
+          assert.ok(existsSync(slotPath), 'failed registration cannot reuse a slot whose tombstone is still present');
+
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `const { FileToolOutputStore } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); console.log(JSON.stringify(store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 10 })));`;
+          let passes = 0;
+          while (existsSync(slotPath) && passes < 16) {
+            const output = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+              cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            const pass = JSON.parse(output.trim()) as { readonly attempted: number; readonly probed: number };
+            assert.ok(pass.attempted <= 10);
+            assert.ok(pass.probed <= 1);
+            passes += 1;
+          }
+          assert.ok(passes > 0 && passes < 16);
+          assert.equal(existsSync(slotPath), false);
+          const afterReclaim = new FileToolOutputStore(directory, { capacity: 1 }).beginOperation({ kind: 'post-reclaim-registration' });
+          afterReclaim.abort();
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 

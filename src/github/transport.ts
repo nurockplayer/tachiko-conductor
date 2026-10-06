@@ -7,6 +7,7 @@ import {
   DEFAULT_TOOL_OUTPUT_POLICY,
   type ToolOutputEnvelope,
   type ToolOutputPolicy,
+  type ToolOutputCaptureSessionResult,
   type ToolOutputStore,
   type ToolOutputCaptureWriter,
 } from '../evidence/tool-output.js';
@@ -34,6 +35,7 @@ export interface ProcessResult {
   /** Bounded, explicitly drillable evidence for the command transcript. */
   readonly output?: ToolOutputEnvelope;
   readonly captureStatus?: 'complete' | 'partial' | 'unavailable';
+  readonly captureObservation?: Omit<ToolOutputCaptureSessionResult, 'capture'>;
 }
 
 export interface ProcessRunOptions {
@@ -65,6 +67,26 @@ export interface NodeProcessRunnerOptions {
 interface ProcessError extends ExecFileException {
   readonly killed?: boolean;
   readonly output?: ToolOutputEnvelope;
+  readonly captureObservation?: Omit<ToolOutputCaptureSessionResult, 'capture'>;
+  readonly captureStatus?: 'complete' | 'partial' | 'unavailable';
+}
+
+interface FinishedCapture {
+  readonly output?: ToolOutputEnvelope;
+  readonly stdout: string;
+  readonly stderr: string;
+  readonly captureStatus: 'complete' | 'partial' | 'unavailable';
+  readonly captureObservation: Omit<ToolOutputCaptureSessionResult, 'capture'>;
+}
+
+function attachCapture(error: unknown, summary: FinishedCapture): unknown {
+  const observation = summary.captureObservation;
+  const fields = { captureStatus: summary.captureStatus, captureObservation: observation,
+    ...(summary.output === undefined ? {} : { output: summary.output }) };
+  if ((typeof error === 'object' && error !== null) || typeof error === 'function') {
+    try { Object.assign(error, fields); } catch { /* bounded metadata must never replace the original rejection */ }
+  }
+  return error;
 }
 
 /** Production process boundary. Commands are always an executable plus args. */
@@ -160,7 +182,7 @@ export class NodeProcessRunner implements ProcessRunner {
     try { writer = options.outputStore!.startCapture(policy); } catch { writer = undefined; }
     if (options.signal?.aborted === true) {
       try { writer?.abort?.(); } catch { /* preserve the pre-aborted child truth */ }
-      throw Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' });
+      throw attachCapture(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }), this.finishCapture(undefined, session, 'cancelled', null, policy));
     }
     // Preserve the main admission fence: capture setup is complete before this
     // synchronous callback, with no await between it and child creation.
@@ -175,7 +197,7 @@ export class NodeProcessRunner implements ProcessRunner {
       });
     } catch (error) {
       try { writer?.abort?.(); } catch { /* admission/spawn refusal remains authoritative */ }
-      throw error;
+      throw attachCapture(error, this.finishCapture(undefined, session, 'unknown', null, policy));
     }
     return await new Promise<ProcessResult>((resolve, reject) => {
       let settled = false;
@@ -201,8 +223,9 @@ export class NodeProcessRunner implements ProcessRunner {
         options.signal?.removeEventListener('abort', onAbort);
         if (settled) return;
         settled = true;
-        const summary = this.finishCapture(writer, session);
-        reject(Object.assign(error, summary.output === undefined ? {} : { output: summary.output }));
+        try { writer?.abort?.(); } catch { /* spawn failure remains authoritative */ }
+        const summary = this.finishCapture(undefined, session);
+        reject(attachCapture(error, summary));
       });
       child.once('close', (rawCode, signal) => {
         clearTimeout(timer);
@@ -217,17 +240,18 @@ export class NodeProcessRunner implements ProcessRunner {
         const outcome = cancelled || options.signal?.aborted === true ? 'cancelled' : timedOut ? 'timed_out' : exitCode === 0 ? 'passed' : exitCode === null ? 'unknown' : 'failed';
         const summary = this.finishCapture(writer, session, outcome, exitCode, policy);
         if (cancelled || options.signal?.aborted === true) {
-          reject(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR', ...(summary.output === undefined ? {} : { output: summary.output }) }));
+          reject(attachCapture(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }), summary));
         } else if (timedOut) {
-          reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT', ...(summary.output === undefined ? {} : { output: summary.output }) }));
+          reject(attachCapture(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT' }), summary));
         } else if (signal !== null) {
-          reject(Object.assign(new Error(`Command ${file} terminated by signal ${signal}.`), {
-            code: null, signal, ...(summary.output === undefined ? {} : { output: summary.output }),
-          }));
+          reject(attachCapture(Object.assign(new Error(`Command ${file} terminated by signal ${signal}.`), { code: null, signal }), summary));
+        } else if (exitCode !== null && exitCode !== 0) {
+          resolve({ stdout: summary.stdout, stderr: summary.stderr, exitCode, ...(summary.output === undefined ? {} : { output: summary.output }), captureStatus: summary.captureStatus, captureObservation: summary.captureObservation });
         } else if (stdinError !== undefined) {
-          reject(stdinError);
+          reject(attachCapture(stdinError, summary));
         } else {
-          resolve({ stdout: summary.stdout, stderr: summary.stderr, exitCode: exitCode ?? 1, ...(summary.output === undefined ? {} : { output: summary.output }), captureStatus: summary.captureStatus });
+          if (exitCode === null) reject(attachCapture(Object.assign(new Error(`Command ${file} closed without an exit code.`), { code: null, signal }), summary));
+          else resolve({ stdout: summary.stdout, stderr: summary.stderr, exitCode, ...(summary.output === undefined ? {} : { output: summary.output }), captureStatus: summary.captureStatus, captureObservation: summary.captureObservation });
         }
       });
       try { child.stdin?.end(options.stdin); } catch (error) { stdinError ??= error; }
@@ -240,17 +264,20 @@ export class NodeProcessRunner implements ProcessRunner {
     outcome: ToolOutputEnvelope['outcome'] = 'unknown',
     exitCode: number | null = null,
     policy: ToolOutputPolicy = DEFAULT_TOOL_OUTPUT_POLICY,
-  ): { readonly output?: ToolOutputEnvelope; readonly stdout: string; readonly stderr: string; readonly captureStatus: 'complete' | 'partial' | 'unavailable' } {
+  ): FinishedCapture {
     const result = session.finish(writer);
+    const captureObservation = { status: result.status, stdout: result.stdout, stderr: result.stderr,
+      diagnostics: result.diagnostics, diagnosticsTruncated: result.diagnosticsTruncated } as const;
     if (result.status === 'complete' && result.capture !== undefined) {
       return {
         output: boundToolOutputFromCapture({ outcome, exitCode, capture: result.capture, policy }),
         stdout: result.stdout.preview,
         stderr: result.stderr.preview,
         captureStatus: result.status,
+        captureObservation,
       };
     }
-    return { stdout: result.stdout.preview, stderr: result.stderr.preview, captureStatus: result.status };
+    return { stdout: result.stdout.preview, stderr: result.stderr.preview, captureStatus: result.status, captureObservation };
   }
 
   private result(stdout: string, stderr: string, exitCode: number, options: ProcessRunOptions): ProcessResult {
