@@ -206,6 +206,71 @@ describe('GhCliTransport', () => {
 });
 
 describe('NodeProcessRunner', () => {
+  it('runs the admission fence before rejecting invalid captured timeouts without preparing capture or child', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-invalid-captured-timeout-fence-'));
+    try {
+      const values = [-1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY];
+      for (const [index, timeoutMs] of values.entries()) {
+        const evidenceRoot = path.join(directory, `evidence-${index}`);
+        const launched = path.join(directory, `launched-${index}`);
+        let fenceCalls = 0;
+        const controller = new AbortController();
+        await assert.rejects(new NodeProcessRunner().run(process.execPath, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(launched)}, 'started')`], {
+          timeoutMs,
+          signal: controller.signal,
+          outputStore: new FileToolOutputStore(evidenceRoot),
+          beforeSpawn: () => { fenceCalls += 1; controller.abort(); },
+        }), (error: unknown) => {
+          assert.equal((error as NodeJS.ErrnoException).code, 'ERR_OUT_OF_RANGE');
+          assert.ok(error instanceof RangeError);
+          return true;
+        });
+        assert.equal(fenceCalls, 1, `timeout ${String(timeoutMs)}: invalid captured configuration still runs the authority fence exactly once`);
+        assert.equal(existsSync(evidenceRoot), false, 'invalid timeout does not create capture operation or root');
+        assert.equal(existsSync(launched), false, 'invalid timeout rejects before child creation');
+      }
+
+      for (const [index, refusal] of [
+        Object.freeze(Object.assign(new Error('host refuses invalid timeout'), { code: 'HOST_REFUSAL' })),
+        'primitive host refusal for invalid timeout',
+      ].entries()) {
+        let refusalFenceCalls = 0;
+        const evidenceRoot = path.join(directory, `refusal-evidence-${index}`);
+        await assert.rejects(new NodeProcessRunner().run(process.execPath, ['-e', 'process.exit(0)'], {
+          timeoutMs: -1,
+          outputStore: new FileToolOutputStore(evidenceRoot),
+          beforeSpawn: () => { refusalFenceCalls += 1; throw refusal; },
+        }), (error: unknown) => {
+          assert.equal(error, refusal, 'frozen or primitive host refusal wins over invalid timeout validation');
+          return true;
+        });
+        assert.equal(refusalFenceCalls, 1);
+        assert.equal(existsSync(evidenceRoot), false);
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('keeps valid zero and positive captured timeouts in capture-preparation then immediate-fence order', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-valid-captured-timeout-order-'));
+    try {
+      for (const timeoutMs of [0, 1_000]) {
+        const events: string[] = [];
+        const store = new FileToolOutputStore(path.join(directory, `evidence-${timeoutMs}`), {
+          testFaults: { beforeCaptureStart: () => { events.push('capture-prepared'); } },
+        });
+        let fenceCalls = 0;
+        const result = await new NodeProcessRunner().run(process.execPath, ['-e', "process.stdout.write('valid')"], {
+          timeoutMs,
+          outputStore: store,
+          beforeSpawn: () => { events.push('beforeSpawn'); fenceCalls += 1; },
+        });
+        assert.equal(result.stdout, 'valid');
+        assert.deepEqual(events, ['capture-prepared', 'beforeSpawn'], `timeout ${timeoutMs}: valid captured flow preserves preparation/fence order`);
+        assert.equal(fenceCalls, 1);
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('runs beforeSpawn immediately before child creation and rejects without spawning when it throws', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-before-spawn-'));
     try {

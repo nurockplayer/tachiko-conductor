@@ -337,8 +337,8 @@ describe('bounded output integration', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it('contains actual file-backed start, second-open, mid-write, short-write, finish, hash, fsync and cleanup faults', async () => {
-    for (const fault of ['start', 'second-open', 'mid-write', 'short-write', 'finish', 'hash', 'fsync', 'cleanup'] as const) {
+  it('contains actual file-backed start, second-open, mid-write, short-write, finish, hash, file/root fsync and cleanup faults', async () => {
+    for (const fault of ['start', 'second-open', 'mid-write', 'short-write', 'finish', 'hash', 'fsync', 'root-fsync', 'cleanup'] as const) {
       const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-fault-'));
       try {
         let writes = 0;
@@ -361,6 +361,7 @@ describe('bounded output integration', () => {
           beforeFinish: () => { if (fault === 'finish') throw new Error('injected finish fault'); },
           beforeHash: () => { if (fault === 'hash') throw new Error('injected hash fault'); },
           beforeFsync: () => { if (fault === 'fsync') throw new Error('injected fsync fault'); },
+          beforeArtifactRootFsync: (phase) => { if (fault === 'root-fsync' && phase === 'finish') throw new Error('injected artifact root fsync fault'); },
           beforeUnlink: () => {
             if (fault === 'cleanup' && !cleanupFaulted) { cleanupFaulted = true; throw new Error('injected cleanup fault'); }
           },

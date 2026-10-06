@@ -35,6 +35,8 @@ export interface ToolOutputFileTestFaults {
   readonly beforeArtifactOpen?: (kind: 'hash' | 'read' | 'search', channel: 'stdout' | 'stderr') => void;
   readonly afterArtifactOpen?: (descriptor: number, kind: 'hash' | 'read' | 'search', channel: 'stdout' | 'stderr') => void;
   readonly beforeUnlink?: (filePath: string) => void;
+  readonly beforeStaleTakeover?: () => void;
+  readonly beforeArtifactRootFsync?: (phase: 'abort' | 'finish' | 'cleanup') => void;
 }
 
 export type ToolOutputOutcome = 'passed' | 'failed' | 'timed_out' | 'cancelled' | 'unknown';
@@ -199,14 +201,95 @@ function isCanonicalTimestamp(value: unknown): value is string {
   return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
 }
 
-function dispatchLockMatchesOwner(value: Record<string, unknown>, nonce: string): boolean {
-  const keys = Object.keys(value).sort().join(',');
-  const versioned = keys === 'bootId,hostId,nonce,pid,processStartId,schemaVersion' && value.schemaVersion === 1 &&
-    typeof value.nonce === 'string' && Number.isSafeInteger(value.pid) && (value.pid as number) > 0 &&
-    typeof value.hostId === 'string' && /^[0-9a-f]{64}$/.test(value.hostId) &&
-    typeof value.bootId === 'string' && /^[0-9a-f]{64}$/.test(value.bootId) &&
-    typeof value.processStartId === 'string' && value.processStartId.length > 0 && value.processStartId.length <= 256;
-  return versioned && value.nonce === nonce;
+interface EvidenceOperationLockRecord {
+  readonly schemaVersion: 1;
+  readonly nonce: string;
+  readonly pid: number;
+  readonly hostId: string;
+  readonly bootId: string;
+  readonly processStartId: string;
+}
+
+function isEvidenceOperationLockRecord(value: unknown): value is EvidenceOperationLockRecord {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort().join(',');
+  return keys === 'bootId,hostId,nonce,pid,processStartId,schemaVersion' && record.schemaVersion === 1 &&
+    typeof record.nonce === 'string' && record.nonce !== '' && record.nonce.length <= 256 &&
+    Number.isSafeInteger(record.pid) && (record.pid as number) > 0 &&
+    typeof record.hostId === 'string' && /^[0-9a-f]{64}$/.test(record.hostId) &&
+    typeof record.bootId === 'string' && /^[0-9a-f]{64}$/.test(record.bootId) &&
+    typeof record.processStartId === 'string' && record.processStartId !== '' && record.processStartId.length <= 256;
+}
+
+function sameEvidenceOperationLockRecord(left: EvidenceOperationLockRecord, right: EvidenceOperationLockRecord): boolean {
+  return left.schemaVersion === right.schemaVersion && left.nonce === right.nonce && left.pid === right.pid &&
+    left.hostId === right.hostId && left.bootId === right.bootId && left.processStartId === right.processStartId;
+}
+
+function readEvidenceOperationLock(lockPath: string, accountRead?: (bytes: number) => void): EvidenceOperationLockRecord | undefined {
+  let pathStats;
+  try { pathStats = lstatSync(lockPath, { bigint: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  if (pathStats.isSymbolicLink() || !pathStats.isFile() || pathStats.size > 4096n) {
+    throw new Error('Evidence operation lock is not a bounded regular file.');
+  }
+  if (typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) {
+    throw new Error('Evidence operation lock admission requires O_NOFOLLOW support.');
+  }
+  const size = Number(pathStats.size);
+  if (!Number.isSafeInteger(size) || size < 1) throw new Error('Evidence operation lock has an invalid size.');
+  accountRead?.(size);
+  const descriptor = openSync(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW |
+    (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0));
+  try {
+    const descriptorStats = fstatSync(descriptor, { bigint: true });
+    if (!descriptorStats.isFile() || descriptorStats.dev !== pathStats.dev || descriptorStats.ino !== pathStats.ino ||
+        descriptorStats.size !== pathStats.size) throw new Error('Evidence operation lock changed during safe open.');
+    const data = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < data.length) {
+      const count = readSync(descriptor, data, offset, data.length - offset, offset);
+      if (count === 0) throw new Error('Evidence operation lock read was shorter than its admitted size.');
+      offset += count;
+    }
+    const finalStats = fstatSync(descriptor, { bigint: true });
+    if (finalStats.dev !== descriptorStats.dev || finalStats.ino !== descriptorStats.ino || finalStats.size !== descriptorStats.size) {
+      throw new Error('Evidence operation lock changed while being read.');
+    }
+    let parsed: unknown;
+    try { parsed = JSON.parse(data.toString('utf8')); }
+    catch { throw new Error('Evidence operation lock is malformed JSON.'); }
+    if (!isEvidenceOperationLockRecord(parsed)) throw new Error('Evidence operation lock does not use the exact versioned schema.');
+    return parsed;
+  } finally { closeSync(descriptor); }
+}
+
+function acquireEvidenceOperationFence(
+  lockPath: string,
+  expectedOwnerNonce?: string,
+  testFaults?: ToolOutputFileTestFaults,
+  accountRead?: (bytes: number) => void,
+  admittedPreflight?: { readonly record: EvidenceOperationLockRecord | undefined },
+): DispatchInvocationLock {
+  const preflight = admittedPreflight ?? { record: readEvidenceOperationLock(lockPath, accountRead) };
+  if (preflight.record !== undefined && expectedOwnerNonce !== undefined && preflight.record.nonce !== expectedOwnerNonce) {
+    throw new Error('Evidence operation lock nonce does not match its persisted owner.');
+  }
+  return acquireDispatchInvocationLock({
+    lockPath,
+    beforeStaleTakeover: () => {
+      testFaults?.beforeStaleTakeover?.();
+      const current = readEvidenceOperationLock(lockPath, accountRead);
+      if (preflight.record === undefined || current === undefined || !sameEvidenceOperationLockRecord(current, preflight.record) ||
+          (expectedOwnerNonce !== undefined && current.nonce !== expectedOwnerNonce)) {
+        throw new Error('Evidence operation lock changed after strict preflight; stale takeover refused.');
+      }
+    },
+  });
 }
 
 function isToolOutputArtifactFileIdentity(value: unknown): value is ToolOutputArtifactFileIdentity {
@@ -676,6 +759,7 @@ export class FileToolOutputStore implements ToolOutputStore {
     const artifacts: ToolOutputArtifactReference[] = [];
     const captureAttributions: Array<Readonly<Record<string, string | number | null>>> = [];
     const activeCaptureIds: string[] = [];
+    const unresolvedCaptureIds = new Set<string>();
     const activeWriters = new Set<FileToolOutputWriter>();
     const allWriters = new Set<FileToolOutputWriter>();
     const metadataPath = path.join(operations, `${id}.json`);
@@ -698,7 +782,7 @@ export class FileToolOutputStore implements ToolOutputStore {
           writer = new FileToolOutputWriter(this.root, policy, captureId, this.testFaults);
         }
         catch (error) {
-          activeCaptureIds.splice(activeCaptureIds.indexOf(captureId), 1);
+          unresolvedCaptureIds.add(captureId);
           try { writeMetadata({ ...base, state: 'active', activeCaptureIds, artifacts }); } catch { /* preserve the original start failure */ }
           throw error;
         }
@@ -724,7 +808,7 @@ export class FileToolOutputStore implements ToolOutputStore {
       },
       close: () => {
         if (closed) throw new Error('Tool-output operation is already closed.');
-        if (activeWriters.size > 0) throw new Error('Tool-output operation cannot commit while a capture writer is open.');
+        if (activeWriters.size > 0 || unresolvedCaptureIds.size > 0) throw new Error('Tool-output operation cannot commit while a capture writer or prepared capture ID is unresolved.');
         const closedAt = this.now().toISOString();
         const retainedUntil = new Date(Date.parse(closedAt) + this.retentionMs).toISOString();
         const committed = artifacts.map((artifact) => ({ ...artifact, operationId: id, retainedUntil }));
@@ -738,7 +822,8 @@ export class FileToolOutputStore implements ToolOutputStore {
         let cleanupFailed = false;
         for (const writer of allWriters) { try { writer.abort(); } catch { cleanupFailed = true; } }
         activeWriters.clear();
-        try { writeMetadata({ ...base, state: 'aborted', closedAt: this.now().toISOString(), activeCaptureIds: cleanupFailed ? activeCaptureIds : [], artifacts }); }
+        const retainedCaptureIds = cleanupFailed ? activeCaptureIds : activeCaptureIds.filter((captureId) => unresolvedCaptureIds.has(captureId));
+        try { writeMetadata({ ...base, state: 'aborted', closedAt: this.now().toISOString(), activeCaptureIds: retainedCaptureIds, artifacts }); }
         finally { closed = true; lock.release(); }
       },
     };
@@ -790,11 +875,21 @@ export class FileToolOutputStore implements ToolOutputStore {
     this.assertAvailable(referenceValue);
     const operationId = referenceValue.operationId!;
     const metadataPath = path.join(this.operationsDir, `${operationId}.json`);
-    const fence = acquireDispatchInvocationLock({ lockPath: path.join(this.operationsDir, `${operationId}.lock`) });
+    const initialMetadata = readBoundedJson(metadataPath, 1_048_576);
+    const expectedOwnerNonce = initialMetadata.ownerNonce;
+    if (initialMetadata.state !== 'closed' || initialMetadata.id !== operationId ||
+        typeof expectedOwnerNonce !== 'string' || expectedOwnerNonce === '' || expectedOwnerNonce.length > 256) {
+      throw new Error('Tool-output operation cannot be released without valid committed owner metadata.');
+    }
+    const fence = acquireEvidenceOperationFence(
+      path.join(this.operationsDir, `${operationId}.lock`), expectedOwnerNonce, this.testFaults,
+    );
     try {
       this.assertAvailable(referenceValue);
       const metadata = readBoundedJson(metadataPath, 1_048_576);
-      if (metadata.state !== 'closed' || metadata.id !== operationId) throw new Error('Tool-output operation cannot be released.');
+      if (metadata.state !== 'closed' || metadata.id !== operationId || metadata.ownerNonce !== expectedOwnerNonce) {
+        throw new Error('Tool-output operation owner changed before release.');
+      }
       writeAtomicJson(this.operationsDir, metadataPath, {
         ...metadata,
         state: 'released',
@@ -849,28 +944,32 @@ export class FileToolOutputStore implements ToolOutputStore {
             }
           } catch { protectedCount += 1; continue; }
         }
-        const expectedOwnerNonce = metadata.ownerNonce;
-        if (!slotRecord.deleting && (typeof expectedOwnerNonce !== 'string' || expectedOwnerNonce === '' || expectedOwnerNonce.length > 256)) {
+        const expectedOwnerNonce = typeof metadata.ownerNonce === 'string' ? metadata.ownerNonce : undefined;
+        if (!slotRecord.deleting && (expectedOwnerNonce === undefined || expectedOwnerNonce === '' || expectedOwnerNonce.length > 256)) {
           protectedCount += 1; continue;
         }
 
         const lockPath = path.join(this.operationsDir, slotRecord.id + '.lock');
-        let lockExisted = false;
+        let admittedLock: { readonly record: EvidenceOperationLockRecord | undefined };
         try {
-          const lockStats = lstatSync(lockPath);
-          lockExisted = lockStats.isFile() && !lockStats.isSymbolicLink();
-          if (!lockExisted) { protectedCount += 1; continue; }
-          const lockRecord = readBoundedJson(lockPath, 4096, accountMetadataRead);
-          const expectedNonce = slotRecord.deleting ? lockRecord.nonce : expectedOwnerNonce;
-          if (typeof expectedNonce !== 'string' || !dispatchLockMatchesOwner(lockRecord, expectedNonce)) { protectedCount += 1; continue; }
+          admittedLock = { record: readEvidenceOperationLock(lockPath, accountMetadataRead) };
+          if (admittedLock.record === undefined && metadata.state === 'active') { protectedCount += 1; continue; }
+          if (!slotRecord.deleting && admittedLock.record !== undefined && admittedLock.record.nonce !== expectedOwnerNonce) {
+            protectedCount += 1; continue;
+          }
         } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-            if (metadata.state === 'active') { protectedCount += 1; continue; }
-          } else { protectedCount += 1; continue; }
+          if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+          protectedCount += 1; continue;
         }
         let ownerFence: DispatchInvocationLock;
-        try { ownerFence = acquireDispatchInvocationLock({ lockPath }); }
-        catch { protectedCount += 1; continue; }
+        try {
+          ownerFence = acquireEvidenceOperationFence(
+            lockPath, slotRecord.deleting ? undefined : expectedOwnerNonce, this.testFaults, accountMetadataRead, admittedLock,
+          );
+        } catch (error) {
+          if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+          protectedCount += 1; continue;
+        }
         try {
           // Re-read under the exact operation fence before acting on owner state.
           let ids = new Set<string>(slotRecord.artifactIds);
@@ -879,7 +978,7 @@ export class FileToolOutputStore implements ToolOutputStore {
             if (!validOperationMetadata(metadata, slotRecord.id, slot) ||
                 metadata.ownerNonce !== expectedOwnerNonce ||
                 (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) || Date.parse(metadata.retainedUntil) > this.now().getTime())) ||
-                (metadata.state === 'active' && !lockExisted)) { protectedCount += 1; continue; }
+                (metadata.state === 'active' && admittedLock.record === undefined)) { protectedCount += 1; continue; }
             ids = new Set<string>();
             if (Array.isArray(metadata.activeCaptureIds)) {
               for (const value of metadata.activeCaptureIds) if (typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value)) ids.add(value);
@@ -926,6 +1025,7 @@ export class FileToolOutputStore implements ToolOutputStore {
             catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { safe = false; break; } }
           }
           if (!safe) { protectedCount += 1; continue; }
+          if (deletingIds.length > 0) fsyncArtifactRoot(this.root, this.testFaults, 'cleanup');
           if (remainingIds.length > 0) {
             writeAtomicJson(this.operationsDir, slotPath, {
               schemaVersion: 1, capacity: this.capacity, slot, id: slotRecord.id,
@@ -1269,8 +1369,9 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
       testFaults?.beforeSecondOpen?.();
       this.stderrHandle = openSync(path.join(root, `${this.id}.stderr`), 'wx', 0o600);
     } catch (error) {
-      if (this.stdoutHandle !== undefined) closeSync(this.stdoutHandle);
-      try { unlinkSync(path.join(root, `${this.id}.stdout`)); } catch { /* cleanup of partial second-open is best effort */ }
+      if (this.stdoutHandle !== undefined) { try { closeSync(this.stdoutHandle); } catch { /* preserve primary constructor failure */ } }
+      const stdoutPath = path.join(root, `${this.id}.stdout`);
+      try { testFaults?.beforeUnlink?.(stdoutPath); unlinkSync(stdoutPath); } catch { /* preserve primary constructor failure and registered capture ID */ }
       throw error;
     }
     this.stdoutCapture = new StreamCapture(policy.previewBytes);
@@ -1340,6 +1441,7 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
     const diagnostics = boundedDiagnostics(
       [...stdoutDiagnostics.lines, ...stderrDiagnostics.lines].join('\n'), '', this.policy,
     );
+    fsyncArtifactRoot(this.root, this.testFaults, 'finish');
     return {
       artifact,
       stdout,
@@ -1358,13 +1460,27 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
     }
     this.stdoutHandle = undefined;
     this.stderrHandle = undefined;
+    let failure: unknown;
     for (const channel of ['stdout', 'stderr'] as const) {
       const filePath = path.join(this.root, `${this.id}.${channel}`);
       try { this.testFaults?.beforeUnlink?.(filePath); unlinkSync(filePath); } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') failure ??= error;
       }
     }
+    if (failure !== undefined) throw failure;
+    fsyncArtifactRoot(this.root, this.testFaults, 'abort');
   }
+}
+
+function fsyncArtifactRoot(
+  root: string,
+  testFaults: ToolOutputFileTestFaults | undefined,
+  phase: 'abort' | 'finish' | 'cleanup',
+): void {
+  testFaults?.beforeArtifactRootFsync?.(phase);
+  const descriptor = openSync(root, constants.O_RDONLY);
+  try { fsyncSync(descriptor); }
+  finally { closeSync(descriptor); }
 }
 
 function writeFully(handle: number, bytes: Buffer, writer: ToolOutputFileTestFaults['writeSync'] = writeSync): void {

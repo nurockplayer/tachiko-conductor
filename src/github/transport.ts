@@ -113,7 +113,13 @@ export class NodeProcessRunner implements ProcessRunner {
 
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
     if (options.outputStore !== undefined) {
-      validateCapturedTimeout(options.timeoutMs);
+      try { validateCapturedTimeout(options.timeoutMs); }
+      catch (validationError) {
+        // Match execFile's synchronous host-admission precedence for invalid
+        // options without preparing capture or creating a child.
+        options.beforeSpawn?.();
+        throw validationError;
+      }
       return await this.runCaptured(file, args, options);
     }
     return await new Promise<ProcessResult>((resolve, reject) => {
