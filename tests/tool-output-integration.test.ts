@@ -309,7 +309,7 @@ describe('bounded output integration', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it('purges prepared captures on pre-abort and spawn failure while preserving their typed process errors', async () => {
+  it('purges pre-spawn aborted captures and failed-spawn preparations while preserving process errors', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-prepared-capture-purge-'));
     try {
       const store = new FileToolOutputStore(directory);
@@ -320,8 +320,8 @@ describe('bounded output integration', () => {
       }), (error: unknown) => {
         const value = error as { readonly code?: unknown; readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown } };
         assert.equal(value.code, 'ABORT_ERR');
-        assert.equal(value.captureStatus, 'unavailable');
-        assert.equal(value.captureObservation?.status, 'unavailable');
+        assert.equal(value.captureStatus, 'partial', 'the admitted child was aborted after its successful spawn event');
+        assert.equal(value.captureObservation?.status, 'partial');
         return true;
       });
       await assert.rejects(new NodeProcessRunner().run(path.join(directory, 'missing-executable'), [], {

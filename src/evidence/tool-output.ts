@@ -32,6 +32,8 @@ export interface ToolOutputFileTestFaults {
   readonly writeSync?: (descriptor: number, bytes: Buffer, offset: number, length: number) => number;
   readonly beforeFsync?: (channel: 'stdout' | 'stderr') => void;
   readonly beforeHash?: () => void;
+  readonly beforeArtifactOpen?: (kind: 'hash' | 'read' | 'search', channel: 'stdout' | 'stderr') => void;
+  readonly afterArtifactOpen?: (descriptor: number, kind: 'hash' | 'read' | 'search', channel: 'stdout' | 'stderr') => void;
   readonly beforeUnlink?: (filePath: string) => void;
 }
 
@@ -84,8 +86,15 @@ export interface ToolOutputArtifactReference {
   readonly stderrBytes: number;
   readonly totalBytes: number;
   readonly sha256: string;
+  /** Stable file identities recorded from the owned descriptors at capture finish. */
+  readonly fileIdentity?: ToolOutputArtifactFileIdentity;
   readonly operationId?: string;
   readonly retainedUntil?: string;
+}
+
+export interface ToolOutputArtifactFileIdentity {
+  readonly stdout: { readonly dev: string; readonly ino: string };
+  readonly stderr: { readonly dev: string; readonly ino: string };
 }
 
 export interface ToolOutputEnvelope {
@@ -200,6 +209,21 @@ function dispatchLockMatchesOwner(value: Record<string, unknown>, nonce: string)
   return versioned && value.nonce === nonce;
 }
 
+function isToolOutputArtifactFileIdentity(value: unknown): value is ToolOutputArtifactFileIdentity {
+  if (typeof value !== 'object' || value === null) return false;
+  const identity = value as Record<string, unknown>;
+  const validPart = (part: unknown): boolean => typeof part === 'object' && part !== null &&
+    typeof (part as Record<string, unknown>).dev === 'string' && /^\d+$/.test((part as Record<string, unknown>).dev as string) &&
+    typeof (part as Record<string, unknown>).ino === 'string' && /^\d+$/.test((part as Record<string, unknown>).ino as string);
+  return validPart(identity.stdout) && validPart(identity.stderr);
+}
+
+function sameToolOutputArtifactFileIdentity(left: unknown, right: ToolOutputArtifactFileIdentity): boolean {
+  if (!isToolOutputArtifactFileIdentity(left)) return false;
+  return left.stdout.dev === right.stdout.dev && left.stdout.ino === right.stdout.ino &&
+    left.stderr.dev === right.stderr.dev && left.stderr.ino === right.stderr.ino;
+}
+
 function validOperationMetadata(value: Record<string, unknown>, id: string, slot: number): boolean {
   if (value.schemaVersion !== 1 || value.id !== id || value.slot !== slot ||
       typeof value.ownerNonce !== 'string' || value.ownerNonce === '' || value.ownerNonce.length > 256 ||
@@ -215,6 +239,7 @@ function validOperationMetadata(value: Record<string, unknown>, id: string, slot
       Number.isSafeInteger(artifact.stderrBytes) && (artifact.stderrBytes as number) >= 0 &&
       artifact.totalBytes === (artifact.stdoutBytes as number) + (artifact.stderrBytes as number) &&
       typeof artifact.sha256 === 'string' && /^[0-9a-f]{64}$/.test(artifact.sha256) &&
+      (artifact.fileIdentity === undefined || isToolOutputArtifactFileIdentity(artifact.fileIdentity)) &&
       (!committed || (artifact.operationId === id && artifact.retainedUntil === value.retainedUntil));
   };
   for (const name of ['artifacts', 'captures'] as const) {
@@ -482,7 +507,8 @@ function isToolOutputArtifact(value: unknown): value is ToolOutputArtifactRefere
   return artifact.kind === 'tool-output' && typeof artifact.id === 'string' && artifact.id.trim() !== '' &&
     [artifact.stdoutBytes, artifact.stderrBytes, artifact.totalBytes].every((item) =>
       typeof item === 'number' && Number.isSafeInteger(item) && item >= 0) &&
-    typeof artifact.sha256 === 'string' && /^[0-9a-f]{64}$/.test(artifact.sha256);
+    typeof artifact.sha256 === 'string' && /^[0-9a-f]{64}$/.test(artifact.sha256) &&
+    (artifact.fileIdentity === undefined || isToolOutputArtifactFileIdentity(artifact.fileIdentity));
 }
 
 function validateReadRequest(reference: ToolOutputArtifactReference, request: ToolOutputReadRequest, readBytes: number): { readonly offset: number; readonly length: number; readonly total: number } {
@@ -719,11 +745,11 @@ export class FileToolOutputStore implements ToolOutputStore {
   }
 
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
-    this.assertAvailable(referenceValue);
+    const identity = this.assertAvailable(referenceValue);
     const range = validateReadRequest(referenceValue, request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
     const filePath = this.file(referenceValue.id, request.channel);
-    if (!existsSync(filePath)) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable or expired.`);
-    const handle = openSync(filePath, 'r');
+    const expectedIdentity = identity[request.channel];
+    const handle = openVerifiedArtifact(filePath, range.total, expectedIdentity, this.testFaults, 'read', request.channel);
     try {
       const bufferOffset = Math.max(0, range.offset - 3);
       const requestedBytes = Math.min(range.length, range.total - range.offset);
@@ -731,9 +757,10 @@ export class FileToolOutputStore implements ToolOutputStore {
       let bytes = 0;
       while (bytes < buffer.length) {
         const count = readSync(handle, buffer, bytes, buffer.length - bytes, bufferOffset + bytes);
-        if (count === 0) break;
+        if (count === 0) throw new Error('Tool-output artifact range read was shorter than committed size.');
         bytes += count;
       }
+      assertArtifactDescriptor(handle, range.total, expectedIdentity);
       const result = readUtf8Range(buffer.subarray(0, bytes), bufferOffset, range.offset, range.length, range.total);
       return { ...result, channel: request.channel };
     } finally {
@@ -742,14 +769,17 @@ export class FileToolOutputStore implements ToolOutputStore {
   }
 
   search(referenceValue: ToolOutputArtifactReference, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
-    this.assertAvailable(referenceValue);
+    const identity = this.assertAvailable(referenceValue);
     const { maxMatches, maxBytes } = validateSearchRequest(request);
     const channels = request.channel === undefined ? (['stdout', 'stderr'] as const) : [request.channel];
     const results: ToolOutputMatch[] = [];
     for (const channel of channels) {
       const filePath = this.file(referenceValue.id, channel);
-      if (!existsSync(filePath)) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable or expired.`);
-      results.push(...searchFile(filePath, channel, request.query, maxMatches, maxBytes, results.length));
+      const expectedBytes = channel === 'stdout' ? referenceValue.stdoutBytes : referenceValue.stderrBytes;
+      const handle = openVerifiedArtifact(filePath, expectedBytes, identity[channel], this.testFaults, 'search', channel);
+      try {
+        results.push(...searchFile(handle, expectedBytes, identity[channel], channel, request.query, maxMatches, maxBytes, results.length));
+      } finally { closeSync(handle); }
       if (results.length >= maxMatches) break;
     }
     return results.slice(0, maxMatches);
@@ -990,12 +1020,14 @@ export class FileToolOutputStore implements ToolOutputStore {
     } finally { maintenance.release(); }
   }
 
-  private assertAvailable(referenceValue: ToolOutputArtifactReference): void {
+  private assertAvailable(referenceValue: ToolOutputArtifactReference): ToolOutputArtifactFileIdentity {
     if (referenceValue.operationId === undefined || referenceValue.retainedUntil === undefined) {
       throw new Error(`Tool-output artifact ${referenceValue.id} has no committed retention authority.`);
     }
     const until = Date.parse(referenceValue.retainedUntil);
     if (!Number.isFinite(until) || this.now().getTime() >= until) throw new Error(`Tool-output artifact ${referenceValue.id} is expired.`);
+    if (!isToolOutputArtifactFileIdentity(referenceValue.fileIdentity)) throw new Error(`Tool-output artifact ${referenceValue.id} has no file identity.`);
+    const fileIdentity = referenceValue.fileIdentity;
     if (!/^[0-9a-f-]{36}$/.test(referenceValue.operationId)) throw new Error('Invalid tool-output operation id.');
     const metadataPath = path.join(this.root, 'operations', `${referenceValue.operationId}.json`);
     try {
@@ -1021,16 +1053,19 @@ export class FileToolOutputStore implements ToolOutputStore {
           persisted === undefined || persisted.kind !== referenceValue.kind || persisted.id !== referenceValue.id ||
           persisted.operationId !== referenceValue.operationId || persisted.retainedUntil !== referenceValue.retainedUntil ||
           persisted.stdoutBytes !== referenceValue.stdoutBytes || persisted.stderrBytes !== referenceValue.stderrBytes ||
-          persisted.totalBytes !== referenceValue.totalBytes || persisted.sha256 !== referenceValue.sha256) {
+          persisted.totalBytes !== referenceValue.totalBytes || persisted.sha256 !== referenceValue.sha256 ||
+          !sameToolOutputArtifactFileIdentity(persisted.fileIdentity, fileIdentity)) {
         throw new Error('operation retention metadata is unavailable');
       }
       for (const channel of ['stdout', 'stderr'] as const) {
-        const fileStats = lstatSync(this.file(referenceValue.id, channel));
-        if (fileStats.isSymbolicLink() || !fileStats.isFile()) throw new Error('invalid artifact file');
+        const fileStats = lstatSync(this.file(referenceValue.id, channel), { bigint: true });
+        if (fileStats.isSymbolicLink() || !fileStats.isFile() ||
+            fileStats.dev.toString() !== fileIdentity[channel].dev || fileStats.ino.toString() !== fileIdentity[channel].ino) throw new Error('invalid artifact file identity');
         const expected = channel === 'stdout' ? referenceValue.stdoutBytes : referenceValue.stderrBytes;
-        if (fileStats.size !== expected) throw new Error('artifact byte length differs from committed metadata');
+        if (fileStats.size !== BigInt(expected)) throw new Error('artifact byte length differs from committed metadata');
       }
     } catch { throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable or expired.`); }
+    return fileIdentity;
   }
 }
 
@@ -1219,6 +1254,7 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
   private readonly stdoutDiagnostics: DiagnosticCapture;
   private readonly stderrDiagnostics: DiagnosticCapture;
   private finished = false;
+  private fileIdentity: ToolOutputArtifactFileIdentity | undefined;
 
   constructor(
     private readonly root: string,
@@ -1259,35 +1295,45 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
   }
 
   finish(): ToolOutputCaptureSummary {
-    if (!this.finished) {
-      this.testFaults?.beforeFinish?.();
-      this.finished = true;
-      let failure: unknown;
-      for (const [channel, handle] of [['stdout', this.stdoutHandle], ['stderr', this.stderrHandle]] as const) {
-        if (handle !== undefined) { try { this.testFaults?.beforeFsync?.(channel); fsyncSync(handle); } catch (error) { if (failure === undefined) failure = error; } }
-      }
-      for (const handle of [this.stdoutHandle, this.stderrHandle]) {
-        if (handle !== undefined) { try { closeSync(handle); } catch (error) { if (failure === undefined) failure = error; } }
-      }
-      this.stdoutHandle = undefined;
-      this.stderrHandle = undefined;
-      if (failure !== undefined) throw failure;
-    }
     const stdout = this.stdoutCapture.value();
     const stderr = this.stderrCapture.value();
     const stdoutBytes = stdout.bytes;
     const stderrBytes = stderr.bytes;
-    if (lstatSync(path.join(this.root, `${this.id}.stdout`)).size !== stdoutBytes ||
-        lstatSync(path.join(this.root, `${this.id}.stderr`)).size !== stderrBytes) {
-      throw new Error('Tool-output capture file length differs from the streamed byte count.');
+    if (!this.finished) {
+      this.testFaults?.beforeFinish?.();
+      let failure: unknown;
+      for (const [channel, handle] of [['stdout', this.stdoutHandle], ['stderr', this.stderrHandle]] as const) {
+        if (handle !== undefined) { try { this.testFaults?.beforeFsync?.(channel); fsyncSync(handle); } catch (error) { if (failure === undefined) failure = error; } }
+      }
+      if (failure === undefined && this.stdoutHandle !== undefined && this.stderrHandle !== undefined) {
+        try {
+          this.fileIdentity = {
+            stdout: ownedArtifactIdentity(this.stdoutHandle, stdoutBytes),
+            stderr: ownedArtifactIdentity(this.stderrHandle, stderrBytes),
+          };
+        } catch (error) { failure = error; }
+      }
+      for (const handle of [this.stdoutHandle, this.stderrHandle]) {
+        if (handle !== undefined) { try { closeSync(handle); } catch (error) { if (failure === undefined) failure = error; } }
+      }
+      this.finished = true;
+      this.stdoutHandle = undefined;
+      this.stderrHandle = undefined;
+      if (failure !== undefined) throw failure;
     }
+    if (this.fileIdentity === undefined) throw new Error('Tool-output capture identity was not recorded from its open descriptors.');
     this.testFaults?.beforeHash?.();
     const hash = hashFiles(
       path.join(this.root, `${this.id}.stdout`),
+      stdoutBytes,
       path.join(this.root, `${this.id}.stderr`),
+      stderrBytes,
+      this.fileIdentity,
+      this.testFaults,
     );
     const artifact: ToolOutputArtifactReference = {
       kind: 'tool-output', id: this.id, stdoutBytes, stderrBytes, totalBytes: stdoutBytes + stderrBytes, sha256: hash,
+      fileIdentity: this.fileIdentity,
     };
     const stdoutDiagnostics = this.stdoutDiagnostics.finish();
     const stderrDiagnostics = this.stderrDiagnostics.finish();
@@ -1341,23 +1387,90 @@ function reference(id: string, stdout: string, stderr: string): ToolOutputArtifa
   };
 }
 
-function hashFiles(stdoutPath: string, stderrPath: string): string {
+function ownedArtifactIdentity(descriptor: number, expectedBytes: number): ToolOutputArtifactFileIdentity['stdout'] {
+  const stats = fstatSync(descriptor, { bigint: true });
+  if (!stats.isFile() || stats.size !== BigInt(expectedBytes)) {
+    throw new Error('Owned tool-output capture descriptor differs from its streamed byte count.');
+  }
+  return { dev: stats.dev.toString(), ino: stats.ino.toString() };
+}
+
+function assertArtifactDescriptor(
+  descriptor: number,
+  expectedBytes: number,
+  identity: ToolOutputArtifactFileIdentity['stdout'],
+): void {
+  const stats = fstatSync(descriptor, { bigint: true });
+  if (!stats.isFile() || stats.size !== BigInt(expectedBytes) ||
+      stats.dev.toString() !== identity.dev || stats.ino.toString() !== identity.ino) {
+    throw new Error('Tool-output artifact descriptor differs from its admitted identity or size.');
+  }
+}
+
+function openVerifiedArtifact(
+  filePath: string,
+  expectedBytes: number,
+  identity: ToolOutputArtifactFileIdentity['stdout'],
+  faults: ToolOutputFileTestFaults | undefined,
+  kind: 'hash' | 'read' | 'search',
+  channel: 'stdout' | 'stderr',
+): number {
+  if (typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) {
+    throw new Error('Safe artifact opens are unavailable because O_NOFOLLOW is unsupported.');
+  }
+  faults?.beforeArtifactOpen?.(kind, channel);
+  const flags = constants.O_RDONLY | constants.O_NOFOLLOW |
+    (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0);
+  const descriptor = openSync(filePath, flags);
+  try {
+    faults?.afterArtifactOpen?.(descriptor, kind, channel);
+    assertArtifactDescriptor(descriptor, expectedBytes, identity);
+    return descriptor;
+  } catch (error) {
+    try { closeSync(descriptor); } catch { /* preserve point-of-use validation failure */ }
+    throw error;
+  }
+}
+
+function hashFiles(
+  stdoutPath: string,
+  stdoutBytes: number,
+  stderrPath: string,
+  stderrBytes: number,
+  identity: ToolOutputArtifactFileIdentity,
+  faults?: ToolOutputFileTestFaults,
+): string {
   const hash = createHash('sha256');
-  hashFile(stdoutPath, hash);
+  hashFile(stdoutPath, stdoutBytes, identity.stdout, hash, faults, 'stdout');
   hash.update('\0', 'utf8');
-  hashFile(stderrPath, hash);
+  hashFile(stderrPath, stderrBytes, identity.stderr, hash, faults, 'stderr');
   return hash.digest('hex');
 }
 
-function hashFile(filePath: string, hash: ReturnType<typeof createHash>): void {
-  const handle = openSync(filePath, 'r');
+function hashFile(
+  filePath: string,
+  expectedBytes: number,
+  identity: ToolOutputArtifactFileIdentity['stdout'],
+  hash: ReturnType<typeof createHash>,
+  faults: ToolOutputFileTestFaults | undefined,
+  channel: 'stdout' | 'stderr',
+): void {
+  const handle = openVerifiedArtifact(filePath, expectedBytes, identity, faults, 'hash', channel);
   const buffer = Buffer.alloc(64 * 1024);
   try {
-    let bytesRead: number;
-    do {
-      bytesRead = readSync(handle, buffer, 0, buffer.length, null);
-      if (bytesRead > 0) hash.update(buffer.subarray(0, bytesRead));
-    } while (bytesRead > 0);
+    let offset = 0;
+    while (offset < expectedBytes) {
+      const requested = Math.min(buffer.length, expectedBytes - offset);
+      let chunkBytes = 0;
+      while (chunkBytes < requested) {
+        const count = readSync(handle, buffer, chunkBytes, requested - chunkBytes, offset + chunkBytes);
+        if (count === 0) throw new Error('Tool-output hash read was shorter than committed size.');
+        chunkBytes += count;
+      }
+      hash.update(buffer.subarray(0, chunkBytes));
+      offset += chunkBytes;
+    }
+    assertArtifactDescriptor(handle, expectedBytes, identity);
   } finally {
     closeSync(handle);
   }
@@ -1396,7 +1509,9 @@ function scanText(
 }
 
 function searchFile(
-  filePath: string,
+  handle: number,
+  expectedBytes: number,
+  identity: ToolOutputArtifactFileIdentity['stdout'],
   channel: 'stdout' | 'stderr',
   query: string,
   maxMatches: number,
@@ -1404,27 +1519,26 @@ function searchFile(
   existingMatches: number,
 ): readonly ToolOutputMatch[] {
   const results: ToolOutputMatch[] = [];
-  const handle = openSync(filePath, 'r');
-  try {
-    const buffer = Buffer.alloc(64 * 1024);
-    const decoder = new StringDecoder('utf8');
-    let state = emptySearchState();
-    let bytesRead: number;
-    let chunks: string[] = [];
-    do {
-      bytesRead = readSync(handle, buffer, 0, buffer.length, null);
-      if (bytesRead > 0) chunks.push(decoder.write(buffer.subarray(0, bytesRead)));
-      if (chunks.length > 0) {
-        state = scanDecodedChunks(channel, query, maxMatches - existingMatches, maxBytes, results, chunks, state);
-        chunks = [];
-      }
-    } while (bytesRead > 0 && results.length + existingMatches < maxMatches);
-    chunks.push(decoder.end());
-    if (results.length + existingMatches < maxMatches) {
-      scanDecodedChunks(channel, query, maxMatches - existingMatches, maxBytes, results, chunks, state, true);
+  const buffer = Buffer.alloc(64 * 1024);
+  const decoder = new StringDecoder('utf8');
+  let state = emptySearchState();
+  let offset = 0;
+  while (offset < expectedBytes && results.length + existingMatches < maxMatches) {
+    const requested = Math.min(buffer.length, expectedBytes - offset);
+    let chunkBytes = 0;
+    while (chunkBytes < requested) {
+      const count = readSync(handle, buffer, chunkBytes, requested - chunkBytes, offset + chunkBytes);
+      if (count === 0) throw new Error('Tool-output search read was shorter than committed size.');
+      chunkBytes += count;
     }
-  } finally {
-    closeSync(handle);
+    offset += chunkBytes;
+    const chunks = [decoder.write(buffer.subarray(0, chunkBytes))];
+    state = scanDecodedChunks(channel, query, maxMatches - existingMatches, maxBytes, results, chunks, state);
+  }
+  assertArtifactDescriptor(handle, expectedBytes, identity);
+  const tail = decoder.end();
+  if (results.length + existingMatches < maxMatches) {
+    scanDecodedChunks(channel, query, maxMatches - existingMatches, maxBytes, results, [tail], state, true);
   }
   return results;
 }

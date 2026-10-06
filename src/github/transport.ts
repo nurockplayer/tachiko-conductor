@@ -197,10 +197,6 @@ export class NodeProcessRunner implements ProcessRunner {
     const session = new ContainedToolOutputCaptureSession(policy);
     let writer: ToolOutputCaptureWriter | undefined;
     try { writer = options.outputStore!.startCapture(policy); } catch { writer = undefined; }
-    if (options.signal?.aborted === true) {
-      try { writer?.abort?.(); } catch { /* preserve the pre-aborted child truth */ }
-      throw attachCapture(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }), this.finishCapture(undefined, session, 'cancelled', null, policy));
-    }
     // Preserve the main admission fence: capture setup is complete before this
     // synchronous callback, with no await between it and child creation.
     let child: ReturnType<typeof spawn>;

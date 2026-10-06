@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -150,6 +150,171 @@ describe('bounded tool output contract', () => {
     });
     const telemetry = attachToolOutputTelemetry(providerTelemetry({ provider: 'test', largestToolResultBytes: 12 }), output);
     assert.equal(telemetry.largestToolResultBytes, output.artifact.totalBytes);
+  });
+});
+
+describe('file-backed artifact point-of-use safety', () => {
+  it('rejects a same-length symlink swap at the hash-open boundary', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-hash-symlink-race-'));
+    const target = path.join(directory, 'same-length-target');
+    writeFileSync(target, 'evil');
+    const store = new FileToolOutputStore(directory, { testFaults: {
+      beforeHash: () => {
+        const stdoutPath = path.join(directory, readdirSync(directory).find((name) => name.endsWith('.stdout'))!);
+        unlinkSync(stdoutPath);
+        symlinkSync(target, stdoutPath);
+      },
+    } });
+    try {
+      assert.throws(() => store.save({ stdout: 'safe', stderr: '' }), /symlink|artifact|file|open/i);
+      assert.equal(readFileSync(target, 'utf8'), 'evil', 'the race target is never modified or adopted');
+      assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [], 'failed hash admission purges the replaced capture path');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('rejects symlink and same-size inode substitutions at each read and search open', () => {
+    for (const kind of ['read', 'search'] as const) {
+      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-output-${kind}-symlink-race-`));
+      const target = path.join(directory, 'same-length-target');
+      writeFileSync(target, 'evil');
+      let artifactId = '';
+      let mutated = false;
+      const store = new FileToolOutputStore(directory, { testFaults: {
+        beforeArtifactOpen: (at, channel) => {
+          if (at !== kind || channel !== 'stdout' || mutated) return;
+          mutated = true;
+          const artifactPath = path.join(directory, `${artifactId}.stdout`);
+          unlinkSync(artifactPath);
+          symlinkSync(target, artifactPath);
+        },
+      } });
+      try {
+        const artifact = store.save({ stdout: 'safe', stderr: '' });
+        artifactId = artifact.id;
+        assert.throws(() => kind === 'read'
+          ? store.read(artifact, { channel: 'stdout', offset: 0, length: 4 })
+          : store.search(artifact, { channel: 'stdout', query: 'evil' }), /unavailable|identity|regular|symlink|open/i);
+        assert.equal(readFileSync(target, 'utf8'), 'evil');
+        assert.equal(mutated, true, `${kind}: test races the actual point-of-use open after validation`);
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    }
+
+    for (const kind of ['read', 'search'] as const) {
+      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-output-${kind}-inode-race-`));
+      let artifactId = '';
+      let mutated = false;
+      const store = new FileToolOutputStore(directory, { testFaults: {
+        beforeArtifactOpen: (at, channel) => {
+          if (at !== kind || channel !== 'stdout' || mutated) return;
+          mutated = true;
+          const artifactPath = path.join(directory, `${artifactId}.stdout`);
+          unlinkSync(artifactPath);
+          writeFileSync(artifactPath, 'evil');
+        },
+      } });
+      try {
+        const artifact = store.save({ stdout: 'safe', stderr: '' });
+        artifactId = artifact.id;
+        assert.throws(() => kind === 'read'
+          ? store.read(artifact, { channel: 'stdout', offset: 0, length: 4 })
+          : store.search(artifact, { channel: 'stdout', query: 'evil' }), /unavailable|identity|size/i);
+        assert.equal(mutated, true);
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    }
+  });
+
+  it('reads and searches the verified descriptor after the artifact pathname changes', () => {
+    for (const kind of ['read', 'search'] as const) {
+      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-output-${kind}-opened-path-change-`));
+      let artifactId = '';
+      let mutated = false;
+      const store = new FileToolOutputStore(directory, { testFaults: {
+        afterArtifactOpen: (descriptor, at, channel) => {
+          if (at !== kind || channel !== 'stdout' || mutated) return;
+          assert.ok(fstatSync(descriptor).isFile(), `${kind}: seam observes the already-open regular-file descriptor`);
+          mutated = true;
+          const artifactPath = path.join(directory, `${artifactId}.stdout`);
+          unlinkSync(artifactPath);
+          writeFileSync(artifactPath, 'evil');
+        },
+      } });
+      try {
+        const artifact = store.save({ stdout: 'safe', stderr: '' });
+        artifactId = artifact.id;
+        if (kind === 'read') {
+          const result = store.read(artifact, { channel: 'stdout', offset: 0, length: 4 });
+          assert.equal(result.text, 'safe', 'read remains bound to the inode opened before the pathname changed');
+        } else {
+          const matches = store.search(artifact, { channel: 'stdout', query: 'safe' });
+          assert.equal(matches.length, 1, 'search reads the verified open descriptor');
+          assert.equal(matches[0]?.text, 'safe');
+        }
+        assert.equal(mutated, true, `${kind}: pathname changed after the descriptor was opened`);
+        assert.equal(readFileSync(path.join(directory, `${artifactId}.stdout`), 'utf8'), 'evil', 'replacement remains separate from the validated descriptor');
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    }
+  });
+
+  it('rejects wrong-size and non-regular artifacts without blocking and closes opened descriptors on faults', (context) => {
+    for (const replacement of ['wrong-size', 'directory', 'fifo'] as const) {
+      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-output-${replacement}-`));
+      let artifactId = '';
+      let mutated = false;
+      const store = new FileToolOutputStore(directory, { testFaults: {
+        beforeArtifactOpen: (kind, channel) => {
+          if (kind !== 'read' || channel !== 'stdout' || mutated) return;
+          mutated = true;
+          const artifactPath = path.join(directory, `${artifactId}.stdout`);
+          unlinkSync(artifactPath);
+          if (replacement === 'wrong-size') writeFileSync(artifactPath, 'too-long');
+          else if (replacement === 'directory') mkdirSync(artifactPath);
+          else execFileSync('mkfifo', [artifactPath], { stdio: 'ignore' });
+        },
+      } });
+      try {
+        const artifact = store.save({ stdout: 'safe', stderr: '' });
+        artifactId = artifact.id;
+        assert.throws(() => store.read(artifact, { channel: 'stdout', offset: 0, length: 4 }), /unavailable|identity|size|regular/i);
+        assert.equal(mutated, true);
+      } catch (error) {
+        if (replacement === 'fifo' && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+          context.skip('mkfifo is unavailable on this platform');
+          return;
+        }
+        throw error;
+      } finally { rmSync(directory, { recursive: true, force: true }); }
+    }
+
+    for (const failedKind of ['hash', 'read', 'search'] as const) {
+      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-output-fd-close-${failedKind}-`));
+      let artifactId = '';
+      let openedDescriptor: number | undefined;
+      const store = new FileToolOutputStore(directory, { testFaults: {
+        afterArtifactOpen: (descriptor, kind, channel) => {
+          if (kind !== failedKind || channel !== 'stdout' || openedDescriptor !== undefined) return;
+          openedDescriptor = descriptor;
+          throw new Error(`injected ${failedKind} post-open fault`);
+        },
+      } });
+      try {
+        if (failedKind === 'hash') {
+          assert.throws(() => store.save({ stdout: 'safe', stderr: '' }), /injected hash post-open fault/);
+        } else {
+          const artifact = store.save({ stdout: 'safe', stderr: '' });
+          assert.throws(() => failedKind === 'read'
+            ? store.read(artifact, { channel: 'stdout', offset: 0, length: 4 })
+            : store.search(artifact, { channel: 'stdout', query: 'safe' }), new RegExp(`injected ${failedKind} post-open fault`));
+          artifactId = artifact.id;
+        }
+        assert.ok(openedDescriptor !== undefined, `${failedKind}: descriptor-open seam was reached`);
+        assert.throws(() => fstatSync(openedDescriptor!), (error: unknown) => (error as NodeJS.ErrnoException).code === 'EBADF');
+      } finally {
+        if (artifactId !== '') {
+          for (const channel of ['stdout', 'stderr']) { try { unlinkSync(path.join(directory, `${artifactId}.${channel}`)); } catch { /* cleanup after injected fault */ } }
+        }
+        rmSync(directory, { recursive: true, force: true });
+      }
+    }
   });
 });
 

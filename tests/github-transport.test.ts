@@ -6,7 +6,7 @@ import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { GitHubLiveStateError } from '../src/github/errors.js';
-import { FileToolOutputStore } from '../src/evidence/tool-output.js';
+import { FileToolOutputStore, InMemoryToolOutputStore } from '../src/evidence/tool-output.js';
 import {
   GhCliTransport,
   NodeProcessRunner,
@@ -535,5 +535,132 @@ describe('NodeProcessRunner', () => {
         return true;
       });
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('preserves already-aborted beforeSpawn refusals across ordinary and captured commands', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-preabort-fence-parity-'));
+    const originalKill = ChildProcess.prototype.kill;
+    let invalidPidAttempts = 0;
+    ChildProcess.prototype.kill = function safeObservedKill(signal?: NodeJS.Signals | number): boolean {
+      const pid = this.pid;
+      if (!Number.isSafeInteger(pid) || (pid as number) <= 0) {
+        invalidPidAttempts += 1;
+        return false;
+      }
+      return originalKill.call(this, signal);
+    };
+    try {
+      const refusals: readonly unknown[] = [
+        Object.freeze(Object.assign(new Error('frozen pre-abort refusal'), { code: 'HOST_REFUSAL' })),
+        'primitive pre-abort refusal',
+        new Error('mutable pre-abort refusal'),
+      ];
+      const commands = [process.execPath, path.join(directory, 'missing-command')];
+      for (const mode of ['ordinary', 'captured'] as const) {
+        for (const command of commands) {
+          for (const [index, refusal] of refusals.entries()) {
+            const controller = new AbortController();
+            controller.abort();
+            let fenceCalls = 0;
+            const options = {
+              timeoutMs: 2_000,
+              signal: controller.signal,
+              beforeSpawn: () => { fenceCalls += 1; throw refusal; },
+              ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(path.join(directory, `refusal-${mode}-${path.basename(command)}-${index}`)) } : {}),
+            };
+            await assert.rejects(new NodeProcessRunner().run(command, ['-e', 'process.exit(0)'], options), (error: unknown) => {
+              assert.equal(error, refusal, `${mode}: original refusal identity wins for ${command}`);
+              return true;
+            });
+            assert.equal(fenceCalls, 1, `${mode}: the synchronous admission fence runs before abort settlement`);
+          }
+        }
+      }
+      assert.equal(invalidPidAttempts, 0, 'a throwing admission fence creates no child and no manual kill attempt');
+    } finally {
+      ChildProcess.prototype.kill = originalKill;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('reconsiders already-aborted captured valid and missing commands after the synchronous fence', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-preabort-spawn-parity-'));
+    const originalKill = ChildProcess.prototype.kill;
+    let invalidPidAttempts = 0;
+    ChildProcess.prototype.kill = function safeObservedKill(signal?: NodeJS.Signals | number): boolean {
+      const pid = this.pid;
+      if (!Number.isSafeInteger(pid) || (pid as number) <= 0) {
+        invalidPidAttempts += 1;
+        return false;
+      }
+      return originalKill.call(this, signal);
+    };
+    try {
+      for (const command of [process.execPath, path.join(directory, 'missing-command')]) {
+        const controller = new AbortController();
+        controller.abort();
+        let fenceCalls = 0;
+        await assert.rejects(new NodeProcessRunner().run(command, ['-e', 'setTimeout(() => process.exit(0), 300)'], {
+          timeoutMs: 2_000,
+          signal: controller.signal,
+          outputStore: new FileToolOutputStore(path.join(directory, `capture-${path.basename(command)}`)),
+          beforeSpawn: () => { fenceCalls += 1; },
+        }), (error: unknown) => {
+          assert.equal((error as NodeJS.ErrnoException).code, 'ABORT_ERR');
+          return true;
+        });
+        assert.equal(fenceCalls, 1, 'pre-abort does not skip the authority fence');
+      }
+      assert.equal(invalidPidAttempts, 0, 'only successfully spawned children with valid PIDs can be terminated');
+    } finally {
+      ChildProcess.prototype.kill = originalKill;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves actual kill exceptions with main-equivalent abort and timeout precedence', async () => {
+    const originalKill = ChildProcess.prototype.kill;
+    try {
+      for (const trigger of ['abort', 'timeout'] as const) {
+        for (const mode of ['ordinary', 'captured'] as const) {
+          const controller = new AbortController();
+          const refusal = Object.assign(new Error('synthetic positive-PID kill refusal'), { code: 'EIO' });
+          let calls = 0;
+          ChildProcess.prototype.kill = function safeThrowingKill(): boolean {
+            assert.ok(Number.isSafeInteger(this.pid) && this.pid! > 0, 'only a real spawned positive PID reaches the injected failure');
+            calls += 1;
+            throw refusal;
+          };
+          const startedAt = Date.now();
+          const pending = new NodeProcessRunner().run(process.execPath, ['-e', 'setTimeout(() => process.exit(0), 400)'], {
+            timeoutMs: trigger === 'timeout' ? 100 : 1_000,
+            ...(trigger === 'abort' ? { signal: controller.signal } : {}),
+            ...(mode === 'captured' ? { outputStore: new InMemoryToolOutputStore() } : {}),
+          });
+          const timer = trigger === 'abort' ? setTimeout(() => controller.abort(), 100) : undefined;
+          try {
+          await assert.rejects(pending, (error: unknown) => {
+              if (trigger === 'abort') {
+                assert.equal((error as NodeJS.ErrnoException).code, 'ABORT_ERR', `${mode}: current aborted-state precedence matches execFile`);
+              } else {
+                assert.equal(error, refusal, `${mode}: a non-aborted timeout preserves the exact kill error`);
+                assert.equal((error as NodeJS.ErrnoException).code, 'EIO');
+              }
+              if (mode === 'captured') {
+                const value = error as NodeJS.ErrnoException & { readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown }; readonly output?: unknown };
+                assert.equal(value.captureStatus, 'partial');
+                assert.equal(value.captureObservation?.status, 'partial');
+                assert.equal(value.output, undefined);
+              }
+              return true;
+            });
+            assert.equal(calls, 1, `${trigger}/${mode}: exactly one valid-PID termination attempt`);
+            assert.ok(Date.now() - startedAt < 350, `${trigger}/${mode}: kill failure settles without waiting for child exit`);
+          } finally {
+            if (timer !== undefined) clearTimeout(timer);
+          }
+        }
+      }
+    } finally { ChildProcess.prototype.kill = originalKill; }
   });
 });
