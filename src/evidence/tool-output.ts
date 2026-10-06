@@ -93,7 +93,9 @@ export interface ToolOutputCaptureWriter {
 
 export interface ToolOutputReadRequest {
   readonly channel: 'stdout' | 'stderr';
+  /** A byte offset inside a UTF-8 character is aligned back to its start. */
   readonly offset?: number;
+  /** Byte budget; a first character that cannot fit is returned whole (at most 4 bytes). */
   readonly length?: number;
 }
 
@@ -372,12 +374,24 @@ function validateReadRequest(reference: ToolOutputArtifactReference, request: To
   return { offset, length, total };
 }
 
-function readStringRange(value: string, offset: number, length: number): ToolOutputReadResult {
-  const bytes = Buffer.from(value, 'utf8');
-  const chunk = bytes.subarray(offset, Math.min(bytes.length, offset + length));
+function readUtf8Range(bytes: Buffer, bufferOffset: number, offset: number, length: number, total: number): ToolOutputReadResult {
+  // Both stores supply up to three bytes of lookbehind/lookahead so a valid
+  // UTF-8 character is never decoded from an isolated partial byte sequence.
+  let start = offset - bufferOffset;
+  while (start > 0 && (bytes[start]! & 0xc0) === 0x80) start -= 1;
+  let end = start + Math.min(length, bytes.length - start);
+  while (end > start && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  if (end === start && start < bytes.length) {
+    // Even a one-byte budget must make progress. Return only the first whole
+    // character when it is larger than the budget, never a replacement glyph.
+    end = start + 1;
+    while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end += 1;
+  }
+  const chunk = bytes.subarray(start, end);
   const text = chunk.toString('utf8');
-  const nextOffset = Math.min(bytes.length, offset + chunk.length);
-  return { channel: 'stdout', offset, text, bytes: chunk.length, nextOffset, eof: nextOffset >= bytes.length };
+  const actualOffset = bufferOffset + start;
+  const nextOffset = actualOffset + chunk.length;
+  return { channel: 'stdout', offset: actualOffset, text, bytes: chunk.length, nextOffset, eof: nextOffset >= total };
 }
 
 export class InMemoryToolOutputStore implements ToolOutputStore {
@@ -410,7 +424,8 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
     if (capture === undefined) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable.`);
     const range = validateReadRequest(referenceValue, request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
     const value = request.channel === 'stdout' ? capture.stdout : capture.stderr;
-    const result = readStringRange(value, range.offset, range.length);
+    const bytes = Buffer.from(value, 'utf8');
+    const result = readUtf8Range(bytes, 0, range.offset, range.length, bytes.length);
     return { ...result, channel: request.channel };
   }
 
@@ -459,11 +474,17 @@ export class FileToolOutputStore implements ToolOutputStore {
     if (!existsSync(filePath)) return this.fallback.read(referenceValue, request);
     const handle = openSync(filePath, 'r');
     try {
-      const buffer = Buffer.alloc(Math.min(range.length, range.total - range.offset));
-      const bytes = readSync(handle, buffer, 0, buffer.length, range.offset);
-      const text = buffer.subarray(0, bytes).toString('utf8');
-      const nextOffset = range.offset + bytes;
-      return { channel: request.channel, offset: range.offset, text, bytes, nextOffset, eof: nextOffset >= range.total };
+      const bufferOffset = Math.max(0, range.offset - 3);
+      const requestedBytes = Math.min(range.length, range.total - range.offset);
+      const buffer = Buffer.alloc(Math.min(range.total - bufferOffset, range.offset - bufferOffset + requestedBytes + 3));
+      let bytes = 0;
+      while (bytes < buffer.length) {
+        const count = readSync(handle, buffer, bytes, buffer.length - bytes, bufferOffset + bytes);
+        if (count === 0) break;
+        bytes += count;
+      }
+      const result = readUtf8Range(buffer.subarray(0, bytes), bufferOffset, range.offset, range.length, range.total);
+      return { ...result, channel: request.channel };
     } finally {
       closeSync(handle);
     }

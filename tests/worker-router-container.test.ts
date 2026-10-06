@@ -19,7 +19,6 @@ import {
   type WorkerContainerSpec,
 } from '../src/agents/worker-router-container.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
-import { InMemoryToolOutputStore, boundToolOutput, searchToolOutput } from '../src/evidence/tool-output.js';
 
 const ID = 'ab'.repeat(32);
 const IMAGE = `tachiko/worker-router@sha256:${'c'.repeat(64)}`;
@@ -212,8 +211,7 @@ describe('ContainerWorkerBoundary', () => {
     assert.equal(result.restartPolicy, 'no');
     assert.equal(result.stdout, 'out');
     assert.equal(result.stderr, 'err');
-    assert.equal(result.output?.outcome, 'passed');
-    assert.equal(result.output?.exitCode, 0);
+    assert.equal(Object.hasOwn(result, 'output'), false);
     assert.deepEqual(runtime.calls, [
       'create',
       `start:${ID}`,
@@ -235,27 +233,12 @@ describe('ContainerWorkerBoundary', () => {
     assert.equal(runtime.calls.filter((call) => call === `remove:${ID}`).length, 1);
   });
 
-  it('retains bounded log-retrieval overflow evidence after the container is terminal', async () => {
+  it('returns terminal logs transiently without creating a provider evidence artifact', async () => {
     const runtime = new FakeRuntime();
-    const store = new InMemoryToolOutputStore();
-    const secret = 'sk-live-secret';
-    const output = boundToolOutput({
-      outcome: 'failed', exitCode: null, stdout: `partial worker log ${secret}`, stderr: '',
-      store: new InMemoryToolOutputStore(), captureTruncated: true,
-    });
-    runtime.logsResult = new WorkerRouterContainerError(
-      WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED,
-      'docker logs exceeded the capture limit',
-      undefined,
-      output,
-    );
-
-    const result = await new ContainerWorkerBoundary({ runtime, outputStore: store }).run(spec({ env: { HOME: '/root', DEEPSEEK_API_KEY: secret } }));
-
-    assert.equal(result.output?.overflow.capture, true);
-    assert.ok((result.output?.artifact.totalBytes ?? 0) > 0);
-    assert.equal(result.stdout.includes(secret), false);
-    assert.equal(searchToolOutput(result.output!, store, { query: secret }).length, 0);
+    runtime.logsResult = { stdout: 'transient worker output', stderr: '' };
+    const result = await new ContainerWorkerBoundary({ runtime }).run(spec());
+    assert.equal(result.stdout, 'transient worker output');
+    assert.equal(Object.hasOwn(result, 'output'), false);
     assert.equal(runtime.calls.includes(`remove:${ID}`), true);
   });
 
@@ -278,38 +261,22 @@ describe('ContainerWorkerBoundary', () => {
     assert.equal(runtime.calls.filter((call) => call === 'create').length, 1);
   });
 
-  it('redacts timeout evidence before returning it from the container boundary', async () => {
+  it('does not persist process evidence attached to a timeout error', async () => {
     const runtime = new FakeRuntime();
-    const store = new InMemoryToolOutputStore();
-    const secret = 'sk-timeout-secret';
     runtime.startError = new WorkerRouterContainerError(
       WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT,
       'worker timed out',
-      undefined,
-      boundToolOutput({
-        outcome: 'timed_out',
-        exitCode: null,
-        stdout: `worker stdout ${secret}`,
-        stderr: `worker stderr ${secret}`,
-        store: new InMemoryToolOutputStore(),
-      }),
     );
 
     let thrown: unknown;
     try {
-      await new ContainerWorkerBoundary({ runtime, outputStore: store }).run(
-        spec({ env: { HOME: '/root', DEEPSEEK_API_KEY: secret } }),
-      );
+      await new ContainerWorkerBoundary({ runtime }).run(spec());
     } catch (error) {
       thrown = error;
     }
     assert.ok(thrown instanceof WorkerRouterContainerError);
     assert.equal(thrown.code, WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT);
-    assert.ok(thrown.output);
-    assert.equal(thrown.output.stdout.preview.includes(secret), false);
-    assert.equal(thrown.output.stderr.preview.includes(secret), false);
-    assert.equal(thrown.output.diagnostics.some((line) => line.includes(secret)), false);
-    assert.equal(searchToolOutput(thrown.output, store, { query: secret }).length, 0);
+    assert.equal(Object.hasOwn(thrown, 'output'), false);
   });
 
   it('cleans up by exact ID on cancellation and reports a single bounded cleanup', async () => {

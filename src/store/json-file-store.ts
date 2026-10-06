@@ -6,7 +6,6 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '..
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetry.js';
-import { isToolOutputEnvelope } from '../evidence/tool-output.js';
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
@@ -146,7 +145,7 @@ function isAgentResult(value: unknown): boolean {
     (result.executor === undefined || isExecutorIdentity(result.executor)) &&
     isOptionalNonEmptyString(result.sessionId) &&
     isOptionalDuration(result.durationMs) &&
-    (result.output === undefined || isToolOutputEnvelope(result.output)) &&
+    result.output === undefined &&
     (result.telemetry === undefined || isProviderExecutionTelemetry(result.telemetry))
   );
 }
@@ -328,6 +327,13 @@ function isRun(value: unknown): value is Run {
     (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
   );
+}
+
+function assertNoRawProviderOutput(run: Run): void {
+  const agentResult = run.agentResult as unknown as Record<string, unknown> | undefined;
+  if (agentResult?.output !== undefined) {
+    throw new Error('Refusing to persist raw provider output artifacts.');
+  }
 }
 
 /** Write atomically and durably: sync the private temp before rename and its parent after rename. */
@@ -554,6 +560,7 @@ export class JsonFileStore implements RunStore {
 
   create(run: Run): void {
     this.withMutationLock(run.id, () => {
+      assertNoRawProviderOutput(run);
       const filePath = this.filePathFor(run.id);
       this.assertSafeRunFile(filePath);
       if (existsSync(filePath)) {
@@ -573,6 +580,7 @@ export class JsonFileStore implements RunStore {
 
   update(run: Run): void {
     this.withMutationLock(run.id, () => {
+      assertNoRawProviderOutput(run);
       const filePath = this.filePathFor(run.id);
       this.assertSafeRunFile(filePath);
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
@@ -586,6 +594,7 @@ export class JsonFileStore implements RunStore {
   updateIfUnchanged(expected: Run, next: Run): boolean {
     if (expected.id !== next.id) throw new Error('updateIfUnchanged requires expected and next to name the same Run id.');
     return this.withMutationLock(expected.id, () => {
+      assertNoRawProviderOutput(next);
       const filePath = this.filePathFor(expected.id);
       this.assertSafeRunFile(filePath);
       const current = readRun(filePath, expected.id);

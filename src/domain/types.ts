@@ -9,7 +9,6 @@
 
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
-import type { ToolOutputEnvelope } from '../evidence/tool-output.js';
 import type { RepairAdmissionSnapshot, RepairExecutorHandoff, RepairHandoffRecord, RepairTaskShapeAuthority } from './repair-admission.js';
 
 /** The work item a run operates on. */
@@ -29,6 +28,8 @@ export interface RepositoryTarget {
   readonly owner: string;
   readonly repo: string;
   readonly branch: string;
+  /** Existing same-repository PR branch that host publication must advance. */
+  readonly publicationBranch?: string;
 }
 
 /** Explicit workflow states (issue #2). */
@@ -59,6 +60,8 @@ export const TRANSITION_TYPES = [
   'review_approved',
   'changes_requested',
   'start_fix',
+  'repair_executor_handoff',
+  'repair_executor_continued',
   'revalidate',
   'gate_blocked',
   'merged',
@@ -73,12 +76,15 @@ export type TransitionType = (typeof TRANSITION_TYPES)[number];
 
 /** Immutable local identity selected before an issue implementation begins. */
 export interface ImplementationBootstrapIdentity {
+  /** Durable workspace boundary; never infer this from an operator path. */
+  readonly bootstrapKind: 'linked-worktree' | 'standalone-isolated';
   readonly owner: string;
   readonly repo: string;
   readonly issueNumber: number;
   readonly baseBranch: string;
   readonly baseSha: string;
   readonly branch: string;
+  readonly publicationBranch?: string;
   readonly workspacePath: string;
 }
 
@@ -113,12 +119,10 @@ export interface AgentResult {
   readonly executor?: ExecutorIdentity;
   /** Opaque executor session token used to continue this logical run. */
   readonly sessionId?: string;
-  /** Wall-clock execution duration. Raw transcripts and hidden reasoning are never retained; bounded evidence is supplemental. */
+  /** Wall-clock execution duration. Raw transcripts and hidden reasoning are never retained. */
   readonly durationMs?: number;
   /** Structured provider usage/provenance only; never raw output or hidden reasoning. */
   readonly telemetry?: ProviderExecutionTelemetry;
-  /** Bounded command/provider evidence with an explicit artifact drill-down. */
-  readonly output?: ToolOutputEnvelope;
 }
 
 export type ReviewVerdict = 'approve' | 'request_changes';
@@ -142,18 +146,16 @@ export interface ReviewResult {
 /** A fail-closed validation outcome. `waiting` is reserved for a re-checkable external dependency. */
 export type ValidationStatus = 'passed' | 'failed' | 'waiting' | 'unknown';
 
-/** Compact result for one explicitly configured local command; output evidence is bounded and supplemental. */
+/** Compact, secret-free result for one explicitly configured local command. */
 export interface LocalValidationCommandEvidence {
   readonly commandIndex: number;
   readonly executable: string;
   readonly outcome: 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed';
   readonly exitCode: number | null;
   readonly durationMs: number;
-  /** Bounded stdout/stderr evidence; exitCode/outcome remain authoritative. */
-  readonly output?: ToolOutputEnvelope;
 }
 
-/** Durable provenance for deterministic local validation; output evidence never becomes validation authority. */
+/** Durable provenance for deterministic local validation. It intentionally excludes command output. */
 export interface LocalValidationEvidence {
   readonly status: Exclude<ValidationStatus, 'waiting'>;
   readonly configRevision: string | null;
@@ -211,6 +213,10 @@ export interface TransitionRecord {
   readonly to: WorkflowState;
   readonly at: string;
   readonly reason?: string;
+  /** Typed one-time executor handoff evidence recorded with repair completion telemetry. */
+  readonly repairHandoff?: RepairHandoffRecord;
+  /** Receipt ordinal atomically appended with this start_fix event. */
+  readonly repairAdmissionIndex?: number;
 }
 
 /** Payload for a single transition application. */
@@ -227,6 +233,10 @@ export interface TransitionInput {
   readonly headSha?: string;
   /** Executor identity captured while an implementation is interrupted for human takeover. */
   readonly executor?: ExecutorIdentity;
+  /** New append-only admission receipt atomically bound to this exact start_fix event. */
+  readonly repairAdmission?: RepairAdmissionSnapshot;
+  /** Provider-qualified executor identity, or an explicit worker-router sessionless result. */
+  readonly repairAgentResult?: AgentResult;
   /** Durable branch/worktree identity produced before an issue starts without a PR. */
   readonly bootstrap?: ImplementationBootstrapIdentity;
   /** Live PR identity captured with a successful implementation or validation. */
@@ -253,6 +263,10 @@ export interface Run {
   readonly history: readonly TransitionRecord[];
   /** Steward-selected, immutable secret-free executor snapshot for this run. */
   readonly execution?: ResolvedExecutionConfiguration;
+  /** Optional for legacy JSON; when present it is the only repair shape authority. */
+  readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
+  /** Append-only, exact-HEAD/PR-bound repair authorizations. */
+  readonly repairAdmissions?: readonly RepairAdmissionSnapshot[];
   /** While paused in WAITING_DEPENDENCY / NEEDS_HUMAN, the state to resume to. */
   readonly interruptedFrom?: WorkflowState;
   readonly interrupt?: Interrupt;

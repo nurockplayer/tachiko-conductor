@@ -111,7 +111,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(result.commands[0]?.executable, process.execPath);
     assert.equal(result.commands[0]?.outcome, 'passed');
     assert.equal(result.commands[0]?.exitCode, 0);
-    assert.equal(result.commands[0]?.output?.outcome, 'passed');
+    assert.equal(Object.hasOwn(result.commands[0]!, 'output'), false);
     assert.equal(Object.hasOwn(result.commands[0]!, 'argv'), false);
   });
 

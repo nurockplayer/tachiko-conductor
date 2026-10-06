@@ -1021,8 +1021,7 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.agentResult?.durationMs, 125);
   });
 
-  it('persists bounded output metadata without making it validation authority', () => {
-    const { dir } = tempStore();
+  it('rejects raw provider output before create, update, or CAS can persist it', () => {
     const evidence = boundToolOutput({
       outcome: 'failed',
       exitCode: 7,
@@ -1031,17 +1030,31 @@ describe('JsonFileStore — persistence round-trips', () => {
       store: new InMemoryToolOutputStore(),
       policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
     });
-    let run = applyTransition(newRun('output-run'), { type: 'start' }, T0);
-    run = applyTransition(run, {
-      type: 'agent_failed',
-      agentResult: { exitStatus: 'failure', summary: 'failed', output: evidence },
-    }, T0);
-    new JsonFileStore({ dir }).create(run);
+    const withRawOutput = (run: Run): Run => ({
+      ...run,
+      agentResult: { exitStatus: 'failure', summary: 'failed', output: evidence } as never,
+    });
 
-    const loaded = new JsonFileStore({ dir }).read('output-run');
-    assert.equal(loaded?.agentResult?.output?.exitCode, 7);
-    assert.equal(loaded?.agentResult?.output?.overflow.truncated, true);
-    assert.equal(loaded?.state, 'FAILED');
+    const createStore = tempStore();
+    const createRun = withRawOutput(newRun('raw-output-create'));
+    assert.throws(() => createStore.store.create(createRun), /raw provider output artifacts/);
+    assert.equal(existsSync(path.join(createStore.dir, `${createRun.id}.json`)), false);
+
+    const updateStore = tempStore();
+    const updateRun = newRun('raw-output-update');
+    updateStore.store.create(updateRun);
+    const updateRunPath = path.join(updateStore.dir, `${updateRun.id}.json`);
+    const updateBytes = readFileSync(updateRunPath, 'utf8');
+    assert.throws(() => updateStore.store.update(withRawOutput(updateRun)), /raw provider output artifacts/);
+    assert.equal(readFileSync(updateRunPath, 'utf8'), updateBytes);
+
+    const casStore = tempStore();
+    const casRun = newRun('raw-output-cas');
+    casStore.store.create(casRun);
+    const casRunPath = path.join(casStore.dir, `${casRun.id}.json`);
+    const casBytes = readFileSync(casRunPath, 'utf8');
+    assert.throws(() => casStore.store.updateIfUnchanged(casRun, withRawOutput(casRun)), /raw provider output artifacts/);
+    assert.equal(readFileSync(casRunPath, 'utf8'), casBytes);
   });
 
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {

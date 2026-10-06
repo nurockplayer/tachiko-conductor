@@ -1,35 +1,19 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
 import { describe, it } from 'node:test';
 
-import { ConfiguredLocalValidationAdapter } from '../src/validation/local-command.js';
 import { FileToolOutputStore, InMemoryToolOutputStore, searchToolOutput } from '../src/evidence/tool-output.js';
 import { NodeProcessRunner } from '../src/github/transport.js';
-
-const TARGET = { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 49 };
-
-function workspace(): { readonly path: string; readonly headSha: string } {
-  const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-integration-'));
-  for (const args of [['init'], ['config', 'user.email', 'output@example.test'], ['config', 'user.name', 'Output'], ['add', '.'], ['commit', '-m', 'initial']]) {
-    if (args[0] === 'add') writeFileSync(path.join(directory, 'README.md'), 'output\n');
-    assert.equal(spawnSync('git', ['-C', directory, ...args], { encoding: 'utf8' }).status, 0);
-  }
-  return {
-    path: directory,
-    headSha: spawnSync('git', ['-C', directory, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim(),
-  };
-}
 
 describe('bounded output integration', () => {
   it('attaches bounded evidence to a real command while retaining the exact exit code', async () => {
     const store = new InMemoryToolOutputStore();
-    const result = await new NodeProcessRunner({ outputStore: store, outputPolicy: { previewBytes: 64, diagnosticBytes: 256, maxDiagnostics: 4, readBytes: 128 } }).run(
+    const result = await new NodeProcessRunner({ outputPolicy: { previewBytes: 64, diagnosticBytes: 256, maxDiagnostics: 4, readBytes: 128 } }).run(
       process.execPath,
       ['-e', "process.stdout.write('x'.repeat(20000)); process.stderr.write('ERROR: command failed\\\\n'); process.exit(23)"],
-      { timeoutMs: 5_000 },
+      { timeoutMs: 5_000, outputStore: store },
     );
 
     assert.equal(result.exitCode, 23);
@@ -42,10 +26,10 @@ describe('bounded output integration', () => {
   it('keeps bounded timeout evidence available to the caller', async () => {
     const store = new InMemoryToolOutputStore();
     await assert.rejects(
-      new NodeProcessRunner({ outputStore: store }).run(
+      new NodeProcessRunner().run(
         process.execPath,
         ['-e', "process.stderr.write('ERROR: timeout evidence\\n'); setTimeout(() => {}, 1000)"],
-        { timeoutMs: 200 },
+        { timeoutMs: 200, outputStore: store },
       ),
       (error: unknown) => {
         const value = error as { readonly code?: unknown; readonly output?: { readonly outcome?: unknown; readonly diagnostics?: readonly string[] } };
@@ -60,10 +44,10 @@ describe('bounded output integration', () => {
   it('preserves explicit overflow evidence when execFile reaches its safety cap', async () => {
     const store = new InMemoryToolOutputStore();
     await assert.rejects(
-      new NodeProcessRunner({ outputStore: store }).run(
+      new NodeProcessRunner().run(
         process.execPath,
         ['-e', "process.stdout.write('x'.repeat(17 * 1024 * 1024))"],
-        { timeoutMs: 10_000 },
+        { timeoutMs: 10_000, outputStore: store },
       ),
       (error: unknown) => {
         const value = error as { readonly code?: unknown; readonly output?: { readonly overflow?: { readonly capture?: boolean }; readonly artifact?: { readonly totalBytes?: number } } };
@@ -79,10 +63,10 @@ describe('bounded output integration', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-file-output-'));
     try {
       const store = new FileToolOutputStore(directory);
-      const result = await new NodeProcessRunner({ outputStore: store }).run(
+      const result = await new NodeProcessRunner().run(
         process.execPath,
         ['-e', "process.stdout.write('α\\r\\nneedle here\\r\\nend\\r\\n')"],
-        { timeoutMs: 5_000 },
+        { timeoutMs: 5_000, outputStore: store },
       );
       const matches = searchToolOutput(result.output!, store, { channel: 'stdout', query: 'needle' });
       assert.deepEqual(matches, [{ channel: 'stdout', line: 2, offset: 4, text: 'needle here' }]);
@@ -96,15 +80,15 @@ describe('bounded output integration', () => {
     try {
       const fileStore = new FileToolOutputStore(directory);
       const bufferedStore = new InMemoryToolOutputStore();
-      const fileResult = await new NodeProcessRunner({ outputStore: fileStore }).run(
+      const fileResult = await new NodeProcessRunner().run(
         process.execPath,
         ['-e', "process.stdout.write('hash stdout'); process.stderr.write('hash stderr')"],
-        { timeoutMs: 5_000 },
+        { timeoutMs: 5_000, outputStore: fileStore },
       );
-      const bufferedResult = await new NodeProcessRunner({ outputStore: bufferedStore }).run(
+      const bufferedResult = await new NodeProcessRunner().run(
         process.execPath,
         ['-e', "process.stdout.write('hash stdout'); process.stderr.write('hash stderr')"],
-        { timeoutMs: 5_000 },
+        { timeoutMs: 5_000, outputStore: bufferedStore },
       );
 
       assert.equal(fileResult.output?.artifact.sha256, bufferedResult.output?.artifact.sha256);
@@ -113,27 +97,28 @@ describe('bounded output integration', () => {
     }
   });
 
-  it('records validation output without changing exact-HEAD acceptance', async () => {
-    const owned = workspace();
+  it('does not create raw artifacts when a generic command only sets a preview policy', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-no-default-evidence-'));
+    const prior = process.env.TACHIKO_EVIDENCE_DIR;
     try {
-      const store = new InMemoryToolOutputStore();
-      const result = await new ConfiguredLocalValidationAdapter({
-        revision: 'output-v1',
-        outputStore: store,
-        outputPolicy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
-        commands: [{
-          argv: [process.execPath, '-e', "process.stdout.write('validation '.repeat(200));"],
-          timeoutMs: 5_000,
-        }],
-      }).validate({ target: TARGET, headSha: owned.headSha, workspacePath: owned.path });
-
-      assert.equal(result.status, 'passed');
-      assert.equal(result.commands[0]?.exitCode, 0);
-      assert.equal(result.commands[0]?.output?.overflow.truncated, true);
-      assert.equal(result.commands[0]?.output?.exitCode, 0);
-      assert.equal(spawnSync('git', ['-C', owned.path, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim(), owned.headSha);
+      process.env.TACHIKO_EVIDENCE_DIR = directory;
+      const runner = new NodeProcessRunner({
+        outputStore: new FileToolOutputStore(directory),
+        outputPolicy: { previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 64 },
+      });
+      if (prior === undefined) delete process.env.TACHIKO_EVIDENCE_DIR;
+      else process.env.TACHIKO_EVIDENCE_DIR = prior;
+      const result = await runner.run(process.execPath, ['-e', "process.stdout.write('private output')"], {
+        timeoutMs: 5_000,
+        outputPolicy: { previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 64 },
+      });
+      assert.equal(result.stdout, 'private output');
+      assert.equal(result.output, undefined);
+      assert.deepEqual(readdirSync(directory), []);
     } finally {
-      rmSync(owned.path, { recursive: true, force: true });
+      if (prior === undefined) delete process.env.TACHIKO_EVIDENCE_DIR;
+      else process.env.TACHIKO_EVIDENCE_DIR = prior;
+      rmSync(directory, { recursive: true, force: true });
     }
   });
 });

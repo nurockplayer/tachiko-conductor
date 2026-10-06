@@ -184,13 +184,20 @@ describe('CodexCliAdapter', () => {
   const HEAD = '9d9cc7d210960f3c81d7d7498a36f65c67b9f4a9';
 
   it('runs a fresh Codex exec with an argument array and returns its exact HEAD and thread identity', async () => {
-    const runner = new FakeRunner([result(codexJsonl()), result(HEAD)]);
+    const sentinel = 'PRIVATE_PROVIDER_TRANSCRIPT_SENTINEL';
+    const output = boundToolOutput({
+      outcome: 'passed', exitCode: 0, stdout: sentinel, stderr: '', store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
+    });
+    const runner = new FakeRunner([{ ...result(codexJsonl()), output }, result(HEAD)]);
     const adapter = new CodexCliAdapter({ runner, cwd: '/tmp/repo', timeoutMs: 9000 });
 
     const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1' });
 
     assert.equal(agentResult.exitStatus, 'success');
     assert.equal(agentResult.summary, 'Implemented Issue #15.');
+    assert.equal(Object.hasOwn(agentResult, 'output'), false);
+    assert.doesNotMatch(JSON.stringify(agentResult), new RegExp(sentinel));
     assert.equal(agentResult.headSha, HEAD);
     assert.deepEqual(agentResult.executor, {
       provider: 'codex-cli',
@@ -299,13 +306,15 @@ describe('CodexCliAdapter', () => {
   });
 
   it('maps timeout, cancellation, missing executable, non-zero exit, and malformed output to typed failures', async () => {
+    const sentinel = 'PRIVATE_PROVIDER_TRANSCRIPT_SENTINEL';
     const cases: Array<{ outcome: ProcessResult | Error; code: string }> = [
-      { outcome: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }), code: 'CODEX_TIMEOUT' },
-      { outcome: Object.assign(new Error('aborted'), { code: 'ABORT_ERR' }), code: 'CODEX_CANCELLED' },
-      { outcome: Object.assign(new Error('spawn codex ENOENT'), { code: 'ENOENT' }), code: 'CODEX_NOT_FOUND' },
-      { outcome: result('', 'auth failed', 1), code: 'CODEX_EXIT_FAILURE' },
-      { outcome: result('{bad json'), code: 'CODEX_INVALID_OUTPUT' },
-      { outcome: result(JSON.stringify({ type: 'turn.completed' })), code: 'CODEX_INVALID_OUTPUT' },
+      { outcome: Object.assign(new Error(`timed out: ${sentinel}`), { code: 'ETIMEDOUT', processOutput: sentinel }), code: 'CODEX_TIMEOUT' },
+      { outcome: Object.assign(new Error(`aborted: ${sentinel}`), { code: 'ABORT_ERR', processOutput: sentinel }), code: 'CODEX_CANCELLED' },
+      { outcome: Object.assign(new Error(`spawn codex ENOENT: ${sentinel}`), { code: 'ENOENT', processOutput: sentinel }), code: 'CODEX_NOT_FOUND' },
+      { outcome: Object.assign(new Error(`spawn failed: ${sentinel}`), { code: 'EIO', processOutput: sentinel }), code: 'CODEX_EXEC_FAILURE' },
+      { outcome: result('', `auth failed ${sentinel}`, 1), code: 'CODEX_EXIT_FAILURE' },
+      { outcome: result(`{bad json ${sentinel}`), code: 'CODEX_INVALID_OUTPUT' },
+      { outcome: result(JSON.stringify({ type: 'turn.completed' }), sentinel), code: 'CODEX_INVALID_OUTPUT' },
       {
         outcome: result([
           JSON.stringify({ type: 'thread.started', thread_id: '0199a213-81c0-7800-8aa1-bbab2a035a53' }),
@@ -322,10 +331,12 @@ describe('CodexCliAdapter', () => {
       assert.equal(agentResult.exitStatus, 'failure', code);
       assert.match(agentResult.diagnostics?.join('\n') ?? '', new RegExp(code));
       assert.equal(runner.calls.length, 1);
+      assert.doesNotMatch(JSON.stringify(agentResult), new RegExp(sentinel));
+      assert.equal(Object.hasOwn(agentResult, 'output'), false);
     }
   });
 
-  it('preserves bounded provider failure evidence without weakening exact-HEAD handling', async () => {
+  it('does not attach injected provider output evidence or weaken exact-HEAD handling', async () => {
     const output = boundToolOutput({
       outcome: 'failed', exitCode: 17, stdout: 'noise '.repeat(100), stderr: 'ERROR: provider failed\n',
       store: new InMemoryToolOutputStore(),
@@ -335,8 +346,8 @@ describe('CodexCliAdapter', () => {
     const agentResult = await new CodexCliAdapter({ runner, cwd: '/tmp/repo' }).run({ target: TARGET, baseSha: 'base-1' });
 
     assert.equal(agentResult.exitStatus, 'failure');
-    assert.equal(agentResult.output?.exitCode, 17);
-    assert.equal(agentResult.output?.overflow.truncated, true);
+    assert.equal(Object.hasOwn(agentResult, 'output'), false);
+    assert.doesNotMatch(JSON.stringify(agentResult), /ERROR: provider failed/);
     assert.equal(runner.calls.length, 1);
   });
 
