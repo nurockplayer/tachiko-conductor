@@ -15,7 +15,6 @@ import {
   boundedMessage,
   isWorkerRouterContainerError,
   planCommitOnlyMounts,
-  redactWorkerEnvValues,
   resolveWorkerNetworkMode,
   type ContainerWorkerExecution,
   type ContainerWorkerResult,
@@ -147,7 +146,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       result = await this.container.run(spec);
     } catch (error) {
       if (isExecutionAdmissionRefusal(error)) throw error;
-      return this.containerFailure(error, request.signal, startedAt, spec.env);
+      return this.containerFailure(error, request.signal, startedAt);
     }
     const provenance = workerProvenance(result.stderr);
     const diagnostics = boundedDiagnostics(result.stderr, result.stdout, provenance);
@@ -225,7 +224,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     return forwarded;
   }
 
-  private containerFailure(error: unknown, signal: AbortSignal | undefined, startedAt: number, env: Readonly<Record<string, string>>): AgentResult {
+  private containerFailure(error: unknown, signal: AbortSignal | undefined, startedAt: number): AgentResult {
     const durationMs = elapsed(startedAt);
     const containerCode = isWorkerRouterContainerError(error) ? error.code : undefined;
     if (isAborted(signal) || containerCode === WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED) {
@@ -234,8 +233,11 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     if (containerCode === WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT) {
       return failure(WORKER_ROUTER_ERROR_CODE.TIMEOUT, `Worker router container timed out after ${this.timeoutMs}ms.`, durationMs);
     }
-    const message = redactWorkerEnvValues(boundedMessage(error), env);
-    return failure(adapterCodeFor(containerCode), `Worker router container failed closed: ${message}`, durationMs);
+    // Container/runtime errors are untrusted: they may embed worker stdout,
+    // stderr, prompts, or secrets. Keep only the typed category in durable
+    // AgentResult summaries; arbitrary exception messages remain transient.
+    const safeCategory = containerCode ?? 'unknown container failure';
+    return failure(adapterCodeFor(containerCode), `Worker router container failed closed (${safeCategory}).`, durationMs);
   }
 
   private async verifyBaseAncestry(

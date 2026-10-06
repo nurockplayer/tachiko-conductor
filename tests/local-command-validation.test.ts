@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, writeSync as fsWriteSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -8,6 +8,7 @@ import { afterEach, describe, it } from 'node:test';
 
 import { ConfiguredLocalValidationAdapter, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
+import { FileToolOutputStore, readToolOutput } from '../src/evidence/tool-output.js';
 import { TARGET } from './helpers.js';
 
 const dirs: string[] = [];
@@ -568,6 +569,62 @@ describe('ConfiguredLocalValidationAdapter', () => {
       }).validate({ target: { ...TARGET, repo: 'other' }, headSha: existing.headSha })).status,
       'unknown',
     );
+  });
+
+  it('persists bounded local-command evidence under one validation-owned operation', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-evidence-'));
+    dirs.push(root);
+    const outputStore = new FileToolOutputStore(path.join(root, 'store'));
+    let beforeSpawnCalls = 0;
+    const evidence = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', "process.stdout.write('VALIDATION-MARKER\\n')"]),
+      outputStore,
+      outputPolicy: { previewBytes: 16, diagnosticBytes: 64, maxDiagnostics: 4, readBytes: 32 },
+    }).validate({ ...owned, runId: 'run-attribution-only', beforeSpawn: () => { beforeSpawnCalls += 1; } });
+
+    const command = evidence.commands[0]!;
+    assert.equal(evidence.status, 'passed');
+    assert.equal(beforeSpawnCalls, 1);
+    assert.equal(command.captureStatus, 'complete');
+    assert.ok(command.output);
+    const artifact = command.output.artifact;
+    assert.ok(artifact.operationId);
+    assert.ok(artifact.retainedUntil);
+    assert.equal(readToolOutput(command.output, outputStore, { channel: 'stdout' }).text, 'VALIDATION-MARKER\n');
+    const operation = JSON.parse(readFileSync(path.join(root, 'store', 'operations', `${artifact.operationId}.json`), 'utf8')) as Record<string, unknown>;
+    assert.equal(operation.state, 'closed');
+    assert.equal(operation.retainedUntil, artifact.retainedUntil);
+    assert.deepEqual(operation.attribution, {
+      kind: 'validation', owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+      headSha: owned.headSha, configRevision: 'test-v1', runId: 'run-attribution-only',
+    });
+  });
+
+  it('keeps bounded local validation diagnostics when a real file-backed write fails', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-capture-fault-'));
+    dirs.push(root);
+    let writes = 0;
+    const outputStore = new FileToolOutputStore(path.join(root, 'store'), { testFaults: {
+      writeSync: (fd, bytes, offset, length) => {
+        writes += 1;
+        if (writes === 1) return fsWriteSync(fd, bytes, offset, Math.max(1, Math.floor(length / 2)));
+        return 0;
+      },
+    } });
+    const evidence = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', "process.stdout.write('VALIDATION-FAULT-MARKER\\n'); process.stderr.write('ERROR: retained-root-cause\\n')"]),
+      outputStore, outputPolicy: { previewBytes: 64, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 32 },
+    }).validate(owned);
+    const command = evidence.commands[0]!;
+    assert.equal(evidence.status, 'passed', 'evidence sink failure does not change validation truth');
+    assert.equal(command.outcome, 'passed');
+    assert.equal(command.captureStatus, 'partial');
+    assert.equal(command.output, undefined, 'partial bytes are never advertised as a durable artifact');
+    assert.ok(command.capturePreview?.stdout.preview.includes('VALIDATION-FAULT-MARKER'));
+    assert.ok(command.capturePreview?.diagnostics.some((line) => line.includes('retained-root-cause')));
+    assert.deepEqual(readdirSync(path.join(root, 'store')).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
   });
 
   it('forces a signal-resistant command to settle after the bounded grace period', async () => {

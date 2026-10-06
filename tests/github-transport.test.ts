@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
 import { GitHubLiveStateError } from '../src/github/errors.js';
+import { FileToolOutputStore } from '../src/evidence/tool-output.js';
 import {
   GhCliTransport,
   NodeProcessRunner,
@@ -175,6 +176,32 @@ describe('GhCliTransport', () => {
       true,
     );
   });
+
+  it('keeps parser input transient and complete when a deprecated store and tiny preview budget are configured', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-gh-parser-output-'));
+    const bin = path.join(directory, 'bin');
+    const evidence = path.join(directory, 'evidence');
+    const previousPath = process.env.PATH;
+    try {
+      const expected = 'TAIL-MARKER-' + 'x'.repeat(64 * 1024);
+      const source = `process.stdout.write(JSON.stringify({ payload: ${JSON.stringify(expected)} }))`;
+      const fakeGh = path.join(bin, 'gh');
+      mkdirSync(bin);
+      writeFileSync(fakeGh, `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} -e ${JSON.stringify(source)}\n`);
+      chmodSync(fakeGh, 0o755);
+      process.env.PATH = bin;
+      const result = await new GhCliTransport({
+        outputStore: new FileToolOutputStore(evidence),
+        outputPolicy: { previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 16 },
+      }).get('/repos/example/project');
+      assert.equal((result as { readonly payload: string }).payload, expected);
+      assert.equal(existsSync(evidence), false, 'parser command created no artifact or operation files');
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
 });
 
 describe('NodeProcessRunner', () => {
@@ -196,6 +223,15 @@ describe('NodeProcessRunner', () => {
         beforeSpawn: () => { throw new Error('host check rejected'); },
       }), /host check rejected/);
       assert.equal(existsSync(launched), false);
+
+      const evidenceRoot = path.join(directory, 'evidence');
+      await assert.rejects(() => runner.run(process.execPath, ['-e', `require('node:fs').writeFileSync(${JSON.stringify(launched)}, 'yes')`], {
+        timeoutMs: 1_000,
+        outputStore: new FileToolOutputStore(evidenceRoot),
+        beforeSpawn: () => { throw new Error('captured host check rejected'); },
+      }), /captured host check rejected/);
+      assert.equal(existsSync(launched), false, 'captured refusal rejects without creating child');
+      assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }

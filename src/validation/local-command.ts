@@ -3,9 +3,11 @@ import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
 import type { LocalValidationConfiguration, ValidationAdapter, ValidationRequest } from '../adapters/validation.js';
+import { boundToolOutputFromCapture, ContainedToolOutputCaptureSession, DEFAULT_TOOL_OUTPUT_POLICY, type ToolOutputCaptureSummary, type ToolOutputOperation, type ToolOutputCaptureWriter, type ToolOutputCaptureSessionResult } from '../evidence/tool-output.js';
 
 function malformed(commandIndex: number, executable = ''): LocalValidationCommandEvidence {
   return { commandIndex, executable, outcome: 'malformed', exitCode: null, durationMs: 0 };
@@ -359,9 +361,20 @@ async function execute(
   workspacePath: string,
   environment: NodeJS.ProcessEnv,
   sandboxProfile?: string,
-): Promise<LocalValidationCommandEvidence> {
+  outputOperation?: ToolOutputOperation,
+  outputStore?: LocalValidationConfiguration['outputStore'],
+  outputPolicy?: LocalValidationConfiguration['outputPolicy'],
+  beforeSpawn?: () => void,
+  captureRequested = outputStore !== undefined,
+): Promise<LocalValidationCommandEvidence & { readonly pendingCapture?: ToolOutputCaptureSummary }> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
+  const policy = outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY;
+  const captureSession = captureRequested ? new ContainedToolOutputCaptureSession(policy) : undefined;
+  let writer: ToolOutputCaptureWriter | undefined;
+  try {
+    writer = outputOperation?.startCapture(policy, { commandIndex, executable }) ?? outputStore?.startCapture(policy);
+  } catch { writer = undefined; }
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
@@ -373,7 +386,23 @@ async function execute(
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       if (forceTimer !== undefined) clearTimeout(forceTimer);
-      resolve({ commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt });
+      let captureResult: ToolOutputCaptureSessionResult | undefined;
+      if (captureSession !== undefined) captureResult = captureSession.finish(writer);
+      const pendingCapture: ToolOutputCaptureSummary | undefined = captureResult?.capture;
+      const captureStatus: LocalValidationCommandEvidence['captureStatus'] = captureResult?.status;
+      const evidence = { commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
+        ...(captureStatus === undefined ? {} : { captureStatus }),
+        ...(captureResult === undefined || captureStatus === 'complete' ? {} : { capturePreview: {
+          stdout: captureResult.stdout, stderr: captureResult.stderr, diagnostics: captureResult.diagnostics,
+          diagnosticsTruncated: captureResult.diagnosticsTruncated,
+        } }),
+        ...(pendingCapture === undefined || outputOperation !== undefined ? {} : { output: boundToolOutputFromCapture({
+          outcome: outcome === 'passed' ? 'passed' : outcome === 'failed' ? 'failed' : outcome === 'timed_out' ? 'timed_out' : 'unknown',
+          exitCode, capture: pendingCapture, policy,
+        }) }),
+        ...(pendingCapture === undefined ? {} : { pendingCapture }),
+      };
+      resolve(evidence);
     };
     const settleTimedOutProcess = async (child: ReturnType<typeof spawn>): Promise<void> => {
       if (settling || settled) return;
@@ -390,18 +419,33 @@ async function execute(
       finish(groupSettled ? 'timed_out' : 'unavailable', null);
     };
     let child: ReturnType<typeof spawn>;
+    // Capture setup has completed; invoke the synchronous host fence directly
+    // before child creation. A refusal rejects validation instead of becoming
+    // a candidate command failure.
+    try { beforeSpawn?.(); }
+    catch (error) { try { writer?.abort?.(); } catch { /* disposal must not mask admission refusal */ } throw error; }
     try {
       child = sandboxProfile === undefined
         ? spawn(executable, command.argv.slice(1), {
-          shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
+          shell: false, stdio: captureRequested ? ['ignore', 'pipe', 'pipe'] : 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
         })
         : spawn('/usr/bin/sandbox-exec', ['-p', sandboxProfile, executable, ...command.argv.slice(1)], {
-        shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
+        shell: false, stdio: captureRequested ? ['ignore', 'pipe', 'pipe'] : 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
       });
     } catch {
+      try { writer?.abort?.(); } catch { /* a spawn refusal cannot retain partial capture */ }
+      writer = undefined;
       finish('unavailable', null);
       return;
     }
+    const stdoutDecoder = new StringDecoder('utf8');
+    const stderrDecoder = new StringDecoder('utf8');
+    const captureChunk = (channel: 'stdout' | 'stderr', chunk: Buffer, decoder: StringDecoder) => {
+      const text = decoder.write(chunk);
+      if (text !== '' && captureSession !== undefined) captureSession.write(writer, channel, text);
+    };
+    child.stdout?.on('data', (chunk: Buffer) => captureChunk('stdout', chunk, stdoutDecoder));
+    child.stderr?.on('data', (chunk: Buffer) => captureChunk('stderr', chunk, stderrDecoder));
     timer = setTimeout(() => {
       timedOut = true;
       if (process.platform === 'win32') {
@@ -413,8 +457,15 @@ async function execute(
         void settleTimedOutProcess(child);
       }, TERMINATION_GRACE_MS);
     }, command.timeoutMs);
-    child.once('error', () => finish('unavailable', null));
+    child.once('error', () => {
+      try { writer?.abort?.(); } catch { /* contain spawn setup cleanup faults */ }
+      writer = undefined;
+      finish('unavailable', null);
+    });
     child.once('close', (code) => {
+      const outTail = stdoutDecoder.end(); const errTail = stderrDecoder.end();
+      if (captureSession !== undefined && outTail !== '') captureSession.write(writer, 'stdout', outTail);
+      if (captureSession !== undefined && errTail !== '') captureSession.write(writer, 'stderr', errTail);
       if (timedOut) {
         void settleTimedOutProcess(child);
         return;
@@ -587,6 +638,8 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
     const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, dependencyStore ?? undefined);
     const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
+    let outputOperation: ToolOutputOperation | undefined;
+    let operationFailed = false;
     try {
       // A production plan has one host-provisioned pnpm authority.  Reject a
       // substituted executable before probing a tool or starting validation.
@@ -608,38 +661,78 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // manifest (or the separately captured cold-hydration manifest).
       const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
       if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      const outputStore = this.configuration.outputStore;
+      try {
+        outputOperation = outputStore?.beginOperation?.({
+          kind: 'validation', owner: request.target.owner, repo: request.target.repo,
+          issueNumber: request.target.issueNumber, headSha: request.headSha,
+          configRevision: revision, ...(request.runId === undefined ? {} : { runId: request.runId }),
+        });
+      } catch { operationFailed = true; }
+      const pending = new Map<number, ToolOutputCaptureSummary>();
+      const finishValidation = (status: LocalValidationEvidence['status']): LocalValidationEvidence => {
+        const managedOperation = outputOperation !== undefined;
+        let committed: readonly import('../evidence/tool-output.js').ToolOutputArtifactReference[] = [];
+        if (outputOperation !== undefined) {
+          const operation = outputOperation;
+          try { committed = operation.close(); outputOperation = undefined; }
+          catch { try { operation.abort(); } catch { /* do not change validator result */ } outputOperation = undefined; }
+        }
+        const commands = evidence.map((command) => {
+          const capture = pending.get(command.commandIndex);
+          if (capture === undefined) return command;
+          if (!managedOperation && command.output !== undefined) return command;
+          const artifact = managedOperation ? committed.find((item) => item.id === capture.artifact.id) : undefined;
+          if (artifact === undefined) return { ...command, captureStatus: 'unavailable' as const, output: undefined,
+            capturePreview: { stdout: capture.stdout, stderr: capture.stderr, diagnostics: capture.diagnostics,
+              diagnosticsTruncated: capture.diagnosticsTruncated } };
+          const output = boundToolOutputFromCapture({
+            outcome: command.outcome === 'passed' ? 'passed' : command.outcome === 'failed' ? 'failed' : command.outcome === 'timed_out' ? 'timed_out' : 'unknown',
+            exitCode: command.exitCode,
+            capture: { ...capture, artifact },
+            policy: this.configuration.outputPolicy,
+          });
+          return { ...command, captureStatus: 'complete' as const, output };
+        });
+        return { status, configRevision: revision, commands };
+      };
+      const captureStore = operationFailed ? undefined : outputStore;
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
         if (!isCommand(command)) {
           evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
-          return { status: 'unknown', configRevision: revision, commands: evidence };
+          return finishValidation('unknown');
         }
-        const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile);
-        evidence.push(result);
+        const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile,
+          outputOperation, captureStore, this.configuration.outputPolicy, request.beforeSpawn, outputStore !== undefined);
+        if (result.pendingCapture !== undefined) pending.set(index, result.pendingCapture);
+        const { pendingCapture: _pendingCapture, ...commandEvidence } = result;
+        evidence.push(commandEvidence);
         if (result.outcome === 'failed' || result.outcome === 'timed_out') {
-          return { status: 'failed', configRevision: revision, commands: evidence };
+          return finishValidation('failed');
         }
-        if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+        if (result.outcome !== 'passed') return finishValidation('unknown');
         const manifest = commandWorkspaceManifest(commandWorkspace.path, request.headSha);
         if (manifest === null || (index === 0 && this.configuration.dependencyArtifactPath !== undefined
           ? !isHydratedDependencyManifest(manifest)
           : manifest.join('\n') !== hydratedManifest.join('\n'))) {
           evidence.push(workspaceUnavailable(evidence.length));
-          return { status: 'unknown', configRevision: revision, commands: evidence };
+          return finishValidation('unknown');
         }
         if (index === 0 && this.configuration.dependencyArtifactPath !== undefined) hydratedManifest = manifest;
       }
       if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, hydratedManifest)) {
         evidence.push(workspaceUnavailable(evidence.length));
-        return { status: 'unknown', configRevision: revision, commands: evidence };
+        return finishValidation('unknown');
       }
       if (workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath) === null) {
         evidence.push(workspaceUnavailable(evidence.length));
-        return { status: 'unknown', configRevision: revision, commands: evidence };
+        return finishValidation('unknown');
       }
-      return { status: 'passed', configRevision: revision, commands: evidence };
+      return finishValidation('passed');
     } finally {
+      if (outputOperation !== undefined) { try { outputOperation.abort(); } catch { /* lifecycle disposal is contained */ } }
       rmSync(runtimeRoot, { recursive: true, force: true });
       commandWorkspace.dispose();
     }

@@ -6,7 +6,26 @@ function isCommandOutcome(value: unknown): value is 'passed' | 'failed' | 'timed
 }
 
 function isCommandOutputCoherent(command: Record<string, unknown>): boolean {
-  if (command.output === undefined) return true;
+  if (command.captureStatus !== undefined && !['complete', 'partial', 'unavailable'].includes(command.captureStatus as string)) return false;
+  if (command.capturePreview !== undefined) {
+    if (command.captureStatus === undefined || command.captureStatus === 'complete' ||
+        typeof command.capturePreview !== 'object' || command.capturePreview === null) return false;
+    const preview = command.capturePreview as Record<string, unknown>;
+    const streamValid = (value: unknown): boolean => {
+      if (typeof value !== 'object' || value === null) return false;
+      const stream = value as Record<string, unknown>;
+      return Number.isSafeInteger(stream.bytes) && (stream.bytes as number) >= 0 &&
+        typeof stream.preview === 'string' && Buffer.byteLength(stream.preview, 'utf8') === stream.previewBytes &&
+        Number.isSafeInteger(stream.previewBytes) && (stream.previewBytes as number) >= 0 &&
+        (stream.previewBytes as number) <= 1_048_576 && typeof stream.truncated === 'boolean';
+    };
+    if (!streamValid(preview.stdout) || !streamValid(preview.stderr) || !Array.isArray(preview.diagnostics) ||
+        !preview.diagnostics.every((line) => typeof line === 'string' && Buffer.byteLength(line, 'utf8') <= 1_048_576) ||
+        typeof preview.diagnosticsTruncated !== 'boolean') return false;
+  }
+  if (command.output === undefined) return command.captureStatus !== 'complete';
+  if (command.capturePreview !== undefined) return false;
+  if (command.captureStatus !== undefined && command.captureStatus !== 'complete') return false;
   if (!isToolOutputEnvelope(command.output)) return false;
   const expected = command.outcome === 'passed' ? 'passed'
     : command.outcome === 'failed' ? 'failed'

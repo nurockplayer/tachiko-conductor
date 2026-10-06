@@ -414,7 +414,7 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(runner.calls.length, 0);
   });
 
-  it('redacts forwarded worker credentials from bounded container diagnostics', async () => {
+  it('keeps raw typed container failure messages out of the durable result', async () => {
     const ws = workspace();
     const container = new FakeContainer([new WorkerRouterContainerError(
       WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED,
@@ -429,7 +429,25 @@ describe('WorkerRouterAdapter container boundary', () => {
     const text = response.diagnostics?.join('\n') ?? '';
     assert.match(text, new RegExp(WORKER_ROUTER_ERROR_CODE.CONTAINER_FAILURE));
     assert.equal(text.includes('sk-live-secret'), false);
-    assert.match(text, /\[redacted\]/);
+    assert.equal(text.includes('--env'), false);
+    assert.match(text, /CREATE_FAILED/);
+  });
+
+  it('keeps unknown container exception messages transient', async () => {
+    const ws = workspace();
+    const sentinel = 'RAW-CONTAINER-TRANSCRIPT-6c57e8';
+    for (const error of [new Error(sentinel), new WorkerRouterContainerError(
+      WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED,
+      `runtime failed with worker output: ${sentinel}`,
+    )]) {
+      const response = await new WorkerRouterAdapter({
+        runner: new FakeRunner([]), container: new FakeContainer([error]), image: IMAGE,
+      }).run(requestFor(ws.workspacePath));
+      const persisted = JSON.stringify(response);
+      assert.equal(persisted.includes(sentinel), false);
+      assert.equal(persisted.includes(error.message), false);
+      assert.equal(response.exitStatus, 'failure');
+    }
   });
 
   it('forwards only the allow-listed container environment', async () => {

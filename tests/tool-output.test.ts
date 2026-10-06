@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -65,6 +66,20 @@ describe('bounded tool output contract', () => {
     });
     assert.equal(full.text.includes('ERROR: assertion failed for exact HEAD'), true);
     assert.equal(full.eof, true);
+  });
+
+  it('retains the first root cause and later failed-test identities within the diagnostic budget', () => {
+    const output = boundToolOutput({
+      outcome: 'failed', exitCode: 1,
+      stdout: '',
+      stderr: ['ERROR: ROOT-CAUSE-9f3a', ...Array.from({ length: 30 }, (_, index) => `FAIL test-${index}`)].join('\n'),
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 8, diagnosticBytes: 96, maxDiagnostics: 4, readBytes: 16 },
+    });
+    assert.ok(output.diagnostics[0]?.includes('ROOT-CAUSE-9f3a'));
+    assert.ok(output.diagnostics.some((line) => line.includes('FAIL test-29')));
+    assert.ok(Buffer.byteLength(output.diagnostics.join(''), 'utf8') <= 96);
+    assert.equal(output.stdout.previewBytes <= 8, true);
   });
 
   it('supports explicit range drill-down and bounded diagnostic search', () => {
@@ -215,16 +230,260 @@ describe('UTF-8 tool output ranges', () => {
     });
 
     if (kind === 'file') {
+      it('file: rejects forged artifact byte counts, hashes, operation IDs and deadlines', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-forged-output-ref-'));
+        try {
+          const store = new FileToolOutputStore(directory);
+          const artifact = store.save({ stdout: 'persisted', stderr: 'proof' });
+          for (const forged of [
+            { ...artifact, stdoutBytes: artifact.stdoutBytes + 1 },
+            { ...artifact, sha256: '0'.repeat(64) },
+            { ...artifact, retainedUntil: new Date(Date.parse(artifact.retainedUntil!) + 86_400_000).toISOString() },
+            { ...artifact, operationId: '00000000-0000-4000-8000-000000000000' },
+          ]) {
+            assert.throws(() => store.read(forged, { channel: 'stdout' }), /unavailable or expired/);
+            assert.throws(() => store.search(forged, { query: 'proof' }), /unavailable or expired/);
+          }
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: refuses root and operations-directory symlinks before creating private state', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-symlink-'));
+        try {
+          const target = path.join(directory, 'target');
+          const rootAlias = path.join(directory, 'root-alias');
+          mkdirSync(target);
+          symlinkSync(target, rootAlias, 'dir');
+          assert.throws(() => new FileToolOutputStore(rootAlias), /symlink/);
+
+          const safeRoot = path.join(directory, 'safe-root');
+          const store = new FileToolOutputStore(safeRoot);
+          mkdirSync(safeRoot);
+          const operationsTarget = path.join(directory, 'operations-target');
+          mkdirSync(operationsTarget);
+          symlinkSync(operationsTarget, path.join(safeRoot, 'operations'), 'dir');
+          assert.throws(() => store.beginOperation({ kind: 'symlink-test' }), /symlink/);
+          assert.deepEqual(readdirSync(operationsTarget), [], 'refusal creates no operation metadata under the symlink target');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: persists finite per-operation retention and releases only the selected operation early', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-release-'));
+        try {
+          const now = new Date();
+          const short = new FileToolOutputStore(directory, { capacity: 2, retentionMs: 60 * 60 * 1000, now: () => now });
+          const first = short.save({ stdout: 'release-me', stderr: '' });
+          const second = short.save({ stdout: 'keep-me', stderr: '' });
+          const persistedDeadline = first.retainedUntil;
+          const storedOperation = JSON.parse(readFileSync(path.join(directory, 'operations', `${first.operationId}.json`), 'utf8')) as { readonly retainedUntil?: string };
+          assert.equal(storedOperation.retainedUntil, persistedDeadline, 'the configured finite deadline is persisted in the operation record');
+          const reopened = new FileToolOutputStore(directory, { capacity: 2, retentionMs: 90 * 24 * 60 * 60 * 1000 });
+          assert.equal(first.retainedUntil, persistedDeadline, 'reopening with a longer policy does not renew the existing reference');
+          assert.equal(reopened.read(first, { channel: 'stdout' }).text, 'release-me');
+          reopened.release(first);
+          assert.throws(() => reopened.read(first, { channel: 'stdout' }), /unavailable or expired/);
+          assert.throws(() => reopened.search(first, { query: 'release' }), /unavailable or expired/);
+          const cleanup = reopened.cleanupExpired({ maxSlotProbes: 2, maxDeletions: 16 });
+          assert.ok(cleanup.attempted <= 16);
+          assert.equal(reopened.read(second, { channel: 'stdout' }).text, 'keep-me', 'release leaves another operation available');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: expires reads and searches against the store clock rather than wall clock', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-injected-expiry-'));
+        try {
+          let now = new Date('2030-01-01T00:00:00.000Z');
+          const store = new FileToolOutputStore(directory, { retentionMs: 1_000, now: () => now });
+          const artifact = store.save({ stdout: 'clock-controlled', stderr: '' });
+          const wallClockBeforeExpiry = Date.now();
+          assert.ok(wallClockBeforeExpiry < Date.parse(artifact.retainedUntil!));
+          now = new Date(Date.parse(artifact.retainedUntil!) + 1);
+          assert.throws(() => store.read(artifact, { channel: 'stdout' }), /expired/);
+          assert.throws(() => store.search(artifact, { query: 'clock' }), /expired/);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: releases failed save/startCapture setup and permits same-process reuse', () => {
+        for (const surface of ['save', 'startCapture'] as const) {
+          for (const fault of ['start', 'second-open'] as const) {
+            const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-start-failure-'));
+            try {
+              let injected = false;
+              const store = new FileToolOutputStore(directory, { capacity: 1, testFaults: {
+                beforeCaptureStart: () => {
+                  if (fault === 'start' && !injected) { injected = true; throw new Error('original start fault'); }
+                },
+                beforeSecondOpen: () => {
+                  if (fault === 'second-open' && !injected) { injected = true; throw new Error('original second-open fault'); }
+                },
+              } });
+              const expected = fault === 'start' ? /original start fault/ : /original second-open fault/;
+              if (surface === 'save') assert.throws(() => store.save({ stdout: 'never persisted', stderr: '' }), expected);
+              else assert.throws(() => store.startCapture(DEFAULT_TOOL_OUTPUT_POLICY), expected);
+
+              const operations = path.join(directory, 'operations');
+              assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [], `${surface}/${fault}: no stream files remain`);
+              assert.deepEqual(readdirSync(operations).filter((name) => name.endsWith('.lock')), [], `${surface}/${fault}: operation and maintenance locks were released`);
+
+              const recovered = store.save({ stdout: `${surface}-${fault}-recovered`, stderr: '' });
+              assert.equal(store.read(recovered, { channel: 'stdout' }).text, `${surface}-${fault}-recovered`, `${surface}/${fault}: same process can reuse the capacity-one store`);
+            } finally { rmSync(directory, { recursive: true, force: true }); }
+          }
+        }
+      });
+
+      it('file: bounds registration probes and advances the persisted cursor past protected slots', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-registration-budget-'));
+        try {
+          const store = new FileToolOutputStore(directory, { capacity: 4, maxRegistrationProbes: 1 });
+          store.cleanupExpired({ maxSlotProbes: 1 });
+          const operations = path.join(directory, 'operations');
+          writeFileSync(path.join(operations, 'slot-0001.json'), 'corrupt protected identity');
+          assert.throws(() => store.beginOperation({ kind: 'bounded-registration' }), /registration probe budget was exhausted/);
+          const next = store.beginOperation({ kind: 'bounded-registration-after-protected' });
+          assert.equal(next.id.length, 36, 'the durable registration cursor reaches a later free slot');
+          next.abort();
+          assert.equal(readFileSync(path.join(operations, 'slot-0001.json'), 'utf8'), 'corrupt protected identity');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: persists cleanup traversal progress across fresh processes and protected slots', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-cleanup-cursor-'));
+        try {
+          const now = new Date('2026-09-01T00:00:00.000Z');
+          const store = new FileToolOutputStore(directory, { capacity: 5, now: () => now });
+          const protectedOperation = store.beginOperation({ kind: 'protected-test' });
+          const refs = [];
+          for (let index = 0; index < 4; index += 1) refs.push(store.save({ stdout: 'expired-' + index, stderr: '' }));
+          const visits = [];
+          writeFileSync(path.join(directory, 'operations', 'index.json'), JSON.stringify({ schemaVersion: 1, capacity: 5, cursor: 0 }));
+          writeFileSync(path.join(directory, 'operations', 'slot-0001.json'), 'corrupt protected slot');
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `const { FileToolOutputStore } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 5 }); console.log(JSON.stringify(store.cleanupExpired({ maxSlotProbes: 1 })));`;
+          for (let batch = 0; batch < 5; batch += 1) {
+            const output = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+              cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+            });
+            visits.push(JSON.parse(output.trim()) as { readonly cursor: number; readonly protected: number });
+          }
+          assert.deepEqual(visits.map((visit) => visit.cursor), [1, 2, 3, 4, 0]);
+          assert.equal(visits[0]!.protected, 1, 'live owner remains protected in a separate process');
+          assert.equal(visits[1]!.protected, 1, 'corrupt slot remains protected and traversal advances');
+          assert.equal(existsSync(path.join(directory, refs[3]!.id + '.stdout')), false, 'later expired identity is reclaimed after protected slots');
+          protectedOperation.abort();
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: reclaims a finished capture left by a dead validation-operation owner before close', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dead-output-owner-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); const operation = store.beginOperation({ kind: 'dead-owner-test' }); const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'finished-before-close'); const summary = writer.finish(); console.log(summary.artifact.id); process.exit(0);`;
+          const artifactId = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim();
+          assert.match(artifactId, /^[0-9a-f-]{36}$/);
+          assert.ok(existsSync(path.join(directory, artifactId + '.stdout')));
+          const result = new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1 });
+          assert.equal(result.deleted, 4, 'two stream files, metadata and operation slot are reclaimed');
+          assert.equal(existsSync(path.join(directory, artifactId + '.stdout')), false);
+          assert.equal(existsSync(path.join(directory, 'operations', 'slot-0000.json')), false);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: protects dead-owner files when the persisted owner nonce disagrees with the stale lock', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-owner-mismatch-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); const operation = store.beginOperation({ kind: 'owner-mismatch-test' }); const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'must-remain-protected'); const summary = writer.finish(); console.log(JSON.stringify({ operationId: operation.id, artifactId: summary.artifact.id })); process.exit(0);`;
+          const owner = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly operationId: string; readonly artifactId: string };
+          const metadataPath = path.join(directory, 'operations', `${owner.operationId}.json`);
+          const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as Record<string, unknown>;
+          writeFileSync(metadataPath, JSON.stringify({ ...metadata, ownerNonce: 'mismatched-owner-nonce' }));
+          const cleanup = new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1 });
+          assert.equal(cleanup.deleted, 0, 'a stale lock cannot authorize cleanup for a different persisted owner identity');
+          assert.equal(cleanup.protected, 1);
+          assert.ok(existsSync(path.join(directory, `${owner.artifactId}.stdout`)));
+          assert.ok(existsSync(path.join(directory, 'operations', 'slot-0000.json')));
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: resumes a durable deletion tombstone after a simulated cleanup interruption', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-cleanup-resume-'));
+        try {
+          const old = new Date('2026-09-01T00:00:00.000Z');
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => old });
+          const artifact = store.save({ stdout: 'stdout-to-remove', stderr: 'stderr-to-remove' });
+          const operations = path.join(directory, 'operations');
+          const metadataPath = path.join(operations, artifact.operationId + '.json');
+          unlinkSync(metadataPath);
+          writeFileSync(path.join(operations, 'slot-0000.json'), JSON.stringify({
+            schemaVersion: 1, capacity: 1, slot: 0, id: artifact.operationId,
+            deleting: true, artifactIds: [artifact.id],
+          }));
+          unlinkSync(path.join(directory, artifact.id + '.stdout'));
+          const cleanup = new FileToolOutputStore(directory, { capacity: 1 });
+          const result = cleanup.cleanupExpired({ maxSlotProbes: 1 });
+          assert.equal(result.deleted, 2, 'already removed stdout is idempotently absent; stderr and the known-owned slot are deleted');
+          assert.equal(existsSync(path.join(directory, artifact.id + '.stdout')), false);
+          assert.equal(existsSync(path.join(directory, artifact.id + '.stderr')), false);
+          assert.equal(existsSync(path.join(operations, 'slot-0000.json')), false);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: reports bounded cleanup attempts and refuses an exhausted metadata-read budget', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-cleanup-budget-'));
+        try {
+          const old = new Date('2026-09-01T00:00:00.000Z');
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => old });
+          const artifact = store.save({ stdout: 'budgeted', stderr: '' });
+          const pass = new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 1 });
+          assert.ok(pass.attempted <= 1);
+          assert.ok(existsSync(path.join(directory, artifact.id + '.stdout')), 'strict deletion budget leaves the owned artifact for a later pass');
+          assert.throws(() => new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 1 }), /metadata-read budget exhausted/);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: reclaims a large expired operation over bounded deletion batches', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-cleanup-batches-'));
+        try {
+          const old = new Date('2026-09-01T00:00:00.000Z');
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => old });
+          const operation = store.beginOperation({ kind: 'bounded-deletion-test' });
+          const ids: string[] = [];
+          for (let index = 0; index < 40; index += 1) {
+            const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY, { commandIndex: index });
+            writer.write('stdout', 'payload-' + index);
+            ids.push(writer.finish().artifact.id);
+          }
+          operation.close();
+          let passes = 0;
+          let deleted = 0;
+          while (existsSync(path.join(directory, 'operations', 'slot-0000.json')) && passes < 16) {
+            const result = new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 10 });
+            passes += 1; deleted += result.deleted;
+          }
+          assert.equal(passes, 10, 'the bounded cursor revisits the retained tombstone until every artifact is reclaimed');
+          assert.equal(deleted, 82, '80 stream files, operation metadata and stable slot are bounded physical deletions');
+          for (const id of ids) {
+            assert.equal(existsSync(path.join(directory, id + '.stdout')), false);
+            assert.equal(existsSync(path.join(directory, id + '.stderr')), false);
+          }
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
       it('file: reads UTF-8 ranges from persisted files without using the memory fallback', () => {
         const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-utf8-file-source-'));
         try {
           const store = new FileToolOutputStore(directory);
           const artifact = store.save({ stdout: 'A中🙂B', stderr: '' });
           const persisted = readdirSync(directory);
-          assert.equal(persisted.length, 2);
+          assert.ok(persisted.includes(`${artifact.id}.stdout`));
+          assert.ok(persisted.includes(`${artifact.id}.stderr`));
           assert.ok(persisted.some((name) => readFileSync(path.join(directory, name), 'utf8') === 'A中🙂B'));
-          const fallback = (store as unknown as { readonly fallback: InMemoryToolOutputStore }).fallback;
-          fallback.read = () => { throw new Error('memory fallback was used'); };
+          assert.equal(Object.hasOwn(store, 'fallback'), false, 'file store does not keep a memory fallback');
           assert.deepEqual(store.read(artifact, { channel: 'stdout', offset: 2, length: 1 }), {
             channel: 'stdout', offset: 1, text: '中', bytes: 3, nextOffset: 4, eof: false,
           });

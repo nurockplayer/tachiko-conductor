@@ -26,6 +26,8 @@ import {
   resolveLocalValidationConfiguration,
   resolveImplementationProvider,
   resolveRunsDir,
+  resolveToolOutputRoot,
+  resolveToolOutputPolicy,
   runCreateCommand,
   runIssueCommand,
   runMergedTransitionCommand,
@@ -38,6 +40,7 @@ import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
+import { FileToolOutputStore } from '../src/evidence/tool-output.js';
 import { CANCEL_RUN_DECISION } from '../src/domain/decisions.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/domain/types.js';
@@ -386,6 +389,34 @@ describe('CLI command layer', () => {
   it('resolves the data dir from TACHIKO_DATA_DIR or the home default', () => {
     assert.equal(resolveRunsDir({ TACHIKO_DATA_DIR: '/tmp/x' }), '/tmp/x');
     assert.match(resolveRunsDir({}), /\.tachiko-conductor/);
+  });
+
+  it('resolves a stable private evidence root and validates byte budgets', () => {
+    assert.equal(resolveToolOutputRoot({ TACHIKO_DATA_DIR: '/tmp/x' }), '/tmp/x/.evidence/v1');
+    assert.equal(resolveToolOutputRoot({ TACHIKO_EVIDENCE_DIR: '/private/evidence' }), '/private/evidence');
+    assert.deepEqual(resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: JSON.stringify({ previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 16 }) }),
+      { previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 16 });
+    assert.throws(() => resolveToolOutputRoot({ TACHIKO_EVIDENCE_DIR: 'relative' }), /absolute/);
+    assert.throws(() => resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: '{"previewBytes":0}' }), /previewBytes/);
+  });
+
+  it('reopens the configured evidence root for CLI range drilldown', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-tool-output-cli-'));
+    const prior = process.env.TACHIKO_EVIDENCE_DIR;
+    const priorLog = console.log;
+    let printed = '';
+    try {
+      process.env.TACHIKO_EVIDENCE_DIR = root;
+      const reference = new FileToolOutputStore(root).save({ stdout: 'cli-evidence', stderr: '' });
+      console.log = (...values: unknown[]) => { printed = values.map(String).join(' '); };
+      assert.equal(await main(['tool-output', 'read', JSON.stringify(reference), '--channel', 'stdout', '--offset', '4', '--length', '8']), 0);
+      assert.equal(JSON.parse(printed).text, 'evidence');
+    } finally {
+      console.log = priorLog;
+      if (prior === undefined) delete process.env.TACHIKO_EVIDENCE_DIR;
+      else process.env.TACHIKO_EVIDENCE_DIR = prior;
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('resolves the implementation provider and explicit Codex execution config without choosing a model', () => {

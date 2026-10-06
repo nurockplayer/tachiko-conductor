@@ -10,6 +10,7 @@
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { ProviderExecutionTelemetry, RunTelemetry } from './telemetry.js';
 import type { RepairAdmissionSnapshot, RepairExecutorHandoff, RepairHandoffRecord, RepairTaskShapeAuthority } from './repair-admission.js';
+import type { ToolOutputEnvelope, ToolOutputStream } from '../evidence/tool-output.js';
 
 /** The work item a run operates on. */
 export type Target = IssueTarget | RepositoryTarget;
@@ -153,6 +154,16 @@ export interface LocalValidationCommandEvidence {
   readonly outcome: 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed';
   readonly exitCode: number | null;
   readonly durationMs: number;
+  /** Supplemental persisted command transcript; never participates in validation status. */
+  readonly output?: ToolOutputEnvelope;
+  readonly captureStatus?: 'complete' | 'partial' | 'unavailable';
+  /** Bounded, non-drillable observation retained when the durable sink fails. */
+  readonly capturePreview?: {
+    readonly stdout: ToolOutputStream;
+    readonly stderr: ToolOutputStream;
+    readonly diagnostics: readonly string[];
+    readonly diagnosticsTruncated: boolean;
+  };
 }
 
 /** Durable provenance for deterministic local validation. It intentionally excludes command output. */

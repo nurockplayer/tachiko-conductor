@@ -1,10 +1,39 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readSync, writeFileSync, writeSync } from 'node:fs';
-import os from 'node:os';
+import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readSync, writeSync, renameSync, fsyncSync, lstatSync, fstatSync, constants, realpathSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { acquireDispatchInvocationLock, type DispatchInvocationLock } from '../dispatch/invocation-lock.js';
 
 export const TOOL_OUTPUT_CONTRACT_VERSION = 'tachiko.tool-output.v1' as const;
+export const DEFAULT_TOOL_OUTPUT_SLOT_CAPACITY = 256;
+export const DEFAULT_TOOL_OUTPUT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+export const DEFAULT_TOOL_OUTPUT_REGISTRATION_PROBES = 16;
+
+export interface ToolOutputCleanupBudget {
+  readonly maxSlotProbes?: number;
+  readonly maxMetadataReadBytes?: number;
+  readonly maxMetadataBytes?: number;
+  readonly maxDeletions?: number;
+}
+
+export interface ToolOutputCleanupResult {
+  readonly probed: number;
+  readonly deleted: number;
+  readonly attempted: number;
+  readonly protected: number;
+  readonly cursor: number;
+}
+
+/** Deterministic filesystem fault seams used by focused capture containment tests. */
+export interface ToolOutputFileTestFaults {
+  readonly beforeCaptureStart?: () => void;
+  readonly beforeSecondOpen?: () => void;
+  readonly beforeFinish?: () => void;
+  readonly writeSync?: (descriptor: number, bytes: Buffer, offset: number, length: number) => number;
+  readonly beforeFsync?: (channel: 'stdout' | 'stderr') => void;
+  readonly beforeHash?: () => void;
+  readonly beforeUnlink?: (filePath: string) => void;
+}
 
 export type ToolOutputOutcome = 'passed' | 'failed' | 'timed_out' | 'cancelled' | 'unknown';
 
@@ -55,6 +84,8 @@ export interface ToolOutputArtifactReference {
   readonly stderrBytes: number;
   readonly totalBytes: number;
   readonly sha256: string;
+  readonly operationId?: string;
+  readonly retainedUntil?: string;
 }
 
 export interface ToolOutputEnvelope {
@@ -89,6 +120,7 @@ export interface ToolOutputCaptureSummary {
 export interface ToolOutputCaptureWriter {
   write(channel: 'stdout' | 'stderr', chunk: string): void;
   finish(): ToolOutputCaptureSummary;
+  abort?(): void;
 }
 
 export interface ToolOutputReadRequest {
@@ -127,12 +159,99 @@ export interface ToolOutputMatch {
 export interface ToolOutputStore {
   save(capture: ToolOutputCapture): ToolOutputArtifactReference;
   startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter;
+  beginOperation?(attribution?: Readonly<Record<string, string | number | null>>): ToolOutputOperation;
   read(reference: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult;
   search(reference: ToolOutputArtifactReference, request: ToolOutputSearchRequest): readonly ToolOutputMatch[];
 }
 
+export interface ToolOutputOperation {
+  readonly id: string;
+  startCapture(policy: ToolOutputPolicy, attribution?: Readonly<Record<string, string | number | null>>): ToolOutputCaptureWriter;
+  close(): readonly ToolOutputArtifactReference[];
+  abort(): void;
+}
+
+export interface ToolOutputCaptureSessionResult {
+  readonly status: 'complete' | 'partial' | 'unavailable';
+  readonly stdout: ToolOutputStream;
+  readonly stderr: ToolOutputStream;
+  readonly diagnostics: readonly string[];
+  readonly diagnosticsTruncated: boolean;
+  readonly capture?: ToolOutputCaptureSummary;
+}
+
 function assertPositiveInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive safe integer.`);
+}
+
+function isCanonicalTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && new Date(parsed).toISOString() === value;
+}
+
+function dispatchLockMatchesOwner(value: Record<string, unknown>, nonce: string): boolean {
+  const keys = Object.keys(value).sort().join(',');
+  const legacy = keys === 'nonce,pid' && typeof value.nonce === 'string' && Number.isSafeInteger(value.pid) && (value.pid as number) > 0;
+  const versioned = keys === 'bootId,hostId,nonce,pid,processStartId,schemaVersion' && value.schemaVersion === 1 &&
+    typeof value.nonce === 'string' && Number.isSafeInteger(value.pid) && (value.pid as number) > 0 &&
+    typeof value.hostId === 'string' && /^[0-9a-f]{64}$/.test(value.hostId) &&
+    typeof value.bootId === 'string' && /^[0-9a-f]{64}$/.test(value.bootId) &&
+    typeof value.processStartId === 'string' && value.processStartId.length > 0 && value.processStartId.length <= 256;
+  return (legacy || versioned) && value.nonce === nonce;
+}
+
+function validOperationMetadata(value: Record<string, unknown>, id: string, slot: number): boolean {
+  if (value.schemaVersion !== 1 || value.id !== id || value.slot !== slot ||
+      typeof value.ownerNonce !== 'string' || value.ownerNonce === '' || value.ownerNonce.length > 256 ||
+      !isCanonicalTimestamp(value.createdAt) || !['active', 'closed', 'released', 'aborted'].includes(String(value.state)) ||
+      typeof value.attribution !== 'object' || value.attribution === null || Array.isArray(value.attribution)) return false;
+  if (value.activeCaptureIds !== undefined && (!Array.isArray(value.activeCaptureIds) ||
+      !value.activeCaptureIds.every((entry) => typeof entry === 'string' && /^[0-9a-f-]{36}$/.test(entry)))) return false;
+  const validArtifact = (entry: unknown, committed: boolean): boolean => {
+    if (typeof entry !== 'object' || entry === null) return false;
+    const artifact = entry as Record<string, unknown>;
+    return artifact.kind === 'tool-output' && typeof artifact.id === 'string' && /^[0-9a-f-]{36}$/.test(artifact.id) &&
+      Number.isSafeInteger(artifact.stdoutBytes) && (artifact.stdoutBytes as number) >= 0 &&
+      Number.isSafeInteger(artifact.stderrBytes) && (artifact.stderrBytes as number) >= 0 &&
+      artifact.totalBytes === (artifact.stdoutBytes as number) + (artifact.stderrBytes as number) &&
+      typeof artifact.sha256 === 'string' && /^[0-9a-f]{64}$/.test(artifact.sha256) &&
+      (!committed || (artifact.operationId === id && artifact.retainedUntil === value.retainedUntil));
+  };
+  for (const name of ['artifacts', 'captures'] as const) {
+    const entries = value[name];
+    if (entries === undefined) continue;
+    if (!Array.isArray(entries)) return false;
+    for (const entry of entries) {
+      const artifact = name === 'captures' && typeof entry === 'object' && entry !== null
+        ? (entry as Record<string, unknown>).artifact : entry;
+      if (name === 'captures' && (typeof entry !== 'object' || entry === null || typeof (entry as Record<string, unknown>).attribution !== 'object')) return false;
+      if (!validArtifact(artifact, value.state === 'closed' || value.state === 'released')) return false;
+    }
+  }
+  if (value.state === 'active') return true;
+  if (!isCanonicalTimestamp(value.closedAt)) return false;
+  if (value.state === 'aborted') return true;
+  if (!isCanonicalTimestamp(value.retainedUntil)) return false;
+  if (value.state === 'released' && !isCanonicalTimestamp(value.releasedAt)) return false;
+  return true;
+}
+
+function ensurePrivateDirectory(directory: string): void {
+  const resolved = path.resolve(directory);
+  if (!path.isAbsolute(resolved)) throw new Error('Tool-output evidence path must be absolute.');
+  const root = path.parse(resolved).root;
+  let current = root;
+  for (const component of resolved.slice(root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, component);
+    try { mkdirSync(current, { mode: 0o700 }); }
+    catch (error) {
+      if (typeof error !== 'object' || error === null || (error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+    const stat = lstatSync(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Tool-output evidence path contains a non-directory or symlink: ${current}`);
+  }
+  chmodSync(resolved, 0o700);
 }
 
 function normalizePolicy(policy: ToolOutputPolicy | undefined): ToolOutputPolicy {
@@ -172,7 +291,7 @@ function head(value: string, maxBytes: number): string {
 
 function boundedDiagnostics(stdout: string, stderr: string, policy: ToolOutputPolicy): { readonly lines: string[]; readonly truncated: boolean } {
   const lines: string[] = [];
-  const highSignal = /\b(error|failed|failure|fatal|exception|assert|panic|timeout|timed[ -]?out|denied|invalid|cannot|could not)\b/i;
+  const highSignal = /\b(error|failed|failure|fatal|exception|assert|panic|timeout|timed[ -]?out|denied|invalid|cannot|could not|fail|not ok\s+\d+)\b|✖/i;
   for (const source of [stderr, stdout]) {
     for (const line of source.split(/\r?\n/)) {
       const normalized = line.trim();
@@ -183,7 +302,9 @@ function boundedDiagnostics(stdout: string, stderr: string, policy: ToolOutputPo
   const result: string[] = [];
   let truncated = selected.length > policy.maxDiagnostics;
   let used = 0;
-  for (const line of selected.slice(-policy.maxDiagnostics)) {
+  const retained = selected.length <= policy.maxDiagnostics ? selected
+    : policy.maxDiagnostics === 1 ? [selected[0]!] : [selected[0]!, ...selected.slice(-(policy.maxDiagnostics - 1))];
+  for (const line of retained) {
     const remaining = policy.diagnosticBytes - used;
     if (remaining <= 0) {
       truncated = true;
@@ -438,40 +559,171 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
 
 export class FileToolOutputStore implements ToolOutputStore {
   private readonly root: string;
-  private readonly fallback = new InMemoryToolOutputStore();
+  private readonly operationsDir: string;
+  private readonly capacity: number;
+  private readonly retentionMs: number;
+  private readonly maxRegistrationProbes: number;
+  private readonly now: () => Date;
+  private readonly testFaults: ToolOutputFileTestFaults | undefined;
 
-  constructor(root = process.env.TACHIKO_EVIDENCE_DIR ?? path.join(os.tmpdir(), 'tachiko-conductor', 'evidence')) {
-    this.root = path.resolve(root);
+  constructor(root: string, options: { readonly capacity?: number; readonly retentionMs?: number; readonly maxRegistrationProbes?: number; readonly now?: () => Date; readonly testFaults?: ToolOutputFileTestFaults } = {}) {
+    if (!path.isAbsolute(root)) throw new Error('Tool-output evidence root must be an absolute stable path.');
+    this.capacity = options.capacity ?? DEFAULT_TOOL_OUTPUT_SLOT_CAPACITY;
+    assertPositiveInteger(this.capacity, 'Tool-output slot capacity');
+    this.retentionMs = options.retentionMs ?? DEFAULT_TOOL_OUTPUT_RETENTION_MS;
+    assertPositiveInteger(this.retentionMs, 'Tool-output retention duration');
+    this.maxRegistrationProbes = options.maxRegistrationProbes ?? Math.min(DEFAULT_TOOL_OUTPUT_REGISTRATION_PROBES, this.capacity);
+    assertPositiveInteger(this.maxRegistrationProbes, 'Tool-output registration probe budget');
+    if (this.maxRegistrationProbes > this.capacity) throw new Error('Tool-output registration probe budget cannot exceed slot capacity.');
+    this.now = options.now ?? (() => new Date());
+    this.testFaults = options.testFaults;
+    const requested = path.resolve(root);
+    try {
+      const suppliedRoot = lstatSync(requested);
+      if (suppliedRoot.isSymbolicLink() || !suppliedRoot.isDirectory()) throw new Error('Tool-output evidence root must not be a symlink or non-directory.');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+    let existing = requested;
+    const suffix: string[] = [];
+    while (!existsSync(existing)) { suffix.unshift(path.basename(existing)); existing = path.dirname(existing); }
+    this.root = path.join(realpathSync(existing), ...suffix);
+    this.operationsDir = path.join(this.root, 'operations');
   }
 
   save(capture: ToolOutputCapture): ToolOutputArtifactReference {
-    const id = randomUUID();
+    const operation = this.beginOperation({ kind: 'standalone-save' });
     try {
-      mkdirSync(this.root, { recursive: true, mode: 0o700 });
-      chmodSync(this.root, 0o700);
-      writeFileSync(this.file(id, 'stdout'), capture.stdout, { encoding: 'utf8', mode: 0o600 });
-      writeFileSync(this.file(id, 'stderr'), capture.stderr, { encoding: 'utf8', mode: 0o600 });
-      return reference(id, capture.stdout, capture.stderr);
-    } catch {
-      // Evidence persistence must not change command/HEAD semantics. Keep a
-      // same-process fallback so diagnostics remain drillable when the
-      // configured artifact directory is temporarily unavailable.
-      return this.fallback.save(capture);
+      const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+      writer.write('stdout', capture.stdout);
+      writer.write('stderr', capture.stderr);
+      const summary = writer.finish();
+      return operation.close().find((item) => item.id === summary.artifact.id)!;
+    } catch (error) {
+      try { operation.abort(); } catch { /* preserve the original capture-start/write failure */ }
+      throw error;
     }
   }
 
   startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
-    try {
-      return new FileToolOutputWriter(this.root, policy);
-    } catch {
-      return new BufferedToolOutputWriter(this.fallback, policy);
+    const operation = this.beginOperation({ kind: 'standalone-capture' });
+    let writer: ToolOutputCaptureWriter;
+    try { writer = operation.startCapture(policy); }
+    catch (error) {
+      try { operation.abort(); } catch { /* preserve the original capture-start failure */ }
+      throw error;
     }
+    return {
+      write: (channel, chunk) => writer.write(channel, chunk),
+      finish: () => {
+        try {
+          const summary = writer.finish();
+          const artifact = operation.close().find((item) => item.id === summary.artifact.id);
+          if (artifact === undefined) throw new Error('Tool-output operation did not commit its artifact.');
+          return { ...summary, artifact };
+        } catch (error) { operation.abort(); throw error; }
+      },
+      abort: () => {
+        let failure: unknown;
+        try { writer.abort?.(); } catch (error) { failure = error; }
+        try { operation.abort(); } catch (error) { failure ??= error; }
+        if (failure !== undefined) throw failure;
+      },
+    };
+  }
+
+  beginOperation(attribution: Readonly<Record<string, string | number | null>> = {}): ToolOutputOperation {
+    ensurePrivateDirectory(this.root);
+    const operations = this.operationsDir;
+    ensurePrivateDirectory(operations);
+    // Reclaim at most one bounded cursor batch on each real capture operation.
+    // Failure is explicit: a new capture never evicts or silently bypasses debt.
+    this.cleanupExpired();
+    const id = randomUUID();
+    const lockPath = path.join(operations, `${id}.lock`);
+    const ownerNonce = randomUUID();
+    let lock: DispatchInvocationLock;
+    try { lock = acquireDispatchInvocationLock({ lockPath, nonce: () => ownerNonce }); }
+    catch (error) { throw new Error(`Tool-output capture operation ownership is unavailable: ${error instanceof Error ? error.message : 'unknown lock error'}`); }
+    let slot: number;
+    try { slot = this.registerOperation(id, operations); }
+    catch (error) { lock.release(); throw error; }
+    const artifacts: ToolOutputArtifactReference[] = [];
+    const captureAttributions: Array<Readonly<Record<string, string | number | null>>> = [];
+    const activeCaptureIds: string[] = [];
+    const activeWriters = new Set<FileToolOutputWriter>();
+    const allWriters = new Set<FileToolOutputWriter>();
+    const metadataPath = path.join(operations, `${id}.json`);
+    const writeMetadata = (value: unknown) => writeAtomicJson(operations, metadataPath, value);
+    const createdAt = new Date().toISOString();
+    const base = { schemaVersion: 1, id, slot, ownerNonce, createdAt, attribution };
+    try { writeMetadata({ ...base, state: 'active', artifacts: [], activeCaptureIds }); }
+    catch (error) { lock.release(); throw error; }
+    let closed = false;
+    return {
+      id,
+      startCapture: (policy, commandAttribution = {}) => {
+        if (closed) throw new Error('Tool-output operation is already closed.');
+        const captureId = randomUUID();
+        activeCaptureIds.push(captureId);
+        writeMetadata({ ...base, state: 'active', activeCaptureIds, captures: artifacts.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })) });
+        let writer: FileToolOutputWriter;
+        try {
+          this.testFaults?.beforeCaptureStart?.();
+          writer = new FileToolOutputWriter(this.root, policy, captureId, this.testFaults);
+        }
+        catch (error) {
+          activeCaptureIds.splice(activeCaptureIds.indexOf(captureId), 1);
+          try { writeMetadata({ ...base, state: 'active', activeCaptureIds, artifacts }); } catch { /* preserve the original start failure */ }
+          throw error;
+        }
+        activeWriters.add(writer);
+        allWriters.add(writer);
+        return {
+          write: (channel, chunk) => writer.write(channel, chunk),
+          finish: () => {
+            const summary = writer.finish();
+            activeWriters.delete(writer);
+            activeCaptureIds.splice(activeCaptureIds.indexOf(captureId), 1);
+            artifacts.push(summary.artifact);
+            captureAttributions.push(commandAttribution);
+            writeMetadata({ ...base, state: 'active', activeCaptureIds, captures: artifacts.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })) });
+            return summary;
+          },
+          abort: () => {
+            writer.abort(); activeWriters.delete(writer);
+            const index = activeCaptureIds.indexOf(captureId); if (index !== -1) activeCaptureIds.splice(index, 1);
+            writeMetadata({ ...base, state: 'active', activeCaptureIds, artifacts });
+          },
+        };
+      },
+      close: () => {
+        if (closed) throw new Error('Tool-output operation is already closed.');
+        if (activeWriters.size > 0) throw new Error('Tool-output operation cannot commit while a capture writer is open.');
+        const closedAt = this.now().toISOString();
+        const retainedUntil = new Date(Date.parse(closedAt) + this.retentionMs).toISOString();
+        const committed = artifacts.map((artifact) => ({ ...artifact, operationId: id, retainedUntil }));
+        writeMetadata({ ...base, state: 'closed', closedAt, retainedUntil, captures: committed.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })), artifacts: committed });
+        closed = true;
+        lock.release();
+        return committed;
+      },
+      abort: () => {
+        if (closed) return;
+        let cleanupFailed = false;
+        for (const writer of allWriters) { try { writer.abort(); } catch { cleanupFailed = true; } }
+        activeWriters.clear();
+        try { writeMetadata({ ...base, state: 'aborted', closedAt: this.now().toISOString(), activeCaptureIds: cleanupFailed ? activeCaptureIds : [], artifacts }); }
+        finally { closed = true; lock.release(); }
+      },
+    };
   }
 
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
+    this.assertAvailable(referenceValue);
     const range = validateReadRequest(referenceValue, request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
     const filePath = this.file(referenceValue.id, request.channel);
-    if (!existsSync(filePath)) return this.fallback.read(referenceValue, request);
+    if (!existsSync(filePath)) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable or expired.`);
     const handle = openSync(filePath, 'r');
     try {
       const bufferOffset = Math.max(0, range.offset - 3);
@@ -491,21 +743,337 @@ export class FileToolOutputStore implements ToolOutputStore {
   }
 
   search(referenceValue: ToolOutputArtifactReference, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
+    this.assertAvailable(referenceValue);
     const { maxMatches, maxBytes } = validateSearchRequest(request);
     const channels = request.channel === undefined ? (['stdout', 'stderr'] as const) : [request.channel];
     const results: ToolOutputMatch[] = [];
     for (const channel of channels) {
       const filePath = this.file(referenceValue.id, channel);
-      if (!existsSync(filePath)) return this.fallback.search(referenceValue, request);
+      if (!existsSync(filePath)) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable or expired.`);
       results.push(...searchFile(filePath, channel, request.query, maxMatches, maxBytes, results.length));
       if (results.length >= maxMatches) break;
     }
     return results.slice(0, maxMatches);
   }
 
+  /** Release one committed operation early; its refs become unavailable immediately. */
+  release(referenceValue: ToolOutputArtifactReference): void {
+    this.assertAvailable(referenceValue);
+    const operationId = referenceValue.operationId!;
+    const metadataPath = path.join(this.operationsDir, `${operationId}.json`);
+    const fence = acquireDispatchInvocationLock({ lockPath: path.join(this.operationsDir, `${operationId}.lock`) });
+    try {
+      this.assertAvailable(referenceValue);
+      const metadata = readBoundedJson(metadataPath, 1_048_576);
+      if (metadata.state !== 'closed' || metadata.id !== operationId) throw new Error('Tool-output operation cannot be released.');
+      writeAtomicJson(this.operationsDir, metadataPath, {
+        ...metadata,
+        state: 'released',
+        releasedAt: this.now().toISOString(),
+      });
+    } finally { fence.release(); }
+  }
+
+  cleanupExpired(budget: ToolOutputCleanupBudget = {}): ToolOutputCleanupResult {
+    const maxSlotProbes = budget.maxSlotProbes ?? 16;
+    const maxMetadataBytes = budget.maxMetadataBytes ?? 1_048_576;
+    const maxMetadataReadBytes = budget.maxMetadataReadBytes ?? 64 * 1_048_576;
+    const maxDeletions = budget.maxDeletions ?? 64;
+    assertPositiveInteger(maxSlotProbes, 'maxSlotProbes');
+    assertPositiveInteger(maxMetadataBytes, 'maxMetadataBytes');
+    assertPositiveInteger(maxMetadataReadBytes, 'maxMetadataReadBytes');
+    assertPositiveInteger(maxDeletions, 'maxDeletions');
+    ensurePrivateDirectory(this.root);
+    ensurePrivateDirectory(this.operationsDir);
+    const maintenance = acquireDispatchInvocationLock({ lockPath: path.join(this.operationsDir, 'maintenance.lock') });
+    let probed = 0;
+    let deleted = 0;
+    let attempted = 0;
+    let protectedCount = 0;
+    let cursor = 0;
+    let metadataReadBytes = 0;
+    const accountMetadataRead = (bytes: number): void => {
+      if (metadataReadBytes + bytes > maxMetadataReadBytes) throw new Error('Tool-output cleanup metadata-read budget exhausted.');
+      metadataReadBytes += bytes;
+    };
+    try {
+      const index = this.readSlotIndex(true, accountMetadataRead);
+      cursor = index.cursor;
+      const toProbe = Math.min(maxSlotProbes, this.capacity);
+      for (let step = 0; step < toProbe; step += 1) {
+        const slot = (index.cursor + step) % this.capacity;
+        probed += 1;
+        const slotPath = this.slotPath(slot);
+        const slotRecord = this.readSlot(slot, accountMetadataRead);
+        if (slotRecord === undefined) continue;
+        if (slotRecord === null) { protectedCount += 1; continue; }
+        const metadataPath = path.join(this.operationsDir, slotRecord.id + '.json');
+        let metadata: Record<string, unknown> = {};
+        if (!slotRecord.deleting) {
+          try {
+            metadata = readBoundedJson(metadataPath, maxMetadataBytes, accountMetadataRead);
+            if (!validOperationMetadata(metadata, slotRecord.id, slot)) {
+              protectedCount += 1; continue;
+            }
+            if (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) || Date.parse(metadata.retainedUntil) > this.now().getTime())) {
+              protectedCount += 1; continue;
+            }
+          } catch { protectedCount += 1; continue; }
+        }
+        const expectedOwnerNonce = metadata.ownerNonce;
+        if (!slotRecord.deleting && (typeof expectedOwnerNonce !== 'string' || expectedOwnerNonce === '' || expectedOwnerNonce.length > 256)) {
+          protectedCount += 1; continue;
+        }
+
+        const lockPath = path.join(this.operationsDir, slotRecord.id + '.lock');
+        let lockExisted = false;
+        try {
+          const lockStats = lstatSync(lockPath);
+          lockExisted = lockStats.isFile() && !lockStats.isSymbolicLink();
+          if (!lockExisted) { protectedCount += 1; continue; }
+          if (!slotRecord.deleting) {
+            const lockRecord = readBoundedJson(lockPath, 4096, accountMetadataRead);
+            if (!dispatchLockMatchesOwner(lockRecord, expectedOwnerNonce as string)) { protectedCount += 1; continue; }
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+            if (metadata.state === 'active') { protectedCount += 1; continue; }
+          } else { protectedCount += 1; continue; }
+        }
+        let ownerFence: DispatchInvocationLock;
+        try { ownerFence = acquireDispatchInvocationLock({ lockPath }); }
+        catch { protectedCount += 1; continue; }
+        try {
+          // Re-read under the exact operation fence before acting on owner state.
+          let ids = new Set<string>(slotRecord.artifactIds);
+          if (!slotRecord.deleting) {
+            metadata = readBoundedJson(metadataPath, maxMetadataBytes, accountMetadataRead);
+            if (!validOperationMetadata(metadata, slotRecord.id, slot) ||
+                metadata.ownerNonce !== expectedOwnerNonce ||
+                (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) || Date.parse(metadata.retainedUntil) > this.now().getTime())) ||
+                (metadata.state === 'active' && !lockExisted)) { protectedCount += 1; continue; }
+            ids = new Set<string>();
+            if (Array.isArray(metadata.activeCaptureIds)) {
+              for (const value of metadata.activeCaptureIds) if (typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value)) ids.add(value);
+            }
+            if (Array.isArray(metadata.artifacts)) {
+              for (const value of metadata.artifacts) {
+                if (typeof value !== 'object' || value === null) continue;
+                const artifact = value as Record<string, unknown>;
+                if (typeof artifact.id === 'string' && /^[0-9a-f-]{36}$/.test(artifact.id)) ids.add(artifact.id);
+              }
+            }
+            if (Array.isArray(metadata.captures)) {
+              for (const value of metadata.captures) {
+                if (typeof value !== 'object' || value === null) continue;
+                const artifact = (value as Record<string, unknown>).artifact;
+                if (typeof artifact !== 'object' || artifact === null) continue;
+                const ref = artifact as Record<string, unknown>;
+                if (typeof ref.id === 'string' && /^[0-9a-f-]{36}$/.test(ref.id)) ids.add(ref.id);
+              }
+            }
+            // This durable tombstone lets a later bounded pass finish deletion after a crash.
+            writeAtomicJson(this.operationsDir, slotPath, {
+              schemaVersion: 1, capacity: this.capacity, slot, id: slotRecord.id,
+              deleting: true, artifactIds: [...ids],
+            });
+          }
+          const availableDeletions = maxDeletions - attempted;
+          const remainingArtifactIds = [...ids];
+          const artifactBatchSize = Math.max(0, Math.floor((availableDeletions - 2) / 2));
+          if (remainingArtifactIds.length > 0 && artifactBatchSize === 0) { protectedCount += 1; continue; }
+          const deletingIds = remainingArtifactIds.slice(0, artifactBatchSize);
+          const remainingIds = remainingArtifactIds.slice(deletingIds.length);
+          const files = deletingIds.flatMap((id) => [this.file(id, 'stdout'), this.file(id, 'stderr')]);
+          let safe = true;
+          for (const filePath of files) {
+            try {
+              const stats = lstatSync(filePath);
+              if (!stats.isFile() || stats.isSymbolicLink()) { safe = false; break; }
+            } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { safe = false; break; } }
+          }
+          if (!safe) { protectedCount += 1; continue; }
+          for (const filePath of files) {
+            try { attempted += 1; unlinkSync(filePath); deleted += 1; }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { safe = false; break; } }
+          }
+          if (!safe) { protectedCount += 1; continue; }
+          if (remainingIds.length > 0) {
+            writeAtomicJson(this.operationsDir, slotPath, {
+              schemaVersion: 1, capacity: this.capacity, slot, id: slotRecord.id,
+              deleting: true, artifactIds: remainingIds,
+            });
+            continue;
+          }
+          // Clearing the metadata and slot is one logical deletion step. Keep
+          // both attempts inside the caller's strict per-pass budget.
+          if (maxDeletions - attempted < 2) { protectedCount += 1; continue; }
+          try { attempted += 1; unlinkSync(metadataPath); deleted += 1; }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { protectedCount += 1; continue; } }
+          const dir = openSync(this.operationsDir, constants.O_RDONLY);
+          try { fsyncSync(dir); } finally { closeSync(dir); }
+          if (this.readSlot(slot, accountMetadataRead)?.id !== slotRecord.id) { protectedCount += 1; continue; }
+          attempted += 1;
+          unlinkSync(slotPath);
+          deleted += 1;
+          const operationDir = openSync(this.operationsDir, constants.O_RDONLY);
+          try { fsyncSync(operationDir); } finally { closeSync(operationDir); }
+        } catch { protectedCount += 1; }
+        finally { try { ownerFence.release(); } catch { /* next pass revalidates persistent state */ } }
+      }
+      const next = (index.cursor + probed) % this.capacity;
+      this.writeSlotIndex({ schemaVersion: 1, capacity: this.capacity, cursor: next });
+      cursor = next;
+    } finally { maintenance.release(); }
+    return { probed, deleted, attempted, protected: protectedCount, cursor };
+  }
+
   private file(id: string, channel: 'stdout' | 'stderr'): string {
     if (!/^[0-9a-f-]{36}$/.test(id)) throw new Error('Invalid tool-output artifact id.');
     return path.join(this.root, `${id}.${channel}`);
+  }
+
+  private slotPath(slot: number): string {
+    return path.join(this.operationsDir, `slot-${String(slot).padStart(4, '0')}.json`);
+  }
+
+  private readSlotIndex(create: boolean, accountRead?: (bytes: number) => void): { readonly schemaVersion: 1; readonly capacity: number; readonly cursor: number } {
+    const indexPath = path.join(this.operationsDir, 'index.json');
+    try {
+      const index = readBoundedJson(indexPath, 4096, accountRead);
+      if (index.schemaVersion !== 1 || index.capacity !== this.capacity || !Number.isSafeInteger(index.cursor) ||
+          (index.cursor as number) < 0 || (index.cursor as number) >= this.capacity) throw new Error('incompatible tool-output slot index');
+      return index as { readonly schemaVersion: 1; readonly capacity: number; readonly cursor: number };
+    } catch (error) {
+      if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || !create) throw new Error('Tool-output operation index is unavailable or incompatible.');
+      this.writeSlotIndex({ schemaVersion: 1, capacity: this.capacity, cursor: 0 });
+      return { schemaVersion: 1, capacity: this.capacity, cursor: 0 };
+    }
+  }
+
+  private writeSlotIndex(index: { readonly schemaVersion: 1; readonly capacity: number; readonly cursor: number }): void {
+    writeAtomicJson(this.operationsDir, path.join(this.operationsDir, 'index.json'), index);
+  }
+
+  private readSlot(slot: number, accountRead?: (bytes: number) => void): { readonly id: string; readonly deleting: boolean; readonly artifactIds: readonly string[] } | null | undefined {
+    try {
+      const value = readBoundedJson(this.slotPath(slot), 1_048_576, accountRead);
+      if (value.schemaVersion !== 1 || value.capacity !== this.capacity || value.slot !== slot ||
+          typeof value.id !== 'string' || !/^[0-9a-f-]{36}$/.test(value.id)) return null;
+      if (value.deleting === true) {
+        if (!Array.isArray(value.artifactIds) || !value.artifactIds.every((id) => typeof id === 'string' && /^[0-9a-f-]{36}$/.test(id))) return null;
+        return { id: value.id, deleting: true, artifactIds: value.artifactIds as string[] };
+      }
+      if (value.deleting !== undefined || value.artifactIds !== undefined) return null;
+      return { id: value.id, deleting: false, artifactIds: [] };
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      return null;
+    }
+  }
+
+  private registerOperation(id: string, operations: string): number {
+    const maintenance = acquireDispatchInvocationLock({ lockPath: path.join(operations, 'maintenance.lock') });
+    try {
+      const index = this.readSlotIndex(true);
+      const probes = Math.min(this.maxRegistrationProbes, this.capacity);
+      for (let step = 0; step < probes; step += 1) {
+        const slot = (index.cursor + step) % this.capacity;
+        if (this.readSlot(slot) !== undefined) continue;
+        writeAtomicJson(operations, this.slotPath(slot), { schemaVersion: 1, capacity: this.capacity, slot, id });
+        this.writeSlotIndex({ schemaVersion: 1, capacity: this.capacity, cursor: (slot + 1) % this.capacity });
+        return slot;
+      }
+      this.writeSlotIndex({ schemaVersion: 1, capacity: this.capacity, cursor: (index.cursor + probes) % this.capacity });
+      throw new Error(probes < this.capacity
+        ? 'Tool-output operation registration probe budget was exhausted; no retained capture was evicted.'
+        : 'Tool-output operation capacity is full; no retained capture was evicted.');
+    } finally { maintenance.release(); }
+  }
+
+  private assertAvailable(referenceValue: ToolOutputArtifactReference): void {
+    if (referenceValue.operationId === undefined || referenceValue.retainedUntil === undefined) {
+      throw new Error(`Tool-output artifact ${referenceValue.id} has no committed retention authority.`);
+    }
+    const until = Date.parse(referenceValue.retainedUntil);
+    if (!Number.isFinite(until) || this.now().getTime() >= until) throw new Error(`Tool-output artifact ${referenceValue.id} is expired.`);
+    if (!/^[0-9a-f-]{36}$/.test(referenceValue.operationId)) throw new Error('Invalid tool-output operation id.');
+    const metadataPath = path.join(this.root, 'operations', `${referenceValue.operationId}.json`);
+    try {
+      const stats = lstatSync(metadataPath);
+      if (stats.isSymbolicLink() || !stats.isFile() || stats.size > 1_048_576) throw new Error('invalid operation metadata path');
+      const descriptor = openSync(metadataPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+      let value: Record<string, unknown>;
+      try {
+        const actual = fstatSync(descriptor);
+        if (!actual.isFile() || actual.size > 1_048_576) throw new Error('invalid operation metadata');
+        const data = Buffer.alloc(actual.size);
+        let offset = 0;
+        while (offset < data.length) {
+          const count = readSync(descriptor, data, offset, data.length - offset, offset);
+          if (count === 0) throw new Error('short operation metadata');
+          offset += count;
+        }
+        value = JSON.parse(data.toString('utf8')) as Record<string, unknown>;
+      } finally { closeSync(descriptor); }
+      const persisted = Array.isArray(value.artifacts) ? value.artifacts.find((item) =>
+        typeof item === 'object' && item !== null && (item as Record<string, unknown>).id === referenceValue.id) as Record<string, unknown> | undefined : undefined;
+      if (value.state !== 'closed' || value.id !== referenceValue.operationId || value.retainedUntil !== referenceValue.retainedUntil ||
+          persisted === undefined || persisted.kind !== referenceValue.kind || persisted.id !== referenceValue.id ||
+          persisted.operationId !== referenceValue.operationId || persisted.retainedUntil !== referenceValue.retainedUntil ||
+          persisted.stdoutBytes !== referenceValue.stdoutBytes || persisted.stderrBytes !== referenceValue.stderrBytes ||
+          persisted.totalBytes !== referenceValue.totalBytes || persisted.sha256 !== referenceValue.sha256) {
+        throw new Error('operation retention metadata is unavailable');
+      }
+      for (const channel of ['stdout', 'stderr'] as const) {
+        const fileStats = lstatSync(this.file(referenceValue.id, channel));
+        if (fileStats.isSymbolicLink() || !fileStats.isFile()) throw new Error('invalid artifact file');
+        const expected = channel === 'stdout' ? referenceValue.stdoutBytes : referenceValue.stderrBytes;
+        if (fileStats.size !== expected) throw new Error('artifact byte length differs from committed metadata');
+      }
+    } catch { throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable or expired.`); }
+  }
+}
+
+function readBoundedJson(filePath: string, maxBytes: number, accountRead?: (bytes: number) => void): Record<string, unknown> {
+  const stats = lstatSync(filePath);
+  if (stats.isSymbolicLink() || !stats.isFile() || stats.size > maxBytes) throw new Error('Invalid bounded metadata file.');
+  const descriptor = openSync(filePath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  try {
+    const actual = fstatSync(descriptor);
+    if (!actual.isFile() || actual.size > maxBytes) throw new Error('Invalid bounded metadata file.');
+    accountRead?.(actual.size);
+    const data = Buffer.alloc(actual.size);
+    let offset = 0;
+    while (offset < data.length) {
+      const count = readSync(descriptor, data, offset, data.length - offset, offset);
+      if (count === 0) throw new Error('Short metadata read.');
+      offset += count;
+    }
+    const value: unknown = JSON.parse(data.toString('utf8'));
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('Invalid metadata object.');
+    return value as Record<string, unknown>;
+  } finally { closeSync(descriptor); }
+}
+
+function writeAtomicJson(directory: string, filePath: string, value: unknown): void {
+  const encoded = Buffer.from(JSON.stringify(value), 'utf8');
+  if (encoded.length > 1_048_576) throw new Error('Tool-output metadata exceeds the bounded metadata limit.');
+  const temporary = `${filePath}.tmp-${randomUUID()}`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = openSync(temporary, 'wx', 0o600);
+    writeFully(descriptor, encoded);
+    fsyncSync(descriptor);
+    closeSync(descriptor); descriptor = undefined;
+    renameSync(temporary, filePath);
+    const dir = openSync(directory, constants.O_RDONLY);
+    try { fsyncSync(dir); } finally { closeSync(dir); }
+  } catch (error) {
+    if (descriptor !== undefined) { try { closeSync(descriptor); } catch { /* preserve initial failure */ } }
+    try { unlinkSync(temporary); } catch { /* preserve initial failure */ }
+    throw error;
   }
 }
 
@@ -535,7 +1103,7 @@ class DiagnosticCapture {
   private readonly highSignal: string[] = [];
   private readonly fallback: string[] = [];
   private dropped = false;
-  private readonly highSignalPattern = /\b(error|failed|failure|fatal|exception|assert|panic|timeout|timed[ -]?out|denied|invalid|cannot|could not)\b/i;
+  private readonly highSignalPattern = /\b(error|failed|failure|fatal|exception|assert|panic|timeout|timed[ -]?out|denied|invalid|cannot|could not|fail|not ok\s+\d+)\b|✖/i;
 
   constructor(private readonly policy: ToolOutputPolicy) {}
 
@@ -568,8 +1136,55 @@ class DiagnosticCapture {
     if (!this.highSignalPattern.test(normalized)) return;
     this.highSignal.push(normalized);
     if (this.highSignal.length > this.policy.maxDiagnostics) {
-      this.highSignal.shift();
+      if (this.policy.maxDiagnostics > 1) this.highSignal.splice(1, 1);
+      else this.highSignal.pop();
       this.dropped = true;
+    }
+  }
+}
+
+/** Bounded observation independent of the durable sink; sink faults never stop pipe draining. */
+export class ContainedToolOutputCaptureSession {
+  private readonly stdout: StreamCapture;
+  private readonly stderr: StreamCapture;
+  private readonly stdoutDiagnostics: DiagnosticCapture;
+  private readonly stderrDiagnostics: DiagnosticCapture;
+  private failed = false;
+
+  constructor(private readonly policy: ToolOutputPolicy) {
+    this.stdout = new StreamCapture(policy.previewBytes);
+    this.stderr = new StreamCapture(policy.previewBytes);
+    this.stdoutDiagnostics = new DiagnosticCapture(policy);
+    this.stderrDiagnostics = new DiagnosticCapture(policy);
+  }
+
+  write(writer: ToolOutputCaptureWriter | undefined, channel: 'stdout' | 'stderr', chunk: string): void {
+    if (channel === 'stdout') { this.stdout.append(chunk); this.stdoutDiagnostics.append(chunk); }
+    else { this.stderr.append(chunk); this.stderrDiagnostics.append(chunk); }
+    if (writer === undefined || this.failed) return;
+    try { writer.write(channel, chunk); }
+    catch {
+      this.failed = true;
+      try { writer.abort?.(); } catch { /* disposal faults cannot stop stream draining */ }
+    }
+  }
+
+  finish(writer: ToolOutputCaptureWriter | undefined): ToolOutputCaptureSessionResult {
+    const stdout = this.stdout.value();
+    const stderr = this.stderr.value();
+    const stdoutDiagnostics = this.stdoutDiagnostics.finish();
+    const stderrDiagnostics = this.stderrDiagnostics.finish();
+    const diagnostics = boundedDiagnostics([...stdoutDiagnostics.lines, ...stderrDiagnostics.lines].join('\n'), '', this.policy);
+    const diagnosticsTruncated = stdoutDiagnostics.truncated || stderrDiagnostics.truncated || diagnostics.truncated;
+    if (writer === undefined) return { status: 'unavailable', stdout, stderr, diagnostics: diagnostics.lines, diagnosticsTruncated };
+    if (this.failed) return { status: 'partial', stdout, stderr, diagnostics: diagnostics.lines, diagnosticsTruncated };
+    try {
+      const capture = writer.finish();
+      return { status: 'complete', stdout: capture.stdout, stderr: capture.stderr, diagnostics: capture.diagnostics,
+        diagnosticsTruncated: capture.diagnosticsTruncated, capture };
+    } catch {
+      try { writer.abort?.(); } catch { /* disposal faults remain contained */ }
+      return { status: 'partial', stdout, stderr, diagnostics: diagnostics.lines, diagnosticsTruncated };
     }
   }
 }
@@ -599,20 +1214,31 @@ class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
 }
 
 class FileToolOutputWriter implements ToolOutputCaptureWriter {
-  private readonly id = randomUUID();
-  private readonly stdoutHandle: number;
-  private readonly stderrHandle: number;
+  private stdoutHandle: number | undefined;
+  private stderrHandle: number | undefined;
   private readonly stdoutCapture: StreamCapture;
   private readonly stderrCapture: StreamCapture;
   private readonly stdoutDiagnostics: DiagnosticCapture;
   private readonly stderrDiagnostics: DiagnosticCapture;
   private finished = false;
 
-  constructor(private readonly root: string, private readonly policy: ToolOutputPolicy) {
+  constructor(
+    private readonly root: string,
+    private readonly policy: ToolOutputPolicy,
+    private readonly id = randomUUID(),
+    private readonly testFaults?: ToolOutputFileTestFaults,
+  ) {
     mkdirSync(root, { recursive: true, mode: 0o700 });
     chmodSync(root, 0o700);
-    this.stdoutHandle = openSync(path.join(root, `${this.id}.stdout`), 'wx', 0o600);
-    this.stderrHandle = openSync(path.join(root, `${this.id}.stderr`), 'wx', 0o600);
+    try {
+      this.stdoutHandle = openSync(path.join(root, `${this.id}.stdout`), 'wx', 0o600);
+      testFaults?.beforeSecondOpen?.();
+      this.stderrHandle = openSync(path.join(root, `${this.id}.stderr`), 'wx', 0o600);
+    } catch (error) {
+      if (this.stdoutHandle !== undefined) closeSync(this.stdoutHandle);
+      try { unlinkSync(path.join(root, `${this.id}.stdout`)); } catch { /* cleanup of partial second-open is best effort */ }
+      throw error;
+    }
     this.stdoutCapture = new StreamCapture(policy.previewBytes);
     this.stderrCapture = new StreamCapture(policy.previewBytes);
     this.stdoutDiagnostics = new DiagnosticCapture(policy);
@@ -623,7 +1249,8 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
     if (this.finished) throw new Error('Tool-output capture is already finished.');
     const bytes = Buffer.from(chunk, 'utf8');
     const handle = channel === 'stdout' ? this.stdoutHandle : this.stderrHandle;
-    writeSync(handle, bytes, 0, bytes.length);
+    if (handle === undefined) throw new Error('Tool-output capture descriptor is unavailable.');
+    writeFully(handle, bytes, this.testFaults?.writeSync);
     if (channel === 'stdout') {
       this.stdoutCapture.append(chunk);
       this.stdoutDiagnostics.append(chunk);
@@ -635,14 +1262,28 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
 
   finish(): ToolOutputCaptureSummary {
     if (!this.finished) {
+      this.testFaults?.beforeFinish?.();
       this.finished = true;
-      closeSync(this.stdoutHandle);
-      closeSync(this.stderrHandle);
+      let failure: unknown;
+      for (const [channel, handle] of [['stdout', this.stdoutHandle], ['stderr', this.stderrHandle]] as const) {
+        if (handle !== undefined) { try { this.testFaults?.beforeFsync?.(channel); fsyncSync(handle); } catch (error) { if (failure === undefined) failure = error; } }
+      }
+      for (const handle of [this.stdoutHandle, this.stderrHandle]) {
+        if (handle !== undefined) { try { closeSync(handle); } catch (error) { if (failure === undefined) failure = error; } }
+      }
+      this.stdoutHandle = undefined;
+      this.stderrHandle = undefined;
+      if (failure !== undefined) throw failure;
     }
     const stdout = this.stdoutCapture.value();
     const stderr = this.stderrCapture.value();
     const stdoutBytes = stdout.bytes;
     const stderrBytes = stderr.bytes;
+    if (lstatSync(path.join(this.root, `${this.id}.stdout`)).size !== stdoutBytes ||
+        lstatSync(path.join(this.root, `${this.id}.stderr`)).size !== stderrBytes) {
+      throw new Error('Tool-output capture file length differs from the streamed byte count.');
+    }
+    this.testFaults?.beforeHash?.();
     const hash = hashFiles(
       path.join(this.root, `${this.id}.stdout`),
       path.join(this.root, `${this.id}.stderr`),
@@ -662,6 +1303,32 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
       diagnostics: diagnostics.lines,
       diagnosticsTruncated: stdoutDiagnostics.truncated || stderrDiagnostics.truncated || diagnostics.truncated,
     };
+  }
+
+  abort(): void {
+    if (!this.finished) {
+      this.finished = true;
+      for (const handle of [this.stdoutHandle, this.stderrHandle]) {
+        if (handle !== undefined) { try { closeSync(handle); } catch { /* disposal is best effort */ } }
+      }
+    }
+    this.stdoutHandle = undefined;
+    this.stderrHandle = undefined;
+    for (const channel of ['stdout', 'stderr'] as const) {
+      const filePath = path.join(this.root, `${this.id}.${channel}`);
+      try { this.testFaults?.beforeUnlink?.(filePath); unlinkSync(filePath); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+    }
+  }
+}
+
+function writeFully(handle: number, bytes: Buffer, writer: ToolOutputFileTestFaults['writeSync'] = writeSync): void {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const written = writer(handle, bytes, offset, bytes.length - offset);
+    if (written <= 0) throw new Error('Tool-output capture write was incomplete.');
+    offset += written;
   }
 }
 

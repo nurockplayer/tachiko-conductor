@@ -386,10 +386,40 @@ TACHIKO_CODEX_APP_SERVER_SMOKE=1 node --import tsx --test tests/codex-app-server
 ## Exact-HEAD validation
 
 `VALIDATING` requires a persisted `ValidationResult` for the current exact
-HEAD. Conductor retains compact local-command and hosted-check provenance only;
-it never stores command output, full command arguments, or secrets. A new HEAD
-makes prior evidence stale. Pending hosted checks park in `WAITING_DEPENDENCY`
-for a later re-read; unavailable or unknown evidence fails closed.
+HEAD. Conductor retains compact local-command and hosted-check provenance;
+when an explicit local validation plan runs, its output is captured as bounded
+summaries plus a private, hashed file artifact. The artifact reference carries
+a fixed seven-day deadline measured from the end of the whole validation
+operation. The library store allows a finite `retentionMs` override (default
+seven days), and each operation persists its deadline once; reopening a store
+with different options cannot renew existing references. `release(reference)`
+revokes one committed operation immediately and makes its references
+unavailable; bounded cleanup then reclaims its files. Reads do not extend the
+deadline. Output remains supplemental and
+does not change the validation result. Full command arguments and secrets are
+not retained. A new HEAD makes prior validation evidence stale. Pending hosted
+checks park in `WAITING_DEPENDENCY` for a later re-read; unavailable or unknown
+evidence fails closed.
+
+The default evidence root is `$TACHIKO_DATA_DIR/.evidence/v1` (under the runs
+directory when `TACHIKO_DATA_DIR` is unset); `TACHIKO_EVIDENCE_DIR` can name an
+absolute private root. `TACHIKO_TOOL_OUTPUT_POLICY` optionally supplies
+positive `previewBytes`, `diagnosticBytes`, `maxDiagnostics`, and `readBytes`
+limits as JSON. The private store has a persisted fixed capacity of 256
+operation slots, limits registration to at most 16 slot probes per attempt, and
+advances a bounded cleanup cursor during capture setup.
+If the index is incompatible, occupied by protected/corrupt ownership, or at
+capacity, capture becomes unavailable; retained slots are never evicted.
+Generic and provider commands do not create raw output files unless the
+individual command explicitly requests capture.
+
+Use the artifact-reference JSON emitted with command evidence for bounded
+drill-down:
+
+```bash
+tachiko tool-output read '{"kind":"tool-output",...}' --channel stdout --offset 0 --length 4096
+tachiko tool-output search '{"kind":"tool-output",...}' --query 'FAILED' --channel stderr
+```
 
 Local commands are repository/run configuration and are never inferred from
 Issue text. Set `TACHIKO_LOCAL_VALIDATION_CONFIG` to a stable revision and

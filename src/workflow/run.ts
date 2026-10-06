@@ -490,7 +490,13 @@ async function validateExactHead(
   if (local === undefined) {
     onExecutionStart?.();
     beforeValidation?.();
-    local = await validation!.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+    local = await validation!.validate({
+      target,
+      headSha: run.headSha,
+      ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }),
+      runId: run.id,
+      ...(beforeValidation === undefined ? {} : { beforeSpawn: beforeValidation }),
+    });
   }
   return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
 }

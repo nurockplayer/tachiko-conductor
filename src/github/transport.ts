@@ -1,12 +1,16 @@
-import { execFile, type ExecFileException } from 'node:child_process';
+import { execFile, spawn, type ExecFileException } from 'node:child_process';
 
 import {
   boundToolOutput,
+  boundToolOutputFromCapture,
+  ContainedToolOutputCaptureSession,
   DEFAULT_TOOL_OUTPUT_POLICY,
   type ToolOutputEnvelope,
   type ToolOutputPolicy,
   type ToolOutputStore,
+  type ToolOutputCaptureWriter,
 } from '../evidence/tool-output.js';
+import { StringDecoder } from 'node:string_decoder';
 import { GitHubLiveStateError } from './errors.js';
 
 export interface GitHubApiTransport {
@@ -29,6 +33,7 @@ export interface ProcessResult {
   readonly exitCode: number;
   /** Bounded, explicitly drillable evidence for the command transcript. */
   readonly output?: ToolOutputEnvelope;
+  readonly captureStatus?: 'complete' | 'partial' | 'unavailable';
 }
 
 export interface ProcessRunOptions {
@@ -71,6 +76,7 @@ export class NodeProcessRunner implements ProcessRunner {
   }
 
   async run(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
+    if (options.outputStore !== undefined) return await this.runCaptured(file, args, options);
     return await new Promise<ProcessResult>((resolve, reject) => {
       let settled = false;
       let stdinError: unknown;
@@ -79,6 +85,7 @@ export class NodeProcessRunner implements ProcessRunner {
         settled = true;
         action();
       };
+      options.beforeSpawn?.();
       const child = execFile(
         file,
         [...args],
@@ -86,6 +93,7 @@ export class NodeProcessRunner implements ProcessRunner {
           encoding: 'utf8',
           timeout: options.timeoutMs,
           cwd: options.cwd,
+          ...(options.env === undefined ? {} : { env: options.env }),
           signal: options.signal,
           maxBuffer: 16 * 1024 * 1024,
         },
@@ -144,6 +152,107 @@ export class NodeProcessRunner implements ProcessRunner {
     });
   }
 
+  /** Explicit evidence capture uses streaming pipes; ordinary/provider runs keep execFile semantics. */
+  private async runCaptured(file: string, args: readonly string[], options: ProcessRunOptions): Promise<ProcessResult> {
+    const policy = options.outputPolicy ?? this.outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY;
+    const session = new ContainedToolOutputCaptureSession(policy);
+    let writer: ToolOutputCaptureWriter | undefined;
+    try { writer = options.outputStore!.startCapture(policy); } catch { writer = undefined; }
+    if (options.signal?.aborted === true) {
+      try { writer?.abort?.(); } catch { /* preserve the pre-aborted child truth */ }
+      throw Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' });
+    }
+    // Preserve the main admission fence: capture setup is complete before this
+    // synchronous callback, with no await between it and child creation.
+    let child: ReturnType<typeof spawn>;
+    try {
+      options.beforeSpawn?.();
+      child = spawn(file, [...args], {
+        cwd: options.cwd,
+        ...(options.env === undefined ? {} : { env: options.env }),
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      });
+    } catch (error) {
+      try { writer?.abort?.(); } catch { /* admission/spawn refusal remains authoritative */ }
+      throw error;
+    }
+    return await new Promise<ProcessResult>((resolve, reject) => {
+      let settled = false;
+      let timedOut = false;
+      let cancelled = false;
+      let stdinError: unknown;
+      const stdoutDecoder = new StringDecoder('utf8');
+      const stderrDecoder = new StringDecoder('utf8');
+      const kill = (): void => { try { child.kill('SIGTERM'); } catch { /* child truth is decided by close */ } };
+      const timer = setTimeout(() => { timedOut = true; kill(); }, options.timeoutMs);
+      const onAbort = (): void => { cancelled = true; kill(); };
+      options.signal?.addEventListener('abort', onAbort, { once: true });
+      if (options.signal?.aborted === true) onAbort();
+      const capture = (channel: 'stdout' | 'stderr', chunk: Buffer, decoder: StringDecoder): void => {
+        const text = decoder.write(chunk);
+        if (text !== '') session.write(writer, channel, text);
+      };
+      child.stdout?.on('data', (chunk: Buffer) => capture('stdout', chunk, stdoutDecoder));
+      child.stderr?.on('data', (chunk: Buffer) => capture('stderr', chunk, stderrDecoder));
+      child.stdin?.on('error', (error) => { stdinError ??= error; });
+      child.once('error', (error) => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener('abort', onAbort);
+        if (settled) return;
+        settled = true;
+        const summary = this.finishCapture(writer, session);
+        reject(Object.assign(error, summary.output === undefined ? {} : { output: summary.output }));
+      });
+      child.once('close', (rawCode, signal) => {
+        clearTimeout(timer);
+        options.signal?.removeEventListener('abort', onAbort);
+        if (settled) return;
+        settled = true;
+        const stdoutFinal = stdoutDecoder.end();
+        const stderrFinal = stderrDecoder.end();
+        if (stdoutFinal !== '') session.write(writer, 'stdout', stdoutFinal);
+        if (stderrFinal !== '') session.write(writer, 'stderr', stderrFinal);
+        const exitCode = typeof rawCode === 'number' ? rawCode : null;
+        const outcome = cancelled || options.signal?.aborted === true ? 'cancelled' : timedOut ? 'timed_out' : exitCode === 0 ? 'passed' : exitCode === null ? 'unknown' : 'failed';
+        const summary = this.finishCapture(writer, session, outcome, exitCode, policy);
+        if (cancelled || options.signal?.aborted === true) {
+          reject(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR', ...(summary.output === undefined ? {} : { output: summary.output }) }));
+        } else if (timedOut) {
+          reject(Object.assign(new Error(`Command ${file} timed out after ${options.timeoutMs}ms.`), { code: 'ETIMEDOUT', ...(summary.output === undefined ? {} : { output: summary.output }) }));
+        } else if (signal !== null) {
+          reject(Object.assign(new Error(`Command ${file} terminated by signal ${signal}.`), {
+            code: null, signal, ...(summary.output === undefined ? {} : { output: summary.output }),
+          }));
+        } else if (stdinError !== undefined) {
+          reject(stdinError);
+        } else {
+          resolve({ stdout: summary.stdout, stderr: summary.stderr, exitCode: exitCode ?? 1, ...(summary.output === undefined ? {} : { output: summary.output }), captureStatus: summary.captureStatus });
+        }
+      });
+      try { child.stdin?.end(options.stdin); } catch (error) { stdinError ??= error; }
+    });
+  }
+
+  private finishCapture(
+    writer: ToolOutputCaptureWriter | undefined,
+    session: ContainedToolOutputCaptureSession,
+    outcome: ToolOutputEnvelope['outcome'] = 'unknown',
+    exitCode: number | null = null,
+    policy: ToolOutputPolicy = DEFAULT_TOOL_OUTPUT_POLICY,
+  ): { readonly output?: ToolOutputEnvelope; readonly stdout: string; readonly stderr: string; readonly captureStatus: 'complete' | 'partial' | 'unavailable' } {
+    const result = session.finish(writer);
+    if (result.status === 'complete' && result.capture !== undefined) {
+      return {
+        output: boundToolOutputFromCapture({ outcome, exitCode, capture: result.capture, policy }),
+        stdout: result.stdout.preview,
+        stderr: result.stderr.preview,
+        captureStatus: result.status,
+      };
+    }
+    return { stdout: result.stdout.preview, stderr: result.stderr.preview, captureStatus: result.status };
+  }
+
   private result(stdout: string, stderr: string, exitCode: number, options: ProcessRunOptions): ProcessResult {
     const output = this.output(stdout, stderr, exitCode === 0 ? 'passed' : 'failed', exitCode, options);
     return {
@@ -180,6 +289,7 @@ export interface GhCliTransportOptions {
   readonly runner?: ProcessRunner;
   readonly timeoutMs?: number;
   readonly outputPolicy?: ToolOutputPolicy;
+  /** @deprecated Parser transcripts remain transient; this store is ignored. */
   readonly outputStore?: ToolOutputStore;
 }
 
@@ -242,13 +352,11 @@ export class GhCliTransport implements GitHubApiTransport {
   private readonly runner: ProcessRunner;
   private readonly timeoutMs: number;
   private readonly outputPolicy: ToolOutputPolicy | undefined;
-  private readonly outputStore: ToolOutputStore | undefined;
 
   constructor(options: GhCliTransportOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
     this.timeoutMs = options.timeoutMs ?? 30_000;
     this.outputPolicy = options.outputPolicy;
-    this.outputStore = options.outputStore;
   }
 
   private args(
@@ -278,7 +386,6 @@ export class GhCliTransport implements GitHubApiTransport {
       result = await this.runner.run('gh', args, {
         timeoutMs: this.timeoutMs,
         ...(this.outputPolicy === undefined ? {} : { outputPolicy: this.outputPolicy }),
-        ...(this.outputStore === undefined ? {} : { outputStore: this.outputStore }),
       });
     } catch (error) {
       throw mapThrownError(error, path);
