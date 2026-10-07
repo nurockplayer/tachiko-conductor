@@ -279,8 +279,9 @@ function acquireEvidenceOperationFence(
   if (preflight.record !== undefined && expectedOwnerNonce !== undefined && preflight.record.nonce !== expectedOwnerNonce) {
     throw new Error('Evidence operation lock nonce does not match its persisted owner.');
   }
-  return acquireDispatchInvocationLock({
+  const acquired = acquireDispatchInvocationLock({
     lockPath,
+    ...(expectedOwnerNonce === undefined ? {} : { nonce: () => expectedOwnerNonce }),
     beforeStaleTakeover: () => {
       testFaults?.beforeStaleTakeover?.();
       const current = readEvidenceOperationLock(lockPath, accountRead);
@@ -290,6 +291,17 @@ function acquireEvidenceOperationFence(
       }
     },
   });
+  // The shared primitive's exact owner record is stable for this operation;
+  // consume this private handle before forwarding release so a duplicate call
+  // cannot remove a later acquisition that intentionally reuses the nonce.
+  let released = false;
+  return {
+    release() {
+      if (released) return;
+      released = true;
+      acquired.release();
+    },
+  };
 }
 
 function isToolOutputArtifactFileIdentity(value: unknown): value is ToolOutputArtifactFileIdentity {

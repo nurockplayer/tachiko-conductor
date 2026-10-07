@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -626,6 +626,70 @@ describe('UTF-8 tool output ranges', () => {
           assert.equal(metadata.state, 'released');
           assert.throws(() => store.read(reference, { channel: 'stdout' }), /unavailable or expired/);
         } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: reclaims after a fresh-process fence crash with the persisted owner nonce', () => {
+        const fixtureModuleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+        const fixtureSource = `
+          import fs from 'node:fs';
+          import path from 'node:path';
+          import { FileToolOutputStore } from ${JSON.stringify(fixtureModuleUrl)};
+          const [root, operationId] = process.argv.slice(1);
+          const lockPath = path.join(root, 'operations', operationId + '.lock');
+          const store = new FileToolOutputStore(root, { capacity: 1, now: () => {
+            if (fs.existsSync(lockPath)) {
+              const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+              if (lock.pid === process.pid) {
+                console.log(JSON.stringify({ kind: 'crash-after-fence-publication', nonce: lock.nonce }));
+                process.exit(91);
+              }
+            }
+            return new Date('2030-01-01T00:00:00.000Z');
+          } });
+          store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          throw new Error('expected fixture process to stop after fence publication');
+        `;
+        for (const initialLock of ['missing', 'stale-versioned'] as const) {
+          const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-output-nonce-recovery-${initialLock}-`));
+          try {
+            const store = new FileToolOutputStore(directory, { capacity: 1 });
+            const operation = store.beginOperation({ kind: `recovery-${initialLock}` });
+            const lockPath = path.join(directory, 'operations', `${operation.id}.lock`);
+            const initialRecord = JSON.parse(readFileSync(lockPath, 'utf8')) as Record<string, unknown>;
+            const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+            writer.write('stdout', 'recovery-source-fixture');
+            writer.finish();
+            const artifact = operation.close()[0]!;
+            const metadataPath = path.join(directory, 'operations', `${operation.id}.json`);
+            const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { readonly ownerNonce: string };
+            if (initialLock === 'stale-versioned') {
+              writeFileSync(lockPath, JSON.stringify({
+                ...initialRecord,
+                pid: 2_147_483_647,
+                processStartId: 'dead-owner-fixture',
+              }));
+            }
+
+            const crashed = spawnSync(process.execPath, [
+              '--import', 'tsx', '--input-type=module', '-e', fixtureSource, directory, operation.id,
+            ], { cwd: process.cwd(), encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+            assert.equal(crashed.status, 91, `${initialLock}: fixture child exits itself after fence publication`);
+            assert.equal(crashed.signal, null);
+            const crashEvidence = JSON.parse(crashed.stdout.trim()) as { readonly nonce: string };
+            assert.equal(crashEvidence.nonce, metadata.ownerNonce, `${initialLock}: fence retains the persisted operation nonce`);
+            assert.equal(JSON.parse(readFileSync(metadataPath, 'utf8')).ownerNonce, metadata.ownerNonce);
+
+            const recoveredStore = new FileToolOutputStore(directory, {
+              capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z'),
+            });
+            const cleanup = recoveredStore.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            assert.equal(cleanup.protected, 0, `${initialLock}: dead exact owner is recoverable`);
+            assert.equal(existsSync(path.join(directory, `${artifact.id}.stdout`)), false);
+            assert.equal(existsSync(path.join(directory, 'operations', 'slot-0000.json')), false);
+            const reused = recoveredStore.beginOperation({ kind: `recovered-${initialLock}` });
+            reused.abort();
+          } finally { rmSync(directory, { recursive: true, force: true }); }
+        }
       });
 
       it('file: syncs artifact directory before commit, abort debt removal and cleanup tombstone progress', () => {
