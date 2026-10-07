@@ -70,7 +70,7 @@ import {
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
-import { DEFAULT_TOOL_OUTPUT_POLICY, FileToolOutputStore, type ToolOutputArtifactReference, type ToolOutputPolicy } from './evidence/tool-output.js';
+import { DEFAULT_TOOL_OUTPUT_POLICY, FileToolOutputStore, validateToolOutputPolicy, type ToolOutputArtifactReference, type ToolOutputPolicy } from './evidence/tool-output.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
@@ -492,16 +492,13 @@ export function resolveToolOutputRoot(env: NodeJS.ProcessEnv = process.env): str
 
 export function resolveToolOutputPolicy(env: NodeJS.ProcessEnv = process.env): ToolOutputPolicy {
   const raw = env.TACHIKO_TOOL_OUTPUT_POLICY;
-  if (raw === undefined) return DEFAULT_TOOL_OUTPUT_POLICY;
+  if (raw === undefined) return validateToolOutputPolicy(DEFAULT_TOOL_OUTPUT_POLICY);
   let value: unknown;
   try { value = JSON.parse(raw); } catch { throw new Error('TACHIKO_TOOL_OUTPUT_POLICY must be valid JSON.'); }
   if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('TACHIKO_TOOL_OUTPUT_POLICY must be an object.');
   const policy = value as Record<string, unknown>;
-  for (const key of ['previewBytes', 'diagnosticBytes', 'maxDiagnostics', 'readBytes']) {
-    if (!Number.isSafeInteger(policy[key]) || (policy[key] as number) < 1) throw new Error(`TACHIKO_TOOL_OUTPUT_POLICY.${key} must be a positive safe integer.`);
-  }
-  return { previewBytes: policy.previewBytes as number, diagnosticBytes: policy.diagnosticBytes as number,
-    maxDiagnostics: policy.maxDiagnostics as number, readBytes: policy.readBytes as number };
+  return validateToolOutputPolicy({ previewBytes: policy.previewBytes as number, diagnosticBytes: policy.diagnosticBytes as number,
+    maxDiagnostics: policy.maxDiagnostics as number, readBytes: policy.readBytes as number });
 }
 
 export interface BrowserRoots {

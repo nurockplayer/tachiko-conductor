@@ -401,6 +401,8 @@ describe('CLI command layer', () => {
       { previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 16 });
     assert.throws(() => resolveToolOutputRoot({ TACHIKO_EVIDENCE_DIR: 'relative' }), /absolute/);
     assert.throws(() => resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: '{"previewBytes":0}' }), /previewBytes/);
+    assert.throws(() => resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: '{"previewBytes":65537,"diagnosticBytes":32,"maxDiagnostics":2,"readBytes":16}' }), /previewBytes.*maximum/);
+    assert.throws(() => resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: '{"previewBytes":8,"diagnosticBytes":32,"maxDiagnostics":129,"readBytes":16}' }), /maxDiagnostics.*maximum/);
   });
 
   it('reopens the configured evidence root for CLI range drilldown', async () => {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { closeSync, existsSync, fstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -7,11 +7,13 @@ import { describe, it } from 'node:test';
 
 import {
   DEFAULT_TOOL_OUTPUT_POLICY,
+  ContainedToolOutputCaptureSession,
   FileToolOutputStore,
   InMemoryToolOutputStore,
   boundToolOutput,
   readToolOutput,
   searchToolOutput,
+  validateToolOutputPolicy,
   type ToolOutputPolicy,
 } from '../src/evidence/tool-output.js';
 import { attachToolOutputTelemetry, providerTelemetry } from '../src/agents/provider-telemetry.js';
@@ -24,6 +26,36 @@ const policy: ToolOutputPolicy = {
 };
 
 describe('bounded tool output contract', () => {
+  it('rejects over-limit policies before capture mutation and copies caller policy scalars', () => {
+    const directory = path.join(os.tmpdir(), `tachiko-invalid-policy-${process.pid}-${Date.now()}`);
+    const store = new FileToolOutputStore(directory);
+    assert.throws(() => store.startCapture({ ...DEFAULT_TOOL_OUTPUT_POLICY, previewBytes: 65_537 }), /previewBytes.*maximum/);
+    assert.equal(existsSync(directory), false, 'invalid standalone policy is rejected before root creation');
+    assert.throws(() => validateToolOutputPolicy({ ...DEFAULT_TOOL_OUTPUT_POLICY, maxDiagnostics: 129 }), /maxDiagnostics.*maximum/);
+    assert.throws(() => new ContainedToolOutputCaptureSession({ ...DEFAULT_TOOL_OUTPUT_POLICY, readBytes: 1_048_577 }), /readBytes.*maximum/);
+    const operation = store.beginOperation({ kind: 'invalid-policy-before-capture-id' });
+    const metadataPath = path.join(directory, 'operations', `${operation.id}.json`);
+    assert.throws(() => operation.startCapture({ ...DEFAULT_TOOL_OUTPUT_POLICY, diagnosticBytes: 65_537 }), /diagnosticBytes.*maximum/);
+    assert.deepEqual(JSON.parse(readFileSync(metadataPath, 'utf8')).activeCaptureIds, [], 'invalid operation policy is rejected before a prepared capture ID is written');
+    assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
+    operation.abort();
+    const mutable = { previewBytes: 8, diagnosticBytes: 24, maxDiagnostics: 2, readBytes: 16 };
+    const writer = new InMemoryToolOutputStore().startCapture(mutable);
+    mutable.previewBytes = 65_536;
+    writer.write('stdout', '0123456789abcdef');
+    assert.equal(writer.finish().stdout.previewBytes, 8, 'capture keeps the validated scalar snapshot');
+  });
+
+  it('bounds retained diagnostic candidate strings and each priority bucket by UTF-8 bytes', () => {
+    const capture = new ContainedToolOutputCaptureSession({ previewBytes: 8, diagnosticBytes: 24, maxDiagnostics: 4, readBytes: 8 });
+    capture.write(undefined, 'stderr', `${'界'.repeat(2_000)} ERROR: ${'界'.repeat(2_000)}\n`);
+    capture.write(undefined, 'stdout', `${'ordinary '.repeat(2_000)}\n`);
+    const result = capture.finish(undefined);
+    assert.ok(result.diagnostics.every((line) => Buffer.byteLength(line, 'utf8') <= 24));
+    assert.ok(result.diagnostics.reduce((sum, line) => sum + Buffer.byteLength(line, 'utf8'), 0) <= 24);
+    assert.equal(result.diagnosticsTruncated, true);
+  });
+
   it('bounds successful huge output without changing the success exit semantics', () => {
     const store = new InMemoryToolOutputStore();
     const output = boundToolOutput({
@@ -513,6 +545,106 @@ describe('UTF-8 tool output ranges', () => {
               'ordinary unexpired evidence without explicit release stays protected');
           } finally { rmSync(directory, { recursive: true, force: true }); }
         }
+      });
+
+      it('file: preserves the original public release timestamp across an unpinned admission retry', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-release-admission-snapshot-'));
+        try {
+          let now = new Date('2030-04-05T06:07:08.000Z');
+          let failPin = true;
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => now, testFaults: {
+            beforePreparedOwnerOpen: () => { if (failPin) throw Object.assign(new Error('prepared owner pin EIO'), { code: 'EIO' }); },
+          } });
+          const operation = store.beginOperation({ kind: 'release-admission-snapshot' });
+          const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'release snapshot'); writer.finish();
+          const reference = operation.close()[0]!;
+          assert.throws(() => store.release(reference), /prepared owner pin EIO/);
+          now = new Date('2030-04-06T06:07:08.000Z');
+          failPin = false;
+          store.release(reference);
+          const metadata = JSON.parse(readFileSync(path.join(directory, 'operations', `${operation.id}.json`), 'utf8')) as { readonly state: string; readonly releasedAt?: string };
+          assert.equal(metadata.state, 'released');
+          assert.equal(metadata.releasedAt, '2030-04-05T06:07:08.000Z', 'retry completes the original consent snapshot without calling now() again');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: bounds stale-owner release reacquisition by the current deletion budget', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-release-reacquire-stale-budget-'));
+        try {
+          const moduleUrl = new URL('../src/dispatch/invocation-lock.ts', import.meta.url).href;
+          let failPin = true;
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-05-06T07:08:09.000Z'), testFaults: {
+            beforePreparedOwnerOpen: () => { if (failPin) throw Object.assign(new Error('release reacquire pin EIO'), { code: 'EIO' }); },
+          } });
+          const artifact = store.save({ stdout: 'stale release reacquisition', stderr: '' });
+          assert.throws(() => store.release(artifact), /release reacquire pin EIO/);
+          failPin = false;
+          const metadataPath = path.join(directory, 'operations', `${artifact.operationId}.json`);
+          const originalMetadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { readonly ownerNonce: string };
+          const originalReleasedAt = '2030-05-06T07:08:09.000Z';
+          const lockPath = path.join(directory, 'operations', `${artifact.operationId}.lock`);
+          const childSource = `const m = await import(${JSON.stringify(moduleUrl)}); const { acquireDispatchInvocationLock } = m.acquireDispatchInvocationLock ? m : m.default; acquireDispatchInvocationLock({ lockPath: ${JSON.stringify(lockPath)}, nonce: () => ${JSON.stringify(originalMetadata.ownerNonce)} });`;
+          execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], { cwd: process.cwd() });
+
+          const short = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 1, maxMetadataReadBytes: 1_048_576 });
+          assert.equal(short.protected, 1, 'one deletion cannot pay for stale takeover and replacement-owner disposal');
+          assert.equal(short.attempted, 0);
+          assert.equal(existsSync(lockPath), true, 'the dead same-nonce owner stays in place when admission is refused');
+          assert.equal(JSON.parse(readFileSync(metadataPath, 'utf8')).state, 'closed', 'refused admission has not written the release snapshot');
+
+          const recovered = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8, maxMetadataReadBytes: 1_048_576 });
+          assert.equal(recovered.protected, 0);
+          assert.equal(recovered.attempted, 2, 'stale owner unlink and acquired-owner disposal are both charged');
+          assert.equal(recovered.deleted, 2);
+          assert.equal(existsSync(lockPath), false);
+          if (existsSync(metadataPath)) {
+            assert.equal(JSON.parse(readFileSync(metadataPath, 'utf8')).releasedAt, originalReleasedAt,
+              'a retained metadata record keeps the original release timestamp');
+          }
+
+          const reclaimed = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8, maxMetadataReadBytes: 1_048_576 });
+          assert.equal(reclaimed.protected, 0);
+          assert.equal(existsSync(path.join(directory, `${artifact.id}.stdout`)), false);
+          const successor = store.beginOperation({ kind: 'release-reacquire-budget-reuse' });
+          successor.abort();
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: refuses release reacquisition after rollback consumes the caller deletion budget', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-release-reacquire-depleted-budget-'));
+        try {
+          let failTemporaryUnlink = true;
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-06-07T08:09:10.000Z'), testFaults: {
+            beforeOwnerLockTemporaryUnlink: () => {
+              if (failTemporaryUnlink) throw Object.assign(new Error('release temporary cleanup EIO'), { code: 'EIO' });
+            },
+          } });
+          const artifact = store.save({ stdout: 'depleted release reacquisition', stderr: '' });
+          const metadataPath = path.join(directory, 'operations', `${artifact.operationId}.json`);
+          const lockPath = path.join(directory, 'operations', `${artifact.operationId}.lock`);
+          assert.throws(() => store.release(artifact), /release temporary cleanup EIO/);
+          const releasedAt = '2030-06-07T08:09:10.000Z';
+          failTemporaryUnlink = false;
+
+          const short = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 2, maxMetadataReadBytes: 1_048_576 });
+          assert.equal(short.protected, 1, 'rollback cleanup uses both current deletion attempts before reacquisition');
+          assert.equal(short.attempted, 2);
+          assert.equal(short.deleted, 2);
+          assert.equal(existsSync(lockPath), false, 'exhausted recovery does not publish another owner');
+          assert.equal(JSON.parse(readFileSync(metadataPath, 'utf8')).state, 'closed', 'rollback-budget refusal has not published a replacement owner or consent metadata');
+
+          const recovered = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8, maxMetadataReadBytes: 1_048_576 });
+          assert.equal(recovered.protected, 0);
+          assert.equal(recovered.attempted, 1, 'a later caller can acquire and dispose within its own budget');
+          assert.equal(recovered.deleted, 1);
+          assert.equal(existsSync(lockPath), false);
+          if (existsSync(metadataPath)) assert.equal(JSON.parse(readFileSync(metadataPath, 'utf8')).releasedAt, releasedAt);
+          for (let pass = 0; pass < 4 && existsSync(path.join(directory, `${artifact.id}.stdout`)); pass += 1) {
+            const result = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8, maxMetadataReadBytes: 1_048_576 });
+            assert.ok(result.attempted <= 8);
+          }
+          assert.equal(existsSync(path.join(directory, `${artifact.id}.stdout`)), false);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
       it('file: expires reads and searches against the store clock rather than wall clock', () => {
@@ -1725,6 +1857,96 @@ describe('UTF-8 tool output ranges', () => {
           assert.equal(recovered.protected, 0);
           assert.equal(existsSync(lockPath), false, 'an adequate fresh budget reclaims the stale owner');
           assert.equal(existsSync(slotPath), false, 'an adequate fresh budget completes the cleanup');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: rejects stale active-owner unlink until the frozen-ID tombstone preflight succeeds', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-stale-active-preunlink-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const ownerSource = `const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); const operation = store.beginOperation({ kind: 'stale-active-preunlink' }); const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'preserve-until-tombstone'); const artifact = writer.finish().artifact; console.log(JSON.stringify({ id: operation.id, artifactId: artifact.id })); process.exit(0);`;
+          const owner = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', ownerSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly id: string; readonly artifactId: string };
+          const operations = path.join(directory, 'operations');
+          const slotPath = path.join(operations, 'slot-0000.json');
+          const lockPath = path.join(operations, `${owner.id}.lock`);
+          const originalLock = readFileSync(lockPath);
+          let failPreflight = true;
+          const store = new FileToolOutputStore(directory, { capacity: 1, testFaults: {
+            beforeActiveCleanupTombstone: () => { if (failPreflight) throw Object.assign(new Error('pre-unlink tombstone EIO'), { code: 'EIO' }); },
+          } });
+          const blocked = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(blocked.protected, 1);
+          assert.deepEqual(readFileSync(lockPath), originalLock, 'the stale canonical owner stays present when tombstone admission fails');
+          assert.equal(JSON.parse(readFileSync(slotPath, 'utf8')).deleting, undefined, 'the active source slot is unchanged');
+          assert.equal(existsSync(path.join(directory, `${owner.artifactId}.stdout`)), true, 'indexed artifacts stay present');
+          failPreflight = false;
+          const recovered = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(recovered.protected, 0);
+          assert.equal(existsSync(lockPath), false);
+          assert.equal(existsSync(slotPath), false);
+          assert.equal(existsSync(path.join(directory, `${owner.artifactId}.stdout`)), false);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: reuses the frozen cleanup transition after tombstone rename succeeds but its barrier fails', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-stale-active-barrier-retry-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const ownerSource = `const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); const operation = store.beginOperation({ kind: 'stale-active-barrier-retry' }); const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'frozen tombstone retry'); const artifact = writer.finish().artifact; console.log(JSON.stringify({ id: operation.id, artifactId: artifact.id })); process.exit(0);`;
+          const owner = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', ownerSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly id: string; readonly artifactId: string };
+          let failBarrier = true;
+          const store = new FileToolOutputStore(directory, { capacity: 1, testFaults: {
+            beforeActiveCleanupTombstoneDirectoryFsync: () => {
+              if (failBarrier) throw Object.assign(new Error('active tombstone directory fsync EIO'), { code: 'EIO' });
+            },
+          } });
+          const first = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          const slotPath = path.join(directory, 'operations', 'slot-0000.json');
+          const lockPath = path.join(directory, 'operations', `${owner.id}.lock`);
+          assert.equal(first.protected, 1);
+          assert.deepEqual(JSON.parse(readFileSync(slotPath, 'utf8')).artifactIds, [owner.artifactId], 'the exact frozen ID tombstone is visible after rename');
+          assert.equal(existsSync(lockPath), true, 'the stale canonical owner was not unlinked after the failed barrier');
+          failBarrier = false;
+          const recovered = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(recovered.protected, 0);
+          assert.equal(existsSync(slotPath), false);
+          assert.equal(existsSync(path.join(directory, `${owner.artifactId}.stdout`)), false);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: stale active takeover rejects identical owner bytes on a different inode', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-stale-active-generation-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const ownerSource = `const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); const operation = store.beginOperation({ kind: 'stale-active-generation' }); const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'generation-bound owner'); writer.finish(); console.log(operation.id); process.exit(0);`;
+          const id = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', ownerSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim();
+          const lockPath = path.join(directory, 'operations', `${id}.lock`);
+          const originalBytes = readFileSync(lockPath);
+          const originalStats = lstatSync(lockPath, { bigint: true });
+          let replaced = false;
+          const store = new FileToolOutputStore(directory, { capacity: 1, testFaults: {
+            beforeStaleTakeover: () => {
+              if (replaced) return;
+              replaced = true;
+              renameSync(lockPath, `${lockPath}.held`);
+              writeFileSync(lockPath, originalBytes, { mode: 0o600, flag: 'wx' });
+            },
+          } });
+          const refused = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          const successor = lstatSync(lockPath, { bigint: true });
+          assert.equal(replaced, true);
+          assert.equal(refused.protected, 1);
+          assert.equal(successor.dev === originalStats.dev && successor.ino === originalStats.ino, false);
+          assert.deepEqual(readFileSync(lockPath), originalBytes, 'byte equality cannot substitute for the frozen owner inode');
+          unlinkSync(`${lockPath}.held`);
+          const recovered = new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(recovered.protected, 0);
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
