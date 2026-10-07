@@ -1739,7 +1739,9 @@ describe('UTF-8 tool output ranges', () => {
             const metadataPath = root + '/operations/' + operationId + '.json';
             const metadataBefore = fs.readFileSync(metadataPath, 'utf8');
             const slotPath = root + '/operations/slot-0000.json'; const slotBefore = fs.readFileSync(slotPath, 'utf8');
+            const unlinkAttemptsBeforeFirst = unlinkAttempts;
             const first = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            const unlinkAttemptsAfterFirst = unlinkAttempts;
             const canonicalAbsent = !fs.existsSync(lockPath);
             const temporaryAliases = fs.readdirSync(root + '/operations').filter((name) => name.startsWith(operationId + '.lock.tmp-'));
             const metadataUnchanged = fs.existsSync(metadataPath) && fs.readFileSync(metadataPath, 'utf8') === metadataBefore;
@@ -1747,19 +1749,27 @@ describe('UTF-8 tool output ranges', () => {
             const artifactExistsAfterFirst = fs.existsSync(root + '/' + ${JSON.stringify(artifact.id)} + '.stdout');
             armed = false;
             const second = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
-            console.log(JSON.stringify({ injected, unlinkAttempts, first, second, canonicalAbsent, temporaryAliases, metadataUnchanged, slotUnchanged,
+            const unlinkAttemptsAfterSecond = unlinkAttempts;
+            console.log(JSON.stringify({ injected, unlinkAttemptsBeforeFirst, unlinkAttemptsAfterFirst, unlinkAttemptsAfterSecond,
+              first, second, canonicalAbsent, temporaryAliases, metadataUnchanged, slotUnchanged,
               artifactExistsAfterFirst }));
           `;
           const result = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
             cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
           }).trim()) as {
-            readonly injected: boolean; readonly unlinkAttempts: number;
-            readonly first: { readonly protected: number }; readonly second: { readonly protected: number };
+            readonly injected: boolean; readonly unlinkAttemptsBeforeFirst: number;
+            readonly unlinkAttemptsAfterFirst: number; readonly unlinkAttemptsAfterSecond: number;
+            readonly first: { readonly attempted: number; readonly protected: number }; readonly second: { readonly protected: number };
             readonly canonicalAbsent: boolean; readonly temporaryAliases: readonly string[];
             readonly metadataUnchanged: boolean; readonly slotUnchanged: boolean; readonly artifactExistsAfterFirst: boolean;
           };
           assert.equal(result.injected, true, `the actual temporary no-follow open failed before canonical publication: ${JSON.stringify(result)}`);
-          assert.equal(result.unlinkAttempts, 0, 'a pre-publication pin failure cannot attempt owner disposal');
+          assert.equal(result.unlinkAttemptsBeforeFirst, 0, 'no owner-disposal callback has fired before the faulted first pass');
+          assert.equal(result.unlinkAttemptsAfterFirst, result.unlinkAttemptsBeforeFirst,
+            `the pre-publication failure pass cannot attempt owner disposal: ${JSON.stringify(result)}`);
+          assert.equal(result.unlinkAttemptsAfterFirst - result.unlinkAttemptsBeforeFirst, 0,
+            `the pre-publication failure pass cannot attempt owner disposal: ${JSON.stringify(result)}`);
+          assert.equal(result.first.attempted, 0, 'the pre-publication refusal consumes no deletion attempt');
           assert.equal(result.first.protected, 1);
           assert.equal(result.canonicalAbsent, true);
           assert.deepEqual(result.temporaryAliases, []);
@@ -1767,6 +1777,8 @@ describe('UTF-8 tool output ranges', () => {
           assert.equal(result.slotUnchanged, true);
           assert.equal(result.artifactExistsAfterFirst, true, 'the no-follow open fault preserves evidence before a later recovery pass');
           assert.equal(result.second.protected, 0);
+          assert.ok(result.unlinkAttemptsAfterSecond >= result.unlinkAttemptsAfterFirst,
+            'the separate recovery-phase counter includes any legitimate later owner disposal');
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
