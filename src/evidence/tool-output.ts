@@ -282,6 +282,7 @@ function acquireEvidenceOperationFence(
   testFaults?: ToolOutputFileTestFaults,
   accountRead?: (bytes: number) => void,
   admittedPreflight?: { readonly record: EvidenceOperationLockRecord | undefined },
+  onStaleTakeoverAttempt?: () => void,
 ): AcquiredEvidenceOperationFence {
   const preflight = admittedPreflight ?? { record: readEvidenceOperationLock(lockPath, accountRead) };
   if (preflight.record !== undefined && expectedOwnerNonce !== undefined && preflight.record.nonce !== expectedOwnerNonce) {
@@ -298,6 +299,7 @@ function acquireEvidenceOperationFence(
           (expectedOwnerNonce !== undefined && current.nonce !== expectedOwnerNonce)) {
         throw new Error('Evidence operation lock changed after strict preflight; stale takeover refused.');
       }
+      onStaleTakeoverAttempt?.();
     },
   });
   // The shared primitive's exact owner record is stable for this operation;
@@ -330,6 +332,8 @@ interface PendingReleaseTransition {
 
 interface CleanupRetryBudget extends TerminalRetryBudget {
   readonly remainingDeletions: () => number;
+  readonly maxMetadataBytes: number;
+  readonly canRead: (bytes: number) => boolean;
 }
 
 interface PendingCleanupTransition {
@@ -1287,7 +1291,7 @@ export class FileToolOutputStore implements ToolOutputStore {
             throw new Error('Tool-output release slot changed before its owner disposal.');
           }
           if (!metadataDurable) {
-            const current = readBoundedJson(metadataPath, 1_048_576, budget.accountRead);
+            const current = readBoundedJson(metadataPath, budget.maxMetadataBytes, budget.accountRead);
             if (JSON.stringify(current) === JSON.stringify(releasedSnapshot)) {
               // A previous replacement may have succeeded while its directory
               // barrier failed. Re-establish that barrier before unlinking owner.
@@ -1317,6 +1321,8 @@ export class FileToolOutputStore implements ToolOutputStore {
     const publicBudget: CleanupRetryBudget = {
       accountRead: () => {}, beginDeletion: () => {}, finishDeletion: () => {},
       remainingDeletions: () => Number.MAX_SAFE_INTEGER,
+      maxMetadataBytes: 1_048_576,
+      canRead: () => true,
     };
     transition.retry(publicBudget);
   }
@@ -1351,6 +1357,8 @@ export class FileToolOutputStore implements ToolOutputStore {
       },
       finishDeletion: () => { deleted += 1; },
       remainingDeletions: () => maxDeletions - attempted,
+      maxMetadataBytes,
+      canRead: (bytes) => metadataReadBytes + bytes <= maxMetadataReadBytes,
     });
     const syncOperationsDirectory = (): void => {
       const descriptor = openSync(this.operationsDir, constants.O_RDONLY);
@@ -1372,8 +1380,8 @@ export class FileToolOutputStore implements ToolOutputStore {
         artifactIds: initialSlot.deleting ? [...initialSlot.artifactIds] : [],
         ownerDisposed: false, metadataRemoved: false, slotUnlinkCommitted: false,
       };
-      const readOwnSlot = (): { readonly id: string; readonly deleting: boolean; readonly artifactIds: readonly string[] } => {
-        const current = this.readSlot(slot, accountMetadataRead);
+      const readOwnSlot = (budget: CleanupRetryBudget): { readonly id: string; readonly deleting: boolean; readonly artifactIds: readonly string[] } => {
+        const current = this.readSlot(slot, budget.accountRead);
         if (current === null || current === undefined || current.id !== id) {
           throw new Error('Cleanup slot identity changed while recovery was pending.');
         }
@@ -1382,7 +1390,7 @@ export class FileToolOutputStore implements ToolOutputStore {
       const publishTombstone = (budget: CleanupRetryBudget): void => {
         const pending = state.pendingSlotWrite;
         if (pending === undefined) throw new Error('Cleanup tombstone write has no frozen transition.');
-        const current = readOwnSlot();
+        const current = readOwnSlot(budget);
         const visibleTarget = current.deleting && sameIds(current.artifactIds, pending.toIds);
         const visibleSource = current.deleting === pending.fromDeleting && sameIds(current.artifactIds, pending.fromIds);
         if (visibleTarget) {
@@ -1415,12 +1423,12 @@ export class FileToolOutputStore implements ToolOutputStore {
           forgetPendingTerminalTransition(this.root, id);
           return 'complete';
         }
-        const current = readOwnSlot();
+        const current = readOwnSlot(budget);
         if (!current.deleting || current.artifactIds.length !== 0) throw new Error('Cleanup finalization requires the durable empty tombstone.');
         if (!state.metadataRemoved) {
           let metadataExists = true;
           try {
-            const metadata = readBoundedJson(metadataPath, maxMetadataBytes, budget.accountRead);
+            const metadata = readBoundedJson(metadataPath, budget.maxMetadataBytes, budget.accountRead);
             if (!validOperationMetadata(metadata, id, slot) ||
                 (metadataOwnerNonce !== undefined && metadata.ownerNonce !== metadataOwnerNonce)) {
               throw new Error('Cleanup operation metadata changed before final deletion.');
@@ -1475,7 +1483,7 @@ export class FileToolOutputStore implements ToolOutputStore {
         }
         if (state.phase === 'admission') {
           ownerFence.assertCurrent(budget.accountRead);
-          const current = readOwnSlot();
+          const current = readOwnSlot(budget);
           if (initialSlot.deleting) {
             if (!current.deleting || !sameIds(current.artifactIds, initialSlot.artifactIds)) {
               throw new Error('Existing cleanup tombstone changed before its barrier.');
@@ -1484,7 +1492,7 @@ export class FileToolOutputStore implements ToolOutputStore {
             state.phase = 'tombstone';
           } else {
             if (current.deleting) throw new Error('Active slot became a tombstone before cleanup admission.');
-            const metadata = readBoundedJson(metadataPath, maxMetadataBytes, budget.accountRead);
+            const metadata = readBoundedJson(metadataPath, budget.maxMetadataBytes, budget.accountRead);
             if (!validOperationMetadata(metadata, id, slot) || metadata.ownerNonce !== metadataOwnerNonce) {
               throw new Error('Cleanup operation metadata changed before tombstone publication.');
             }
@@ -1522,7 +1530,7 @@ export class FileToolOutputStore implements ToolOutputStore {
           ownerFence.assertCurrent(budget.accountRead);
           if (state.pendingSlotWrite !== undefined) publishTombstone(budget);
           else if (!state.tombstoneDurable) {
-            const current = readOwnSlot();
+            const current = readOwnSlot(budget);
             if (!current.deleting || !sameIds(current.artifactIds, state.artifactIds)) {
               throw new Error('Existing cleanup tombstone does not match its frozen artifact IDs.');
             }
@@ -1633,14 +1641,18 @@ export class FileToolOutputStore implements ToolOutputStore {
             }
             continue;
           }
+          const retry = retryBudget();
           try {
-            const retry = retryBudget();
             pendingTransition.retry(retry.accountRead, retry.beginDeletion, retry.finishDeletion);
           } catch (error) {
             if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
             protectedCount += 1;
             continue;
           }
+          // Completing a terminal owner disposal may consume this caller's
+          // final unlink attempt. Do not reacquire and pin a cleanup owner for
+          // the same slot when this pass has no deletion budget left.
+          if (retry.remainingDeletions() < 1) continue;
         }
         const metadataPath = path.join(this.operationsDir, slotRecord.id + '.json');
         let metadata: Record<string, unknown> = {};
@@ -1663,6 +1675,16 @@ export class FileToolOutputStore implements ToolOutputStore {
           protectedCount += 1; continue;
         }
 
+        // Acquiring a stale/absent owner can read it once during takeover and
+        // again while pinning. Reserve the fixed maximum for preflight,
+        // takeover revalidation, and pin reads, plus one owner-disposal
+        // attempt, before acquisition can create a new lock path.
+        const retry = retryBudget();
+        const ownerReadReservation = 3 * 4096;
+        if (retry.remainingDeletions() < 1 || !retry.canRead(ownerReadReservation)) {
+          protectedCount += 1; continue;
+        }
+
         const lockPath = path.join(this.operationsDir, slotRecord.id + '.lock');
         let admittedLock: { readonly record: EvidenceOperationLockRecord | undefined };
         try {
@@ -1675,10 +1697,16 @@ export class FileToolOutputStore implements ToolOutputStore {
           if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
           protectedCount += 1; continue;
         }
+        const admissionBudget = retryBudget();
+        const staleTakeoverReserve = admittedLock.record === undefined ? 0 : 1;
+        if (admissionBudget.remainingDeletions() < staleTakeoverReserve + 1) {
+          protectedCount += 1; continue;
+        }
         let admittedFence: AcquiredEvidenceOperationFence;
         try {
           admittedFence = acquireEvidenceOperationFence(
             lockPath, slotRecord.deleting ? undefined : expectedOwnerNonce, this.testFaults, accountMetadataRead, admittedLock,
+            () => admissionBudget.beginDeletion(),
           );
         } catch (error) {
           if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
@@ -1688,14 +1716,24 @@ export class FileToolOutputStore implements ToolOutputStore {
         try {
           ownerFence = pinEvidenceOperationFence(lockPath, admittedFence.ownerNonce, this.testFaults, accountMetadataRead);
         } catch (error) {
-          try { admittedFence.release(); } catch { /* failed pin remains protected for fresh-process recovery */ }
+          try {
+            const disposal = retryBudget();
+            disposal.beginDeletion();
+            admittedFence.release();
+            disposal.finishDeletion();
+          } catch { /* preserve the original pin failure and the durable slot */ }
           if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
           protectedCount += 1; continue;
         }
         const pendingCleanup = cleanupTransition(slotRecord.id, slot, slotRecord, expectedOwnerNonce, ownerFence);
         try { registerPendingTerminalTransition(this.root, this.capacity, pendingCleanup); }
         catch (error) {
-          try { ownerFence.release(); } catch { /* retain the durable slot for strict fresh-process recovery */ }
+          try {
+            const disposal = retryBudget();
+            disposal.beginDeletion();
+            ownerFence.release(disposal);
+            disposal.finishDeletion();
+          } catch { /* retain the durable slot for strict fresh-process recovery */ }
           protectedCount += 1; continue;
         }
         try {

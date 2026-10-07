@@ -1457,6 +1457,134 @@ describe('UTF-8 tool output ranges', () => {
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
+      it('file: retained cleanup retries charge every nested read to the current caller budget', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-current-read-budget-'));
+        try {
+          const old = new Date('2000-01-01T00:00:00.000Z');
+          const artifact = new FileToolOutputStore(directory, { capacity: 1, retentionMs: 1, now: () => old })
+            .save({ stdout: 'retained-read-budget', stderr: '' });
+          const lockPath = path.join(directory, 'operations', `${artifact.operationId}.lock`);
+          let failOwnerUnlink = true;
+          const firstStore = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z'), testFaults: {
+            beforeOwnerLockUnlink: (candidate) => {
+              if (candidate.endsWith(`${artifact.operationId}.lock`) && failOwnerUnlink) {
+                failOwnerUnlink = false;
+                throw Object.assign(new Error('retained read-budget owner unlink EIO'), { code: 'EIO' });
+              }
+            },
+          } });
+          const firstResult = firstStore.cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 65_536, maxDeletions: 8 });
+          assert.equal(firstResult.protected, 1, `${JSON.stringify(firstResult)} failOwnerUnlink=${failOwnerUnlink}`);
+          assert.equal(failOwnerUnlink, false);
+          const operations = path.join(directory, 'operations');
+          const indexBytes = readFileSync(path.join(operations, 'index.json')).byteLength;
+          const slotBytes = readFileSync(path.join(operations, 'slot-0000.json')).byteLength;
+          const ownerBytes = readFileSync(lockPath).byteLength;
+          const metadataBytes = readFileSync(path.join(operations, `${artifact.operationId}.json`)).byteLength;
+          const currentReadBudget = indexBytes + slotBytes + (2 * ownerBytes) + metadataBytes + slotBytes;
+          const retryStore = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z') });
+          let retryError: unknown;
+          try { retryStore.cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: currentReadBudget, maxDeletions: 8 }); }
+          catch (error) { retryError = error; }
+          assert.ok(existsSync(path.join(operations, 'slot-0000.json')),
+            `the current read limit must leave a discoverable tombstone; error=${String(retryError)} budget=${currentReadBudget}`);
+          const recovered = retryStore.cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 65_536, maxDeletions: 8 });
+          assert.ok(recovered.attempted <= 8);
+          assert.equal(existsSync(path.join(operations, 'slot-0000.json')), false, 'a later larger current budget resumes the same pinned continuation');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: retained cleanup retries enforce the current per-operation metadata cap', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-current-cleanup-metadata-cap-'));
+        try {
+          const old = new Date('2000-01-01T00:00:00.000Z');
+          const artifact = new FileToolOutputStore(directory, { capacity: 1, retentionMs: 1, now: () => old })
+            .save({ stdout: 'retained-cleanup-metadata-cap', stderr: '' });
+          const operations = path.join(directory, 'operations');
+          const metadataPath = path.join(operations, `${artifact.operationId}.json`);
+          assert.ok(readFileSync(metadataPath).byteLength > 64);
+          let failOwnerUnlink = true;
+          const firstStore = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z'), testFaults: {
+            beforeOwnerLockUnlink: (candidate) => {
+              if (candidate.endsWith(`${artifact.operationId}.lock`) && failOwnerUnlink) {
+                failOwnerUnlink = false;
+                throw Object.assign(new Error('metadata-cap cleanup owner unlink EIO'), { code: 'EIO' });
+              }
+            },
+          } });
+          assert.equal(firstStore.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 }).protected, 1);
+          const retryStore = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z') });
+          const limited = retryStore.cleanupExpired({ maxSlotProbes: 1, maxMetadataBytes: 64, maxMetadataReadBytes: 65_536, maxDeletions: 8 });
+          assert.equal(limited.protected, 1);
+          assert.ok(existsSync(path.join(operations, 'slot-0000.json')), 'the current smaller cap preserves cleanup debt');
+          retryStore.cleanupExpired({ maxSlotProbes: 1, maxMetadataBytes: 65_536, maxMetadataReadBytes: 65_536, maxDeletions: 8 });
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: retained release retries enforce the current per-operation metadata cap', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-current-release-metadata-cap-'));
+        try {
+          const now = new Date('2030-01-01T00:00:00.000Z');
+          const artifact = new FileToolOutputStore(directory, { capacity: 1, retentionMs: 60_000, now: () => now })
+            .save({ stdout: 'retained-release-metadata-cap', stderr: '' });
+          const operations = path.join(directory, 'operations');
+          const metadataPath = path.join(operations, `${artifact.operationId}.json`);
+          assert.ok(readFileSync(metadataPath).byteLength > 64);
+          let failMetadataSync = true;
+          const releaseStore = new FileToolOutputStore(directory, { capacity: 1, now: () => now, testFaults: {
+            beforeOperationMetadataDirectoryFsync: (value) => {
+              if ((value as { readonly state?: string }).state === 'released' && failMetadataSync) {
+                failMetadataSync = false;
+                throw Object.assign(new Error('metadata-cap release directory fsync EIO'), { code: 'EIO' });
+              }
+            },
+          } });
+          assert.throws(() => releaseStore.release(artifact), /metadata-cap release directory fsync EIO/);
+          const lockPath = path.join(operations, `${artifact.operationId}.lock`);
+          const retryStore = new FileToolOutputStore(directory, { capacity: 1, now: () => now });
+          const limited = retryStore.cleanupExpired({ maxSlotProbes: 1, maxMetadataBytes: 64, maxMetadataReadBytes: 65_536, maxDeletions: 8 });
+          assert.equal(limited.protected, 1);
+          assert.ok(existsSync(lockPath), 'the too-small current cap cannot commit release owner disposal');
+          assert.ok(existsSync(path.join(operations, 'slot-0000.json')));
+          retryStore.cleanupExpired({ maxSlotProbes: 1, maxMetadataBytes: 65_536, maxMetadataReadBytes: 65_536, maxDeletions: 8 });
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: refuses cleanup owner admission before a low read budget can strand an unregistered lock', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-owner-admission-read-budget-'));
+        try {
+          const old = new Date('2000-01-01T00:00:00.000Z');
+          const artifact = new FileToolOutputStore(directory, { capacity: 1, retentionMs: 1, now: () => old })
+            .save({ stdout: 'owner-admission-read-budget', stderr: '' });
+          const operations = path.join(directory, 'operations');
+          const indexBytes = readFileSync(path.join(operations, 'index.json')).byteLength;
+          const slotBytes = readFileSync(path.join(operations, 'slot-0000.json')).byteLength;
+          const metadataBytes = readFileSync(path.join(operations, `${artifact.operationId}.json`)).byteLength;
+          const cleanupLock = path.join(operations, `${artifact.operationId}.lock`);
+          let unlinkAttempted = false;
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z'), testFaults: {
+            beforeOwnerLockUnlink: (candidate) => {
+              if (candidate === cleanupLock) {
+                unlinkAttempted = true;
+                throw Object.assign(new Error('low-budget owner unlink EIO'), { code: 'EIO' });
+              }
+            },
+          } });
+          let result: ReturnType<typeof store.cleanupExpired> | undefined;
+          let admissionError: unknown;
+          try { result = store.cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: indexBytes + slotBytes + metadataBytes + 1, maxDeletions: 8 }); }
+          catch (error) { admissionError = error; }
+          if (admissionError !== undefined) assert.match(String(admissionError), /metadata-read budget exhausted/);
+          else assert.equal(result?.protected, 1);
+          assert.equal(unlinkAttempted, false, 'budget refusal happens before creating or disposing a cleanup owner');
+          assert.equal(existsSync(cleanupLock), false, 'no unregistered live cleanup owner is left behind');
+          assert.ok(existsSync(path.join(operations, 'slot-0000.json')));
+          assert.ok(existsSync(path.join(directory, `${artifact.id}.stdout`)));
+          const recovered = store.cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 65_536, maxDeletions: 8 });
+          assert.ok(recovered.attempted <= 8);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
       it('file: resumes active cleanup after tombstone rename and post-rename directory-sync faults', () => {
         const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
         for (const fault of ['rename', 'directory-sync'] as const) {
