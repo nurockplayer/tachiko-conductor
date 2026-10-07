@@ -35,6 +35,9 @@ export interface ToolOutputFileTestFaults {
   readonly beforeArtifactOpen?: (kind: 'hash' | 'read' | 'search', channel: 'stdout' | 'stderr') => void;
   readonly afterArtifactOpen?: (descriptor: number, kind: 'hash' | 'read' | 'search', channel: 'stdout' | 'stderr') => void;
   readonly beforeUnlink?: (filePath: string) => void;
+  readonly beforeOwnerLockUnlink?: (lockPath: string) => void;
+  readonly beforeOwnerLockDirectoryFsync?: (lockPath: string) => void;
+  readonly beforeOperationMetadataDirectoryFsync?: (value: unknown) => void;
   readonly beforeStaleTakeover?: () => void;
   readonly beforeArtifactRootFsync?: (phase: 'abort' | 'finish' | 'cleanup') => void;
 }
@@ -302,6 +305,169 @@ function acquireEvidenceOperationFence(
       acquired.release();
     },
   };
+}
+
+interface PendingTerminalTransition {
+  readonly id: string;
+  readonly slot: number;
+  retry(accountRead: (bytes: number) => void, beginDeletion: () => void, finishDeletion: () => void): void;
+}
+
+interface TerminalRetryBudget {
+  readonly accountRead: (bytes: number) => void;
+  readonly beginDeletion: () => void;
+  readonly finishDeletion: () => void;
+}
+
+const pendingTerminalTransitions = new Map<string, Map<string, PendingTerminalTransition>>();
+
+function rootTerminalTransitions(root: string): Map<string, PendingTerminalTransition> {
+  let transitions = pendingTerminalTransitions.get(root);
+  if (transitions === undefined) {
+    transitions = new Map();
+    pendingTerminalTransitions.set(root, transitions);
+  }
+  return transitions;
+}
+
+function registerPendingTerminalTransition(root: string, capacity: number, transition: PendingTerminalTransition): void {
+  const transitions = rootTerminalTransitions(root);
+  if (transitions.has(transition.id)) return;
+  if (transitions.size >= capacity) throw new Error('Tool-output pending terminal recovery capacity is full.');
+  transitions.set(transition.id, transition);
+}
+
+function forgetPendingTerminalTransition(root: string, id: string): void {
+  const transitions = pendingTerminalTransitions.get(root);
+  transitions?.delete(id);
+  if (transitions?.size === 0) pendingTerminalTransitions.delete(root);
+}
+
+interface PinnedEvidenceOperationFence {
+  assertCurrent(accountRead?: (bytes: number) => void): void;
+  release(budget?: TerminalRetryBudget): void;
+}
+
+function readEvidenceOperationRecordFromDescriptor(
+  descriptor: number,
+  expectedGeneration: { readonly dev: bigint; readonly ino: bigint },
+  accountRead?: (bytes: number) => void,
+): EvidenceOperationLockRecord {
+  const before = fstatSync(descriptor, { bigint: true });
+  if (!before.isFile() || before.dev !== expectedGeneration.dev || before.ino !== expectedGeneration.ino ||
+      before.size < 1n || before.size > 4096n) throw new Error('Pinned evidence operation owner changed.');
+  const size = Number(before.size);
+  accountRead?.(size);
+  const data = Buffer.alloc(size);
+  let offset = 0;
+  while (offset < size) {
+    const count = readSync(descriptor, data, offset, size - offset, offset);
+    if (count === 0) throw new Error('Pinned evidence operation owner read was short.');
+    offset += count;
+  }
+  const after = fstatSync(descriptor, { bigint: true });
+  if (after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size) {
+    throw new Error('Pinned evidence operation owner changed while being read.');
+  }
+  let value: unknown;
+  try { value = JSON.parse(data.toString('utf8')); }
+  catch { throw new Error('Pinned evidence operation owner is malformed.'); }
+  if (!isEvidenceOperationLockRecord(value)) throw new Error('Pinned evidence operation owner is not versioned.');
+  return value;
+}
+
+function pinEvidenceOperationFence(
+  lockPath: string,
+  expectedNonce: string,
+  testFaults?: ToolOutputFileTestFaults,
+): PinnedEvidenceOperationFence {
+  if (typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) {
+    throw new Error('Evidence operation ownership requires O_NOFOLLOW support.');
+  }
+  const pathBefore = lstatSync(lockPath, { bigint: true });
+  if (pathBefore.isSymbolicLink() || !pathBefore.isFile()) throw new Error('Evidence operation owner path is not a regular file.');
+  const descriptor = openSync(lockPath, constants.O_RDONLY | constants.O_NOFOLLOW |
+    (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0));
+  let keepDescriptor = false;
+  try {
+    const opened = fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || opened.dev !== pathBefore.dev || opened.ino !== pathBefore.ino) {
+      throw new Error('Evidence operation owner changed during pinning.');
+    }
+    const record = readEvidenceOperationRecordFromDescriptor(descriptor, { dev: opened.dev, ino: opened.ino });
+    if (record.nonce !== expectedNonce || record.pid !== process.pid) {
+      throw new Error('Evidence operation owner does not match the acquired local owner.');
+    }
+    const pathAfter = lstatSync(lockPath, { bigint: true });
+    if (pathAfter.isSymbolicLink() || !pathAfter.isFile() || pathAfter.dev !== opened.dev || pathAfter.ino !== opened.ino) {
+      throw new Error('Evidence operation owner changed after pinning.');
+    }
+    let unlinkCommitted = false;
+    let complete = false;
+    const generation = { dev: opened.dev, ino: opened.ino };
+    const assertCurrent = (accountRead?: (bytes: number) => void): void => {
+      if (complete || unlinkCommitted) throw new Error('Evidence operation owner is no longer present for metadata publication.');
+      let current;
+      try { current = lstatSync(lockPath, { bigint: true }); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('Evidence operation owner disappeared before terminal metadata was durable.');
+        throw error;
+      }
+      if (current.isSymbolicLink() || !current.isFile() || current.dev !== generation.dev || current.ino !== generation.ino) {
+        throw new Error('Evidence operation owner generation changed; terminal metadata retry is protected.');
+      }
+      const currentRecord = readEvidenceOperationRecordFromDescriptor(descriptor, generation, accountRead);
+      if (!sameEvidenceOperationLockRecord(currentRecord, record)) {
+        throw new Error('Evidence operation owner record changed; terminal metadata retry is protected.');
+      }
+      const afterRead = lstatSync(lockPath, { bigint: true });
+      if (afterRead.isSymbolicLink() || afterRead.dev !== generation.dev || afterRead.ino !== generation.ino) {
+        throw new Error('Evidence operation owner generation changed during verification.');
+      }
+    };
+    const syncOwnerDirectory = (): void => {
+      testFaults?.beforeOwnerLockDirectoryFsync?.(lockPath);
+      const directory = openSync(path.dirname(lockPath), constants.O_RDONLY);
+      try { fsyncSync(directory); } finally { closeSync(directory); }
+    };
+    const closePinnedDescriptor = (): void => {
+      closeSync(descriptor);
+      keepDescriptor = false;
+    };
+    keepDescriptor = true;
+    return {
+      assertCurrent,
+      release: (budget) => {
+        if (complete) return;
+        if (unlinkCommitted) {
+          let current;
+          try { current = lstatSync(lockPath, { bigint: true }); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+          if (current !== undefined) {
+            throw new Error('Evidence operation successor occupies the released owner path; recovery remains pending.');
+          }
+          syncOwnerDirectory();
+          closePinnedDescriptor();
+          complete = true;
+          return;
+        }
+        assertCurrent(budget?.accountRead);
+        testFaults?.beforeOwnerLockUnlink?.(lockPath);
+        // Revalidate after the synchronous fault seam so replacement with a
+        // byte-identical owner record on a different inode is never unlinked.
+        assertCurrent(budget?.accountRead);
+        budget?.beginDeletion();
+        unlinkSync(lockPath);
+        unlinkCommitted = true;
+        budget?.finishDeletion();
+        syncOwnerDirectory();
+        closePinnedDescriptor();
+        complete = true;
+      },
+    };
+  } finally {
+    if (!keepDescriptor) { try { closeSync(descriptor); } catch { /* preserve pinning failure */ } }
+  }
 }
 
 function isToolOutputArtifactFileIdentity(value: unknown): value is ToolOutputArtifactFileIdentity {
@@ -735,18 +901,30 @@ export class FileToolOutputStore implements ToolOutputStore {
     }
     let captureState: 'open' | 'finishing' | 'finished' | 'failed' | 'aborted' | 'commit-pending' = 'open';
     let writerFinished = false;
+    let finishedSummary: ToolOutputCaptureSummary | undefined;
     return {
       write: (channel, chunk) => {
         if (captureState !== 'open') throw new Error('Tool-output capture is no longer writable.');
         writer.write(channel, chunk);
       },
       finish: () => {
+        if (captureState === 'commit-pending') {
+          try {
+            const artifact = operation.close().find((item) => item.id === finishedSummary!.artifact.id);
+            if (artifact === undefined) throw new Error('Tool-output operation did not commit its artifact.');
+            captureState = 'finished';
+            return { ...finishedSummary!, artifact };
+          } catch (error) {
+            throw error;
+          }
+        }
         if (captureState !== 'open') throw new Error('Tool-output capture can only finish once.');
         captureState = 'finishing';
         let summary: ToolOutputCaptureSummary;
         try {
           summary = writer.finish();
           writerFinished = true;
+          finishedSummary = summary;
         } catch (error) {
           captureState = 'failed';
           try { writer.abort?.(); } catch { /* preserve the original finish failure */ }
@@ -796,9 +974,15 @@ export class FileToolOutputStore implements ToolOutputStore {
     let lock: DispatchInvocationLock;
     try { lock = acquireDispatchInvocationLock({ lockPath, nonce: () => ownerNonce }); }
     catch (error) { throw new Error(`Tool-output capture operation ownership is unavailable: ${error instanceof Error ? error.message : 'unknown lock error'}`); }
+    let ownerFence: PinnedEvidenceOperationFence;
+    try { ownerFence = pinEvidenceOperationFence(lockPath, ownerNonce, this.testFaults); }
+    catch (error) {
+      try { lock.release(); } catch { /* initial owner-pin failure remains primary */ }
+      throw error;
+    }
     let slot: number;
     try { slot = this.registerOperation(id, operations); }
-    catch (error) { lock.release(); throw error; }
+    catch (error) { try { ownerFence.release(); } catch { /* pre-metadata registration debt remains protected */ } throw error; }
     const artifacts: ToolOutputArtifactReference[] = [];
     const captureAttributions: Array<Readonly<Record<string, string | number | null>>> = [];
     const activeCaptureIds: string[] = [];
@@ -806,16 +990,43 @@ export class FileToolOutputStore implements ToolOutputStore {
     const activeWriters = new Set<FileToolOutputWriter>();
     const allWriters = new Map<FileToolOutputWriter, string>();
     const metadataPath = path.join(operations, `${id}.json`);
-    const writeMetadata = (value: unknown) => writeAtomicJson(operations, metadataPath, value);
+    const writeMetadata = (value: unknown) => writeAtomicJson(operations, metadataPath, value, () => {
+      const state = typeof value === 'object' && value !== null ? (value as Record<string, unknown>).state : undefined;
+      if (state === 'closed' || state === 'aborted') this.testFaults?.beforeOperationMetadataDirectoryFsync?.(value);
+    });
     const createdAt = new Date().toISOString();
     const base = { schemaVersion: 1, id, slot, ownerNonce, createdAt, attribution };
     try { writeMetadata({ ...base, state: 'active', artifacts: [], activeCaptureIds }); }
-    catch (error) { lock.release(); throw error; }
+    catch (error) { try { ownerFence.release(); } catch { /* initial metadata bootstrap debt remains protected */ } throw error; }
     let operationState: 'open' | 'close-pending' | 'abort-pending' | 'closed' = 'open';
     let closeTimestamp: string | undefined;
     let retainedUntil: string | undefined;
     let committedReferences: ToolOutputArtifactReference[] | undefined;
+    let publicCloseDelivered = false;
     let abortTimestamp: string | undefined;
+    let terminalKind: 'close' | 'abort' | undefined;
+    let terminalMetadata: Record<string, unknown> | undefined;
+    let terminalMetadataDurable = false;
+    const pendingTransition: PendingTerminalTransition = {
+      id,
+      slot,
+      retry: (accountRead, beginDeletion, finishDeletion) => {
+        attemptTerminalTransition({ accountRead, beginDeletion, finishDeletion });
+      },
+    };
+    const attemptTerminalTransition = (budget?: TerminalRetryBudget): readonly ToolOutputArtifactReference[] | undefined => {
+      if (terminalKind === undefined || terminalMetadata === undefined) throw new Error('Tool-output terminal transition has no frozen intent.');
+      if (!terminalMetadataDurable) {
+        ownerFence.assertCurrent(budget?.accountRead);
+        writeMetadata(terminalMetadata);
+        terminalMetadataDurable = true;
+      }
+      ownerFence.release(budget);
+      operationState = 'closed';
+      forgetPendingTerminalTransition(this.root, id);
+      return terminalKind === 'close' ? committedReferences : undefined;
+    };
+    const retainPendingTransition = (): void => registerPendingTerminalTransition(this.root, this.capacity, pendingTransition);
     return {
       id,
       startCapture: (policy, commandAttribution = {}) => {
@@ -876,7 +1087,13 @@ export class FileToolOutputStore implements ToolOutputStore {
         };
       },
       close: () => {
-        if (operationState === 'closed') throw new Error('Tool-output operation is already closed.');
+        if (operationState === 'closed') {
+          if (terminalKind === 'close' && !publicCloseDelivered) {
+            publicCloseDelivered = true;
+            return committedReferences!;
+          }
+          throw new Error('Tool-output operation is already closed.');
+        }
         if (operationState === 'abort-pending') throw new Error('Tool-output operation abort is pending.');
         if (operationState === 'open') {
           if (activeWriters.size > 0 || unresolvedCaptureIds.size > 0) throw new Error('Tool-output operation cannot commit while a capture writer or prepared capture ID is unresolved.');
@@ -884,21 +1101,26 @@ export class FileToolOutputStore implements ToolOutputStore {
           retainedUntil = new Date(Date.parse(closeTimestamp) + this.retentionMs).toISOString();
           committedReferences = artifacts.map((artifact) => ({ ...artifact, operationId: id, retainedUntil }));
           operationState = 'close-pending';
+          terminalKind = 'close';
+          terminalMetadata = {
+            ...base, state: 'closed', closedAt: closeTimestamp, retainedUntil,
+            activeCaptureIds: [],
+            captures: committedReferences.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })),
+            artifacts: committedReferences,
+          };
+          retainPendingTransition();
         }
-        const committed = committedReferences!;
-        writeMetadata({
-          ...base, state: 'closed', closedAt: closeTimestamp, retainedUntil,
-          activeCaptureIds: [],
-          captures: committed.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })),
-          artifacts: committed,
-        });
-        operationState = 'closed';
-        lock.release();
-        return committed;
+        const references = attemptTerminalTransition()!;
+        publicCloseDelivered = true;
+        return references;
       },
       abort: () => {
         if (operationState === 'closed') return;
         if (operationState === 'close-pending') throw new Error('Tool-output operation close is pending and cannot be aborted.');
+        if (operationState === 'abort-pending' && terminalMetadataDurable) {
+          attemptTerminalTransition();
+          return;
+        }
         operationState = 'abort-pending';
         abortTimestamp ??= this.now().toISOString();
         let cleanupFailed = false;
@@ -908,16 +1130,12 @@ export class FileToolOutputStore implements ToolOutputStore {
           catch (error) { cleanupFailed = true; firstFailure ??= error; }
         }
         const retainedCaptureIds = cleanupFailed ? [...activeCaptureIds] : [...unresolvedCaptureIds];
-        try {
-          writeMetadata({ ...base, state: 'aborted', closedAt: abortTimestamp, activeCaptureIds: retainedCaptureIds, artifacts: [] });
-        } catch (error) {
-          // Do not discard the exact owner fence when terminal metadata did
-          // not cross its directory durability barrier. The prior active
-          // record still contains all prepared IDs for dead-owner recovery.
-          throw firstFailure ?? error;
-        }
-        operationState = 'closed';
-        try { lock.release(); } catch (error) { throw firstFailure ?? error; }
+        terminalKind = 'abort';
+        terminalMetadata = { ...base, state: 'aborted', closedAt: abortTimestamp, activeCaptureIds: retainedCaptureIds, artifacts: [] };
+        terminalMetadataDurable = false;
+        retainPendingTransition();
+        try { attemptTerminalTransition(); }
+        catch (error) { throw firstFailure ?? error; }
         if (firstFailure !== undefined) throw firstFailure;
       },
     };
@@ -1025,6 +1243,24 @@ export class FileToolOutputStore implements ToolOutputStore {
         const slotRecord = this.readSlot(slot, accountMetadataRead);
         if (slotRecord === undefined) continue;
         if (slotRecord === null) { protectedCount += 1; continue; }
+        const pendingTransition = pendingTerminalTransitions.get(this.root)?.get(slotRecord.id);
+        if (pendingTransition !== undefined) {
+          if (pendingTransition.slot !== slot) { protectedCount += 1; continue; }
+          try {
+            pendingTransition.retry(
+              accountMetadataRead,
+              () => {
+                if (attempted >= maxDeletions) throw new Error('Tool-output cleanup deletion budget exhausted.');
+                attempted += 1;
+              },
+              () => { deleted += 1; },
+            );
+          } catch (error) {
+            if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+            protectedCount += 1;
+            continue;
+          }
+        }
         const metadataPath = path.join(this.operationsDir, slotRecord.id + '.json');
         let metadata: Record<string, unknown> = {};
         if (!slotRecord.deleting) {
@@ -1298,7 +1534,7 @@ function readBoundedJson(filePath: string, maxBytes: number, accountRead?: (byte
   } finally { closeSync(descriptor); }
 }
 
-function writeAtomicJson(directory: string, filePath: string, value: unknown): void {
+function writeAtomicJson(directory: string, filePath: string, value: unknown, beforeDirectoryFsync?: () => void): void {
   const encoded = Buffer.from(JSON.stringify(value), 'utf8');
   if (encoded.length > 1_048_576) throw new Error('Tool-output metadata exceeds the bounded metadata limit.');
   const temporary = `${filePath}.tmp-${randomUUID()}`;
@@ -1309,6 +1545,7 @@ function writeAtomicJson(directory: string, filePath: string, value: unknown): v
     fsyncSync(descriptor);
     closeSync(descriptor); descriptor = undefined;
     renameSync(temporary, filePath);
+    beforeDirectoryFsync?.();
     const dir = openSync(directory, constants.O_RDONLY);
     try { fsyncSync(dir); } finally { closeSync(dir); }
   } catch (error) {

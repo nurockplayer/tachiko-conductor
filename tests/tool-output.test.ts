@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, fstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -673,6 +673,208 @@ describe('UTF-8 tool output ranges', () => {
           buffered.abort?.();
           assert.equal(memory.read(bufferedSummary.artifact, { channel: 'stdout' }).text, 'buffered-committed');
         } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: close and abort remain retryable until their owner-fence unlink and directory barrier commit', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-terminal-fence-retry-'));
+        try {
+          let failCloseUnlink = true;
+          let failAbortUnlink = true;
+          let failCloseSync = true;
+          let closeUnlinks = 0;
+          let closeSyncs = 0;
+          let closeOperationId = '';
+          let abortOperationId = '';
+          let syncOperationId = '';
+          const store = new FileToolOutputStore(directory, { capacity: 2, retentionMs: 60_000, testFaults: {
+            beforeOwnerLockUnlink: (lockPath) => {
+              if (closeOperationId !== '' && lockPath.includes(`${closeOperationId}.lock`)) {
+                closeUnlinks += 1;
+                if (failCloseUnlink) { failCloseUnlink = false; throw Object.assign(new Error('close owner unlink EIO'), { code: 'EIO' }); }
+              }
+              if (abortOperationId !== '' && lockPath.includes(`${abortOperationId}.lock`) && failAbortUnlink) {
+                failAbortUnlink = false;
+                throw Object.assign(new Error('abort owner unlink EIO'), { code: 'EIO' });
+              }
+            },
+            beforeOwnerLockDirectoryFsync: (lockPath) => {
+              if (syncOperationId !== '' && lockPath.includes(`${syncOperationId}.lock`)) {
+                closeSyncs += 1;
+                if (failCloseSync) { failCloseSync = false; throw Object.assign(new Error('close owner directory fsync EIO'), { code: 'EIO' }); }
+              }
+            },
+          } });
+
+          const closeOperation = store.beginOperation({ kind: 'close-fence' });
+          closeOperationId = closeOperation.id;
+          const closeWriter = closeOperation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          closeWriter.write('stdout', 'retry-close'); closeWriter.finish();
+          const closeMetadataPath = path.join(directory, 'operations', `${closeOperation.id}.json`);
+          assert.throws(() => closeOperation.close(), /close owner unlink EIO/);
+          const frozen = JSON.parse(readFileSync(closeMetadataPath, 'utf8')) as { readonly state: string; readonly closedAt: string; readonly retainedUntil: string };
+          assert.equal(frozen.state, 'closed');
+          assert.throws(() => closeOperation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY), /not accepting captures/);
+          assert.throws(() => closeOperation.abort(), /close is pending/);
+          assert.ok(existsSync(path.join(directory, 'operations', `${closeOperation.id}.lock`)), 'owner fence remains until retry commits');
+          const committed = closeOperation.close();
+          assert.equal(closeUnlinks, 2, 'retry revalidates then removes the exact owner once');
+          assert.equal(JSON.parse(readFileSync(closeMetadataPath, 'utf8')).closedAt, frozen.closedAt);
+          assert.equal(JSON.parse(readFileSync(closeMetadataPath, 'utf8')).retainedUntil, frozen.retainedUntil);
+          assert.equal(store.read(committed[0]!, { channel: 'stdout' }).text, 'retry-close');
+
+          const abortOperation = store.beginOperation({ kind: 'abort-fence' });
+          abortOperationId = abortOperation.id;
+          const abortWriter = abortOperation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          abortWriter.write('stdout', 'retry-abort');
+          const abortCaptureId = JSON.parse(readFileSync(path.join(directory, 'operations', `${abortOperation.id}.json`), 'utf8')).activeCaptureIds[0] as string;
+          assert.throws(() => abortOperation.abort(), /abort owner unlink EIO/);
+          const aborted = JSON.parse(readFileSync(path.join(directory, 'operations', `${abortOperation.id}.json`), 'utf8')) as { readonly state: string };
+          assert.equal(aborted.state, 'aborted');
+          assert.ok(existsSync(path.join(directory, 'operations', `${abortOperation.id}.lock`)));
+          assert.throws(() => abortOperation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY), /not accepting captures/);
+          abortOperation.abort();
+          assert.equal(existsSync(path.join(directory, 'operations', `${abortOperation.id}.lock`)), false);
+          assert.equal(existsSync(path.join(directory, `${abortCaptureId}.stdout`)), false);
+
+          const syncOperation = store.beginOperation({ kind: 'close-sync' });
+          syncOperationId = syncOperation.id;
+          const syncWriter = syncOperation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          syncWriter.write('stdout', 'retry-directory-sync'); syncWriter.finish();
+          assert.throws(() => syncOperation.close(), /close owner directory fsync EIO/);
+          assert.equal(existsSync(path.join(directory, 'operations', `${syncOperation.id}.lock`)), false, 'unlink already happened before the failed barrier');
+          const syncRefs = syncOperation.close();
+          assert.equal(closeSyncs, 2, 'retry performs only the missing directory barrier');
+          assert.equal(store.read(syncRefs[0]!, { channel: 'stdout' }).text, 'retry-directory-sync');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: standalone finish and save retry only terminal metadata without renewing or purging evidence', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-standalone-terminal-retry-'));
+        try {
+          let failClosedSync = true;
+          const store = new FileToolOutputStore(directory, { capacity: 2, retentionMs: 1000, testFaults: {
+            beforeOperationMetadataDirectoryFsync: (value) => {
+              if ((value as { readonly state?: string }).state === 'closed' && failClosedSync) {
+                failClosedSync = false;
+                throw Object.assign(new Error('closed metadata directory fsync EIO'), { code: 'EIO' });
+              }
+            },
+          } });
+          const standalone = store.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          standalone.write('stdout', 'standalone-finish-retry');
+          assert.throws(() => standalone.finish(), /closed metadata directory fsync EIO/);
+          standalone.abort?.();
+          const summary = standalone.finish();
+          assert.equal(store.read(summary.artifact, { channel: 'stdout' }).text, 'standalone-finish-retry');
+          assert.throws(() => standalone.finish(), /finish once/i, 'a committed standalone summary remains one-shot');
+
+          const saveDirectory = path.join(directory, 'save-retry');
+          let failSaveSync = true;
+          const saveStore = new FileToolOutputStore(saveDirectory, { capacity: 1, retentionMs: 1000, testFaults: {
+            beforeOperationMetadataDirectoryFsync: (value) => {
+              if ((value as { readonly state?: string }).state === 'closed' && failSaveSync) {
+                failSaveSync = false;
+                throw Object.assign(new Error('save metadata directory fsync EIO'), { code: 'EIO' });
+              }
+            },
+          } });
+          assert.throws(() => saveStore.save({ stdout: 'save-terminal-debt', stderr: '' }), /save metadata directory fsync EIO/);
+          const metadataPath = path.join(saveDirectory, 'operations');
+          const operationId = readdirSync(metadataPath).find((name) => name.endsWith('.json') && !name.startsWith('slot-') && name !== 'index.json')!.slice(0, -5);
+          const original = JSON.parse(readFileSync(path.join(metadataPath, `${operationId}.json`), 'utf8')) as { readonly retainedUntil: string; readonly artifacts: readonly [{ readonly id: string }] };
+          const cleanup = new FileToolOutputStore(saveDirectory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(cleanup.protected, 1, 'valid unexpired evidence stays committed and occupies its slot');
+          assert.equal(JSON.parse(readFileSync(path.join(metadataPath, `${operationId}.json`), 'utf8')).retainedUntil, original.retainedUntil);
+          assert.equal(readFileSync(path.join(saveDirectory, `${original.artifacts[0]!.id}.stdout`), 'utf8'), 'save-terminal-debt');
+          assert.ok(existsSync(path.join(metadataPath, 'slot-0000.json')));
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: a byte-identical successor owner on a new inode blocks pending terminal release', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-terminal-successor-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `
+            import fs from 'node:fs'; import path from 'node:path';
+            const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)});
+            const root = fs.realpathSync(${JSON.stringify(directory)}); let operationId = ''; let substituted = false;
+            const store = new FileToolOutputStore(root, { capacity: 1, testFaults: { beforeOwnerLockUnlink: (lockPath) => {
+              if (substituted || !lockPath.endsWith(operationId + '.lock')) return;
+              substituted = true;
+              const bytes = fs.readFileSync(lockPath);
+              const replacement = lockPath + '.successor';
+              fs.writeFileSync(replacement, bytes, { mode: 0o600 });
+              fs.renameSync(replacement, lockPath);
+            } } });
+            const operation = store.beginOperation({ kind: 'terminal-successor' }); operationId = operation.id;
+            const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'protected-successor-evidence'); writer.finish();
+            const lockPath = path.join(root, 'operations', operation.id + '.lock'); const originalBytes = fs.readFileSync(lockPath, 'utf8');
+            let firstError = ''; try { operation.close(); } catch (error) { firstError = error.message; }
+            const cleanup = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            const metadata = JSON.parse(fs.readFileSync(path.join(root, 'operations', operation.id + '.json'), 'utf8'));
+            console.log(JSON.stringify({ firstError, substituted, cleanup, lock: fs.readFileSync(lockPath, 'utf8'), originalBytes,
+              metadata, artifactExists: fs.existsSync(path.join(root, metadata.artifacts[0].id + '.stdout')) }));
+            process.exit(0);
+          `;
+          const result = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly firstError: string; readonly substituted: boolean; readonly cleanup: { readonly protected: number; readonly deleted: number }; readonly lock: string; readonly originalBytes: string; readonly metadata: { readonly state: string }; readonly artifactExists: boolean };
+          assert.match(result.firstError, /generation changed/);
+          assert.equal(result.substituted, true);
+          assert.equal(result.lock, result.originalBytes, 'same owner bytes on a new inode remain untouched');
+          assert.equal(result.metadata.state, 'closed', 'the frozen metadata is retained but never rewritten under the successor');
+          assert.equal(result.cleanup.protected, 1);
+          assert.equal(result.cleanup.deleted, 0);
+          assert.equal(result.artifactExists, true);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: maintenance recovery preserves one undelivered public close or standalone finish response', () => {
+        const closeDirectory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-close-response-retry-'));
+        const finishDirectory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-finish-response-retry-'));
+        try {
+          let operationId = '';
+          let failUnlink = true;
+          const closeStore = new FileToolOutputStore(closeDirectory, { capacity: 1, testFaults: {
+            beforeOwnerLockUnlink: (lockPath) => {
+              if (failUnlink && lockPath.endsWith(`${operationId}.lock`)) {
+                failUnlink = false;
+                throw Object.assign(new Error('close delivery unlink EIO'), { code: 'EIO' });
+              }
+            },
+          } });
+          const operation = closeStore.beginOperation({ kind: 'close-response-retry' });
+          operationId = operation.id;
+          const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          writer.write('stdout', 'one-close-response'); writer.finish();
+          assert.throws(() => operation.close(), /close delivery unlink EIO/);
+          const recoveredClose = new FileToolOutputStore(closeDirectory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(recoveredClose.protected, 1, 'same-root maintenance completes the close transition but preserves unexpired data');
+          const references = operation.close();
+          assert.equal(closeStore.read(references[0]!, { channel: 'stdout' }).text, 'one-close-response');
+          assert.throws(() => operation.close(), /already closed/);
+
+          let failMetadataSync = true;
+          const finishStore = new FileToolOutputStore(finishDirectory, { capacity: 1, testFaults: {
+            beforeOperationMetadataDirectoryFsync: (value) => {
+              if ((value as { readonly state?: string }).state === 'closed' && failMetadataSync) {
+                failMetadataSync = false;
+                throw Object.assign(new Error('standalone delivery metadata sync EIO'), { code: 'EIO' });
+              }
+            },
+          } });
+          const capture = finishStore.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          capture.write('stdout', 'one-finish-response');
+          assert.throws(() => capture.finish(), /standalone delivery metadata sync EIO/);
+          const recoveredFinish = new FileToolOutputStore(finishDirectory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(recoveredFinish.protected, 1);
+          const summary = capture.finish();
+          assert.equal(finishStore.read(summary.artifact, { channel: 'stdout' }).text, 'one-finish-response');
+          assert.throws(() => capture.finish(), /finish once/i);
+        } finally {
+          rmSync(closeDirectory, { recursive: true, force: true });
+          rmSync(finishDirectory, { recursive: true, force: true });
+        }
       });
 
       it('file: double finish cannot unindex a second writer across a real process crash', () => {

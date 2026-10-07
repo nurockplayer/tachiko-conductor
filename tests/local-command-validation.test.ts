@@ -602,6 +602,39 @@ describe('ConfiguredLocalValidationAdapter', () => {
     });
   });
 
+  it('keeps validation outcome truthful when capture close needs a bounded store-owned retry', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-terminal-retry-'));
+    dirs.push(root);
+    let failClosedSync = true;
+    const storeRoot = path.join(root, 'store');
+    const outputStore = new FileToolOutputStore(storeRoot, { capacity: 1, testFaults: {
+      beforeOperationMetadataDirectoryFsync: (value) => {
+        if ((value as { readonly state?: string }).state === 'closed' && failClosedSync) {
+          failClosedSync = false;
+          throw Object.assign(new Error('validation close directory fsync EIO'), { code: 'EIO' });
+        }
+      },
+    } });
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'validation-terminal-retry-v1',
+      commands: [{ argv: [process.execPath, '-e', "process.stdout.write('VALIDATION-TERMINAL-MARKER')"], timeoutMs: 1_000, captureOutput: true }],
+      outputStore,
+    }).validate(owned);
+
+    assert.equal(result.status, 'passed', 'terminal capture metadata failure does not rewrite the real child outcome');
+    assert.equal(result.commands[0]?.outcome, 'passed');
+    assert.equal(result.commands[0]?.captureStatus, 'unavailable', 'uncommitted references are withheld from returned evidence');
+    assert.equal(result.commands[0]?.output, undefined);
+    const cleanup = new FileToolOutputStore(storeRoot, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+    assert.equal(cleanup.protected, 1, 'retry commits original unexpired retention and does not evict validation evidence');
+    const operationFiles = readdirSync(path.join(storeRoot, 'operations')).filter((name) => name.endsWith('.json') && !name.startsWith('slot-') && name !== 'index.json');
+    assert.equal(operationFiles.length, 1);
+    const metadata = JSON.parse(readFileSync(path.join(storeRoot, 'operations', operationFiles[0]!), 'utf8')) as { readonly state: string; readonly artifacts: readonly [{ readonly id: string }] };
+    assert.equal(metadata.state, 'closed');
+    assert.equal(readFileSync(path.join(storeRoot, `${metadata.artifacts[0]!.id}.stdout`), 'utf8'), 'VALIDATION-TERMINAL-MARKER');
+  });
+
   it('captures only explicitly opted-in commands and starts the operation only when reached', async () => {
     const owned = request();
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-opt-in-'));
