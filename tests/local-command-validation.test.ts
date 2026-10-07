@@ -3,12 +3,15 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import * as childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
 import { ConfiguredLocalValidationAdapter, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
-import { FileToolOutputStore, readToolOutput } from '../src/evidence/tool-output.js';
+import { FileToolOutputStore, InMemoryToolOutputStore, readToolOutput } from '../src/evidence/tool-output.js';
 import { TARGET } from './helpers.js';
 
 const dirs: string[] = [];
@@ -200,6 +203,138 @@ describe('ConfiguredLocalValidationAdapter', () => {
 
     assert.equal(result.status, 'failed');
     assert.equal(result.commands[0]?.outcome, 'timed_out');
+  });
+
+  it('preserves direct exit truth when inherited pipes hit the deadline and aborts empty capture operations', async () => {
+    const owned = request();
+    const evidenceRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-held-pipes-'));
+    dirs.push(evidenceRoot);
+    const store = new FileToolOutputStore(evidenceRoot, { capacity: 1 });
+    const code = 7;
+    const marker = 'DIRECT-BEFORE-DEADLINE';
+    const script = `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(() => {}, 2500)'], { stdio: 'inherit' }); process.stdout.write(${JSON.stringify(marker)}); setImmediate(() => process.exit(${code}));`;
+    const childApi = createRequire(import.meta.url)('node:child_process') as { spawn: typeof childProcess.spawn };
+    const originalSpawn = childApi.spawn;
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let selectedDeadline: (() => void) | undefined;
+    let selectedTimer: ReturnType<typeof setTimeout> | undefined;
+    let observedMarker = '';
+    let observedExit = false;
+    let ready = false;
+    let deliveryQueued = false;
+    let watchdogFired = false;
+    let commandChild: ReturnType<typeof childProcess.spawn> | undefined;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const deliverWhenReady = (): void => {
+      if (ready || deliveryQueued || !observedExit || !observedMarker.includes(marker) || selectedDeadline === undefined) return;
+      // The wrapper's exit listener runs before the adapter's listener. A
+      // setImmediate queues delivery after all listeners on that exit event.
+      deliveryQueued = true;
+      setImmediate(() => {
+        if (ready) return;
+        ready = true;
+        if (selectedTimer !== undefined) originalClearTimeout(selectedTimer);
+        selectedDeadline?.();
+      });
+    };
+    childApi.spawn = ((...args: Parameters<typeof childProcess.spawn>) => {
+      const child = originalSpawn(...args);
+      commandChild = child;
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (observedMarker.length < marker.length) observedMarker += chunk.toString('utf8').slice(0, marker.length - observedMarker.length);
+        deliverWhenReady();
+      });
+      child.once('exit', () => { observedExit = true; deliverWhenReady(); });
+      return child;
+    }) as typeof childProcess.spawn;
+    syncBuiltinESMExports();
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      if (delay === 250) {
+        selectedDeadline = () => callback(...args);
+        // Keep a real timer handle so production clearTimeout remains real.
+        selectedTimer = originalSetTimeout(() => undefined, 60_000);
+        watchdog = originalSetTimeout(() => {
+          watchdogFired = true;
+          // Fail-only cleanup: the assertion below rejects this path even
+          // though it delivers the production callback to settle the child.
+          selectedDeadline?.();
+        }, 5_000);
+        return selectedTimer;
+      }
+      return originalSetTimeout(callback, delay, ...args);
+    }) as typeof globalThis.setTimeout;
+    let result;
+    try {
+      result = await new ConfiguredLocalValidationAdapter({
+        ...configuration([process.execPath, '-e', script], 250),
+        commands: [{ argv: [process.execPath, '-e', script], timeoutMs: 250, captureOutput: true }],
+        outputStore: store,
+      }).validate(owned);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+      childApi.spawn = originalSpawn;
+      syncBuiltinESMExports();
+      if (watchdog !== undefined) originalClearTimeout(watchdog);
+      if (selectedTimer !== undefined) originalClearTimeout(selectedTimer);
+      if (!ready && commandChild?.pid !== undefined && process.platform !== 'win32') {
+        try { process.kill(-commandChild.pid, 'SIGKILL'); } catch { /* cleanup only after a failed readiness path */ }
+      }
+    }
+    assert.equal(watchdogFired, false, 'independent real watchdog must not provide the expected transition');
+    assert.equal(ready, true, 'actual parent-side exit and complete marker must precede deadline delivery');
+    assert.equal(result!.status, 'failed');
+    assert.equal(result!.commands[0]?.outcome, 'failed');
+    assert.equal(result!.commands[0]?.exitCode, code);
+    assert.equal(result!.commands[0]?.captureStatus, 'partial', 'forced cleanup cannot claim complete pipe capture');
+    assert.equal(result!.commands[0]?.output, undefined, 'incomplete capture cannot publish an artifact');
+    assert.ok(result!.commands[0]?.capturePreview?.stdout.preview.includes(marker));
+    assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
+
+    const missing = new FileToolOutputStore(path.join(evidenceRoot, 'empty-operation'), { capacity: 1 });
+    const unavailable = await new ConfiguredLocalValidationAdapter({
+      ...configuration([path.join(evidenceRoot, 'missing-command')]),
+      commands: [{ argv: [path.join(evidenceRoot, 'missing-command')], timeoutMs: 1_000, captureOutput: true }],
+      outputStore: missing,
+    }).validate(owned);
+    assert.equal(unavailable.status, 'unknown');
+    const reusable = missing.beginOperation({ kind: 'after-empty-validation-operation' });
+    reusable.abort();
+  });
+
+  it('keeps forced-incomplete capture partial even when a custom writer cannot abort', async () => {
+    const owned = request();
+    const marker = 'CUSTOM-WRITER-FORCED-INCOMPLETE';
+    for (const abortBehavior of ['absent', 'noop', 'throws'] as const) {
+      const backing = new InMemoryToolOutputStore();
+      let finishCalls = 0;
+      const outputStore = {
+        save: backing.save.bind(backing),
+        read: backing.read.bind(backing),
+        search: backing.search.bind(backing),
+        startCapture(policy: Parameters<typeof backing.startCapture>[0]) {
+          const writer = backing.startCapture(policy);
+          return {
+            write: writer.write.bind(writer),
+            finish() { finishCalls += 1; return writer.finish(); },
+            ...(abortBehavior === 'absent' ? {} : { abort: abortBehavior === 'noop' ? () => undefined : () => { throw new Error('abort unavailable'); } }),
+          };
+        },
+      } as NonNullable<LocalValidationConfiguration['outputStore']>;
+      const script = `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: 'inherit' }); process.stdout.write(${JSON.stringify(marker)}); setImmediate(() => process.exit(0));`;
+      const result = await new ConfiguredLocalValidationAdapter({
+        ...configuration([process.execPath, '-e', script], 1_000),
+        commands: [{ argv: [process.execPath, '-e', script], timeoutMs: 1_000, captureOutput: true }],
+        outputStore,
+      }).validate(owned);
+      assert.equal(result.commands[0]?.outcome, 'passed', 'actual direct child exit remains independent of capture cleanup');
+      assert.equal(result.commands[0]?.exitCode, 0);
+      assert.equal(result.commands[0]?.captureStatus, 'partial');
+      assert.equal(result.commands[0]?.output, undefined);
+      assert.ok(result.commands[0]?.capturePreview?.stdout.preview.includes(marker));
+      assert.equal(finishCalls, 0, `${abortBehavior} abort behavior cannot allow writer.finish after forced invalidation`);
+    }
   });
 
   it('runs in an isolated exact-HEAD reconstruction and rejects a wrong checkout', async () => {

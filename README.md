@@ -415,6 +415,24 @@ capacity, capture becomes unavailable; retained slots are never evicted.
 Generic and provider commands do not create raw output files unless the
 individual command explicitly requests capture.
 
+Committed artifacts preserve the complete bytes admitted during successful
+capture for their declared lifetime. Durable writes share a fixed 64 MiB
+cumulative admission limit per operation (including every captured command and
+both streams); the library may lower this limit with `captureMaxBytes`, but no
+runtime environment setting raises or changes it. When admission or filesystem
+I/O fails, capture is partial and no artifact is published for that writer;
+streaming validation continues draining output and reports the observed command
+result separately. This is an admission bound, not a guarantee of available
+disk space or a global filesystem quota.
+
+Explicit range reads are limited to 1 MiB. Search queries are limited to 64 KiB
+of UTF-8, with at most 128 matches and 64 KiB per matching line. File capture
+requires supported POSIX ownership and private-mode checks. Existing evidence-
+root and operations directories must already be owned by the effective current
+user and private; the store refuses unsafe permissions without changing them.
+Windows file capture is unavailable under this implementation because it does
+not qualify ACL privacy.
+
 Use the artifact-reference JSON emitted with command evidence for bounded
 drill-down:
 

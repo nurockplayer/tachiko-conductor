@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync as fsWriteSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -26,6 +26,176 @@ const policy: ToolOutputPolicy = {
 };
 
 describe('bounded tool output contract', () => {
+  it('admits one cumulative UTF-8 operation quota across channels and writers without refunds', () => {
+    const exactRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-quota-exact-'));
+    const faultRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-quota-fault-'));
+    try {
+      const exact = new FileToolOutputStore(exactRoot, { capacity: 2, captureMaxBytes: 8 });
+      const exactOperation = exact.beginOperation({ kind: 'exact-cumulative-quota' });
+      const exactWriter = exactOperation.startCapture(policy);
+      exactWriter.write('stdout', 'éé');
+      exactWriter.write('stderr', 'abcd');
+      const exactCapture = exactWriter.finish();
+      const [exactArtifact] = exactOperation.close();
+      assert.equal(exactArtifact?.totalBytes, 8, 'UTF-8 bytes across both channels share the exact operation limit');
+      assert.equal(readFileSync(path.join(exactRoot, `${exactCapture.artifact.id}.stdout`), 'utf8'), 'éé');
+
+      let shortWrite = false;
+      let wrotePrefix = false;
+      const store = new FileToolOutputStore(faultRoot, { capacity: 2, captureMaxBytes: 8, testFaults: {
+        writeSync: (descriptor, bytes, offset, length) => {
+          if (!shortWrite) return fsWriteSync(descriptor, bytes, offset, length);
+          if (!wrotePrefix) { wrotePrefix = true; return fsWriteSync(descriptor, bytes, offset, 1); }
+          throw new Error('injected write failure after a physical prefix');
+        },
+      } });
+      const operation = store.beginOperation({ kind: 'quota-no-refund' });
+      const sibling = operation.startCapture(policy);
+      sibling.write('stdout', 'abc');
+      const siblingSummary = sibling.finish();
+      const failed = operation.startCapture(policy);
+      shortWrite = true;
+      assert.throws(() => failed.write('stderr', 'xyz'), /injected write failure/);
+      failed.abort?.();
+      const overBudget = operation.startCapture(policy);
+      assert.throws(() => overBudget.write('stdout', 'xyz'), /byte budget exhausted/);
+      assert.throws(() => overBudget.finish(), /cannot finish/);
+      overBudget.abort?.();
+      const [committed] = operation.close();
+      assert.equal(committed?.id, siblingSummary.artifact.id, 'a completed sibling still commits');
+      assert.equal(readFileSync(path.join(faultRoot, `${siblingSummary.artifact.id}.stdout`), 'utf8'), 'abc');
+      assert.deepEqual(readdirSync(faultRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')).sort(),
+        [`${siblingSummary.artifact.id}.stderr`, `${siblingSummary.artifact.id}.stdout`].sort(), 'failed and over-budget captures leave no artifact files');
+    } finally { rmSync(exactRoot, { recursive: true, force: true }); rmSync(faultRoot, { recursive: true, force: true }); }
+  });
+
+  it('rejects invalid capture quotas before filesystem changes and refuses unsafe existing evidence leaves unchanged', () => {
+    const invalidRoot = path.join(os.tmpdir(), `tachiko-invalid-capture-quota-${process.pid}-${Date.now()}`);
+    assert.throws(() => new FileToolOutputStore(invalidRoot, { captureMaxBytes: 0 }), /positive safe integer/);
+    assert.throws(() => new FileToolOutputStore(invalidRoot, { captureMaxBytes: 64 * 1_048_576 + 1 }), /exceeds the maximum/);
+    assert.equal(existsSync(invalidRoot), false, 'invalid constructor budgets do not create the root');
+
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-unsafe-evidence-root-'));
+    const sentinel = path.join(root, 'sentinel');
+    writeFileSync(sentinel, 'keep');
+    chmodSync(root, 0o755);
+    try {
+      const store = new FileToolOutputStore(root, { capacity: 1 });
+      assert.throws(() => store.beginOperation({ kind: 'unsafe-root' }), /owned by the current user and private/);
+      assert.equal(lstatSync(root).mode & 0o777, 0o755, 'existing evidence root mode is never repaired');
+      assert.equal(readFileSync(sentinel, 'utf8'), 'keep');
+      assert.equal(existsSync(path.join(root, 'operations')), false, 'unsafe root is rejected before operations/slot mutation');
+    } finally { chmodSync(root, 0o700); rmSync(root, { recursive: true, force: true }); }
+
+    const operationsRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-unsafe-operations-'));
+    const operations = path.join(operationsRoot, 'operations');
+    mkdirSync(operations, { mode: 0o700 });
+    const operationSentinel = path.join(operations, 'sentinel');
+    writeFileSync(operationSentinel, 'keep');
+    chmodSync(operations, 0o755);
+    try {
+      assert.throws(() => new FileToolOutputStore(operationsRoot, { capacity: 1 }).beginOperation(), /owned by the current user and private/);
+      assert.equal(lstatSync(operations).mode & 0o777, 0o755, 'existing operations mode is never repaired');
+      assert.equal(readFileSync(operationSentinel, 'utf8'), 'keep');
+      assert.deepEqual(readdirSync(operations), ['sentinel'], 'unsafe operations leaf is rejected before lock or slot mutation');
+    } finally { chmodSync(operations, 0o700); rmSync(operationsRoot, { recursive: true, force: true }); }
+
+    const newParent = mkdtempSync(path.join(os.tmpdir(), 'tachiko-new-evidence-parent-'));
+    try {
+      const newRoot = path.join(newParent, 'nested', 'evidence');
+      const operation = new FileToolOutputStore(newRoot, { capacity: 1 }).beginOperation({ kind: 'new-private-leaves' });
+      operation.abort();
+      assert.equal(lstatSync(path.join(newParent, 'nested')).mode & 0o777, 0o700);
+      assert.equal(lstatSync(newRoot).mode & 0o777, 0o700);
+      assert.equal(lstatSync(path.join(newRoot, 'operations')).mode & 0o777, 0o700);
+    } finally { rmSync(newParent, { recursive: true, force: true }); }
+  });
+
+  it('fails closed before mutation when private POSIX identity proof is unavailable and prefers effective uid', () => {
+    const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    const effectiveUid = Object.getOwnPropertyDescriptor(process, 'geteuid');
+    const realUid = Object.getOwnPropertyDescriptor(process, 'getuid');
+    const unsupported = path.join(os.tmpdir(), `tachiko-unsupported-file-capture-${process.pid}-${Date.now()}`);
+    const roots: string[] = [];
+    try {
+      Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+      assert.throws(() => new FileToolOutputStore(unsupported).beginOperation(), /requires supported POSIX/);
+      assert.equal(existsSync(unsupported), false, 'unsupported platform is rejected before mkdir');
+
+      Object.defineProperty(process, 'platform', platform);
+      const uidRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-effective-uid-'));
+      roots.push(uidRoot);
+      Object.defineProperty(process, 'geteuid', { configurable: true, writable: true, value: () => (realUid!.value as () => number)() + 1 });
+      assert.throws(() => new FileToolOutputStore(uidRoot).beginOperation(), /owned by the current user and private/);
+      assert.equal(existsSync(path.join(uidRoot, 'operations')), false, 'different effective uid is rejected before child-directory creation');
+
+      Object.defineProperty(process, 'geteuid', { configurable: true, writable: true, value: () => { throw new Error('effective uid unavailable'); } });
+      const failedLookupRoot = path.join(os.tmpdir(), `tachiko-failed-euid-${process.pid}-${Date.now()}`);
+      assert.throws(() => new FileToolOutputStore(failedLookupRoot).beginOperation(), /cannot verify the current effective user/);
+      assert.equal(existsSync(failedLookupRoot), false, 'failed effective lookup does not fall back or mutate the root');
+
+      Object.defineProperty(process, 'geteuid', { configurable: true, writable: true, value: null });
+      const unusableLookupRoot = path.join(os.tmpdir(), `tachiko-unusable-euid-${process.pid}-${Date.now()}`);
+      assert.throws(() => new FileToolOutputStore(unusableLookupRoot).beginOperation(), /cannot verify the current effective user/);
+      assert.equal(existsSync(unusableLookupRoot), false, 'an unusable present effective-uid API does not fall back');
+
+      Object.defineProperty(process, 'geteuid', { configurable: true, writable: true, value: undefined });
+      const fallbackRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-real-uid-fallback-'));
+      roots.push(fallbackRoot);
+      const operation = new FileToolOutputStore(fallbackRoot).beginOperation({ kind: 'getuid-fallback' });
+      operation.abort();
+    } finally {
+      Object.defineProperty(process, 'platform', platform);
+      if (effectiveUid === undefined) delete (process as NodeJS.Process & { geteuid?: () => number }).geteuid;
+      else Object.defineProperty(process, 'geteuid', effectiveUid);
+      if (realUid === undefined) delete (process as NodeJS.Process & { getuid?: () => number }).getuid;
+      else Object.defineProperty(process, 'getuid', realUid);
+      rmSync(unsupported, { recursive: true, force: true });
+      for (const root of roots) rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects oversized read and search requests before looking up an artifact in either store', () => {
+    const missing = { kind: 'tool-output', id: 'missing', stdoutBytes: 0, stderrBytes: 0, totalBytes: 0, sha256: '0'.repeat(64) } as const;
+    for (const store of [new InMemoryToolOutputStore(), new FileToolOutputStore(path.join(os.tmpdir(), `tachiko-request-bounds-${process.pid}-${Date.now()}`))]) {
+      assert.throws(() => store.read(missing, { channel: 'stdout', length: 1_048_577 }), /range length exceeds/);
+      assert.throws(() => store.search(missing, { channel: 'stdout', query: 'x', maxMatches: 129 }), /maxMatches exceeds/);
+      assert.throws(() => store.search(missing, { channel: 'stdout', query: 'x', maxBytes: 65_537 }), /maxBytes exceeds/);
+      assert.throws(() => store.search(missing, { channel: 'stdout', query: 'x'.repeat(65_537) }), /query exceeds/);
+    }
+  });
+
+  it('accepts the exact read, query, match and per-line maxima including a multibyte query boundary', () => {
+    const store = new InMemoryToolOutputStore();
+    const query = `${'界'.repeat(21_845)}x`;
+    assert.equal(Buffer.byteLength(query, 'utf8'), 65_536);
+    const reference = store.save({ stdout: query, stderr: '' });
+    assert.equal(store.read(reference, { channel: 'stdout', length: 1_048_576 }).text, query);
+    const matches = store.search(reference, { channel: 'stdout', query, maxMatches: 128, maxBytes: 65_536 });
+    assert.equal(matches.length, 1);
+    assert.equal(matches[0]?.text, query);
+  });
+
+  it('contains durable quota exhaustion while draining and returns bounded partial observations without an artifact', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-quota-session-'));
+    try {
+      const store = new FileToolOutputStore(directory, { capacity: 1, captureMaxBytes: 3 });
+      const operation = store.beginOperation({ kind: 'contained-quota-exhaustion' });
+      const writer = operation.startCapture(policy);
+      const session = new ContainedToolOutputCaptureSession(policy);
+      session.write(writer, 'stdout', 'four');
+      session.write(writer, 'stderr', 'also-drained');
+      const result = session.finish(writer);
+      assert.equal(result.status, 'partial');
+      assert.equal(result.capture, undefined);
+      assert.equal(result.stdout.bytes, 4);
+      assert.equal(result.stderr.bytes, 12);
+      assert.equal(result.stdout.preview, 'four');
+      operation.abort();
+      assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('rejects over-limit policies before capture mutation and copies caller policy scalars', () => {
     const directory = path.join(os.tmpdir(), `tachiko-invalid-policy-${process.pid}-${Date.now()}`);
     const store = new FileToolOutputStore(directory);
@@ -440,7 +610,7 @@ describe('UTF-8 tool output ranges', () => {
           { offset: 10, length: 1, actual: 9, text: '\u0301', next: 11 },
           { offset: 11, length: 1, actual: 11, text: 'B', next: 12 },
           { offset: 12, length: 1, actual: 12, text: '', next: 12 },
-          { offset: 5, length: Number.MAX_SAFE_INTEGER, actual: 4, text: '🙂e\u0301B', next: 12 },
+          { offset: 5, length: 1_048_576, actual: 4, text: '🙂e\u0301B', next: 12 },
         ];
         for (const test of cases) {
           assert.deepEqual(store.read(artifact, { channel: 'stdout', offset: test.offset, length: test.length }), {
@@ -481,6 +651,7 @@ describe('UTF-8 tool output ranges', () => {
           const safeRoot = path.join(directory, 'safe-root');
           const store = new FileToolOutputStore(safeRoot);
           mkdirSync(safeRoot);
+          chmodSync(safeRoot, 0o700);
           const operationsTarget = path.join(directory, 'operations-target');
           mkdirSync(operationsTarget);
           symlinkSync(operationsTarget, path.join(safeRoot, 'operations'), 'dir');

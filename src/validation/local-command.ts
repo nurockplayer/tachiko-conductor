@@ -384,13 +384,21 @@ async function execute(
     let timer: NodeJS.Timeout | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
     let settling = false;
+    let captureForcedIncomplete = false;
+    let directExitBeforeDeadline = false;
+    let directExitCode: number | null = null;
     const finish = (outcome: LocalValidationCommandEvidence['outcome'], exitCode: number | null): void => {
       if (settled) return;
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       if (forceTimer !== undefined) clearTimeout(forceTimer);
       let captureResult: ToolOutputCaptureSessionResult | undefined;
-      if (captureSession !== undefined) captureResult = captureSession.finish(writer);
+      if (captureSession !== undefined) {
+        if (captureForcedIncomplete) {
+          const observed = captureSession.finish(undefined);
+          captureResult = { ...observed, status: writer === undefined ? 'unavailable' : 'partial' };
+        } else captureResult = captureSession.finish(writer);
+      }
       const pendingCapture: ToolOutputCaptureSummary | undefined = captureResult?.capture;
       const captureStatus: LocalValidationCommandEvidence['captureStatus'] = captureResult?.status;
       const evidence = { commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
@@ -410,8 +418,15 @@ async function execute(
     const settleTimedOutProcess = async (child: ReturnType<typeof spawn>): Promise<void> => {
       if (settling || settled) return;
       settling = true;
+      // The wall-clock deadline can expire while descendants keep inherited
+      // pipes open after the direct child already exited. Such a deadline
+      // forces incomplete capture and group cleanup, but does not rewrite the
+      // child's observed exit into a timeout.
+      try { writer?.abort?.(); } catch { /* settlement truth is independent of capture cleanup */ }
       if (process.platform === 'win32') {
-        finish((await terminateWindowsProcessTree(child.pid)) ? 'timed_out' : 'unavailable', null);
+        const settledTree = await terminateWindowsProcessTree(child.pid);
+        finish(!settledTree ? 'unavailable' : directExitBeforeDeadline
+          ? (directExitCode === 0 ? 'passed' : 'failed') : 'timed_out', directExitBeforeDeadline ? directExitCode : null);
         return;
       }
       terminateProcessGroup(child.pid, 'SIGKILL');
@@ -419,7 +434,8 @@ async function execute(
       // detached validation command, prove the owned group has no surviving
       // descendants before recording a timeout; otherwise fail closed.
       const groupSettled = await waitForProcessGroupSettlement(child.pid);
-      finish(groupSettled ? 'timed_out' : 'unavailable', null);
+      finish(!groupSettled ? 'unavailable' : directExitBeforeDeadline
+        ? (directExitCode === 0 ? 'passed' : 'failed') : 'timed_out', directExitBeforeDeadline ? directExitCode : null);
     };
     let child: ReturnType<typeof spawn>;
     // Capture setup has completed; invoke the synchronous host fence directly
@@ -443,13 +459,20 @@ async function execute(
     }
     const stdoutDecoder = new StringDecoder('utf8');
     const stderrDecoder = new StringDecoder('utf8');
+    child.once('exit', (code) => {
+      directExitBeforeDeadline = !timedOut;
+      directExitCode = code;
+    });
     const captureChunk = (channel: 'stdout' | 'stderr', chunk: Buffer, decoder: StringDecoder) => {
       const text = decoder.write(chunk);
-      if (text !== '' && captureSession !== undefined) captureSession.write(writer, channel, text);
+      if (text !== '' && captureSession !== undefined) captureSession.write(captureForcedIncomplete ? undefined : writer, channel, text);
     };
     child.stdout?.on('data', (chunk: Buffer) => captureChunk('stdout', chunk, stdoutDecoder));
     child.stderr?.on('data', (chunk: Buffer) => captureChunk('stderr', chunk, stderrDecoder));
     timer = setTimeout(() => {
+      // Invalidate completeness synchronously before any signal or asynchronous
+      // group settlement. Optional writer cleanup is not the publication gate.
+      captureForcedIncomplete = true;
       timedOut = true;
       if (process.platform === 'win32') {
         void settleTimedOutProcess(child);
@@ -467,8 +490,8 @@ async function execute(
     });
     child.once('close', (code) => {
       const outTail = stdoutDecoder.end(); const errTail = stderrDecoder.end();
-      if (captureSession !== undefined && outTail !== '') captureSession.write(writer, 'stdout', outTail);
-      if (captureSession !== undefined && errTail !== '') captureSession.write(writer, 'stderr', errTail);
+      if (captureSession !== undefined && outTail !== '') captureSession.write(captureForcedIncomplete ? undefined : writer, 'stdout', outTail);
+      if (captureSession !== undefined && errTail !== '') captureSession.write(captureForcedIncomplete ? undefined : writer, 'stderr', errTail);
       if (timedOut) {
         void settleTimedOutProcess(child);
         return;
@@ -671,7 +694,11 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         let committed: readonly import('../evidence/tool-output.js').ToolOutputArtifactReference[] = [];
         if (outputOperation !== undefined) {
           const operation = outputOperation;
-          try { committed = operation.close(); outputOperation = undefined; }
+          try {
+            if (pending.size === 0) operation.abort();
+            else committed = operation.close();
+            outputOperation = undefined;
+          }
           catch { try { operation.abort(); } catch { /* do not change validator result */ } outputOperation = undefined; }
         }
         const commands = evidence.map((command) => {

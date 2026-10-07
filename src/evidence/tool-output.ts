@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readSync, writeSync, renameSync, fsyncSync, lstatSync, fstatSync, constants, realpathSync, unlinkSync } from 'node:fs';
+import { closeSync, existsSync, mkdirSync, openSync, readSync, writeSync, renameSync, fsyncSync, lstatSync, fstatSync, constants, realpathSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import {
@@ -13,6 +13,7 @@ export const TOOL_OUTPUT_CONTRACT_VERSION = 'tachiko.tool-output.v1' as const;
 export const DEFAULT_TOOL_OUTPUT_SLOT_CAPACITY = 256;
 export const DEFAULT_TOOL_OUTPUT_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export const DEFAULT_TOOL_OUTPUT_REGISTRATION_PROBES = 16;
+export const MAX_TOOL_OUTPUT_CAPTURE_BYTES = 64 * 1_048_576;
 
 export interface ToolOutputCleanupBudget {
   readonly maxSlotProbes?: number;
@@ -78,6 +79,9 @@ export const TOOL_OUTPUT_POLICY_MAXIMA: ToolOutputPolicy = Object.freeze({
   maxDiagnostics: 128,
   readBytes: 1_048_576,
 });
+export const TOOL_OUTPUT_SEARCH_MAX_MATCHES = 128;
+export const TOOL_OUTPUT_SEARCH_MAX_BYTES_PER_LINE = 65_536;
+export const TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES = 65_536;
 
 export interface ToolOutputStream {
   readonly bytes: number;
@@ -709,20 +713,48 @@ function validOperationMetadata(value: Record<string, unknown>, id: string, slot
 }
 
 function ensurePrivateDirectory(directory: string): void {
+  // File capture relies on POSIX ownership and mode bits as its privacy
+  // boundary. Refuse unsupported platforms before even creating a path.
+  if (process.platform === 'win32') throw new Error('File tool-output capture requires supported POSIX ownership and private-mode checks.');
+  let uid: number | undefined;
+  try {
+    const effectiveUid = (process as NodeJS.Process & { geteuid?: () => number }).geteuid;
+    if (effectiveUid === undefined) uid = typeof process.getuid === 'function' ? process.getuid() : undefined;
+    else {
+      if (typeof effectiveUid !== 'function') throw new Error('effective uid API is unusable');
+      uid = effectiveUid.call(process);
+    }
+  } catch {
+    throw new Error('File tool-output capture cannot verify the current effective user.');
+  }
+  if (uid === undefined || !Number.isSafeInteger(uid) || uid < 0) {
+    throw new Error('File tool-output capture cannot verify the current effective user.');
+  }
   const resolved = path.resolve(directory);
   if (!path.isAbsolute(resolved)) throw new Error('Tool-output evidence path must be absolute.');
   const root = path.parse(resolved).root;
+  if (resolved === root) throw new Error('Tool-output evidence root must not be the filesystem root.');
   let current = root;
   for (const component of resolved.slice(root.length).split(path.sep).filter(Boolean)) {
     current = path.join(current, component);
-    try { mkdirSync(current, { mode: 0o700 }); }
+    let created = false;
+    try { mkdirSync(current, { mode: 0o700 }); created = true; }
     catch (error) {
       if (typeof error !== 'object' || error === null || (error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
     const stat = lstatSync(current);
     if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error(`Tool-output evidence path contains a non-directory or symlink: ${current}`);
+    // mkdir's successful return is the only point where we know this process
+    // created the leaf. Existing permissions are inspected, never repaired.
+    // Intermediate ancestors retain their existing policy; only the requested
+    // evidence directory leaf is a private-storage boundary.
+    if (current === resolved) {
+      if (stat.uid !== uid || (stat.mode & 0o077) !== 0 || (stat.mode & 0o700) !== 0o700 ||
+          (created && (stat.mode & 0o777) !== 0o700)) {
+        throw new Error(`${created ? 'New' : 'Existing'} tool-output evidence directory must be owned by the current user and private (0700).`);
+      }
+    }
   }
-  chmodSync(resolved, 0o700);
 }
 
 export function validateToolOutputPolicy(policy?: ToolOutputPolicy): ToolOutputPolicy {
@@ -901,7 +933,12 @@ export function readToolOutput(
   request: ToolOutputReadRequest,
 ): ToolOutputReadResult {
   if (envelope.version !== TOOL_OUTPUT_CONTRACT_VERSION) throw new Error('Unsupported tool-output envelope version.');
-  return store.read(envelope.artifact, { ...request, ...(request.length === undefined ? { length: envelope.readBytes } : {}) });
+  if (!Number.isSafeInteger(envelope.readBytes) || envelope.readBytes < 1 || envelope.readBytes > TOOL_OUTPUT_POLICY_MAXIMA.readBytes) {
+    throw new Error(`Tool-output envelope readBytes must be between 1 and ${TOOL_OUTPUT_POLICY_MAXIMA.readBytes}.`);
+  }
+  const resolved = { ...request, ...(request.length === undefined ? { length: envelope.readBytes } : {}) };
+  validateReadLength(resolved, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
+  return store.read(envelope.artifact, resolved);
 }
 
 export function searchToolOutput(
@@ -910,10 +947,12 @@ export function searchToolOutput(
   request: ToolOutputSearchRequest,
 ): readonly ToolOutputMatch[] {
   if (envelope.version !== TOOL_OUTPUT_CONTRACT_VERSION) throw new Error('Unsupported tool-output envelope version.');
-  return store.search(envelope.artifact, {
+  const resolved = {
     ...request,
     maxBytes: request.maxBytes ?? envelope.overflow.diagnosticLimitBytes,
-  });
+  };
+  validateSearchRequest(resolved);
+  return store.search(envelope.artifact, resolved);
 }
 
 export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelope {
@@ -922,7 +961,7 @@ export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelop
   if (envelope.version !== TOOL_OUTPUT_CONTRACT_VERSION ||
       !['passed', 'failed', 'timed_out', 'cancelled', 'unknown'].includes(envelope.outcome as string) ||
       (envelope.exitCode !== null && (!Number.isInteger(envelope.exitCode) || typeof envelope.exitCode !== 'number')) ||
-      typeof envelope.readBytes !== 'number' || !Number.isSafeInteger(envelope.readBytes) || envelope.readBytes < 1 ||
+      typeof envelope.readBytes !== 'number' || !Number.isSafeInteger(envelope.readBytes) || envelope.readBytes < 1 || envelope.readBytes > TOOL_OUTPUT_POLICY_MAXIMA.readBytes ||
       typeof envelope.summary !== 'string' || !Array.isArray(envelope.diagnostics) ||
       !envelope.diagnostics.every((item) => typeof item === 'string')) return false;
   if (!isToolOutputStream(envelope.stdout) || !isToolOutputStream(envelope.stderr)) return false;
@@ -935,6 +974,11 @@ export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelop
     ![overflowRecord.totalBytes, overflowRecord.retainedBytes, overflowRecord.omittedBytes, overflowRecord.previewLimitBytes,
       overflowRecord.diagnosticLimitBytes, overflowRecord.diagnosticLimitLines]
       .every((item) => typeof item === 'number' && Number.isSafeInteger(item) && item >= 0)) return false;
+  if ((overflowRecord.previewLimitBytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes ||
+      (overflowRecord.diagnosticLimitBytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes ||
+      (overflowRecord.diagnosticLimitLines as number) > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||
+      envelope.diagnostics.length > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||
+      utf8Bytes(envelope.diagnostics.join('\n')) > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes) return false;
   const expectedTruncated = overflowRecord.capture || overflowRecord.summary || overflowRecord.diagnostics || overflowRecord.stdout || overflowRecord.stderr;
   return envelope.stdout.previewBytes === utf8Bytes(envelope.stdout.preview) &&
     envelope.stderr.previewBytes === utf8Bytes(envelope.stderr.preview) &&
@@ -965,12 +1009,18 @@ function isToolOutputArtifact(value: unknown): value is ToolOutputArtifactRefere
     (artifact.fileIdentity === undefined || isToolOutputArtifactFileIdentity(artifact.fileIdentity));
 }
 
+function validateReadLength(request: ToolOutputReadRequest, readBytes: number): number {
+  const length = request.length ?? readBytes;
+  assertPositiveInteger(length, 'Tool-output range length');
+  if (length > TOOL_OUTPUT_POLICY_MAXIMA.readBytes) throw new Error(`Tool-output range length exceeds the maximum of ${TOOL_OUTPUT_POLICY_MAXIMA.readBytes}.`);
+  return length;
+}
+
 function validateReadRequest(reference: ToolOutputArtifactReference, request: ToolOutputReadRequest, readBytes: number): { readonly offset: number; readonly length: number; readonly total: number } {
   const total = request.channel === 'stdout' ? reference.stdoutBytes : reference.stderrBytes;
   const offset = request.offset ?? 0;
-  const length = request.length ?? readBytes;
+  const length = validateReadLength(request, readBytes);
   if (!Number.isSafeInteger(offset) || offset < 0 || offset > total) throw new Error('Tool-output range offset is outside the artifact.');
-  assertPositiveInteger(length, 'Tool-output range length');
   return { offset, length, total };
 }
 
@@ -1020,6 +1070,7 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
   }
 
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
+    validateReadLength(request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
     const capture = this.values.get(referenceValue.id);
     if (capture === undefined) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable.`);
     const range = validateReadRequest(referenceValue, request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
@@ -1030,6 +1081,7 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
   }
 
   search(referenceValue: ToolOutputArtifactReference, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
+    validateSearchRequest(request);
     const capture = this.values.get(referenceValue.id);
     if (capture === undefined) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable.`);
     return searchCapture(capture, request);
@@ -1044,8 +1096,9 @@ export class FileToolOutputStore implements ToolOutputStore {
   private readonly maxRegistrationProbes: number;
   private readonly now: () => Date;
   private readonly testFaults: ToolOutputFileTestFaults | undefined;
+  private readonly captureMaxBytes: number;
 
-  constructor(root: string, options: { readonly capacity?: number; readonly retentionMs?: number; readonly maxRegistrationProbes?: number; readonly now?: () => Date; readonly testFaults?: ToolOutputFileTestFaults } = {}) {
+  constructor(root: string, options: { readonly capacity?: number; readonly retentionMs?: number; readonly maxRegistrationProbes?: number; readonly captureMaxBytes?: number; readonly now?: () => Date; readonly testFaults?: ToolOutputFileTestFaults } = {}) {
     if (!path.isAbsolute(root)) throw new Error('Tool-output evidence root must be an absolute stable path.');
     this.capacity = options.capacity ?? DEFAULT_TOOL_OUTPUT_SLOT_CAPACITY;
     assertPositiveInteger(this.capacity, 'Tool-output slot capacity');
@@ -1054,6 +1107,9 @@ export class FileToolOutputStore implements ToolOutputStore {
     this.maxRegistrationProbes = options.maxRegistrationProbes ?? Math.min(DEFAULT_TOOL_OUTPUT_REGISTRATION_PROBES, this.capacity);
     assertPositiveInteger(this.maxRegistrationProbes, 'Tool-output registration probe budget');
     if (this.maxRegistrationProbes > this.capacity) throw new Error('Tool-output registration probe budget cannot exceed slot capacity.');
+    this.captureMaxBytes = options.captureMaxBytes ?? MAX_TOOL_OUTPUT_CAPTURE_BYTES;
+    assertPositiveInteger(this.captureMaxBytes, 'Tool-output capture byte budget');
+    if (this.captureMaxBytes > MAX_TOOL_OUTPUT_CAPTURE_BYTES) throw new Error(`Tool-output capture byte budget exceeds the maximum of ${MAX_TOOL_OUTPUT_CAPTURE_BYTES}.`);
     this.now = options.now ?? (() => new Date());
     this.testFaults = options.testFaults;
     const requested = path.resolve(root);
@@ -1183,6 +1239,11 @@ export class FileToolOutputStore implements ToolOutputStore {
     const unresolvedCaptureIds = new Set<string>();
     const activeWriters = new Set<FileToolOutputWriter>();
     const allWriters = new Map<FileToolOutputWriter, string>();
+    let captureBytesAdmitted = 0;
+    const reserveCaptureBytes = (bytes: number): void => {
+      if (bytes > this.captureMaxBytes - captureBytesAdmitted) throw new Error('Tool-output operation capture byte budget exhausted.');
+      captureBytesAdmitted += bytes;
+    };
     const metadataPath = path.join(operations, `${id}.json`);
     const writeMetadata = (value: unknown) => writeAtomicJson(operations, metadataPath, value, () => {
       const state = typeof value === 'object' && value !== null ? (value as Record<string, unknown>).state : undefined;
@@ -1233,7 +1294,7 @@ export class FileToolOutputStore implements ToolOutputStore {
         let writer: FileToolOutputWriter;
         try {
           this.testFaults?.beforeCaptureStart?.();
-          writer = new FileToolOutputWriter(this.root, frozenPolicy, captureId, this.testFaults);
+          writer = new FileToolOutputWriter(this.root, frozenPolicy, captureId, this.testFaults, reserveCaptureBytes);
         }
         catch (error) {
           unresolvedCaptureIds.add(captureId);
@@ -1338,8 +1399,9 @@ export class FileToolOutputStore implements ToolOutputStore {
   }
 
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
-    const identity = this.assertAvailable(referenceValue);
+    validateReadLength(request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
     const range = validateReadRequest(referenceValue, request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
+    const identity = this.assertAvailable(referenceValue);
     const filePath = this.file(referenceValue.id, request.channel);
     const expectedIdentity = identity[request.channel];
     const handle = openVerifiedArtifact(filePath, range.total, expectedIdentity, this.testFaults, 'read', request.channel);
@@ -1362,8 +1424,8 @@ export class FileToolOutputStore implements ToolOutputStore {
   }
 
   search(referenceValue: ToolOutputArtifactReference, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
-    const identity = this.assertAvailable(referenceValue);
     const { maxMatches, maxBytes } = validateSearchRequest(request);
+    const identity = this.assertAvailable(referenceValue);
     const channels = request.channel === undefined ? (['stdout', 'stderr'] as const) : [request.channel];
     const results: ToolOutputMatch[] = [];
     for (const channel of channels) {
@@ -2412,6 +2474,7 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
   private readonly stdoutDiagnostics: DiagnosticCapture;
   private readonly stderrDiagnostics: DiagnosticCapture;
   private finished = false;
+  private poisoned = false;
   private fileIdentity: ToolOutputArtifactFileIdentity | undefined;
 
   constructor(
@@ -2419,9 +2482,9 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
     private readonly policy: ToolOutputPolicy,
     private readonly id = randomUUID(),
     private readonly testFaults?: ToolOutputFileTestFaults,
+    private readonly reserveBytes: (bytes: number) => void = () => undefined,
   ) {
-    mkdirSync(root, { recursive: true, mode: 0o700 });
-    chmodSync(root, 0o700);
+    ensurePrivateDirectory(root);
     try {
       this.stdoutHandle = openSync(path.join(root, `${this.id}.stdout`), 'wx', 0o600);
       testFaults?.beforeSecondOpen?.();
@@ -2440,10 +2503,16 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
 
   write(channel: 'stdout' | 'stderr', chunk: string): void {
     if (this.finished) throw new Error('Tool-output capture is already finished.');
-    const bytes = Buffer.from(chunk, 'utf8');
-    const handle = channel === 'stdout' ? this.stdoutHandle : this.stderrHandle;
-    if (handle === undefined) throw new Error('Tool-output capture descriptor is unavailable.');
-    writeFully(handle, bytes, this.testFaults?.writeSync);
+    if (this.poisoned) throw new Error('Tool-output capture writer is poisoned after an incomplete write.');
+    const byteLength = Buffer.byteLength(chunk, 'utf8');
+    try { this.reserveBytes(byteLength); }
+    catch (error) { this.poisoned = true; throw error; }
+    try {
+      const bytes = Buffer.from(chunk, 'utf8');
+      const handle = channel === 'stdout' ? this.stdoutHandle : this.stderrHandle;
+      if (handle === undefined) throw new Error('Tool-output capture descriptor is unavailable.');
+      writeFully(handle, bytes, this.testFaults?.writeSync);
+    } catch (error) { this.poisoned = true; throw error; }
     if (channel === 'stdout') {
       this.stdoutCapture.append(chunk);
       this.stdoutDiagnostics.append(chunk);
@@ -2454,6 +2523,7 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
   }
 
   finish(): ToolOutputCaptureSummary {
+    if (this.poisoned) throw new Error('Tool-output capture cannot finish after an incomplete or over-budget write.');
     const stdout = this.stdoutCapture.value();
     const stderr = this.stderrCapture.value();
     const stdoutBytes = stdout.bytes;
@@ -2663,11 +2733,16 @@ function searchCapture(capture: ToolOutputCapture, request: ToolOutputSearchRequ
 }
 
 function validateSearchRequest(request: ToolOutputSearchRequest): { readonly maxMatches: number; readonly maxBytes: number } {
+  if (typeof request.query !== 'string') throw new Error('Tool-output search query must be a string.');
+  if (request.query.length > TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES) throw new Error(`Tool-output search query exceeds the maximum of ${TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes.`);
+  if (Buffer.byteLength(request.query, 'utf8') > TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES) throw new Error(`Tool-output search query exceeds the maximum of ${TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes.`);
   if (request.query.trim() === '') throw new Error('Tool-output search query must not be empty.');
   const maxMatches = request.maxMatches ?? DEFAULT_TOOL_OUTPUT_POLICY.maxDiagnostics;
   assertPositiveInteger(maxMatches, 'maxMatches');
+  if (maxMatches > TOOL_OUTPUT_SEARCH_MAX_MATCHES) throw new Error(`maxMatches exceeds the maximum of ${TOOL_OUTPUT_SEARCH_MAX_MATCHES}.`);
   const maxBytes = request.maxBytes ?? DEFAULT_TOOL_OUTPUT_POLICY.diagnosticBytes;
   assertPositiveInteger(maxBytes, 'maxBytes');
+  if (maxBytes > TOOL_OUTPUT_SEARCH_MAX_BYTES_PER_LINE) throw new Error(`maxBytes exceeds the maximum of ${TOOL_OUTPUT_SEARCH_MAX_BYTES_PER_LINE}.`);
   return { maxMatches, maxBytes };
 }
 

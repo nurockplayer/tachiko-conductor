@@ -89,6 +89,26 @@ describe('bounded output integration', () => {
     assert.equal(result.output?.artifact.stdoutBytes, 20_000);
   });
 
+  it('continues draining both real child streams after cumulative durable admission is exhausted', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-quota-child-'));
+    try {
+      const stdout = 'stdout-exceeds-budget';
+      const stderr = 'stderr-still-drained';
+      const result = await new NodeProcessRunner().run(process.execPath, ['-e',
+        `process.stdout.write(${JSON.stringify(stdout)}); process.stderr.write(${JSON.stringify(stderr)}); process.exitCode = 0;`], {
+        timeoutMs: 5_000,
+        outputStore: new FileToolOutputStore(directory, { capacity: 1, captureMaxBytes: 4 }),
+      });
+      assert.equal(result.exitCode, 0);
+      assert.equal(result.captureStatus, 'partial');
+      assert.equal(result.captureObservation?.status, 'partial');
+      assert.equal(result.captureObservation?.stdout.bytes, Buffer.byteLength(stdout, 'utf8'));
+      assert.equal(result.captureObservation?.stderr.bytes, Buffer.byteLength(stderr, 'utf8'));
+      assert.equal(result.output, undefined);
+      assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('keeps bounded partial timeout observations after the actual marker reaches the capture writer', async (t) => {
     const controller = new AbortController();
     const delegate = new InMemoryToolOutputStore();
