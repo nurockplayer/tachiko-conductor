@@ -4,8 +4,74 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 
-import { FileToolOutputStore, InMemoryToolOutputStore, readToolOutput, searchToolOutput } from '../src/evidence/tool-output.js';
+import { DEFAULT_TOOL_OUTPUT_POLICY, FileToolOutputStore, InMemoryToolOutputStore, readToolOutput, searchToolOutput, type ToolOutputCaptureWriter, type ToolOutputPolicy, type ToolOutputStore } from '../src/evidence/tool-output.js';
 import { NodeProcessRunner } from '../src/github/transport.js';
+
+const realSetTimeout = globalThis.setTimeout.bind(globalThis);
+const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
+const observedMarker = 'ERROR: ROOT-CAUSE-OBSERVED\n';
+const observedMarkerBytes = Buffer.byteLength(observedMarker, 'utf8');
+
+function observingStore(delegate: InMemoryToolOutputStore, onObserved: () => void): ToolOutputStore {
+  let stderr = '';
+  let observed = false;
+  return {
+    save: delegate.save.bind(delegate),
+    startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
+      const writer = delegate.startCapture(policy);
+      return {
+        write(channel, chunk) {
+          writer.write(channel, chunk);
+          if (channel === 'stderr' && !observed) {
+            stderr += chunk.slice(0, observedMarkerBytes - Buffer.byteLength(stderr, 'utf8'));
+            if (stderr.includes(observedMarker)) {
+              observed = true;
+              onObserved();
+            }
+          }
+        },
+        finish: writer.finish.bind(writer),
+        abort: writer.abort?.bind(writer),
+      };
+    },
+    read: delegate.read.bind(delegate),
+    search: delegate.search.bind(delegate),
+  };
+}
+
+function fragmentedMarkerScript(terminal: 'hang' | 'signal'): string {
+  const ending = terminal === 'signal'
+    ? "process.stderr.write('', () => process.kill(process.pid, 'SIGTERM'));"
+    : 'setInterval(() => {}, 1000);';
+  return [
+    "const parts = ['ERROR: ROOT-CAUSE-', 'OBSERVED\\n'];",
+    'let index = 0;',
+    `function emit() { if (index === parts.length) { ${ending} return; } process.stderr.write(parts[index++], emit); }`,
+    'emit();',
+  ].join('\n');
+}
+
+function assertPartialCapture(error: unknown, terminal: 'timeout' | 'cancel' | 'signal', policy: ToolOutputPolicy): void {
+  const value = error as { readonly code?: unknown; readonly signal?: unknown; readonly output?: unknown;
+    readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown; readonly stderr?: { readonly bytes: number; readonly preview: string }; readonly diagnostics?: readonly string[] } };
+  assert.equal(value.captureStatus, 'partial');
+  assert.equal(value.captureObservation?.status, 'partial');
+  const observedStderr = value.captureObservation?.stderr;
+  assert.ok(observedStderr !== undefined && observedStderr.bytes > 0);
+  assert.ok(Buffer.byteLength(observedStderr.preview, 'utf8') <= policy.previewBytes);
+  assert.ok(observedStderr.preview.includes(observedMarker.trimEnd()));
+  const diagnostics = value.captureObservation?.diagnostics ?? [];
+  assert.ok(diagnostics.some((line) => line.includes(observedMarker.trimEnd())));
+  assert.ok(diagnostics.length <= policy.maxDiagnostics);
+  assert.ok(Buffer.byteLength(diagnostics.join('\n'), 'utf8') <= policy.diagnosticBytes);
+  assert.equal(value.output, undefined, 'a failed sink never advertises durable evidence');
+  if (terminal === 'timeout') assert.equal(value.code, 'ETIMEDOUT');
+  if (terminal === 'cancel') assert.equal(value.code, 'ABORT_ERR');
+  if (terminal === 'signal') {
+    assert.equal(value.code, null);
+    assert.equal(value.signal, 'SIGTERM');
+  }
+}
 
 describe('bounded output integration', () => {
   it('attaches bounded evidence to a real command while retaining the exact exit code', async () => {
@@ -23,25 +89,35 @@ describe('bounded output integration', () => {
     assert.equal(result.output?.artifact.stdoutBytes, 20_000);
   });
 
-  it('keeps bounded partial timeout observations when the deadline closes output pipes', async () => {
-    const store = new InMemoryToolOutputStore();
-    await assert.rejects(
-      new NodeProcessRunner().run(
-        process.execPath,
-        ['-e', "process.stderr.write('ERROR: timeout evidence\\n'); setTimeout(() => {}, 1000)"],
-        { timeoutMs: 200, outputStore: store },
-      ),
-      (error: unknown) => {
-        const value = error as { readonly code?: unknown; readonly output?: unknown; readonly captureStatus?: unknown;
-          readonly captureObservation?: { readonly status?: unknown; readonly diagnostics?: readonly string[] } };
-        assert.equal(value.code, 'ETIMEDOUT');
-        assert.equal(value.captureStatus, 'partial');
-        assert.equal(value.captureObservation?.status, 'partial');
-        assert.equal(value.output, undefined, 'the force-closed transcript cannot be advertised as a complete artifact');
-        assert.ok(value.captureObservation?.diagnostics?.some((line) => line.includes('timeout evidence')));
-        return true;
-      },
-    );
+  it('keeps bounded partial timeout observations after the actual marker reaches the capture writer', async (t) => {
+    const controller = new AbortController();
+    const delegate = new InMemoryToolOutputStore();
+    let markerReachedWriter = false;
+    let terminalTriggered = false;
+    let watchdogFired = false;
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const store = observingStore(delegate, () => {
+      markerReachedWriter = true;
+      queueMicrotask(() => { terminalTriggered = true; t.mock.timers.tick(200); });
+    });
+    const watchdog = realSetTimeout(() => { watchdogFired = true; controller.abort(); }, 5_000);
+    try {
+      let rejection: unknown;
+      try {
+        await new NodeProcessRunner().run(process.execPath,
+          ['-e', fragmentedMarkerScript('hang')],
+          { timeoutMs: 200, signal: controller.signal, outputStore: store });
+      } catch (error) { rejection = error; }
+      assert.ok(markerReachedWriter, 'the full marker was captured by the actual in-memory writer before deadline delivery');
+      assert.ok(terminalTriggered, 'the production deadline was driven only after writer observation');
+      assert.equal(watchdogFired, false, 'the real watchdog did not supply the expected terminal result');
+      assert.ok(rejection, 'the actual timeout path rejects');
+      assertPartialCapture(rejection, 'timeout', DEFAULT_TOOL_OUTPUT_POLICY);
+    } finally {
+      controller.abort();
+      realClearTimeout(watchdog);
+      t.mock.timers.reset();
+    }
   });
 
   it('streams explicit in-memory evidence past the former execFile safety cap', async () => {
@@ -254,41 +330,69 @@ describe('bounded output integration', () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
-  it('attaches bounded partial observations to actual timeout, cancel, and signal rejections after sink failure', async () => {
-    for (const terminal of ['timeout', 'cancel', 'signal'] as const) {
-      const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-${terminal}-partial-observation-`));
-      const controller = new AbortController();
+  async function runSinkFailureTerminalCase(terminal: 'timeout' | 'cancel' | 'signal', t: import('node:test').TestContext): Promise<void> {
+    const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-${terminal}-partial-observation-`));
+    const controller = new AbortController();
+    let capturedStderr = '';
+    let markerReachedSink = false;
+    let sinkFailureObserved = false;
+    let sinkFaulted = false;
+    let terminalTriggered = false;
+    let watchdogFired = false;
+    if (terminal === 'timeout') t.mock.timers.enable({ apis: ['setTimeout'] });
+    const policy = { previewBytes: 64, diagnosticBytes: 128, maxDiagnostics: 3, readBytes: 32 } as const;
+    const store = new FileToolOutputStore(directory, { testFaults: {
+      writeSync: (descriptor, bytes, offset, length) => {
+        const remainingBytes = observedMarkerBytes - Buffer.byteLength(capturedStderr, 'utf8');
+        if (remainingBytes > 0) capturedStderr += bytes.subarray(offset, offset + Math.min(length, remainingBytes)).toString('utf8');
+        if (!sinkFaulted && capturedStderr.includes(observedMarker)) {
+          sinkFaulted = true;
+          markerReachedSink = true;
+          if (terminal === 'timeout') queueMicrotask(() => { terminalTriggered = true; t.mock.timers.tick(200); });
+          if (terminal === 'cancel') queueMicrotask(() => { terminalTriggered = true; controller.abort(); });
+          sinkFailureObserved = true;
+          throw new Error('injected durable sink failure after full marker');
+        }
+        return writeSync(descriptor, bytes, offset, length);
+      },
+    } });
+    const watchdog = realSetTimeout(() => { watchdogFired = true; controller.abort(); }, 5_000);
+    try {
+      let rejection: unknown;
+      const args = ['-e', fragmentedMarkerScript(terminal === 'signal' ? 'signal' : 'hang')];
       try {
-        const store = new FileToolOutputStore(directory, { testFaults: {
-          writeSync: () => { throw new Error('injected durable sink failure'); },
-        } });
-        const args = terminal === 'signal'
-          ? ['-e', "process.stderr.write('ROOT-CAUSE-OBSERVED\\n'); process.kill(process.pid, 'SIGTERM')"]
-          : ['-e', "process.stderr.write('ROOT-CAUSE-OBSERVED\\n'); setInterval(() => {}, 1000)"];
-        if (terminal === 'cancel') setTimeout(() => controller.abort(), 250);
-        await assert.rejects(new NodeProcessRunner().run(process.execPath, args, {
-          timeoutMs: terminal === 'timeout' ? 200 : 5_000,
-          ...(terminal === 'cancel' ? { signal: controller.signal } : {}),
+        await new NodeProcessRunner().run(process.execPath, args, {
+          timeoutMs: terminal === 'timeout' ? 200 : 0,
+          signal: controller.signal,
           outputStore: store,
-          outputPolicy: { previewBytes: 64, diagnosticBytes: 128, maxDiagnostics: 3, readBytes: 32 },
-        }), (error: unknown) => {
-          const value = error as { readonly code?: unknown; readonly signal?: unknown; readonly output?: unknown;
-            readonly captureStatus?: unknown; readonly captureObservation?: { readonly status?: unknown; readonly stderr?: { readonly bytes: number; readonly preview: string }; readonly diagnostics?: readonly string[] } };
-          assert.equal(value.captureStatus, 'partial');
-          assert.equal(value.captureObservation?.status, 'partial');
-          const observedStderr = value.captureObservation?.stderr;
-          assert.ok(observedStderr !== undefined && observedStderr.bytes > 0);
-          assert.ok(observedStderr.preview.includes('ROOT-CAUSE-OBSERVED'));
-          assert.ok(value.captureObservation?.diagnostics?.some((line) => line.includes('ROOT-CAUSE-OBSERVED')));
-          assert.equal(value.output, undefined, 'a failed sink never advertises durable evidence');
-          if (terminal === 'timeout') assert.equal(value.code, 'ETIMEDOUT');
-          if (terminal === 'cancel') assert.equal(value.code, 'ABORT_ERR');
-          if (terminal === 'signal') assert.equal(value.signal, 'SIGTERM');
-          return true;
+          outputPolicy: policy,
         });
-        assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
-      } finally { rmSync(directory, { recursive: true, force: true }); }
+      } catch (error) { rejection = error; }
+      assert.ok(markerReachedSink, 'the complete fragmented marker reached the real file writer before the terminal transition');
+      assert.ok(sinkFailureObserved, 'the actual file-backed writer faulted after observing the complete marker');
+      if (terminal !== 'signal') assert.ok(terminalTriggered, 'the actual terminal transition followed observed sink containment');
+      assert.equal(watchdogFired, false, 'the real watchdog did not supply the expected terminal result');
+      assert.ok(rejection, `the actual ${terminal} path rejects`);
+      assertPartialCapture(rejection, terminal, policy);
+      assert.deepEqual(readdirSync(directory).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [], 'no raw artifacts remain after the contained failure');
+    } finally {
+      controller.abort();
+      realClearTimeout(watchdog);
+      if (terminal === 'timeout') t.mock.timers.reset();
+      rmSync(directory, { recursive: true, force: true });
     }
+  }
+
+  it('retains partial marker observations on the actual timeout after durable sink failure', async (t) => {
+    await runSinkFailureTerminalCase('timeout', t);
+  });
+
+  it('retains partial marker observations on cancellation after durable sink failure', async (t) => {
+    await runSinkFailureTerminalCase('cancel', t);
+  });
+
+  it('retains partial marker observations on SIGTERM after durable sink failure', async (t) => {
+    await runSinkFailureTerminalCase('signal', t);
   });
 
   it('observes aborts that occur synchronously inside beforeSpawn', async () => {
