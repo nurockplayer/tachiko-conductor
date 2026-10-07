@@ -1585,6 +1585,42 @@ describe('UTF-8 tool output ranges', () => {
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
+      it('file: reserves shared stale-owner reads before takeover and recovers with a larger caller budget', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-shared-owner-read-reserve-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `const { FileToolOutputStore } = await import(${JSON.stringify(moduleUrl)}); const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 }); const operation = store.beginOperation({ kind: 'shared-owner-read-reserve' }); const writer = operation.startCapture({ previewBytes: 16, diagnosticBytes: 32, maxDiagnostics: 1, readBytes: 32 }); writer.write('stdout', 'reserved-owner'); writer.finish(); console.log(operation.id); process.exit(0);`;
+          const operationId = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim();
+          const operations = path.join(directory, 'operations');
+          const indexPath = path.join(operations, 'index.json');
+          const slotPath = path.join(operations, 'slot-0000.json');
+          const metadataPath = path.join(operations, `${operationId}.json`);
+          const lockPath = path.join(operations, `${operationId}.lock`);
+          const indexBytes = readFileSync(indexPath);
+          const slotBytes = readFileSync(slotPath);
+          const metadataBytes = readFileSync(metadataPath);
+          const ownerBytes = readFileSync(lockPath);
+          const stdoutPath = readdirSync(directory).find((name) => name.endsWith('.stdout'))!;
+          const artifactBytes = readFileSync(path.join(directory, stdoutPath));
+          const oldGuardBudget = indexBytes.byteLength + slotBytes.byteLength + metadataBytes.byteLength + (3 * 4096);
+          const refused = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z') })
+            .cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: oldGuardBudget, maxDeletions: 8 });
+          assert.equal(refused.protected, 1, 'the old three-record guard is insufficient for the admitted shared and local envelope');
+          assert.deepEqual(readFileSync(lockPath), ownerBytes, 'refusal leaves the stale owner unchanged');
+          assert.deepEqual(readFileSync(slotPath), slotBytes, 'refusal leaves the slot unchanged');
+          assert.deepEqual(readFileSync(metadataPath), metadataBytes, 'refusal leaves operation metadata unchanged');
+          assert.deepEqual(readFileSync(path.join(directory, stdoutPath)), artifactBytes, 'refusal leaves the artifact unchanged');
+
+          const recovered = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z') })
+            .cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 1_048_576, maxDeletions: 8 });
+          assert.equal(recovered.protected, 0);
+          assert.equal(existsSync(lockPath), false, 'an adequate fresh budget reclaims the stale owner');
+          assert.equal(existsSync(slotPath), false, 'an adequate fresh budget completes the cleanup');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
       it('file: resumes active cleanup after tombstone rename and post-rename directory-sync faults', () => {
         const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
         for (const fault of ['rename', 'directory-sync'] as const) {

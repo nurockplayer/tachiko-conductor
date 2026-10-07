@@ -1702,6 +1702,16 @@ export class FileToolOutputStore implements ToolOutputStore {
         if (admissionBudget.remainingDeletions() < staleTakeoverReserve + 1) {
           protectedCount += 1; continue;
         }
+        const sharedOwnerReadReserve = admittedLock.record === undefined ? 1 * 4096 : 5 * 4096;
+        const localOwnerReadHeadroom = admittedLock.record === undefined ? 3 * 4096 : 4 * 4096;
+        if (!admissionBudget.canRead(sharedOwnerReadReserve + localOwnerReadHeadroom)) {
+          protectedCount += 1; continue;
+        }
+        // The shared invocation-lock primitive performs bounded regular-file
+        // owner reads without an accounting callback. Charge its accepted
+        // envelope once before acquisition can mutate the lock path. Reads
+        // exposed through callbacks remain charged against the current caller.
+        accountMetadataRead(sharedOwnerReadReserve);
         let admittedFence: AcquiredEvidenceOperationFence;
         try {
           admittedFence = acquireEvidenceOperationFence(
@@ -1730,9 +1740,7 @@ export class FileToolOutputStore implements ToolOutputStore {
         catch (error) {
           try {
             const disposal = retryBudget();
-            disposal.beginDeletion();
             ownerFence.release(disposal);
-            disposal.finishDeletion();
           } catch { /* retain the durable slot for strict fresh-process recovery */ }
           protectedCount += 1; continue;
         }
