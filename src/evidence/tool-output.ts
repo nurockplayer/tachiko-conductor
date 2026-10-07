@@ -37,6 +37,7 @@ export interface ToolOutputFileTestFaults {
   readonly beforeUnlink?: (filePath: string) => void;
   readonly beforeOwnerLockUnlink?: (lockPath: string) => void;
   readonly beforeOwnerLockDirectoryFsync?: (lockPath: string) => void;
+  readonly beforeOwnerLockDescriptorClose?: (lockPath: string, descriptor: number) => void;
   readonly beforeOperationMetadataDirectoryFsync?: (value: unknown) => void;
   readonly beforeStaleTakeover?: () => void;
   readonly beforeArtifactRootFsync?: (phase: 'abort' | 'finish' | 'cleanup') => void;
@@ -271,20 +272,25 @@ function readEvidenceOperationLock(lockPath: string, accountRead?: (bytes: numbe
   } finally { closeSync(descriptor); }
 }
 
+interface AcquiredEvidenceOperationFence extends DispatchInvocationLock {
+  readonly ownerNonce: string;
+}
+
 function acquireEvidenceOperationFence(
   lockPath: string,
   expectedOwnerNonce?: string,
   testFaults?: ToolOutputFileTestFaults,
   accountRead?: (bytes: number) => void,
   admittedPreflight?: { readonly record: EvidenceOperationLockRecord | undefined },
-): DispatchInvocationLock {
+): AcquiredEvidenceOperationFence {
   const preflight = admittedPreflight ?? { record: readEvidenceOperationLock(lockPath, accountRead) };
   if (preflight.record !== undefined && expectedOwnerNonce !== undefined && preflight.record.nonce !== expectedOwnerNonce) {
     throw new Error('Evidence operation lock nonce does not match its persisted owner.');
   }
+  const ownerNonce = expectedOwnerNonce ?? randomUUID();
   const acquired = acquireDispatchInvocationLock({
     lockPath,
-    ...(expectedOwnerNonce === undefined ? {} : { nonce: () => expectedOwnerNonce }),
+    nonce: () => ownerNonce,
     beforeStaleTakeover: () => {
       testFaults?.beforeStaleTakeover?.();
       const current = readEvidenceOperationLock(lockPath, accountRead);
@@ -299,6 +305,7 @@ function acquireEvidenceOperationFence(
   // cannot remove a later acquisition that intentionally reuses the nonce.
   let released = false;
   return {
+    ownerNonce,
     release() {
       if (released) return;
       released = true;
@@ -308,10 +315,47 @@ function acquireEvidenceOperationFence(
 }
 
 interface PendingTerminalTransition {
+  readonly kind: 'terminal';
   readonly id: string;
   readonly slot: number;
   retry(accountRead: (bytes: number) => void, beginDeletion: () => void, finishDeletion: () => void): void;
 }
+
+interface PendingReleaseTransition {
+  readonly kind: 'release';
+  readonly id: string;
+  readonly slot: number;
+  retry(budget: CleanupRetryBudget): 'complete' | 'pending';
+}
+
+interface CleanupRetryBudget extends TerminalRetryBudget {
+  readonly remainingDeletions: () => number;
+}
+
+interface PendingCleanupTransition {
+  readonly kind: 'cleanup';
+  readonly id: string;
+  readonly slot: number;
+  retry(budget: CleanupRetryBudget): 'complete' | 'released' | 'pending';
+}
+
+interface CleanupSlotWrite {
+  readonly fromDeleting: boolean;
+  readonly fromIds: readonly string[];
+  readonly toIds: readonly string[];
+}
+
+interface CleanupRecoveryState {
+  phase: 'admission' | 'tombstone' | 'owner-release' | 'release-only' | 'finalize' | 'slot-sync';
+  tombstoneDurable: boolean;
+  artifactIds: string[];
+  pendingSlotWrite?: CleanupSlotWrite;
+  ownerDisposed: boolean;
+  metadataRemoved: boolean;
+  slotUnlinkCommitted: boolean;
+}
+
+type PendingRecoveryTransition = PendingTerminalTransition | PendingReleaseTransition | PendingCleanupTransition;
 
 interface TerminalRetryBudget {
   readonly accountRead: (bytes: number) => void;
@@ -319,9 +363,9 @@ interface TerminalRetryBudget {
   readonly finishDeletion: () => void;
 }
 
-const pendingTerminalTransitions = new Map<string, Map<string, PendingTerminalTransition>>();
+const pendingTerminalTransitions = new Map<string, Map<string, PendingRecoveryTransition>>();
 
-function rootTerminalTransitions(root: string): Map<string, PendingTerminalTransition> {
+function rootTerminalTransitions(root: string): Map<string, PendingRecoveryTransition> {
   let transitions = pendingTerminalTransitions.get(root);
   if (transitions === undefined) {
     transitions = new Map();
@@ -330,9 +374,11 @@ function rootTerminalTransitions(root: string): Map<string, PendingTerminalTrans
   return transitions;
 }
 
-function registerPendingTerminalTransition(root: string, capacity: number, transition: PendingTerminalTransition): void {
+function registerPendingTerminalTransition(root: string, capacity: number, transition: PendingRecoveryTransition): void {
   const transitions = rootTerminalTransitions(root);
-  if (transitions.has(transition.id)) return;
+  const existing = transitions.get(transition.id);
+  if (existing === transition) return;
+  if (existing !== undefined) throw new Error('Tool-output operation already has a conflicting pending recovery entry.');
   if (transitions.size >= capacity) throw new Error('Tool-output pending terminal recovery capacity is full.');
   transitions.set(transition.id, transition);
 }
@@ -344,6 +390,7 @@ function forgetPendingTerminalTransition(root: string, id: string): void {
 }
 
 interface PinnedEvidenceOperationFence {
+  state(): 'present' | 'unlinked' | 'complete';
   assertCurrent(accountRead?: (bytes: number) => void): void;
   release(budget?: TerminalRetryBudget): void;
 }
@@ -380,6 +427,7 @@ function pinEvidenceOperationFence(
   lockPath: string,
   expectedNonce: string,
   testFaults?: ToolOutputFileTestFaults,
+  accountRead?: (bytes: number) => void,
 ): PinnedEvidenceOperationFence {
   if (typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) {
     throw new Error('Evidence operation ownership requires O_NOFOLLOW support.');
@@ -394,7 +442,7 @@ function pinEvidenceOperationFence(
     if (!opened.isFile() || opened.dev !== pathBefore.dev || opened.ino !== pathBefore.ino) {
       throw new Error('Evidence operation owner changed during pinning.');
     }
-    const record = readEvidenceOperationRecordFromDescriptor(descriptor, { dev: opened.dev, ino: opened.ino });
+    const record = readEvidenceOperationRecordFromDescriptor(descriptor, { dev: opened.dev, ino: opened.ino }, accountRead);
     if (record.nonce !== expectedNonce || record.pid !== process.pid) {
       throw new Error('Evidence operation owner does not match the acquired local owner.');
     }
@@ -431,11 +479,17 @@ function pinEvidenceOperationFence(
       try { fsyncSync(directory); } finally { closeSync(directory); }
     };
     const closePinnedDescriptor = (): void => {
-      closeSync(descriptor);
+      // Node/libuv may have consumed the descriptor even when close reports
+      // an error. Retire this numeric capability before the one close call so
+      // retries can never close a descriptor that the OS has since reused.
       keepDescriptor = false;
+      complete = true;
+      testFaults?.beforeOwnerLockDescriptorClose?.(lockPath, descriptor);
+      closeSync(descriptor);
     };
     keepDescriptor = true;
     return {
+      state: () => complete ? 'complete' : unlinkCommitted ? 'unlinked' : 'present',
       assertCurrent,
       release: (budget) => {
         if (complete) return;
@@ -448,7 +502,6 @@ function pinEvidenceOperationFence(
           }
           syncOwnerDirectory();
           closePinnedDescriptor();
-          complete = true;
           return;
         }
         assertCurrent(budget?.accountRead);
@@ -462,7 +515,6 @@ function pinEvidenceOperationFence(
         budget?.finishDeletion();
         syncOwnerDirectory();
         closePinnedDescriptor();
-        complete = true;
       },
     };
   } finally {
@@ -1008,6 +1060,7 @@ export class FileToolOutputStore implements ToolOutputStore {
     let terminalMetadata: Record<string, unknown> | undefined;
     let terminalMetadataDurable = false;
     const pendingTransition: PendingTerminalTransition = {
+      kind: 'terminal',
       id,
       slot,
       retry: (accountRead, beginDeletion, finishDeletion) => {
@@ -1189,25 +1242,83 @@ export class FileToolOutputStore implements ToolOutputStore {
     const metadataPath = path.join(this.operationsDir, `${operationId}.json`);
     const initialMetadata = readBoundedJson(metadataPath, 1_048_576);
     const expectedOwnerNonce = initialMetadata.ownerNonce;
+    const slot = initialMetadata.slot;
     if (initialMetadata.state !== 'closed' || initialMetadata.id !== operationId ||
-        typeof expectedOwnerNonce !== 'string' || expectedOwnerNonce === '' || expectedOwnerNonce.length > 256) {
+        !Number.isSafeInteger(slot) || (slot as number) < 0 ||
+        typeof expectedOwnerNonce !== 'string' || expectedOwnerNonce === '' || expectedOwnerNonce.length > 256 ||
+        !validOperationMetadata(initialMetadata, operationId, slot as number)) {
       throw new Error('Tool-output operation cannot be released without valid committed owner metadata.');
     }
-    const fence = acquireEvidenceOperationFence(
-      path.join(this.operationsDir, `${operationId}.lock`), expectedOwnerNonce, this.testFaults,
+    const lockPath = path.join(this.operationsDir, `${operationId}.lock`);
+    const admittedFence = acquireEvidenceOperationFence(
+      lockPath, expectedOwnerNonce, this.testFaults,
     );
+    let ownerFence: PinnedEvidenceOperationFence;
     try {
-      this.assertAvailable(referenceValue);
-      const metadata = readBoundedJson(metadataPath, 1_048_576);
-      if (metadata.state !== 'closed' || metadata.id !== operationId || metadata.ownerNonce !== expectedOwnerNonce) {
-        throw new Error('Tool-output operation owner changed before release.');
-      }
-      writeAtomicJson(this.operationsDir, metadataPath, {
-        ...metadata,
-        state: 'released',
-        releasedAt: this.now().toISOString(),
-      });
-    } finally { fence.release(); }
+      ownerFence = pinEvidenceOperationFence(lockPath, admittedFence.ownerNonce, this.testFaults);
+    } catch (error) {
+      try { admittedFence.release(); } catch { /* preserve the pin failure */ }
+      throw error;
+    }
+    const closedSnapshot = JSON.parse(JSON.stringify(initialMetadata)) as Record<string, unknown>;
+    const releasedAt = this.now().toISOString();
+    const releasedSnapshot: Record<string, unknown> = { ...closedSnapshot, state: 'released', releasedAt };
+    let metadataDurable = false;
+    let ownerDisposed = false;
+    const transition: PendingReleaseTransition = {
+      kind: 'release', id: operationId, slot: slot as number,
+      retry: (budget) => {
+        if (!ownerDisposed) {
+          const ownerState = ownerFence.state();
+          if (ownerState === 'complete') {
+            ownerDisposed = true;
+            forgetPendingTerminalTransition(this.root, operationId);
+            return 'complete';
+          }
+          if (ownerState === 'unlinked') {
+            ownerFence.release(budget);
+            ownerDisposed = true;
+            forgetPendingTerminalTransition(this.root, operationId);
+            return 'complete';
+          }
+          ownerFence.assertCurrent(budget.accountRead);
+          const currentSlot = this.readSlot(slot as number, budget.accountRead);
+          if (currentSlot === undefined || currentSlot === null || currentSlot.id !== operationId || currentSlot.deleting) {
+            throw new Error('Tool-output release slot changed before its owner disposal.');
+          }
+          if (!metadataDurable) {
+            const current = readBoundedJson(metadataPath, 1_048_576, budget.accountRead);
+            if (JSON.stringify(current) === JSON.stringify(releasedSnapshot)) {
+              // A previous replacement may have succeeded while its directory
+              // barrier failed. Re-establish that barrier before unlinking owner.
+              const descriptor = openSync(this.operationsDir, constants.O_RDONLY);
+              try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+            } else if (JSON.stringify(current) === JSON.stringify(closedSnapshot)) {
+              ownerFence.assertCurrent(budget.accountRead);
+              writeAtomicJson(this.operationsDir, metadataPath, releasedSnapshot,
+                () => this.testFaults?.beforeOperationMetadataDirectoryFsync?.(releasedSnapshot));
+            } else {
+              throw new Error('Tool-output release metadata differs from its frozen consent snapshot.');
+            }
+            metadataDurable = true;
+          }
+          ownerFence.release(budget);
+          ownerDisposed = true;
+        }
+        forgetPendingTerminalTransition(this.root, operationId);
+        return 'complete';
+      },
+    };
+    try { registerPendingTerminalTransition(this.root, this.capacity, transition); }
+    catch (error) {
+      try { ownerFence.release(); } catch { /* preserve indexed operation evidence on uncertain disposal */ }
+      throw error;
+    }
+    const publicBudget: CleanupRetryBudget = {
+      accountRead: () => {}, beginDeletion: () => {}, finishDeletion: () => {},
+      remainingDeletions: () => Number.MAX_SAFE_INTEGER,
+    };
+    transition.retry(publicBudget);
   }
 
   cleanupExpired(budget: ToolOutputCleanupBudget = {}): ToolOutputCleanupResult {
@@ -1232,6 +1343,247 @@ export class FileToolOutputStore implements ToolOutputStore {
       if (metadataReadBytes + bytes > maxMetadataReadBytes) throw new Error('Tool-output cleanup metadata-read budget exhausted.');
       metadataReadBytes += bytes;
     };
+    const retryBudget = (): CleanupRetryBudget => ({
+      accountRead: accountMetadataRead,
+      beginDeletion: () => {
+        if (attempted >= maxDeletions) throw new Error('Tool-output cleanup deletion budget exhausted.');
+        attempted += 1;
+      },
+      finishDeletion: () => { deleted += 1; },
+      remainingDeletions: () => maxDeletions - attempted,
+    });
+    const syncOperationsDirectory = (): void => {
+      const descriptor = openSync(this.operationsDir, constants.O_RDONLY);
+      try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
+    };
+    const sameIds = (left: readonly string[], right: readonly string[]): boolean =>
+      left.length === right.length && left.every((id, index) => id === right[index]);
+    const cleanupTransition = (
+      id: string,
+      slot: number,
+      initialSlot: { readonly id: string; readonly deleting: boolean; readonly artifactIds: readonly string[] },
+      metadataOwnerNonce: string | undefined,
+      ownerFence: PinnedEvidenceOperationFence,
+    ): PendingCleanupTransition => {
+      const slotPath = this.slotPath(slot);
+      const metadataPath = path.join(this.operationsDir, `${id}.json`);
+      const state: CleanupRecoveryState = {
+        phase: 'admission', tombstoneDurable: false,
+        artifactIds: initialSlot.deleting ? [...initialSlot.artifactIds] : [],
+        ownerDisposed: false, metadataRemoved: false, slotUnlinkCommitted: false,
+      };
+      const readOwnSlot = (): { readonly id: string; readonly deleting: boolean; readonly artifactIds: readonly string[] } => {
+        const current = this.readSlot(slot, accountMetadataRead);
+        if (current === null || current === undefined || current.id !== id) {
+          throw new Error('Cleanup slot identity changed while recovery was pending.');
+        }
+        return current;
+      };
+      const publishTombstone = (budget: CleanupRetryBudget): void => {
+        const pending = state.pendingSlotWrite;
+        if (pending === undefined) throw new Error('Cleanup tombstone write has no frozen transition.');
+        const current = readOwnSlot();
+        const visibleTarget = current.deleting && sameIds(current.artifactIds, pending.toIds);
+        const visibleSource = current.deleting === pending.fromDeleting && sameIds(current.artifactIds, pending.fromIds);
+        if (visibleTarget) {
+          syncOperationsDirectory();
+        } else if (visibleSource) {
+          ownerFence.assertCurrent(budget.accountRead);
+          writeAtomicJson(this.operationsDir, slotPath, {
+            schemaVersion: 1, capacity: this.capacity, slot, id,
+            deleting: true, artifactIds: pending.toIds,
+          });
+        } else {
+          throw new Error('Cleanup tombstone differs from its frozen source and target.');
+        }
+        state.artifactIds = [...pending.toIds];
+        state.pendingSlotWrite = undefined;
+        state.tombstoneDurable = true;
+      };
+      const finalizeReleasedCleanup = (budget: CleanupRetryBudget): 'complete' | 'released' => {
+        if (state.artifactIds.length !== 0) return 'released';
+        // A prior unlink may have succeeded while its directory fsync failed.
+        // In that state the durable in-memory intent is the only authority;
+        // retry the barrier without reopening or removing a possible successor.
+        if (state.slotUnlinkCommitted || state.phase === 'slot-sync') {
+          let slotExists = true;
+          try { lstatSync(slotPath); }
+          catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') slotExists = false; else throw error; }
+          if (slotExists) throw new Error('Cleanup slot successor appeared before its directory barrier.');
+          syncOperationsDirectory();
+          state.slotUnlinkCommitted = false;
+          forgetPendingTerminalTransition(this.root, id);
+          return 'complete';
+        }
+        const current = readOwnSlot();
+        if (!current.deleting || current.artifactIds.length !== 0) throw new Error('Cleanup finalization requires the durable empty tombstone.');
+        if (!state.metadataRemoved) {
+          let metadataExists = true;
+          try {
+            const metadata = readBoundedJson(metadataPath, maxMetadataBytes, budget.accountRead);
+            if (!validOperationMetadata(metadata, id, slot) ||
+                (metadataOwnerNonce !== undefined && metadata.ownerNonce !== metadataOwnerNonce)) {
+              throw new Error('Cleanup operation metadata changed before final deletion.');
+            }
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') metadataExists = false;
+            else throw error;
+          }
+          // Reserve the final slot unlink as well as metadata removal before
+          // beginning either mutation; a short pass leaves the empty tombstone.
+          const requiredDeletions = (metadataExists ? 1 : 0) + 1;
+          if (budget.remainingDeletions() < requiredDeletions) return 'released';
+          if (metadataExists) {
+            budget.beginDeletion();
+            try { unlinkSync(metadataPath); budget.finishDeletion(); }
+            catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            }
+          }
+          syncOperationsDirectory();
+          state.metadataRemoved = true;
+        }
+        if (budget.remainingDeletions() < 1) return 'released';
+        const latest = this.readSlot(slot, budget.accountRead);
+        if (latest === undefined) {
+          state.phase = 'slot-sync';
+          syncOperationsDirectory();
+          state.phase = 'finalize';
+          forgetPendingTerminalTransition(this.root, id);
+          return 'complete';
+        }
+        if (latest === null || latest.id !== id || !latest.deleting || latest.artifactIds.length !== 0) {
+          throw new Error('Cleanup slot changed before final removal.');
+        }
+        budget.beginDeletion();
+        unlinkSync(slotPath);
+        budget.finishDeletion();
+        state.slotUnlinkCommitted = true;
+        state.phase = 'slot-sync';
+        syncOperationsDirectory();
+        state.slotUnlinkCommitted = false;
+        state.phase = 'finalize';
+        forgetPendingTerminalTransition(this.root, id);
+        return 'complete';
+      };
+      const resume = (budget: CleanupRetryBudget): 'complete' | 'released' | 'pending' => {
+        if (state.phase === 'release-only') {
+          ownerFence.release(budget);
+          state.ownerDisposed = true;
+          forgetPendingTerminalTransition(this.root, id);
+          return 'released';
+        }
+        if (state.phase === 'admission') {
+          ownerFence.assertCurrent(budget.accountRead);
+          const current = readOwnSlot();
+          if (initialSlot.deleting) {
+            if (!current.deleting || !sameIds(current.artifactIds, initialSlot.artifactIds)) {
+              throw new Error('Existing cleanup tombstone changed before its barrier.');
+            }
+            state.artifactIds = [...current.artifactIds];
+            state.phase = 'tombstone';
+          } else {
+            if (current.deleting) throw new Error('Active slot became a tombstone before cleanup admission.');
+            const metadata = readBoundedJson(metadataPath, maxMetadataBytes, budget.accountRead);
+            if (!validOperationMetadata(metadata, id, slot) || metadata.ownerNonce !== metadataOwnerNonce) {
+              throw new Error('Cleanup operation metadata changed before tombstone publication.');
+            }
+            if (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) ||
+                Date.parse(metadata.retainedUntil) > this.now().getTime())) {
+              state.phase = 'release-only';
+              return resume(budget);
+            }
+            const ids = new Set<string>();
+            if (Array.isArray(metadata.activeCaptureIds)) {
+              for (const value of metadata.activeCaptureIds) if (typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value)) ids.add(value);
+            }
+            if (Array.isArray(metadata.artifacts)) {
+              for (const value of metadata.artifacts) {
+                if (typeof value !== 'object' || value === null) continue;
+                const artifact = value as Record<string, unknown>;
+                if (typeof artifact.id === 'string' && /^[0-9a-f-]{36}$/.test(artifact.id)) ids.add(artifact.id);
+              }
+            }
+            if (Array.isArray(metadata.captures)) {
+              for (const value of metadata.captures) {
+                if (typeof value !== 'object' || value === null) continue;
+                const artifact = (value as Record<string, unknown>).artifact;
+                if (typeof artifact !== 'object' || artifact === null) continue;
+                const ref = artifact as Record<string, unknown>;
+                if (typeof ref.id === 'string' && /^[0-9a-f-]{36}$/.test(ref.id)) ids.add(ref.id);
+              }
+            }
+            state.artifactIds = [...ids];
+            state.pendingSlotWrite = { fromDeleting: false, fromIds: [], toIds: state.artifactIds };
+            state.phase = 'tombstone';
+          }
+        }
+        if (state.phase === 'tombstone') {
+          ownerFence.assertCurrent(budget.accountRead);
+          if (state.pendingSlotWrite !== undefined) publishTombstone(budget);
+          else if (!state.tombstoneDurable) {
+            const current = readOwnSlot();
+            if (!current.deleting || !sameIds(current.artifactIds, state.artifactIds)) {
+              throw new Error('Existing cleanup tombstone does not match its frozen artifact IDs.');
+            }
+            syncOperationsDirectory();
+            state.tombstoneDurable = true;
+          }
+          if (!state.tombstoneDurable) throw new Error('Cleanup tombstone is not durable.');
+          const available = budget.remainingDeletions();
+          const canFinishThisPass = available >= (state.artifactIds.length * 2) + 3;
+          const boundedBatchCount = Math.floor(Math.max(0, available - 1) / 2);
+          const batchCount = canFinishThisPass
+            ? state.artifactIds.length
+            : Math.min(Math.max(0, state.artifactIds.length - 1), boundedBatchCount);
+          if (state.artifactIds.length > 0 && batchCount > 0) {
+            const deletingIds = state.artifactIds.slice(0, batchCount);
+            const remainingIds = state.artifactIds.slice(batchCount);
+            const files = deletingIds.flatMap((artifactId) => [this.file(artifactId, 'stdout'), this.file(artifactId, 'stderr')]);
+            for (const filePath of files) {
+              try {
+                const stats = lstatSync(filePath);
+                if (!stats.isFile() || stats.isSymbolicLink()) throw new Error('Cleanup artifact is not a regular owned file.');
+              } catch (error) {
+                if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+              }
+            }
+            for (const filePath of files) {
+              budget.beginDeletion();
+              try { unlinkSync(filePath); budget.finishDeletion(); }
+              catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+            }
+            fsyncArtifactRoot(this.root, this.testFaults, 'cleanup');
+            state.pendingSlotWrite = { fromDeleting: true, fromIds: state.artifactIds, toIds: remainingIds };
+            publishTombstone(budget);
+          }
+          state.phase = 'owner-release';
+        }
+        if (state.phase === 'owner-release') {
+          const requiredAfterRelease = state.artifactIds.length === 0 ? 2 : 0;
+          if (budget.remainingDeletions() < requiredAfterRelease + 1) return 'pending';
+          if (!state.ownerDisposed) {
+            ownerFence.release(budget);
+            state.ownerDisposed = true;
+          }
+          // A non-empty durable tombstone is the recovery record for the next
+          // bounded pass. Reacquire its owner then, rather than retaining a
+          // released handle that cannot safely mutate the remaining IDs.
+          if (state.artifactIds.length > 0) {
+            forgetPendingTerminalTransition(this.root, id);
+            return 'released';
+          }
+          state.phase = 'finalize';
+        }
+        if (state.phase === 'finalize') {
+          if (!state.ownerDisposed) throw new Error('Cleanup finalization cannot precede owner disposal.');
+          return finalizeReleasedCleanup(budget);
+        }
+        if (state.phase === 'slot-sync') return finalizeReleasedCleanup(budget);
+        return 'pending';
+      };
+      return { kind: 'cleanup', id, slot, retry: resume };
+    };
     try {
       const index = this.readSlotIndex(true, accountMetadataRead);
       cursor = index.cursor;
@@ -1241,20 +1593,49 @@ export class FileToolOutputStore implements ToolOutputStore {
         probed += 1;
         const slotPath = this.slotPath(slot);
         const slotRecord = this.readSlot(slot, accountMetadataRead);
+        const rootTransitions = pendingTerminalTransitions.get(this.root);
+        const pendingBySlot = rootTransitions === undefined ? undefined : [...rootTransitions.values()].find((entry) => entry.slot === slot);
+        if (pendingBySlot !== undefined && (slotRecord === undefined || slotRecord === null || slotRecord.id !== pendingBySlot.id)) {
+          try {
+            const retry = retryBudget();
+            const result = pendingBySlot.kind === 'terminal'
+              ? (pendingBySlot.retry(retry.accountRead, retry.beginDeletion, retry.finishDeletion), 'pending' as const)
+              : pendingBySlot.retry(retry);
+            if (result !== 'complete') protectedCount += 1;
+          } catch (error) {
+            if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+            protectedCount += 1;
+          }
+          continue;
+        }
         if (slotRecord === undefined) continue;
         if (slotRecord === null) { protectedCount += 1; continue; }
         const pendingTransition = pendingTerminalTransitions.get(this.root)?.get(slotRecord.id);
         if (pendingTransition !== undefined) {
           if (pendingTransition.slot !== slot) { protectedCount += 1; continue; }
+          if (pendingTransition.kind === 'cleanup') {
+            try {
+              const result = pendingTransition.retry(retryBudget());
+              if (result !== 'complete') protectedCount += 1;
+            } catch (error) {
+              if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+              protectedCount += 1;
+            }
+            continue;
+          }
+          if (pendingTransition.kind === 'release') {
+            try {
+              const result = pendingTransition.retry(retryBudget());
+              if (result !== 'complete') protectedCount += 1;
+            } catch (error) {
+              if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+              protectedCount += 1;
+            }
+            continue;
+          }
           try {
-            pendingTransition.retry(
-              accountMetadataRead,
-              () => {
-                if (attempted >= maxDeletions) throw new Error('Tool-output cleanup deletion budget exhausted.');
-                attempted += 1;
-              },
-              () => { deleted += 1; },
-            );
+            const retry = retryBudget();
+            pendingTransition.retry(retry.accountRead, retry.beginDeletion, retry.finishDeletion);
           } catch (error) {
             if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
             protectedCount += 1;
@@ -1270,6 +1651,9 @@ export class FileToolOutputStore implements ToolOutputStore {
               protectedCount += 1; continue;
             }
             if (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) || Date.parse(metadata.retainedUntil) > this.now().getTime())) {
+              protectedCount += 1; continue;
+            }
+            if (metadata.state === 'released' && !isCanonicalTimestamp(metadata.releasedAt)) {
               protectedCount += 1; continue;
             }
           } catch { protectedCount += 1; continue; }
@@ -1291,106 +1675,35 @@ export class FileToolOutputStore implements ToolOutputStore {
           if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
           protectedCount += 1; continue;
         }
-        let ownerFence: DispatchInvocationLock;
+        let admittedFence: AcquiredEvidenceOperationFence;
         try {
-          ownerFence = acquireEvidenceOperationFence(
+          admittedFence = acquireEvidenceOperationFence(
             lockPath, slotRecord.deleting ? undefined : expectedOwnerNonce, this.testFaults, accountMetadataRead, admittedLock,
           );
         } catch (error) {
           if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
           protectedCount += 1; continue;
         }
-        // A pre-existing durable tombstone is already sufficient recovery
-        // evidence. For an active operation, keep the exact owner fence until
-        // its tombstone replacement and directory barrier have both completed.
-        let ownerStateDurable = slotRecord.deleting;
+        let ownerFence: PinnedEvidenceOperationFence;
         try {
-          // Re-read under the exact operation fence before acting on owner state.
-          let ids = new Set<string>(slotRecord.artifactIds);
-          if (!slotRecord.deleting) {
-            metadata = readBoundedJson(metadataPath, maxMetadataBytes, accountMetadataRead);
-            if (!validOperationMetadata(metadata, slotRecord.id, slot) || metadata.ownerNonce !== expectedOwnerNonce ||
-                (metadata.state === 'closed' && !isCanonicalTimestamp(metadata.retainedUntil)) ||
-                (metadata.state === 'active' && admittedLock.record === undefined)) { protectedCount += 1; continue; }
-            if (metadata.state === 'closed' && Date.parse(metadata.retainedUntil as string) > this.now().getTime()) {
-              ownerStateDurable = true;
-              protectedCount += 1;
-              continue;
-            }
-            if (metadata.state !== 'active') ownerStateDurable = true;
-            ids = new Set<string>();
-            if (Array.isArray(metadata.activeCaptureIds)) {
-              for (const value of metadata.activeCaptureIds) if (typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value)) ids.add(value);
-            }
-            if (Array.isArray(metadata.artifacts)) {
-              for (const value of metadata.artifacts) {
-                if (typeof value !== 'object' || value === null) continue;
-                const artifact = value as Record<string, unknown>;
-                if (typeof artifact.id === 'string' && /^[0-9a-f-]{36}$/.test(artifact.id)) ids.add(artifact.id);
-              }
-            }
-            if (Array.isArray(metadata.captures)) {
-              for (const value of metadata.captures) {
-                if (typeof value !== 'object' || value === null) continue;
-                const artifact = (value as Record<string, unknown>).artifact;
-                if (typeof artifact !== 'object' || artifact === null) continue;
-                const ref = artifact as Record<string, unknown>;
-                if (typeof ref.id === 'string' && /^[0-9a-f-]{36}$/.test(ref.id)) ids.add(ref.id);
-              }
-            }
-            // This durable tombstone lets a later bounded pass finish deletion after a crash.
-            writeAtomicJson(this.operationsDir, slotPath, {
-              schemaVersion: 1, capacity: this.capacity, slot, id: slotRecord.id,
-              deleting: true, artifactIds: [...ids],
-            });
-            ownerStateDurable = true;
-          }
-          const availableDeletions = maxDeletions - attempted;
-          const remainingArtifactIds = [...ids];
-          const artifactBatchSize = Math.max(0, Math.floor((availableDeletions - 2) / 2));
-          if (remainingArtifactIds.length > 0 && artifactBatchSize === 0) { protectedCount += 1; continue; }
-          const deletingIds = remainingArtifactIds.slice(0, artifactBatchSize);
-          const remainingIds = remainingArtifactIds.slice(deletingIds.length);
-          const files = deletingIds.flatMap((id) => [this.file(id, 'stdout'), this.file(id, 'stderr')]);
-          let safe = true;
-          for (const filePath of files) {
-            try {
-              const stats = lstatSync(filePath);
-              if (!stats.isFile() || stats.isSymbolicLink()) { safe = false; break; }
-            } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { safe = false; break; } }
-          }
-          if (!safe) { protectedCount += 1; continue; }
-          for (const filePath of files) {
-            try { attempted += 1; unlinkSync(filePath); deleted += 1; }
-            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { safe = false; break; } }
-          }
-          if (!safe) { protectedCount += 1; continue; }
-          if (deletingIds.length > 0) fsyncArtifactRoot(this.root, this.testFaults, 'cleanup');
-          if (remainingIds.length > 0) {
-            writeAtomicJson(this.operationsDir, slotPath, {
-              schemaVersion: 1, capacity: this.capacity, slot, id: slotRecord.id,
-              deleting: true, artifactIds: remainingIds,
-            });
-            continue;
-          }
-          // Clearing the metadata and slot is one logical deletion step. Keep
-          // both attempts inside the caller's strict per-pass budget.
-          if (maxDeletions - attempted < 2) { protectedCount += 1; continue; }
-          try { attempted += 1; unlinkSync(metadataPath); deleted += 1; }
-          catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') { protectedCount += 1; continue; } }
-          const dir = openSync(this.operationsDir, constants.O_RDONLY);
-          try { fsyncSync(dir); } finally { closeSync(dir); }
-          if (this.readSlot(slot, accountMetadataRead)?.id !== slotRecord.id) { protectedCount += 1; continue; }
-          attempted += 1;
-          unlinkSync(slotPath);
-          deleted += 1;
-          const operationDir = openSync(this.operationsDir, constants.O_RDONLY);
-          try { fsyncSync(operationDir); } finally { closeSync(operationDir); }
-        } catch { protectedCount += 1; }
-        finally {
-          if (ownerStateDurable) {
-            try { ownerFence.release(); } catch { /* next pass revalidates persistent state */ }
-          }
+          ownerFence = pinEvidenceOperationFence(lockPath, admittedFence.ownerNonce, this.testFaults, accountMetadataRead);
+        } catch (error) {
+          try { admittedFence.release(); } catch { /* failed pin remains protected for fresh-process recovery */ }
+          if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+          protectedCount += 1; continue;
+        }
+        const pendingCleanup = cleanupTransition(slotRecord.id, slot, slotRecord, expectedOwnerNonce, ownerFence);
+        try { registerPendingTerminalTransition(this.root, this.capacity, pendingCleanup); }
+        catch (error) {
+          try { ownerFence.release(); } catch { /* retain the durable slot for strict fresh-process recovery */ }
+          protectedCount += 1; continue;
+        }
+        try {
+          const result = pendingCleanup.retry(retryBudget());
+          if (result !== 'complete') protectedCount += 1;
+        } catch (error) {
+          if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
+          protectedCount += 1;
         }
       }
       const next = (index.cursor + probed) % this.capacity;
@@ -1452,6 +1765,8 @@ export class FileToolOutputStore implements ToolOutputStore {
       const probes = Math.min(this.maxRegistrationProbes, this.capacity);
       for (let step = 0; step < probes; step += 1) {
         const slot = (index.cursor + step) % this.capacity;
+        const pendingAtSlot = pendingTerminalTransitions.get(this.root);
+        if (pendingAtSlot !== undefined && [...pendingAtSlot.values()].some((entry) => entry.slot === slot)) continue;
         if (this.readSlot(slot) !== undefined) continue;
         writeAtomicJson(operations, this.slotPath(slot), { schemaVersion: 1, capacity: this.capacity, slot, id });
         this.writeSlotIndex({ schemaVersion: 1, capacity: this.capacity, cursor: (slot + 1) % this.capacity });
