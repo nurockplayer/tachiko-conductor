@@ -733,20 +733,51 @@ export class FileToolOutputStore implements ToolOutputStore {
       try { operation.abort(); } catch { /* preserve the original capture-start failure */ }
       throw error;
     }
+    let captureState: 'open' | 'finishing' | 'finished' | 'failed' | 'aborted' | 'commit-pending' = 'open';
+    let writerFinished = false;
     return {
-      write: (channel, chunk) => writer.write(channel, chunk),
+      write: (channel, chunk) => {
+        if (captureState !== 'open') throw new Error('Tool-output capture is no longer writable.');
+        writer.write(channel, chunk);
+      },
       finish: () => {
+        if (captureState !== 'open') throw new Error('Tool-output capture can only finish once.');
+        captureState = 'finishing';
+        let summary: ToolOutputCaptureSummary;
         try {
-          const summary = writer.finish();
+          summary = writer.finish();
+          writerFinished = true;
+        } catch (error) {
+          captureState = 'failed';
+          try { writer.abort?.(); } catch { /* preserve the original finish failure */ }
+          try { operation.abort(); } catch { /* preserve the original finish failure */ }
+          throw error;
+        }
+        try {
           const artifact = operation.close().find((item) => item.id === summary.artifact.id);
           if (artifact === undefined) throw new Error('Tool-output operation did not commit its artifact.');
+          captureState = 'finished';
           return { ...summary, artifact };
-        } catch (error) { operation.abort(); throw error; }
+        } catch (error) {
+          // close() can fail after an atomic rename. Keep the backing files and
+          // operation lock for a safe retry/recovery rather than aborting a
+          // reference that may already be committed.
+          captureState = 'commit-pending';
+          throw error;
+        }
       },
       abort: () => {
+        if (captureState === 'finished' || captureState === 'aborted' || captureState === 'commit-pending') return;
+        if (writerFinished) return;
         let failure: unknown;
         try { writer.abort?.(); } catch (error) { failure = error; }
+        // A failed per-writer disposal must not strand its owning operation.
+        // Operation abort retries every prepared writer and records unresolved
+        // IDs before releasing ownership; keep the first disposal error as the
+        // caller-visible result if that retry also encounters a fault.
         try { operation.abort(); } catch (error) { failure ??= error; }
+        if (failure === undefined) captureState = 'aborted';
+        else captureState = 'failed';
         if (failure !== undefined) throw failure;
       },
     };
@@ -773,18 +804,22 @@ export class FileToolOutputStore implements ToolOutputStore {
     const activeCaptureIds: string[] = [];
     const unresolvedCaptureIds = new Set<string>();
     const activeWriters = new Set<FileToolOutputWriter>();
-    const allWriters = new Set<FileToolOutputWriter>();
+    const allWriters = new Map<FileToolOutputWriter, string>();
     const metadataPath = path.join(operations, `${id}.json`);
     const writeMetadata = (value: unknown) => writeAtomicJson(operations, metadataPath, value);
     const createdAt = new Date().toISOString();
     const base = { schemaVersion: 1, id, slot, ownerNonce, createdAt, attribution };
     try { writeMetadata({ ...base, state: 'active', artifacts: [], activeCaptureIds }); }
     catch (error) { lock.release(); throw error; }
-    let closed = false;
+    let operationState: 'open' | 'close-pending' | 'abort-pending' | 'closed' = 'open';
+    let closeTimestamp: string | undefined;
+    let retainedUntil: string | undefined;
+    let committedReferences: ToolOutputArtifactReference[] | undefined;
+    let abortTimestamp: string | undefined;
     return {
       id,
       startCapture: (policy, commandAttribution = {}) => {
-        if (closed) throw new Error('Tool-output operation is already closed.');
+        if (operationState !== 'open') throw new Error('Tool-output operation is not accepting captures.');
         const captureId = randomUUID();
         activeCaptureIds.push(captureId);
         writeMetadata({ ...base, state: 'active', activeCaptureIds, captures: artifacts.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })) });
@@ -799,44 +834,91 @@ export class FileToolOutputStore implements ToolOutputStore {
           throw error;
         }
         activeWriters.add(writer);
-        allWriters.add(writer);
+        allWriters.set(writer, captureId);
+        let captureState: 'open' | 'finishing' | 'finished' | 'failed' | 'aborted' = 'open';
         return {
-          write: (channel, chunk) => writer.write(channel, chunk),
+          write: (channel, chunk) => {
+            if (captureState !== 'open' || operationState !== 'open') throw new Error('Tool-output capture is no longer writable.');
+            writer.write(channel, chunk);
+          },
           finish: () => {
-            const summary = writer.finish();
-            activeWriters.delete(writer);
-            activeCaptureIds.splice(activeCaptureIds.indexOf(captureId), 1);
+            if (captureState !== 'open' || operationState !== 'open') throw new Error('Tool-output capture can only finish once while its operation is open.');
+            captureState = 'finishing';
+            let summary: ToolOutputCaptureSummary;
+            try { summary = writer.finish(); }
+            catch (error) { captureState = 'failed'; throw error; }
+            const nextArtifacts = [...artifacts, summary.artifact];
+            const nextAttributions = [...captureAttributions, commandAttribution];
+            try {
+              // Keep the registered ID beside the finished reference until the
+              // operation's terminal commit. Either old or new metadata then
+              // names every file if this atomic replacement is interrupted.
+              writeMetadata({
+                ...base, state: 'active', activeCaptureIds,
+                captures: nextArtifacts.map((artifact, index) => ({ artifact, attribution: nextAttributions[index] })),
+                artifacts: nextArtifacts,
+              });
+            } catch (error) { captureState = 'failed'; throw error; }
             artifacts.push(summary.artifact);
             captureAttributions.push(commandAttribution);
-            writeMetadata({ ...base, state: 'active', activeCaptureIds, captures: artifacts.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })) });
+            activeWriters.delete(writer);
+            captureState = 'finished';
             return summary;
           },
           abort: () => {
-            writer.abort(); activeWriters.delete(writer);
-            const index = activeCaptureIds.indexOf(captureId); if (index !== -1) activeCaptureIds.splice(index, 1);
-            writeMetadata({ ...base, state: 'active', activeCaptureIds, artifacts });
+            if (captureState === 'finished' || captureState === 'aborted' || operationState === 'closed') return;
+            if (operationState === 'close-pending') throw new Error('Tool-output operation has a terminal commit pending.');
+            try { writer.abort(); }
+            catch (error) { captureState = 'failed'; throw error; }
+            activeWriters.delete(writer);
+            captureState = 'aborted';
           },
         };
       },
       close: () => {
-        if (closed) throw new Error('Tool-output operation is already closed.');
-        if (activeWriters.size > 0 || unresolvedCaptureIds.size > 0) throw new Error('Tool-output operation cannot commit while a capture writer or prepared capture ID is unresolved.');
-        const closedAt = this.now().toISOString();
-        const retainedUntil = new Date(Date.parse(closedAt) + this.retentionMs).toISOString();
-        const committed = artifacts.map((artifact) => ({ ...artifact, operationId: id, retainedUntil }));
-        writeMetadata({ ...base, state: 'closed', closedAt, retainedUntil, captures: committed.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })), artifacts: committed });
-        closed = true;
+        if (operationState === 'closed') throw new Error('Tool-output operation is already closed.');
+        if (operationState === 'abort-pending') throw new Error('Tool-output operation abort is pending.');
+        if (operationState === 'open') {
+          if (activeWriters.size > 0 || unresolvedCaptureIds.size > 0) throw new Error('Tool-output operation cannot commit while a capture writer or prepared capture ID is unresolved.');
+          closeTimestamp = this.now().toISOString();
+          retainedUntil = new Date(Date.parse(closeTimestamp) + this.retentionMs).toISOString();
+          committedReferences = artifacts.map((artifact) => ({ ...artifact, operationId: id, retainedUntil }));
+          operationState = 'close-pending';
+        }
+        const committed = committedReferences!;
+        writeMetadata({
+          ...base, state: 'closed', closedAt: closeTimestamp, retainedUntil,
+          activeCaptureIds: [],
+          captures: committed.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })),
+          artifacts: committed,
+        });
+        operationState = 'closed';
         lock.release();
         return committed;
       },
       abort: () => {
-        if (closed) return;
+        if (operationState === 'closed') return;
+        if (operationState === 'close-pending') throw new Error('Tool-output operation close is pending and cannot be aborted.');
+        operationState = 'abort-pending';
+        abortTimestamp ??= this.now().toISOString();
         let cleanupFailed = false;
-        for (const writer of allWriters) { try { writer.abort(); } catch { cleanupFailed = true; } }
-        activeWriters.clear();
-        const retainedCaptureIds = cleanupFailed ? activeCaptureIds : activeCaptureIds.filter((captureId) => unresolvedCaptureIds.has(captureId));
-        try { writeMetadata({ ...base, state: 'aborted', closedAt: this.now().toISOString(), activeCaptureIds: retainedCaptureIds, artifacts }); }
-        finally { closed = true; lock.release(); }
+        let firstFailure: unknown;
+        for (const writer of allWriters.keys()) {
+          try { writer.abort(); }
+          catch (error) { cleanupFailed = true; firstFailure ??= error; }
+        }
+        const retainedCaptureIds = cleanupFailed ? [...activeCaptureIds] : [...unresolvedCaptureIds];
+        try {
+          writeMetadata({ ...base, state: 'aborted', closedAt: abortTimestamp, activeCaptureIds: retainedCaptureIds, artifacts: [] });
+        } catch (error) {
+          // Do not discard the exact owner fence when terminal metadata did
+          // not cross its directory durability barrier. The prior active
+          // record still contains all prepared IDs for dead-owner recovery.
+          throw firstFailure ?? error;
+        }
+        operationState = 'closed';
+        try { lock.release(); } catch (error) { throw firstFailure ?? error; }
+        if (firstFailure !== undefined) throw firstFailure;
       },
     };
   }
@@ -982,15 +1064,24 @@ export class FileToolOutputStore implements ToolOutputStore {
           if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
           protectedCount += 1; continue;
         }
+        // A pre-existing durable tombstone is already sufficient recovery
+        // evidence. For an active operation, keep the exact owner fence until
+        // its tombstone replacement and directory barrier have both completed.
+        let ownerStateDurable = slotRecord.deleting;
         try {
           // Re-read under the exact operation fence before acting on owner state.
           let ids = new Set<string>(slotRecord.artifactIds);
           if (!slotRecord.deleting) {
             metadata = readBoundedJson(metadataPath, maxMetadataBytes, accountMetadataRead);
-            if (!validOperationMetadata(metadata, slotRecord.id, slot) ||
-                metadata.ownerNonce !== expectedOwnerNonce ||
-                (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) || Date.parse(metadata.retainedUntil) > this.now().getTime())) ||
+            if (!validOperationMetadata(metadata, slotRecord.id, slot) || metadata.ownerNonce !== expectedOwnerNonce ||
+                (metadata.state === 'closed' && !isCanonicalTimestamp(metadata.retainedUntil)) ||
                 (metadata.state === 'active' && admittedLock.record === undefined)) { protectedCount += 1; continue; }
+            if (metadata.state === 'closed' && Date.parse(metadata.retainedUntil as string) > this.now().getTime()) {
+              ownerStateDurable = true;
+              protectedCount += 1;
+              continue;
+            }
+            if (metadata.state !== 'active') ownerStateDurable = true;
             ids = new Set<string>();
             if (Array.isArray(metadata.activeCaptureIds)) {
               for (const value of metadata.activeCaptureIds) if (typeof value === 'string' && /^[0-9a-f-]{36}$/.test(value)) ids.add(value);
@@ -1016,6 +1107,7 @@ export class FileToolOutputStore implements ToolOutputStore {
               schemaVersion: 1, capacity: this.capacity, slot, id: slotRecord.id,
               deleting: true, artifactIds: [...ids],
             });
+            ownerStateDurable = true;
           }
           const availableDeletions = maxDeletions - attempted;
           const remainingArtifactIds = [...ids];
@@ -1059,7 +1151,11 @@ export class FileToolOutputStore implements ToolOutputStore {
           const operationDir = openSync(this.operationsDir, constants.O_RDONLY);
           try { fsyncSync(operationDir); } finally { closeSync(operationDir); }
         } catch { protectedCount += 1; }
-        finally { try { ownerFence.release(); } catch { /* next pass revalidates persistent state */ } }
+        finally {
+          if (ownerStateDurable) {
+            try { ownerFence.release(); } catch { /* next pass revalidates persistent state */ }
+          }
+        }
       }
       const next = (index.cursor + probed) % this.capacity;
       this.writeSlotIndex({ schemaVersion: 1, capacity: this.capacity, cursor: next });
@@ -1337,17 +1433,23 @@ export class ContainedToolOutputCaptureSession {
 class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
   private stdout = '';
   private stderr = '';
+  private state: 'open' | 'finished' | 'failed' | 'aborted' = 'open';
 
   constructor(private readonly store: ToolOutputStore, private readonly policy: ToolOutputPolicy) {}
 
   write(channel: 'stdout' | 'stderr', chunk: string): void {
+    if (this.state !== 'open') throw new Error('Tool-output capture is no longer writable.');
     if (channel === 'stdout') this.stdout += chunk;
     else this.stderr += chunk;
   }
 
   finish(): ToolOutputCaptureSummary {
-    const artifact = this.store.save({ stdout: this.stdout, stderr: this.stderr });
+    if (this.state !== 'open') throw new Error('Tool-output capture can only finish once.');
+    let artifact: ToolOutputArtifactReference;
+    try { artifact = this.store.save({ stdout: this.stdout, stderr: this.stderr }); }
+    catch (error) { this.state = 'failed'; throw error; }
     const diagnostics = boundedDiagnostics(this.stdout, this.stderr, this.policy);
+    this.state = 'finished';
     return {
       artifact,
       stdout: stream(this.stdout, this.policy.previewBytes),
@@ -1355,6 +1457,13 @@ class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
       diagnostics: diagnostics.lines,
       diagnosticsTruncated: diagnostics.truncated,
     };
+  }
+
+  abort(): void {
+    if (this.state === 'finished' || this.state === 'aborted') return;
+    this.stdout = '';
+    this.stderr = '';
+    this.state = 'aborted';
   }
 }
 

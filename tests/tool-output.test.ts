@@ -628,6 +628,224 @@ describe('UTF-8 tool output ranges', () => {
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
+      it('file: capture handles are one-shot and operation abort still removes finished uncommitted evidence', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-terminal-capture-'));
+        try {
+          const store = new FileToolOutputStore(directory, { capacity: 4 });
+          const operation = store.beginOperation({ kind: 'terminal-handles' });
+          const first = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          const second = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          first.write('stdout', 'first-committed');
+          second.write('stdout', 'second-committed');
+          const firstSummary = first.finish();
+          assert.throws(() => first.finish(), /finish once/i, 'a second finish is rejected before touching operation bookkeeping');
+          const metadata = JSON.parse(readFileSync(path.join(directory, 'operations', `${operation.id}.json`), 'utf8')) as { readonly activeCaptureIds: readonly string[] };
+          assert.equal(metadata.activeCaptureIds.length, 2, 'both prepared capture IDs remain indexed until the operation terminal commit');
+          const secondId = metadata.activeCaptureIds.find((captureId) => captureId !== firstSummary.artifact.id)!;
+          const secondSummary = second.finish();
+          assert.equal(secondSummary.artifact.id, secondId);
+          const committed = operation.close();
+          first.abort?.();
+          assert.equal(store.read(committed.find((artifact) => artifact.id === firstSummary.artifact.id)!, { channel: 'stdout' }).text, 'first-committed');
+          assert.equal(store.read(committed.find((artifact) => artifact.id === secondSummary.artifact.id)!, { channel: 'stdout' }).text, 'second-committed');
+
+          const abortedOperation = store.beginOperation({ kind: 'private-abort-cleanup' });
+          const finishedUncommitted = abortedOperation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          finishedUncommitted.write('stdout', 'purge-on-operation-abort');
+          const uncommittedSummary = finishedUncommitted.finish();
+          finishedUncommitted.abort?.();
+          assert.ok(existsSync(path.join(directory, `${uncommittedSummary.artifact.id}.stdout`)), 'public abort after finish is harmless');
+          abortedOperation.abort();
+          assert.equal(existsSync(path.join(directory, `${uncommittedSummary.artifact.id}.stdout`)), false, 'private operation abort still purges finished uncommitted data');
+
+          const standalone = store.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          standalone.write('stdout', 'standalone-committed');
+          const standaloneSummary = standalone.finish();
+          standalone.abort?.();
+          assert.throws(() => standalone.finish(), /finish once/i);
+          assert.equal(store.read(standaloneSummary.artifact, { channel: 'stdout' }).text, 'standalone-committed');
+
+          const memory = new InMemoryToolOutputStore();
+          const buffered = memory.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          buffered.write('stdout', 'buffered-committed');
+          const bufferedSummary = buffered.finish();
+          assert.throws(() => buffered.finish(), /finish once/i);
+          buffered.abort?.();
+          assert.equal(memory.read(bufferedSummary.artifact, { channel: 'stdout' }).text, 'buffered-committed');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: double finish cannot unindex a second writer across a real process crash', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-double-finish-crash-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `
+            import { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } from ${JSON.stringify(moduleUrl)};
+            const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 });
+            const operation = store.beginOperation({ kind: 'double-finish-crash' });
+            const first = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+            const second = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+            first.write('stdout', 'first-finished'); second.write('stdout', 'second-still-open');
+            const firstResult = first.finish();
+            let repeatedRejected = false; try { first.finish(); } catch { repeatedRejected = true; }
+            const metadata = JSON.parse((await import('node:fs')).readFileSync(${JSON.stringify(path.join(directory, 'operations'))} + '/' + operation.id + '.json', 'utf8'));
+            console.log(JSON.stringify({ operationId: operation.id, firstId: firstResult.artifact.id, secondId: metadata.activeCaptureIds.find((id) => id !== firstResult.artifact.id), repeatedRejected }));
+            process.exit(0);
+          `;
+          const output = execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          });
+          const child = JSON.parse(output.trim()) as { readonly operationId: string; readonly firstId: string; readonly secondId: string; readonly repeatedRejected: boolean };
+          assert.equal(child.repeatedRejected, true, 'the live process rejects second finish before it can unindex the other writer');
+          assert.ok(existsSync(path.join(directory, `${child.secondId}.stdout`)));
+          const store = new FileToolOutputStore(directory, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z') });
+          const cleanup = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(cleanup.protected, 0);
+          assert.equal(existsSync(path.join(directory, `${child.firstId}.stdout`)), false);
+          assert.equal(existsSync(path.join(directory, `${child.secondId}.stdout`)), false, 'fresh bounded recovery removes B instead of orphaning it');
+          assert.equal(existsSync(path.join(directory, 'operations', 'slot-0000.json')), false);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: preserves a finish failure when disposal also fails', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-finish-abort-primary-'));
+        try {
+          const finishFailure = Object.assign(new Error('owned finish hash failure'), { code: 'EIO' });
+          const store = new FileToolOutputStore(directory, { capacity: 1, testFaults: {
+            beforeHash: () => { throw finishFailure; },
+            beforeUnlink: () => { throw Object.assign(new Error('owned abort disposal failure'), { code: 'EACCES' }); },
+          } });
+          const capture = store.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          capture.write('stdout', 'still-indexed-after-failed-finish');
+          assert.throws(() => capture.finish(), (error: unknown) => error === finishFailure);
+          assert.doesNotThrow(() => capture.abort?.(), 'public disposal cannot replace the already-reported finish error');
+          const operationIds = readdirSync(path.join(directory, 'operations')).filter((name) => name.endsWith('.json') && !name.startsWith('slot-') && name !== 'index.json');
+          assert.equal(operationIds.length, 1, 'failed finish/disposal remains represented by operation metadata');
+          assert.equal(readdirSync(directory).filter((name) => name.endsWith('.stdout')).length, 1);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: abort metadata failure retains its owner fence and permits a safe retry', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-abort-retry-fence-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `
+            import fs from 'node:fs';
+            import path from 'node:path';
+            import { syncBuiltinESMExports } from 'node:module';
+            const root = fs.realpathSync(${JSON.stringify(directory)});
+            const originalRename = fs.renameSync; let armed = false; let failRename = true; let failUnlink = true; let metadataPath = '';
+            fs.renameSync = (from, to) => {
+              if (armed && to === metadataPath && failRename) { failRename = false; throw Object.assign(new Error('owned abort metadata rename EIO'), { code: 'EIO' }); }
+              return originalRename(from, to);
+            };
+            syncBuiltinESMExports();
+            const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)});
+            const store = new FileToolOutputStore(root, { capacity: 1, testFaults: { beforeUnlink: () => {
+              if (armed && failUnlink) { failUnlink = false; throw Object.assign(new Error('owned abort unlink EIO'), { code: 'EIO' }); }
+            } } });
+            const operation = store.beginOperation({ kind: 'abort-retry-fence' });
+            const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'retryable-owned-abort');
+            metadataPath = path.join(root, 'operations', operation.id + '.json');
+            const lockPath = path.join(root, 'operations', operation.id + '.lock');
+            const before = JSON.parse(fs.readFileSync(metadataPath, 'utf8')); const owner = before.ownerNonce; const captureId = before.activeCaptureIds[0];
+            armed = true; let firstError;
+            try { operation.abort(); } catch (error) { firstError = { code: error.code, message: error.message }; }
+            const afterFailure = { state: JSON.parse(fs.readFileSync(metadataPath, 'utf8')).state, ids: JSON.parse(fs.readFileSync(metadataPath, 'utf8')).activeCaptureIds, lock: JSON.parse(fs.readFileSync(lockPath, 'utf8')) };
+            let captureRefused = false; try { operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); } catch { captureRefused = true; }
+            let closeRefused = false; try { operation.close(); } catch { closeRefused = true; }
+            armed = false; operation.abort();
+            const afterRetry = { state: JSON.parse(fs.readFileSync(metadataPath, 'utf8')).state, ids: JSON.parse(fs.readFileSync(metadataPath, 'utf8')).activeCaptureIds, lockExists: fs.existsSync(lockPath), stdoutExists: fs.existsSync(path.join(root, captureId + '.stdout')) };
+            console.log(JSON.stringify({ id: operation.id, owner, firstError, afterFailure, captureRefused, closeRefused, afterRetry }));
+          `;
+          const result = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly owner: string; readonly firstError: { readonly code: string }; readonly afterFailure: { readonly state: string; readonly ids: readonly string[]; readonly lock: { readonly nonce: string } }; readonly captureRefused: boolean; readonly closeRefused: boolean; readonly afterRetry: { readonly state: string; readonly lockExists: boolean; readonly stdoutExists: boolean } };
+          assert.equal(result.firstError.code, 'EIO');
+          assert.equal(result.afterFailure.state, 'active', 'failed terminal metadata must not replace the last recoverable record');
+          assert.equal(result.afterFailure.ids.length, 1, 'the failed stream stays indexed through the retry window');
+          assert.equal(result.afterFailure.lock.nonce, result.owner, 'the original versioned owner proof remains present');
+          assert.equal(result.captureRefused, true);
+          assert.equal(result.closeRefused, true);
+          assert.equal(result.afterRetry.state, 'aborted');
+          assert.equal(result.afterRetry.lockExists, false);
+          assert.equal(result.afterRetry.stdoutExists, false);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: failed active-owner tombstone publication keeps the fence for fresh-process recovery', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-active-tombstone-retry-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const ownerSource = `
+            import { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } from ${JSON.stringify(moduleUrl)};
+            const store = new FileToolOutputStore(${JSON.stringify(directory)}, { capacity: 1 });
+            const operation = store.beginOperation({ kind: 'active-tombstone-owner' });
+            const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'active-tombstone-recovery-marker');
+            const artifact = writer.finish().artifact;
+            console.log(JSON.stringify({ operationId: operation.id, artifactId: artifact.id })); process.exit(0);
+          `;
+          const owner = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', ownerSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly operationId: string; readonly artifactId: string };
+          const cleanupSource = `
+            import fs from 'node:fs'; import path from 'node:path'; import { syncBuiltinESMExports } from 'node:module';
+            const root = fs.realpathSync(${JSON.stringify(directory)}); const slotPath = path.join(root, 'operations', 'slot-0000.json');
+            const originalRename = fs.renameSync; let armed = true; let faults = 0;
+            fs.renameSync = (from, to) => { if (armed && to === slotPath && faults++ === 0) throw Object.assign(new Error('owned tombstone rename EIO'), { code: 'EIO' }); return originalRename(from, to); };
+            syncBuiltinESMExports(); const { FileToolOutputStore } = await import(${JSON.stringify(moduleUrl)});
+            const store = new FileToolOutputStore(root, { capacity: 1 }); const cleanup = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            armed = false; fs.renameSync = originalRename; syncBuiltinESMExports();
+            const metadata = JSON.parse(fs.readFileSync(path.join(root, 'operations', ${JSON.stringify(owner.operationId)} + '.json'), 'utf8'));
+            const lockPath = path.join(root, 'operations', ${JSON.stringify(owner.operationId)} + '.lock');
+            console.log(JSON.stringify({ faults, cleanup, state: metadata.state, lockExists: fs.existsSync(lockPath), ownerNonce: metadata.ownerNonce, lockNonce: JSON.parse(fs.readFileSync(lockPath, 'utf8')).nonce }));
+          `;
+          const failed = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', cleanupSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly faults: number; readonly cleanup: { readonly protected: number; readonly deleted: number }; readonly state: string; readonly lockExists: boolean; readonly ownerNonce: string; readonly lockNonce: string };
+          assert.equal(failed.faults, 1);
+          assert.equal(failed.state, 'active');
+          assert.equal(failed.lockExists, true, 'failed active-to-tombstone publication cannot release its acquired owner fence');
+          assert.equal(failed.lockNonce, failed.ownerNonce);
+          assert.equal(failed.cleanup.protected, 1);
+          assert.equal(failed.cleanup.deleted, 0);
+
+          const recovered = new FileToolOutputStore(directory, { capacity: 1 });
+          const cleanup = recovered.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+          assert.equal(cleanup.protected, 0);
+          assert.equal(existsSync(path.join(directory, `${owner.artifactId}.stdout`)), false);
+          assert.equal(existsSync(path.join(directory, 'operations', 'slot-0000.json')), false);
+          const reused = recovered.beginOperation({ kind: 'after-fence-safe-tombstone-recovery' }); reused.abort();
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: retries close with its original retention deadline after metadata publication failure', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-close-retry-deadline-'));
+        try {
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `
+            import fs from 'node:fs'; import path from 'node:path'; import { syncBuiltinESMExports } from 'node:module';
+            const root = fs.realpathSync(${JSON.stringify(directory)}); const originalRename = fs.renameSync;
+            const initial = new Date('2030-01-01T00:00:00.000Z'); let now = initial; let metadataPath = ''; let armed = false; let failOnce = true;
+            fs.renameSync = (from, to) => { if (armed && to === metadataPath && failOnce) { failOnce = false; throw Object.assign(new Error('owned close rename EIO'), { code: 'EIO' }); } return originalRename(from, to); };
+            syncBuiltinESMExports(); const { FileToolOutputStore, DEFAULT_TOOL_OUTPUT_POLICY } = await import(${JSON.stringify(moduleUrl)});
+            const store = new FileToolOutputStore(root, { capacity: 1, retentionMs: 1000, now: () => now });
+            const operation = store.beginOperation({ kind: 'close-retry-deadline' }); const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY); writer.write('stdout', 'close-retry'); writer.finish();
+            metadataPath = path.join(root, 'operations', operation.id + '.json'); armed = true; let firstError;
+            try { operation.close(); } catch (error) { firstError = error.code; }
+            armed = false; now = new Date(initial.getTime() + 50_000); const reference = operation.close()[0];
+            const metadata = JSON.parse(fs.readFileSync(metadataPath, 'utf8')); console.log(JSON.stringify({ firstError, reference, metadata, expectedClosedAt: initial.toISOString(), expectedRetainedUntil: new Date(initial.getTime() + 1000).toISOString() }));
+          `;
+          const result = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as { readonly firstError: string; readonly reference: { readonly retainedUntil: string }; readonly metadata: { readonly closedAt: string; readonly retainedUntil: string }; readonly expectedClosedAt: string; readonly expectedRetainedUntil: string };
+          assert.equal(result.firstError, 'EIO');
+          assert.equal(result.metadata.closedAt, result.expectedClosedAt);
+          assert.equal(result.metadata.retainedUntil, result.expectedRetainedUntil);
+          assert.equal(result.reference.retainedUntil, result.expectedRetainedUntil);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
       it('file: reclaims after a fresh-process fence crash with the persisted owner nonce', () => {
         const fixtureModuleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
         const fixtureSource = `
@@ -729,7 +947,8 @@ describe('UTF-8 tool output ranges', () => {
           const abortOperation = abortStore.beginOperation({ kind: 'abort-root-fsync-debt' });
           const abortWriter = abortOperation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
           abortWriter.write('stdout', 'already-unlinked-but-not-durable');
-          abortOperation.abort();
+          assert.throws(() => abortOperation.abort(), /injected abort directory sync failure/,
+            'abort reports the directory durability failure after recording recoverable debt');
           const abortMetadata = JSON.parse(readFileSync(path.join(abortDirectory, 'operations', `${abortOperation.id}.json`), 'utf8')) as { readonly state: string; readonly activeCaptureIds?: readonly string[] };
           assert.equal(abortMetadata.state, 'aborted');
           assert.equal(abortMetadata.activeCaptureIds?.length, 1, 'root fsync failure retains prepared-ID debt despite absent paths');
