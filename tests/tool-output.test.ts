@@ -234,23 +234,48 @@ describe('file-backed artifact point-of-use safety', () => {
     for (const kind of ['read', 'search'] as const) {
       const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-output-${kind}-inode-race-`));
       let artifactId = '';
+      let artifactPath = '';
+      let replacementPath = '';
       let mutated = false;
       const store = new FileToolOutputStore(directory, { testFaults: {
         beforeArtifactOpen: (at, channel) => {
           if (at !== kind || channel !== 'stdout' || mutated) return;
           mutated = true;
-          const artifactPath = path.join(directory, `${artifactId}.stdout`);
-          unlinkSync(artifactPath);
-          writeFileSync(artifactPath, 'evil');
+          renameSync(replacementPath, artifactPath);
         },
       } });
       try {
         const artifact = store.save({ stdout: 'safe', stderr: '' });
         artifactId = artifact.id;
+        artifactPath = path.join(directory, `${artifactId}.stdout`);
+        replacementPath = `${artifactPath}.replacement-${process.pid}`;
+        const original = lstatSync(artifactPath, { bigint: true });
+        assert.equal(original.dev.toString(), artifact.fileIdentity!.stdout.dev, `${kind}: original device matches the admitted artifact identity`);
+        assert.equal(original.ino.toString(), artifact.fileIdentity!.stdout.ino, `${kind}: original inode matches the admitted artifact identity`);
+        assert.equal(original.size, BigInt(artifact.stdoutBytes), `${kind}: original size matches the admitted artifact identity`);
+        assert.equal(readFileSync(artifactPath, 'utf8'), 'safe', `${kind}: original content is committed before replacement setup`);
+
+        // Keep the admitted allocation alive while creating the replacement,
+        // so the filesystem cannot recycle its inode for this same-length file.
+        writeFileSync(replacementPath, 'evil', { flag: 'wx', mode: 0o600 });
+        const stillOriginal = lstatSync(artifactPath, { bigint: true });
+        assert.equal(stillOriginal.dev, original.dev, `${kind}: original allocation remains present during replacement creation`);
+        assert.equal(stillOriginal.ino, original.ino, `${kind}: original inode remains allocated during replacement creation`);
+        const replacement = lstatSync(replacementPath, { bigint: true });
+        assert.equal(replacement.size, original.size, `${kind}: replacement has the same length as the original`);
+        assert.equal(readFileSync(replacementPath, 'utf8'), 'evil');
+        assert.ok(replacement.dev !== original.dev || replacement.ino !== original.ino,
+          `${kind}: replacement generation differs while both allocations exist`);
+
         assert.throws(() => kind === 'read'
           ? store.read(artifact, { channel: 'stdout', offset: 0, length: 4 })
           : store.search(artifact, { channel: 'stdout', query: 'evil' }), /unavailable|identity|size/i);
         assert.equal(mutated, true);
+        const installed = lstatSync(artifactPath, { bigint: true });
+        assert.equal(installed.dev, replacement.dev, `${kind}: the seam installed the precreated replacement device`);
+        assert.equal(installed.ino, replacement.ino, `${kind}: the seam installed the precreated replacement inode`);
+        assert.equal(installed.size, original.size, `${kind}: installed replacement remains same-sized`);
+        assert.equal(readFileSync(artifactPath, 'utf8'), 'evil', `${kind}: substituted content was not adopted by the read/search operation`);
       } finally { rmSync(directory, { recursive: true, force: true }); }
     }
   });
