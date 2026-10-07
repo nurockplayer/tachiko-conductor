@@ -2,7 +2,12 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, closeSync, existsSync, mkdirSync, openSync, readSync, writeSync, renameSync, fsyncSync, lstatSync, fstatSync, constants, realpathSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
-import { acquireDispatchInvocationLock, type DispatchInvocationLock } from '../dispatch/invocation-lock.js';
+import {
+  acquireDispatchInvocationLock,
+  type DispatchInvocationLock,
+  type DispatchInvocationPublicationHandoff,
+  type PreparedDispatchInvocationPublication,
+} from '../dispatch/invocation-lock.js';
 
 export const TOOL_OUTPUT_CONTRACT_VERSION = 'tachiko.tool-output.v1' as const;
 export const DEFAULT_TOOL_OUTPUT_SLOT_CAPACITY = 256;
@@ -36,6 +41,8 @@ export interface ToolOutputFileTestFaults {
   readonly afterArtifactOpen?: (descriptor: number, kind: 'hash' | 'read' | 'search', channel: 'stdout' | 'stderr') => void;
   readonly beforeUnlink?: (filePath: string) => void;
   readonly beforeOwnerLockUnlink?: (lockPath: string) => void;
+  readonly beforeOwnerLockTemporaryUnlink?: (lockPath: string, temporaryPath: string) => void;
+  readonly beforePreparedOwnerOpen?: (temporaryPath: string) => void;
   readonly beforeOwnerLockDirectoryFsync?: (lockPath: string) => void;
   readonly beforeOwnerLockDescriptorClose?: (lockPath: string, descriptor: number) => void;
   readonly beforeOperationMetadataDirectoryFsync?: (value: unknown) => void;
@@ -283,6 +290,7 @@ function acquireEvidenceOperationFence(
   accountRead?: (bytes: number) => void,
   admittedPreflight?: { readonly record: EvidenceOperationLockRecord | undefined },
   onStaleTakeoverAttempt?: () => void,
+  preparePublication?: (publication: PreparedDispatchInvocationPublication) => DispatchInvocationPublicationHandoff,
 ): AcquiredEvidenceOperationFence {
   const preflight = admittedPreflight ?? { record: readEvidenceOperationLock(lockPath, accountRead) };
   if (preflight.record !== undefined && expectedOwnerNonce !== undefined && preflight.record.nonce !== expectedOwnerNonce) {
@@ -292,6 +300,7 @@ function acquireEvidenceOperationFence(
   const acquired = acquireDispatchInvocationLock({
     lockPath,
     nonce: () => ownerNonce,
+    preparePublication,
     beforeStaleTakeover: () => {
       testFaults?.beforeStaleTakeover?.();
       const current = readEvidenceOperationLock(lockPath, accountRead);
@@ -327,7 +336,7 @@ interface PendingReleaseTransition {
   readonly kind: 'release';
   readonly id: string;
   readonly slot: number;
-  retry(budget: CleanupRetryBudget): 'complete' | 'pending';
+  retry(budget: CleanupRetryBudget): 'complete' | 'pending' | 'admission-released';
 }
 
 interface CleanupRetryBudget extends TerminalRetryBudget {
@@ -357,6 +366,12 @@ interface CleanupRecoveryState {
   ownerDisposed: boolean;
   metadataRemoved: boolean;
   slotUnlinkCommitted: boolean;
+}
+
+interface EvidenceOwnerAcquisition {
+  phase: 'acquiring' | 'ready' | 'rollback-only';
+  fence?: PinnedEvidenceOperationFence;
+  temporary?: { readonly path: string; readonly dev: bigint; readonly ino: bigint };
 }
 
 type PendingRecoveryTransition = PendingTerminalTransition | PendingReleaseTransition | PendingCleanupTransition;
@@ -396,6 +411,9 @@ function forgetPendingTerminalTransition(root: string, id: string): void {
 interface PinnedEvidenceOperationFence {
   state(): 'present' | 'unlinked' | 'complete';
   assertCurrent(accountRead?: (bytes: number) => void): void;
+  beforeRollbackUnlink(budget: TerminalRetryBudget): void;
+  afterRollbackUnlink(budget: TerminalRetryBudget): void;
+  discardUnpublished(): void;
   release(budget?: TerminalRetryBudget): void;
 }
 
@@ -454,6 +472,87 @@ function pinEvidenceOperationFence(
     if (pathAfter.isSymbolicLink() || !pathAfter.isFile() || pathAfter.dev !== opened.dev || pathAfter.ino !== opened.ino) {
       throw new Error('Evidence operation owner changed after pinning.');
     }
+    const fence = createPinnedEvidenceOperationFence(lockPath, descriptor, opened, record, testFaults);
+    keepDescriptor = true;
+    return fence;
+  } finally {
+    if (!keepDescriptor) { try { closeSync(descriptor); } catch { /* preserve pinning failure */ } }
+  }
+}
+
+function prepareEvidenceOperationFence(
+  lockPath: string,
+  publication: PreparedDispatchInvocationPublication,
+  testFaults: ToolOutputFileTestFaults | undefined,
+  accountRead: (bytes: number) => void,
+): PinnedEvidenceOperationFence {
+  if (!isEvidenceOperationLockRecord(publication.owner) || publication.owner.pid !== process.pid ||
+      typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) {
+    throw new Error('Prepared evidence operation owner is not an exact local versioned identity.');
+  }
+  const pathBefore = lstatSync(publication.temporaryPath, { bigint: true });
+  if (pathBefore.isSymbolicLink() || !pathBefore.isFile() || pathBefore.dev !== publication.generation.dev ||
+      pathBefore.ino !== publication.generation.ino || pathBefore.size < 1n || pathBefore.size > 4096n) {
+    throw new Error('Prepared evidence operation owner path differs from its producer identity.');
+  }
+  testFaults?.beforePreparedOwnerOpen?.(publication.temporaryPath);
+  const descriptor = openSync(publication.temporaryPath, constants.O_RDONLY | constants.O_NOFOLLOW |
+    (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0));
+  let keepDescriptor = false;
+  try {
+    const opened = fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || opened.dev !== publication.generation.dev || opened.ino !== publication.generation.ino ||
+        opened.size !== pathBefore.size) throw new Error('Prepared evidence operation owner changed during safe open.');
+    const record = readEvidenceOperationRecordFromDescriptor(descriptor, publication.generation, accountRead);
+    if (!sameEvidenceOperationLockRecord(record, publication.owner)) {
+      throw new Error('Prepared evidence operation owner record differs from its producer identity.');
+    }
+    const pathAfter = lstatSync(publication.temporaryPath, { bigint: true });
+    if (pathAfter.isSymbolicLink() || !pathAfter.isFile() || pathAfter.dev !== opened.dev || pathAfter.ino !== opened.ino ||
+        pathAfter.size !== opened.size) throw new Error('Prepared evidence operation owner changed after safe open.');
+    const fence = createPinnedEvidenceOperationFence(lockPath, descriptor, opened, record, testFaults);
+    keepDescriptor = true;
+    return fence;
+  } finally {
+    if (!keepDescriptor) { try { closeSync(descriptor); } catch { /* preserve prepared-owner validation failure */ } }
+  }
+}
+
+function cleanupPreparedTemporaryAlias(ownerAcquisition: EvidenceOwnerAcquisition, budget: TerminalRetryBudget): void {
+  const temporary = ownerAcquisition.temporary;
+  if (temporary === undefined) return;
+  let stats;
+  try { stats = lstatSync(temporary.path, { bigint: true }); }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      ownerAcquisition.temporary = undefined;
+      return;
+    }
+    throw error;
+  }
+  if (stats.isSymbolicLink() || !stats.isFile() || stats.dev !== temporary.dev || stats.ino !== temporary.ino) {
+    throw new Error('Prepared evidence owner temporary path no longer matches its pinned generation.');
+  }
+  budget.beginDeletion();
+  try {
+    unlinkSync(temporary.path);
+    budget.finishDeletion();
+    ownerAcquisition.temporary = undefined;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') ownerAcquisition.temporary = undefined;
+    throw error;
+  }
+}
+
+function createPinnedEvidenceOperationFence(
+  lockPath: string,
+  descriptor: number,
+  opened: { readonly dev: bigint; readonly ino: bigint },
+  record: EvidenceOperationLockRecord,
+  testFaults?: ToolOutputFileTestFaults,
+): PinnedEvidenceOperationFence {
+  let keepDescriptor = false;
+  try {
     let unlinkCommitted = false;
     let complete = false;
     const generation = { dev: opened.dev, ino: opened.ino };
@@ -483,18 +582,28 @@ function pinEvidenceOperationFence(
       try { fsyncSync(directory); } finally { closeSync(directory); }
     };
     const closePinnedDescriptor = (): void => {
-      // Node/libuv may have consumed the descriptor even when close reports
-      // an error. Retire this numeric capability before the one close call so
-      // retries can never close a descriptor that the OS has since reused.
       keepDescriptor = false;
       complete = true;
       testFaults?.beforeOwnerLockDescriptorClose?.(lockPath, descriptor);
       closeSync(descriptor);
     };
+    const guardUnlink = (budget?: TerminalRetryBudget): void => {
+      assertCurrent(budget?.accountRead);
+      testFaults?.beforeOwnerLockUnlink?.(lockPath);
+      assertCurrent(budget?.accountRead);
+      budget?.beginDeletion();
+    };
+    const markUnlinked = (budget?: TerminalRetryBudget): void => {
+      unlinkCommitted = true;
+      budget?.finishDeletion();
+    };
     keepDescriptor = true;
     return {
       state: () => complete ? 'complete' : unlinkCommitted ? 'unlinked' : 'present',
       assertCurrent,
+      beforeRollbackUnlink: guardUnlink,
+      afterRollbackUnlink: markUnlinked,
+      discardUnpublished: closePinnedDescriptor,
       release: (budget) => {
         if (complete) return;
         if (unlinkCommitted) {
@@ -508,21 +617,15 @@ function pinEvidenceOperationFence(
           closePinnedDescriptor();
           return;
         }
-        assertCurrent(budget?.accountRead);
-        testFaults?.beforeOwnerLockUnlink?.(lockPath);
-        // Revalidate after the synchronous fault seam so replacement with a
-        // byte-identical owner record on a different inode is never unlinked.
-        assertCurrent(budget?.accountRead);
-        budget?.beginDeletion();
+        guardUnlink(budget);
         unlinkSync(lockPath);
-        unlinkCommitted = true;
-        budget?.finishDeletion();
+        markUnlinked(budget);
         syncOwnerDirectory();
         closePinnedDescriptor();
       },
     };
   } finally {
-    if (!keepDescriptor) { try { closeSync(descriptor); } catch { /* preserve pinning failure */ } }
+    if (!keepDescriptor) { try { closeSync(descriptor); } catch { /* preserve fence construction failure */ } }
   }
 }
 
@@ -1243,6 +1346,18 @@ export class FileToolOutputStore implements ToolOutputStore {
   release(referenceValue: ToolOutputArtifactReference): void {
     this.assertAvailable(referenceValue);
     const operationId = referenceValue.operationId!;
+    const publicBudget: CleanupRetryBudget = {
+      accountRead: () => {}, beginDeletion: () => {}, finishDeletion: () => {},
+      remainingDeletions: () => Number.MAX_SAFE_INTEGER,
+      maxMetadataBytes: 1_048_576,
+      canRead: () => true,
+    };
+    const existingTransition = pendingTerminalTransitions.get(this.root)?.get(operationId);
+    if (existingTransition !== undefined) {
+      if (existingTransition.kind !== 'release') throw new Error('Tool-output operation has a conflicting pending recovery transition.');
+      const result = existingTransition.retry(publicBudget);
+      if (result !== 'admission-released') return;
+    }
     const metadataPath = path.join(this.operationsDir, `${operationId}.json`);
     const initialMetadata = readBoundedJson(metadataPath, 1_048_576);
     const expectedOwnerNonce = initialMetadata.ownerNonce;
@@ -1254,24 +1369,27 @@ export class FileToolOutputStore implements ToolOutputStore {
       throw new Error('Tool-output operation cannot be released without valid committed owner metadata.');
     }
     const lockPath = path.join(this.operationsDir, `${operationId}.lock`);
-    const admittedFence = acquireEvidenceOperationFence(
-      lockPath, expectedOwnerNonce, this.testFaults,
-    );
-    let ownerFence: PinnedEvidenceOperationFence;
-    try {
-      ownerFence = pinEvidenceOperationFence(lockPath, admittedFence.ownerNonce, this.testFaults);
-    } catch (error) {
-      try { admittedFence.release(); } catch { /* preserve the pin failure */ }
-      throw error;
-    }
     const closedSnapshot = JSON.parse(JSON.stringify(initialMetadata)) as Record<string, unknown>;
     const releasedAt = this.now().toISOString();
     const releasedSnapshot: Record<string, unknown> = { ...closedSnapshot, state: 'released', releasedAt };
+    const ownerAcquisition: EvidenceOwnerAcquisition = { phase: 'acquiring' };
     let metadataDurable = false;
     let ownerDisposed = false;
     const transition: PendingReleaseTransition = {
       kind: 'release', id: operationId, slot: slot as number,
       retry: (budget) => {
+        if (ownerAcquisition.phase === 'acquiring') return 'pending';
+        if (ownerAcquisition.phase === 'rollback-only') {
+          const fence = ownerAcquisition.fence;
+          if (fence === undefined) throw new Error('Release admission recovery lost its prepared owner anchor.');
+          cleanupPreparedTemporaryAlias(ownerAcquisition, budget);
+          fence.release(budget);
+          ownerAcquisition.fence = undefined;
+          forgetPendingTerminalTransition(this.root, operationId);
+          return 'admission-released';
+        }
+        const ownerFence = ownerAcquisition.fence;
+        if (ownerFence === undefined) throw new Error('Release transition has no prepared owner anchor.');
         if (!ownerDisposed) {
           const ownerState = ownerFence.state();
           if (ownerState === 'complete') {
@@ -1313,17 +1431,39 @@ export class FileToolOutputStore implements ToolOutputStore {
         return 'complete';
       },
     };
-    try { registerPendingTerminalTransition(this.root, this.capacity, transition); }
-    catch (error) {
-      try { ownerFence.release(); } catch { /* preserve indexed operation evidence on uncertain disposal */ }
+    registerPendingTerminalTransition(this.root, this.capacity, transition);
+    const preparePublication = (publication: PreparedDispatchInvocationPublication): DispatchInvocationPublicationHandoff => {
+      const fence = prepareEvidenceOperationFence(lockPath, publication, this.testFaults, publicBudget.accountRead);
+      if (ownerAcquisition.fence !== undefined) {
+        fence.discardUnpublished();
+        throw new Error('Release admission already has a prepared owner anchor.');
+      }
+      ownerAcquisition.fence = fence;
+      ownerAcquisition.temporary = {
+        path: publication.temporaryPath,
+        dev: publication.generation.dev,
+        ino: publication.generation.ino,
+      };
+      return {
+        discardUnpublished: () => {
+          if (ownerAcquisition.fence === fence) ownerAcquisition.fence = undefined;
+          ownerAcquisition.temporary = undefined;
+          fence.discardUnpublished();
+        },
+        beforeRollbackUnlink: () => fence.beforeRollbackUnlink(publicBudget),
+        afterRollbackUnlink: () => fence.afterRollbackUnlink(publicBudget),
+        beforeTemporaryUnlink: () => this.testFaults?.beforeOwnerLockTemporaryUnlink?.(lockPath, publication.temporaryPath),
+      };
+    };
+    try {
+      acquireEvidenceOperationFence(lockPath, expectedOwnerNonce, this.testFaults, publicBudget.accountRead, undefined, undefined, preparePublication);
+      ownerAcquisition.temporary = undefined;
+      ownerAcquisition.phase = 'ready';
+    } catch (error) {
+      if (ownerAcquisition.fence !== undefined) ownerAcquisition.phase = 'rollback-only';
+      else forgetPendingTerminalTransition(this.root, operationId);
       throw error;
     }
-    const publicBudget: CleanupRetryBudget = {
-      accountRead: () => {}, beginDeletion: () => {}, finishDeletion: () => {},
-      remainingDeletions: () => Number.MAX_SAFE_INTEGER,
-      maxMetadataBytes: 1_048_576,
-      canRead: () => true,
-    };
     transition.retry(publicBudget);
   }
 
@@ -1371,7 +1511,7 @@ export class FileToolOutputStore implements ToolOutputStore {
       slot: number,
       initialSlot: { readonly id: string; readonly deleting: boolean; readonly artifactIds: readonly string[] },
       metadataOwnerNonce: string | undefined,
-      ownerFence: PinnedEvidenceOperationFence,
+      ownerAcquisition: EvidenceOwnerAcquisition,
     ): PendingCleanupTransition => {
       const slotPath = this.slotPath(slot);
       const metadataPath = path.join(this.operationsDir, `${id}.json`);
@@ -1379,6 +1519,11 @@ export class FileToolOutputStore implements ToolOutputStore {
         phase: 'admission', tombstoneDurable: false,
         artifactIds: initialSlot.deleting ? [...initialSlot.artifactIds] : [],
         ownerDisposed: false, metadataRemoved: false, slotUnlinkCommitted: false,
+      };
+      const currentOwnerFence = (): PinnedEvidenceOperationFence => {
+        const fence = ownerAcquisition.fence;
+        if (fence === undefined) throw new Error('Cleanup transition has no prepared owner anchor.');
+        return fence;
       };
       const readOwnSlot = (budget: CleanupRetryBudget): { readonly id: string; readonly deleting: boolean; readonly artifactIds: readonly string[] } => {
         const current = this.readSlot(slot, budget.accountRead);
@@ -1396,7 +1541,7 @@ export class FileToolOutputStore implements ToolOutputStore {
         if (visibleTarget) {
           syncOperationsDirectory();
         } else if (visibleSource) {
-          ownerFence.assertCurrent(budget.accountRead);
+          currentOwnerFence().assertCurrent(budget.accountRead);
           writeAtomicJson(this.operationsDir, slotPath, {
             schemaVersion: 1, capacity: this.capacity, slot, id,
             deleting: true, artifactIds: pending.toIds,
@@ -1475,6 +1620,17 @@ export class FileToolOutputStore implements ToolOutputStore {
         return 'complete';
       };
       const resume = (budget: CleanupRetryBudget): 'complete' | 'released' | 'pending' => {
+        if (ownerAcquisition.phase === 'acquiring') return 'pending';
+        const ownerFence = ownerAcquisition.fence;
+        if (ownerAcquisition.phase === 'rollback-only') {
+          if (ownerFence === undefined) throw new Error('Cleanup admission recovery lost its prepared owner anchor.');
+          cleanupPreparedTemporaryAlias(ownerAcquisition, budget);
+          ownerFence.release(budget);
+          ownerAcquisition.fence = undefined;
+          forgetPendingTerminalTransition(this.root, id);
+          return 'released';
+        }
+        if (ownerFence === undefined) throw new Error('Cleanup transition has no prepared owner anchor.');
         if (state.phase === 'release-only') {
           ownerFence.release(budget);
           state.ownerDisposed = true;
@@ -1703,7 +1859,7 @@ export class FileToolOutputStore implements ToolOutputStore {
           protectedCount += 1; continue;
         }
         const sharedOwnerReadReserve = admittedLock.record === undefined ? 1 * 4096 : 5 * 4096;
-        const localOwnerReadHeadroom = admittedLock.record === undefined ? 3 * 4096 : 4 * 4096;
+        const localOwnerReadHeadroom = admittedLock.record === undefined ? 3 * 4096 : 5 * 4096;
         if (!admissionBudget.canRead(sharedOwnerReadReserve + localOwnerReadHeadroom)) {
           protectedCount += 1; continue;
         }
@@ -1712,36 +1868,44 @@ export class FileToolOutputStore implements ToolOutputStore {
         // envelope once before acquisition can mutate the lock path. Reads
         // exposed through callbacks remain charged against the current caller.
         accountMetadataRead(sharedOwnerReadReserve);
-        let admittedFence: AcquiredEvidenceOperationFence;
-        try {
-          admittedFence = acquireEvidenceOperationFence(
-            lockPath, slotRecord.deleting ? undefined : expectedOwnerNonce, this.testFaults, accountMetadataRead, admittedLock,
-            () => admissionBudget.beginDeletion(),
-          );
-        } catch (error) {
-          if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
-          protectedCount += 1; continue;
-        }
-        let ownerFence: PinnedEvidenceOperationFence;
-        try {
-          ownerFence = pinEvidenceOperationFence(lockPath, admittedFence.ownerNonce, this.testFaults, accountMetadataRead);
-        } catch (error) {
-          try {
-            const disposal = retryBudget();
-            disposal.beginDeletion();
-            admittedFence.release();
-            disposal.finishDeletion();
-          } catch { /* preserve the original pin failure and the durable slot */ }
-          if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
-          protectedCount += 1; continue;
-        }
-        const pendingCleanup = cleanupTransition(slotRecord.id, slot, slotRecord, expectedOwnerNonce, ownerFence);
+        const ownerAcquisition: EvidenceOwnerAcquisition = { phase: 'acquiring' };
+        const pendingCleanup = cleanupTransition(slotRecord.id, slot, slotRecord, expectedOwnerNonce, ownerAcquisition);
         try { registerPendingTerminalTransition(this.root, this.capacity, pendingCleanup); }
-        catch (error) {
-          try {
-            const disposal = retryBudget();
-            ownerFence.release(disposal);
-          } catch { /* retain the durable slot for strict fresh-process recovery */ }
+        catch { protectedCount += 1; continue; }
+        const preparePublication = (publication: PreparedDispatchInvocationPublication): DispatchInvocationPublicationHandoff => {
+          const fence = prepareEvidenceOperationFence(lockPath, publication, this.testFaults, accountMetadataRead);
+          if (ownerAcquisition.fence !== undefined) {
+            fence.discardUnpublished();
+            throw new Error('Cleanup admission already has a prepared owner anchor.');
+          }
+          ownerAcquisition.fence = fence;
+          ownerAcquisition.temporary = {
+            path: publication.temporaryPath,
+            dev: publication.generation.dev,
+            ino: publication.generation.ino,
+          };
+          return {
+            discardUnpublished: () => {
+              if (ownerAcquisition.fence === fence) ownerAcquisition.fence = undefined;
+              ownerAcquisition.temporary = undefined;
+              fence.discardUnpublished();
+            },
+            beforeRollbackUnlink: () => fence.beforeRollbackUnlink(admissionBudget),
+            afterRollbackUnlink: () => fence.afterRollbackUnlink(admissionBudget),
+            beforeTemporaryUnlink: () => this.testFaults?.beforeOwnerLockTemporaryUnlink?.(lockPath, publication.temporaryPath),
+          };
+        };
+        try {
+          acquireEvidenceOperationFence(
+            lockPath, slotRecord.deleting ? undefined : expectedOwnerNonce, this.testFaults, accountMetadataRead, admittedLock,
+            () => admissionBudget.beginDeletion(), preparePublication,
+          );
+          ownerAcquisition.temporary = undefined;
+          ownerAcquisition.phase = 'ready';
+        } catch (error) {
+          if (ownerAcquisition.fence !== undefined) ownerAcquisition.phase = 'rollback-only';
+          else forgetPendingTerminalTransition(this.root, slotRecord.id);
+          if (error instanceof Error && error.message.includes('metadata-read budget exhausted')) throw error;
           protectedCount += 1; continue;
         }
         try {

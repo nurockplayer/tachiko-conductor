@@ -1585,6 +1585,113 @@ describe('UTF-8 tool output ranges', () => {
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
+      it('file: refuses publication when the prepared owner no-follow open fails, then recovers on a later pass', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-prepared-open-failure-'));
+        try {
+          const artifact = new FileToolOutputStore(directory, { capacity: 1, retentionMs: 1,
+            now: () => new Date('2000-01-01T00:00:00.000Z') }).save({ stdout: 'prepared-open', stderr: '' });
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `import fs from 'node:fs';
+            const root = ${JSON.stringify(directory)}; const operationId = ${JSON.stringify(artifact.operationId)};
+            const lockPath = root + '/operations/' + operationId + '.lock';
+            let armed = true; let injected = false; let unlinkAttempts = 0;
+            const { FileToolOutputStore } = await import(${JSON.stringify(moduleUrl)});
+            const store = new FileToolOutputStore(root, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z'),
+              testFaults: {
+                beforeOwnerLockUnlink: (candidate) => { if (candidate === lockPath) unlinkAttempts += 1; },
+                beforePreparedOwnerOpen: (temporaryPath) => {
+                  if (!armed || injected) return;
+                  injected = true; fs.unlinkSync(temporaryPath); fs.symlinkSync(temporaryPath, temporaryPath);
+                },
+              } });
+            const metadataPath = root + '/operations/' + operationId + '.json';
+            const metadataBefore = fs.readFileSync(metadataPath, 'utf8');
+            const slotPath = root + '/operations/slot-0000.json'; const slotBefore = fs.readFileSync(slotPath, 'utf8');
+            const first = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            const canonicalAbsent = !fs.existsSync(lockPath);
+            const temporaryAliases = fs.readdirSync(root + '/operations').filter((name) => name.startsWith(operationId + '.lock.tmp-'));
+            const metadataUnchanged = fs.existsSync(metadataPath) && fs.readFileSync(metadataPath, 'utf8') === metadataBefore;
+            const slotUnchanged = fs.existsSync(slotPath) && fs.readFileSync(slotPath, 'utf8') === slotBefore;
+            const artifactExistsAfterFirst = fs.existsSync(root + '/' + ${JSON.stringify(artifact.id)} + '.stdout');
+            armed = false;
+            const second = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            console.log(JSON.stringify({ injected, unlinkAttempts, first, second, canonicalAbsent, temporaryAliases, metadataUnchanged, slotUnchanged,
+              artifactExistsAfterFirst }));
+          `;
+          const result = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as {
+            readonly injected: boolean; readonly unlinkAttempts: number;
+            readonly first: { readonly protected: number }; readonly second: { readonly protected: number };
+            readonly canonicalAbsent: boolean; readonly temporaryAliases: readonly string[];
+            readonly metadataUnchanged: boolean; readonly slotUnchanged: boolean; readonly artifactExistsAfterFirst: boolean;
+          };
+          assert.equal(result.injected, true, `the actual temporary no-follow open failed before canonical publication: ${JSON.stringify(result)}`);
+          assert.equal(result.unlinkAttempts, 0, 'a pre-publication pin failure cannot attempt owner disposal');
+          assert.equal(result.first.protected, 1);
+          assert.equal(result.canonicalAbsent, true);
+          assert.deepEqual(result.temporaryAliases, []);
+          assert.equal(result.metadataUnchanged, true);
+          assert.equal(result.slotUnchanged, true);
+          assert.equal(result.artifactExistsAfterFirst, true, 'the no-follow open fault preserves evidence before a later recovery pass');
+          assert.equal(result.second.protected, 0);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: retains a published owner anchor through temporary-alias unlink failure and retries the exact alias', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-prepared-temp-unlink-'));
+        try {
+          const artifact = new FileToolOutputStore(directory, { capacity: 1, retentionMs: 1,
+            now: () => new Date('2000-01-01T00:00:00.000Z') }).save({ stdout: 'temporary-unlink', stderr: '' });
+          const moduleUrl = new URL('../src/evidence/tool-output.ts', import.meta.url).href;
+          const childSource = `import fs from 'node:fs';
+            const root = ${JSON.stringify(directory)}; const operationId = ${JSON.stringify(artifact.operationId)};
+            const lockPath = root + '/operations/' + operationId + '.lock';
+            let armed = false; let injected = false; let temporaryPath = ''; let temporaryHookCalls = 0; let candidateSeen = '';
+            const { FileToolOutputStore } = await import(${JSON.stringify(moduleUrl)});
+            const store = new FileToolOutputStore(root, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z'), testFaults: {
+              beforeOwnerLockTemporaryUnlink: (candidate, temporary) => {
+                temporaryHookCalls += 1;
+                candidateSeen = candidate;
+                if (armed && !injected && candidate.endsWith(operationId + '.lock')) {
+                  injected = true; temporaryPath = temporary;
+                  throw Object.assign(new Error('prepared temporary alias unlink EIO'), { code: 'EIO' });
+                }
+              },
+            } });
+            armed = true;
+            const first = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            armed = false;
+            const ownerHeld = fs.existsSync(lockPath);
+            const exactTemporaryHeld = temporaryPath !== '' && fs.existsSync(temporaryPath);
+            const second = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            const ownerReleased = !fs.existsSync(lockPath);
+            const exactTemporaryRemoved = temporaryPath !== '' && !fs.existsSync(temporaryPath);
+            const third = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            console.log(JSON.stringify({ injected, temporaryHookCalls, candidateSeen, lockPath, first, second, third, ownerHeld, exactTemporaryHeld, ownerReleased, exactTemporaryRemoved,
+              artifactExists: fs.existsSync(root + '/' + ${JSON.stringify(artifact.id)} + '.stdout') }));
+          `;
+          const result = JSON.parse(execFileSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', childSource], {
+            cwd: process.cwd(), encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
+          }).trim()) as {
+            readonly injected: boolean; readonly temporaryHookCalls: number; readonly candidateSeen: string; readonly lockPath: string; readonly first: { readonly protected: number };
+            readonly second: { readonly attempted: number }; readonly third: { readonly protected: number; readonly attempted: number };
+            readonly ownerHeld: boolean; readonly exactTemporaryHeld: boolean;
+            readonly ownerReleased: boolean; readonly exactTemporaryRemoved: boolean; readonly artifactExists: boolean;
+          };
+          assert.equal(result.injected, true, `the post-publication temp unlink fault was reached: ${JSON.stringify(result)}`);
+          assert.equal(result.first.protected, 1);
+          assert.equal(result.ownerHeld, true, 'the linked owner remains anchored after post-link temp cleanup failure');
+          assert.equal(result.exactTemporaryHeld, true);
+          assert.ok(result.second.attempted <= 8);
+          assert.equal(result.ownerReleased, true, 'the pending entry disposes only the exact owner using the later caller budget');
+          assert.equal(result.exactTemporaryRemoved, true, 'the pending entry cleans only the prepared temp alias');
+          assert.ok(result.third.attempted <= 8);
+          assert.equal(result.third.protected, 0);
+          assert.equal(result.artifactExists, false, 'a subsequent bounded cleanup pass converges');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
       it('file: reserves shared stale-owner reads before takeover and recovers with a larger caller budget', () => {
         const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-shared-owner-read-reserve-'));
         try {

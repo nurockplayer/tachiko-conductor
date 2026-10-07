@@ -224,6 +224,41 @@ describe('dispatch scheduler boundary', () => {
     }
   });
 
+  it('hands a prepared publication anchor through rollback without discarding a linked owner', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-prepared-owner-'));
+    const lockPath = path.join(directory, 'prepared.lock');
+    const events: string[] = [];
+    let prelink = false;
+    let failPublicationBarrier = true;
+    try {
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath,
+        preparePublication: (publication) => {
+          assert.equal(publication.temporaryPath.startsWith(`${lockPath}.tmp-`), true);
+          assert.equal(typeof publication.generation.dev, 'bigint');
+          assert.equal(typeof publication.generation.ino, 'bigint');
+          events.push('prepared');
+          return {
+            discardUnpublished: () => { events.push('discard'); },
+            beforeRollbackUnlink: () => { events.push('guard'); },
+            afterRollbackUnlink: () => { events.push('unlinked'); },
+          };
+        },
+        beforeCanonicalLink: () => { prelink = true; events.push('prelink'); },
+        syncDirectory: (directoryPath) => {
+          if (prelink && failPublicationBarrier) {
+            failPublicationBarrier = false;
+            throw new Error('prepared publication barrier failure');
+          }
+          syncDirectory(directoryPath);
+        },
+      }), /prepared publication barrier failure/);
+      assert.deepEqual(events, ['prepared', 'prelink', 'guard', 'unlinked']);
+      assert.equal(existsSync(lockPath), false, 'the exact linked owner was rolled back only after its guard');
+      assert.deepEqual(readdirSync(directory), [], 'the temporary alias is retired after rollback');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('reclaims versioned same-host locks only across reboot or process-start mismatch', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-incarnation-'));
     const lockPath = path.join(directory, 'once.lock');

@@ -1,7 +1,7 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
-  closeSync, constants, fchmodSync, fsyncSync, linkSync, lstatSync, openSync,
+  closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync,
   readFileSync, readlinkSync, symlinkSync, unlinkSync, writeSync,
 } from 'node:fs';
 import path from 'node:path';
@@ -30,6 +30,23 @@ interface VersionedLockRecord extends LegacyLockRecord {
 type LockRecord = LegacyLockRecord | VersionedLockRecord;
 type TakeoverClaim = LockRecord;
 
+export interface PreparedDispatchInvocationPublication {
+  readonly owner: Readonly<VersionedLockRecord>;
+  readonly temporaryPath: string;
+  readonly generation: Readonly<{ readonly dev: bigint; readonly ino: bigint }>;
+}
+
+export interface DispatchInvocationPublicationHandoff {
+  /** Retire the prepared descriptor only when this publication never linked. */
+  discardUnpublished(): void;
+  /** Admit and qualify the shared rollback unlink before it mutates the canonical path. */
+  beforeRollbackUnlink(): void;
+  /** Record the already successful rollback unlink without performing I/O. */
+  afterRollbackUnlink(): void;
+  /** Optional deterministic fault seam immediately before retiring the sibling alias. */
+  beforeTemporaryUnlink?(): void;
+}
+
 export interface DispatchInvocationIdentity {
   readonly hostId: string;
   readonly bootId: string;
@@ -43,6 +60,7 @@ export interface DispatchInvocationLockOptions {
   readonly hostBootIdentity?: () => DispatchInvocationIdentity;
   readonly processStartIdentity?: (pid: number) => string | null;
   readonly beforeCanonicalLink?: () => void;
+  readonly preparePublication?: (publication: PreparedDispatchInvocationPublication) => DispatchInvocationPublicationHandoff;
   readonly syncDirectory?: (directory: string) => void;
   /** Separate path-aware barrier for every component leading to the lock directory. */
   readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
@@ -310,6 +328,10 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
     const tempPath = `${options.lockPath}.tmp-${randomBytes(16).toString('hex')}`;
     let descriptor: number | undefined;
     let linked = false;
+    let published = false;
+    let exists = false;
+    let handoff: DispatchInvocationPublicationHandoff | undefined;
+    let discardConsumed = false;
     let failure: unknown;
     try {
       descriptor = openSync(tempPath, 'wx', 0o600);
@@ -322,48 +344,76 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
       }
       fchmodSync(descriptor, 0o600);
       fsyncSync(descriptor);
-      closeSync(descriptor);
-      descriptor = undefined;
+      if (options.preparePublication !== undefined) {
+        const stats = fstatSync(descriptor, { bigint: true });
+        if (!stats.isFile() || stats.size !== BigInt(data.byteLength) || stats.size < 1n || stats.size > 4096n) {
+          throw new Error('Dispatch invocation lock prepared owner is not the expected bounded regular file.');
+        }
+        const publication: PreparedDispatchInvocationPublication = Object.freeze({
+          owner: Object.freeze({ ...owner }),
+          temporaryPath: tempPath,
+          generation: Object.freeze({ dev: stats.dev, ino: stats.ino }),
+        });
+        const closing = descriptor;
+        descriptor = undefined;
+        closeSync(closing);
+        handoff = options.preparePublication(publication);
+      } else {
+        const closing = descriptor;
+        descriptor = undefined;
+        closeSync(closing);
+      }
       options.beforeCanonicalLink?.();
       validatePath();
       try {
         linkSync(tempPath, options.lockPath);
         linked = true;
       } catch (error: unknown) {
-        if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'EEXIST') return false;
-        throw error;
+        if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'EEXIST') exists = true;
+        else throw error;
       }
-      fsyncParent();
-      return true;
+      if (!exists) {
+        fsyncParent();
+        published = true;
+      }
     } catch (error) {
       failure = error;
       if (linked) {
         try {
-          const canonicalStats = lstatSync(options.lockPath);
-          const tempStats = lstatSync(tempPath);
+          const canonicalStats = lstatSync(options.lockPath, { bigint: true });
+          const tempStats = lstatSync(tempPath, { bigint: true });
           if (canonicalStats.isFile() && !canonicalStats.isSymbolicLink() &&
               tempStats.isFile() && !tempStats.isSymbolicLink() &&
               canonicalStats.dev === tempStats.dev && canonicalStats.ino === tempStats.ino) {
+            handoff?.beforeRollbackUnlink();
             validatePath();
             unlinkSync(options.lockPath);
+            handoff?.afterRollbackUnlink();
             fsyncParent();
           }
         } catch {
-          // Preserve the publication error; cleanup must never remove an
-          // unverified successor or turn an uncertain fsync into success.
+          // Preserve the publication error. A failed handoff guard deliberately
+          // leaves the exact published owner for its registered recovery entry.
         }
       }
-      throw error;
     } finally {
       if (descriptor !== undefined) {
-        try { closeSync(descriptor); } catch (error) { if (failure === undefined) throw error; }
+        const closing = descriptor;
+        descriptor = undefined;
+        try { closeSync(closing); } catch (error) { if (failure === undefined) failure = error; }
       }
-      try { validatePath(); unlinkSync(tempPath); } catch (error: unknown) {
+      if (!linked && handoff !== undefined && !discardConsumed) {
+        discardConsumed = true;
+        try { handoff.discardUnpublished(); } catch (error) { if (failure === undefined) failure = error; }
+      }
+      try { handoff?.beforeTemporaryUnlink?.(); validatePath(); unlinkSync(tempPath); } catch (error: unknown) {
         if (typeof error !== 'object' || error === null || (error as { code?: unknown }).code !== 'ENOENT') {
-          if (failure === undefined) throw error;
+          if (failure === undefined) failure = error;
         }
       }
     }
+    if (failure !== undefined) throw failure;
+    return published;
   };
 
   if (!publish()) {
