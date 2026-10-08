@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -269,6 +270,26 @@ describe('NodeProcessRunner', () => {
         assert.equal(fenceCalls, 1);
       }
     } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('retains actual process pipe bytes in memory capture while exposing a bounded text projection', async () => {
+    const store = new InMemoryToolOutputStore();
+    const stdout = Buffer.from([0x41, 0xff, 0x80, 0xe2, 0x82, 0x42]);
+    const stderr = Buffer.from([0xf0, 0x9f, 0x99, 0x82, 0xed, 0xa0, 0x80]);
+    const script = `process.stdout.write(Buffer.from(${JSON.stringify([...stdout])})); process.stderr.write(Buffer.from(${JSON.stringify([...stderr])}));`;
+    const result = await new NodeProcessRunner().run(process.execPath, ['-e', script], {
+      timeoutMs: 2_000, outputStore: store,
+    });
+    assert.equal(result.captureStatus, 'complete');
+    assert.ok(result.output);
+    assert.equal(result.output.stdout.bytes, stdout.length);
+    assert.equal(result.output.stderr.bytes, stderr.length);
+    assert.equal(result.output.stdout.preview, 'A????B');
+    assert.equal(result.output.stderr.preview, '🙂???');
+    assert.equal(store.read(result.output.artifact, { channel: 'stdout', length: 32 }).text, 'A????B');
+    assert.equal(store.read(result.output.artifact, { channel: 'stderr', length: 32 }).text, '🙂???');
+    assert.equal(result.output.artifact.sha256,
+      createHash('sha256').update(stdout).update('\0').update(stderr).digest('hex'));
   });
 
   it('runs beforeSpawn immediately before child creation and rejects without spawning when it throws', async () => {

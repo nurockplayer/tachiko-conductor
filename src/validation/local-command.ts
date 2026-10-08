@@ -3,7 +3,6 @@ import { createHash } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { StringDecoder } from 'node:string_decoder';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
 import type { LocalValidationConfiguration, ValidationAdapter, ValidationRequest } from '../adapters/validation.js';
@@ -457,18 +456,15 @@ async function execute(
       finish('unavailable', null);
       return;
     }
-    const stdoutDecoder = new StringDecoder('utf8');
-    const stderrDecoder = new StringDecoder('utf8');
     child.once('exit', (code) => {
       directExitBeforeDeadline = !timedOut;
       directExitCode = code;
     });
-    const captureChunk = (channel: 'stdout' | 'stderr', chunk: Buffer, decoder: StringDecoder) => {
-      const text = decoder.write(chunk);
-      if (text !== '' && captureSession !== undefined) captureSession.write(captureForcedIncomplete ? undefined : writer, channel, text);
+    const captureChunk = (channel: 'stdout' | 'stderr', chunk: Buffer) => {
+      if (captureSession !== undefined) captureSession.writeBytes(captureForcedIncomplete ? undefined : writer, channel, chunk);
     };
-    child.stdout?.on('data', (chunk: Buffer) => captureChunk('stdout', chunk, stdoutDecoder));
-    child.stderr?.on('data', (chunk: Buffer) => captureChunk('stderr', chunk, stderrDecoder));
+    child.stdout?.on('data', (chunk: Buffer) => captureChunk('stdout', chunk));
+    child.stderr?.on('data', (chunk: Buffer) => captureChunk('stderr', chunk));
     timer = setTimeout(() => {
       // Invalidate completeness synchronously before any signal or asynchronous
       // group settlement. Optional writer cleanup is not the publication gate.
@@ -489,9 +485,6 @@ async function execute(
       finish('unavailable', null);
     });
     child.once('close', (code) => {
-      const outTail = stdoutDecoder.end(); const errTail = stderrDecoder.end();
-      if (captureSession !== undefined && outTail !== '') captureSession.write(captureForcedIncomplete ? undefined : writer, 'stdout', outTail);
-      if (captureSession !== undefined && errTail !== '') captureSession.write(captureForcedIncomplete ? undefined : writer, 'stderr', errTail);
       if (timedOut) {
         void settleTimedOutProcess(child);
         return;

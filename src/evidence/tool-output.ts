@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readSync, writeSync, renameSync, fsyncSync, lstatSync, fstatSync, constants, realpathSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
-import { StringDecoder } from 'node:string_decoder';
 import {
   acquireDispatchInvocationLock,
   type DispatchInvocationLock,
@@ -157,6 +156,8 @@ export interface ToolOutputCaptureSummary {
 
 export interface ToolOutputCaptureWriter {
   write(channel: 'stdout' | 'stderr', chunk: string): void;
+  /** Exact process bytes; legacy string-only writers are not raw-capture capable. */
+  writeBytes?(channel: 'stdout' | 'stderr', chunk: Buffer): void;
   finish(): ToolOutputCaptureSummary;
   abort?(): void;
 }
@@ -783,6 +784,92 @@ function utf8Bytes(value: string): number {
   return Buffer.byteLength(value, 'utf8');
 }
 
+function utf8ScalarLength(bytes: Buffer, offset: number): number {
+  const first = bytes[offset];
+  if (first === undefined) return 0;
+  if (first <= 0x7f) return 1;
+  if (first >= 0xc2 && first <= 0xdf && isUtf8Continuation(bytes[offset + 1])) return 2;
+  if (first >= 0xe0 && first <= 0xef && isUtf8ThreeByteSecond(first, bytes[offset + 1]) &&
+      isUtf8Continuation(bytes[offset + 2])) return 3;
+  if (first >= 0xf0 && first <= 0xf4 && isUtf8FourByteSecond(first, bytes[offset + 1]) &&
+      isUtf8Continuation(bytes[offset + 2]) && isUtf8Continuation(bytes[offset + 3])) return 4;
+  return 0;
+}
+
+function isUtf8Continuation(value: number | undefined): boolean {
+  return value !== undefined && value >= 0x80 && value <= 0xbf;
+}
+
+function isUtf8ThreeByteSecond(first: number, second: number | undefined): boolean {
+  if (second === undefined) return false;
+  if (first === 0xe0) return second >= 0xa0 && second <= 0xbf;
+  if (first === 0xed) return second >= 0x80 && second <= 0x9f;
+  return second >= 0x80 && second <= 0xbf;
+}
+
+function isUtf8FourByteSecond(first: number, second: number | undefined): boolean {
+  if (second === undefined) return false;
+  if (first === 0xf0) return second >= 0x90 && second <= 0xbf;
+  if (first === 0xf4) return second >= 0x80 && second <= 0x8f;
+  return second >= 0x80 && second <= 0xbf;
+}
+
+function isPotentialUtf8Prefix(bytes: Buffer, offset: number): boolean {
+  const first = bytes[offset]!;
+  const expected = first >= 0xc2 && first <= 0xdf ? 2
+    : first >= 0xe0 && first <= 0xef ? 3
+      : first >= 0xf0 && first <= 0xf4 ? 4 : 0;
+  if (expected === 0 || bytes.length - offset >= expected) return false;
+  for (let index = 1; offset + index < bytes.length; index += 1) {
+    const next = bytes[offset + index]!;
+    if (index === 1 && expected === 3 && !isUtf8ThreeByteSecond(first, next)) return false;
+    if (index === 1 && expected === 4 && !isUtf8FourByteSecond(first, next)) return false;
+    if (index > 1 && !isUtf8Continuation(next)) return false;
+  }
+  return true;
+}
+
+/** Projects malformed UTF-8 byte-by-byte to '?' while preserving valid scalars and raw byte width. */
+class Utf8TextProjector {
+  private pending = Buffer.alloc(0);
+  private finalized = false;
+
+  write(input: Buffer): string {
+    if (this.finalized) throw new Error('UTF-8 text projection is already finalized.');
+    const bytes = this.pending.length === 0 ? input : Buffer.concat([this.pending, input]);
+    this.pending = Buffer.alloc(0);
+    let output = '';
+    let offset = 0;
+    while (offset < bytes.length) {
+      const scalarLength = utf8ScalarLength(bytes, offset);
+      if (scalarLength > 0) {
+        output += bytes.subarray(offset, offset + scalarLength).toString('utf8');
+        offset += scalarLength;
+      } else if (isPotentialUtf8Prefix(bytes, offset)) {
+        this.pending = Buffer.from(bytes.subarray(offset));
+        break;
+      } else {
+        output += '?';
+        offset += 1;
+      }
+    }
+    return output;
+  }
+
+  finish(): string {
+    if (this.finalized) return '';
+    this.finalized = true;
+    const remaining = '?'.repeat(this.pending.length);
+    this.pending = Buffer.alloc(0);
+    return remaining;
+  }
+}
+
+function projectUtf8Bytes(bytes: Buffer): string {
+  const projector = new Utf8TextProjector();
+  return projector.write(bytes) + projector.finish();
+}
+
 function tail(value: string, maxBytes: number): string {
   const bytes = Buffer.from(value, 'utf8');
   if (bytes.length <= maxBytes) return value;
@@ -1052,27 +1139,32 @@ function validateReadRequest(reference: ToolOutputArtifactReference, request: To
 }
 
 function readUtf8Range(bytes: Buffer, bufferOffset: number, offset: number, length: number, total: number): ToolOutputReadResult {
-  // Both stores supply up to three bytes of lookbehind/lookahead so a valid
-  // UTF-8 character is never decoded from an isolated partial byte sequence.
+  if (offset === total) return { channel: 'stdout', offset, text: '', bytes: 0, nextOffset: offset, eof: true };
   let start = offset - bufferOffset;
-  while (start > 0 && (bytes[start]! & 0xc0) === 0x80) start -= 1;
-  let end = start + Math.min(length, bytes.length - start);
-  while (end > start && (bytes[end]! & 0xc0) === 0x80) end -= 1;
-  if (end === start && start < bytes.length) {
-    // Even a one-byte budget must make progress. Return only the first whole
-    // character when it is larger than the budget, never a replacement glyph.
-    end = start + 1;
-    while (end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end += 1;
+  const requested = start;
+  for (let candidate = Math.max(0, requested - 3); candidate < requested; candidate += 1) {
+    const scalarLength = utf8ScalarLength(bytes, candidate);
+    if (scalarLength > 0 && candidate + scalarLength > requested) { start = candidate; break; }
+  }
+  const targetBytes = Math.min(length, total - (bufferOffset + start));
+  let end = start;
+  let firstScalar = true;
+  while (end < bytes.length && (firstScalar || end - start < targetBytes)) {
+    const scalarLength = utf8ScalarLength(bytes, end);
+    const nextLength = scalarLength > 0 ? scalarLength : 1;
+    if (!firstScalar && end - start + nextLength > targetBytes) break;
+    end += nextLength;
+    firstScalar = false;
   }
   const chunk = bytes.subarray(start, end);
-  const text = chunk.toString('utf8');
+  const text = projectUtf8Bytes(chunk);
   const actualOffset = bufferOffset + start;
   const nextOffset = actualOffset + chunk.length;
   return { channel: 'stdout', offset: actualOffset, text, bytes: chunk.length, nextOffset, eof: nextOffset >= total };
 }
 
 export class InMemoryToolOutputStore implements ToolOutputStore {
-  private readonly values = new Map<string, ToolOutputCapture>();
+  private readonly values = new Map<string, { readonly stdout: Buffer; readonly stderr: Buffer }>();
   private readonly maxArtifacts: number;
   private readonly order: string[] = [];
 
@@ -1082,18 +1174,25 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
   }
 
   save(capture: ToolOutputCapture): ToolOutputArtifactReference {
+    return this.saveRawCapture(Buffer.from(capture.stdout, 'utf8'), Buffer.from(capture.stderr, 'utf8'));
+  }
+
+  /** Internal raw-byte path used by the built-in streaming writer. */
+  private saveRawCapture(stdout: Buffer, stderr: Buffer): ToolOutputArtifactReference {
     const id = randomUUID();
-    this.values.set(id, { stdout: capture.stdout, stderr: capture.stderr });
+    const retainedStdout = Buffer.from(stdout);
+    const retainedStderr = Buffer.from(stderr);
+    this.values.set(id, { stdout: retainedStdout, stderr: retainedStderr });
     this.order.push(id);
     while (this.order.length > this.maxArtifacts) {
       const evicted = this.order.shift();
       if (evicted !== undefined) this.values.delete(evicted);
     }
-    return reference(id, capture.stdout, capture.stderr);
+    return referenceBytes(id, retainedStdout, retainedStderr);
   }
 
   startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
-    return new BufferedToolOutputWriter(this, validateToolOutputPolicy(policy));
+    return new BufferedToolOutputWriter(this, validateToolOutputPolicy(policy), (stdout, stderr) => this.saveRawCapture(stdout, stderr));
   }
 
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
@@ -1101,8 +1200,7 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
     const capture = this.values.get(referenceValue.id);
     if (capture === undefined) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable.`);
     const range = validateReadRequest(referenceValue, request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
-    const value = request.channel === 'stdout' ? capture.stdout : capture.stderr;
-    const bytes = Buffer.from(value, 'utf8');
+    const bytes = request.channel === 'stdout' ? capture.stdout : capture.stderr;
     const result = readUtf8Range(bytes, 0, range.offset, range.length, bytes.length);
     return { ...result, channel: request.channel };
   }
@@ -1111,7 +1209,7 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
     validateSearchRequest(request);
     const capture = this.values.get(referenceValue.id);
     if (capture === undefined) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable.`);
-    return searchCapture(capture, request);
+    return searchRawCapture(capture, request);
   }
 }
 
@@ -1183,6 +1281,11 @@ export class FileToolOutputStore implements ToolOutputStore {
       write: (channel, chunk) => {
         if (captureState !== 'open') throw new Error('Tool-output capture is no longer writable.');
         writer.write(channel, chunk);
+      },
+      writeBytes: (channel, chunk) => {
+        if (captureState !== 'open') throw new Error('Tool-output capture is no longer writable.');
+        if (writer.writeBytes === undefined) throw new Error('Tool-output capture writer cannot preserve raw bytes.');
+        writer.writeBytes(channel, chunk);
       },
       finish: () => {
         if (captureState === 'commit-pending') {
@@ -1341,6 +1444,10 @@ export class FileToolOutputStore implements ToolOutputStore {
           write: (channel, chunk) => {
             if (captureState !== 'open' || operationState !== 'open') throw new Error('Tool-output capture is no longer writable.');
             writer.write(channel, chunk);
+          },
+          writeBytes: (channel, chunk) => {
+            if (captureState !== 'open' || operationState !== 'open') throw new Error('Tool-output capture is no longer writable.');
+            writer.writeBytes(channel, chunk);
           },
           finish: () => {
             if (captureState !== 'open' || operationState !== 'open') throw new Error('Tool-output capture can only finish once while its operation is open.');
@@ -2453,7 +2560,11 @@ class StreamCapture {
   constructor(private readonly limit: number) {}
 
   append(chunk: string): void {
-    this.total += utf8Bytes(chunk);
+    this.appendProjected(chunk, utf8Bytes(chunk));
+  }
+
+  appendProjected(chunk: string, rawBytes: number): void {
+    this.total += rawBytes;
     this.preview = tail(`${this.preview}${chunk}`, this.limit);
   }
 
@@ -2536,7 +2647,10 @@ export class ContainedToolOutputCaptureSession {
   private readonly stderr: StreamCapture;
   private readonly stdoutDiagnostics: DiagnosticCapture;
   private readonly stderrDiagnostics: DiagnosticCapture;
+  private readonly stdoutProjector = new Utf8TextProjector();
+  private readonly stderrProjector = new Utf8TextProjector();
   private failed = false;
+  private finalized = false;
 
   private readonly policy: ToolOutputPolicy;
 
@@ -2549,17 +2663,47 @@ export class ContainedToolOutputCaptureSession {
   }
 
   write(writer: ToolOutputCaptureWriter | undefined, channel: 'stdout' | 'stderr', chunk: string): void {
-    if (channel === 'stdout') { this.stdout.append(chunk); this.stdoutDiagnostics.append(chunk); }
-    else { this.stderr.append(chunk); this.stderrDiagnostics.append(chunk); }
+    const raw = Buffer.from(chunk, 'utf8');
+    const projector = channel === 'stdout' ? this.stdoutProjector : this.stderrProjector;
+    this.appendObserved(channel, projector.write(raw), raw.length);
     if (writer === undefined || this.failed) return;
-    try { writer.write(channel, chunk); }
+    try {
+      if (writer.writeBytes !== undefined) writer.writeBytes(channel, raw);
+      else writer.write(channel, chunk);
+    }
     catch {
-      this.failed = true;
-      try { writer.abort?.(); } catch { /* disposal faults cannot stop stream draining */ }
+      this.failWriter(writer);
     }
   }
 
+  writeBytes(writer: ToolOutputCaptureWriter | undefined, channel: 'stdout' | 'stderr', chunk: Buffer): void {
+    const projector = channel === 'stdout' ? this.stdoutProjector : this.stderrProjector;
+    this.appendObserved(channel, projector.write(chunk), chunk.length);
+    if (writer === undefined || this.failed) return;
+    if (writer.writeBytes === undefined) { this.failWriter(writer); return; }
+    try { writer.writeBytes(channel, chunk); }
+    catch { this.failWriter(writer); }
+  }
+
+  private appendObserved(channel: 'stdout' | 'stderr', text: string, rawBytes: number): void {
+    if (channel === 'stdout') { this.stdout.appendProjected(text, rawBytes); this.stdoutDiagnostics.append(text); }
+    else { this.stderr.appendProjected(text, rawBytes); this.stderrDiagnostics.append(text); }
+  }
+
+  private failWriter(writer: ToolOutputCaptureWriter): void {
+    this.failed = true;
+    try { writer.abort?.(); } catch { /* disposal faults cannot stop stream draining */ }
+  }
+
+  private finalizeViews(): void {
+    if (this.finalized) return;
+    this.finalized = true;
+    this.appendObserved('stdout', this.stdoutProjector.finish(), 0);
+    this.appendObserved('stderr', this.stderrProjector.finish(), 0);
+  }
+
   finish(writer: ToolOutputCaptureWriter | undefined): ToolOutputCaptureSessionResult {
+    this.finalizeViews();
     const stdout = this.stdout.value();
     const stderr = this.stderr.value();
     const stdoutDiagnostics = this.stdoutDiagnostics.finish();
@@ -2580,38 +2724,94 @@ export class ContainedToolOutputCaptureSession {
 }
 
 class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
-  private stdout = '';
-  private stderr = '';
+  private stdoutParts: Buffer[] = [];
+  private stderrParts: Buffer[] = [];
+  private readonly stdoutCapture: StreamCapture;
+  private readonly stderrCapture: StreamCapture;
+  private readonly stdoutDiagnostics: DiagnosticCapture;
+  private readonly stderrDiagnostics: DiagnosticCapture;
+  private readonly stdoutProjector = new Utf8TextProjector();
+  private readonly stderrProjector = new Utf8TextProjector();
   private state: 'open' | 'finished' | 'failed' | 'aborted' = 'open';
+  private finalizedViews = false;
 
-  constructor(private readonly store: ToolOutputStore, private readonly policy: ToolOutputPolicy) {}
+  constructor(
+    private readonly store: ToolOutputStore,
+    private readonly policy: ToolOutputPolicy,
+    private readonly saveRaw?: (stdout: Buffer, stderr: Buffer) => ToolOutputArtifactReference,
+  ) {
+    this.stdoutCapture = new StreamCapture(policy.previewBytes);
+    this.stderrCapture = new StreamCapture(policy.previewBytes);
+    this.stdoutDiagnostics = new DiagnosticCapture(policy);
+    this.stderrDiagnostics = new DiagnosticCapture(policy);
+  }
 
   write(channel: 'stdout' | 'stderr', chunk: string): void {
+    this.writeBytes(channel, Buffer.from(chunk, 'utf8'));
+  }
+
+  writeBytes(channel: 'stdout' | 'stderr', chunk: Buffer): void {
     if (this.state !== 'open') throw new Error('Tool-output capture is no longer writable.');
-    if (channel === 'stdout') this.stdout += chunk;
-    else this.stderr += chunk;
+    const retained = Buffer.from(chunk);
+    const projector = channel === 'stdout' ? this.stdoutProjector : this.stderrProjector;
+    const text = projector.write(retained);
+    if (channel === 'stdout') {
+      this.stdoutParts.push(retained);
+      this.stdoutCapture.appendProjected(text, retained.length);
+      this.stdoutDiagnostics.append(text);
+    } else {
+      this.stderrParts.push(retained);
+      this.stderrCapture.appendProjected(text, retained.length);
+      this.stderrDiagnostics.append(text);
+    }
   }
 
   finish(): ToolOutputCaptureSummary {
     if (this.state !== 'open') throw new Error('Tool-output capture can only finish once.');
+    this.finalizeViews();
+    const stdout = Buffer.concat(this.stdoutParts);
+    const stderr = Buffer.concat(this.stderrParts);
     let artifact: ToolOutputArtifactReference;
-    try { artifact = this.store.save({ stdout: this.stdout, stderr: this.stderr }); }
+    try {
+      if (this.saveRaw !== undefined) artifact = this.saveRaw(stdout, stderr);
+      else {
+        const stdoutText = stdout.toString('utf8');
+        const stderrText = stderr.toString('utf8');
+        if (!Buffer.from(stdoutText, 'utf8').equals(stdout) || !Buffer.from(stderrText, 'utf8').equals(stderr)) {
+          throw new Error('A string-only tool-output store cannot preserve malformed raw UTF-8 bytes.');
+        }
+        artifact = this.store.save({ stdout: stdoutText, stderr: stderrText });
+      }
+    }
     catch (error) { this.state = 'failed'; throw error; }
-    const diagnostics = boundedDiagnostics(this.stdout, this.stderr, this.policy);
+    const stdoutDiagnostics = this.stdoutDiagnostics.finish();
+    const stderrDiagnostics = this.stderrDiagnostics.finish();
+    const diagnostics = boundedDiagnostics([...stdoutDiagnostics.lines, ...stderrDiagnostics.lines].join('\n'), '', this.policy);
     this.state = 'finished';
     return {
       artifact,
-      stdout: stream(this.stdout, this.policy.previewBytes),
-      stderr: stream(this.stderr, this.policy.previewBytes),
+      stdout: this.stdoutCapture.value(),
+      stderr: this.stderrCapture.value(),
       diagnostics: diagnostics.lines,
-      diagnosticsTruncated: diagnostics.truncated,
+      diagnosticsTruncated: stdoutDiagnostics.truncated || stderrDiagnostics.truncated || diagnostics.truncated,
     };
+  }
+
+  private finalizeViews(): void {
+    if (this.finalizedViews) return;
+    this.finalizedViews = true;
+    const stdout = this.stdoutProjector.finish();
+    const stderr = this.stderrProjector.finish();
+    this.stdoutCapture.appendProjected(stdout, 0);
+    this.stderrCapture.appendProjected(stderr, 0);
+    this.stdoutDiagnostics.append(stdout);
+    this.stderrDiagnostics.append(stderr);
   }
 
   abort(): void {
     if (this.state === 'finished' || this.state === 'aborted') return;
-    this.stdout = '';
-    this.stderr = '';
+    this.stdoutParts = [];
+    this.stderrParts = [];
     this.state = 'aborted';
   }
 }
@@ -2623,8 +2823,11 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
   private readonly stderrCapture: StreamCapture;
   private readonly stdoutDiagnostics: DiagnosticCapture;
   private readonly stderrDiagnostics: DiagnosticCapture;
+  private readonly stdoutProjector = new Utf8TextProjector();
+  private readonly stderrProjector = new Utf8TextProjector();
   private finished = false;
   private poisoned = false;
+  private finalizedViews = false;
   private fileIdentity: ToolOutputArtifactFileIdentity | undefined;
 
   constructor(
@@ -2652,34 +2855,60 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
   }
 
   write(channel: 'stdout' | 'stderr', chunk: string): void {
+    this.assertWritable();
+    const byteLength = Buffer.byteLength(chunk, 'utf8');
+    this.reserveCaptureBytes(byteLength);
+    let bytes: Buffer;
+    try { bytes = Buffer.from(chunk, 'utf8'); }
+    catch (error) { this.poisoned = true; throw error; }
+    this.writeAdmittedBytes(channel, bytes, byteLength);
+  }
+
+  writeBytes(channel: 'stdout' | 'stderr', bytes: Buffer): void {
+    this.assertWritable();
+    const byteLength = bytes.length;
+    this.reserveCaptureBytes(byteLength);
+    this.writeAdmittedBytes(channel, bytes, byteLength);
+  }
+
+  private assertWritable(): void {
     if (this.finished) throw new Error('Tool-output capture is already finished.');
     if (this.poisoned) throw new Error('Tool-output capture writer is poisoned after an incomplete write.');
-    const byteLength = Buffer.byteLength(chunk, 'utf8');
+  }
+
+  private reserveCaptureBytes(byteLength: number): void {
     try { this.reserveBytes(byteLength); }
     catch (error) { this.poisoned = true; throw error; }
+  }
+
+  private writeAdmittedBytes(channel: 'stdout' | 'stderr', bytes: Buffer, byteLength: number): void {
     try {
-      const bytes = Buffer.from(chunk, 'utf8');
       const handle = channel === 'stdout' ? this.stdoutHandle : this.stderrHandle;
       if (handle === undefined) throw new Error('Tool-output capture descriptor is unavailable.');
       writeFully(handle, bytes, this.testFaults?.writeSync);
     } catch (error) { this.poisoned = true; throw error; }
+    const projector = channel === 'stdout' ? this.stdoutProjector : this.stderrProjector;
+    const text = projector.write(bytes);
     if (channel === 'stdout') {
-      this.stdoutCapture.append(chunk);
-      this.stdoutDiagnostics.append(chunk);
+      this.stdoutCapture.appendProjected(text, byteLength);
+      this.stdoutDiagnostics.append(text);
     } else {
-      this.stderrCapture.append(chunk);
-      this.stderrDiagnostics.append(chunk);
+      this.stderrCapture.appendProjected(text, byteLength);
+      this.stderrDiagnostics.append(text);
     }
   }
 
   finish(): ToolOutputCaptureSummary {
     if (this.poisoned) throw new Error('Tool-output capture cannot finish after an incomplete or over-budget write.');
+    if (!this.finished) {
+      this.testFaults?.beforeFinish?.();
+      this.finalizeViews();
+    }
     const stdout = this.stdoutCapture.value();
     const stderr = this.stderrCapture.value();
     const stdoutBytes = stdout.bytes;
     const stderrBytes = stderr.bytes;
     if (!this.finished) {
-      this.testFaults?.beforeFinish?.();
       let failure: unknown;
       for (const [channel, handle] of [['stdout', this.stdoutHandle], ['stderr', this.stderrHandle]] as const) {
         if (handle !== undefined) { try { this.testFaults?.beforeFsync?.(channel); fsyncSync(handle); } catch (error) { if (failure === undefined) failure = error; } }
@@ -2748,6 +2977,17 @@ class FileToolOutputWriter implements ToolOutputCaptureWriter {
     if (failure !== undefined) throw failure;
     fsyncArtifactRoot(this.root, this.testFaults, 'abort');
   }
+
+  private finalizeViews(): void {
+    if (this.finalizedViews) return;
+    this.finalizedViews = true;
+    const stdout = this.stdoutProjector.finish();
+    const stderr = this.stderrProjector.finish();
+    this.stdoutCapture.appendProjected(stdout, 0);
+    this.stderrCapture.appendProjected(stderr, 0);
+    this.stdoutDiagnostics.append(stdout);
+    this.stderrDiagnostics.append(stderr);
+  }
 }
 
 function fsyncArtifactRoot(
@@ -2778,6 +3018,15 @@ function reference(id: string, stdout: string, stderr: string): ToolOutputArtifa
     stderrBytes: utf8Bytes(stderr),
     totalBytes: utf8Bytes(stdout) + utf8Bytes(stderr),
     sha256: artifactHash(stdout, stderr),
+  };
+}
+
+function referenceBytes(id: string, stdout: Buffer, stderr: Buffer): ToolOutputArtifactReference {
+  const hash = createHash('sha256').update(stdout).update('\0', 'utf8').update(stderr).digest('hex');
+  return {
+    kind: 'tool-output', id,
+    stdoutBytes: stdout.length, stderrBytes: stderr.length, totalBytes: stdout.length + stderr.length,
+    sha256: hash,
   };
 }
 
@@ -2870,13 +3119,15 @@ function hashFile(
   }
 }
 
-function searchCapture(capture: ToolOutputCapture, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
+function searchRawCapture(capture: { readonly stdout: Buffer; readonly stderr: Buffer }, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
   const { maxMatches, maxBytes } = validateSearchRequest(request);
   const channels = request.channel === undefined ? (['stdout', 'stderr'] as const) : [request.channel];
   const results: ToolOutputMatch[] = [];
   for (const channel of channels) {
-    const value = channel === 'stdout' ? capture.stdout : capture.stderr;
-    scanText(channel, value, request.query, maxMatches, maxBytes, results);
+    const bytes = channel === 'stdout' ? capture.stdout : capture.stderr;
+    const projector = new Utf8TextProjector();
+    const projected = projector.write(bytes) + projector.finish();
+    scanDecodedChunks(channel, request.query, maxMatches, maxBytes, results, [projected], emptySearchState(), true);
     if (results.length >= maxMatches) return results;
   }
   return results;
@@ -2906,17 +3157,6 @@ function validateSearchRequest(request: ToolOutputSearchRequest): { readonly max
   return { maxMatches, maxBytes };
 }
 
-function scanText(
-  channel: 'stdout' | 'stderr',
-  value: string,
-  query: string,
-  maxMatches: number,
-  maxBytes: number,
-  results: ToolOutputMatch[],
-): void {
-  scanDecodedChunks(channel, query, maxMatches, maxBytes, results, [value], emptySearchState(), true);
-}
-
 function searchFile(
   handle: number,
   expectedBytes: number,
@@ -2929,7 +3169,7 @@ function searchFile(
 ): readonly ToolOutputMatch[] {
   const results: ToolOutputMatch[] = [];
   const buffer = Buffer.alloc(64 * 1024);
-  const decoder = new StringDecoder('utf8');
+  const projector = new Utf8TextProjector();
   let state = emptySearchState();
   let offset = 0;
   while (offset < expectedBytes && results.length + existingMatches < maxMatches) {
@@ -2941,11 +3181,11 @@ function searchFile(
       chunkBytes += count;
     }
     offset += chunkBytes;
-    const chunks = [decoder.write(buffer.subarray(0, chunkBytes))];
+    const chunks = [projector.write(buffer.subarray(0, chunkBytes))];
     state = scanDecodedChunks(channel, query, maxMatches - existingMatches, maxBytes, results, chunks, state);
   }
   assertArtifactDescriptor(handle, expectedBytes, identity);
-  const tail = decoder.end();
+  const tail = projector.finish();
   if (results.length + existingMatches < maxMatches) {
     scanDecodedChunks(channel, query, maxMatches - existingMatches, maxBytes, results, [tail], state, true);
   }

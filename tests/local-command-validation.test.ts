@@ -737,6 +737,33 @@ describe('ConfiguredLocalValidationAdapter', () => {
     });
   });
 
+  it('captures actual child pipe bytes without replacement decoding before validation evidence persistence', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-raw-pipes-'));
+    dirs.push(root);
+    const store = new FileToolOutputStore(path.join(root, 'store'));
+    const stdout = Buffer.from([0x4f, 0xff, 0x80, 0xe2, 0x82, 0x42]);
+    const stderr = Buffer.from([0xc0, 0xaf, 0xf0, 0x9f, 0x99, 0x82]);
+    const script = `process.stdout.write(Buffer.from(${JSON.stringify([...stdout])})); process.stderr.write(Buffer.from(${JSON.stringify([...stderr])}));`;
+    const evidence = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', script]),
+      commands: [{ argv: [process.execPath, '-e', script], timeoutMs: 2_000, captureOutput: true }],
+      outputStore: store,
+      outputPolicy: { previewBytes: 32, diagnosticBytes: 64, maxDiagnostics: 4, readBytes: 32 },
+    }).validate(owned);
+    const command = evidence.commands[0]!;
+    assert.equal(command.captureStatus, 'complete');
+    assert.ok(command.output);
+    const artifact = command.output.artifact;
+    assert.deepEqual(readFileSync(path.join(root, 'store', `${artifact.id}.stdout`)), stdout);
+    assert.deepEqual(readFileSync(path.join(root, 'store', `${artifact.id}.stderr`)), stderr);
+    assert.equal(command.output.stdout.preview, 'O????B');
+    assert.equal(command.output.stderr.preview, '??🙂');
+    assert.equal(artifact.stdoutBytes, stdout.length);
+    assert.equal(artifact.stderrBytes, stderr.length);
+    assert.equal(readToolOutput(command.output, store, { channel: 'stdout' }).text, 'O????B');
+  });
+
   it('keeps validation outcome truthful when capture close needs a bounded store-owned retry', async () => {
     const owned = request();
     const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-terminal-retry-'));

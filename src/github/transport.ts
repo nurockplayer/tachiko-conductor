@@ -11,7 +11,6 @@ import {
   type ToolOutputStore,
   type ToolOutputCaptureWriter,
 } from '../evidence/tool-output.js';
-import { StringDecoder } from 'node:string_decoder';
 import { GitHubLiveStateError } from './errors.js';
 
 export interface GitHubApiTransport {
@@ -229,8 +228,6 @@ export class NodeProcessRunner implements ProcessRunner {
       let captureForcedIncomplete = false;
       let writerAborted = false;
       let stdinError: unknown;
-      const stdoutDecoder = new StringDecoder('utf8');
-      const stderrDecoder = new StringDecoder('utf8');
       let timer: ReturnType<typeof setTimeout> | undefined;
       const kill = (): boolean => {
         if (settled || !childSpawned || directExitObserved || !Number.isSafeInteger(child.pid) || child.pid! <= 0) return false;
@@ -256,12 +253,11 @@ export class NodeProcessRunner implements ProcessRunner {
         if (!stdoutNaturalEof) { try { child.stdout?.destroy(); } catch { /* settlement continues */ } }
         if (!stderrNaturalEof) { try { child.stderr?.destroy(); } catch { /* settlement continues */ } }
       };
-      const capture = (channel: 'stdout' | 'stderr', chunk: Buffer, decoder: StringDecoder): void => {
-        const text = decoder.write(chunk);
-        if (text !== '') session.write(captureForcedIncomplete ? undefined : writer, channel, text);
+      const capture = (channel: 'stdout' | 'stderr', chunk: Buffer): void => {
+        session.writeBytes(captureForcedIncomplete ? undefined : writer, channel, chunk);
       };
-      child.stdout?.on('data', (chunk: Buffer) => capture('stdout', chunk, stdoutDecoder));
-      child.stderr?.on('data', (chunk: Buffer) => capture('stderr', chunk, stderrDecoder));
+      child.stdout?.on('data', (chunk: Buffer) => capture('stdout', chunk));
+      child.stderr?.on('data', (chunk: Buffer) => capture('stderr', chunk));
       child.stdout?.once('end', () => { stdoutNaturalEof = true; });
       child.stderr?.once('end', () => { stderrNaturalEof = true; });
       child.stdin?.on('error', (error) => { stdinError ??= error; });
@@ -287,10 +283,6 @@ export class NodeProcessRunner implements ProcessRunner {
         options.signal?.removeEventListener('abort', onAbort);
         if (settled) return;
         settled = true;
-        const stdoutFinal = stdoutDecoder.end();
-        const stderrFinal = stderrDecoder.end();
-        if (stdoutFinal !== '') session.write(captureForcedIncomplete ? undefined : writer, 'stdout', stdoutFinal);
-        if (stderrFinal !== '') session.write(captureForcedIncomplete ? undefined : writer, 'stderr', stderrFinal);
         const exitCode = typeof rawCode === 'number' ? rawCode : null;
         const cleanZeroExit = exitCode === 0 && signal === null;
         const cancelledError = cancelled || (!cleanZeroExit && options.signal?.aborted === true);
@@ -332,10 +324,6 @@ export class NodeProcessRunner implements ProcessRunner {
           settled = true;
           if (timer !== undefined) clearTimeout(timer);
           options.signal?.removeEventListener('abort', onAbort);
-          const stdoutFinal = stdoutDecoder.end();
-          const stderrFinal = stderrDecoder.end();
-          if (stdoutFinal !== '') session.write(captureForcedIncomplete ? undefined : writer, 'stdout', stdoutFinal);
-          if (stderrFinal !== '') session.write(captureForcedIncomplete ? undefined : writer, 'stderr', stderrFinal);
           const summary = this.finishCapture(writer, session, 'cancelled', null, policy, captureForcedIncomplete);
           reject(attachCapture(Object.assign(new Error(`Command ${file} was cancelled.`), { code: 'ABORT_ERR' }), summary));
         }

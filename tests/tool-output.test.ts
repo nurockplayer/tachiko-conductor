@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { chmodSync, closeSync, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync, writeSync as fsWriteSync } from 'node:fs';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -2727,4 +2728,128 @@ describe('UTF-8 tool output ranges', () => {
       });
     });
   }
+});
+
+describe('raw-byte tool output capture', () => {
+  it('preserves malformed source bytes and projects each invalid byte consistently across stores', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-raw-byte-capture-'));
+    const raw = Buffer.from([0x41, 0xff, 0x80, 0xc0, 0xaf, 0xed, 0xa0, 0x80, 0xf4, 0x90, 0x80, 0x80, 0xe2, 0x82, 0x0a, 0x42]);
+    const stderr = Buffer.from([0x00, 0xef, 0xbb, 0xbf, 0xef, 0xbf, 0xbd, 0xe2, 0x82]);
+    const expected = Buffer.from([0x41, ...Buffer.from('?????????????\n'), 0x42]);
+    try {
+      for (const store of [new InMemoryToolOutputStore(), new FileToolOutputStore(directory)]) {
+        const writer = store.startCapture(policy);
+        writer.writeBytes!('stdout', raw.subarray(0, 2));
+        writer.writeBytes!('stdout', raw.subarray(2, 9));
+        writer.writeBytes!('stdout', raw.subarray(9));
+        writer.writeBytes!('stderr', stderr);
+        const summary = writer.finish();
+        assert.equal(summary.artifact.stdoutBytes, raw.length);
+        assert.equal(summary.artifact.stderrBytes, stderr.length);
+        assert.equal(summary.artifact.sha256,
+          createHash('sha256').update(raw).update('\0').update(stderr).digest('hex'));
+        assert.equal(summary.stdout.preview, expected.toString('utf8'));
+        assert.equal(summary.stdout.bytes, raw.length, 'preview accounting is charged in original bytes');
+        assert.equal(summary.stderr.preview, '\0\ufeff\ufffd??', 'NUL, BOM, literal U+FFFD, and truncated EOF bytes retain distinct meanings');
+        assert.equal(store.read(summary.artifact, { channel: 'stdout', offset: 0, length: 64 }).text, expected.toString('utf8'));
+        assert.deepEqual(store.search(summary.artifact, { channel: 'stdout', query: 'B' })[0]?.offset, raw.length - 1,
+          'search reports original source-byte offsets after malformed input');
+        if (store instanceof FileToolOutputStore) {
+          assert.deepEqual(readFileSync(path.join(directory, `${summary.artifact.id}.stdout`)), raw);
+          assert.deepEqual(readFileSync(path.join(directory, `${summary.artifact.id}.stderr`)), stderr);
+        }
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('copies memory writer buffers and preserves valid UTF-8 split across writes', () => {
+    const store = new InMemoryToolOutputStore();
+    const writer = store.startCapture(policy);
+    for (const split of [1, 2, 3]) {
+      const bytes = Buffer.from([0xf0, 0x9f, 0x99, 0x82]);
+      const first = bytes.subarray(0, split);
+      const second = bytes.subarray(split);
+      writer.writeBytes!('stdout', first);
+      writer.writeBytes!('stdout', second);
+      // Each partition is independently projected by a fresh store below.
+      const check = new InMemoryToolOutputStore().startCapture(policy);
+      check.writeBytes!('stdout', bytes.subarray(0, split));
+      check.writeBytes!('stdout', bytes.subarray(split));
+      assert.equal(check.finish().stdout.preview, '🙂');
+      first.fill(0);
+      second.fill(0);
+    }
+    const summary = writer.finish();
+    assert.equal(summary.artifact.stdoutBytes, 12);
+    assert.equal(store.read(summary.artifact, { channel: 'stdout', length: 12 }).text, '🙂🙂🙂');
+    assert.equal(store.read(summary.artifact, { channel: 'stdout', offset: 1, length: 1 }).bytes, 4,
+      'range reads align only to the valid scalar containing the requested raw offset');
+  });
+
+  it('charges file capture limits in raw bytes and fails closed for a legacy string-only sink', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-raw-byte-quota-'));
+    try {
+      const store = new FileToolOutputStore(directory, { captureMaxBytes: 2 });
+      const exact = store.startCapture(policy);
+      exact.writeBytes!('stdout', Buffer.from([0xff, 0x80]));
+      assert.equal(exact.finish().artifact.totalBytes, 2);
+
+      const over = store.startCapture(policy);
+      assert.throws(() => over.writeBytes!('stdout', Buffer.from([0xff, 0x80, 0x81])), /budget exhausted/);
+      assert.throws(() => over.finish(), /cannot finish/);
+      over.abort?.();
+
+      let aborted = 0;
+      const legacy = {
+        write() { throw new Error('raw bytes must never be coerced into this legacy writer'); },
+        finish() { throw new Error('partial capture must not finish'); },
+        abort() { aborted += 1; },
+      };
+      const session = new ContainedToolOutputCaptureSession(policy);
+      session.writeBytes(legacy, 'stdout', Buffer.from([0xff]));
+      const result = session.finish(legacy);
+      assert.equal(aborted, 1);
+      assert.equal(result.status, 'partial');
+      assert.equal(result.stdout.preview, '?');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('reserves oversized string bytes before encoding and charges mixed strings and raw buffers exactly once', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-string-admission-order-'));
+    try {
+    const oversizedStore = new FileToolOutputStore(path.join(directory, 'oversized'), { captureMaxBytes: 1 });
+    const oversizedWriter = oversizedStore.startCapture(policy);
+    const largeString = 'x'.repeat(262_163);
+    const originalFrom = Buffer.from;
+    let largeEncodes = 0;
+    Buffer.from = new Proxy(originalFrom, {
+      apply(target, thisArg, argumentsList: unknown[]) {
+        if (typeof argumentsList[0] === 'string' && argumentsList[0].length > 100_000) largeEncodes += 1;
+        return Reflect.apply(target, thisArg, argumentsList);
+      },
+    }) as typeof Buffer.from;
+    try {
+      assert.throws(() => oversizedWriter.write('stdout', largeString), /budget exhausted/);
+      assert.equal(largeEncodes, 0, 'a refused string is never converted into a full Buffer');
+      assert.throws(() => oversizedWriter.finish(), /cannot finish/);
+    } finally {
+      Buffer.from = originalFrom;
+      oversizedWriter.abort?.();
+    }
+
+    const exactStore = new FileToolOutputStore(path.join(directory, 'exact'), { captureMaxBytes: 4 });
+    const exactWriter = exactStore.startCapture(policy);
+    exactWriter.write('stdout', 'é');
+    exactWriter.writeBytes!('stderr', Buffer.from([0xff, 0x80]));
+    const summary = exactWriter.finish();
+    assert.equal(summary.artifact.stdoutBytes, 2);
+    assert.equal(summary.artifact.stderrBytes, 2);
+    assert.equal(summary.artifact.totalBytes, 4, 'string and raw writes share the exact aggregate quota');
+    assert.equal(summary.stdout.bytes, 2);
+    assert.equal(summary.stderr.bytes, 2);
+    assert.equal(summary.stderr.preview, '??');
+    assert.equal(summary.artifact.sha256,
+      createHash('sha256').update(Buffer.from('é')).update('\0').update(Buffer.from([0xff, 0x80])).digest('hex'));
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
 });

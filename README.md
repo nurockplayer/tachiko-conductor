@@ -427,8 +427,18 @@ both streams); the library may lower this limit with `captureMaxBytes`, but no
 runtime environment setting raises or changes it. When admission or filesystem
 I/O fails, capture is partial and no artifact is published for that writer;
 streaming validation continues draining output and reports the observed command
-result separately. This is an admission bound, not a guarantee of available
-disk space or a global filesystem quota. New and rewritten authoritative Run
+result separately. Artifacts retain the exact source bytes. Bounded previews,
+diagnostics, range reads, and search expose valid UTF-8 unchanged and project
+each malformed UTF-8 byte to `?`; their byte counts and offsets still refer to
+the original artifact bytes. This text view is intentionally lossy, while the
+artifact hash and raw artifact remain exact. Search runs over the projected
+text, so `?` can match either a malformed-byte placeholder or a literal question
+mark; text reads and search are not binary export paths. String writes are
+encoded as UTF-8 per write, including Node's replacement of isolated JavaScript
+surrogates; scalar sequences split across separate string writes are not joined.
+This is an admission bound, not a
+guarantee of available disk space or a global filesystem quota. New and
+rewritten authoritative Run
 snapshots are published with mode `0600`; existing legacy Run files are not
 retroactively hardened. Releasing or expiring a tool-output artifact does not
 scrub raw previews already persisted in a Run; those previews follow the
