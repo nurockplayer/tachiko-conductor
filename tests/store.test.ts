@@ -8,7 +8,7 @@ import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
 import { isValidationResultCoherent } from '../src/domain/validation.js';
-import { InMemoryToolOutputStore, boundToolOutput, isToolOutputEnvelope } from '../src/evidence/tool-output.js';
+import { InMemoryToolOutputStore, TOOL_OUTPUT_POLICY_MAXIMA, boundToolOutput, isToolOutputEnvelope } from '../src/evidence/tool-output.js';
 import type { Run } from '../src/domain/types.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import { isCurrentAccountPathApplicable } from '../src/account-home.js';
@@ -1242,6 +1242,80 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
       'CAS rejects a corrupt existing Run before comparing or writing');
     assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS leaves the original raw bytes untouched');
+  });
+
+  it('bounds partial and unavailable fallback diagnostics before validation and persisted Run admission', () => {
+    const headSha = 'fallback-diagnostics-validation-head';
+    const base = validationPassed(headSha);
+    const command = { commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+      exitCode: 0, durationMs: 1, captureStatus: 'partial' as const, capturePreview: {
+        stdout: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        diagnostics: [] as string[], diagnosticsTruncated: false,
+      } };
+    const withDiagnostics = (status: 'partial' | 'unavailable', diagnostics: string[]) => ({
+      ...base,
+      local: { ...base.local, commands: [{ ...command, captureStatus: status, capturePreview: {
+        ...command.capturePreview, diagnostics,
+      } }] },
+    });
+    const rejected: Array<{ name: string; diagnostics: string[] }> = [
+      { name: 'line count', diagnostics: Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics + 1 }, () => 'x') },
+      { name: 'single byte total', diagnostics: ['x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes + 1)] },
+      { name: 'LF joined total', diagnostics: Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics }, () => 'x'.repeat(512)) },
+      { name: 'UTF-8 total', diagnostics: ['界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes / 3)) + '界'.repeat(2)] },
+    ];
+    for (const status of ['partial', 'unavailable'] as const) {
+      for (const candidate of rejected) {
+        assert.equal(isValidationResultCoherent(withDiagnostics(status, candidate.diagnostics)), false,
+          `${status} capture rejects ${candidate.name} above policy`);
+      }
+    }
+
+    const exactJoined = Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics }, (_, index) =>
+      index === TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics - 1 ? 'x'.repeat(385) : 'x'.repeat(512));
+    assert.equal(exactJoined.reduce((bytes, line) => bytes + Buffer.byteLength(line) + 1, -1), TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes,
+      'positive joined-byte fixture includes each LF separator');
+    const exactUtf8 = '😀'.repeat(16_383) + 'abcd';
+    assert.equal(Buffer.byteLength(exactUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes);
+    for (const status of ['partial', 'unavailable'] as const) {
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, exactJoined)), true,
+        `${status} capture accepts exact line-count and joined-byte boundaries`);
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, [exactUtf8])), true,
+        `${status} capture counts UTF-8 bytes at the exact boundary`);
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, [])), true,
+        `${status} capture accepts an empty diagnostic list`);
+    }
+
+    const invalidValidation = withDiagnostics('partial', rejected[2]!.diagnostics);
+    const implementing = applyTransition(newRun('fallback-diagnostics-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: invalidValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const validValidation = withDiagnostics('partial', exactJoined);
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    assert.equal(isValidationResultCoherent(store.read(validRun.id)?.validationResult), true,
+      'legitimate exact-boundary fallback evidence survives create/read');
+
+    const invalidRun = { ...validRun, validationResult: invalidValidation };
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const invalidBytes = JSON.stringify(invalidRun);
+    writeFileSync(runPath, invalidBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected persisted read preserves the malformed raw bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects malformed persisted fallback evidence before writing');
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS preserves the malformed raw bytes');
   });
 
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {

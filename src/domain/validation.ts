@@ -1,5 +1,5 @@
 import type { HostedValidationEvidence, LocalValidationEvidence, ValidationResult, ValidationStatus } from './types.js';
-import { isToolOutputEnvelope } from '../evidence/tool-output.js';
+import { isToolOutputEnvelope, TOOL_OUTPUT_POLICY_MAXIMA } from '../evidence/tool-output.js';
 
 function isCommandOutcome(value: unknown): value is 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed' {
   return value === 'passed' || value === 'failed' || value === 'timed_out' || value === 'unavailable' || value === 'malformed';
@@ -20,8 +20,17 @@ function isCommandOutputCoherent(command: Record<string, unknown>): boolean {
         (stream.previewBytes as number) <= 1_048_576 && typeof stream.truncated === 'boolean';
     };
     if (!streamValid(preview.stdout) || !streamValid(preview.stderr) || !Array.isArray(preview.diagnostics) ||
-        !preview.diagnostics.every((line) => typeof line === 'string' && Buffer.byteLength(line, 'utf8') <= 1_048_576) ||
+        preview.diagnostics.length > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||
         typeof preview.diagnosticsTruncated !== 'boolean') return false;
+    let diagnosticBytes = 0;
+    for (let index = 0; index < preview.diagnostics.length; index += 1) {
+      const line = preview.diagnostics[index];
+      if (typeof line !== 'string') return false;
+      const separatorBytes = index === 0 ? 0 : 1;
+      if (diagnosticBytes + line.length + separatorBytes > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes) return false;
+      diagnosticBytes += Buffer.byteLength(line, 'utf8') + separatorBytes;
+      if (diagnosticBytes > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes) return false;
+    }
   }
   if (command.output === undefined) return command.captureStatus !== 'complete';
   if (command.capturePreview !== undefined) return false;
