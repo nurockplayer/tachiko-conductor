@@ -984,14 +984,31 @@ export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelop
     ![overflowRecord.totalBytes, overflowRecord.retainedBytes, overflowRecord.omittedBytes, overflowRecord.previewLimitBytes,
       overflowRecord.diagnosticLimitBytes, overflowRecord.diagnosticLimitLines]
       .every((item) => typeof item === 'number' && Number.isSafeInteger(item) && item >= 0)) return false;
-  if ((overflowRecord.previewLimitBytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes ||
-      (overflowRecord.diagnosticLimitBytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes ||
-      (overflowRecord.diagnosticLimitLines as number) > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||
-      envelope.diagnostics.length > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||
-      utf8Bytes(envelope.diagnostics.join('\n')) > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes) return false;
+  const previewLimitBytes = overflowRecord.previewLimitBytes as number;
+  const diagnosticLimitBytes = overflowRecord.diagnosticLimitBytes as number;
+  const diagnosticLimitLines = overflowRecord.diagnosticLimitLines as number;
+  if (previewLimitBytes < 1 || diagnosticLimitBytes < 1 || diagnosticLimitLines < 1 ||
+      previewLimitBytes > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes ||
+      diagnosticLimitBytes > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes ||
+      diagnosticLimitLines > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||
+      envelope.diagnostics.length > diagnosticLimitLines ||
+      utf8Bytes(envelope.summary) > diagnosticLimitBytes) return false;
+  let joinedDiagnosticsBytes = 0;
+  for (let index = 0; index < envelope.diagnostics.length; index += 1) {
+    if (index > 0) {
+      if (joinedDiagnosticsBytes >= diagnosticLimitBytes) return false;
+      joinedDiagnosticsBytes += 1;
+    }
+    const lineBytes = utf8Bytes(envelope.diagnostics[index]!);
+    if (lineBytes > diagnosticLimitBytes - joinedDiagnosticsBytes) return false;
+    joinedDiagnosticsBytes += lineBytes;
+  }
   const expectedTruncated = overflowRecord.capture || overflowRecord.summary || overflowRecord.diagnostics || overflowRecord.stdout || overflowRecord.stderr;
   return envelope.stdout.previewBytes === utf8Bytes(envelope.stdout.preview) &&
     envelope.stderr.previewBytes === utf8Bytes(envelope.stderr.preview) &&
+    envelope.stdout.previewBytes <= previewLimitBytes && envelope.stdout.previewBytes <= envelope.stdout.bytes &&
+    envelope.stderr.previewBytes <= previewLimitBytes && envelope.stderr.previewBytes <= envelope.stderr.bytes &&
+    envelope.stdout.bytes === envelope.artifact.stdoutBytes && envelope.stderr.bytes === envelope.artifact.stderrBytes &&
     envelope.artifact.totalBytes === envelope.artifact.stdoutBytes + envelope.artifact.stderrBytes &&
     overflowRecord.totalBytes === envelope.artifact.totalBytes &&
     overflowRecord.retainedBytes === envelope.stdout.previewBytes + envelope.stderr.previewBytes &&

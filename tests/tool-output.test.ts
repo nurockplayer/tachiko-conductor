@@ -487,6 +487,65 @@ describe('bounded tool output contract', () => {
     assert.equal(omitted.diagnosticsTruncated, true);
   });
 
+  it('enforces each declared envelope payload limit and preserves exact UTF-8 boundaries', () => {
+    const base = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'xy', stderr: '',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 1, diagnosticBytes: 1, maxDiagnostics: 1, readBytes: 1 } });
+    assert.equal(isToolOutputEnvelope(base), true);
+
+    const invalid = (mutate: (envelope: any) => void) => {
+      const envelope = structuredClone(base) as any;
+      mutate(envelope);
+      return envelope;
+    };
+    const overPreview = invalid((envelope) => {
+      envelope.stdout.preview = 'xy';
+      envelope.stdout.previewBytes = Buffer.byteLength(envelope.stdout.preview);
+      envelope.overflow.retainedBytes = envelope.stdout.previewBytes + envelope.stderr.previewBytes;
+      envelope.overflow.omittedBytes = Math.max(0, envelope.overflow.totalBytes - envelope.overflow.retainedBytes);
+    });
+    const overSummary = invalid((envelope) => { envelope.summary = 'x'.repeat(65_537); });
+    const overDiagnosticBytes = invalid((envelope) => { envelope.diagnostics = ['xx']; });
+    const overJoinedDiagnosticBytes = invalid((envelope) => {
+      envelope.overflow.diagnosticLimitBytes = 2;
+      envelope.overflow.diagnosticLimitLines = 2;
+      envelope.diagnostics = ['x', 'x'];
+    });
+    const overDiagnosticLines = invalid((envelope) => {
+      envelope.overflow.diagnosticLimitBytes = 4;
+      envelope.diagnostics = ['x', 'x'];
+    });
+    const previewExceedsStreamBytes = invalid((envelope) => {
+      envelope.stdout.preview = 'xy';
+      envelope.stdout.previewBytes = Buffer.byteLength(envelope.stdout.preview);
+      envelope.stdout.bytes = 1;
+      envelope.overflow.previewLimitBytes = 4;
+      envelope.overflow.retainedBytes = envelope.stdout.previewBytes + envelope.stderr.previewBytes;
+      envelope.overflow.omittedBytes = Math.max(0, envelope.overflow.totalBytes - envelope.overflow.retainedBytes);
+    });
+    const mismatchedStreamBytes = invalid((envelope) => { envelope.stdout.bytes += 1; });
+    for (const [kind, envelope] of [
+      ['preview', overPreview], ['summary', overSummary], ['diagnostic bytes', overDiagnosticBytes],
+      ['joined diagnostic bytes including LF', overJoinedDiagnosticBytes], ['diagnostic lines', overDiagnosticLines],
+      ['preview larger than stream bytes', previewExceedsStreamBytes], ['stream/artifact size', mismatchedStreamBytes],
+    ] as const) {
+      assert.equal(isToolOutputEnvelope(envelope), false, `${kind} beyond its declared envelope contract is rejected`);
+    }
+
+    const exact = boundToolOutput({ outcome: 'failed', exitCode: 1, stdout: 'ERROR!', stderr: '', summary: '界界',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 6, diagnosticBytes: 6, maxDiagnostics: 1, readBytes: 1 } });
+    assert.equal(Buffer.byteLength(exact.stdout.preview), 6);
+    assert.equal(Buffer.byteLength(exact.summary), 6);
+    assert.deepEqual(exact.diagnostics, ['ERROR!']);
+    assert.equal(isToolOutputEnvelope(exact), true, 'exact preview, summary, joined diagnostic bytes, and line count are admitted');
+
+    const tinyScalar = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '界', stderr: '',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 1, diagnosticBytes: 1, maxDiagnostics: 1, readBytes: 1 } });
+    assert.equal(isToolOutputEnvelope(tinyScalar), true, 'legitimate tiny UTF-8 producer output remains coherent');
+  });
+
   it('bounds successful huge output without changing the success exit semantics', () => {
     const store = new InMemoryToolOutputStore();
     const output = boundToolOutput({

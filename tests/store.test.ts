@@ -7,7 +7,8 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
-import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
+import { isValidationResultCoherent } from '../src/domain/validation.js';
+import { InMemoryToolOutputStore, boundToolOutput, isToolOutputEnvelope } from '../src/evidence/tool-output.js';
 import type { Run } from '../src/domain/types.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import { isCurrentAccountPathApplicable } from '../src/account-home.js';
@@ -1186,6 +1187,61 @@ describe('JsonFileStore — persistence round-trips', () => {
     const persisted = loaded?.validationResult?.local.commands[0]?.output;
     assert.deepEqual(persisted?.diagnostics, output.diagnostics);
     assert.equal(Buffer.byteLength((persisted?.diagnostics ?? []).join('\n')), 65_536);
+  });
+
+  it('rejects incoherent tool-output payloads before validation admission and on persisted Run read/CAS', () => {
+    const headSha = 'envelope-limits-validation-head';
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'xy', stderr: '',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 1, diagnosticBytes: 2, maxDiagnostics: 1, readBytes: 1 } });
+    const invalidOutput = structuredClone(output) as any;
+    invalidOutput.stdout.preview = 'xy';
+    invalidOutput.stdout.previewBytes = Buffer.byteLength(invalidOutput.stdout.preview);
+    invalidOutput.overflow.retainedBytes = invalidOutput.stdout.previewBytes + invalidOutput.stderr.previewBytes;
+    invalidOutput.overflow.omittedBytes = Math.max(0, invalidOutput.overflow.totalBytes - invalidOutput.overflow.retainedBytes);
+    const validation = validationPassed(headSha);
+    const validValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus: 'complete' as const, output }] },
+    };
+    const invalidValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: invalidOutput }] },
+    };
+    assert.equal(isValidationResultCoherent(validValidation), true);
+    assert.equal(isValidationResultCoherent(invalidValidation), false);
+
+    const implementing = applyTransition(newRun('envelope-limits-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: invalidValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    assert.equal(isToolOutputEnvelope(store.read(validRun.id)?.validationResult?.local.commands[0]?.output), true,
+      'a legitimate bounded envelope survives Run creation and readback');
+
+    const invalidRun = {
+      ...validRun,
+      validationResult: invalidValidation,
+    };
+    const invalidBytes = JSON.stringify(invalidRun);
+    writeFileSync(runPath, invalidBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected persisted read leaves the original raw bytes untouched');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects a corrupt existing Run before comparing or writing');
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS leaves the original raw bytes untouched');
   });
 
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {
