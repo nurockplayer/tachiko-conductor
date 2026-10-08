@@ -10,11 +10,31 @@ import { NodeProcessRunner } from '../src/github/transport.js';
 const realSetTimeout = globalThis.setTimeout.bind(globalThis);
 const realClearTimeout = globalThis.clearTimeout.bind(globalThis);
 const observedMarker = 'ERROR: ROOT-CAUSE-OBSERVED\n';
-const observedMarkerBytes = Buffer.byteLength(observedMarker, 'utf8');
+const observedMarkerBuffer = Buffer.from(observedMarker, 'utf8');
+const observedMarkerBytes = observedMarkerBuffer.byteLength;
+const markerCarryBytes = Math.max(0, observedMarkerBytes - 1);
 
 function observingStore(delegate: InMemoryToolOutputStore, onObserved: () => void): ToolOutputStore {
-  let stderr = '';
+  let stderrTail = Buffer.alloc(0);
   let observed = false;
+  const observe = (channel: 'stdout' | 'stderr', chunk: Buffer): void => {
+    if (channel !== 'stderr' || observed) return;
+
+    // Keep only enough bytes to detect a marker split across adjacent raw writes.
+    const boundaryLength = Math.min(chunk.byteLength, markerCarryBytes);
+    const boundary = Buffer.concat([stderrTail, chunk.subarray(0, boundaryLength)]);
+    if (chunk.indexOf(observedMarkerBuffer) !== -1 || boundary.indexOf(observedMarkerBuffer) !== -1) {
+      observed = true;
+      onObserved();
+      return;
+    }
+
+    if (chunk.byteLength >= markerCarryBytes) {
+      stderrTail = Buffer.from(chunk.subarray(chunk.byteLength - markerCarryBytes));
+    } else {
+      stderrTail = Buffer.concat([stderrTail, chunk]).subarray(-markerCarryBytes);
+    }
+  };
   return {
     save: delegate.save.bind(delegate),
     startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
@@ -22,13 +42,12 @@ function observingStore(delegate: InMemoryToolOutputStore, onObserved: () => voi
       return {
         write(channel, chunk) {
           writer.write(channel, chunk);
-          if (channel === 'stderr' && !observed) {
-            stderr += chunk.slice(0, observedMarkerBytes - Buffer.byteLength(stderr, 'utf8'));
-            if (stderr.includes(observedMarker)) {
-              observed = true;
-              onObserved();
-            }
-          }
+          observe(channel, Buffer.from(chunk, 'utf8'));
+        },
+        writeBytes(channel, chunk) {
+          if (writer.writeBytes === undefined) throw new Error('The delegate cannot preserve raw capture bytes.');
+          writer.writeBytes(channel, chunk);
+          observe(channel, chunk);
         },
         finish: writer.finish.bind(writer),
         abort: writer.abort?.bind(writer),
@@ -37,6 +56,25 @@ function observingStore(delegate: InMemoryToolOutputStore, onObserved: () => voi
     read: delegate.read.bind(delegate),
     search: delegate.search.bind(delegate),
   };
+}
+
+class WriteObservedInMemoryToolOutputStore extends InMemoryToolOutputStore {
+  readonly successfulWrites: Buffer[] = [];
+
+  override startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
+    const writer = super.startCapture(policy);
+    const writeBytes = writer.writeBytes;
+    if (writeBytes === undefined) throw new Error('The in-memory writer must preserve raw capture bytes.');
+    return {
+      write: writer.write.bind(writer),
+      writeBytes: (channel, chunk) => {
+        writeBytes.call(writer, channel, chunk);
+        this.successfulWrites.push(chunk);
+      },
+      finish: writer.finish.bind(writer),
+      abort: writer.abort?.bind(writer),
+    };
+  }
 }
 
 function fragmentedMarkerScript(terminal: 'hang' | 'signal'): string {
@@ -74,6 +112,38 @@ function assertPartialCapture(error: unknown, terminal: 'timeout' | 'cancel' | '
 }
 
 describe('bounded output integration', () => {
+  it('forwards exact raw chunks and observes a fragmented marker only after successful writes', () => {
+    const delegate = new WriteObservedInMemoryToolOutputStore();
+    const chunks = [
+      Buffer.from('prefix ERROR: ROOT-'),
+      Buffer.from('CAUSE-'),
+      Buffer.from('OBSERVED\n suffix'),
+    ];
+    let observationCount = 0;
+    const store = observingStore(delegate, () => {
+      observationCount += 1;
+      assert.deepEqual(delegate.successfulWrites, chunks, 'the delegate write returned before observation');
+    });
+    const writer = store.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+
+    writer.writeBytes!('stderr', chunks[0]!);
+    assert.equal(observationCount, 0);
+    writer.writeBytes!('stderr', chunks[1]!);
+    assert.equal(observationCount, 0);
+    writer.writeBytes!('stderr', chunks[2]!);
+    assert.equal(observationCount, 1);
+    writer.writeBytes!('stderr', Buffer.from('later bytes'));
+    assert.equal(observationCount, 1, 'the marker triggers observation once');
+
+    const summary = writer.finish();
+    assert.equal(summary.stderr.bytes, chunks.reduce((total, chunk) => total + chunk.byteLength, 0) + Buffer.byteLength('later bytes'));
+    const stored = store.read(summary.artifact, { channel: 'stderr', offset: 0, length: summary.stderr.bytes });
+    assert.equal(stored.text, `${Buffer.concat([...chunks, Buffer.from('later bytes')]).toString('utf8')}`);
+    assert.equal(delegate.successfulWrites[0], chunks[0], 'raw buffers are forwarded without replacement');
+    assert.equal(delegate.successfulWrites[1], chunks[1], 'raw buffers are forwarded without replacement');
+    assert.equal(delegate.successfulWrites[2], chunks[2], 'raw buffers are forwarded without replacement');
+  });
+
   it('attaches bounded evidence to a real command while retaining the exact exit code', async () => {
     const store = new InMemoryToolOutputStore();
     const result = await new NodeProcessRunner({ outputPolicy: { previewBytes: 64, diagnosticBytes: 256, maxDiagnostics: 4, readBytes: 128 } }).run(
@@ -283,12 +353,15 @@ describe('bounded output integration', () => {
     try {
       for (const mode of ['ordinary', 'captured'] as const) {
         const evidenceRoot = path.join(directory, `${mode}-deadline`);
-        const startedAt = Date.now();
+        const outputStore = mode === 'captured' ? new FileToolOutputStore(evidenceRoot) : undefined;
+        let commandStartedAt: number | undefined;
         const result = await new NodeProcessRunner().run(process.execPath, ['-e', childHoldingPipe(850, false)], {
           timeoutMs: 250,
-          ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(evidenceRoot) } : {}),
+          ...(outputStore === undefined ? {} : { outputStore }),
+          beforeSpawn: () => { commandStartedAt = Date.now(); },
         });
-        const elapsedMs = Date.now() - startedAt;
+        assert.ok(commandStartedAt !== undefined, `${mode}: command timing starts at the actual beforeSpawn fence`);
+        const elapsedMs = Date.now() - commandStartedAt;
         assert.equal(result.exitCode, 0, `${mode}: direct child completed successfully before its descendant released inherited pipes`);
         assert.ok(elapsedMs < 650, `${mode}: unfinished inherited pipes settle near the positive deadline (observed ${elapsedMs}ms)`);
         if (mode === 'captured') {
@@ -326,6 +399,53 @@ describe('bounded output integration', () => {
       assert.equal(readToolOutput(naturalEof.output!, new FileToolOutputStore(naturalEofRoot), {
         channel: 'stderr', offset: 0, length: 128,
       }).text, 'PARENT-ERRDESCENDANT-ERR-MARKER');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('starts the inherited-pipe deadline measurement after owned capture preparation', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-delayed-capture-preparation-'));
+    const evidenceRoot = path.join(directory, 'evidence');
+    const descendantCompleted = path.join(directory, 'descendant-completed');
+    const delegate = new FileToolOutputStore(evidenceRoot);
+    const preparationDelayMs = 700;
+    const delayedStore: ToolOutputStore = {
+      save: delegate.save.bind(delegate),
+      startCapture(policy) {
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT)), 0, 0, preparationDelayMs);
+        return delegate.startCapture(policy);
+      },
+      read: delegate.read.bind(delegate),
+      search: delegate.search.bind(delegate),
+    };
+    try {
+      const wholeCallStartedAt = Date.now();
+      let commandStartedAt: number | undefined;
+      const descendant = `setTimeout(() => { require('node:fs').writeFileSync(${JSON.stringify(descendantCompleted)}, 'done'); }, 850)`;
+      const command = `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', ${JSON.stringify(descendant)}], { stdio: 'inherit' }); process.stdout.write('PARENT-OUT'); process.stderr.write('PARENT-ERR'); setImmediate(() => process.exit(0));`;
+      const result = await new NodeProcessRunner().run(process.execPath,
+        ['-e', command], {
+          timeoutMs: 250,
+          outputStore: delayedStore,
+          beforeSpawn: () => { commandStartedAt = Date.now(); },
+        });
+      const wholeCallElapsedMs = Date.now() - wholeCallStartedAt;
+      assert.ok(commandStartedAt !== undefined, 'the real command reaches the beforeSpawn fence after capture preparation');
+      const commandElapsedMs = Date.now() - commandStartedAt;
+      assert.ok(wholeCallElapsedMs >= 650, `the former whole-call timing origin would exceed the unchanged 650ms bound (observed ${wholeCallElapsedMs}ms)`);
+      assert.ok(commandElapsedMs < 650, `the command settles within the unchanged 650ms bound (observed ${commandElapsedMs}ms)`);
+      assert.equal(result.exitCode, 0, 'the direct child succeeds before its descendant releases inherited pipes');
+      assert.equal(result.captureStatus, 'partial');
+      assert.equal(result.captureObservation?.status, 'partial');
+      assert.ok(result.captureObservation?.stdout.preview.includes('PARENT-OUT'));
+      assert.ok(result.captureObservation?.stderr.preview.includes('PARENT-ERR'));
+      assert.equal(result.output, undefined, 'forced pipe closure cannot publish a complete artifact');
+      assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [], 'incomplete durable streams are purged');
+
+      const cleanupDeadline = Date.now() + 3_000;
+      while (!existsSync(descendantCompleted) && Date.now() < cleanupDeadline) {
+        await new Promise((resolve) => realSetTimeout(resolve, 20));
+      }
+      assert.ok(existsSync(descendantCompleted), 'the owned descendant finishes and releases its inherited pipes within the finite cleanup window');
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
