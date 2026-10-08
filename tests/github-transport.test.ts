@@ -504,27 +504,82 @@ describe('NodeProcessRunner', () => {
       for (const mode of ['ordinary', 'captured'] as const) {
         const controller = new AbortController();
         const root = path.join(directory, mode);
-        const pending = new NodeProcessRunner().run(process.execPath, ['-e', "process.on('SIGTERM', () => setTimeout(() => process.exit(0), 1000)); process.stderr.write('ABORT-OBSERVED\\n'); setInterval(() => {}, 1000)"], {
+        const marker = 'ABORT-OBSERVED';
+        const script = `setTimeout(() => { process.on('SIGTERM', () => setTimeout(() => process.exit(0), 1000)); process.stderr.write('${marker}\\n'); }, 400); setInterval(() => {}, 1000)`;
+        const originalEmit = ChildProcess.prototype.emit;
+        let child: ChildProcess | undefined;
+        let observedReady = false;
+        let markerSuffix = '';
+        let abortAt: number | undefined;
+        let resolveReady!: () => void;
+        let rejectReady!: (error: Error) => void;
+        const ready = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+        let resolveClosed!: () => void;
+        const closed = new Promise<void>((resolve) => { resolveClosed = resolve; });
+        const observedEmit = function (this: ChildProcess, eventName: string | symbol, ...args: unknown[]): boolean {
+          if (eventName === 'spawn' && this.spawnfile === process.execPath && this.spawnargs[1] === '-e' && this.spawnargs[2] === script) {
+            child = this;
+            this.once('close', resolveClosed);
+            this.stderr?.on('data', (chunk: Buffer | string) => {
+              const combined = markerSuffix + String(chunk);
+              const containsMarker = combined.includes(marker);
+              markerSuffix = combined.slice(-(marker.length - 1));
+              if (observedReady || !containsMarker) return;
+              observedReady = true;
+              resolveReady();
+              queueMicrotask(() => {
+                abortAt = Date.now();
+                controller.abort();
+              });
+            });
+          }
+          return Reflect.apply(originalEmit, this, [eventName, ...args]) as boolean;
+        };
+        ChildProcess.prototype.emit = observedEmit as typeof originalEmit;
+        const pending = new NodeProcessRunner().run(process.execPath, ['-e', script], {
           timeoutMs: 2_000,
           signal: controller.signal,
           ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
         });
-        const startedAt = Date.now();
-        setTimeout(() => controller.abort(), 100);
-        await assert.rejects(pending, (error: unknown) => {
+        const settled = pending.then((value) => ({ value }), (error: unknown) => ({ error }));
+        const readinessTimer = setTimeout(() => rejectReady(new Error(`${mode}: child readiness marker was not observed`)), 3_000);
+        try {
+          await ready;
+          clearTimeout(readinessTimer);
+          assert.equal(observedReady, true, `${mode}: readiness follows 400ms child initialization and installed SIGTERM handler`);
+          const outcome = await settled;
+          assert.ok('error' in outcome, `${mode}: genuine abort rejects the runner`);
+          const error = outcome.error;
           assert.equal((error as NodeJS.ErrnoException).code, 'ABORT_ERR');
+          assert.ok(abortAt !== undefined, `${mode}: abort was triggered only after the actual marker observation`);
           if (mode === 'captured') {
             const value = error as NodeJS.ErrnoException & { readonly captureStatus?: unknown; readonly output?: unknown;
               readonly captureObservation?: { readonly status?: unknown; readonly diagnostics?: readonly string[] } };
             assert.equal(value.captureStatus, 'partial');
             assert.equal(value.captureObservation?.status, 'partial');
-            assert.ok(value.captureObservation?.diagnostics?.some((line) => line.includes('ABORT-OBSERVED')));
-            assert.equal(value.output, undefined);
+            assert.ok(value.captureObservation?.diagnostics?.some((line) => line.includes(marker)));
+            assert.equal(value.output, undefined, 'an aborted partial capture publishes no complete artifact');
+            assert.deepEqual(readdirSync(root, { recursive: true }).map(String).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [],
+              'an aborted partial capture leaves no raw artifact files');
           }
-          return true;
-        });
-        const elapsedMs = Date.now() - startedAt;
-        assert.ok(elapsedMs < 650, `${mode}: successful abort kill settles without waiting for the child close (observed ${elapsedMs}ms)`);
+          const elapsedMs = Date.now() - abortAt!;
+          assert.ok(elapsedMs < 650, `${mode}: abort settlement is measured from the observed abort trigger, not startup (observed ${elapsedMs}ms)`);
+        } finally {
+          clearTimeout(readinessTimer);
+          ChildProcess.prototype.emit = originalEmit;
+          if (!controller.signal.aborted) controller.abort();
+          await settled;
+          if (child !== undefined) {
+            let closeDeadline: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([closed, new Promise<void>((_resolve, reject) => {
+                closeDeadline = setTimeout(() => reject(new Error(`${mode}: owned child did not close after abort`)), 3_000);
+              })]);
+            } finally {
+              if (closeDeadline !== undefined) clearTimeout(closeDeadline);
+            }
+          }
+        }
       }
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
