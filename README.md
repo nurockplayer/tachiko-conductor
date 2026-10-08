@@ -397,11 +397,16 @@ seven days), and each operation persists its deadline once; reopening a store
 with different options cannot renew existing references. `release(reference)`
 revokes one committed operation immediately and makes its references
 unavailable; bounded cleanup then reclaims its files. Reads do not extend the
-deadline. Output remains supplemental and
-does not change the validation result. Full command arguments and secrets are
-not retained. A new HEAD makes prior validation evidence stale. Pending hosted
-checks park in `WAITING_DEPENDENCY` for a later re-read; unavailable or unknown
-evidence fails closed.
+deadline. Output remains supplemental and does not change the validation
+result. Full command arguments are not recorded as command metadata, but
+opted-in commands can print their arguments, credentials, or other sensitive
+content. Raw stdout, stderr, complete artifacts, and bounded complete or
+fallback previews are unredacted and may contain secrets or echoed arguments.
+Opt in only when that retention is appropriate, keep secrets out of emitted
+output, and restrict access to the private evidence store. A new HEAD makes
+prior validation evidence stale. Pending hosted checks park in
+`WAITING_DEPENDENCY` for a later re-read; unavailable or unknown evidence fails
+closed.
 
 The default evidence root is `$TACHIKO_DATA_DIR/.evidence/v1` (under the runs
 directory when `TACHIKO_DATA_DIR` is unset); `TACHIKO_EVIDENCE_DIR` can name an
@@ -423,7 +428,11 @@ runtime environment setting raises or changes it. When admission or filesystem
 I/O fails, capture is partial and no artifact is published for that writer;
 streaming validation continues draining output and reports the observed command
 result separately. This is an admission bound, not a guarantee of available
-disk space or a global filesystem quota.
+disk space or a global filesystem quota. New and rewritten authoritative Run
+snapshots are published with mode `0600`; existing legacy Run files are not
+retroactively hardened. Releasing or expiring a tool-output artifact does not
+scrub raw previews already persisted in a Run; those previews follow the
+existing Run lifecycle.
 
 Explicit range reads are limited to 1 MiB. Search queries are limited to 64 KiB
 of UTF-8, with at most 128 matches and 64 KiB per matching line. File capture

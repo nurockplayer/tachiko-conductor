@@ -345,9 +345,11 @@ function writeJsonAtomic(filePath: string, value: unknown, syncForDurability: (f
   validatePath();
   const serialized = serializedJson(value);
   const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
-  let fd: number | undefined = openSync(tmpPath, 'wx', 0o644);
+  let fd: number | undefined = openSync(tmpPath, 'wx', 0o600);
   try {
-    fchmodSync(fd, 0o644);
+    // Keep the authoritative Run private from temporary creation through
+    // publication, independent of the caller's umask.
+    fchmodSync(fd, 0o600);
     writeFileSync(fd, serialized, 'utf8');
     syncForDurability(fd, 'file');
     closeSync(fd);

@@ -174,6 +174,71 @@ describe('bounded tool output contract', () => {
     const matches = store.search(reference, { channel: 'stdout', query, maxMatches: 128, maxBytes: 65_536 });
     assert.equal(matches.length, 1);
     assert.equal(matches[0]?.text, query);
+
+    const astralQuery = '🙂'.repeat(16_384);
+    assert.equal(Buffer.byteLength(astralQuery, 'utf8'), 65_536);
+    const astralReference = store.save({ stdout: astralQuery, stderr: astralQuery });
+    for (const channel of ['stdout', 'stderr'] as const) {
+      const astralMatches = store.search(astralReference, { channel, query: astralQuery, maxBytes: 65_536 });
+      assert.equal(astralMatches.length, 1);
+      assert.equal(astralMatches[0]?.text, astralQuery);
+      assert.equal(astralMatches[0]?.text.includes('\uFFFD'), false);
+    }
+  });
+
+  it('keeps search overlap scalar-safe at a native 64 KiB boundary on both streams and stores', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-search-scalar-boundary-'));
+    try {
+      const content = `first\n${'a'.repeat(65_526)}🙂xy\n`;
+      assert.equal(Buffer.byteLength(content.slice(0, content.indexOf('xy')), 'utf8'), 65_536,
+        'the first native file-search chunk ends exactly after a complete astral scalar');
+      for (const store of [new InMemoryToolOutputStore(), new FileToolOutputStore(directory)]) {
+        const artifact = store.save({ stdout: content, stderr: content });
+        for (const channel of ['stdout', 'stderr'] as const) {
+          const ascii = store.search(artifact, { channel, query: 'xy', maxBytes: 24 });
+          assert.equal(ascii.length, 1);
+          assert.equal(ascii[0]?.line, 2);
+          assert.equal(ascii[0]?.offset, 6);
+          assert.ok(ascii[0]?.text.includes('🙂xy'));
+          assert.equal(ascii[0]?.text.includes('\uFFFD'), false);
+          assert.ok(Buffer.byteLength(ascii[0]!.text, 'utf8') <= 24);
+
+          const astral = store.search(artifact, { channel, query: '🙂xy', maxBytes: 24 });
+          assert.equal(astral.length, 1);
+          assert.equal(astral[0]?.line, 2);
+          assert.equal(astral[0]?.offset, 6);
+          assert.ok(astral[0]?.text.includes('🙂xy'));
+          assert.equal(astral[0]?.text.includes('\uFFFD'), false);
+
+          const tiny = store.search(artifact, { channel, query: 'xy', maxBytes: 1 });
+          assert.equal(tiny.length, 1);
+          assert.ok(Buffer.byteLength(tiny[0]!.text, 'utf8') <= 1);
+          assert.equal(tiny[0]?.text.includes('\uFFFD'), false);
+        }
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('rejects malformed UTF-16 queries before artifact access but preserves literal replacement characters', () => {
+    const fileRoot = path.join(os.tmpdir(), `tachiko-malformed-query-${process.pid}-${Date.now()}`);
+    let artifactOpens = 0;
+    const fileStore = new FileToolOutputStore(fileRoot, { testFaults: { beforeArtifactOpen: () => { artifactOpens += 1; } } });
+    const missing = { kind: 'tool-output', id: 'missing', stdoutBytes: 0, stderrBytes: 0, totalBytes: 0, sha256: '0'.repeat(64) } as const;
+    const memoryStore = new InMemoryToolOutputStore();
+    for (const query of ['\uD800', '\uDC00', '\uD800x', 'x\uDC00']) {
+      assert.throws(() => fileStore.search(missing, { query }), /well-formed Unicode/);
+      assert.throws(() => memoryStore.search(missing, { query }), /well-formed Unicode/);
+    }
+    assert.equal(artifactOpens, 0);
+    assert.equal(existsSync(fileRoot), false, 'malformed input is rejected before File store path admission');
+
+    const fileArtifact = fileStore.save({ stdout: 'literal �x astral 🙂', stderr: '' });
+    const memoryArtifact = memoryStore.save({ stdout: 'literal �x astral 🙂', stderr: '' });
+    assert.equal(fileStore.search(fileArtifact, { query: '�x' })[0]?.text.includes('�x'), true);
+    assert.equal(memoryStore.search(memoryArtifact, { query: '�x' })[0]?.text.includes('�x'), true);
+    assert.equal(fileStore.search(fileArtifact, { query: '🙂' })[0]?.text.includes('🙂'), true);
+    assert.equal(memoryStore.search(memoryArtifact, { query: '🙂' })[0]?.text.includes('🙂'), true);
+    rmSync(fileRoot, { recursive: true, force: true });
   });
 
   it('contains durable quota exhaustion while draining and returns bounded partial observations without an artifact', () => {

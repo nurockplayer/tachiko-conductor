@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -204,7 +204,7 @@ describe('JsonFileStore — persistence round-trips', () => {
     }
   });
 
-  it('publishes canonical Run JSON with a safe mode under umask 002', () => {
+  it('publishes canonical Run JSON with a private mode under umask 002', () => {
     const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-umask-'));
     tmpDirs.push(home);
     const conductor = path.join(home, '.tachiko-conductor');
@@ -219,14 +219,96 @@ describe('JsonFileStore — persistence round-trips', () => {
       const initial = newRun('canonical-umask-run');
       store.create(initial);
       const filePath = path.join(runs, `${initial.id}.json`);
-      assert.equal(statSync(filePath).mode & 0o777, 0o644);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
       store.update(applyTransition(initial, { type: 'start' }, T0));
-      assert.equal(statSync(filePath).mode & 0o777, 0o644);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
       store.read(initial.id);
     } finally {
       process.umask(originalUmask);
       os.userInfo = originalUserInfo;
     }
+  });
+
+  it('keeps Run temp descriptors and final snapshots private across create, update and CAS under permissive umask', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-private-run-'));
+    tmpDirs.push(home);
+    const conductor = path.join(home, '.tachiko-conductor');
+    const runs = path.join(conductor, 'runs');
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(home, 0o755);
+    chmodSync(conductor, 0o755);
+    chmodSync(runs, 0o755);
+    const originalUserInfo = os.userInfo;
+    const originalUmask = process.umask(0);
+    const observedTempModes: number[] = [];
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const store = new JsonFileStore({ dir: runs, syncForDurability: (fd, target) => {
+        if (target !== 'file') { fsyncSync(fd); return; }
+        const descriptorMode = fstatSync(fd).mode & 0o777;
+        observedTempModes.push(descriptorMode);
+        assert.equal(descriptorMode, 0o600, 'the descriptor remains private at the pre-rename file durability seam');
+        const tempName = readdirSync(runs).find((name) => name.startsWith('private-run-writes.json.') && name.endsWith('.tmp'));
+        assert.ok(tempName, 'file durability seam is observing the authoritative Run temporary');
+        const tempPath = path.join(runs, tempName);
+        assert.equal(statSync(tempPath).mode & 0o777, 0o600);
+        const prospectiveBytes = readFileSync(tempPath, 'utf8');
+        assert.ok(prospectiveBytes.includes('COMPLETE-PRIVATE-RUN-OUTPUT'));
+        assert.ok(prospectiveBytes.includes('FALLBACK-PRIVATE-RUN-PREVIEW'));
+        fsyncSync(fd);
+      } });
+      const completeOutput = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'COMPLETE-PRIVATE-RUN-OUTPUT', stderr: '', store: new InMemoryToolOutputStore() });
+      const fallbackText = 'FALLBACK-PRIVATE-RUN-PREVIEW';
+      const fallbackStream = { bytes: Buffer.byteLength(fallbackText), preview: fallbackText,
+        previewBytes: Buffer.byteLength(fallbackText), truncated: false };
+      const validation = validationPassed();
+      const initial = {
+        ...newRun('private-run-writes'),
+        validationResult: {
+          ...validation,
+          local: { ...validation.local, commands: [
+            { commandIndex: 0, executable: 'test', outcome: 'passed' as const, exitCode: 0, durationMs: 1,
+              captureStatus: 'complete' as const, output: completeOutput },
+            { commandIndex: 1, executable: 'test', outcome: 'passed' as const, exitCode: 0, durationMs: 1,
+              captureStatus: 'partial' as const, capturePreview: {
+                stdout: fallbackStream, stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+                diagnostics: [fallbackText], diagnosticsTruncated: false,
+              } },
+          ] },
+        },
+      };
+      store.create(initial);
+      const filePath = path.join(runs, `${initial.id}.json`);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.ok(readFileSync(filePath, 'utf8').includes('COMPLETE-PRIVATE-RUN-OUTPUT'));
+      assert.ok(readFileSync(filePath, 'utf8').includes('FALLBACK-PRIVATE-RUN-PREVIEW'));
+      const updated = applyTransition(initial, { type: 'start' }, T0);
+      store.update(updated);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.equal(store.updateIfUnchanged(updated, updated), true, 'successful CAS still writes through the shared private helper');
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.deepEqual(observedTempModes, [0o600, 0o600, 0o600]);
+    } finally {
+      process.umask(originalUmask);
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('reads legacy 0644 Runs without mutation, leaves failed CAS untouched, and hardens an ordinary update', () => {
+    const { store, dir } = tempStore();
+    const legacy = newRun('legacy-run-permissions');
+    const filePath = path.join(dir, `${legacy.id}.json`);
+    writeFileSync(filePath, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o644 });
+    chmodSync(filePath, 0o644);
+    const legacyBytes = readFileSync(filePath, 'utf8');
+    assert.deepEqual(store.read(legacy.id), legacy);
+    assert.equal(statSync(filePath).mode & 0o777, 0o644, 'read preserves legacy mode');
+    const stale = { ...legacy, updatedAt: '2030-01-01T00:00:00.000Z' };
+    assert.equal(store.updateIfUnchanged(stale, { ...stale, updatedAt: '2030-01-01T00:00:01.000Z' }), false);
+    assert.equal(readFileSync(filePath, 'utf8'), legacyBytes, 'failed CAS preserves legacy bytes');
+    assert.equal(statSync(filePath).mode & 0o777, 0o644, 'failed CAS preserves legacy permissions');
+    store.update({ ...legacy, updatedAt: '2026-10-08T00:00:00.000Z' });
+    assert.equal(statSync(filePath).mode & 0o777, 0o600, 'ordinary authorized rewrite atomically hardens only this Run');
   });
 
   it('rejects a cached canonical Run store after its conductor root is retargeted', () => {
@@ -416,12 +498,40 @@ describe('JsonFileStore — persistence round-trips', () => {
       agentResult: { ...successResult('head-sha'), executor: { provider: 'codex-cli', sessionId: 'secret-session' } },
       pullRequest: { number: 7, headSha: 'head-sha' },
     }, T0);
+    const completeSentinel = 'COMPLETE-RAW-OUTPUT-SENTINEL';
+    const fallbackSentinel = 'FALLBACK-RAW-PREVIEW-SENTINEL';
+    const completeOutput = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: completeSentinel, stderr: '', store: new InMemoryToolOutputStore() });
+    const fallbackStream = { bytes: Buffer.byteLength(fallbackSentinel), preview: fallbackSentinel,
+      previewBytes: Buffer.byteLength(fallbackSentinel), truncated: false };
+    const validation = validationPassed('head-sha');
+    run = {
+      ...run,
+      validationResult: {
+        ...validation,
+        local: {
+          ...validation.local,
+          commands: [
+            { commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+              captureStatus: 'complete' as const, output: completeOutput },
+            { commandIndex: 1, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+              captureStatus: 'partial' as const, capturePreview: {
+                stdout: fallbackStream, stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+                diagnostics: [fallbackSentinel], diagnosticsTruncated: false,
+              } },
+          ],
+        },
+      },
+    };
     store.create(run);
 
     const raw = readFileSync(path.join(dir, 'projected.json'), 'utf8');
     const projection = JSON.parse(readFileSync(operationalProjectionPath(dir, 'projected'), 'utf8')) as Record<string, unknown>;
     assert.equal(projection.schemaVersion, OPERATIONAL_RUN_PROJECTION_VERSION);
     assert.equal(projection.sourceDigest, sha256(raw));
+    assert.equal(raw.includes(completeSentinel), true);
+    assert.equal(raw.includes(fallbackSentinel), true);
+    assert.equal(JSON.stringify(projection).includes(completeSentinel), false, 'derived metadata omits complete raw-output bytes');
+    assert.equal(JSON.stringify(projection).includes(fallbackSentinel), false, 'derived metadata omits fallback raw-preview bytes');
     assert.equal(projection.workflowState, 'VALIDATING');
     assert.deepEqual(projection.target, { owner: 'acme', repo: 'widgets', issueNumber: 42 });
     assert.deepEqual(projection.bootstrap, { workspacePath: '/tmp/projected', branch: 'codex/projected', baseBranch: 'main', baseSha: 'base-sha' });

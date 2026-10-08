@@ -2735,6 +2735,16 @@ function searchCapture(capture: ToolOutputCapture, request: ToolOutputSearchRequ
 function validateSearchRequest(request: ToolOutputSearchRequest): { readonly maxMatches: number; readonly maxBytes: number } {
   if (typeof request.query !== 'string') throw new Error('Tool-output search query must be a string.');
   if (request.query.length > TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES) throw new Error(`Tool-output search query exceeds the maximum of ${TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes.`);
+  for (let index = 0; index < request.query.length; index += 1) {
+    const unit = request.query.charCodeAt(index);
+    if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = request.query.charCodeAt(index + 1);
+      if (!(next >= 0xdc00 && next <= 0xdfff)) throw new Error('Tool-output search query must contain well-formed Unicode.');
+      index += 1;
+    } else if (unit >= 0xdc00 && unit <= 0xdfff) {
+      throw new Error('Tool-output search query must contain well-formed Unicode.');
+    }
+  }
   if (Buffer.byteLength(request.query, 'utf8') > TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES) throw new Error(`Tool-output search query exceeds the maximum of ${TOOL_OUTPUT_SEARCH_MAX_QUERY_BYTES} UTF-8 bytes.`);
   if (request.query.trim() === '') throw new Error('Tool-output search query must not be empty.');
   const maxMatches = request.maxMatches ?? DEFAULT_TOOL_OUTPUT_POLICY.maxDiagnostics;
@@ -2864,9 +2874,19 @@ function appendSearchSegment(state: SearchScanState, segment: string, query: str
   return {
     ...state,
     lineBytes: state.lineBytes + utf8Bytes(segment),
-    matchTail: query.length <= 1 ? '' : candidate.slice(-(query.length - 1)),
+    matchTail: query.length <= 1 ? '' : searchOverlapTail(candidate, query.length - 1),
     ...(matchIndex < 0 || state.matchedText !== undefined ? {} : { matchedText: boundedMatchText(candidate, matchIndex, query, maxBytes) }),
   };
+}
+
+function searchOverlapTail(candidate: string, retainUnits: number): string {
+  let start = Math.max(0, candidate.length - retainUnits);
+  if (start > 0) {
+    const before = candidate.charCodeAt(start - 1);
+    const at = candidate.charCodeAt(start);
+    if (before >= 0xd800 && before <= 0xdbff && at >= 0xdc00 && at <= 0xdfff) start -= 1;
+  }
+  return candidate.slice(start);
 }
 
 function boundedMatchText(line: string, matchIndex: number, query: string, maxBytes: number): string {
