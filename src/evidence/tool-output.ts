@@ -1212,15 +1212,22 @@ export class FileToolOutputStore implements ToolOutputStore {
   }
 
   beginOperation(attribution: Readonly<Record<string, string | number | null>> = {}): ToolOutputOperation {
+    // Serialize caller-controlled attribution once, before touching the
+    // evidence root. The detached scalar record remains stable if the caller
+    // mutates its input after admission.
+    const detachedAttribution = snapshotOperationAttribution(attribution);
+    const id = randomUUID();
+    const ownerNonce = randomUUID();
+    const createdAt = new Date().toISOString();
+    const preflightBase = { schemaVersion: 1, id, slot: this.capacity - 1, ownerNonce, createdAt, attribution: detachedAttribution };
+    encodeBoundedMetadata({ ...preflightBase, state: 'active', artifacts: [], activeCaptureIds: [] });
     ensurePrivateDirectory(this.root);
     const operations = this.operationsDir;
     ensurePrivateDirectory(operations);
     // Reclaim at most one bounded cursor batch on each real capture operation.
     // Failure is explicit: a new capture never evicts or silently bypasses debt.
     this.cleanupExpired();
-    const id = randomUUID();
     const lockPath = path.join(operations, `${id}.lock`);
-    const ownerNonce = randomUUID();
     let lock: DispatchInvocationLock;
     try { lock = acquireDispatchInvocationLock({ lockPath, nonce: () => ownerNonce }); }
     catch (error) { throw new Error(`Tool-output capture operation ownership is unavailable: ${error instanceof Error ? error.message : 'unknown lock error'}`); }
@@ -1249,8 +1256,7 @@ export class FileToolOutputStore implements ToolOutputStore {
       const state = typeof value === 'object' && value !== null ? (value as Record<string, unknown>).state : undefined;
       if (state === 'closed' || state === 'aborted') this.testFaults?.beforeOperationMetadataDirectoryFsync?.(value);
     });
-    const createdAt = new Date().toISOString();
-    const base = { schemaVersion: 1, id, slot, ownerNonce, createdAt, attribution };
+    const base = { schemaVersion: 1, id, slot, ownerNonce, createdAt, attribution: detachedAttribution };
     try { writeMetadata({ ...base, state: 'active', artifacts: [], activeCaptureIds }); }
     catch (error) { try { ownerFence.release(); } catch { /* initial metadata bootstrap debt remains protected */ } throw error; }
     let operationState: 'open' | 'close-pending' | 'abort-pending' | 'closed' = 'open';
@@ -2282,8 +2288,7 @@ function readBoundedJson(filePath: string, maxBytes: number, accountRead?: (byte
 }
 
 function writeAtomicJson(directory: string, filePath: string, value: unknown, beforeDirectoryFsync?: () => void): void {
-  const encoded = Buffer.from(JSON.stringify(value), 'utf8');
-  if (encoded.length > 1_048_576) throw new Error('Tool-output metadata exceeds the bounded metadata limit.');
+  const encoded = Buffer.from(encodeBoundedMetadata(value), 'utf8');
   const temporary = `${filePath}.tmp-${randomUUID()}`;
   let descriptor: number | undefined;
   try {
@@ -2300,6 +2305,25 @@ function writeAtomicJson(directory: string, filePath: string, value: unknown, be
     try { unlinkSync(temporary); } catch { /* preserve initial failure */ }
     throw error;
   }
+}
+
+function encodeBoundedMetadata(value: unknown): string {
+  const encoded = JSON.stringify(value);
+  if (encoded === undefined) throw new Error('Tool-output metadata is not JSON serializable.');
+  if (Buffer.byteLength(encoded, 'utf8') > 1_048_576) throw new Error('Tool-output metadata exceeds the bounded metadata limit.');
+  return encoded;
+}
+
+function snapshotOperationAttribution(value: Readonly<Record<string, string | number | null>>): Readonly<Record<string, string | number | null>> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('Tool-output attribution must be a scalar record.');
+  const detached: Record<string, string | number | null> = Object.create(null) as Record<string, string | number | null>;
+  for (const [key, entry] of Object.entries(value)) {
+    if (typeof entry !== 'string' && entry !== null && (typeof entry !== 'number' || !Number.isFinite(entry))) {
+      throw new Error('Tool-output attribution values must be finite JSON scalars.');
+    }
+    detached[key] = entry;
+  }
+  return Object.freeze(detached);
 }
 
 class StreamCapture {
@@ -2808,6 +2832,7 @@ interface SearchScanState {
   lineBytes: number;
   matchTail: string;
   matchedText?: string;
+  pendingCR?: boolean;
 }
 
 function emptySearchState(): SearchScanState {
@@ -2826,7 +2851,20 @@ function scanDecodedChunks(
 ): SearchScanState {
   let pending = initialState;
   for (const chunk of chunks) {
-    let remainder = chunk;
+    if (chunk === '') continue;
+    const hasPendingCR = pending.pendingCR === true;
+    let remainder: string;
+    if (hasPendingCR && !chunk.startsWith('\n') && pending.matchedText !== undefined) {
+      pending = commitSearchCarriedCR(pending, query, maxBytes);
+      remainder = chunk;
+    } else {
+      remainder = `${hasPendingCR ? '\r' : ''}${chunk}`;
+      pending = { ...pending, pendingCR: false };
+    }
+    const carryTerminalCR = remainder.endsWith('\r');
+    if (carryTerminalCR) {
+      remainder = remainder.slice(0, -1);
+    }
     while (remainder !== '') {
       const newlineIndex = remainder.search(/\r?\n/);
       if (newlineIndex < 0) {
@@ -2853,7 +2891,13 @@ function scanDecodedChunks(
       remainder = remainder.slice(newlineIndex + delimiter.length);
       if (results.length >= maxMatches) break;
     }
+    // Attach the undecided CR only after this chunk's earlier delimiters have
+    // advanced the scanner to its final logical line.
+    if (carryTerminalCR && results.length < maxMatches) pending = { ...pending, pendingCR: true };
     if (results.length >= maxMatches) break;
+  }
+  if (final && pending.pendingCR === true && results.length < maxMatches) {
+    pending = commitSearchCarriedCR(pending, query, maxBytes);
   }
   if (final && results.length < maxMatches && pending.matchedText !== undefined) {
     results.push({
@@ -2865,6 +2909,16 @@ function scanDecodedChunks(
     });
   }
   return pending;
+}
+
+function commitSearchCarriedCR(state: SearchScanState, query: string, maxBytes: number): SearchScanState {
+  const priorText = state.matchedText;
+  const priorBytes = state.lineBytes;
+  const next = appendSearchSegment({ ...state, pendingCR: false }, '\r', query, maxBytes);
+  if (priorText !== undefined && utf8Bytes(priorText) === priorBytes && priorBytes + 1 <= maxBytes) {
+    return { ...next, matchedText: `${priorText}\r` };
+  }
+  return next;
 }
 
 function appendSearchSegment(state: SearchScanState, segment: string, query: string, maxBytes: number): SearchScanState {

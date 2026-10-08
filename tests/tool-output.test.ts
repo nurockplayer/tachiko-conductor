@@ -111,6 +111,60 @@ describe('bounded tool output contract', () => {
     } finally { rmSync(newParent, { recursive: true, force: true }); }
   });
 
+  it('preflights the complete initial attribution envelope before filesystem mutation', () => {
+    const absentRoot = path.join(os.tmpdir(), `tachiko-attribution-preflight-${process.pid}-${Date.now()}`);
+    const absent = new FileToolOutputStore(absentRoot, { capacity: 1 });
+    const oversized = { escaped: '\\"\\n\\t', multibyte: '界🙂', payload: 'x'.repeat(1_048_576) };
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      assert.throws(() => absent.beginOperation(oversized), /bounded metadata limit/);
+      assert.equal(existsSync(absentRoot), false, 'deterministically inadmissible metadata does not create the evidence root');
+    }
+    const unsupportedRoot = path.join(os.tmpdir(), `tachiko-attribution-unsupported-${process.pid}-${Date.now()}`);
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    assert.throws(() => new FileToolOutputStore(unsupportedRoot, { capacity: 1 }).beginOperation(cyclic as never), /scalar record|scalar/);
+    assert.equal(existsSync(unsupportedRoot), false, 'unsupported caller values are rejected before root mutation');
+
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-attribution-existing-root-'));
+    try {
+      const store = new FileToolOutputStore(root, { capacity: 1 });
+      const owner = store.beginOperation({ kind: 'existing-capacity-owner' });
+      const operations = path.join(root, 'operations');
+      const snapshot = (): Array<[string, string]> => readdirSync(operations).sort().map((name) => [name, readFileSync(path.join(operations, name)).toString('base64')]);
+      const before = snapshot();
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        assert.throws(() => store.beginOperation(oversized), /bounded metadata limit/);
+        assert.deepEqual(snapshot(), before, 'rejected attribution leaves slot, index, owner and cursor bytes unchanged');
+      }
+      owner.abort();
+      const mutable = { label: 'before' };
+      const admitted = store.beginOperation(mutable);
+      mutable.label = 'after';
+      const metadata = JSON.parse(readFileSync(path.join(operations, `${admitted.id}.json`), 'utf8')) as { attribution: { label: string } };
+      assert.equal(metadata.attribution.label, 'before', 'initial metadata uses the detached admission snapshot');
+      admitted.abort();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+
+    const exactRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-attribution-exact-bound-'));
+    try {
+      const fixed = { schemaVersion: 1, id: '0'.repeat(36), slot: 0, ownerNonce: '0'.repeat(36), createdAt: '2030-01-01T00:00:00.000Z', attribution: { value: '' }, state: 'active', artifacts: [], activeCaptureIds: [] };
+      const exactBytes = 1_048_576 - Buffer.byteLength(JSON.stringify(fixed), 'utf8');
+      const exact = new FileToolOutputStore(exactRoot, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z') });
+      const operation = exact.beginOperation({ value: 'x'.repeat(exactBytes) });
+      assert.equal(Buffer.byteLength(readFileSync(path.join(exactRoot, 'operations', `${operation.id}.json`)), 'utf8'), 1_048_576,
+        'the complete initial envelope admits the exact UTF-8 metadata limit');
+      rmSync(exactRoot, { recursive: true, force: true });
+    } finally { rmSync(exactRoot, { recursive: true, force: true }); }
+
+    const conservativeRoot = path.join(os.tmpdir(), `tachiko-attribution-conservative-${process.pid}-${Date.now()}`);
+    const slotZeroFixed = { schemaVersion: 1, id: '0'.repeat(36), slot: 0, ownerNonce: '0'.repeat(36), createdAt: '2030-01-01T00:00:00.000Z', attribution: { value: '' }, state: 'active', artifacts: [], activeCaptureIds: [] };
+    const slotZeroExactBytes = 1_048_576 - Buffer.byteLength(JSON.stringify(slotZeroFixed), 'utf8');
+    assert.throws(() => new FileToolOutputStore(conservativeRoot, { capacity: 256, now: () => new Date('2030-01-01T00:00:00.000Z') })
+      .beginOperation({ value: 'x'.repeat(slotZeroExactBytes) }), /bounded metadata limit/,
+    'the maximum slot width may conservatively refuse metadata that would fit the first slot');
+    assert.equal(existsSync(conservativeRoot), false, 'conservative boundary refusal still precedes all filesystem mutation');
+  });
+
   it('fails closed before mutation when private POSIX identity proof is unavailable and prefers effective uid', () => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
     const effectiveUid = Object.getOwnPropertyDescriptor(process, 'geteuid');
@@ -215,6 +269,81 @@ describe('bounded tool output contract', () => {
           assert.ok(Buffer.byteLength(tiny[0]!.text, 'utf8') <= 1);
           assert.equal(tiny[0]?.text.includes('\uFFFD'), false);
         }
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('treats split CRLF as one delimiter with file and memory search parity', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-search-crlf-boundary-'));
+    try {
+      const content = `prefix\n${'n'.repeat(65_524)}\nhit\r\nafter\nrepeat\r\r\nother\rZ\nend\r`;
+      assert.equal(Buffer.byteLength(content.slice(0, content.indexOf('hit') + 4), 'utf8'), 65_536,
+        'an earlier nonmatching delimiter and short target put CR at byte 65,535 and LF at 65,536');
+      const stores = [new InMemoryToolOutputStore(), new FileToolOutputStore(directory)];
+      const references = stores.map((store) => store.save({ stdout: content, stderr: content }));
+      for (const channel of ['stdout', 'stderr'] as const) {
+        for (const maxBytes of [4, 5, 6]) {
+          const file = stores[1]!.search(references[1]!, { channel, query: 'after', maxBytes });
+          const memory = stores[0]!.search(references[0]!, { channel, query: 'after', maxBytes });
+          assert.deepEqual(file, memory);
+          assert.equal(file[0]?.line, 4);
+          assert.equal(file[0]?.offset, 65_537, 'CRLF consumes two bytes in the raw offset even after earlier delimiters');
+          assert.equal(Boolean(file[0]?.truncated), maxBytes < 5);
+        }
+        assert.deepEqual(stores[1]!.search(references[1]!, { channel, query: 'hit\r' }), [], 'the CRLF delimiter is not searchable line content');
+        const repeatedCR = stores[1]!.search(references[1]!, { channel, query: 'repeat\r' });
+        assert.deepEqual(repeatedCR, stores[0]!.search(references[0]!, { channel, query: 'repeat\r' }));
+        assert.deepEqual(repeatedCR.map(({ line, offset, text }) => ({ line, offset, text })), [{ line: 5, offset: 65_543, text: 'repeat\r' }]);
+        const bareCR = stores[1]!.search(references[1]!, { channel, query: 'other\rZ' });
+        assert.deepEqual(bareCR, stores[0]!.search(references[0]!, { channel, query: 'other\rZ' }));
+        assert.deepEqual(bareCR.map(({ line, offset, text }) => ({ line, offset, text })), [{ line: 6, offset: 65_552, text: 'other\rZ' }]);
+        const eofCR = stores[1]!.search(references[1]!, { channel, query: 'end\r' });
+        assert.deepEqual(eofCR, stores[0]!.search(references[0]!, { channel, query: 'end\r' }));
+        assert.deepEqual(eofCR.map(({ line, offset, text }) => ({ line, offset, text })), [{ line: 7, offset: 65_560, text: 'end\r' }]);
+      }
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('preserves bounded context when committing an ordinary carried carriage return', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-search-carried-cr-context-'));
+    try {
+      const stores = [new InMemoryToolOutputStore(), new FileToolOutputStore(directory)];
+      const eofReference = stores.map((store) => store.save({ stdout: 'hit\r', stderr: 'hit\r' }));
+      for (const channel of ['stdout', 'stderr'] as const) {
+        for (const query of ['hit', 'hit\r']) {
+          const full = stores[1]!.search(eofReference[1]!, { channel, query, maxBytes: 64 });
+          assert.deepEqual(full, stores[0]!.search(eofReference[0]!, { channel, query, maxBytes: 64 }));
+          assert.deepEqual(full.map(({ text, truncated }) => ({ text, truncated })), [{ text: 'hit\r', truncated: undefined }]);
+        }
+        const exact = stores[1]!.search(eofReference[1]!, { channel, query: 'hit\r', maxBytes: 4 });
+        assert.deepEqual(exact, stores[0]!.search(eofReference[0]!, { channel, query: 'hit\r', maxBytes: 4 }));
+        assert.deepEqual(exact.map(({ text, truncated }) => ({ text, truncated })), [{ text: 'hit\r', truncated: undefined }]);
+        const clipped = stores[1]!.search(eofReference[1]!, { channel, query: 'hit\r', maxBytes: 3 });
+        assert.deepEqual(clipped, stores[0]!.search(eofReference[0]!, { channel, query: 'hit\r', maxBytes: 3 }));
+        assert.deepEqual(clipped.map(({ text, truncated }) => ({ text, truncated })), [{ text: 'hit', truncated: true }]);
+        assert.equal(stores[1]!.read(eofReference[1]!, { channel, length: 4 }).text, 'hit\r', 'search never changes raw artifact bytes');
+
+        const boundaryContent = `prefix\n${'n'.repeat(65_524)}\nhit\rX\nafter\n`;
+        assert.equal(Buffer.byteLength(boundaryContent.slice(0, boundaryContent.indexOf('hit') + 4), 'utf8'), 65_536);
+        const boundaryReferences = stores.map((store) => store.save({ stdout: boundaryContent, stderr: boundaryContent }));
+        const hit = stores[1]!.search(boundaryReferences[1]!, { channel, query: 'hit', maxBytes: 64 });
+        assert.equal(stores[0]!.search(boundaryReferences[0]!, { channel, query: 'hit', maxBytes: 64 })[0]?.text, 'hit\rX',
+          'memory scanner retains the context present in its single input chunk');
+        assert.deepEqual(hit.map(({ line, offset, text, truncated }) => ({ line, offset, text, truncated })),
+          [{ line: 3, offset: 65_532, text: 'hit\r', truncated: true }], 'a full-prefix frozen match may gain the carried CR but remains bounded before X');
+        const endingCR = stores[1]!.search(boundaryReferences[1]!, { channel, query: 'hit\r', maxBytes: 64 });
+        assert.deepEqual(endingCR, stores[0]!.search(boundaryReferences[0]!, { channel, query: 'hit\r', maxBytes: 64 }));
+        assert.deepEqual(endingCR.map(({ text, truncated }) => ({ text, truncated })),
+          [{ text: 'hit\rX', truncated: undefined }], 'without a frozen match, CR and following context stay coalesced');
+        const following = stores[1]!.search(boundaryReferences[1]!, { channel, query: 'after', maxBytes: 64 });
+        assert.deepEqual(following, stores[0]!.search(boundaryReferences[0]!, { channel, query: 'after', maxBytes: 64 }));
+        assert.equal(following[0]?.offset, 65_538);
+
+        const partialReference = stores.map((store) => store.save({ stdout: 'prefixhit\r', stderr: 'prefixhit\r' }));
+        const partial = stores[1]!.search(partialReference[1]!, { channel, query: 'hit', maxBytes: 3 });
+        assert.deepEqual(partial, stores[0]!.search(partialReference[0]!, { channel, query: 'hit', maxBytes: 3 }));
+        assert.deepEqual(partial.map(({ text, truncated }) => ({ text, truncated })),
+          [{ text: 'hit', truncated: true }], 'a bounded fragment missing its prefix is not extended with the adjacent CR');
       }
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });

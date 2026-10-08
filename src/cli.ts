@@ -2291,13 +2291,7 @@ export function printWaitResult(result: WaitCommandResult): void {
 }
 
 export async function main(argv: string[]): Promise<number> {
-  const store = new JsonFileStore({ dir: resolveRunsDir() });
   const [command, subcommand, ...rest] = argv;
-
-  if (command === undefined || command === '--help' || command === '-h') {
-    console.log(USAGE);
-    return 0;
-  }
 
   if (command === 'tool-output') {
     try {
@@ -2326,6 +2320,16 @@ export async function main(argv: string[]): Promise<number> {
       console.error(error instanceof Error ? error.message : String(error));
       return 1;
     }
+  }
+
+  // Keep the evidence-only command independent of Run-store admission. Every
+  // other command constructs the Run store at its original point before help
+  // and command dispatch, preserving existing admission order.
+  const store = new JsonFileStore({ dir: resolveRunsDir() });
+
+  if (command === undefined || command === '--help' || command === '-h') {
+    console.log(USAGE);
+    return 0;
   }
 
   if (command === 'browser') {

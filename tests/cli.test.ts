@@ -424,6 +424,44 @@ describe('CLI command layer', () => {
     }
   });
 
+  it('dispatches explicit evidence read and search before unrelated Run-store admission', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-tool-output-independent-cli-'));
+    const evidenceRoot = path.join(root, 'evidence');
+    const blocker = path.join(root, 'run-store-is-a-file');
+    const previous = { evidence: process.env.TACHIKO_EVIDENCE_DIR, data: process.env.TACHIKO_DATA_DIR };
+    const priorLog = console.log;
+    const priorError = console.error;
+    let printed = '';
+    let errors = '';
+    try {
+      const reference = new FileToolOutputStore(evidenceRoot).save({ stdout: 'independent-evidence-marker', stderr: '' });
+      writeFileSync(blocker, 'unrelated Run path sentinel');
+      process.env.TACHIKO_EVIDENCE_DIR = evidenceRoot;
+      process.env.TACHIKO_DATA_DIR = blocker;
+      console.log = (...values: unknown[]) => { printed = values.map(String).join(' '); };
+      console.error = (...values: unknown[]) => { errors = values.map(String).join(' '); };
+
+      assert.equal(await main(['tool-output', 'read', JSON.stringify(reference), '--channel', 'stdout']), 0);
+      assert.equal(JSON.parse(printed).text, 'independent-evidence-marker');
+      assert.equal(await main(['tool-output', 'search', JSON.stringify(reference), '--query', 'evidence-marker']), 0);
+      assert.equal(JSON.parse(printed)[0]?.text, 'independent-evidence-marker');
+      assert.equal(await main(['tool-output', 'read', JSON.stringify({ ...reference, id: 'missing' }), '--channel', 'stdout']), 1,
+        'invalid explicit evidence still refuses through the evidence store');
+      assert.match(errors, /not found|identity|reference|unavailable|expired/i);
+      assert.equal(readFileSync(blocker, 'utf8'), 'unrelated Run path sentinel');
+
+      await assert.rejects(main(['--help']), /not a directory/i, 'help retains its historical Run-store construction order');
+      await assert.rejects(main(['run', 'show', reference.id]), /not a directory/i, 'Run commands retain their historical admission failure');
+      assert.equal(readFileSync(blocker, 'utf8'), 'unrelated Run path sentinel');
+    } finally {
+      console.log = priorLog;
+      console.error = priorError;
+      if (previous.evidence === undefined) delete process.env.TACHIKO_EVIDENCE_DIR; else process.env.TACHIKO_EVIDENCE_DIR = previous.evidence;
+      if (previous.data === undefined) delete process.env.TACHIKO_DATA_DIR; else process.env.TACHIKO_DATA_DIR = previous.data;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('resolves the implementation provider and explicit Codex execution config without choosing a model', () => {
     assert.equal(resolveImplementationProvider({}), 'worker-router');
     assert.equal(resolveImplementationProvider({ TACHIKO_IMPLEMENTATION_AGENT: 'codex-cli' }), 'codex-cli');
