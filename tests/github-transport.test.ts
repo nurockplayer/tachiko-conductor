@@ -477,44 +477,124 @@ describe('NodeProcessRunner', () => {
         });
       }
 
+      const originalEmit = ChildProcess.prototype.emit;
       for (const mode of ['ordinary', 'captured'] as const) {
-        const controller = new AbortController();
-        const root = path.join(directory, `${mode}-late-abort`);
-        const script = [
-          "const { spawn } = require('node:child_process');",
-          `spawn(process.execPath, ['-e', "setTimeout(() => process.stdout.write('LATE-PIPE-DONE'), 250)"], { stdio: 'inherit' });`,
-          'process.exit(0);',
-        ].join(' ');
-        const pending = new NodeProcessRunner().run(process.execPath, ['-e', script], {
-          timeoutMs: 5_000, signal: controller.signal,
-          ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
-        });
-        setTimeout(() => controller.abort(), 75);
-        const result = await pending;
-        assert.equal(result.exitCode, 0, `${mode}: late abort after direct exit cannot change successful child truth`);
-        assert.match(result.stdout, /LATE-PIPE-DONE/);
-        if (mode === 'captured') assert.equal(result.output?.outcome, 'passed');
-      }
+        for (const directExitCode of [0, 17] as const) {
+          const controller = new AbortController();
+          const root = path.join(directory, `${mode}-late-abort-${directExitCode}`);
+          const outputMarker = directExitCode === 0 ? 'LATE-PIPE-DONE' : 'LATE-NONZERO-DONE';
+          const script = [
+            "const { spawn } = require('node:child_process');",
+            `spawn(process.execPath, ['-e', ${JSON.stringify(`setTimeout(() => process.stdout.write('${outputMarker}'), 250)`)}], { stdio: 'inherit' });`,
+            `setTimeout(() => process.exit(${directExitCode}), 150);`,
+          ].join(' ');
+          let ownedChild: ChildProcess | undefined;
+          let spawnedAt: number | undefined;
+          let closed = false;
+          let resolveClosed!: () => void;
+          const closeObserved = new Promise<void>((resolve) => { resolveClosed = resolve; });
+          let resolveDirectExit!: (value: { readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly elapsedSinceSpawnMs: number }) => void;
+          const directExitObserved = new Promise<{ readonly code: number | null; readonly signal: NodeJS.Signals | null; readonly elapsedSinceSpawnMs: number }>((resolve) => {
+            resolveDirectExit = resolve;
+          });
+          const isOwnedChild = (child: ChildProcess): boolean => child.spawnfile === process.execPath
+            && child.spawnargs[1] === '-e' && child.spawnargs[2] === script;
+          const observedEmit = function (this: ChildProcess, eventName: string | symbol, ...args: unknown[]): boolean {
+            const isTarget = isOwnedChild(this);
+            if (isTarget && eventName === 'spawn' && ownedChild === undefined) {
+              ownedChild = this;
+              spawnedAt = Date.now();
+              this.once('close', () => { closed = true; resolveClosed(); });
+            }
+            const emitted = Reflect.apply(originalEmit, this, [eventName, ...args]) as boolean;
+            if (isTarget && this === ownedChild && eventName === 'exit') {
+              const observedAt = Date.now();
+              resolveDirectExit({
+                code: typeof args[0] === 'number' ? args[0] : null,
+                signal: typeof args[1] === 'string' ? args[1] as NodeJS.Signals : null,
+                elapsedSinceSpawnMs: spawnedAt === undefined ? -1 : observedAt - spawnedAt,
+              });
+              // The production exit listeners have all run before this event observer delivers the abort.
+              controller.abort();
+            }
+            return emitted;
+          };
+          ChildProcess.prototype.emit = observedEmit as typeof originalEmit;
+          let pending: Promise<ProcessResult> | undefined;
+          let settled: Promise<{ readonly result: ProcessResult } | { readonly error: unknown }> | undefined;
+          let exitDeadline: ReturnType<typeof setTimeout> | undefined;
+          let settlementDeadline: ReturnType<typeof setTimeout> | undefined;
+          try {
+            pending = new NodeProcessRunner().run(process.execPath, ['-e', script], {
+              timeoutMs: 5_000, signal: controller.signal,
+              ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
+            });
+            settled = pending.then((result) => ({ result }), (error: unknown) => ({ error }));
+            const deadline = new Promise<never>((_resolve, reject) => {
+              exitDeadline = setTimeout(() => reject(new Error(`${mode}/${directExitCode}: actual owned child did not exit`)), 3_000);
+            });
+            const observedExit = await Promise.race([directExitObserved, deadline]);
+            if (exitDeadline !== undefined) clearTimeout(exitDeadline);
+            assert.equal(observedExit.code, directExitCode, `${mode}/${directExitCode}: observer matched the expected real direct child`);
+            assert.equal(observedExit.signal, null);
+            assert.ok(observedExit.elapsedSinceSpawnMs >= 150,
+              `${mode}/${directExitCode}: the actual child's 150ms startup makes the old 75ms timer a pre-exit abort`);
+            assert.equal(controller.signal.aborted, true, `${mode}/${directExitCode}: abort is delivered after actual exit listeners run`);
 
-      for (const mode of ['ordinary', 'captured'] as const) {
-        const controller = new AbortController();
-        const root = path.join(directory, `${mode}-late-abort-nonzero`);
-        const script = [
-          "const { spawn } = require('node:child_process');",
-          `spawn(process.execPath, ['-e', "setTimeout(() => process.stdout.write('LATE-NONZERO-DONE'), 250)"], { stdio: 'inherit' });`,
-          'process.exit(17);',
-        ].join(' ');
-        const pending = new NodeProcessRunner().run(process.execPath, ['-e', script], {
-          timeoutMs: 5_000, signal: controller.signal,
-          ...(mode === 'captured' ? { outputStore: new FileToolOutputStore(root) } : {}),
-        });
-        setTimeout(() => controller.abort(), 75);
-        await assert.rejects(pending, (error: unknown) => {
-          const value = error as NodeJS.ErrnoException & { readonly output?: { readonly outcome?: unknown } };
-          assert.equal(code(error), 'ABORT_ERR');
-          if (mode === 'captured') assert.equal(value.output?.outcome, 'cancelled');
-          return true;
-        });
+            const settlementTimedOut = new Promise<never>((_resolve, reject) => {
+              settlementDeadline = setTimeout(() => reject(new Error(`${mode}/${directExitCode}: runner did not settle after natural pipe close`)), 3_000);
+            });
+            const outcome = await Promise.race([settled, settlementTimedOut]);
+            if (settlementDeadline !== undefined) clearTimeout(settlementDeadline);
+            if (directExitCode !== 0) {
+              assert.ok('error' in outcome, `${mode}/${directExitCode}: abort error is retained after the real nonzero exit`);
+              assert.equal(code(outcome.error), 'ABORT_ERR');
+              assert.equal(closed, true, `${mode}/${directExitCode}: inherited pipes reached actual close before the runner settled`);
+              if (mode === 'captured') {
+                const value = outcome.error as NodeJS.ErrnoException & {
+                  readonly captureStatus?: unknown;
+                  readonly captureObservation?: { readonly status?: unknown; readonly stdout?: { readonly preview?: string } };
+                  readonly output?: { readonly outcome?: unknown; readonly exitCode?: unknown; readonly artifact?: unknown };
+                };
+                assert.equal(value.captureStatus, 'complete');
+                assert.equal(value.captureObservation?.status, 'complete');
+                assert.match(value.captureObservation?.stdout?.preview ?? '', new RegExp(outputMarker));
+                assert.equal(value.output?.outcome, 'cancelled');
+                assert.equal(value.output?.exitCode, directExitCode, 'the artifact retains the observed numeric child exit');
+                assert.ok(value.output?.artifact, 'natural EOF retains the completed failure artifact');
+              }
+              continue;
+            }
+            assert.ok('result' in outcome, `${mode}/${directExitCode}: the observed successful child exit remains authoritative`);
+            const result = outcome.result;
+            assert.equal(result.exitCode, directExitCode);
+            assert.match(result.stdout, new RegExp(outputMarker));
+            assert.equal(closed, true, `${mode}/${directExitCode}: inherited pipes reached actual close before the runner settled`);
+            if (mode === 'captured') {
+              assert.equal(result.captureStatus, 'complete');
+              assert.equal(result.captureObservation?.status, 'complete');
+              assert.equal(result.output?.outcome, directExitCode === 0 ? 'passed' : 'failed');
+              assert.equal(result.output?.exitCode, directExitCode);
+              assert.ok(result.output?.artifact, `${mode}/${directExitCode}: naturally completed inherited pipes retain their artifact`);
+            }
+          } finally {
+            if (exitDeadline !== undefined) clearTimeout(exitDeadline);
+            if (settlementDeadline !== undefined) clearTimeout(settlementDeadline);
+            ChildProcess.prototype.emit = originalEmit;
+            if (!controller.signal.aborted) controller.abort();
+            if (settled !== undefined) await settled;
+            if (ownedChild !== undefined && !closed) {
+              let closeDeadline: ReturnType<typeof setTimeout> | undefined;
+              try {
+                await Promise.race([closeObserved, new Promise<void>((_resolve, reject) => {
+                  closeDeadline = setTimeout(() => reject(new Error(`${mode}/${directExitCode}: owned child did not close`)), 3_000);
+                })]);
+              } finally {
+                if (closeDeadline !== undefined) clearTimeout(closeDeadline);
+              }
+            }
+          }
+        }
       }
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });

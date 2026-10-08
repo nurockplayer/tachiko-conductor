@@ -15,6 +15,7 @@ import {
   BrowserRuntimeError,
   ManagedPlaywrightMcpRuntime,
   type BrowserRuntimeHandle,
+  type BrowserRuntimeSnapshot,
 } from '../src/browser/playwright-mcp-runtime.js';
 import { openBrowserForBootstrap } from '../src/browser/mcp-client.js';
 
@@ -224,8 +225,46 @@ describe('managed Playwright MCP integration', () => {
     });
     let first: BrowserRuntimeHandle | undefined;
     let second: BrowserRuntimeHandle | undefined;
+    let firstSnapshot: BrowserRuntimeSnapshot | undefined;
+    let firstStopSnapshot: BrowserRuntimeSnapshot | undefined;
+    let firstStopElapsedMs: number | undefined;
+    let secondNavigationDiagnostic: { readonly isError: unknown; readonly text: string } | undefined;
+    let secondReadDiagnostic: { readonly isError: unknown; readonly text: string } | undefined;
+    const boundedToolResult = (value: unknown): { readonly isError: unknown; readonly text: string } => {
+      if (typeof value !== 'object' || value === null) return { isError: undefined, text: '' };
+      const toolResult = value as { readonly isError?: unknown; readonly content?: unknown };
+      const text = Array.isArray(toolResult.content)
+        ? toolResult.content.slice(0, 4).flatMap((item: unknown) => {
+          if (typeof item !== 'object' || item === null) return [];
+          const entry = item as { readonly type?: unknown; readonly text?: unknown };
+          return entry.type === 'text' && typeof entry.text === 'string' ? [entry.text.slice(0, 320)] : [];
+        }).join('\n').slice(0, 1_200)
+        : '';
+      return { isError: toolResult.isError, text };
+    };
+    const persistenceDiagnostic = (): string => JSON.stringify({
+      fixtureOrigin: new URL(fixtureUrl).origin,
+      profileRoot: path.join(root, 'profiles'),
+      firstRuntimeId: firstSnapshot?.runtimeId,
+      firstProfile: firstSnapshot?.profile,
+      firstStopElapsedMs,
+      firstStopSnapshot: firstStopSnapshot === undefined ? undefined : {
+        runtimeId: firstStopSnapshot.runtimeId,
+        profile: firstStopSnapshot.profile,
+        state: firstStopSnapshot.state,
+        health: firstStopSnapshot.health,
+        exitCode: firstStopSnapshot.exitCode,
+        exitSignal: firstStopSnapshot.exitSignal,
+        stoppedAt: firstStopSnapshot.stoppedAt,
+      },
+      secondRuntimeId: second?.snapshot.runtimeId,
+      secondProfile: second?.snapshot.profile,
+      secondNavigation: secondNavigationDiagnostic,
+      secondRead: secondReadDiagnostic,
+    });
     try {
       first = await runtime.start({ profile: 'persistent', port: await freePort(), headless: true });
+      firstSnapshot = first.snapshot;
       assert.equal(first.snapshot.host, '127.0.0.1');
       await assert.rejects(
         runtime.start({ profile: 'persistent', port: await freePort(), headless: true }),
@@ -255,19 +294,23 @@ describe('managed Playwright MCP integration', () => {
         assert.notEqual(written.isError, true);
         assert.match(contentText(written), /state-from-first-session/);
       });
-      await first.stop();
+      const firstStopStartedAt = Date.now();
+      firstStopSnapshot = await first.stop();
+      firstStopElapsedMs = Date.now() - firstStopStartedAt;
       first = undefined;
 
       second = await runtime.start({ profile: 'persistent', port: await freePort(), headless: true });
       await withClient(second.snapshot.endpoint, async (client) => {
         const navigation = await client.callTool({ name: 'browser_navigate', arguments: { url: fixtureUrl } });
-        assert.notEqual(navigation.isError, true);
+        secondNavigationDiagnostic = boundedToolResult(navigation);
+        assert.notEqual(navigation.isError, true, `second same-profile navigation failed; bounded runtime context=${persistenceDiagnostic()}`);
         const read = await client.callTool({
           name: 'browser_evaluate',
           arguments: { function: "() => localStorage.getItem('tachiko-persistent')" },
         });
-        assert.notEqual(read.isError, true);
-        assert.match(contentText(read), /state-from-first-session/);
+        secondReadDiagnostic = boundedToolResult(read);
+        assert.notEqual(read.isError, true, `second same-profile read failed; bounded runtime context=${persistenceDiagnostic()}`);
+        assert.match(contentText(read), /state-from-first-session/, `persisted value missing; bounded runtime context=${persistenceDiagnostic()}`);
       });
     } finally {
       await first?.stop().catch(() => undefined);
