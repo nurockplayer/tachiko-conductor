@@ -11,6 +11,8 @@ import {
   FileToolOutputStore,
   InMemoryToolOutputStore,
   boundToolOutput,
+  boundToolOutputFromCapture,
+  isToolOutputEnvelope,
   readToolOutput,
   searchToolOutput,
   validateToolOutputPolicy,
@@ -418,6 +420,71 @@ describe('bounded tool output contract', () => {
     assert.ok(result.diagnostics.every((line) => Buffer.byteLength(line, 'utf8') <= 24));
     assert.ok(result.diagnostics.reduce((sum, line) => sum + Buffer.byteLength(line, 'utf8'), 0) <= 24);
     assert.equal(result.diagnosticsTruncated, true);
+  });
+
+  it('accounts for joined diagnostic separators across buffered, file, and partial observations', () => {
+    const diagnosticPolicy = { previewBytes: 8, diagnosticBytes: 65_536, maxDiagnostics: 2, readBytes: 8 };
+    const line = `ERROR: ${'x'.repeat(32_761)}`;
+    assert.equal(Buffer.byteLength(line), 32_768);
+
+    const direct = boundToolOutput({ outcome: 'failed', exitCode: 1, stderr: line, stdout: line,
+      store: new InMemoryToolOutputStore(), policy: diagnosticPolicy });
+    assert.equal(Buffer.byteLength(direct.diagnostics.join('\n')), 65_536);
+    assert.equal(direct.overflow.diagnostics, true);
+    assert.equal(isToolOutputEnvelope(direct), true);
+
+    const bufferedStore = new InMemoryToolOutputStore();
+    const buffered = bufferedStore.startCapture(diagnosticPolicy);
+    buffered.write('stderr', line);
+    buffered.write('stdout', line);
+    const bufferedEnvelope = boundToolOutputFromCapture({ outcome: 'failed', exitCode: 1,
+      capture: buffered.finish(), policy: diagnosticPolicy });
+    assert.equal(Buffer.byteLength(bufferedEnvelope.diagnostics.join('\n')), 65_536);
+    assert.equal(isToolOutputEnvelope(bufferedEnvelope), true);
+
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-diagnostic-joined-bound-'));
+    try {
+      const fileStore = new FileToolOutputStore(root);
+      const file = fileStore.startCapture(diagnosticPolicy);
+      file.write('stderr', line);
+      file.write('stdout', line);
+      const fileEnvelope = boundToolOutputFromCapture({ outcome: 'failed', exitCode: 1,
+        capture: file.finish(), policy: diagnosticPolicy });
+      assert.equal(Buffer.byteLength(fileEnvelope.diagnostics.join('\n')), 65_536);
+      assert.equal(isToolOutputEnvelope(fileEnvelope), true);
+    } finally { rmSync(root, { recursive: true, force: true }); }
+
+    const unavailable = new ContainedToolOutputCaptureSession(diagnosticPolicy);
+    unavailable.write(undefined, 'stderr', line);
+    unavailable.write(undefined, 'stdout', line);
+    const unavailableResult = unavailable.finish(undefined);
+    assert.equal(unavailableResult.status, 'unavailable');
+    assert.equal(Buffer.byteLength(unavailableResult.diagnostics.join('\n')), 65_536);
+    assert.equal(unavailableResult.diagnosticsTruncated, true);
+
+    const partial = new ContainedToolOutputCaptureSession(diagnosticPolicy);
+    const failingWriter = { write: () => undefined, finish: () => { throw new Error('sink failed'); }, abort: () => undefined };
+    partial.write(failingWriter, 'stderr', line);
+    partial.write(failingWriter, 'stdout', line);
+    const partialResult = partial.finish(failingWriter);
+    assert.equal(partialResult.status, 'partial');
+    assert.equal(Buffer.byteLength(partialResult.diagnostics.join('\n')), 65_536);
+    assert.equal(partialResult.diagnosticsTruncated, true);
+  });
+
+  it('keeps an exact single diagnostic line and marks omitted UTF-8 scalars truthfully', () => {
+    const exactLine = `ERROR: ${'x'.repeat(65_529)}`;
+    const exact = boundToolOutput({ outcome: 'failed', exitCode: 1, stderr: exactLine, stdout: '',
+      store: new InMemoryToolOutputStore(), policy: { previewBytes: 8, diagnosticBytes: 65_536, maxDiagnostics: 2, readBytes: 8 } });
+    assert.equal(Buffer.byteLength(exact.diagnostics[0] ?? ''), 65_536);
+    assert.equal(exact.overflow.diagnostics, false);
+    assert.equal(isToolOutputEnvelope(exact), true);
+
+    const tiny = new ContainedToolOutputCaptureSession({ previewBytes: 1, diagnosticBytes: 2, maxDiagnostics: 1, readBytes: 1 });
+    tiny.write(undefined, 'stderr', '界');
+    const omitted = tiny.finish(undefined);
+    assert.deepEqual(omitted.diagnostics, []);
+    assert.equal(omitted.diagnosticsTruncated, true);
   });
 
   it('bounds successful huge output without changing the success exit semantics', () => {
@@ -2414,6 +2481,60 @@ describe('UTF-8 tool output ranges', () => {
           assert.ok(pass.attempted <= 1);
           assert.ok(existsSync(path.join(directory, artifact.id + '.stdout')), 'strict deletion budget leaves the owned artifact for a later pass');
           assert.throws(() => new FileToolOutputStore(directory, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 1 }), /metadata-read budget exhausted/);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: refuses aggregate budgets below maintenance finalization before publishing an owner', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-maintenance-reserve-'));
+        try {
+          const store = new FileToolOutputStore(directory, { capacity: 1 });
+          const operations = path.join(directory, 'operations');
+          assert.throws(() => store.cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 8_191 }), /metadata-read budget exhausted/);
+          assert.equal(existsSync(path.join(operations, 'maintenance.lock')), false);
+          assert.deepEqual(readdirSync(operations).filter((name) => name.startsWith('maintenance.lock.tmp-')), []);
+          const reusable = store.beginOperation({ kind: 'after-maintenance-reservation-refusal' });
+          reusable.abort();
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: releases the pinned maintenance owner after ordinary cleanup reads exhaust', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-maintenance-finalizer-'));
+        try {
+          const store = new FileToolOutputStore(directory, { capacity: 1 });
+          const operation = store.beginOperation({ kind: 'maintenance-finalizer-body-exhaustion' });
+          const maintenanceOwnerBytes = readFileSync(path.join(directory, 'operations', `${operation.id}.lock`)).byteLength;
+          operation.abort();
+          store.cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 65_536 });
+          assert.ok(maintenanceOwnerBytes > 0);
+          const maintenancePath = path.join(directory, 'operations', 'maintenance.lock');
+          assert.throws(() => store.cleanupExpired({ maxSlotProbes: 1, maxMetadataReadBytes: 8_192 + maintenanceOwnerBytes + 1 }), /metadata-read budget exhausted/);
+          assert.equal(existsSync(maintenancePath), false, 'the reserved owner finalizer completes after body-ledger exhaustion');
+          const reusable = store.beginOperation({ kind: 'after-maintenance-body-exhaustion' });
+          reusable.abort();
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: bounds and preserves an oversized malformed maintenance owner', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-oversized-maintenance-'));
+        try {
+          let now = new Date('2020-01-01T00:00:00.000Z');
+          const store = new FileToolOutputStore(directory, { capacity: 1, retentionMs: 1, now: () => now });
+          const artifact = store.save({ stdout: 'protected-by-oversized-owner', stderr: '' });
+          const operations = path.join(directory, 'operations');
+          const maintenancePath = path.join(operations, 'maintenance.lock');
+          const malformed = Buffer.alloc(2 * 1_048_576, 0x78);
+          writeFileSync(maintenancePath, malformed, { mode: 0o600 });
+          const metadataPath = path.join(operations, `${artifact.operationId}.json`);
+          const metadataBefore = readFileSync(metadataPath);
+          assert.throws(() => store.cleanupExpired({ maxSlotProbes: 1, maxMetadataBytes: 4_096, maxMetadataReadBytes: 65_536 }), /lock|owner|invocation/i);
+          assert.deepEqual(readFileSync(maintenancePath), malformed, 'oversized owner bytes remain untouched');
+          assert.deepEqual(readFileSync(metadataPath), metadataBefore, 'the protected operation metadata remains untouched');
+          assert.equal(existsSync(path.join(directory, `${artifact.id}.stdout`)), true);
+          unlinkSync(maintenancePath);
+          now = new Date('2030-01-01T00:00:00.000Z');
+          store.cleanupExpired({ maxSlotProbes: 1, maxMetadataBytes: 4_096, maxMetadataReadBytes: 65_536 });
+          const reusable = store.beginOperation({ kind: 'after-oversized-maintenance-owner' });
+          reusable.abort();
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 

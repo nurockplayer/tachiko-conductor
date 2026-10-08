@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import { closeSync, existsSync, mkdirSync, openSync, readSync, writeSync, renameSync, fsyncSync, lstatSync, fstatSync, constants, realpathSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
@@ -7,6 +8,8 @@ import {
   type DispatchInvocationLock,
   type DispatchInvocationPublicationHandoff,
   type PreparedDispatchInvocationPublication,
+  type DispatchInvocationReadPolicy,
+  type DispatchInvocationReadAllowance,
 } from '../dispatch/invocation-lock.js';
 
 export const TOOL_OUTPUT_CONTRACT_VERSION = 'tachiko.tool-output.v1' as const;
@@ -317,7 +320,8 @@ function acquireEvidenceOperationFence(
   accountRead?: (bytes: number) => void,
   admittedPreflight?: StrictEvidenceOperationLock | undefined,
   onStaleTakeoverAttempt?: (owner: StrictEvidenceOperationLock) => void,
-  preparePublication?: (publication: PreparedDispatchInvocationPublication) => DispatchInvocationPublicationHandoff,
+  preparePublication?: (publication: PreparedDispatchInvocationPublication, accountRead?: (bytes: number) => void) => DispatchInvocationPublicationHandoff,
+  readPolicy?: DispatchInvocationReadPolicy,
 ): AcquiredEvidenceOperationFence {
   const preflight = admittedPreflight ?? readEvidenceOperationLock(lockPath, accountRead);
   if (preflight?.record !== undefined && expectedOwnerNonce !== undefined && preflight.record.nonce !== expectedOwnerNonce) {
@@ -328,6 +332,7 @@ function acquireEvidenceOperationFence(
     lockPath,
     nonce: () => ownerNonce,
     preparePublication,
+    readPolicy,
     beforeStaleTakeover: () => {
       testFaults?.beforeStaleTakeover?.();
       const current = readEvidenceOperationLock(lockPath, accountRead);
@@ -371,6 +376,7 @@ interface CleanupRetryBudget extends TerminalRetryBudget {
   readonly remainingDeletions: () => number;
   readonly maxMetadataBytes: number;
   readonly canRead: (bytes: number) => boolean;
+  readonly reserveReadBytes: (bytes: number) => DispatchInvocationReadAllowance;
 }
 
 interface PendingCleanupTransition {
@@ -815,16 +821,20 @@ function boundedDiagnostics(stdout: string, stderr: string, policy: ToolOutputPo
   const retained = selected.length <= policy.maxDiagnostics ? selected
     : policy.maxDiagnostics === 1 ? [selected[0]!] : [selected[0]!, ...selected.slice(-(policy.maxDiagnostics - 1))];
   for (const line of retained) {
-    const remaining = policy.diagnosticBytes - used;
+    const separatorBytes = result.length === 0 ? 0 : 1;
+    const remaining = policy.diagnosticBytes - used - separatorBytes;
     if (remaining <= 0) {
       truncated = true;
       break;
     }
     const bounded = head(line, remaining);
-    if (bounded === '') continue;
+    if (bounded === '') {
+      truncated = true;
+      break;
+    }
     result.push(bounded);
     if (bounded.length < line.length || utf8Bytes(bounded) < utf8Bytes(line)) truncated = true;
-    used += utf8Bytes(bounded);
+    used += separatorBytes + utf8Bytes(bounded);
   }
   return { lines: result, truncated };
 }
@@ -1455,6 +1465,7 @@ export class FileToolOutputStore implements ToolOutputStore {
       remainingDeletions: () => Number.MAX_SAFE_INTEGER,
       maxMetadataBytes: 1_048_576,
       canRead: () => true,
+      reserveReadBytes: () => ({ accountRead: () => undefined, releaseUnused: () => undefined }),
     };
     const existingTransition = pendingTerminalTransitions.get(this.root)?.get(operationId);
     if (existingTransition !== undefined) {
@@ -1550,16 +1561,18 @@ export class FileToolOutputStore implements ToolOutputStore {
       if (admittedLock !== undefined && admittedLock.record.nonce !== expectedOwnerNonce) {
         throw new Error('Evidence operation lock nonce does not match its persisted release owner.');
       }
-      const sharedOwnerReadReserve = admittedLock === undefined ? 1 * 4096 : 5 * 4096;
       const localOwnerReadHeadroom = admittedLock === undefined ? 3 * 4096 : 5 * 4096;
-      if (!budget.canRead(sharedOwnerReadReserve + localOwnerReadHeadroom)) return;
+      if (!budget.canRead(localOwnerReadHeadroom)) return;
       const staleTakeoverReserve = admittedLock === undefined ? 0 : 1;
       if (budget.remainingDeletions() < staleTakeoverReserve + 1) return;
-      budget.accountRead(sharedOwnerReadReserve);
       let staleTakeoverAttempted = false;
       let staleTakeoverCounted = false;
-      const preparePublication = (publication: PreparedDispatchInvocationPublication): DispatchInvocationPublicationHandoff => {
-        const fence = prepareEvidenceOperationFence(lockPath, publication, this.testFaults, budget.accountRead);
+      const readPolicy: DispatchInvocationReadPolicy = {
+        maxRecordBytes: 4096, symlinkReadBytes: 4096,
+        accountRead: budget.accountRead, reserveReadBytes: budget.reserveReadBytes,
+      };
+      const preparePublication = (publication: PreparedDispatchInvocationPublication, readOwner: (bytes: number) => void = budget.accountRead): DispatchInvocationPublicationHandoff => {
+        const fence = prepareEvidenceOperationFence(lockPath, publication, this.testFaults, readOwner);
         if (ownerAcquisition.fence !== undefined) {
           fence.discardUnpublished();
           throw new Error('Release admission already has a prepared owner anchor.');
@@ -1572,8 +1585,8 @@ export class FileToolOutputStore implements ToolOutputStore {
             ownerAcquisition.temporary = undefined;
             fence.discardUnpublished();
           },
-          beforeRollbackUnlink: () => fence.beforeRollbackUnlink(budget),
-          afterRollbackUnlink: () => fence.afterRollbackUnlink(budget),
+          beforeRollbackUnlink: () => fence.beforeRollbackUnlink({ ...budget, accountRead: readOwner }),
+          afterRollbackUnlink: () => fence.afterRollbackUnlink({ ...budget, accountRead: readOwner }),
           beforeTemporaryUnlink: () => this.testFaults?.beforeOwnerLockTemporaryUnlink?.(lockPath, publication.temporaryPath),
         };
       };
@@ -1594,6 +1607,7 @@ export class FileToolOutputStore implements ToolOutputStore {
             staleTakeoverAttempted = true;
           },
           preparePublication,
+          readPolicy,
         );
         if (staleTakeoverAttempted) {
           budget.finishDeletion();
@@ -1631,7 +1645,6 @@ export class FileToolOutputStore implements ToolOutputStore {
     assertPositiveInteger(maxDeletions, 'maxDeletions');
     ensurePrivateDirectory(this.root);
     ensurePrivateDirectory(this.operationsDir);
-    const maintenance = acquireDispatchInvocationLock({ lockPath: path.join(this.operationsDir, 'maintenance.lock') });
     let probed = 0;
     let deleted = 0;
     let attempted = 0;
@@ -1639,8 +1652,29 @@ export class FileToolOutputStore implements ToolOutputStore {
     let cursor = 0;
     let metadataReadBytes = 0;
     const accountMetadataRead = (bytes: number): void => {
-      if (metadataReadBytes + bytes > maxMetadataReadBytes) throw new Error('Tool-output cleanup metadata-read budget exhausted.');
+      if (!Number.isSafeInteger(bytes) || bytes < 0 || metadataReadBytes + bytes > maxMetadataReadBytes) {
+        throw new Error('Tool-output cleanup metadata-read budget exhausted.');
+      }
       metadataReadBytes += bytes;
+    };
+    const reserveMetadataRead = (bytes: number): DispatchInvocationReadAllowance => {
+      accountMetadataRead(bytes);
+      let remaining = bytes;
+      let active = true;
+      return {
+        accountRead: (count) => {
+          if (!active || !Number.isSafeInteger(count) || count < 0 || count > remaining) {
+            throw new Error('Tool-output cleanup metadata-read budget exhausted.');
+          }
+          remaining -= count;
+        },
+        releaseUnused: () => {
+          if (!active) return;
+          metadataReadBytes -= remaining;
+          remaining = 0;
+          active = false;
+        },
+      };
     };
     const retryBudget = (): CleanupRetryBudget => ({
       accountRead: accountMetadataRead,
@@ -1652,7 +1686,68 @@ export class FileToolOutputStore implements ToolOutputStore {
       remainingDeletions: () => maxDeletions - attempted,
       maxMetadataBytes,
       canRead: (bytes) => metadataReadBytes + bytes <= maxMetadataReadBytes,
+      reserveReadBytes: reserveMetadataRead,
     });
+    const pathLimit = spawnSync('/usr/bin/getconf', ['PATH_MAX', this.operationsDir], {
+      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2_000, maxBuffer: 64 * 1024,
+      env: { ...process.env, LC_ALL: 'C', LANG: 'C', TZ: 'UTC0' },
+    });
+    const qualifiedPathMax = pathLimit.status === 0 && typeof pathLimit.stdout === 'string' ? Number(pathLimit.stdout.trim()) : NaN;
+    if (!Number.isSafeInteger(qualifiedPathMax) || qualifiedPathMax < 1 || qualifiedPathMax > 4096) {
+      throw new Error('Tool-output cleanup cannot qualify a bounded symlink-claim read on this filesystem.');
+    }
+    const maintenanceReleaseAllowance = reserveMetadataRead(2 * 4096);
+    const maintenanceReadPolicy: DispatchInvocationReadPolicy = {
+      maxRecordBytes: 4096, symlinkReadBytes: 4096,
+      accountRead: accountMetadataRead, reserveReadBytes: reserveMetadataRead,
+      releaseRead: maintenanceReleaseAllowance,
+    };
+    const maintenanceLockPath = path.join(this.operationsDir, 'maintenance.lock');
+    let maintenanceFence: PinnedEvidenceOperationFence | undefined;
+    const maintenanceFinalizerBudget: TerminalRetryBudget = {
+      accountRead: maintenanceReleaseAllowance.accountRead,
+      beginDeletion: () => undefined,
+      finishDeletion: () => undefined,
+    };
+    const maintenanceHandoff = (publication: PreparedDispatchInvocationPublication,
+      accountRead: (bytes: number) => void = accountMetadataRead): DispatchInvocationPublicationHandoff => {
+      const fence = prepareEvidenceOperationFence(maintenanceLockPath, publication, undefined, accountRead);
+      if (maintenanceFence !== undefined) {
+        fence.discardUnpublished();
+        throw new Error('Tool-output maintenance lock already has a prepared owner anchor.');
+      }
+      maintenanceFence = fence;
+      return {
+        discardUnpublished: () => {
+          if (maintenanceFence === fence) maintenanceFence = undefined;
+          fence.discardUnpublished();
+        },
+        beforeRollbackUnlink: () => fence.beforeRollbackUnlink(maintenanceFinalizerBudget),
+        afterRollbackUnlink: () => fence.afterRollbackUnlink(maintenanceFinalizerBudget),
+      };
+    };
+    let maintenance: DispatchInvocationLock;
+    try {
+      const acquired = acquireDispatchInvocationLock({
+        lockPath: maintenanceLockPath,
+        readPolicy: maintenanceReadPolicy,
+        preparePublication: maintenanceHandoff,
+      });
+      maintenance = {
+        release: () => {
+          if (maintenanceFence !== undefined) maintenanceFence.release(maintenanceFinalizerBudget);
+          else acquired.release();
+        },
+      };
+    } catch (error) {
+      if (maintenanceFence !== undefined) {
+        try { maintenanceFence.release(maintenanceFinalizerBudget); }
+        catch (releaseError) {
+          throw new AggregateError([error, releaseError], 'Tool-output maintenance admission failed and its owner release remains observable.', { cause: error });
+        }
+      } else maintenanceReleaseAllowance.releaseUnused();
+      throw error;
+    }
     const syncOperationsDirectory = (): void => {
       const descriptor = openSync(this.operationsDir, constants.O_RDONLY);
       try { fsyncSync(descriptor); } finally { closeSync(descriptor); }
@@ -1963,6 +2058,8 @@ export class FileToolOutputStore implements ToolOutputStore {
           (state.pendingSlotWrite !== undefined || state.tombstoneDurable || state.phase === 'tombstone'),
       };
     };
+    let cleanupFailed = false;
+    let cleanupFailure: unknown;
     try {
       const index = this.readSlotIndex(true, accountMetadataRead);
       cursor = index.cursor;
@@ -2051,13 +2148,8 @@ export class FileToolOutputStore implements ToolOutputStore {
           protectedCount += 1; continue;
         }
 
-        // Acquiring a stale/absent owner can read it once during takeover and
-        // again while pinning. Reserve the fixed maximum for preflight,
-        // takeover revalidation, and pin reads, plus one owner-disposal
-        // attempt, before acquisition can create a new lock path.
         const retry = retryBudget();
-        const ownerReadReservation = 3 * 4096;
-        if (retry.remainingDeletions() < 1 || !retry.canRead(ownerReadReservation)) {
+        if (retry.remainingDeletions() < 1) {
           protectedCount += 1; continue;
         }
 
@@ -2078,24 +2170,22 @@ export class FileToolOutputStore implements ToolOutputStore {
         if (admissionBudget.remainingDeletions() < staleTakeoverReserve + 1) {
           protectedCount += 1; continue;
         }
-        const sharedOwnerReadReserve = admittedLock === undefined ? 1 * 4096 : 5 * 4096;
         const localOwnerReadHeadroom = admittedLock === undefined ? 3 * 4096 : 5 * 4096;
-        if (!admissionBudget.canRead(sharedOwnerReadReserve + localOwnerReadHeadroom)) {
+        if (!admissionBudget.canRead(localOwnerReadHeadroom)) {
           protectedCount += 1; continue;
         }
-        // The shared invocation-lock primitive performs bounded regular-file
-        // owner reads without an accounting callback. Charge its accepted
-        // envelope once before acquisition can mutate the lock path. Reads
-        // exposed through callbacks remain charged against the current caller.
-        accountMetadataRead(sharedOwnerReadReserve);
+        const readPolicy: DispatchInvocationReadPolicy = {
+          maxRecordBytes: 4096, symlinkReadBytes: 4096,
+          accountRead: admissionBudget.accountRead, reserveReadBytes: admissionBudget.reserveReadBytes,
+        };
         const ownerAcquisition: EvidenceOwnerAcquisition = reusableCleanup?.admission ?? { phase: 'acquiring' };
         const pendingCleanup = reusableCleanup ?? cleanupTransition(slotRecord.id, slot, slotRecord, expectedOwnerNonce, ownerAcquisition);
         if (reusableCleanup === undefined) {
           try { registerPendingTerminalTransition(this.root, this.capacity, pendingCleanup); }
           catch { protectedCount += 1; continue; }
         }
-        const preparePublication = (publication: PreparedDispatchInvocationPublication): DispatchInvocationPublicationHandoff => {
-          const fence = prepareEvidenceOperationFence(lockPath, publication, this.testFaults, accountMetadataRead);
+        const preparePublication = (publication: PreparedDispatchInvocationPublication, accountRead: (bytes: number) => void = admissionBudget.accountRead): DispatchInvocationPublicationHandoff => {
+          const fence = prepareEvidenceOperationFence(lockPath, publication, this.testFaults, accountRead);
           if (ownerAcquisition.fence !== undefined) {
             fence.discardUnpublished();
             throw new Error('Cleanup admission already has a prepared owner anchor.');
@@ -2112,8 +2202,8 @@ export class FileToolOutputStore implements ToolOutputStore {
               ownerAcquisition.temporary = undefined;
               fence.discardUnpublished();
             },
-            beforeRollbackUnlink: () => fence.beforeRollbackUnlink(admissionBudget),
-            afterRollbackUnlink: () => fence.afterRollbackUnlink(admissionBudget),
+            beforeRollbackUnlink: () => fence.beforeRollbackUnlink({ ...admissionBudget, accountRead }),
+            afterRollbackUnlink: () => fence.afterRollbackUnlink({ ...admissionBudget, accountRead }),
             beforeTemporaryUnlink: () => this.testFaults?.beforeOwnerLockTemporaryUnlink?.(lockPath, publication.temporaryPath),
           };
         };
@@ -2124,6 +2214,7 @@ export class FileToolOutputStore implements ToolOutputStore {
               if (!slotRecord.deleting && metadata.state === 'active') pendingCleanup.staleTakeover(staleOwner, retryBudget());
               admissionBudget.beginDeletion();
             }, preparePublication,
+            readPolicy,
           );
           ownerAcquisition.temporary = undefined;
           ownerAcquisition.phase = 'ready';
@@ -2147,7 +2238,19 @@ export class FileToolOutputStore implements ToolOutputStore {
       const next = (index.cursor + probed) % this.capacity;
       this.writeSlotIndex({ schemaVersion: 1, capacity: this.capacity, cursor: next });
       cursor = next;
-    } finally { maintenance.release(); }
+    } catch (error) {
+      cleanupFailed = true;
+      cleanupFailure = error;
+    }
+    try { maintenance.release(); }
+    catch (releaseError) {
+      if (cleanupFailed) {
+        throw new AggregateError([cleanupFailure, releaseError],
+          'Tool-output cleanup failed and maintenance release also remains observable.', { cause: cleanupFailure });
+      }
+      throw releaseError;
+    }
+    if (cleanupFailed) throw cleanupFailure;
     return { probed, deleted, attempted, protected: protectedCount, cursor };
   }
 
@@ -2383,17 +2486,23 @@ class DiagnosticCapture {
     const fallbackLine = head(normalized, this.policy.diagnosticBytes);
     if (fallbackLine !== normalized) this.dropped = true;
     this.fallback.push(fallbackLine);
-    while (this.fallback.length > 2 || this.fallback.reduce((sum, item) => sum + utf8Bytes(item), 0) > this.policy.diagnosticBytes) {
+    while (this.fallback.length > 2 || this.fallback.reduce((sum, item, index) => sum + (index === 0 ? 0 : 1) + utf8Bytes(item), 0) > this.policy.diagnosticBytes) {
       this.fallback.shift();
       this.dropped = true;
     }
     if (!this.highSignalPattern.test(normalized)) return;
-    const remaining = this.policy.diagnosticBytes - this.highSignal.reduce((sum, item) => sum + utf8Bytes(item), 0);
+    const separatorBytes = this.highSignal.length === 0 ? 0 : 1;
+    const used = this.highSignal.reduce((sum, item, index) => sum + (index === 0 ? 0 : 1) + utf8Bytes(item), 0);
+    const remaining = this.policy.diagnosticBytes - used - separatorBytes;
     if (remaining <= 0) {
       this.dropped = true;
       return;
     }
     const retained = head(normalized, remaining);
+    if (retained === '') {
+      this.dropped = true;
+      return;
+    }
     this.highSignal.push(retained);
     if (retained !== normalized) this.dropped = true;
     while (this.highSignal.length > this.policy.maxDiagnostics) {

@@ -1167,6 +1167,27 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(readFileSync(casRunPath, 'utf8'), casBytes);
   });
 
+  it('round trips an exact joined diagnostic boundary inside local Run validation evidence', () => {
+    const line = `ERROR: ${'x'.repeat(32_761)}`;
+    const output = boundToolOutput({ outcome: 'failed', exitCode: 1, stderr: line, stdout: line,
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 8, diagnosticBytes: 65_536, maxDiagnostics: 2, readBytes: 8 } });
+    assert.equal(Buffer.byteLength(output.diagnostics.join('\n')), 65_536);
+    const validation = validationFailed('diagnostic-roundtrip');
+    let run: Run = applyTransition(newRun('diagnostic-run-roundtrip'), { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('diagnostic-roundtrip'), headSha: 'diagnostic-roundtrip' }, T0);
+    run = applyTransition(run, { type: 'validation_failed', validationResult: validation,
+      pullRequest: { number: 7, headSha: 'diagnostic-roundtrip' } }, T0);
+    run = { ...run, validationResult: { ...validation, local: { ...validation.local, commands: [{ commandIndex: 0,
+      executable: 'test', outcome: 'failed', exitCode: 1, durationMs: 1, captureStatus: 'complete', output }] } } };
+    const { store, dir } = tempStore();
+    store.create(run);
+    const loaded = store.read(run.id);
+    const persisted = loaded?.validationResult?.local.commands[0]?.output;
+    assert.deepEqual(persisted?.diagnostics, output.diagnostics);
+    assert.equal(Buffer.byteLength((persisted?.diagnostics ?? []).join('\n')), 65_536);
+  });
+
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {
     const { dir } = tempStore();
     const execution = {
