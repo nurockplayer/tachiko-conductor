@@ -14,10 +14,12 @@ function isCommandOutputCoherent(command: Record<string, unknown>): boolean {
     const streamValid = (value: unknown): boolean => {
       if (typeof value !== 'object' || value === null) return false;
       const stream = value as Record<string, unknown>;
-      return Number.isSafeInteger(stream.bytes) && (stream.bytes as number) >= 0 &&
-        typeof stream.preview === 'string' && Buffer.byteLength(stream.preview, 'utf8') === stream.previewBytes &&
-        Number.isSafeInteger(stream.previewBytes) && (stream.previewBytes as number) >= 0 &&
-        (stream.previewBytes as number) <= 1_048_576 && typeof stream.truncated === 'boolean';
+      if (!Number.isSafeInteger(stream.bytes) || (stream.bytes as number) < 0 || typeof stream.preview !== 'string' ||
+          !Number.isSafeInteger(stream.previewBytes) || (stream.previewBytes as number) < 0 ||
+          (stream.previewBytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes ||
+          (stream.previewBytes as number) > (stream.bytes as number) ||
+          stream.preview.length > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes || typeof stream.truncated !== 'boolean') return false;
+      return Buffer.byteLength(stream.preview, 'utf8') === stream.previewBytes;
     };
     if (!streamValid(preview.stdout) || !streamValid(preview.stderr) || !Array.isArray(preview.diagnostics) ||
         preview.diagnostics.length > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||

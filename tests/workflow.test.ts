@@ -33,6 +33,8 @@ import { createBootstrapGitFixture } from './bootstrap-fixture.js';
 import { createGenuineLunaFixture } from './support/genuine-luna.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
+import { TOOL_OUTPUT_POLICY_MAXIMA } from '../src/evidence/tool-output.js';
+import { DEFAULT_EFFICIENCY_THRESHOLDS, RUN_TELEMETRY_REVISION } from '../src/domain/telemetry.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -398,36 +400,70 @@ describe('runWorkflow', { concurrency: false }, () => {
   });
 
   it('F06 persists incoherent local validation evidence as a durable fail-closed interrupt', async () => {
-    const store = new MemoryStore();
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-f06-preview-'));
+    const store = new JsonFileStore({ dir: directory });
     let run = createRun(TARGET, T0, 'validation-incoherent-adapter');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = { ...run, telemetry: {
+      revision: RUN_TELEMETRY_REVISION, coverage: 'partial', thresholds: DEFAULT_EFFICIENCY_THRESHOLDS,
+      events: [{ id: 'f06-existing-wait', at: T0, kind: 'wait_status_wakeup', state: 'VALIDATING', headSha: HEAD }],
+    } };
     store.create(run);
+    const oversizedSentinel = 'OVERSIZED-FALLBACK-PREVIEW-MUST-NOT-PERSIST';
+    const oversizedPreview = oversizedSentinel + 'x'.repeat(1_048_576 - oversizedSentinel.length);
     const incoherentValidation: ValidationAdapter = {
       kind: 'validation', configRevision: 'test-config-v1',
       async validate() {
-        return { status: 'passed', configRevision: 'test-config-v1', commands: [] } as unknown as LocalValidationEvidence;
+        return {
+          status: 'passed', configRevision: 'test-config-v1',
+          commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+            captureStatus: 'unavailable', capturePreview: {
+              stdout: { bytes: Buffer.byteLength(oversizedPreview), preview: oversizedPreview,
+                previewBytes: Buffer.byteLength(oversizedPreview), truncated: false },
+              stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+              diagnostics: [], diagnosticsTruncated: false,
+            } }],
+        };
       },
     };
 
-    const result = await runWorkflow(
-      {
-        store,
-        github: githubAdapter([HEAD]),
-        implementation: new FakeImplementation([]),
-        reviewer: new FakeReviewer([]),
-        validation: incoherentValidation,
-        hostedCheckPolicy: TEST_HOSTED_POLICY,
-      },
-      run.id,
-      { maxReviewAttempts: 1, now: () => T0 },
-    );
+    try {
+      const result = await runWorkflow(
+        {
+          store,
+          github: githubAdapter([HEAD]),
+          implementation: new FakeImplementation([]),
+          reviewer: new FakeReviewer([]),
+          validation: incoherentValidation,
+          hostedCheckPolicy: TEST_HOSTED_POLICY,
+        },
+        run.id,
+        { maxReviewAttempts: 1, now: () => T0 },
+      );
 
-    assert.equal(result.outcome, 'needs_human');
-    assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.equal(result.run.validationResult?.status, 'unknown');
-    assert.equal(result.run.validationResult?.local.status, 'unknown');
-    assert.equal(result.run.history.at(-1)?.type, 'escalate');
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.state, 'NEEDS_HUMAN');
+      assert.equal(result.run.validationResult?.status, 'unknown');
+      assert.equal(result.run.validationResult?.local.status, 'unknown');
+      assert.deepEqual(result.run.validationResult?.local.commands, [], 'the oversized adapter preview is replaced by unavailable local evidence');
+      assert.equal(result.run.history.at(-1)?.type, 'escalate');
+      const jsonHistory = (history: Run['history']): Run['history'] => JSON.parse(JSON.stringify(history)) as Run['history'];
+      assert.deepEqual(jsonHistory(result.run.history.slice(0, run.history.length)), jsonHistory(run.history),
+        'pre-validation history is preserved');
+      assert.deepEqual(result.run.telemetry, run.telemetry, 'existing telemetry is preserved without preview content');
+
+      const persisted = new JsonFileStore({ dir: directory }).read(run.id);
+      assert.equal(persisted?.state, 'NEEDS_HUMAN');
+      assert.deepEqual(persisted?.history, jsonHistory(result.run.history),
+        'durable history retains the refusal transition');
+      assert.deepEqual(persisted?.telemetry, run.telemetry, 'durable telemetry event and thresholds are preserved');
+      assert.deepEqual(persisted?.validationResult?.local.commands, []);
+      assert.equal(JSON.stringify(persisted?.validationResult).includes(oversizedSentinel), false,
+        'durable refusal contains no oversized fallback preview');
+      assert.ok(JSON.stringify(persisted?.validationResult).length < TOOL_OUTPUT_POLICY_MAXIMA.previewBytes,
+        'only compact unavailable evidence reaches durable validation state');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('F06 rejects failed local evidence that contradicts its zero exit code', async () => {

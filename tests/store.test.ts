@@ -1318,6 +1318,103 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS preserves the malformed raw bytes');
   });
 
+  it('bounds partial and unavailable fallback stream previews to the shared policy before Run admission', () => {
+    const headSha = 'fallback-stream-preview-validation-head';
+    const base = validationPassed(headSha);
+    const exactAscii = 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes);
+    const exactUtf8 = '界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes / 3)) + 'a';
+    const oversizedUtf8 = '界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes / 3)) + 'ab';
+    assert.equal(Buffer.byteLength(exactUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes);
+    assert.equal(Buffer.byteLength(oversizedUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1);
+    const makeValidation = (
+      status: 'partial' | 'unavailable', channel: 'stdout' | 'stderr', preview: string,
+      declaredBytes = Buffer.byteLength(preview, 'utf8'), rawBytes = Buffer.byteLength(preview, 'utf8'), truncated = false,
+    ) => {
+      const stream = { bytes: rawBytes, preview, previewBytes: declaredBytes, truncated };
+      const capturePreview = {
+        stdout: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        diagnostics: [] as string[], diagnosticsTruncated: false,
+      };
+      capturePreview[channel] = stream;
+      return {
+        ...base,
+        local: {
+          ...base.local,
+          commands: [{ ...base.local.commands[0]!, captureStatus: status, capturePreview }],
+        },
+      };
+    };
+    const validatingRun = (id: string) => {
+      let run = newRun(id);
+      run = applyTransition(run, { type: 'start' }, T0);
+      return applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha }, T0);
+    };
+    let storedRun: Run | undefined;
+
+    for (const status of ['partial', 'unavailable'] as const) {
+      for (const channel of ['stdout', 'stderr'] as const) {
+        for (const [label, preview] of [['empty', ''], ['exact ASCII', exactAscii], ['exact UTF-8', exactUtf8]] as const) {
+          const validation = makeValidation(status, channel, preview);
+          assert.equal(isValidationResultCoherent(validation), true, `${status}/${channel} accepts ${label}`);
+          const next = applyTransition(validatingRun(`fallback-preview-${status}-${channel}-${label.replaceAll(' ', '-')}`), {
+            type: 'validation_passed', validationResult: validation,
+            pullRequest: { number: 7, headSha },
+          }, T0);
+          assert.equal(next.state, 'REVIEWING', `${status}/${channel} admits ${label} through the state machine`);
+          if (label === 'exact ASCII' && status === 'partial' && channel === 'stdout') storedRun = next;
+        }
+        const truncatedPrefix = makeValidation(status, channel, 'retained-prefix', undefined, 128, true);
+        assert.equal(isValidationResultCoherent(truncatedPrefix), true,
+          `${status}/${channel} accepts an exact valid truncated prefix whose preview does not exceed observed bytes`);
+        const truncatedRun = applyTransition(validatingRun(`fallback-truncated-${status}-${channel}`), {
+          type: 'validation_passed', validationResult: truncatedPrefix,
+          pullRequest: { number: 7, headSha },
+        }, T0);
+        assert.equal(truncatedRun.state, 'REVIEWING', `${status}/${channel} admits a valid truncated prefix`);
+
+        const rejected: Array<{ name: string; preview: string; declared?: number; raw?: number }> = [
+          { name: 'oversized ASCII', preview: 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1) },
+          { name: 'oversized UTF-8', preview: oversizedUtf8 },
+          { name: '1MiB', preview: 'm'.repeat(1_048_576) },
+          { name: 'negative declared count', preview: 'x', declared: -1 },
+          { name: 'fractional declared count', preview: 'x', declared: 1.5 },
+          { name: 'unsafe declared count', preview: 'x', declared: Number.MAX_SAFE_INTEGER + 1 },
+          { name: 'mismatched declared count', preview: 'xy', declared: 1 },
+          { name: 'preview count exceeds zero observed bytes', preview: 'x', raw: 0 },
+          { name: 'UTF-8 preview count exceeds one observed byte', preview: '😀', raw: 1 },
+        ];
+        for (const candidate of rejected) {
+          const validation = makeValidation(status, channel, candidate.preview, candidate.declared, candidate.raw);
+          assert.equal(isValidationResultCoherent(validation), false,
+            `${status}/${channel} rejects ${candidate.name}`);
+          assert.throws(() => applyTransition(validatingRun(`invalid-preview-${status}-${channel}-${candidate.name.replaceAll(' ', '-')}`), {
+            type: 'validation_passed', validationResult: validation,
+            pullRequest: { number: 7, headSha },
+          }, T0), /coherent|conflicts/, `${status}/${channel} rejects ${candidate.name} at state-machine admission`);
+        }
+      }
+    }
+
+    assert.ok(storedRun, 'exact-boundary fallback validation reached Run state');
+    const { store, dir } = tempStore();
+    store.create(storedRun);
+    assert.deepEqual(store.read(storedRun.id)?.validationResult, storedRun.validationResult,
+      'legitimate exact-boundary fallback evidence survives JSON create/read');
+
+    const invalidValidation = makeValidation('unavailable', 'stderr', 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1));
+    const invalidBytes = JSON.stringify({ ...storedRun, validationResult: invalidValidation });
+    const runPath = path.join(dir, `${storedRun.id}.json`);
+    writeFileSync(runPath, invalidBytes, 'utf8');
+    assert.throws(() => store.read(storedRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
+      'rejected persisted read preserves original malformed preview bytes');
+    assert.throws(() => store.updateIfUnchanged!(storedRun, storedRun), /corrupt or incompatible/,
+      'CAS rejects a corrupt existing fallback preview before writing');
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
+      'rejected CAS preserves original malformed preview bytes');
+  });
+
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {
     const { dir } = tempStore();
     const execution = {
