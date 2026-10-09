@@ -532,6 +532,7 @@ async function fetchAuthoritySnapshot(github, { owner, repo, number, expectedRep
   const issue = JSON.parse(core);
   const snapshot = { repositoryId, repositoryOwner, issue, comments, deletions, pullRequest: false };
   snapshot.evidenceFingerprint = snapshotFingerprint(snapshot);
+  snapshot.authorityInputsSha256 = authorityInputsFingerprint(snapshot);
   snapshot.decision = classifyVerifiedSnapshot(snapshot);
   return snapshot;
 }
@@ -572,6 +573,47 @@ function snapshotFingerprint(snapshot) {
   return crypto.createHash('sha256').update(JSON.stringify(projection)).digest('hex');
 }
 
+function authorityInputsFingerprint(snapshot) {
+  const actorIdentity = (actor) => actor === null ? null : {
+    typename: actor?.__typename ?? null,
+    id: actor?.id ?? null,
+    login: actor?.login ?? null,
+  };
+  const projection = {
+    repositoryId: snapshot.repositoryId,
+    repositoryOwner: actorIdentity(snapshot.repositoryOwner),
+    issue: {
+      id: snapshot.issue.id,
+      number: snapshot.issue.number,
+      state: snapshot.issue.state,
+      bodySha256: bodyDigest(snapshot.issue.body),
+      createdAt: snapshot.issue.createdAt,
+      lastEditedAt: snapshot.issue.lastEditedAt,
+      authorAssociation: snapshot.issue.authorAssociation,
+      author: actorIdentity(snapshot.issue.author),
+      editor: actorIdentity(snapshot.issue.editor),
+    },
+    ownerAssociatedComments: snapshot.comments.filter((comment) => comment.author_association === 'OWNER').map((comment) => ({
+      id: comment.id,
+      bodySha256: bodyDigest(comment.body),
+      createdAt: comment.created_at,
+      lastEditedAt: comment.last_edited_at,
+      authorAssociation: comment.author_association,
+      author: actorIdentity(comment.author),
+      editor: actorIdentity(comment.editor),
+      parentIssueId: comment.parent_issue_id,
+      parentIssueNumber: comment.parent_issue_number,
+      repositoryId: comment.repository_id,
+    })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    deletions: snapshot.deletions.map((event) => ({
+      id: event.id,
+      createdAt: event.created_at,
+      actorType: event.actor_type ?? null,
+    })).sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+  };
+  return crypto.createHash('sha256').update(JSON.stringify(projection)).digest('hex');
+}
+
 function provenanceFor(snapshot, source, authorityComment, contentTimestamp, holdReason) {
   return {
     repositoryId: snapshot.repositoryId,
@@ -587,9 +629,9 @@ function provenanceFor(snapshot, source, authorityComment, contentTimestamp, hol
     authorityBodySha256: authorityComment ? bodyDigest(authorityComment.body) : bodyDigest(snapshot.issue.body),
     authorityContentTime: contentTimestamp ?? null,
     authorityAuthorId: authorityComment?.author?.id ?? snapshot.issue.author?.id ?? null,
-    authorityEditorId: authorityComment?.editor?.id ?? snapshot.issue.editor?.id ?? null,
+    authorityEditorId: authorityComment ? authorityComment.editor?.id ?? null : snapshot.issue.editor?.id ?? null,
     deletionEvents: snapshot.deletions.map((event) => ({ id: event.id, createdAt: event.created_at, actorType: event.actor_type ?? null })),
-    snapshotSha256: snapshotFingerprint(snapshot),
+    authorityInputsSha256: snapshot.authorityInputsSha256 ?? authorityInputsFingerprint(snapshot),
     holdReason: holdReason ?? null,
   };
 }
@@ -696,7 +738,7 @@ function blockedUnavailableProvenance(reason, observed = {}) {
     issueId: observed.issueId ?? null,
     issueNumber: observed.issueNumber ?? null,
     observedIssueBodySha256: typeof observed.body === 'string' ? bodyDigest(observed.body) : null,
-    observedSnapshotSha256: observed.snapshotSha256 ?? null,
+    observedAuthorityInputsSha256: observed.authorityInputsSha256 ?? null,
     holdReason: reason,
   };
   return decision;

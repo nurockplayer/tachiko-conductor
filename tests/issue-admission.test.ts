@@ -168,7 +168,7 @@ function verifiedSnapshot(issue: Record<string, unknown> = verifiedIssue(), comm
   };
 }
 
-async function classifySnapshotFixture(snapshot: Record<string, any>) {
+async function fetchSnapshotFixture(snapshot: Record<string, any>) {
   const issue = snapshot.issue;
   const comments = snapshot.comments ?? [];
   const deletions = snapshot.deletions ?? [];
@@ -188,7 +188,11 @@ async function classifySnapshotFixture(snapshot: Record<string, any>) {
     id: snapshot.repositoryId, nameWithOwner: 'owner/repo', owner: snapshot.repositoryOwner,
     issue: graphIssue, pullRequest: null,
   } }) }, { owner: 'owner', repo: 'repo', number: issue.number, expectedRepositoryId: snapshot.repositoryId });
-  return verified.decision;
+  return verified;
+}
+
+async function classifySnapshotFixture(snapshot: Record<string, any>) {
+  return (await fetchSnapshotFixture(snapshot)).decision;
 }
 
 function authorityComment(overrides: Record<string, unknown> = {}) {
@@ -215,6 +219,8 @@ test('verified source accepts current owner content and binds provenance hashes 
   assert.equal(form.dispatch, 'ready');
   assert.equal(form.provenance.issueId, 'ISSUE_NODE');
   assert.match(form.provenance.issueBodySha256, /^[a-f0-9]{64}$/);
+  assert.match(form.provenance.authorityInputsSha256, /^[a-f0-9]{64}$/);
+  assert.equal(Object.hasOwn(form.provenance, 'snapshotSha256'), false);
   assert.equal(form.provenance.authorityContentTime, '2026-10-01T00:00:00Z');
 
   const approvedExternalProposal = await classifySnapshotFixture(verifiedSnapshot(
@@ -225,6 +231,52 @@ test('verified source accepts current owner content and binds provenance hashes 
   assert.equal(approvedExternalProposal.source, 'steward-comment');
   assert.equal(approvedExternalProposal.provenance.authorityCommentId, 'COMMENT_NODE');
   assert.match(approvedExternalProposal.provenance.authorityBodySha256, /^[a-f0-9]{64}$/);
+
+  const bodyEditedByCollaborator = await classifySnapshotFixture(verifiedSnapshot(
+    verifiedIssue({ lastEditedAt: '2026-10-03T00:00:00Z', updatedAt: '2026-10-03T00:00:00Z', editor: { __typename: 'User', id: 'COLLAB_USER', login: 'collaborator' } }),
+    [authorityComment({ created_at: '2026-10-04T00:00:00Z' })],
+  ));
+  assert.equal(bodyEditedByCollaborator.dispatch, 'ready');
+  assert.equal(bodyEditedByCollaborator.provenance.issueEditorId, 'COLLAB_USER');
+  assert.equal(bodyEditedByCollaborator.provenance.authorityEditorId, null);
+});
+
+test('rendered authority digest is stable across derived projections but binds every OWNER-origin comment', async () => {
+  const ownerComment = authorityComment();
+  const botProjection = {
+    id: 'BOT_PROJECTION', body: `${admission.ADMISSION_MARKER}\nold projection`,
+    created_at: '2026-10-01T01:00:00Z', last_edited_at: null,
+    author_association: 'NONE', author: { __typename: 'Bot' }, editor: null,
+    parent_issue_id: 'ISSUE_NODE', parent_issue_number: 7, repository_id: 'REPO_NODE',
+  };
+  const deletion = { id: 'DELETED_COMMENT_1', created_at: '2026-10-01T01:30:00Z', actor_type: 'User' };
+  const first = await fetchSnapshotFixture(verifiedSnapshot(
+    verifiedIssue({ updatedAt: '2026-10-01T01:00:00Z' }), [ownerComment, botProjection], [deletion],
+  ));
+  const changedProjection = await fetchSnapshotFixture(verifiedSnapshot(
+    verifiedIssue({ updatedAt: '2026-10-01T02:00:00Z' }),
+    [ownerComment, { ...botProjection, body: `${admission.ADMISSION_MARKER}\nnew projection` }], [deletion],
+  ));
+  assert.notEqual(changedProjection.evidenceFingerprint, first.evidenceFingerprint, 'full internal witness still sees bot comment and updatedAt changes');
+  assert.equal(changedProjection.authorityInputsSha256, first.authorityInputsSha256, 'rendered authority digest excludes derived non-OWNER projections and general updatedAt');
+
+  const markerRemoved = await fetchSnapshotFixture(verifiedSnapshot(
+    verifiedIssue({ updatedAt: '2026-10-01T01:00:00Z' }),
+    [{ ...ownerComment, body: 'OWNER-origin comment whose authority marker was removed' }, botProjection], [deletion],
+  ));
+  assert.notEqual(markerRemoved.authorityInputsSha256, first.authorityInputsSha256, 'all original OWNER-associated comments remain bound regardless of marker');
+
+  const changedEditor = await fetchSnapshotFixture(verifiedSnapshot(
+    verifiedIssue({ updatedAt: '2026-10-01T01:00:00Z' }),
+    [{ ...ownerComment, last_edited_at: '2026-10-02T00:00:00Z', editor: { __typename: 'User', id: 'OTHER_USER', login: 'other' } }, botProjection], [deletion],
+  ));
+  assert.notEqual(changedEditor.authorityInputsSha256, first.authorityInputsSha256, 'OWNER-origin editor identity changes remain bound');
+
+  const changedDeletion = await fetchSnapshotFixture(verifiedSnapshot(
+    verifiedIssue({ updatedAt: '2026-10-01T01:00:00Z' }), [ownerComment, botProjection],
+    [{ ...deletion, actor_type: 'App' }],
+  ));
+  assert.notEqual(changedDeletion.authorityInputsSha256, first.authorityInputsSha256, 'deletion evidence remains bound');
 });
 
 test('edited non-owner content and stale or tampered OWNER comments fail closed', async () => {
