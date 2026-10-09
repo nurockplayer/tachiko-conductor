@@ -1,4 +1,5 @@
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import net from 'node:net';
 
 import { ManagedPlaywrightMcpRuntime } from '../../src/browser/playwright-mcp-runtime.js';
@@ -44,5 +45,12 @@ const runtime = new ManagedPlaywrightMcpRuntime({
   },
 });
 const handle = await runtime.start({ profile, port: Number(portText), stopTimeoutMs: 250 });
-writeFileSync(snapshotPath, `${JSON.stringify(handle.snapshot)}\n`, { mode: 0o600 });
+const snapshotTemporaryPath = `${snapshotPath}.${process.pid}.${randomUUID()}.tmp`;
+writeFileSync(snapshotTemporaryPath, `${JSON.stringify(handle.snapshot)}\n`, { mode: 0o600, flag: 'wx' });
+try {
+  renameSync(snapshotTemporaryPath, snapshotPath);
+} catch (error) {
+  rmSync(snapshotTemporaryPath, { force: true });
+  throw error;
+}
 await handle.waitForExit();

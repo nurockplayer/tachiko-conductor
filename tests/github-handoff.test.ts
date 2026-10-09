@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { parseAgentHandoffs } from '../src/github/handoff.js';
+import { acceptedScopeFromHandoff } from '../src/agents/implementation-packet.js';
 import type { GitHubConversationEntry } from '../src/adapters/github.js';
 
 const SHA_1 = '1111111111111111111111111111111111111111';
@@ -97,6 +98,70 @@ describe('agent-handoff:v1 parser', () => {
 
     assert.equal(result.handoff, null);
     assert.deepEqual(result.problems.map((problem) => problem.code), ['AMBIGUOUS_HANDOFF']);
+  });
+
+  it('rejects duplicate section headings instead of keeping only the last accepted-scope section', () => {
+    const body = `<!-- agent-handoff:v1 -->
+
+## Accepted #48-A scope
+
+First conflicting scope.
+
+## Branch / PR
+
+No claims.
+
+## Accepted #48-A scope
+
+Second conflicting scope.`;
+
+    const result = parseAgentHandoffs([comment('duplicate-scope', body, '2026-08-14T01:00:00.000Z', 'issue')], {
+      headSha: null,
+      pullRequestNumber: null,
+    });
+
+    assert.equal(result.handoff, null);
+    assert.deepEqual(result.problems.map((problem) => problem.code), ['AMBIGUOUS_HANDOFF']);
+  });
+
+  it('rejects distinct full SHA and PR claims rather than collapsing them to claimless identity', () => {
+    const body = `<!-- agent-handoff:v1 -->
+
+## Accepted #48-A scope
+
+Only the bounded packet builder slice.
+
+## Branch / PR
+
+HEAD: \`${SHA_1}\`
+Additional candidate: \`${SHA_2}\`
+PR: #7
+Previous PR: #8`;
+
+    const result = parseAgentHandoffs([comment('conflicting-identity', body, '2026-08-14T01:00:00.000Z', 'issue')], {
+      headSha: null,
+      pullRequestNumber: null,
+    });
+
+    assert.equal(result.handoff, null);
+    assert.deepEqual(result.problems.map((problem) => problem.code), ['AMBIGUOUS_HANDOFF']);
+  });
+
+  it('preserves genuinely absent identity claims for the initial issue-scope exception', () => {
+    const body = `<!-- agent-handoff:v1 -->
+
+## Accepted #48-A scope
+
+Only the bounded packet builder slice.`;
+    const result = parseAgentHandoffs([comment('claimless-initial', body, '2026-08-14T01:00:00.000Z', 'issue')], {
+      headSha: null,
+      pullRequestNumber: null,
+    });
+
+    assert.equal(result.handoff?.freshness, 'unknown');
+    assert.deepEqual(result.problems, []);
+    assert.equal(acceptedScopeFromHandoff(result.handoff, result.problems, true)?.text, 'Only the bounded packet builder slice.');
+    assert.equal(acceptedScopeFromHandoff(result.handoff, result.problems, false), null);
   });
 
   it('uses stable id ordering for equal timestamps and marks mismatched claims stale', () => {

@@ -185,10 +185,14 @@ bounded model-free safety poll.
 `tachiko dispatch once` now takes a small local lock before reading GitHub. It
 complements (but never replaces) the GitHub claim lease: a concurrent same-host
 invocation returns `{ "outcome": "already_running" }` without changing GitHub
-or starting a second executor. The default lock lives outside the repository at
-`~/.tachiko-conductor/dispatch/once.lock`; override it only with an absolute
-`TACHIKO_DISPATCH_LOCK_PATH`. A malformed or live lock fails closed; a lock for
-a provably absent PID is retried once.
+or starting a second executor. The singleton lock and short admission lock
+both live outside the repository under the effective OS account's physical
+home at `~/.tachiko-conductor/dispatch/once.lock` and
+`~/.tachiko-conductor/dispatch/once.lock.admission`. The optional
+`TACHIKO_DISPATCH_LOCK_PATH` and `TACHIKO_DISPATCH_ADMISSION_LOCK_PATH` values
+may alias those canonical physical paths; divergent values fail closed. A
+malformed or live lock fails closed; a lock for a provably absent PID is
+retried once.
 
 For macOS, use `launchd` to supervise the continuous driver. First create a
 private, absolute-path wrapper that supplies the explicitly selected dispatch,
@@ -492,13 +496,22 @@ non-zero exit code.
 require result payloads supplied by adapters; `run transition` rejects them
 explicitly. Drive those through the domain API (`applyTransition`).
 
+`run transition <id> merged` requires a direct live read of the Run's persisted
+pull request and exact head/branch/base identity. It settles only a
+`workflow_settled` parked admission; retries reconcile the matching private
+generation receipt under the dispatch and registry locks.
+
 ## Container-owned worker-router execution
 
 `WorkerRouterAdapter` is the one executor placed behind the container boundary
 proven in issue #73. The untrusted worker runs only inside a digest-pinned
 container; the host worker path is never executed and there is no fallback.
+This adapter is not currently source-qualified for governed publication, so
+fresh and continued governed invocations are held before any worker or host
+publication operation. Its execution and host publication path remains
+available to ungoverned callers.
 
-The adapter keeps the authority split unchanged. It runs `guard(before)`, then
+For an ungoverned call, the adapter runs `guard(before)`, then
 creates and starts the container, forwards the task on stdin, waits for the
 exact container terminal state, and only then runs `guard(after)`, reads the
 exact HEAD, proves base ancestry, and publishes that exact HEAD from the host.
@@ -630,6 +643,23 @@ committed raw run bytes: a missing, stale, malformed, or digest-mismatched
 sidecar is unknown/unlinked rather than an authority to reconstruct a run.
 Use `tachiko run projections rebuild` only to backfill sidecars from runs that
 `JsonFileStore` has successfully validated.
+
+## Oracle review policy
+
+The exported Oracle reviewer applies the versioned provider-neutral R1–R5 risk
+floor before transport. It requires trusted, complete candidate evidence and a
+qualified binding whose separate transport observation verifies the model,
+effort, exact HEAD/base, associated pull request, and complete changed-path
+coverage. Missing or mismatched evidence holds the review without approval.
+Floors R1–R3 currently bind to selected Oracle semantic tier R3 at Medium;
+R4 uses High and R5 uses Extra High with a recorded critical reason. Legacy
+receipts remain readable but do not contain policy qualification.
+
+This module policy does not activate a native production Oracle factory or
+unattended browser transport. Native dispatch, durable pending receipts, and
+transport qualification remain separate work. The selected Medium/High/Extra
+High effort is an observed configuration; account quota economics are not
+established here.
 
 ## Layout
 

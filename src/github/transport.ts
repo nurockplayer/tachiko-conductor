@@ -30,6 +30,12 @@ export interface ProcessRunOptions {
   readonly stdin?: string;
   /** Deliberately narrowed environment for an isolated implementation runtime. */
   readonly env?: NodeJS.ProcessEnv;
+  /**
+   * Synchronous host check run immediately before child creation. Injected
+   * runners must call this after their final asynchronous preparation and
+   * directly before delegating to the real child-process boundary.
+   */
+  readonly beforeSpawn?: () => void;
 }
 
 export interface ProcessRunner {
@@ -51,6 +57,9 @@ export class NodeProcessRunner implements ProcessRunner {
         settled = true;
         action();
       };
+      // Keep this callback in the child-creation turn: a rejected host check
+      // must reject this promise without creating a process.
+      options.beforeSpawn?.();
       const child = execFile(
         file,
         [...args],

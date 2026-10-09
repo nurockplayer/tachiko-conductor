@@ -23,6 +23,7 @@ export * from './agents/worker-router.js';
 export * from './agents/worker-router-container.js';
 export * from './reviewers/deepseek.js';
 export * from './reviewers/loop.js';
+export * from './reviewers/risk-policy.js';
 export * from './workflow/run.js';
 export * from './workflow/wait-observation.js';
 export * from './workflow/wait-ledger-store.js';

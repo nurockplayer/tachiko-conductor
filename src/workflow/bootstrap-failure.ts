@@ -11,6 +11,17 @@ export function parkBootstrapFailure(
   now: () => string,
   executor?: ExecutorIdentity,
 ): { readonly run: Run; readonly reason: string } {
+  const parked = createBootstrapFailureRun(run, error, now, executor);
+  store.update(parked.run);
+  return parked;
+}
+
+export function createBootstrapFailureRun(
+  run: Run,
+  error: unknown,
+  now: () => string,
+  executor?: ExecutorIdentity,
+): { readonly run: Run; readonly reason: string } {
   const code = typeof error === 'object' && error !== null && typeof (error as { code?: unknown }).code === 'string'
     ? ` (${String((error as { code: string }).code)})` : '';
   const detail = error instanceof Error ? error.message : String(error);
@@ -19,6 +30,5 @@ export function parkBootstrapFailure(
     type: 'escalate', reason, ...(executor === undefined ? {} : { executor }),
     interrupt: { evidence: reason, choices: ['Resolve the workspace identity and retry', CANCEL_RUN_DECISION] },
   }, now());
-  store.update(parked);
   return { run: parked, reason };
 }
