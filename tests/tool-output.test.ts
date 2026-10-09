@@ -525,10 +525,38 @@ describe('bounded tool output contract', () => {
       envelope.overflow.omittedBytes = Math.max(0, envelope.overflow.totalBytes - envelope.overflow.retainedBytes);
     });
     const mismatchedStreamBytes = invalid((envelope) => { envelope.stdout.bytes += 1; });
+    const falseStdoutTruncation = invalid((envelope) => {
+      envelope.stdout.truncated = false;
+      envelope.overflow.stdout = false;
+      envelope.overflow.truncated = envelope.overflow.capture || envelope.overflow.summary || envelope.overflow.diagnostics ||
+        envelope.overflow.stdout || envelope.overflow.stderr;
+    });
+    const falseStderrTruncation = invalid((envelope) => {
+      envelope.stderr.bytes = 2;
+      envelope.artifact.stderrBytes = 2;
+      envelope.artifact.totalBytes = envelope.artifact.stdoutBytes + envelope.artifact.stderrBytes;
+      envelope.overflow.totalBytes = envelope.artifact.totalBytes;
+      envelope.overflow.omittedBytes = envelope.overflow.totalBytes - envelope.overflow.retainedBytes;
+      envelope.stderr.truncated = false;
+      envelope.overflow.stderr = false;
+    });
+    const linkedTruncationMismatch = invalid((envelope) => {
+      envelope.stdout.bytes = 1;
+      envelope.artifact.stdoutBytes = 1;
+      envelope.artifact.totalBytes = envelope.artifact.stdoutBytes + envelope.artifact.stderrBytes;
+      envelope.overflow.totalBytes = envelope.artifact.totalBytes;
+      envelope.overflow.retainedBytes = envelope.stdout.previewBytes + envelope.stderr.previewBytes;
+      envelope.overflow.omittedBytes = Math.max(0, envelope.overflow.totalBytes - envelope.overflow.retainedBytes);
+      envelope.stdout.truncated = false;
+      // Keep overflow.stdout true to verify the existing channel linkage check.
+    });
     for (const [kind, envelope] of [
       ['preview', overPreview], ['summary', overSummary], ['diagnostic bytes', overDiagnosticBytes],
       ['joined diagnostic bytes including LF', overJoinedDiagnosticBytes], ['diagnostic lines', overDiagnosticLines],
       ['preview larger than stream bytes', previewExceedsStreamBytes], ['stream/artifact size', mismatchedStreamBytes],
+      ['stdout over declared limit without truncation', falseStdoutTruncation],
+      ['stderr over declared limit without truncation', falseStderrTruncation],
+      ['channel truncation flag contradicts overflow linkage', linkedTruncationMismatch],
     ] as const) {
       assert.equal(isToolOutputEnvelope(envelope), false, `${kind} beyond its declared envelope contract is rejected`);
     }
@@ -545,6 +573,20 @@ describe('bounded tool output contract', () => {
       store: new InMemoryToolOutputStore(),
       policy: { previewBytes: 1, diagnosticBytes: 1, maxDiagnostics: 1, readBytes: 1 } });
     assert.equal(isToolOutputEnvelope(tinyScalar), true, 'legitimate tiny UTF-8 producer output remains coherent');
+
+    const exactStreams = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'x', stderr: 'y',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 1, diagnosticBytes: 1, maxDiagnostics: 1, readBytes: 1 } });
+    assert.equal(exactStreams.stdout.truncated, false);
+    assert.equal(exactStreams.stderr.truncated, false);
+    assert.equal(isToolOutputEnvelope(exactStreams), true, 'both streams at the declared boundary may remain untruncated');
+
+    const retainedBelowDeclaredMaximum = structuredClone(base) as any;
+    retainedBelowDeclaredMaximum.overflow.previewLimitBytes = 65_536;
+    assert.equal(retainedBelowDeclaredMaximum.stdout.bytes, 2);
+    assert.equal(retainedBelowDeclaredMaximum.stdout.truncated, true);
+    assert.equal(isToolOutputEnvelope(retainedBelowDeclaredMaximum), true,
+      'a producer may report a narrower retained preview while the declared maximum is larger');
   });
 
   it('bounds successful huge output without changing the success exit semantics', () => {

@@ -362,7 +362,7 @@ function buildTask(request: ImplementationRequest): string {
 
 function workerProvenance(stderr: string): string | undefined {
   const match = stderr.match(/^\[worker-router\] -> (luna-worker|deepseek-worker)\s*$/m);
-  return match?.[0];
+  return match === null ? undefined : `[worker-router] -> ${match[1]}`;
 }
 
 function boundedDiagnostics(stderr: string, stdout: string, provenance: string | undefined): string[] {

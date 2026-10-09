@@ -18,7 +18,8 @@ function isCommandOutputCoherent(command: Record<string, unknown>): boolean {
           !Number.isSafeInteger(stream.previewBytes) || (stream.previewBytes as number) < 0 ||
           (stream.previewBytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes ||
           (stream.previewBytes as number) > (stream.bytes as number) ||
-          stream.preview.length > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes || typeof stream.truncated !== 'boolean') return false;
+          stream.preview.length > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes || typeof stream.truncated !== 'boolean' ||
+          ((stream.bytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes && stream.truncated !== true)) return false;
       return Buffer.byteLength(stream.preview, 'utf8') === stream.previewBytes;
     };
     if (!streamValid(preview.stdout) || !streamValid(preview.stderr) || !Array.isArray(preview.diagnostics) ||

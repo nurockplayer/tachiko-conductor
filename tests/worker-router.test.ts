@@ -320,13 +320,45 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(runner.calls.length, 0);
   });
 
-  it('keeps only recognized provenance and never persists worker output', async () => {
-    const ws = workspace();
-    const container = new FakeContainer([containerResult({ exitCode: 7, stderr: `[worker-router] -> deepseek-worker\n${'x'.repeat(5000)}` })]);
-    const response = await new WorkerRouterAdapter({ runner: new FakeRunner([]), container, image: IMAGE }).run(requestFor(ws.workspacePath));
-    assert.equal(response.exitStatus, 'failure');
-    assert.match(response.diagnostics?.join('\n') ?? '', /deepseek-worker/);
-    assert.equal(response.diagnostics?.join('\n').includes('xxxxx'), false);
+  it('returns only the canonical recognized worker marker in success and failure results', async () => {
+    const largeWhitespace = `${' \t\u2003\u00a0'.repeat(2_000)}${'\n\u2028\u3000'.repeat(2_000)}`;
+    for (const worker of ['luna-worker', 'deepseek-worker'] as const) {
+      for (const outcome of ['success', 'failure'] as const) {
+        const ws = workspace();
+        const marker = `[worker-router] -> ${worker}`;
+        const container = new FakeContainer([containerResult({
+          exitCode: outcome === 'success' ? 0 : 7,
+          stderr: `${marker}${largeWhitespace}\nfollowing transcript ${'x'.repeat(5000)}`,
+        })]);
+        const runner = outcome === 'success'
+          ? new FakeRunner([result(HEAD), result(), result('To origin\n')])
+          : new FakeRunner([]);
+        const response = await new WorkerRouterAdapter({ runner, container, image: IMAGE }).run(requestFor(ws.workspacePath));
+        assert.equal(response.exitStatus, outcome);
+        if (outcome === 'success') assert.deepEqual(response.diagnostics, [marker], `${outcome}/${worker} retains only the compact canonical marker`);
+        else {
+          assert.equal(response.diagnostics?.at(-1), marker, `${outcome}/${worker} retains the compact marker after the typed failure`);
+          assert.equal(response.diagnostics?.join('\n').includes('xxxxx'), false, 'failure diagnostics omit the worker transcript');
+        }
+      }
+    }
+
+    for (const stderr of [
+      `[worker-router] -> unknown-worker\nfollowing transcript ${'x'.repeat(5000)}`,
+      '[worker-router] -> luna-worker-extra\n',
+      '[worker-router] -> deepseek-worker suffix\n',
+    ]) {
+      const ws = workspace();
+      const response = await new WorkerRouterAdapter({
+        runner: new FakeRunner([]),
+        container: new FakeContainer([containerResult({ exitCode: 7, stderr })]),
+        image: IMAGE,
+      }).run(requestFor(ws.workspacePath));
+      assert.equal(response.exitStatus, 'failure');
+      assert.equal(response.diagnostics?.some((line) => line.includes('[worker-router]')), false,
+        'unknown marker names and unrelated transcript text are not persisted');
+      assert.equal(response.diagnostics?.join('\n').includes('xxxxx'), false);
+    }
   });
 
   it('returns cancellation when the request is already aborted', async () => {

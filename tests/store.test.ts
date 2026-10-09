@@ -1242,6 +1242,34 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
       'CAS rejects a corrupt existing Run before comparing or writing');
     assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS leaves the original raw bytes untouched');
+
+    const falseTruncatedOutput = structuredClone(output) as any;
+    falseTruncatedOutput.stdout.truncated = false;
+    falseTruncatedOutput.overflow.stdout = false;
+    falseTruncatedOutput.overflow.truncated = falseTruncatedOutput.overflow.capture || falseTruncatedOutput.overflow.summary ||
+      falseTruncatedOutput.overflow.diagnostics || falseTruncatedOutput.overflow.stdout || falseTruncatedOutput.overflow.stderr;
+    const falseTruncatedValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: falseTruncatedOutput }] },
+    };
+    assert.equal(isToolOutputEnvelope(falseTruncatedOutput), false,
+      'a complete envelope cannot report over-limit stream bytes without truncation');
+    assert.equal(isValidationResultCoherent({ ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: falseTruncatedOutput }] } }), false);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: falseTruncatedValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const falseTruncatedRun = { ...validRun, validationResult: falseTruncatedValidation };
+    const falseTruncatedBytes = JSON.stringify(falseTruncatedRun);
+    writeFileSync(runPath, falseTruncatedBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), falseTruncatedBytes,
+      'rejected complete-envelope read preserves original raw bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), falseTruncatedBytes,
+      'rejected complete-envelope CAS preserves original raw bytes');
   });
 
   it('bounds partial and unavailable fallback diagnostics before validation and persisted Run admission', () => {
@@ -1373,6 +1401,17 @@ describe('JsonFileStore — persistence round-trips', () => {
         }, T0);
         assert.equal(truncatedRun.state, 'REVIEWING', `${status}/${channel} admits a valid truncated prefix`);
 
+        const largeTruncatedPrefix = makeValidation(status, channel, 'retained-prefix', undefined,
+          TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, true);
+        assert.equal(isValidationResultCoherent(largeTruncatedPrefix), true,
+          `${status}/${channel} accepts a truthful truncated stream above the policy preview maximum`);
+        const largeTruncatedRun = applyTransition(validatingRun(`fallback-large-truncated-${status}-${channel}`), {
+          type: 'validation_passed', validationResult: largeTruncatedPrefix,
+          pullRequest: { number: 7, headSha },
+        }, T0);
+        assert.equal(largeTruncatedRun.state, 'REVIEWING',
+          `${status}/${channel} admits a truthful over-limit raw stream with a bounded retained preview`);
+
         const rejected: Array<{ name: string; preview: string; declared?: number; raw?: number }> = [
           { name: 'oversized ASCII', preview: 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1) },
           { name: 'oversized UTF-8', preview: oversizedUtf8 },
@@ -1383,6 +1422,7 @@ describe('JsonFileStore — persistence round-trips', () => {
           { name: 'mismatched declared count', preview: 'xy', declared: 1 },
           { name: 'preview count exceeds zero observed bytes', preview: 'x', raw: 0 },
           { name: 'UTF-8 preview count exceeds one observed byte', preview: '😀', raw: 1 },
+          { name: 'over-policy bytes without truncation flag', preview: 'x', raw: TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1 },
         ];
         for (const candidate of rejected) {
           const validation = makeValidation(status, channel, candidate.preview, candidate.declared, candidate.raw);
@@ -1402,17 +1442,23 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.deepEqual(store.read(storedRun.id)?.validationResult, storedRun.validationResult,
       'legitimate exact-boundary fallback evidence survives JSON create/read');
 
-    const invalidValidation = makeValidation('unavailable', 'stderr', 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1));
-    const invalidBytes = JSON.stringify({ ...storedRun, validationResult: invalidValidation });
     const runPath = path.join(dir, `${storedRun.id}.json`);
-    writeFileSync(runPath, invalidBytes, 'utf8');
-    assert.throws(() => store.read(storedRun.id), /corrupt or incompatible/);
-    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
-      'rejected persisted read preserves original malformed preview bytes');
-    assert.throws(() => store.updateIfUnchanged!(storedRun, storedRun), /corrupt or incompatible/,
-      'CAS rejects a corrupt existing fallback preview before writing');
-    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
-      'rejected CAS preserves original malformed preview bytes');
+    const invalidValidations = [
+      makeValidation('unavailable', 'stderr', 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1)),
+      makeValidation('unavailable', 'stderr', 'corrupt-retained-prefix',
+        Buffer.byteLength('corrupt-retained-prefix'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, false),
+    ];
+    for (const [index, invalidValidation] of invalidValidations.entries()) {
+      const invalidBytes = JSON.stringify({ ...storedRun, validationResult: invalidValidation });
+      writeFileSync(runPath, invalidBytes, 'utf8');
+      assert.throws(() => store.read(storedRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
+        `rejected persisted fallback read ${index} preserves original malformed preview bytes`);
+      assert.throws(() => store.updateIfUnchanged!(storedRun, storedRun), /corrupt or incompatible/,
+        `CAS rejects corrupt existing fallback evidence ${index} before writing`);
+      assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
+        `rejected fallback CAS ${index} preserves original malformed preview bytes`);
+    }
   });
 
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {

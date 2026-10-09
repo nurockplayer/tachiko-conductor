@@ -466,6 +466,61 @@ describe('runWorkflow', { concurrency: false }, () => {
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
+  it('fails closed when fallback raw stream bytes exceed the preview policy without a truncation claim', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-f06-truncated-flag-'));
+    const store = new JsonFileStore({ dir: directory });
+    let run = createRun(TARGET, T0, 'validation-false-truncation-claim');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = { ...run, telemetry: {
+      revision: RUN_TELEMETRY_REVISION, coverage: 'partial', thresholds: DEFAULT_EFFICIENCY_THRESHOLDS,
+      events: [{ id: 'f1-existing-wait', at: T0, kind: 'wait_status_wakeup', state: 'VALIDATING', headSha: HEAD }],
+    } };
+    store.create(run);
+    const retainedSentinel = 'OVER-LIMIT-COMPLETE-RETAINED-PREVIEW-MUST-NOT-PERSIST';
+    const incoherentValidation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate() {
+        return {
+          status: 'passed', configRevision: 'test-config-v1',
+          commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+            captureStatus: 'unavailable', capturePreview: {
+              stdout: { bytes: TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, preview: retainedSentinel,
+                previewBytes: Buffer.byteLength(retainedSentinel), truncated: false },
+              stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+              diagnostics: [], diagnosticsTruncated: false,
+            } }],
+        };
+      },
+    };
+
+    try {
+      const result = await runWorkflow({
+        store,
+        github: githubAdapter([HEAD]),
+        implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([]),
+        validation: incoherentValidation,
+        hostedCheckPolicy: TEST_HOSTED_POLICY,
+      }, run.id, { maxReviewAttempts: 1, now: () => T0 });
+
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.state, 'NEEDS_HUMAN');
+      assert.equal(result.run.validationResult?.local.status, 'unknown');
+      assert.deepEqual(result.run.validationResult?.local.commands, []);
+      const jsonHistory = (history: Run['history']): Run['history'] => JSON.parse(JSON.stringify(history)) as Run['history'];
+      assert.deepEqual(jsonHistory(result.run.history.slice(0, run.history.length)), jsonHistory(run.history),
+        'pre-validation history survives the fail-closed replacement');
+      assert.deepEqual(result.run.telemetry, run.telemetry, 'the existing wait event and thresholds survive the replacement');
+      const persisted = new JsonFileStore({ dir: directory }).read(run.id);
+      assert.equal(persisted?.state, 'NEEDS_HUMAN');
+      assert.deepEqual(jsonHistory(persisted?.history ?? []), jsonHistory(result.run.history));
+      assert.deepEqual(persisted?.telemetry, run.telemetry, 'durable telemetry preserves the prior event and thresholds');
+      assert.equal(JSON.stringify(persisted?.validationResult).includes(retainedSentinel), false,
+        'the compact retained preview is not persisted when its raw byte count lacks a truncation claim');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('F06 rejects failed local evidence that contradicts its zero exit code', async () => {
     const store = new MemoryStore();
     let run = createRun(TARGET, T0, 'validation-failed-zero-exit');

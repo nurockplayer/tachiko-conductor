@@ -1095,6 +1095,8 @@ export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelop
     envelope.stderr.previewBytes === utf8Bytes(envelope.stderr.preview) &&
     envelope.stdout.previewBytes <= previewLimitBytes && envelope.stdout.previewBytes <= envelope.stdout.bytes &&
     envelope.stderr.previewBytes <= previewLimitBytes && envelope.stderr.previewBytes <= envelope.stderr.bytes &&
+    (envelope.stdout.bytes <= previewLimitBytes || envelope.stdout.truncated) &&
+    (envelope.stderr.bytes <= previewLimitBytes || envelope.stderr.truncated) &&
     envelope.stdout.bytes === envelope.artifact.stdoutBytes && envelope.stderr.bytes === envelope.artifact.stderrBytes &&
     envelope.artifact.totalBytes === envelope.artifact.stdoutBytes + envelope.artifact.stderrBytes &&
     overflowRecord.totalBytes === envelope.artifact.totalBytes &&
