@@ -46,20 +46,127 @@ jobs:
             }
 
             const issue = (await github.rest.issues.get({ owner, repo, issue_number })).data;
-            const comments = await github.paginate(github.rest.issues.listComments, {
-              owner,
-              repo,
-              issue_number,
-              per_page: 100,
-            });
+            if (issue?.pull_request) return;
+            if (!issue || typeof issue.node_id !== 'string' || issue.node_id === '' || issue.number !== issue_number) {
+              core.setFailed('The requested target is not a positively identified Issue. No admission projection was written.');
+              return;
+            }
+            let repository;
+            try {
+              repository = (await github.rest.repos.get({ owner, repo })).data;
+            } catch (error) {
+              core.setFailed(`The repository identity could not be verified. No admission projection was written: ${error?.message ?? error}`);
+              return;
+            }
+            if (typeof repository?.node_id !== 'string' || repository.node_id === '' ||
+                typeof repository?.full_name !== 'string' || repository.full_name.toLowerCase() !== `${owner}/${repo}`.toLowerCase()) {
+              core.setFailed('The repository identity is unavailable or does not match the configured repository. No admission projection was written.');
+              return;
+            }
 
-            const decision = admission.classifyIssue({ issue, comments });
+            let snapshot;
+            let decision;
+            try {
+              snapshot = await admission.fetchAuthoritySnapshot(github, { owner, repo, number: issue_number, expectedRepositoryId: repository.node_id });
+              if (snapshot.pullRequest) return;
+              if (snapshot.issue.id !== issue.node_id || snapshot.issue.number !== issue_number) {
+                core.setFailed('REST and GraphQL target identities disagree. No admission projection was written.');
+                return;
+              }
+              const restState = issue.state === 'open' ? 'OPEN' : issue.state === 'closed' ? 'CLOSED' : undefined;
+              const sameJoinedSnapshot = issue.body === snapshot.issue.body && restState === snapshot.issue.state &&
+                Date.parse(issue.created_at ?? '') === Date.parse(snapshot.issue.createdAt) &&
+                Date.parse(issue.updated_at ?? '') === Date.parse(snapshot.issue.updatedAt) &&
+                issue.author_association === snapshot.issue.authorAssociation &&
+                issue.user?.node_id === snapshot.issue.author?.id;
+              if (!sameJoinedSnapshot) {
+                decision = admission.blockedUnavailableProvenance('REST and GraphQL Issue content or provenance snapshots disagree.', {
+                  repositoryId: snapshot.repositoryId, issueId: snapshot.issue.id, issueNumber: snapshot.issue.number,
+                  body: issue.body, snapshotSha256: snapshot.evidenceFingerprint,
+                });
+              } else {
+                decision = snapshot.decision;
+                const recheck = await admission.fetchAuthoritySnapshot(github, { owner, repo, number: issue_number, expectedRepositoryId: repository.node_id });
+                if (recheck.pullRequest || recheck.issue.id !== snapshot.issue.id) {
+                  core.setFailed('The target changed during provenance recheck. No admission projection was written.');
+                  return;
+                }
+                if (recheck.evidenceFingerprint !== snapshot.evidenceFingerprint) {
+                  decision = admission.blockedUnavailableProvenance('Issue content, authority provenance, deletion evidence, or pagination changed before projection.', {
+                    repositoryId: recheck.repositoryId, issueId: recheck.issue.id, issueNumber: recheck.issue.number,
+                    body: recheck.issue.body, snapshotSha256: recheck.evidenceFingerprint,
+                  });
+                }
+              }
+            } catch (error) {
+              if (error?.targetMismatch) {
+                core.setFailed(`Target identity could not be verified: ${error.message}`);
+                return;
+              }
+              decision = admission.blockedUnavailableProvenance(error?.message ?? 'GitHub provenance data was unavailable.', {
+                repositoryId: repository.node_id, issueId: issue.node_id, issueNumber: issue.number,
+                body: issue.body, snapshotSha256: snapshot?.evidenceFingerprint,
+              });
+            }
 
-            const repoLabels = await github.paginate(github.rest.issues.listLabelsForRepo, {
-              owner,
-              repo,
-              per_page: 100,
-            });
+            const currentLabels = issue.labels
+              .map((label) => typeof label === 'string' ? label : label.name)
+              .filter((label) => typeof label === 'string' && label !== '');
+            const readinessLabels = ['dispatch:ready', 'classification:ready'];
+            const cleanupFailures = [];
+            const cleanupAttempted = new Set();
+            const cleanupSucceeded = new Set();
+            const ensureReadinessRevoked = async () => {
+              for (const name of readinessLabels) {
+                if (!currentLabels.includes(name) || cleanupAttempted.has(name)) continue;
+                cleanupAttempted.add(name);
+                try {
+                  await github.rest.issues.removeLabel({ owner, repo, issue_number, name });
+                  cleanupSucceeded.add(name);
+                } catch (error) {
+                  cleanupFailures.push(`${name}: ${error?.message ?? error}`);
+                }
+              }
+              if (cleanupFailures.length > 0) {
+                decision = admission.blockedUnavailableProvenance(`A readiness label could not be revoked (${cleanupFailures.join('; ')}).`, {
+                  repositoryId: repository.node_id, issueId: issue.node_id, issueNumber: issue.number,
+                  body: issue.body, snapshotSha256: snapshot?.evidenceFingerprint,
+                });
+                core.setFailed(`Admission readiness cleanup was incomplete: ${cleanupFailures.join('; ')}`);
+              }
+            };
+            if (decision.status !== 'ready') await ensureReadinessRevoked();
+
+            let comments;
+            let commentsAvailable = true;
+            try {
+              comments = await github.paginate(github.rest.issues.listComments, {
+                owner,
+                repo,
+                issue_number,
+                per_page: 100,
+              });
+            } catch (error) {
+              commentsAvailable = false;
+              decision = admission.blockedUnavailableProvenance(`Comment discovery failed; the existing admission projection could not be verified or corrected: ${error?.message ?? error}`, {
+                repositoryId: repository.node_id, issueId: issue.node_id, issueNumber: issue.number,
+                body: issue.body, snapshotSha256: snapshot?.evidenceFingerprint,
+              });
+              await ensureReadinessRevoked();
+              core.setFailed('Admission projection is incomplete because comment discovery failed; no canonical comment was created or updated. Readiness revocation was attempted separately.');
+            }
+
+            let repoLabels = [];
+            try {
+              repoLabels = await github.paginate(github.rest.issues.listLabelsForRepo, { owner, repo, per_page: 100 });
+            } catch (error) {
+              decision = admission.blockedUnavailableProvenance(`Label definition discovery failed: ${error?.message ?? error}`, {
+                repositoryId: repository.node_id, issueId: issue.node_id, issueNumber: issue.number,
+                body: issue.body, snapshotSha256: snapshot?.evidenceFingerprint,
+              });
+              await ensureReadinessRevoked();
+              core.setFailed('Admission projection is incomplete because repository label definitions could not be read.');
+            }
             const existingDefinitions = new Set(repoLabels.map((label) => label.name));
             for (const [name, definition] of Object.entries(admission.LABEL_DEFINITIONS)) {
               if (existingDefinitions.has(name)) continue;
@@ -69,35 +176,50 @@ jobs:
                 // Different Issues have separate concurrency groups, so the very first
                 // admission runs may race while installing the shared label schema.
                 // A concurrent successful create is equivalent to this create.
-                if (error?.status !== 422) throw error;
+                if (error?.status !== 422) {
+                  decision = admission.blockedUnavailableProvenance(`Could not install managed label ${name}: ${error?.message ?? error}`, {
+                    repositoryId: repository.node_id, issueId: issue.node_id, issueNumber: issue.number,
+                    body: issue.body, snapshotSha256: snapshot?.evidenceFingerprint,
+                  });
+                  await ensureReadinessRevoked();
+                  core.setFailed(`Admission label setup is incomplete for ${name}.`);
+                }
               }
             }
 
-            const currentLabels = issue.labels
-              .map((label) => typeof label === 'string' ? label : label.name)
-              .filter((label) => typeof label === 'string' && label !== '');
-            const currentLabelSet = new Set(currentLabels);
+            const currentLabelSet = new Set(currentLabels.filter((label) => !cleanupSucceeded.has(label)));
             const labelsToAdd = decision.labels.filter((label) => !currentLabelSet.has(label));
             if (labelsToAdd.length > 0) {
-              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: labelsToAdd });
+              try {
+                await github.rest.issues.addLabels({ owner, repo, issue_number, labels: labelsToAdd });
+              } catch (error) {
+                core.setFailed(`Admission labels could not be fully projected: ${error?.message ?? error}`);
+              }
             }
             const desiredManagedLabels = new Set(decision.labels);
             const staleManagedLabels = currentLabels.filter((label) =>
-              admission.MANAGED_LABELS.has(label) && !desiredManagedLabels.has(label)
+              admission.MANAGED_LABELS.has(label) && !desiredManagedLabels.has(label) && !cleanupAttempted.has(label)
             );
             for (const name of staleManagedLabels) {
-              await github.rest.issues.removeLabel({ owner, repo, issue_number, name });
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name });
+              } catch (error) {
+                core.setFailed(`Stale managed label ${name} could not be removed: ${error?.message ?? error}`);
+              }
             }
 
             const body = admission.renderAdmission(decision);
-            const managed = comments.filter((comment) =>
+            const managed = (commentsAvailable ? comments : []).filter((comment) =>
               comment.user?.login === 'github-actions[bot]' &&
               typeof comment.body === 'string' &&
               comment.body.includes(admission.ADMISSION_MARKER)
             );
             managed.sort((a, b) => Number(a.id) - Number(b.id));
 
-            if (managed.length === 0) {
+            if (!commentsAvailable) {
+              // Comment discovery failed, so creating a new canonical projection could duplicate or
+              // conceal an existing handoff. Readiness cleanup and blocked labels still stand alone.
+            } else if (managed.length === 0) {
               await github.rest.issues.createComment({ owner, repo, issue_number, body });
             } else {
               const canonical = managed[0];
