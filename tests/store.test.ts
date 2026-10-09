@@ -1272,6 +1272,53 @@ describe('JsonFileStore — persistence round-trips', () => {
       'rejected complete-envelope CAS preserves original raw bytes');
   });
 
+  it('roundtrips canonical retention metadata and refuses malformed metadata on Run read and CAS', () => {
+    const headSha = 'retention-metadata-validation-head';
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
+      store: new InMemoryToolOutputStore(), policy: { previewBytes: 8, diagnosticBytes: 8, maxDiagnostics: 1, readBytes: 8 } });
+    const operationId = '00000000-0000-4000-8000-000000000000';
+    const retainedUntil = '2000-01-01T00:00:00.000Z';
+    const retainedOutput = { ...output, artifact: { ...output.artifact, operationId, retainedUntil } };
+    assert.equal(isToolOutputEnvelope(retainedOutput), true, 'canonical past deadline is structurally coherent');
+    const validation = {
+      ...validationPassed(headSha),
+      local: { ...validationPassed(headSha).local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus: 'complete' as const, output: retainedOutput }] },
+    };
+    const implementing = applyTransition(newRun('retention-metadata-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const persistedOutput = store.read(validRun.id)?.validationResult?.local.commands[0]?.output;
+    assert.equal(isToolOutputEnvelope(persistedOutput), true, 'valid paired authority survives store roundtrip');
+
+    const malformedOutputs = [
+      { ...retainedOutput, artifact: { ...retainedOutput.artifact, operationId: 'not-an-operation-id' } },
+      { ...retainedOutput, artifact: { ...retainedOutput.artifact, retainedUntil: '2000-1-1T00:00:00.000Z' } },
+      { ...output, artifact: { ...output.artifact, operationId } },
+    ];
+    for (const malformedOutput of malformedOutputs) {
+      const malformedValidation = {
+        ...validation,
+        local: { ...validation.local, commands: [{ ...validation.local.commands[0]!, output: malformedOutput }] },
+      };
+      const corruptRun = { ...validRun, validationResult: malformedValidation };
+      const originalBytes = JSON.stringify(corruptRun);
+      writeFileSync(runPath, originalBytes, 'utf8');
+      assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalBytes, 'rejected read preserves raw bytes');
+      assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalBytes, 'rejected CAS preserves raw bytes');
+    }
+  });
+
   it('bounds partial and unavailable fallback diagnostics before validation and persisted Run admission', () => {
     const headSha = 'fallback-diagnostics-validation-head';
     const base = validationPassed(headSha);

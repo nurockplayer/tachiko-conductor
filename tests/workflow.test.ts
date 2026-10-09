@@ -33,7 +33,7 @@ import { createBootstrapGitFixture } from './bootstrap-fixture.js';
 import { createGenuineLunaFixture } from './support/genuine-luna.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
-import { TOOL_OUTPUT_POLICY_MAXIMA } from '../src/evidence/tool-output.js';
+import { InMemoryToolOutputStore, TOOL_OUTPUT_POLICY_MAXIMA, boundToolOutput } from '../src/evidence/tool-output.js';
 import { DEFAULT_EFFICIENCY_THRESHOLDS, RUN_TELEMETRY_REVISION } from '../src/domain/telemetry.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
@@ -463,6 +463,52 @@ describe('runWorkflow', { concurrency: false }, () => {
         'durable refusal contains no oversized fallback preview');
       assert.ok(JSON.stringify(persisted?.validationResult).length < TOOL_OUTPUT_POLICY_MAXIMA.previewBytes,
         'only compact unavailable evidence reaches durable validation state');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('refuses malformed retention authority in complete evidence before persisting it', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-retention-authority-'));
+    const store = new JsonFileStore({ dir: directory });
+    let run = createRun(TARGET, T0, 'validation-malformed-retention-authority');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = { ...run, telemetry: {
+      revision: RUN_TELEMETRY_REVISION, coverage: 'partial', thresholds: DEFAULT_EFFICIENCY_THRESHOLDS,
+      events: [{ id: 'retention-existing-wait', at: T0, kind: 'wait_status_wakeup', state: 'VALIDATING', headSha: HEAD }],
+    } };
+    store.create(run);
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
+      store: new InMemoryToolOutputStore(), policy: { previewBytes: 8, diagnosticBytes: 8, maxDiagnostics: 1, readBytes: 8 } });
+    const malformedOutput = { ...output, artifact: { ...output.artifact,
+      operationId: 'not-an-operation-id', retainedUntil: '2000-01-01T00:00:00.000Z' } };
+    const malformedValidation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate() {
+        return { status: 'passed', configRevision: 'test-config-v1', commands: [{
+          commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+          captureStatus: 'complete', output: malformedOutput,
+        }] };
+      },
+    };
+
+    try {
+      const result = await runWorkflow({
+        store, github: githubAdapter([HEAD]), implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([approve(HEAD)]), validation: malformedValidation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+      }, run.id, { maxReviewAttempts: 1, now: () => T0 });
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.state, 'NEEDS_HUMAN');
+      assert.deepEqual(result.run.validationResult?.local.commands, [], 'malformed complete evidence is replaced with compact unavailable evidence');
+      const jsonHistory = (history: Run['history']): Run['history'] => JSON.parse(JSON.stringify(history)) as Run['history'];
+      assert.deepEqual(jsonHistory(result.run.history.slice(0, run.history.length)), jsonHistory(run.history),
+        'pre-validation history is preserved');
+      assert.deepEqual(result.run.telemetry, run.telemetry, 'prior telemetry is preserved');
+      const persisted = new JsonFileStore({ dir: directory }).read(run.id);
+      assert.equal(persisted?.state, 'NEEDS_HUMAN');
+      assert.deepEqual(persisted?.validationResult?.local.commands, []);
+      assert.equal(JSON.stringify(persisted?.validationResult).includes('not-an-operation-id'), false,
+        'invalid retention authority never reaches durable validation state');
+      assert.deepEqual(persisted?.telemetry, run.telemetry);
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

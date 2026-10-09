@@ -1122,7 +1122,10 @@ function isToolOutputArtifact(value: unknown): value is ToolOutputArtifactRefere
     [artifact.stdoutBytes, artifact.stderrBytes, artifact.totalBytes].every((item) =>
       typeof item === 'number' && Number.isSafeInteger(item) && item >= 0) &&
     typeof artifact.sha256 === 'string' && /^[0-9a-f]{64}$/.test(artifact.sha256) &&
-    (artifact.fileIdentity === undefined || isToolOutputArtifactFileIdentity(artifact.fileIdentity));
+    (artifact.fileIdentity === undefined || isToolOutputArtifactFileIdentity(artifact.fileIdentity)) &&
+    ((artifact.operationId === undefined && artifact.retainedUntil === undefined) ||
+      (typeof artifact.operationId === 'string' && /^[0-9a-f-]{36}$/.test(artifact.operationId) &&
+        isCanonicalTimestamp(artifact.retainedUntil)));
 }
 
 function validateReadLength(request: ToolOutputReadRequest, readBytes: number): number {

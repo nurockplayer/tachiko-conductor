@@ -29,6 +29,28 @@ const policy: ToolOutputPolicy = {
 };
 
 describe('bounded tool output contract', () => {
+  it('validates optional retention authority as an absent pair or a canonical pair', () => {
+    const base = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
+      store: new InMemoryToolOutputStore(), policy });
+    const validId = '00000000-0000-4000-8000-000000000000';
+    const canonicalPast = '2000-01-01T00:00:00.000Z';
+    assert.equal(isToolOutputEnvelope(base), true, 'legacy and memory references may omit both retention fields');
+    assert.equal(isToolOutputEnvelope({ ...base, artifact: { ...base.artifact,
+      operationId: validId, retainedUntil: canonicalPast } }), true,
+    'a valid past deadline remains structurally valid without making a freshness decision');
+    for (const fields of [
+      { operationId: 7, retainedUntil: canonicalPast },
+      { operationId: validId, retainedUntil: null },
+      { operationId: 'bad-operation-id', retainedUntil: canonicalPast },
+      { operationId: validId, retainedUntil: '2000-1-1T00:00:00.000Z' },
+      { operationId: validId },
+      { retainedUntil: canonicalPast },
+    ]) {
+      assert.equal(isToolOutputEnvelope({ ...base, artifact: { ...base.artifact, ...fields } }), false,
+        `malformed retention metadata is rejected: ${JSON.stringify(fields)}`);
+    }
+  });
+
   it('admits one cumulative UTF-8 operation quota across channels and writers without refunds', () => {
     const exactRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-quota-exact-'));
     const faultRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-quota-fault-'));
