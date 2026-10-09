@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -21,7 +21,9 @@ import {
 } from '../src/agents/worker-router-container.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
 import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
-import { TARGET } from './helpers.js';
+import { applyTransition } from '../src/domain/state-machine.js';
+import { JsonFileStore } from '../src/store/json-file-store.js';
+import { T0, TARGET, newRun } from './helpers.js';
 
 class FakeRunner implements ProcessRunner {
   readonly calls: Array<{ file: string; args: readonly string[]; options: ProcessRunOptions }> = [];
@@ -340,6 +342,40 @@ describe('WorkerRouterAdapter container boundary', () => {
           assert.equal(response.diagnostics?.at(-1), marker, `${outcome}/${worker} retains the compact marker after the typed failure`);
           assert.equal(response.diagnostics?.join('\n').includes('xxxxx'), false, 'failure diagnostics omit the worker transcript');
         }
+        assert.equal(response.diagnostics?.join('\n').includes('following transcript'), false,
+          `${outcome}/${worker} diagnostics omit transcript text after the marker`);
+
+        const runId = `worker-marker-${worker}-${outcome}`;
+        let run = applyTransition(newRun(runId, TARGET), { type: 'start' }, T0);
+        if (response.exitStatus === 'success') {
+          const headSha = response.headSha;
+          if (headSha === undefined) throw new Error('Successful worker result must include HEAD for persistence.');
+          run = applyTransition(run, { type: 'agent_succeeded', agentResult: response, headSha }, T0);
+        } else {
+          run = applyTransition(run, { type: 'agent_failed', agentResult: response }, T0);
+        }
+
+        const storeDir = mkdtempSync(path.join(os.tmpdir(), 'worker-router-provenance-run-'));
+        cleanupPaths.push(storeDir);
+        new JsonFileStore({ dir: storeDir }).create(run);
+        const persisted = new JsonFileStore({ dir: storeDir }).read(runId);
+        assert.ok(persisted, `${outcome}/${worker} Run is readable from a fresh JsonFileStore`);
+        assert.equal(persisted.state, outcome === 'success' ? 'VALIDATING' : 'FAILED');
+        const { telemetry: _responseTelemetry, ...expectedPersistedResponse } = response;
+        void _responseTelemetry;
+        assert.deepEqual(persisted.agentResult, expectedPersistedResponse,
+          `${outcome}/${worker} durable Run preserves exit status, HEAD, summary, diagnostics, and duration`);
+        assert.equal(Object.hasOwn(persisted.agentResult ?? {}, 'telemetry'), false,
+          'durable Run omits provider telemetry from the worker result');
+        const persistedMarker = persisted.agentResult?.diagnostics?.at(-1);
+        if (persistedMarker === undefined) throw new Error('Persisted worker result must include the canonical marker.');
+        assert.equal(persistedMarker, marker);
+        assert.ok(Buffer.byteLength(persistedMarker, 'utf8') <= 64, 'persisted canonical marker remains compact');
+        const durableBytes = readFileSync(path.join(storeDir, `${runId}.json`), 'utf8');
+        assert.equal(durableBytes.includes(marker), true);
+        const escapedWhitespace = JSON.stringify(largeWhitespace).slice(1, -1);
+        assert.equal(durableBytes.includes(escapedWhitespace), false, 'durable Run excludes JSON-escaped marker whitespace');
+        assert.equal(durableBytes.includes('following transcript'), false, 'durable Run excludes following transcript text');
       }
     }
 
