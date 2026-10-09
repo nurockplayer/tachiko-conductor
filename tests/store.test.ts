@@ -1449,7 +1449,7 @@ describe('JsonFileStore — persistence round-trips', () => {
         Buffer.byteLength('corrupt-retained-prefix'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, false),
     ];
     for (const [index, invalidValidation] of invalidValidations.entries()) {
-      const invalidBytes = JSON.stringify({ ...storedRun, validationResult: invalidValidation });
+      const invalidBytes: string = JSON.stringify({ ...storedRun, validationResult: invalidValidation });
       writeFileSync(runPath, invalidBytes, 'utf8');
       assert.throws(() => store.read(storedRun.id), /corrupt or incompatible/);
       assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
