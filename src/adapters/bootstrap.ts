@@ -12,6 +12,8 @@ export interface BootstrapPlanRequest {
   readonly baseBranch: string;
   readonly baseSha: string;
   readonly publicationBranch?: string;
+  /** Ephemeral synchronous authority check immediately before each deliberate Git/filesystem mutation. */
+  readonly beforeMutation?: () => void;
 }
 
 export interface BootstrapPrepareRequest extends BootstrapPlanRequest {
@@ -26,6 +28,10 @@ export interface VerifyDurableRequest {
   readonly workspaceGuard?: WorkspaceGuard;
   /** Existing authoritative PR recovery, not a newly produced worker result. */
   readonly adoptExistingHead?: boolean;
+  /** Synchronous host-owned fence immediately before every trusted-host mutation. */
+  readonly beforeMutation?: () => void;
+  /** Synchronous host-owned fence called immediately before a publication push. */
+  readonly beforePublish?: () => void;
 }
 
 export interface DurableImplementationSnapshot {

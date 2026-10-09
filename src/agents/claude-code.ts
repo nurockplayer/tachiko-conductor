@@ -1,6 +1,8 @@
 import {
   HUMAN_TAKEOVER_DIAGNOSTIC,
   assertWorkspaceGuard,
+  governedPublicationRefusal,
+  isExecutionAdmissionRefusal,
   normalizeMcpHttpCapabilities,
   type ImplementationAgent,
   type ImplementationRequest,
@@ -102,6 +104,8 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
+    const publicationRefusal = governedPublicationRefusal(this, request);
+    if (publicationRefusal !== undefined) return publicationRefusal;
     if (
       request.executor !== undefined &&
       (request.executor.provider !== CLAUDE_CODE_PROVIDER || request.executor.sessionId.trim() === '')
@@ -129,6 +133,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       request.signal,
       sessionId,
       cwd,
+      request.beforeExecution,
     );
     if (!outcome.ok) return outcome.agentResult;
     const executor = executorIdentity(outcome.sessionId);
@@ -230,12 +235,14 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
     signal: AbortSignal | undefined,
     resumeSessionId: string | undefined,
     cwd: string,
+    beforeSpawn?: () => void,
   ): Promise<ClaudeOutcome> {
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
-      result = await this.runner.run('claude', args, processOptions(this.timeoutMs, cwd, signal));
+      result = await this.runner.run('claude', args, processOptions(this.timeoutMs, cwd, signal, beforeSpawn));
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) throw error;
       const durationMs = elapsedMs(startedAt);
       const code = errorCode(error);
       if (signal?.aborted === true || code === 'ABORT_ERR') {
@@ -386,8 +393,10 @@ function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
 }
 
-function processOptions(timeoutMs: number, cwd: string, signal: AbortSignal | undefined): ProcessRunOptions {
-  return signal === undefined ? { timeoutMs, cwd } : { timeoutMs, cwd, signal };
+function processOptions(timeoutMs: number, cwd: string, signal: AbortSignal | undefined, beforeSpawn?: () => void): ProcessRunOptions {
+  return signal === undefined
+    ? { timeoutMs, cwd, ...(beforeSpawn === undefined ? {} : { beforeSpawn }) }
+    : { timeoutMs, cwd, signal, ...(beforeSpawn === undefined ? {} : { beforeSpawn }) };
 }
 
 function cancelledAgentResult(durationMs: number, sessionId?: string): AgentResult {

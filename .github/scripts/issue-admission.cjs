@@ -63,12 +63,29 @@ function parseJsonAfterMarker(text, marker) {
 function field(body, label) {
   if (typeof body !== 'string') return undefined;
   const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const match = new RegExp(`(?:^|\\n)### ${escaped}\\r?\\n+([\\s\\S]*?)(?=\\n### |$)`, 'm').exec(body);
+  // GitHub Issue Forms serialize each answer between blank-line-delimited
+  // headings. Normalize line endings first so CRLF bodies use the same
+  // boundaries, and require a complete heading line to avoid matching a
+  // heading-like line embedded in another answer.
+  const normalizedBody = body.replace(/\r\n?/g, '\n');
+  const match = new RegExp(`(?:^|\\n\\n)### ${escaped}\\n([\\s\\S]*?)(?=\\n\\n### [^\\n]+\\n|$)`).exec(normalizedBody);
   if (match === null) return undefined;
   const value = match[1].trim();
-  if (value === '' || value === '_No response_') return undefined;
+  if (value === '' || /^_No response_$/i.test(value)) return undefined;
   return value;
 }
+
+const REQUIRED_WRITER_FORM_FIELDS = Object.freeze([
+  'Kind',
+  'Task shape',
+  'Classification reason',
+  'Goal',
+  'Scope',
+  'Non-goals',
+  'Acceptance criteria',
+  'Dependencies',
+  'Stop conditions',
+]);
 
 function normalizeKind(value) {
   if (typeof value !== 'string') return undefined;
@@ -164,6 +181,10 @@ function formProposal(issue) {
   let executionProfile = null;
   let oracleRequired = false;
   if (WRITER_KINDS.has(kind)) {
+    const missing = REQUIRED_WRITER_FORM_FIELDS.filter((label) => field(issue.body, label) === undefined);
+    if (missing.length > 0) {
+      return { error: `Implementation/repair Issue Form requires non-empty fields: ${missing.join(', ')}.` };
+    }
     shape = normalizeShape(field(issue.body, 'Task shape'));
     if (shape === undefined || shape === null) return { error: 'Implementation/repair Issue Form requires "Task shape".' };
     executionProfile = expectedProfile(kind, shape);

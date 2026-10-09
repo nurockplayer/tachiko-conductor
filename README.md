@@ -185,10 +185,14 @@ bounded model-free safety poll.
 `tachiko dispatch once` now takes a small local lock before reading GitHub. It
 complements (but never replaces) the GitHub claim lease: a concurrent same-host
 invocation returns `{ "outcome": "already_running" }` without changing GitHub
-or starting a second executor. The default lock lives outside the repository at
-`~/.tachiko-conductor/dispatch/once.lock`; override it only with an absolute
-`TACHIKO_DISPATCH_LOCK_PATH`. A malformed or live lock fails closed; a lock for
-a provably absent PID is retried once.
+or starting a second executor. The singleton lock and short admission lock
+both live outside the repository under the effective OS account's physical
+home at `~/.tachiko-conductor/dispatch/once.lock` and
+`~/.tachiko-conductor/dispatch/once.lock.admission`. The optional
+`TACHIKO_DISPATCH_LOCK_PATH` and `TACHIKO_DISPATCH_ADMISSION_LOCK_PATH` values
+may alias those canonical physical paths; divergent values fail closed. A
+malformed or live lock fails closed; a lock for a provably absent PID is
+retried once.
 
 For macOS, use `launchd` to supervise the continuous driver. First create a
 private, absolute-path wrapper that supplies the explicitly selected dispatch,
@@ -206,6 +210,10 @@ execution, or provider credentials and is not a calendar wake:
 pnpm exec tsx src/cli.ts dispatch launchd render \
   --program '/absolute/path/to/run-dispatch-driver.sh' \
   --node-program '/stable/absolute/path/to/node' \
+  --pnpm-program '/stable/absolute/path/to/pnpm' \
+  --dependency-artifact-path '/absolute/path/to/lockfile-bound-pnpm-artifact' \
+  --luna-codex-home '/absolute/path/to/luna-codex-home' \
+  --playwright-browsers-path '/absolute/path/to/playwright-artifacts' \
   --working-directory "$PWD" \
   > "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
 launchctl bootstrap "gui/$(id -u)" "$HOME/Library/LaunchAgents/io.tachiko.conductor.dispatch-driver.plist"
@@ -424,6 +432,30 @@ separate live Issue/PR/exact-HEAD/merge-state reconciliation. A configured
 validation adapter or hosted policy without a non-empty revision is invalid
 operator configuration: Conductor parks before validation or review executes.
 
+### #104 production policy and held restart
+
+`scripts/issue-104-production-policy.sh` is the checked-in, revisioned
+reboot-safe policy source for the qualified Luna lane. It pins `routine` to
+`luna-isolated` / `gpt-5.6-luna`, an absolute `TACHIKO_LUNA_CODEX_HOME`,
+frozen-lockfile `pnpm` hydration plus test/typecheck/build in the reconstructed
+exact candidate, and the hosted-check policy. Luna rejects `standard`,
+`complex`, and `critical` before provider construction; they are not quiet
+fallback routes.
+
+From a stable merged checkout, set `TACHIKO_NODE_PROGRAM` and
+`TACHIKO_PNPM_PROGRAM` to the host-provisioned absolute Node and pnpm paths,
+and `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` to a private host-created directory
+containing `store/` and `pnpm-lock.yaml.sha256` (the SHA-256 of the candidate
+lockfile),
+then run `scripts/issue-104-deploy.sh preflight`. This reads only local policy
+and the qualified Luna config—no GitHub, pnpm install, or model turn. The
+production validator executes pnpm only by that explicit path, under macOS
+`sandbox-exec` with network and default filesystem access denied. The store is
+read-only to candidate code and hydration is offline; a missing, dirty, or
+lockfile-mismatched artifact makes validation unknown. `scripts/issue-104-deploy.sh restart` first persists the existing
+maintenance hold, preflights, and then restarts launchd; leave the hold in
+place until an operator explicitly verifies and releases it.
+
 Without explicit configuration, local validation is unknown and the run cannot
 advance to review. The configured runner refuses an ambient directory: it
 re-proves the clean bootstrap-owned worktree's exact HEAD before and after the
@@ -464,13 +496,22 @@ non-zero exit code.
 require result payloads supplied by adapters; `run transition` rejects them
 explicitly. Drive those through the domain API (`applyTransition`).
 
+`run transition <id> merged` requires a direct live read of the Run's persisted
+pull request and exact head/branch/base identity. It settles only a
+`workflow_settled` parked admission; retries reconcile the matching private
+generation receipt under the dispatch and registry locks.
+
 ## Container-owned worker-router execution
 
 `WorkerRouterAdapter` is the one executor placed behind the container boundary
 proven in issue #73. The untrusted worker runs only inside a digest-pinned
 container; the host worker path is never executed and there is no fallback.
+This adapter is not currently source-qualified for governed publication, so
+fresh and continued governed invocations are held before any worker or host
+publication operation. Its execution and host publication path remains
+available to ungoverned callers.
 
-The adapter keeps the authority split unchanged. It runs `guard(before)`, then
+For an ungoverned call, the adapter runs `guard(before)`, then
 creates and starts the container, forwards the task on stdin, waits for the
 exact container terminal state, and only then runs `guard(after)`, reads the
 exact HEAD, proves base ancestry, and publishes that exact HEAD from the host.
@@ -602,6 +643,23 @@ committed raw run bytes: a missing, stale, malformed, or digest-mismatched
 sidecar is unknown/unlinked rather than an authority to reconstruct a run.
 Use `tachiko run projections rebuild` only to backfill sidecars from runs that
 `JsonFileStore` has successfully validated.
+
+## Oracle review policy
+
+The exported Oracle reviewer applies the versioned provider-neutral R1–R5 risk
+floor before transport. It requires trusted, complete candidate evidence and a
+qualified binding whose separate transport observation verifies the model,
+effort, exact HEAD/base, associated pull request, and complete changed-path
+coverage. Missing or mismatched evidence holds the review without approval.
+Floors R1–R3 currently bind to selected Oracle semantic tier R3 at Medium;
+R4 uses High and R5 uses Extra High with a recorded critical reason. Legacy
+receipts remain readable but do not contain policy qualification.
+
+This module policy does not activate a native production Oracle factory or
+unattended browser transport. Native dispatch, durable pending receipts, and
+transport qualification remain separate work. The selected Medium/High/Extra
+High effort is an observed configuration; account quota economics are not
+established here.
 
 ## Layout
 

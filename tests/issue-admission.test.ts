@@ -8,6 +8,7 @@ const admission = require('../.github/scripts/issue-admission.cjs') as {
   readonly AUTHORITY_MARKER: string;
   readonly LEGACY_AUTHORITY_MARKER: string;
   classifyIssue(input: { issue: Record<string, unknown>; comments?: readonly Record<string, unknown>[] }): any;
+  field(body: string, label: string): string | undefined;
   reconcileLabels(existing: readonly string[], desired: readonly string[]): string[];
   renderAdmission(decision: any): string;
 };
@@ -16,9 +17,31 @@ function implementationForm(shape: 'bounded' | 'interacting' | 'decision' = 'bou
   return {
     author_association: association,
     state: 'open',
-    body: `### Kind\nimplementation\n\n### Task shape\n${shape}\n\n### Goal\nFixture`,
+    body: [
+      '### Kind', 'implementation', '',
+      '### Task shape', shape, '',
+      '### Classification reason', 'The scope is bounded.', '',
+      '### Goal', 'Fixture goal.', '',
+      '### Scope', 'Fixture scope.', '',
+      '### Non-goals', 'Fixture exclusions.', '',
+      '### Acceptance criteria', 'The fixture is accepted.', '',
+      '### Dependencies', 'none', '',
+      '### Stop conditions', 'Stop if the fixture is unclear.',
+    ].join('\n'),
   };
 }
+
+const requiredWriterFields = [
+  'Kind',
+  'Task shape',
+  'Classification reason',
+  'Goal',
+  'Scope',
+  'Non-goals',
+  'Acceptance criteria',
+  'Dependencies',
+  'Stop conditions',
+];
 
 test('trusted bounded implementation projects routine dispatch readiness', () => {
   const decision = admission.classifyIssue({ issue: implementationForm() });
@@ -43,6 +66,49 @@ test('Issue Form edits rotate task authority revision even when shape is unchang
   });
   assert.notEqual(first.authority.revision, second.authority.revision);
   assert.equal(second.authority.executionProfile, 'routine');
+});
+
+test('implementation and repair forms require every field to be present and non-empty', () => {
+  for (const kind of ['implementation', 'repair']) {
+    for (const label of requiredWriterFields) {
+      const escapedLabel = label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const missingBody = implementationForm().body.replace(
+        new RegExp(`(?:^|\\n\\n)### ${escapedLabel}\\n[\\s\\S]*?(?=\\n\\n### |$)`),
+        '',
+      );
+      const absent = admission.classifyIssue({
+        issue: { author_association: 'OWNER', state: 'open', body: missingBody.replace('implementation', kind) },
+      });
+      assert.equal(absent.status, 'blocked', `${kind}: missing ${label}`);
+      assert.equal(absent.dispatch, 'blocked', `${kind}: missing ${label}`);
+      assert.ok(absent.labels.includes('needs:classification'), `${kind}: missing ${label}`);
+
+      for (const response of ['', '_No response_']) {
+        const emptyBody = implementationForm().body
+          .replace('implementation', kind)
+          .replace(new RegExp(`(### ${escapedLabel}\\n)[^\\n]+`), `$1${response}`);
+        const empty = admission.classifyIssue({
+          issue: { author_association: 'OWNER', state: 'open', body: emptyBody },
+        });
+        assert.equal(empty.status, 'blocked', `${kind}: empty ${label}`);
+        assert.equal(empty.dispatch, 'blocked', `${kind}: empty ${label}`);
+        assert.ok(empty.labels.includes('needs:classification'), `${kind}: empty ${label}`);
+      }
+    }
+  }
+});
+
+test('writer form fields accept multiline answers and CRLF Issue Form serialization', () => {
+  const body = implementationForm().body
+    .replace('The scope is bounded.', 'The scope is bounded.\nIt changes one admission boundary.')
+    .replace('Fixture goal.', 'First goal line.\nSecond $goal line.')
+    .replace(/\n/g, '\r\n');
+  const decision = admission.classifyIssue({ issue: { ...implementationForm(), body } });
+  assert.equal(decision.status, 'ready');
+  assert.equal(decision.dispatch, 'ready');
+  assert.equal(decision.authority.shape, 'bounded');
+  assert.equal(admission.field(body, 'Goal'), 'First goal line.\nSecond $goal line.');
+  assert.equal(admission.field(body, 'Classification reason'), 'The scope is bounded.\nIt changes one admission boundary.');
 });
 
 test('trusted interacting implementation projects complex dispatch readiness', () => {

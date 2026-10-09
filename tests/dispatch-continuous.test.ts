@@ -53,6 +53,21 @@ describe('continuous dispatch driver', () => {
     assert.deepEqual(sleeps, [23]);
   });
 
+  it('treats typed admission wait as a retained nonterminal claim and polls serially', async () => {
+    const waiting: DispatchOnceResult = {
+      outcome: 'admission_wait', waitKind: 'capacity', entry: { issue: 18, route: 'codex', profile: 'routine' },
+      runId: 'run-1', reason: 'waiting for capacity',
+      claim: { issue: 18, claimId: 'claim-1', runId: 'run-1', profile: 'routine', state: 'claimed', claimedAt: '2026-09-20T00:00:00.000Z', heartbeatAt: '2026-09-20T00:00:00.000Z', leaseUntil: '2026-09-20T00:15:00.000Z' },
+    };
+    const calls: string[] = [];
+    const result = await dispatchContinuously({
+      dispatchOnce: async () => { calls.push('reconcile'); return waiting; },
+      sleep: async () => { calls.push('wait'); }, idlePollMs: 13, maxCycles: 2,
+    });
+    assert.deepEqual(calls, ['reconcile', 'wait', 'reconcile']);
+    assert.equal(result.last?.outcome, 'admission_wait');
+  });
+
   it('fails closed for invalid bounds before dispatching', async () => {
     await assert.rejects(
       dispatchContinuously({ dispatchOnce: async () => terminal, sleep: async () => undefined, idlePollMs: 0, maxCycles: 1 }),
