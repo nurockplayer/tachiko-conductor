@@ -1,0 +1,328 @@
+name: Issue admission
+
+"on":
+  workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to reconcile
+        required: true
+        type: number
+  issues:
+    types: [opened, edited, reopened, closed, labeled, unlabeled]
+  issue_comment:
+    types: [created, edited, deleted]
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: issue-admission-${{ github.repository }}-${{ github.event.issue.number || inputs.issue_number }}
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.event.issue.pull_request == null) && github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    env:
+      TACHIKO_ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+    steps:
+      - name: Checkout admission policy
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Reconcile issue admission
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const path = require('node:path');
+            const admission = require(path.join(process.env.GITHUB_WORKSPACE, '.github/scripts/issue-admission.cjs'));
+            const { owner, repo } = context.repo;
+            const issue_number = Number(process.env.TACHIKO_ISSUE_NUMBER);
+            if (!Number.isSafeInteger(issue_number) || issue_number < 1) {
+              core.setFailed('A positive issue number is required.');
+              return;
+            }
+
+            const issue = (await github.rest.issues.get({ owner, repo, issue_number })).data;
+            if (issue?.pull_request) return;
+            if (!issue || typeof issue.node_id !== 'string' || issue.node_id === '' || issue.number !== issue_number) {
+              core.setFailed('The requested target is not a positively identified Issue. No admission projection was written.');
+              return;
+            }
+            let repository;
+            try {
+              repository = (await github.rest.repos.get({ owner, repo })).data;
+            } catch (error) {
+              core.setFailed(`The repository identity could not be verified. No admission projection was written: ${error?.message ?? error}`);
+              return;
+            }
+            if (typeof repository?.node_id !== 'string' || repository.node_id === '' ||
+                typeof repository?.full_name !== 'string' || repository.full_name.toLowerCase() !== `${owner}/${repo}`.toLowerCase()) {
+              core.setFailed('The repository identity is unavailable or does not match the configured repository. No admission projection was written.');
+              return;
+            }
+
+            let snapshot;
+            let decision;
+            try {
+              snapshot = await admission.fetchAuthoritySnapshot(github, { owner, repo, number: issue_number, expectedRepositoryId: repository.node_id });
+              if (snapshot.pullRequest) return;
+              if (snapshot.issue.id !== issue.node_id || snapshot.issue.number !== issue_number) {
+                core.setFailed('REST and GraphQL target identities disagree. No admission projection was written.');
+                return;
+              }
+              const restState = issue.state === 'open' ? 'OPEN' : issue.state === 'closed' ? 'CLOSED' : undefined;
+              const sameJoinedSnapshot = issue.body === snapshot.issue.body && restState === snapshot.issue.state &&
+                Date.parse(issue.created_at ?? '') === Date.parse(snapshot.issue.createdAt) &&
+                Date.parse(issue.updated_at ?? '') === Date.parse(snapshot.issue.updatedAt) &&
+                issue.author_association === snapshot.issue.authorAssociation &&
+                issue.user?.node_id === snapshot.issue.author?.id;
+              if (!sameJoinedSnapshot) {
+                decision = admission.blockedUnavailableProvenance('REST and GraphQL Issue content or provenance snapshots disagree.', {
+                  repositoryId: snapshot.repositoryId, issueId: snapshot.issue.id, issueNumber: snapshot.issue.number,
+                  body: issue.body, authorityInputsSha256: snapshot.authorityInputsSha256,
+                });
+              } else {
+                decision = snapshot.decision;
+                const recheck = await admission.fetchAuthoritySnapshot(github, { owner, repo, number: issue_number, expectedRepositoryId: repository.node_id });
+                if (recheck.pullRequest || recheck.issue.id !== snapshot.issue.id) {
+                  core.setFailed('The target changed during provenance recheck. No admission projection was written.');
+                  return;
+                }
+                if (recheck.evidenceFingerprint !== snapshot.evidenceFingerprint) {
+                  decision = admission.blockedUnavailableProvenance('Issue content, authority provenance, deletion evidence, or pagination changed before projection.', {
+                    repositoryId: recheck.repositoryId, issueId: recheck.issue.id, issueNumber: recheck.issue.number,
+                    body: recheck.issue.body, authorityInputsSha256: recheck.authorityInputsSha256,
+                  });
+                }
+              }
+            } catch (error) {
+              if (error?.targetMismatch) {
+                core.setFailed(`Target identity could not be verified: ${error.message}`);
+                return;
+              }
+              decision = admission.blockedUnavailableProvenance(error?.message ?? 'GitHub provenance data was unavailable.', {
+                repositoryId: repository.node_id, issueId: issue.node_id, issueNumber: issue.number,
+                body: issue.body, authorityInputsSha256: snapshot?.authorityInputsSha256,
+              });
+            }
+
+            const currentLabels = issue.labels
+              .map((label) => typeof label === 'string' ? label : label.name)
+              .filter((label) => typeof label === 'string' && label !== '');
+            const liveLabels = new Set(currentLabels);
+            const failures = [];
+            const cleanupAttempts = new Set();
+            const labelAddAttempts = new Set();
+            const possibleLabelPresence = new Set();
+            const readinessExposure = new Map();
+            let classificationExposure = 0;
+            let dispatchExposure = 0;
+            const observed = () => ({ repositoryId: repository.node_id, issueId: issue.node_id, issueNumber: issue.number,
+              body: issue.body, authorityInputsSha256: snapshot?.authorityInputsSha256 });
+            const block = (reason) => { decision = admission.blockedUnavailableProvenance(reason, observed()); };
+            const fail = (message) => {
+              failures.push(message);
+              core.setFailed(message);
+              block(message);
+            };
+            const removeOnce = async (name, exposure = 0, force = false) => {
+              const key = name + ':' + exposure;
+              if (cleanupAttempts.has(key) || (!force && !liveLabels.has(name))) return true;
+              cleanupAttempts.add(key);
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name });
+                liveLabels.delete(name);
+                possibleLabelPresence.delete(name);
+                return true;
+              } catch (error) {
+                fail('Could not revoke ' + name + ' exposure ' + exposure + ': ' + (error?.message ?? error));
+                return false;
+              }
+            };
+            const revokeBlockedReadiness = async () => {
+              await removeOnce('dispatch:ready');
+              const exposure = readinessExposure.get('classification:ready') ?? 0;
+              await removeOnce('classification:ready', exposure, possibleLabelPresence.has('classification:ready'));
+            };
+            if (decision.status !== 'ready') await revokeBlockedReadiness();
+            else if (decision.dispatch !== 'ready') {
+              await removeOnce('dispatch:ready');
+              if (decision.status !== 'ready') await revokeBlockedReadiness();
+            }
+
+            let comments = [];
+            let commentsAvailable = true;
+            try {
+              comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number, per_page: 100 });
+            } catch (error) {
+              commentsAvailable = false;
+              fail('Comment discovery failed; the existing admission projection could not be verified or corrected: ' + (error?.message ?? error));
+              await revokeBlockedReadiness();
+            }
+            const managed = comments.filter((comment) => comment.user?.login === 'github-actions[bot]' &&
+              typeof comment.body === 'string' && comment.body.includes(admission.ADMISSION_MARKER));
+            managed.sort((a, b) => Number(a.id) - Number(b.id));
+            let canonical = managed[0];
+            let canonicalKnown = canonical !== undefined;
+            let canonicalCreateAttempted = false;
+            let canonicalBlockedCorrectionAttempted = false;
+
+            let repoLabels = [];
+            let labelDefinitionsAvailable = true;
+            try {
+              repoLabels = await github.paginate(github.rest.issues.listLabelsForRepo, { owner, repo, per_page: 100 });
+            } catch (error) {
+              labelDefinitionsAvailable = false;
+              fail('Label definition discovery failed: ' + (error?.message ?? error));
+              await revokeBlockedReadiness();
+            }
+            const existingDefinitions = new Set(repoLabels.map((label) => label.name));
+            const initialDesired = new Set(decision.labels);
+            const initialBody = admission.renderAdmission(decision);
+            const initialAdds = decision.labels.filter((name) => name !== 'dispatch:ready' && !liveLabels.has(name));
+            const initialRemoves = [...liveLabels].filter((name) => admission.MANAGED_LABELS.has(name) && !initialDesired.has(name));
+            const missingDefinitions = Object.keys(admission.LABEL_DEFINITIONS).filter((name) => !existingDefinitions.has(name));
+            const projectionNeedsCorrection = (commentsAvailable && (canonical === undefined || canonical.body !== initialBody || managed.length > 1)) ||
+              initialAdds.length > 0 || initialRemoves.length > 0 || missingDefinitions.length > 0;
+            if (decision.status === 'ready' && decision.dispatch === 'ready' && liveLabels.has('dispatch:ready') && projectionNeedsCorrection) {
+              await removeOnce('dispatch:ready');
+              if (decision.status !== 'ready') await revokeBlockedReadiness();
+            }
+
+            if (labelDefinitionsAvailable) {
+              for (const [name, definition] of Object.entries(admission.LABEL_DEFINITIONS)) {
+                if (existingDefinitions.has(name)) continue;
+                try {
+                  await github.rest.issues.createLabel({ owner, repo, name, ...definition });
+                  existingDefinitions.add(name);
+                } catch (error) {
+                  if (error?.status !== 422) {
+                    fail('Could not install managed label ' + name + ': ' + (error?.message ?? error));
+                    await revokeBlockedReadiness();
+                  }
+                }
+              }
+            }
+
+            const writeCanonical = async (targetDecision) => {
+              if (!commentsAvailable) return;
+              const body = admission.renderAdmission(targetDecision);
+              if (canonical) {
+                if (canonical.body === body) return;
+                try {
+                  await github.rest.issues.updateComment({ owner, repo, comment_id: canonical.id, body });
+                  canonical.body = body;
+                } catch (error) {
+                  fail('Canonical comment update failed: ' + (error?.message ?? error));
+                }
+                return;
+              }
+              if (canonicalCreateAttempted) return;
+              canonicalCreateAttempted = true;
+              try {
+                const response = await github.rest.issues.createComment({ owner, repo, issue_number, body });
+                const created = response?.data;
+                if (created && (typeof created.id === 'number' || typeof created.id === 'string') && created.id !== '') {
+                  canonical = { ...created, body };
+                  canonicalKnown = true;
+                } else {
+                  canonicalKnown = false;
+                  fail('Canonical comment creation returned no verifiable comment ID; no blind retry will be attempted.');
+                }
+              } catch (error) {
+                canonicalKnown = false;
+                fail('Canonical comment creation failed with an unknown outcome; no blind retry will be attempted: ' + (error?.message ?? error));
+              }
+            };
+
+            if (commentsAvailable) {
+              await writeCanonical(decision);
+              for (const duplicate of managed.slice(1)) {
+                try {
+                  await github.rest.issues.updateComment({ owner, repo, comment_id: duplicate.id,
+                    body: 'Superseded by canonical Tachiko issue-admission comment ' + (canonical?.html_url ?? '') + '.' });
+                } catch (error) {
+                  fail('Managed duplicate comment ' + duplicate.id + ' could not be neutralized: ' + (error?.message ?? error));
+                }
+              }
+            }
+            if (failures.length > 0) await revokeBlockedReadiness();
+
+            const applyManagedLabels = async (targetDecision) => {
+              const additions = targetDecision.labels.filter((name) => name !== 'dispatch:ready' && !liveLabels.has(name) && !labelAddAttempts.has(name));
+              if (additions.length > 0) {
+                for (const name of additions) labelAddAttempts.add(name);
+                for (const name of additions) {
+                  if (name === 'classification:ready') {
+                    classificationExposure += 1;
+                    readinessExposure.set(name, classificationExposure);
+                    possibleLabelPresence.add(name);
+                  }
+                }
+                try {
+                  await github.rest.issues.addLabels({ owner, repo, issue_number, labels: additions });
+                  for (const name of additions) {
+                    liveLabels.add(name);
+                    possibleLabelPresence.delete(name);
+                  }
+                } catch (error) {
+                  fail('Managed label addition failed (' + additions.join(', ') + '): ' + (error?.message ?? error));
+                  for (const name of additions) {
+                    if (!possibleLabelPresence.has(name)) continue;
+                    await removeOnce(name, readinessExposure.get(name) ?? 0, true);
+                  }
+                  await revokeBlockedReadiness();
+                }
+              }
+              const removals = [...liveLabels].filter((name) => admission.MANAGED_LABELS.has(name));
+              for (const name of removals) {
+                if (!decision.labels.includes(name)) await removeOnce(name);
+                if (failures.length > 0) await revokeBlockedReadiness();
+              }
+            };
+            await applyManagedLabels(decision);
+
+            if (failures.length > 0) {
+              await revokeBlockedReadiness();
+              await applyManagedLabels(decision);
+              if (commentsAvailable && canonicalKnown && canonical && !canonicalBlockedCorrectionAttempted) {
+                const blockedBody = admission.renderAdmission(decision);
+                if (canonical.body !== blockedBody) {
+                  canonicalBlockedCorrectionAttempted = true;
+                  try {
+                    await github.rest.issues.updateComment({ owner, repo, comment_id: canonical.id, body: blockedBody });
+                    canonical.body = blockedBody;
+                  } catch (error) {
+                    fail('Bounded blocked canonical correction failed: ' + (error?.message ?? error));
+                  }
+                }
+              }
+            }
+
+            if (decision.status === 'ready' && decision.dispatch === 'ready' && failures.length === 0 && !liveLabels.has('dispatch:ready')) {
+              try {
+                await github.rest.issues.addLabels({ owner, repo, issue_number, labels: ['dispatch:ready'] });
+                liveLabels.add('dispatch:ready');
+              } catch (error) {
+                dispatchExposure += 1;
+                fail('Final dispatch:ready publication failed with a possible new exposure: ' + (error?.message ?? error));
+                await removeOnce('dispatch:ready', dispatchExposure, true);
+                await revokeBlockedReadiness();
+                await applyManagedLabels(decision);
+                if (commentsAvailable && canonicalKnown && canonical && !canonicalBlockedCorrectionAttempted) {
+                  const blockedBody = admission.renderAdmission(decision);
+                  if (canonical.body !== blockedBody) {
+                    canonicalBlockedCorrectionAttempted = true;
+                    try {
+                      await github.rest.issues.updateComment({ owner, repo, comment_id: canonical.id, body: blockedBody });
+                      canonical.body = blockedBody;
+                    } catch (correctionError) {
+                      fail('Bounded blocked canonical correction failed: ' + (correctionError?.message ?? correctionError));
+                    }
+                  }
+                }
+              }
+            }

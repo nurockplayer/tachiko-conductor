@@ -1,0 +1,45 @@
+name: Coordination
+description: Reconcile roadmap, dependency, ownership, queue, or multi-Issue state without implementation writer authority.
+title: "[Coordination] "
+body:
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Kind
+      options:
+        - coordination
+    validations:
+      required: true
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+    validations:
+      required: true
+  - type: textarea
+    id: sources
+    attributes:
+      label: Sources of truth to reconcile
+      description: Issues, PRs, queues, handoffs, runtime state, or roadmap records.
+    validations:
+      required: true
+  - type: textarea
+    id: target_state
+    attributes:
+      label: Expected reconciled state
+    validations:
+      required: true
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: State which implementation/operational work is explicitly not authorized here.
+    validations:
+      required: true
+  - type: textarea
+    id: stop_conditions
+    attributes:
+      label: Stop conditions
+      description: Ambiguities that require Steward/human authority instead of silently changing scope or priority.
+    validations:
+      required: true
