@@ -46,6 +46,182 @@ function withForeignLstatUid<T>(targetPath: string, operation: () => T): T {
   }
 }
 
+function withPathObservations<T>(
+  observers: { readonly realpath?: typeof realpathSync.native; readonly lstat?: typeof fs.lstatSync },
+  operation: () => T,
+): T {
+  const mutableFs = fs as { lstatSync: typeof fs.lstatSync };
+  const originalRealpath = realpathSync.native;
+  const originalLstat = mutableFs.lstatSync;
+  if (observers.realpath !== undefined) realpathSync.native = observers.realpath;
+  if (observers.lstat !== undefined) mutableFs.lstatSync = observers.lstat;
+  syncBuiltinESMExports();
+  try { return operation(); } finally {
+    realpathSync.native = originalRealpath;
+    mutableFs.lstatSync = originalLstat;
+    syncBuiltinESMExports();
+  }
+}
+
+describe('physical account-path observations', () => {
+  it('reobserves ordinary files and directories created between realpath and lstat', () => {
+    const f = fixture();
+    const originalUserInfo = os.userInfo;
+    const originalRealpath = realpathSync.native;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: f.home })) as typeof os.userInfo;
+      for (const insideAccount of [false, true]) {
+        for (const endpoint of ['file', 'directory'] as const) {
+          const target = path.join(insideAccount ? path.join(f.home, '.tachiko-conductor', 'runs') : f.root, `published-${endpoint}`);
+          let published = false;
+          withPathObservations({ realpath: ((candidate: Parameters<typeof realpathSync.native>[0]) => {
+            try { return originalRealpath(candidate); } catch (error) {
+              if (!published && path.resolve(String(candidate)) === target && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+                published = true;
+                if (endpoint === 'directory') mkdirSync(target, { mode: 0o700 });
+                else writeFileSync(target, '{}\n', { mode: 0o600 });
+              }
+              throw error;
+            }
+          }) as typeof realpathSync.native }, () => {
+            assert.equal(isCurrentAccountPathApplicable(target), insideAccount);
+            assertSafeCurrentAccountPathIfApplicable(target, endpoint);
+          });
+          assert.equal(published, true, `${endpoint} publication interleaving was exercised`);
+        }
+      }
+    } finally {
+      os.userInfo = originalUserInfo;
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it('still rejects unsafe permissions after a concurrent directory publication', () => {
+    const f = fixture();
+    const originalUserInfo = os.userInfo;
+    const originalRealpath = realpathSync.native;
+    const target = path.join(f.home, '.tachiko-conductor', 'runs', 'unsafe-publication');
+    let published = false;
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: f.home })) as typeof os.userInfo;
+      withPathObservations({ realpath: ((candidate: Parameters<typeof realpathSync.native>[0]) => {
+        try { return originalRealpath(candidate); } catch (error) {
+          if (!published && path.resolve(String(candidate)) === target && (error as NodeJS.ErrnoException).code === 'ENOENT') {
+            published = true;
+            mkdirSync(target);
+            chmodSync(target, 0o777);
+          }
+          throw error;
+        }
+      }) as typeof realpathSync.native }, () => {
+        assert.throws(() => assertSafeCurrentAccountPathIfApplicable(target, 'directory'), /Unsafe/);
+      });
+      assert.equal(published, true);
+      assert.equal(statSync(target).mode & 0o777, 0o777, 'unsafe publication is not repaired');
+    } finally {
+      os.userInfo = originalUserInfo;
+      rmSync(f.root, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed after three reobservations of a persistently unresolved ordinary object', () => {
+    const f = fixture();
+    const target = path.join(f.root, 'unresolved');
+    mkdirSync(target);
+    const originalRealpath = realpathSync.native;
+    const missing = Object.assign(new Error('injected ENOENT'), { code: 'ENOENT' });
+    let observations = 0;
+    try {
+      withPathObservations({ realpath: ((candidate: Parameters<typeof realpathSync.native>[0]) => {
+        if (path.resolve(String(candidate)) === target) { observations += 1; throw missing; }
+        return originalRealpath(candidate);
+      }) as typeof realpathSync.native }, () => {
+        assert.throws(() => isCurrentAccountPathApplicable(target), (error) => error === missing);
+      });
+      assert.equal(observations, 4, 'one initial observation plus a fixed total of three reobservations');
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  it('propagates non-ENOENT realpath and lstat failures without retrying them', () => {
+    const f = fixture();
+    const target = path.join(f.root, 'unreadable');
+    const originalRealpath = realpathSync.native;
+    const originalLstat = fs.lstatSync;
+    try {
+      for (const code of ['EACCES', 'ENOTDIR', 'ELOOP']) {
+        for (const failureAt of ['realpath', 'lstat']) {
+          const failure = Object.assign(new Error(`injected ${failureAt} ${code}`), { code });
+          let observations = 0;
+          withPathObservations({
+            realpath: ((candidate: Parameters<typeof realpathSync.native>[0]) => {
+              if (path.resolve(String(candidate)) === target) {
+                observations += 1;
+                if (failureAt === 'realpath') throw failure;
+                throw Object.assign(new Error('injected ENOENT'), { code: 'ENOENT' });
+              }
+              return originalRealpath(candidate);
+            }) as typeof realpathSync.native,
+            lstat: ((candidate: Parameters<typeof fs.lstatSync>[0]) => {
+              if (path.resolve(String(candidate)) === target) throw failure;
+              return originalLstat(candidate);
+            }) as typeof fs.lstatSync,
+          }, () => assert.throws(() => isCurrentAccountPathApplicable(target), (error) => error === failure));
+          assert.equal(observations, 1, `${failureAt} ${code} is not retried`);
+        }
+      }
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  it('rejects unresolved symlinks and unsupported filesystem types without reobservation', () => {
+    const f = fixture();
+    const originalRealpath = realpathSync.native;
+    const originalLstat = fs.lstatSync;
+    const target = path.join(f.root, 'unresolved');
+    const missing = Object.assign(new Error('injected ENOENT'), { code: 'ENOENT' });
+    try {
+      for (const symlink of [true, false]) {
+        let observations = 0;
+        withPathObservations({
+          realpath: ((candidate: Parameters<typeof realpathSync.native>[0]) => {
+            if (path.resolve(String(candidate)) === target) { observations += 1; throw missing; }
+            return originalRealpath(candidate);
+          }) as typeof realpathSync.native,
+          lstat: ((candidate: Parameters<typeof fs.lstatSync>[0]) => {
+            if (path.resolve(String(candidate)) === target) {
+              const stats = originalLstat(f.root);
+              stats.isSymbolicLink = () => symlink;
+              stats.isDirectory = () => false;
+              stats.isFile = () => false;
+              return stats;
+            }
+            return originalLstat(candidate);
+          }) as typeof fs.lstatSync,
+        }, () => assert.throws(() => isCurrentAccountPathApplicable(target), (error) => error === missing));
+        assert.equal(observations, 1);
+      }
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+  it('rejects an unresolvable filesystem root instead of returning the unverified target', () => {
+    const root = path.parse(path.resolve(os.tmpdir())).root;
+    const originalRealpath = realpathSync.native;
+    const originalLstat = fs.lstatSync;
+    const missing = Object.assign(new Error('injected root ENOENT'), { code: 'ENOENT' });
+    let rootResolutionStarted = false;
+    withPathObservations({
+      realpath: ((candidate: Parameters<typeof realpathSync.native>[0]) => {
+        if (path.resolve(String(candidate)) === root) { rootResolutionStarted = true; throw missing; }
+        return originalRealpath(candidate);
+      }) as typeof realpathSync.native,
+      lstat: ((candidate: Parameters<typeof fs.lstatSync>[0]) => {
+        if (rootResolutionStarted && path.resolve(String(candidate)) === root) throw missing;
+        return originalLstat(candidate);
+      }) as typeof fs.lstatSync,
+    }, () => assert.throws(() => isCurrentAccountPathApplicable(root), (error) => error === missing));
+    assert.equal(rootResolutionStarted, true);
+  });
+});
+
 describe('account-owned path permissions', () => {
   it('accepts root-owned sticky temp ancestors, safe 0755 run ancestry, 0644 Run JSON, and private authorities', () => {
     const f = fixture();

@@ -279,6 +279,13 @@ describe('CLI command layer', () => {
       process.env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH = path.join(dir, 'unrelated-admission.lock');
       await assert.rejects(main(['run', 'transition', rejectedRun.id, 'start']), /TACHIKO_DISPATCH_ADMISSION_LOCK_PATH must resolve to the canonical/);
       assert.deepEqual(runShowCommand(store, rejectedRun.id), before, 'divergent admission-lock alias is rejected before Run write');
+
+      const danglingAlias = path.join(dir, 'dangling-lock-alias');
+      symlinkSync(path.join(dir, 'missing-lock'), danglingAlias);
+      process.env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH = danglingAlias;
+      await assert.rejects(main(['run', 'transition', rejectedRun.id, 'start']), (error: unknown) =>
+        typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT');
+      assert.deepEqual(runShowCommand(store, rejectedRun.id), before, 'an unresolved alias cannot admit a Run transition');
     } finally {
       Object.defineProperty(os, 'userInfo', { configurable: true, value: originalUserInfo });
       for (const [name, value] of Object.entries(previousEnv)) {
@@ -3818,6 +3825,59 @@ describe('CLI end-to-end across processes', () => {
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('production CLI reobserves an admission lock removed immediately before physical resolution', () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-cli-lock-observation-'));
+    const accountHome = path.join(dir, 'account-home');
+    const dispatch = path.join(accountHome, '.tachiko-conductor', 'dispatch');
+    const admissionLock = path.join(dispatch, 'once.lock.admission');
+    const marker = path.join(dir, 'interleaving-observed');
+    const runs = path.join(dir, 'runs');
+    mkdirSync(dispatch, { recursive: true, mode: 0o700 });
+    writeFileSync(admissionLock, '{}\n', { mode: 0o600 });
+    const store = new JsonFileStore({ dir: runs });
+    const run = createRun(TARGET, T0, 'lock-observation-race');
+    store.create(run);
+    const preload = path.join(dir, 'path-observation-preload.mjs');
+    writeFileSync(preload, [
+      "import fs from 'node:fs';",
+      "import os from 'node:os';",
+      "import path from 'node:path';",
+      'const originalUserInfo = os.userInfo;',
+      'const originalRealpath = fs.realpathSync.native;',
+      'let removed = false;',
+      'os.userInfo = (...args) => ({ ...originalUserInfo(...args), homedir: process.env.TACHIKO_TEST_ACCOUNT_HOME });',
+      'fs.realpathSync.native = (...args) => {',
+      '  if (!removed && path.resolve(String(args[0])) === process.env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH) {',
+      '    fs.unlinkSync(process.env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH);',
+      '    removed = true;',
+      "    fs.writeFileSync(process.env.TACHIKO_TEST_OBSERVATION_MARKER, 'removed');",
+      '  }',
+      '  return originalRealpath(...args);',
+      '};',
+      "process.once('exit', () => { os.userInfo = originalUserInfo; fs.realpathSync.native = originalRealpath; });",
+      '',
+    ].join('\n'));
+    try {
+      const result = spawnSync(process.execPath, ['--import', preload, '--import', 'tsx', path.join(REPO_ROOT, 'src/cli.ts'), 'run', 'transition', run.id, 'start'], {
+        cwd: REPO_ROOT,
+        env: {
+          ...process.env,
+          TACHIKO_TEST_ACCOUNT_HOME: accountHome,
+          TACHIKO_TEST_OBSERVATION_MARKER: marker,
+          TACHIKO_DATA_DIR: runs,
+          TACHIKO_MISSION_ADMISSION_PATH: path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'registry.json'),
+          TACHIKO_DISPATCH_LOCK_PATH: path.join(dispatch, 'once.lock'),
+          TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: admissionLock,
+        },
+        encoding: 'utf8',
+      });
+      assert.equal(result.status, 0, JSON.stringify({ status: result.status, stdout: result.stdout, stderr: result.stderr }));
+      assert.equal(readFileSync(marker, 'utf8'), 'removed', 'the lock disappearance occurred at the realpath boundary');
+      assert.equal(runShowCommand(store, run.id).state, 'IMPLEMENTING');
+      assert.equal(existsSync(admissionLock), false, 'the subsequently acquired admission lock was released');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('production direct CLI serializes concurrent lookup, profile validation, READY create, and capacity reservation', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-direct-cli-admission-'));
     const accountHome = path.join(dir, 'account-home');
@@ -3862,8 +3922,8 @@ describe('CLI end-to-end across processes', () => {
       assert.equal(holder.status, 0, holder.stderr);
       const args = ['run', 'acme/widgets#42', '--execution-profile', 'standard', '--repair-task-shape-authority', '{"revision":"test-shape-v1","shape":"bounded"}'];
       const callers = await Promise.all([invoke(args), invoke(args)]);
-      assert.deepEqual(callers.map((result) => result.status), [1, 1]);
-      assert.ok(callers.every((result) => /waiting for mission admission capacity/.test(result.stderr)));
+      assert.deepEqual(callers.map((result) => result.status), [1, 1], JSON.stringify(callers));
+      assert.ok(callers.every((result) => /waiting for mission admission capacity/.test(result.stderr)), JSON.stringify(callers));
       const listing = await invoke(['run', 'list']);
       assert.equal(listing.status, 0, listing.stderr);
       const rows = listing.stdout.trim().split('\n').filter(Boolean);
