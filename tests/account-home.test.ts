@@ -50,14 +50,15 @@ function withPathObservations<T>(
   observers: { readonly realpath?: typeof realpathSync.native; readonly lstat?: typeof fs.lstatSync },
   operation: () => T,
 ): T {
+  const mutableFs = fs as { lstatSync: typeof fs.lstatSync };
   const originalRealpath = realpathSync.native;
-  const originalLstat = fs.lstatSync;
+  const originalLstat = mutableFs.lstatSync;
   if (observers.realpath !== undefined) realpathSync.native = observers.realpath;
-  if (observers.lstat !== undefined) fs.lstatSync = observers.lstat;
+  if (observers.lstat !== undefined) mutableFs.lstatSync = observers.lstat;
   syncBuiltinESMExports();
   try { return operation(); } finally {
     realpathSync.native = originalRealpath;
-    fs.lstatSync = originalLstat;
+    mutableFs.lstatSync = originalLstat;
     syncBuiltinESMExports();
   }
 }
