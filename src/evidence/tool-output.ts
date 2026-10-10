@@ -225,13 +225,25 @@ function assertPositiveInteger(value: number, label: string): void {
 
 const MAX_DATE_TIME = 8.64e15;
 
-class ToolOutputRetentionDeadlineError extends Error {}
+class ToolOutputClockError extends Error {}
+class ToolOutputRetentionDeadlineError extends ToolOutputClockError {}
+
+function readStoreClock(now: () => Date): Date {
+  let sampled: unknown;
+  try { sampled = now(); }
+  catch { throw new ToolOutputClockError('Tool-output store clock must return a valid date.'); }
+  let milliseconds = Number.NaN;
+  try {
+    if (sampled instanceof Date) milliseconds = Date.prototype.getTime.call(sampled);
+  } catch { /* a Date-shaped proxy without a valid Date slot is not a clock value */ }
+  if (!Number.isFinite(milliseconds) || Math.abs(milliseconds) > MAX_DATE_TIME) {
+    throw new ToolOutputClockError('Tool-output store clock must return a valid date.');
+  }
+  return new Date(milliseconds);
+}
 
 function retentionDeadline(now: () => Date, retentionMs: number): { readonly closedAt: string; readonly retainedUntil: string } {
-  let clock: Date;
-  try { clock = now(); }
-  catch { throw new ToolOutputRetentionDeadlineError('Tool-output store clock must return a valid date for its retention deadline.'); }
-  const clockMs = clock instanceof Date ? clock.getTime() : Number.NaN;
+  const clockMs = readStoreClock(now).getTime();
   const deadlineMs = clockMs + retentionMs;
   if (!Number.isFinite(clockMs) || Math.abs(clockMs) > MAX_DATE_TIME || !Number.isFinite(deadlineMs) || Math.abs(deadlineMs) > MAX_DATE_TIME) {
     throw new ToolOutputRetentionDeadlineError('Tool-output retention deadline must be representable as a valid date.');
@@ -690,10 +702,38 @@ function createPinnedEvidenceOperationFence(
 function isToolOutputArtifactFileIdentity(value: unknown): value is ToolOutputArtifactFileIdentity {
   if (typeof value !== 'object' || value === null) return false;
   const identity = value as Record<string, unknown>;
+  if (!hasOnlyKeys(identity, ['stdout', 'stderr'])) return false;
   const validPart = (part: unknown): boolean => typeof part === 'object' && part !== null &&
+    hasOnlyKeys(part, ['dev', 'ino']) &&
     typeof (part as Record<string, unknown>).dev === 'string' && /^\d+$/.test((part as Record<string, unknown>).dev as string) &&
     typeof (part as Record<string, unknown>).ino === 'string' && /^\d+$/.test((part as Record<string, unknown>).ino as string);
   return validPart(identity.stdout) && validPart(identity.stderr);
+}
+
+function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
+  const allowed = new Set(allowedKeys);
+  return !hasCustomToJSON(value) && Reflect.ownKeys(value).every((key) => typeof key === 'string' && allowed.has(key));
+}
+
+function hasCustomToJSON(value: object): boolean {
+  let current: object | null = value;
+  while (current !== null) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, 'toJSON');
+    if (descriptor !== undefined) return typeof descriptor.value === 'function' || descriptor.get !== undefined;
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  return false;
+}
+
+function hasOnlyStringArrayItems(value: unknown): value is readonly string[] {
+  if (!Array.isArray(value) || hasCustomToJSON(value)) return false;
+  const allowedKeys = Reflect.ownKeys(value).every((key) => key === 'length' || (typeof key === 'string' &&
+    /^(0|[1-9]\d*)$/.test(key) && Number(key) < value.length));
+  if (!allowedKeys) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(value, index) || typeof value[index] !== 'string') return false;
+  }
+  return true;
 }
 
 function sameToolOutputArtifactFileIdentity(left: unknown, right: ToolOutputArtifactFileIdentity): boolean {
@@ -1075,18 +1115,21 @@ export function searchToolOutput(
 export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelope {
   if (typeof value !== 'object' || value === null) return false;
   const envelope = value as Record<string, unknown>;
+  if (!hasOnlyKeys(envelope, ['version', 'outcome', 'exitCode', 'readBytes', 'summary', 'stdout', 'stderr',
+    'diagnostics', 'artifact', 'overflow'])) return false;
   if (envelope.version !== TOOL_OUTPUT_CONTRACT_VERSION ||
       !['passed', 'failed', 'timed_out', 'cancelled', 'unknown'].includes(envelope.outcome as string) ||
       (envelope.exitCode !== null && (!Number.isInteger(envelope.exitCode) || typeof envelope.exitCode !== 'number')) ||
       typeof envelope.readBytes !== 'number' || !Number.isSafeInteger(envelope.readBytes) || envelope.readBytes < 1 || envelope.readBytes > TOOL_OUTPUT_POLICY_MAXIMA.readBytes ||
-      typeof envelope.summary !== 'string' || !Array.isArray(envelope.diagnostics) ||
-      !envelope.diagnostics.every((item) => typeof item === 'string')) return false;
+      typeof envelope.summary !== 'string' || !hasOnlyStringArrayItems(envelope.diagnostics)) return false;
   if (!isToolOutputStream(envelope.stdout) || !isToolOutputStream(envelope.stderr)) return false;
   if (!isToolOutputArtifact(envelope.artifact)) return false;
   const overflow = envelope.overflow;
   if (typeof overflow !== 'object' || overflow === null) return false;
   const overflowRecord = overflow as Record<string, unknown>;
-  if (typeof overflowRecord.truncated !== 'boolean' || typeof overflowRecord.capture !== 'boolean' || typeof overflowRecord.summary !== 'boolean' ||
+  if (!hasOnlyKeys(overflowRecord, ['truncated', 'capture', 'summary', 'diagnostics', 'stdout', 'stderr', 'totalBytes',
+    'retainedBytes', 'omittedBytes', 'previewLimitBytes', 'diagnosticLimitBytes', 'diagnosticLimitLines']) ||
+    typeof overflowRecord.truncated !== 'boolean' || typeof overflowRecord.capture !== 'boolean' || typeof overflowRecord.summary !== 'boolean' ||
     typeof overflowRecord.diagnostics !== 'boolean' || typeof overflowRecord.stdout !== 'boolean' || typeof overflowRecord.stderr !== 'boolean' ||
     ![overflowRecord.totalBytes, overflowRecord.retainedBytes, overflowRecord.omittedBytes, overflowRecord.previewLimitBytes,
       overflowRecord.diagnosticLimitBytes, overflowRecord.diagnosticLimitLines]
@@ -1129,7 +1172,8 @@ export function isToolOutputEnvelope(value: unknown): value is ToolOutputEnvelop
 function isToolOutputStream(value: unknown): value is ToolOutputStream {
   if (typeof value !== 'object' || value === null) return false;
   const streamValue = value as Record<string, unknown>;
-  return typeof streamValue.bytes === 'number' && Number.isSafeInteger(streamValue.bytes) && streamValue.bytes >= 0 &&
+  return hasOnlyKeys(streamValue, ['bytes', 'preview', 'previewBytes', 'truncated']) &&
+    typeof streamValue.bytes === 'number' && Number.isSafeInteger(streamValue.bytes) && streamValue.bytes >= 0 &&
     typeof streamValue.preview === 'string' && typeof streamValue.previewBytes === 'number' &&
     Number.isSafeInteger(streamValue.previewBytes) && streamValue.previewBytes >= 0 &&
     typeof streamValue.truncated === 'boolean';
@@ -1138,7 +1182,8 @@ function isToolOutputStream(value: unknown): value is ToolOutputStream {
 function isToolOutputArtifact(value: unknown): value is ToolOutputArtifactReference {
   if (typeof value !== 'object' || value === null) return false;
   const artifact = value as Record<string, unknown>;
-  return artifact.kind === 'tool-output' && typeof artifact.id === 'string' && artifact.id.trim() !== '' &&
+  return hasOnlyKeys(artifact, ['kind', 'id', 'stdoutBytes', 'stderrBytes', 'totalBytes', 'sha256', 'fileIdentity',
+    'operationId', 'retainedUntil']) && artifact.kind === 'tool-output' && typeof artifact.id === 'string' && artifact.id.trim() !== '' &&
     [artifact.stdoutBytes, artifact.stderrBytes, artifact.totalBytes].every((item) =>
       typeof item === 'number' && Number.isSafeInteger(item) && item >= 0) &&
     typeof artifact.sha256 === 'string' && /^[0-9a-f]{64}$/.test(artifact.sha256) &&
@@ -1343,7 +1388,7 @@ export class FileToolOutputStore implements ToolOutputStore {
           captureState = 'finished';
           return { ...summary, artifact };
         } catch (error) {
-          if (error instanceof ToolOutputRetentionDeadlineError) {
+          if (error instanceof ToolOutputClockError) {
             try { operation.abort(); captureState = 'aborted'; }
             catch { captureState = 'failed'; }
             throw error;
@@ -1552,7 +1597,7 @@ export class FileToolOutputStore implements ToolOutputStore {
           return;
         }
         operationState = 'abort-pending';
-        abortTimestamp ??= this.now().toISOString();
+        abortTimestamp ??= readStoreClock(this.now).toISOString();
         let cleanupFailed = false;
         let firstFailure: unknown;
         for (const writer of allWriters.keys()) {
@@ -1642,7 +1687,7 @@ export class FileToolOutputStore implements ToolOutputStore {
     }
     const lockPath = path.join(this.operationsDir, `${operationId}.lock`);
     const closedSnapshot = JSON.parse(JSON.stringify(initialMetadata)) as Record<string, unknown>;
-    const releasedAt = this.now().toISOString();
+    const releasedAt = readStoreClock(this.now).toISOString();
     const releasedSnapshot: Record<string, unknown> = { ...closedSnapshot, state: 'released', releasedAt };
     const ownerAcquisition: EvidenceOwnerAcquisition = { phase: 'acquiring' };
     let metadataDurable = false;
@@ -2131,10 +2176,22 @@ export class FileToolOutputStore implements ToolOutputStore {
             if (!validOperationMetadata(metadata, id, slot) || metadata.ownerNonce !== metadataOwnerNonce) {
               throw new Error('Cleanup operation metadata changed before tombstone publication.');
             }
-            if (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) ||
-                Date.parse(metadata.retainedUntil) > this.now().getTime())) {
-              state.phase = 'release-only';
-              return resume(budget);
+            if (metadata.state === 'closed') {
+              if (!isCanonicalTimestamp(metadata.retainedUntil)) {
+                state.phase = 'release-only';
+                return resume(budget);
+              }
+              let nowMs: number;
+              try { nowMs = readStoreClock(this.now).getTime(); }
+              catch (error) {
+                if (!(error instanceof ToolOutputClockError)) throw error;
+                state.phase = 'release-only';
+                return resume(budget);
+              }
+              if (Date.parse(metadata.retainedUntil) > nowMs) {
+                state.phase = 'release-only';
+                return resume(budget);
+              }
             }
             const ids = freezeActiveArtifacts(metadata);
             if (frozenTarget !== undefined && !sameIds(frozenTarget.toIds, ids)) {
@@ -2292,7 +2349,7 @@ export class FileToolOutputStore implements ToolOutputStore {
             if (!validOperationMetadata(metadata, slotRecord.id, slot)) {
               protectedCount += 1; continue;
             }
-            if (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) || Date.parse(metadata.retainedUntil) > this.now().getTime())) {
+            if (metadata.state === 'closed' && (!isCanonicalTimestamp(metadata.retainedUntil) || Date.parse(metadata.retainedUntil) > readStoreClock(this.now).getTime())) {
               protectedCount += 1; continue;
             }
             if (metadata.state === 'released' && !isCanonicalTimestamp(metadata.releasedAt)) {
@@ -2482,7 +2539,7 @@ export class FileToolOutputStore implements ToolOutputStore {
       throw new Error(`Tool-output artifact ${referenceValue.id} has no committed retention authority.`);
     }
     const until = Date.parse(referenceValue.retainedUntil);
-    if (!Number.isFinite(until) || this.now().getTime() >= until) throw new Error(`Tool-output artifact ${referenceValue.id} is expired.`);
+    if (!Number.isFinite(until) || readStoreClock(this.now).getTime() >= until) throw new Error(`Tool-output artifact ${referenceValue.id} is expired.`);
     if (!isToolOutputArtifactFileIdentity(referenceValue.fileIdentity)) throw new Error(`Tool-output artifact ${referenceValue.id} has no file identity.`);
     const fileIdentity = referenceValue.fileIdentity;
     if (!/^[0-9a-f-]{36}$/.test(referenceValue.operationId)) throw new Error('Invalid tool-output operation id.');

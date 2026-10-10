@@ -1228,6 +1228,9 @@ describe('JsonFileStore — persistence round-trips', () => {
     const { store, dir } = tempStore();
     store.create(validRun);
     const runPath = path.join(dir, `${validRun.id}.json`);
+    const projectionPath = operationalProjectionPath(dir, validRun.id);
+    const originalRunBytes = readFileSync(runPath, 'utf8');
+    const originalProjectionBytes = readFileSync(projectionPath, 'utf8');
     assert.equal(isToolOutputEnvelope(store.read(validRun.id)?.validationResult?.local.commands[0]?.output), true,
       'a legitimate bounded envelope survives Run creation and readback');
 
@@ -1242,6 +1245,63 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
       'CAS rejects a corrupt existing Run before comparing or writing');
     assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS leaves the original raw bytes untouched');
+
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    class InheritedEnvelopeSerializer {
+      constructor(value: typeof output) { Object.assign(this, value); }
+      toJSON() { return { ...this, rawTranscript }; }
+    }
+    const diagnosticsWithSerializer = [...output.diagnostics];
+    Object.defineProperty(diagnosticsWithSerializer, 'toJSON', { value: () => [...diagnosticsWithSerializer, rawTranscript] });
+    const serializerCases: ReadonlyArray<{ readonly label: string; readonly output: typeof output }> = [
+      { label: 'unknown own envelope field', output: { ...output, rawTranscript } as unknown as typeof output },
+      { label: 'inherited envelope serializer', output: new InheritedEnvelopeSerializer(output) as unknown as typeof output },
+      { label: 'own nonenumerable diagnostics serializer', output: { ...output, diagnostics: diagnosticsWithSerializer } },
+    ];
+    for (const candidate of serializerCases) {
+      const candidateValidation = {
+        ...validation,
+        local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: candidate.output }] },
+      };
+      assert.equal(isToolOutputEnvelope(candidate.output), false, `${candidate.label} is rejected by the envelope guard`);
+      assert.equal(isValidationResultCoherent(candidateValidation), false,
+        `${candidate.label} is rejected as validation evidence`);
+      assert.throws(() => applyTransition(validating, {
+        type: 'validation_passed', validationResult: candidateValidation,
+        pullRequest: { number: 7, headSha },
+      }, T0), /coherent|conflicts/, `transition refuses ${candidate.label}`);
+      const candidateRun = { ...validRun, validationResult: candidateValidation };
+      const candidateBytes = JSON.stringify(candidateRun);
+      assert.ok(candidateBytes.includes(rawTranscript), `${candidate.label} would serialize the unbounded transcript`);
+
+      const { store: rejectedCreateStore, dir: rejectedCreateDir } = tempStore();
+      assert.throws(() => rejectedCreateStore.create(candidateRun), /invalid bounded validation output payload/,
+        `create refuses ${candidate.label} before persistence`);
+      assert.equal(existsSync(path.join(rejectedCreateDir, `${validRun.id}.json`)), false,
+        `${candidate.label} create leaves no authoritative Run`);
+      assert.equal(existsSync(operationalProjectionPath(rejectedCreateDir, validRun.id)), false,
+        `${candidate.label} create leaves no operational projection`);
+
+      writeFileSync(runPath, originalRunBytes, 'utf8');
+      assert.throws(() => store.update(candidateRun), /invalid bounded validation output payload/,
+        `update refuses ${candidate.label} before mutation`);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidate.label} update preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} update preserves projection bytes`);
+      assert.throws(() => store.updateIfUnchanged!(validRun, candidateRun), /invalid bounded validation output payload/,
+        `CAS refuses ${candidate.label} before mutation`);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidate.label} CAS preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} CAS preserves projection bytes`);
+
+      writeFileSync(runPath, candidateBytes, 'utf8');
+      assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), candidateBytes, `${candidate.label} rejected read preserves raw bytes`);
+      assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), candidateBytes, `${candidate.label} rejected CAS preserves raw bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} corrupt read/CAS leaves operational projection unchanged`);
+    }
 
     const falseTruncatedOutput = structuredClone(output) as any;
     falseTruncatedOutput.stdout.truncated = false;
@@ -1391,6 +1451,85 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
       'CAS rejects malformed persisted fallback evidence before writing');
     assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS preserves the malformed raw bytes');
+  });
+
+  it('rejects unbounded own fields in partial fallback previews before persisted Run read or CAS', () => {
+    const headSha = 'fallback-preview-unknown-payload-head';
+    const base = validationPassed(headSha);
+    const preview = {
+      stdout: { bytes: 1, preview: 'x', previewBytes: 1, truncated: false },
+      stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+      diagnostics: [] as string[], diagnosticsTruncated: false,
+    };
+    const withPreview = (captureStatus: 'partial' | 'unavailable', capturePreview = preview) => ({
+      ...base,
+      local: { ...base.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus, capturePreview }] },
+    });
+    for (const status of ['partial', 'unavailable'] as const) {
+      assert.equal(isValidationResultCoherent(withPreview(status)), true,
+        `${status} capture keeps valid bounded preview fields`);
+      assert.equal(isValidationResultCoherent({ ...base,
+        local: { ...base.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+          exitCode: 0, durationMs: 1, captureStatus: status }] } }), true,
+      `${status} capture still permits legacy evidence without an optional preview`);
+    }
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    const diagnosticsWithSerializer = [...preview.diagnostics];
+    Object.defineProperty(diagnosticsWithSerializer, 'toJSON', { value: () => [...diagnosticsWithSerializer, rawTranscript] });
+    const invalidPreviews = [
+      { ...preview, rawTranscript },
+      { ...preview, stdout: { ...preview.stdout, rawTranscript } },
+      { ...preview, stderr: { ...preview.stderr, rawTranscript } },
+      { ...preview, diagnostics: diagnosticsWithSerializer },
+    ];
+    for (const invalidPreview of invalidPreviews) {
+      assert.equal(isValidationResultCoherent(withPreview('partial', invalidPreview)), false,
+        'partial preview rejects unknown raw payload at the preview and nested stream levels');
+    }
+
+    const validValidation = withPreview('partial');
+    const implementing = applyTransition(newRun('fallback-preview-unknown-payload'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    const unknownPayloadValidation = withPreview('partial', invalidPreviews[3]!);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: unknownPayloadValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/, 'transition refuses unbounded partial-preview payload');
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const projectionPath = operationalProjectionPath(dir, validRun.id);
+    const originalRunBytes = readFileSync(runPath, 'utf8');
+    const originalProjectionBytes = readFileSync(projectionPath, 'utf8');
+    const malformedRun = { ...validRun, validationResult: unknownPayloadValidation };
+    const malformedBytes = JSON.stringify(malformedRun);
+    const { store: rejectedCreateStore, dir: rejectedCreateDir } = tempStore();
+    assert.throws(() => rejectedCreateStore.create(malformedRun), /invalid bounded validation output payload/);
+    assert.equal(existsSync(path.join(rejectedCreateDir, `${validRun.id}.json`)), false,
+      'invalid partial preview creates no authoritative Run');
+    assert.equal(existsSync(operationalProjectionPath(rejectedCreateDir, validRun.id)), false,
+      'invalid partial preview creates no operational projection');
+    assert.throws(() => store.update(malformedRun), /invalid bounded validation output payload/);
+    assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, 'invalid preview update preserves Run bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes, 'invalid preview update preserves projection bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, malformedRun), /invalid bounded validation output payload/);
+    assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, 'invalid preview CAS preserves Run bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes, 'invalid preview CAS preserves projection bytes');
+    writeFileSync(runPath, malformedBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), malformedBytes, 'rejected read preserves original bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects malformed persisted preview before writing');
+    assert.equal(readFileSync(runPath, 'utf8'), malformedBytes, 'rejected CAS preserves original bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+      'rejected malformed preview read/CAS leaves projection unchanged');
   });
 
   it('bounds partial and unavailable fallback stream previews to the shared policy before Run admission', () => {

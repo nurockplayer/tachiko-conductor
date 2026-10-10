@@ -51,6 +51,52 @@ describe('bounded tool output contract', () => {
     }
   });
 
+  it('rejects unknown envelope payload fields while retaining declared optional artifact metadata', () => {
+    const base = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'ok', stderr: '',
+      store: new InMemoryToolOutputStore(), policy });
+    const withIdentity = { ...base, artifact: { ...base.artifact, fileIdentity: {
+      stdout: { dev: '1', ino: '2' }, stderr: { dev: '3', ino: '4' },
+    } } };
+    assert.equal(isToolOutputEnvelope(withIdentity), true, 'declared optional file identity remains supported');
+    assert.equal(isToolOutputEnvelope({ ...base, artifact: { ...base.artifact,
+      operationId: '00000000-0000-4000-8000-000000000000', retainedUntil: '2000-01-01T00:00:00.000Z',
+    } }), true, 'canonical past retention metadata remains supported');
+
+    const hiddenOwnField = { ...base };
+    Object.defineProperty(hiddenOwnField, 'rawTranscript', { value: 'unbounded' });
+    const symbolField = { ...base, [Symbol('rawTranscript')]: 'unbounded' };
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    class InheritedSerializer {
+      constructor(value: typeof base) { Object.assign(this, value); }
+      toJSON() { return { ...this, rawTranscript }; }
+    }
+    const inheritedSerializer = new InheritedSerializer(base);
+    const diagnosticsWithSerializer = [...base.diagnostics];
+    Object.defineProperty(diagnosticsWithSerializer, 'toJSON', { value: () => [...diagnosticsWithSerializer, rawTranscript] });
+    const invalid = [
+      { ...base, rawTranscript: 'unbounded' },
+      hiddenOwnField,
+      symbolField,
+      inheritedSerializer,
+      { ...base, diagnostics: diagnosticsWithSerializer },
+      { ...base, stdout: { ...base.stdout, rawTranscript: 'unbounded' } },
+      { ...base, stderr: { ...base.stderr, rawTranscript: 'unbounded' } },
+      { ...base, overflow: { ...base.overflow, rawTranscript: 'unbounded' } },
+      { ...base, artifact: { ...base.artifact, rawTranscript: 'unbounded' } },
+      { ...withIdentity, artifact: { ...withIdentity.artifact, fileIdentity: {
+        ...withIdentity.artifact.fileIdentity, rawTranscript: 'unbounded',
+      } } },
+      { ...withIdentity, artifact: { ...withIdentity.artifact, fileIdentity: {
+        ...withIdentity.artifact.fileIdentity, stdout: { ...withIdentity.artifact.fileIdentity.stdout, rawTranscript: 'unbounded' },
+      } } },
+      { ...withIdentity, artifact: { ...withIdentity.artifact, fileIdentity: {
+        ...withIdentity.artifact.fileIdentity, stderr: { ...withIdentity.artifact.fileIdentity.stderr, rawTranscript: 'unbounded' },
+      } } },
+    ];
+    for (const candidate of invalid) assert.equal(isToolOutputEnvelope(candidate), false,
+      'unknown own payload fields at every declared envelope level are rejected');
+  });
+
   it('admits one cumulative UTF-8 operation quota across channels and writers without refunds', () => {
     const exactRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-quota-exact-'));
     const faultRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-capture-quota-fault-'));
@@ -1055,11 +1101,15 @@ describe('UTF-8 tool output ranges', () => {
           assert.equal(existsSync(absentRoot), false, 'an invalid injected clock is refused before root creation');
 
           const maxDateTime = 8.64e15;
+          let boundaryNow = new Date(maxDateTime - 1_000);
           const atBoundary = new FileToolOutputStore(path.join(directory, 'boundary'), {
-            capacity: 1, retentionMs: 1_000, now: () => new Date(maxDateTime - 1_000),
+            capacity: 1, retentionMs: 1_000, now: () => boundaryNow,
           });
           const boundaryReference = atBoundary.save({ stdout: 'upper date boundary', stderr: '' });
           assert.equal(boundaryReference.retainedUntil, new Date(maxDateTime).toISOString(), 'the inclusive ECMAScript date boundary remains valid');
+          boundaryNow = new Date(maxDateTime);
+          assert.throws(() => atBoundary.read(boundaryReference, { channel: 'stdout' }), /expired/i,
+            'a valid upper-boundary clock is evaluated as a date without requiring another retention addition');
           assert.throws(() => new FileToolOutputStore(path.join(directory, 'past-boundary'), {
             retentionMs: 1_001, now: () => new Date(maxDateTime - 1_000),
           }), /retention deadline.*representable/i);
@@ -1121,6 +1171,125 @@ describe('UTF-8 tool output ranges', () => {
             reusable.abort();
           } finally { rmSync(directory, { recursive: true, force: true }); }
         }
+      });
+
+      it('file: rejects invalid store clocks for readers and release before metadata mutation', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-invalid-clock-'));
+        try {
+          const start = new Date('2030-01-01T00:00:00.000Z');
+          const invalidClock = (kind: 'nan' | 'non-date' | 'throwing'): (() => Date) => () => {
+            if (kind === 'nan') return new Date(Number.NaN);
+            if (kind === 'non-date') return ({ getTime: () => start.getTime() } as unknown as Date);
+            throw new Error('injected store clock failure');
+          };
+          for (const kind of ['nan', 'non-date', 'throwing'] as const) {
+            const absentRoot = path.join(directory, `invalid-constructor-${kind}`);
+            assert.throws(() => new FileToolOutputStore(absentRoot, { now: invalidClock(kind) }), /store clock.*valid date/i);
+            assert.equal(existsSync(absentRoot), false, `${kind} constructor clock is refused before root creation`);
+
+            let fault: 'nan' | 'non-date' | 'throwing' | undefined;
+            let failAt = -1;
+            let calls = 0;
+            let validNow = start;
+            const now = (): Date => {
+              const call = calls++;
+              if (fault !== undefined && call === failAt) return invalidClock(fault)();
+              return validNow;
+            };
+            const root = path.join(directory, `operations-${kind}`);
+            const store = new FileToolOutputStore(root, { capacity: 1, retentionMs: 1_000, now });
+            const reference = store.save({ stdout: 'clock-controlled', stderr: '' });
+            validNow = new Date(start.getTime() + 1_001);
+            calls = 0;
+            assert.throws(() => store.read(reference, { channel: 'stdout' }), /expired/i, 'a valid expired timestamp remains expired');
+            calls = 0;
+            assert.throws(() => store.search(reference, { query: 'clock' }), /expired/i, 'a valid expired search remains refused');
+            validNow = start;
+            calls = 0; fault = kind; failAt = 0;
+            assert.throws(() => store.read(reference, { channel: 'stdout' }), /store clock.*valid date/i, `${kind} read clock fails closed`);
+            calls = 0;
+            assert.throws(() => store.search(reference, { query: 'clock' }), /store clock.*valid date/i, `${kind} search clock fails closed`);
+
+            calls = 0; failAt = 1;
+            assert.throws(() => store.release(reference), /store clock.*valid date/i, `${kind} release clock fails before mutation`);
+            const metadataPath = path.join(root, 'operations', `${reference.operationId}.json`);
+            const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { readonly state: string; readonly releasedAt?: string };
+            assert.equal(metadata.state, 'closed');
+            assert.equal(metadata.releasedAt, undefined, 'failed release does not publish released metadata');
+
+            fault = undefined;
+            assert.equal(store.read(reference, { channel: 'stdout' }).text, 'clock-controlled');
+            store.release(reference);
+          }
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: protects closed evidence when cleanup clocks are invalid at either expiry check', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-invalid-cleanup-clock-'));
+        try {
+          const start = Date.parse('2030-01-01T00:00:00.000Z');
+          for (const mode of ['initial-invalid', 'recheck-invalid'] as const) {
+            let calls = 0;
+            let clock: () => Date = () => new Date(start);
+            const root = path.join(directory, mode);
+            const store = new FileToolOutputStore(root, { capacity: 1, retentionMs: 1_000, now: () => { calls += 1; return clock(); } });
+            const reference = store.save({ stdout: 'must-survive-invalid-clock', stderr: '' });
+            calls = 0;
+            clock = mode === 'initial-invalid'
+              ? () => new Date(Number.NaN)
+              : () => calls === 1 ? new Date(start + 1_001) : new Date(Number.NaN);
+
+            const cleanup = store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+            assert.ok(cleanup.protected >= 1, `${mode} reports the operation protected`);
+            assert.equal(readdirSync(root).filter((name) => /\.(stdout|stderr)$/.test(name)).length, 2,
+              `${mode} keeps both raw streams`);
+            const metadataPath = path.join(root, 'operations', `${reference.operationId}.json`);
+            const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { readonly state: string };
+            assert.equal(metadata.state, 'closed', `${mode} does not publish a cleanup tombstone`);
+            assert.ok(readdirSync(path.join(root, 'operations')).some((name) => /^slot-/.test(name)), `${mode} keeps the slot record`);
+            clock = () => new Date(start);
+            assert.equal(store.read(reference, { channel: 'stdout' }).text, 'must-survive-invalid-clock');
+          }
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
+      it('file: retries standalone abort after a sampled close clock is invalid', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-invalid-close-clock-'));
+        try {
+          for (const mode of ['standalone', 'contained'] as const) {
+            let currentClock = new Date('2030-01-01T00:00:00.000Z');
+            const root = path.join(directory, mode);
+            const store = new FileToolOutputStore(root, { capacity: 1, retentionMs: 1_000, now: () => currentClock });
+            const writer = store.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+            if (mode === 'standalone') writer.write('stdout', 'recover after invalid clock');
+            else {
+              const session = new ContainedToolOutputCaptureSession(DEFAULT_TOOL_OUTPUT_POLICY);
+              session.write(writer, 'stdout', 'recover after invalid clock');
+              currentClock = new Date(Number.NaN);
+              const result = session.finish(writer);
+              assert.equal(result.status, 'partial');
+              assert.equal(result.capture, undefined);
+            }
+            if (mode === 'standalone') {
+              currentClock = new Date(Number.NaN);
+              assert.throws(() => writer.finish(), /store clock.*valid date/i);
+            }
+            currentClock = new Date('2030-01-01T00:00:00.000Z');
+            writer.abort?.();
+
+            const operations = path.join(root, 'operations');
+            const operationFile = readdirSync(operations).find((name) => /^[a-f0-9-]{36}\.json$/.test(name))!;
+            const metadata = JSON.parse(readFileSync(path.join(operations, operationFile), 'utf8')) as {
+              readonly state: string; readonly retainedUntil?: string; readonly artifacts?: readonly unknown[];
+            };
+            assert.equal(metadata.state, 'aborted');
+            assert.equal(metadata.retainedUntil, undefined);
+            assert.deepEqual(metadata.artifacts, []);
+            assert.deepEqual(readdirSync(root).filter((name) => /\.(stdout|stderr)$/.test(name)), []);
+            assert.deepEqual(readdirSync(operations).filter((name) => name.endsWith('.lock')), []);
+            store.beginOperation({ kind: 'after-clock-recovery-abort' }).abort();
+          }
+        } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
       it('file: persists finite per-operation retention and releases only the selected operation early', () => {

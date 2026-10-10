@@ -6,7 +6,7 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '..
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetry.js';
-import { isValidationResultCoherent } from '../domain/validation.js';
+import { isKnownBoundedValidationPayloadCoherent, isValidationResultCoherent } from '../domain/validation.js';
 import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
 import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, sameRepairExecutorIdentity, unfinishedBoundRepairAttempt, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
@@ -336,6 +336,12 @@ function assertNoRawProviderOutput(run: Run): void {
   }
 }
 
+function assertNoInvalidBoundedValidationPayload(run: Run): void {
+  if (!isKnownBoundedValidationPayloadCoherent(run.validationResult)) {
+    throw new Error('Refusing to persist an invalid bounded validation output payload.');
+  }
+}
+
 /** Write atomically and durably: sync the private temp before rename and its parent after rename. */
 function serializedJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
@@ -563,6 +569,7 @@ export class JsonFileStore implements RunStore {
   create(run: Run): void {
     this.withMutationLock(run.id, () => {
       assertNoRawProviderOutput(run);
+      assertNoInvalidBoundedValidationPayload(run);
       const filePath = this.filePathFor(run.id);
       this.assertSafeRunFile(filePath);
       if (existsSync(filePath)) {
@@ -583,6 +590,7 @@ export class JsonFileStore implements RunStore {
   update(run: Run): void {
     this.withMutationLock(run.id, () => {
       assertNoRawProviderOutput(run);
+      assertNoInvalidBoundedValidationPayload(run);
       const filePath = this.filePathFor(run.id);
       this.assertSafeRunFile(filePath);
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
@@ -597,6 +605,7 @@ export class JsonFileStore implements RunStore {
     if (expected.id !== next.id) throw new Error('updateIfUnchanged requires expected and next to name the same Run id.');
     return this.withMutationLock(expected.id, () => {
       assertNoRawProviderOutput(next);
+      assertNoInvalidBoundedValidationPayload(next);
       const filePath = this.filePathFor(expected.id);
       this.assertSafeRunFile(filePath);
       const current = readRun(filePath, expected.id);
