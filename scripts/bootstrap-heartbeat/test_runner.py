@@ -339,7 +339,11 @@ class ProviderBuildTest(unittest.TestCase):
             old_mode = stat.S_IMODE(self.module.ROOT.stat().st_mode)
             try:
                 self.module.ROOT.chmod(old_mode | 0o077)
-                with self.assertRaisesRegex(RuntimeError, "snapshot root"):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"(?:unsafe ownership or permissions for heartbeat private path:|"
+                    r"private provider snapshot root ownership or permissions changed)",
+                ):
                     self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
             finally:
                 self.module.ROOT.chmod(old_mode)
