@@ -927,6 +927,33 @@ PR: #7`;
     assert.deepEqual(await mergedAdapter.listPullRequests(TARGET), []);
   });
 
+  for (const body of ['Closes #42', 'See #42.', '']) {
+    it(`rejects a wrong-number Issue PR candidate before association lookup for body ${JSON.stringify(body)}`, async () => {
+      const transport = new RouteTransport()
+        .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+        .queue('repos/acme/widgets/pulls/7', pull(8, HEAD, { body }));
+
+      await assert.rejects(new LiveGitHubAdapter({ transport }).listPullRequests(TARGET), (error: unknown) =>
+        error instanceof GitHubLiveStateError && error.code === 'GH_INVALID_RESPONSE' &&
+        /pull request number 8 does not match the referenced 7/.test(error.message));
+      assert.deepEqual(transport.calls, [
+        { kind: 'paginated', path: 'repos/acme/widgets/issues/42/timeline' },
+        { kind: 'get', path: 'repos/acme/widgets/pulls/7' },
+      ]);
+    });
+  }
+
+  it('retains an exact-number candidate when association remains unknown', async () => {
+    const transport = new RouteTransport()
+      .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])
+      .queue('repos/acme/widgets/pulls/7', pull(7, HEAD, { body: 'See #42.' }))
+      .queueGraphql({ errors: [{ message: 'temporarily unavailable' }] });
+
+    assert.deepEqual(await new LiveGitHubAdapter({ transport }).listPullRequests(TARGET), [
+      { number: 7, headSha: HEAD, baseSha: BASE, state: 'open' },
+    ]);
+  });
+
   it('keeps a genuine open implementation PR associated so it still blocks a second writer', async () => {
     const transport = new RouteTransport()
       .collection('repos/acme/widgets/issues/42/timeline', [crossRef(7)])

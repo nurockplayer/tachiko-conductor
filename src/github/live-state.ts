@@ -266,6 +266,9 @@ export class LiveGitHubAdapter implements GitHubAdapter {
       const path = `repos/${owner}/${repo}/pulls/${number}`;
       const record = asRecord(await this.transport.get(path));
       if (record === null) throw invalid(path, 'pull request is not an object');
+      if (requirePositiveInt(record, 'number', path) !== number) {
+        throw invalid(path, `pull request number ${String(record.number)} does not match the referenced ${number}`);
+      }
       normalizePullState(record, path);
       const association = await this.classifyPullRequestAssociation(owner, repo, target.issueNumber, number, record);
       if (association === 'not_associated') continue;
