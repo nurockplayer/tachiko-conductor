@@ -225,18 +225,20 @@ function assertPositiveInteger(value: number, label: string): void {
 
 const MAX_DATE_TIME = 8.64e15;
 
+class ToolOutputRetentionDeadlineError extends Error {}
+
 function retentionDeadline(now: () => Date, retentionMs: number): { readonly closedAt: string; readonly retainedUntil: string } {
   let clock: Date;
   try { clock = now(); }
-  catch { throw new Error('Tool-output store clock must return a valid date for its retention deadline.'); }
+  catch { throw new ToolOutputRetentionDeadlineError('Tool-output store clock must return a valid date for its retention deadline.'); }
   const clockMs = clock instanceof Date ? clock.getTime() : Number.NaN;
   const deadlineMs = clockMs + retentionMs;
   if (!Number.isFinite(clockMs) || Math.abs(clockMs) > MAX_DATE_TIME || !Number.isFinite(deadlineMs) || Math.abs(deadlineMs) > MAX_DATE_TIME) {
-    throw new Error('Tool-output retention deadline must be representable as a valid date.');
+    throw new ToolOutputRetentionDeadlineError('Tool-output retention deadline must be representable as a valid date.');
   }
   const deadline = new Date(deadlineMs);
   if (!Number.isFinite(deadline.getTime()) || deadline.getTime() !== deadlineMs) {
-    throw new Error('Tool-output retention deadline must be representable as a valid date.');
+    throw new ToolOutputRetentionDeadlineError('Tool-output retention deadline must be representable as a valid date.');
   }
   return { closedAt: new Date(clockMs).toISOString(), retainedUntil: deadline.toISOString() };
 }
@@ -1341,6 +1343,11 @@ export class FileToolOutputStore implements ToolOutputStore {
           captureState = 'finished';
           return { ...summary, artifact };
         } catch (error) {
+          if (error instanceof ToolOutputRetentionDeadlineError) {
+            try { operation.abort(); captureState = 'aborted'; }
+            catch { captureState = 'failed'; }
+            throw error;
+          }
           // close() can fail after an atomic rename. Keep the backing files and
           // operation lock for a safe retry/recovery rather than aborting a
           // reference that may already be committed.
@@ -1350,9 +1357,10 @@ export class FileToolOutputStore implements ToolOutputStore {
       },
       abort: () => {
         if (captureState === 'finished' || captureState === 'aborted' || captureState === 'commit-pending') return;
-        if (writerFinished) return;
         let failure: unknown;
-        try { writer.abort?.(); } catch (error) { failure = error; }
+        if (!writerFinished) {
+          try { writer.abort?.(); } catch (error) { failure = error; }
+        }
         // A failed per-writer disposal must not strand its owning operation.
         // Operation abort retries every prepared writer and records unresolved
         // IDs before releasing ownership; keep the first disposal error as the

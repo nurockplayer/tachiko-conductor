@@ -1082,6 +1082,47 @@ describe('UTF-8 tool output ranges', () => {
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
+      it('file: aborts standalone captures when a close deadline is refused before terminal intent', () => {
+        for (const mode of ['standalone', 'contained'] as const) {
+          const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-output-retention-${mode}-`));
+          try {
+            let now = new Date('2030-01-01T00:00:00.000Z');
+            const root = path.join(directory, 'evidence');
+            const store = new FileToolOutputStore(root, { capacity: 1, retentionMs: 1_000, now: () => now });
+            const writer = store.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+
+            if (mode === 'standalone') {
+              writer.write('stdout', 'standalone retention refusal');
+              now = new Date(8.64e15 - 500);
+              assert.throws(() => writer.finish(), /retention deadline.*representable/i);
+            } else {
+              const session = new ContainedToolOutputCaptureSession(DEFAULT_TOOL_OUTPUT_POLICY);
+              session.write(writer, 'stdout', 'standalone retention refusal');
+              now = new Date(8.64e15 - 500);
+              const result = session.finish(writer);
+              assert.equal(result.status, 'partial');
+              assert.equal(result.capture, undefined, 'a refused deadline cannot publish a reference');
+            }
+
+            const operations = path.join(root, 'operations');
+            const operationFiles = readdirSync(operations).filter((name) => /^[a-f0-9-]{36}\.json$/.test(name));
+            assert.equal(operationFiles.length, 1);
+            const metadata = JSON.parse(readFileSync(path.join(operations, operationFiles[0]!), 'utf8')) as {
+              readonly state: string; readonly retainedUntil?: string; readonly artifacts?: readonly unknown[];
+            };
+            assert.equal(metadata.state, 'aborted', 'standalone cleanup records an abort instead of an invalid closed record');
+            assert.equal(metadata.retainedUntil, undefined);
+            assert.deepEqual(metadata.artifacts, []);
+            assert.deepEqual(readdirSync(root).filter((name) => /\.(stdout|stderr)$/.test(name)), [], 'both raw stream files are removed');
+            assert.deepEqual(readdirSync(operations).filter((name) => name.endsWith('.lock')), [], 'the operation owner is released');
+
+            now = new Date('2030-01-01T00:00:00.000Z');
+            const reusable = store.beginOperation({ kind: 'after-standalone-retention-refusal' });
+            reusable.abort();
+          } finally { rmSync(directory, { recursive: true, force: true }); }
+        }
+      });
+
       it('file: persists finite per-operation retention and releases only the selected operation early', () => {
         const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-release-'));
         try {
@@ -1609,6 +1650,8 @@ describe('UTF-8 tool output ranges', () => {
           standalone.write('stdout', 'standalone-finish-retry');
           assert.throws(() => standalone.finish(), /closed metadata directory fsync EIO/);
           standalone.abort?.();
+          assert.equal(readdirSync(directory).filter((name) => /\.(stdout|stderr)$/.test(name)).length, 2,
+            'a genuine close-pending failure keeps committed bytes while the frozen close is retried');
           const summary = standalone.finish();
           assert.equal(store.read(summary.artifact, { channel: 'stdout' }).text, 'standalone-finish-retry');
           assert.throws(() => standalone.finish(), /finish once/i, 'a committed standalone summary remains one-shot');
