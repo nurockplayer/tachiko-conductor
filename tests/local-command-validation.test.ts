@@ -1,13 +1,17 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync, writeSync as fsWriteSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import * as childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
 import { ConfiguredLocalValidationAdapter, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
+import { FileToolOutputStore, InMemoryToolOutputStore, readToolOutput } from '../src/evidence/tool-output.js';
 import { TARGET } from './helpers.js';
 
 const dirs: string[] = [];
@@ -107,10 +111,11 @@ describe('ConfiguredLocalValidationAdapter', () => {
     ).validate(request());
 
     assert.equal(result.status, 'passed');
-    assert.deepEqual(result.commands, [{
-      commandIndex: 0, executable: process.execPath, outcome: 'passed', exitCode: 0,
-      durationMs: result.commands[0]?.durationMs,
-    }]);
+    assert.equal(result.commands[0]?.commandIndex, 0);
+    assert.equal(result.commands[0]?.executable, process.execPath);
+    assert.equal(result.commands[0]?.outcome, 'passed');
+    assert.equal(result.commands[0]?.exitCode, 0);
+    assert.equal(Object.hasOwn(result.commands[0]!, 'output'), false);
     assert.equal(Object.hasOwn(result.commands[0]!, 'argv'), false);
   });
 
@@ -198,6 +203,138 @@ describe('ConfiguredLocalValidationAdapter', () => {
 
     assert.equal(result.status, 'failed');
     assert.equal(result.commands[0]?.outcome, 'timed_out');
+  });
+
+  it('preserves direct exit truth when inherited pipes hit the deadline and aborts empty capture operations', async () => {
+    const owned = request();
+    const evidenceRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-held-pipes-'));
+    dirs.push(evidenceRoot);
+    const store = new FileToolOutputStore(evidenceRoot, { capacity: 1 });
+    const code = 7;
+    const marker = 'DIRECT-BEFORE-DEADLINE';
+    const script = `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(() => {}, 2500)'], { stdio: 'inherit' }); process.stdout.write(${JSON.stringify(marker)}); setImmediate(() => process.exit(${code}));`;
+    const childApi = createRequire(import.meta.url)('node:child_process') as { spawn: typeof childProcess.spawn };
+    const originalSpawn = childApi.spawn;
+    const originalSetTimeout = globalThis.setTimeout;
+    const originalClearTimeout = globalThis.clearTimeout;
+    let selectedDeadline: (() => void) | undefined;
+    let selectedTimer: ReturnType<typeof setTimeout> | undefined;
+    let observedMarker = '';
+    let observedExit = false;
+    let ready = false;
+    let deliveryQueued = false;
+    let watchdogFired = false;
+    let commandChild: ReturnType<typeof childProcess.spawn> | undefined;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
+    const deliverWhenReady = (): void => {
+      if (ready || deliveryQueued || !observedExit || !observedMarker.includes(marker) || selectedDeadline === undefined) return;
+      // The wrapper's exit listener runs before the adapter's listener. A
+      // setImmediate queues delivery after all listeners on that exit event.
+      deliveryQueued = true;
+      setImmediate(() => {
+        if (ready) return;
+        ready = true;
+        if (selectedTimer !== undefined) originalClearTimeout(selectedTimer);
+        selectedDeadline?.();
+      });
+    };
+    childApi.spawn = ((...args: Parameters<typeof childProcess.spawn>) => {
+      const child = originalSpawn(...args);
+      commandChild = child;
+      child.stdout?.on('data', (chunk: Buffer) => {
+        if (observedMarker.length < marker.length) observedMarker += chunk.toString('utf8').slice(0, marker.length - observedMarker.length);
+        deliverWhenReady();
+      });
+      child.once('exit', () => { observedExit = true; deliverWhenReady(); });
+      return child;
+    }) as typeof childProcess.spawn;
+    syncBuiltinESMExports();
+    globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+      if (delay === 250) {
+        selectedDeadline = () => callback(...args);
+        // Keep a real timer handle so production clearTimeout remains real.
+        selectedTimer = originalSetTimeout(() => undefined, 60_000);
+        watchdog = originalSetTimeout(() => {
+          watchdogFired = true;
+          // Fail-only cleanup: the assertion below rejects this path even
+          // though it delivers the production callback to settle the child.
+          selectedDeadline?.();
+        }, 5_000);
+        return selectedTimer;
+      }
+      return originalSetTimeout(callback, delay, ...args);
+    }) as typeof globalThis.setTimeout;
+    let result;
+    try {
+      result = await new ConfiguredLocalValidationAdapter({
+        ...configuration([process.execPath, '-e', script], 250),
+        commands: [{ argv: [process.execPath, '-e', script], timeoutMs: 250, captureOutput: true }],
+        outputStore: store,
+      }).validate(owned);
+    } finally {
+      globalThis.setTimeout = originalSetTimeout;
+      globalThis.clearTimeout = originalClearTimeout;
+      childApi.spawn = originalSpawn;
+      syncBuiltinESMExports();
+      if (watchdog !== undefined) originalClearTimeout(watchdog);
+      if (selectedTimer !== undefined) originalClearTimeout(selectedTimer);
+      if (!ready && commandChild?.pid !== undefined && process.platform !== 'win32') {
+        try { process.kill(-commandChild.pid, 'SIGKILL'); } catch { /* cleanup only after a failed readiness path */ }
+      }
+    }
+    assert.equal(watchdogFired, false, 'independent real watchdog must not provide the expected transition');
+    assert.equal(ready, true, 'actual parent-side exit and complete marker must precede deadline delivery');
+    assert.equal(result!.status, 'failed');
+    assert.equal(result!.commands[0]?.outcome, 'failed');
+    assert.equal(result!.commands[0]?.exitCode, code);
+    assert.equal(result!.commands[0]?.captureStatus, 'partial', 'forced cleanup cannot claim complete pipe capture');
+    assert.equal(result!.commands[0]?.output, undefined, 'incomplete capture cannot publish an artifact');
+    assert.ok(result!.commands[0]?.capturePreview?.stdout.preview.includes(marker));
+    assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
+
+    const missing = new FileToolOutputStore(path.join(evidenceRoot, 'empty-operation'), { capacity: 1 });
+    const unavailable = await new ConfiguredLocalValidationAdapter({
+      ...configuration([path.join(evidenceRoot, 'missing-command')]),
+      commands: [{ argv: [path.join(evidenceRoot, 'missing-command')], timeoutMs: 1_000, captureOutput: true }],
+      outputStore: missing,
+    }).validate(owned);
+    assert.equal(unavailable.status, 'unknown');
+    const reusable = missing.beginOperation({ kind: 'after-empty-validation-operation' });
+    reusable.abort();
+  });
+
+  it('keeps forced-incomplete capture partial even when a custom writer cannot abort', async () => {
+    const owned = request();
+    const marker = 'CUSTOM-WRITER-FORCED-INCOMPLETE';
+    for (const abortBehavior of ['absent', 'noop', 'throws'] as const) {
+      const backing = new InMemoryToolOutputStore();
+      let finishCalls = 0;
+      const outputStore = {
+        save: backing.save.bind(backing),
+        read: backing.read.bind(backing),
+        search: backing.search.bind(backing),
+        startCapture(policy: Parameters<typeof backing.startCapture>[0]) {
+          const writer = backing.startCapture(policy);
+          return {
+            write: writer.write.bind(writer),
+            finish() { finishCalls += 1; return writer.finish(); },
+            ...(abortBehavior === 'absent' ? {} : { abort: abortBehavior === 'noop' ? () => undefined : () => { throw new Error('abort unavailable'); } }),
+          };
+        },
+      } as NonNullable<LocalValidationConfiguration['outputStore']>;
+      const script = `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3000)'], { stdio: 'inherit' }); process.stdout.write(${JSON.stringify(marker)}); setImmediate(() => process.exit(0));`;
+      const result = await new ConfiguredLocalValidationAdapter({
+        ...configuration([process.execPath, '-e', script], 1_000),
+        commands: [{ argv: [process.execPath, '-e', script], timeoutMs: 1_000, captureOutput: true }],
+        outputStore,
+      }).validate(owned);
+      assert.equal(result.commands[0]?.outcome, 'passed', 'actual direct child exit remains independent of capture cleanup');
+      assert.equal(result.commands[0]?.exitCode, 0);
+      assert.equal(result.commands[0]?.captureStatus, 'partial');
+      assert.equal(result.commands[0]?.output, undefined);
+      assert.ok(result.commands[0]?.capturePreview?.stdout.preview.includes(marker));
+      assert.equal(finishCalls, 0, `${abortBehavior} abort behavior cannot allow writer.finish after forced invalidation`);
+    }
   });
 
   it('runs in an isolated exact-HEAD reconstruction and rejects a wrong checkout', async () => {
@@ -567,6 +704,181 @@ describe('ConfiguredLocalValidationAdapter', () => {
       }).validate({ target: { ...TARGET, repo: 'other' }, headSha: existing.headSha })).status,
       'unknown',
     );
+  });
+
+  it('persists bounded local-command evidence under one validation-owned operation', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-evidence-'));
+    dirs.push(root);
+    const outputStore = new FileToolOutputStore(path.join(root, 'store'));
+    let beforeSpawnCalls = 0;
+    const evidence = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', "process.stdout.write('VALIDATION-MARKER\\n')"]),
+      commands: [{ argv: [process.execPath, '-e', "process.stdout.write('VALIDATION-MARKER\\n')"], timeoutMs: 1_000, captureOutput: true }],
+      outputStore,
+      outputPolicy: { previewBytes: 16, diagnosticBytes: 64, maxDiagnostics: 4, readBytes: 32 },
+    }).validate({ ...owned, runId: 'run-attribution-only', beforeSpawn: () => { beforeSpawnCalls += 1; } });
+
+    const command = evidence.commands[0]!;
+    assert.equal(evidence.status, 'passed');
+    assert.equal(beforeSpawnCalls, 1);
+    assert.equal(command.captureStatus, 'complete');
+    assert.ok(command.output);
+    const artifact = command.output.artifact;
+    assert.ok(artifact.operationId);
+    assert.ok(artifact.retainedUntil);
+    assert.equal(readToolOutput(command.output, outputStore, { channel: 'stdout' }).text, 'VALIDATION-MARKER\n');
+    const operation = JSON.parse(readFileSync(path.join(root, 'store', 'operations', `${artifact.operationId}.json`), 'utf8')) as Record<string, unknown>;
+    assert.equal(operation.state, 'closed');
+    assert.equal(operation.retainedUntil, artifact.retainedUntil);
+    assert.deepEqual(operation.attribution, {
+      kind: 'validation', owner: TARGET.owner, repo: TARGET.repo, issueNumber: TARGET.issueNumber,
+      headSha: owned.headSha, configRevision: 'test-v1', runId: 'run-attribution-only',
+    });
+  });
+
+  it('captures actual child pipe bytes without replacement decoding before validation evidence persistence', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-raw-pipes-'));
+    dirs.push(root);
+    const store = new FileToolOutputStore(path.join(root, 'store'));
+    const stdout = Buffer.from([0x4f, 0xff, 0x80, 0xe2, 0x82, 0x42]);
+    const stderr = Buffer.from([0xc0, 0xaf, 0xf0, 0x9f, 0x99, 0x82]);
+    const script = `process.stdout.write(Buffer.from(${JSON.stringify([...stdout])})); process.stderr.write(Buffer.from(${JSON.stringify([...stderr])}));`;
+    const evidence = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', script]),
+      commands: [{ argv: [process.execPath, '-e', script], timeoutMs: 2_000, captureOutput: true }],
+      outputStore: store,
+      outputPolicy: { previewBytes: 32, diagnosticBytes: 64, maxDiagnostics: 4, readBytes: 32 },
+    }).validate(owned);
+    const command = evidence.commands[0]!;
+    assert.equal(command.captureStatus, 'complete');
+    assert.ok(command.output);
+    const artifact = command.output.artifact;
+    assert.deepEqual(readFileSync(path.join(root, 'store', `${artifact.id}.stdout`)), stdout);
+    assert.deepEqual(readFileSync(path.join(root, 'store', `${artifact.id}.stderr`)), stderr);
+    assert.equal(command.output.stdout.preview, 'O????B');
+    assert.equal(command.output.stderr.preview, '??🙂');
+    assert.equal(artifact.stdoutBytes, stdout.length);
+    assert.equal(artifact.stderrBytes, stderr.length);
+    assert.equal(readToolOutput(command.output, store, { channel: 'stdout' }).text, 'O????B');
+  });
+
+  it('keeps validation outcome truthful when capture close needs a bounded store-owned retry', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-terminal-retry-'));
+    dirs.push(root);
+    let failClosedSync = true;
+    const storeRoot = path.join(root, 'store');
+    const outputStore = new FileToolOutputStore(storeRoot, { capacity: 1, testFaults: {
+      beforeOperationMetadataDirectoryFsync: (value) => {
+        if ((value as { readonly state?: string }).state === 'closed' && failClosedSync) {
+          failClosedSync = false;
+          throw Object.assign(new Error('validation close directory fsync EIO'), { code: 'EIO' });
+        }
+      },
+    } });
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'validation-terminal-retry-v1',
+      commands: [{ argv: [process.execPath, '-e', "process.stdout.write('VALIDATION-TERMINAL-MARKER')"], timeoutMs: 1_000, captureOutput: true }],
+      outputStore,
+    }).validate(owned);
+
+    assert.equal(result.status, 'passed', 'terminal capture metadata failure does not rewrite the real child outcome');
+    assert.equal(result.commands[0]?.outcome, 'passed');
+    assert.equal(result.commands[0]?.captureStatus, 'unavailable', 'uncommitted references are withheld from returned evidence');
+    assert.equal(result.commands[0]?.output, undefined);
+    const cleanup = new FileToolOutputStore(storeRoot, { capacity: 1 }).cleanupExpired({ maxSlotProbes: 1, maxDeletions: 8 });
+    assert.equal(cleanup.protected, 1, 'retry commits original unexpired retention and does not evict validation evidence');
+    const operationFiles = readdirSync(path.join(storeRoot, 'operations')).filter((name) => name.endsWith('.json') && !name.startsWith('slot-') && name !== 'index.json');
+    assert.equal(operationFiles.length, 1);
+    const metadata = JSON.parse(readFileSync(path.join(storeRoot, 'operations', operationFiles[0]!), 'utf8')) as { readonly state: string; readonly artifacts: readonly [{ readonly id: string }] };
+    assert.equal(metadata.state, 'closed');
+    assert.equal(readFileSync(path.join(storeRoot, `${metadata.artifacts[0]!.id}.stdout`), 'utf8'), 'VALIDATION-TERMINAL-MARKER');
+  });
+
+  it('captures only explicitly opted-in commands and starts the operation only when reached', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-opt-in-'));
+    dirs.push(root);
+    const storeRoot = path.join(root, 'store');
+    const evidence = await new ConfiguredLocalValidationAdapter({
+      revision: 'opt-in-v1',
+      commands: [
+        { argv: [process.execPath, '-e', "process.stdout.write('TRANSIENT-ONLY')"], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', "process.stdout.write('EXPLICIT-EVIDENCE')"], timeoutMs: 1_000, captureOutput: true },
+      ],
+      outputStore: new FileToolOutputStore(storeRoot),
+    }).validate(owned);
+    assert.equal(evidence.status, 'passed');
+    assert.equal(evidence.commands[0]?.captureStatus, undefined);
+    assert.equal(evidence.commands[0]?.output, undefined);
+    assert.equal(evidence.commands[1]?.captureStatus, 'complete');
+    assert.equal(readToolOutput(evidence.commands[1]!.output!, new FileToolOutputStore(storeRoot), { channel: 'stdout' }).text, 'EXPLICIT-EVIDENCE');
+    assert.equal(readdirSync(storeRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')).length, 2);
+
+    const unreachedRoot = path.join(root, 'unreached-store');
+    const unreached = await new ConfiguredLocalValidationAdapter({
+      revision: 'unreached-v1',
+      commands: [
+        { argv: [process.execPath, '-e', 'process.exit(9)'], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000, captureOutput: true },
+      ],
+      outputStore: new FileToolOutputStore(unreachedRoot),
+    }).validate(owned);
+    assert.equal(unreached.status, 'failed');
+    assert.equal(existsSync(unreachedRoot), false, 'a later opted-in command that is never reached starts no operation');
+  });
+
+  it('observes opted-in output as unavailable when no evidence store is provided', async () => {
+    const owned = request();
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'missing-store-v1',
+      commands: [{ argv: [process.execPath, '-e', "process.stdout.write('bounded-without-store')"], timeoutMs: 1_000, captureOutput: true }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(result.commands[0]?.captureStatus, 'unavailable');
+    assert.ok(result.commands[0]?.capturePreview?.stdout.preview.includes('bounded-without-store'));
+  });
+
+  it('rejects a nonboolean direct-adapter capture authority before spawning', async () => {
+    const owned = request();
+    let spawned = false;
+    const malformed = {
+      revision: 'malformed-capture-v1',
+      commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000, captureOutput: 'yes' }],
+    } as unknown as LocalValidationConfiguration;
+    const result = await new ConfiguredLocalValidationAdapter(malformed).validate({ ...owned, beforeSpawn: () => { spawned = true; } });
+    assert.equal(result.status, 'unknown');
+    assert.equal(spawned, false);
+    assert.equal(result.commands[0]?.outcome, 'malformed');
+  });
+
+  it('keeps bounded local validation diagnostics when a real file-backed write fails', async () => {
+    const owned = request();
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-capture-fault-'));
+    dirs.push(root);
+    let writes = 0;
+    const outputStore = new FileToolOutputStore(path.join(root, 'store'), { testFaults: {
+      writeSync: (fd, bytes, offset, length) => {
+        writes += 1;
+        if (writes === 1) return fsWriteSync(fd, bytes, offset, Math.max(1, Math.floor(length / 2)));
+        return 0;
+      },
+    } });
+    const evidence = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', "process.stdout.write('VALIDATION-FAULT-MARKER\\n'); process.stderr.write('ERROR: retained-root-cause\\n')"]),
+      commands: [{ argv: [process.execPath, '-e', "process.stdout.write('VALIDATION-FAULT-MARKER\\n'); process.stderr.write('ERROR: retained-root-cause\\n')"], timeoutMs: 1_000, captureOutput: true }],
+      outputStore, outputPolicy: { previewBytes: 64, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 32 },
+    }).validate(owned);
+    const command = evidence.commands[0]!;
+    assert.equal(evidence.status, 'passed', 'evidence sink failure does not change validation truth');
+    assert.equal(command.outcome, 'passed');
+    assert.equal(command.captureStatus, 'partial');
+    assert.equal(command.output, undefined, 'partial bytes are never advertised as a durable artifact');
+    assert.ok(command.capturePreview?.stdout.preview.includes('VALIDATION-FAULT-MARKER'));
+    assert.ok(command.capturePreview?.diagnostics.some((line) => line.includes('retained-root-cause')));
+    assert.deepEqual(readdirSync(path.join(root, 'store')).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
   });
 
   it('forces a signal-resistant command to settle after the bounded grace period', async () => {

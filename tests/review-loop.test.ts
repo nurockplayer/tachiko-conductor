@@ -2118,6 +2118,7 @@ describe('runReviewLoop', () => {
         const id = `governed-durable-omission-${mode}`;
         const luna = await createGenuineLunaFixture(id);
         const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-governed-durable-${mode}-`));
+        const fixtureGitStderrPath = path.join(directory, 'fixture-git.stderr.log');
         try {
           const store = new JsonFileStore({ dir: directory });
           const workerScript = path.join(luna.root, 'bin', 'codex');
@@ -2125,8 +2126,8 @@ describe('runReviewLoop', () => {
             '#!/bin/sh',
             'set -e',
             "printf 'bounded repair\\n' > governed-repair.txt",
-            'git add governed-repair.txt >/dev/null 2>&1',
-            'git commit -m "bounded governed fixture repair" >/dev/null 2>&1',
+            `git add governed-repair.txt >/dev/null 2>>${JSON.stringify(fixtureGitStderrPath)}`,
+            `git commit -m "bounded governed fixture repair" >/dev/null 2>>${JSON.stringify(fixtureGitStderrPath)}`,
             `printf '%s\\n' '${JSON.stringify({ type: 'thread.started', thread_id: 'genuine-luna-thread' })}'`,
             `printf '%s\\n' '${JSON.stringify({ type: 'turn.started' })}'`,
             `printf '%s\\n' '${JSON.stringify({ type: 'item.completed', item: { id: 'genuine-luna-message', type: 'agent_message', text: 'bounded fixture result' } })}'`,
@@ -2194,7 +2195,49 @@ describe('runReviewLoop', () => {
             get assertCanPublish() { return verifying && mode === 'missing-publication' ? undefined : validPublication; },
           };
           const result = await runReviewLoop(dependencies, id, { maxAttempts: 2, now: () => T0 });
-          assert.equal(verifying, true, 'the actual durable producer reached the targeted verification callback');
+          const boundedText = (value: string | undefined, max: number): string | undefined => value === undefined
+            ? undefined : value.slice(0, max).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, ' ');
+          const finalTransition = result.run.history[result.run.history.length - 1];
+          const agentResult = result.run.agentResult;
+          const completionPresent = result.run.telemetry?.events.some((event) => event.kind === 'completion') ?? false;
+          let fixtureGitStderr = '';
+          try { fixtureGitStderr = boundedText(readFileSync(fixtureGitStderrPath, 'utf8').slice(-2048), 2048) ?? ''; }
+          catch { fixtureGitStderr = '(fixture git stderr file unavailable)'; }
+          const verificationDiagnostic = JSON.stringify({
+            verifying,
+            outcome: result.outcome,
+            reason: 'reason' in result ? boundedText(result.reason, 320) : undefined,
+            runState: result.run.state,
+            latestReason: boundedText(finalTransition?.reason, 320),
+            lastTransition: finalTransition === undefined ? undefined : { type: finalTransition.type, from: finalTransition.from, to: finalTransition.to },
+            worker: agentResult === undefined ? undefined : {
+              exitStatus: agentResult.exitStatus,
+              summary: boundedText(agentResult.summary, 512),
+              headSha: agentResult.headSha?.slice(0, 64),
+              changedFiles: agentResult.changedFiles?.slice(0, 8).map((file) => boundedText(file, 160)),
+              diagnostics: agentResult.diagnostics?.slice(0, 3).map((entry) => boundedText(entry, 240)),
+              changedHead: agentResult.headSha !== undefined && agentResult.headSha !== luna.identity.baseSha,
+              executor: agentResult.executor === undefined ? undefined : {
+                provider: boundedText(agentResult.executor.provider, 96),
+                sessionId: boundedText(agentResult.executor.sessionId, 128),
+              },
+            },
+            runHeadSha: result.run.headSha?.slice(0, 64),
+            baseHeadSha: luna.identity.baseSha.slice(0, 64),
+            completionTelemetryPresent: completionPresent,
+            bootstrapGuardContext: result.run.bootstrap === undefined ? undefined : {
+              kind: result.run.bootstrap.bootstrapKind,
+              branchMatches: result.run.bootstrap.branch === luna.identity.branch,
+              workspaceMatches: result.run.bootstrap.workspacePath === luna.identity.workspacePath,
+            },
+            selectedExecutorProfile: result.run.execution === undefined ? undefined : {
+              profile: result.run.execution.profile,
+              revision: result.run.execution.revision,
+              executor: result.run.execution.executor,
+            },
+            fixtureGitStderr,
+          });
+          assert.equal(verifying, true, `the actual durable producer reached the targeted verification callback; bounded context=${verificationDiagnostic}`);
           assert.equal(beforeMutationReached, true);
           assert.equal(beforePublishReached, mode === 'missing-publication', 'missing mutation admission blocks before the publication callback');
           assert.equal(authorizedImportEffects, mode === 'missing-publication' ? 1 : 0, 'only the mutation-admitted case reaches the simulated trusted import');

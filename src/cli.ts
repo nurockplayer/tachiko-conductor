@@ -70,6 +70,7 @@ import {
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
+import { DEFAULT_TOOL_OUTPUT_POLICY, FileToolOutputStore, validateToolOutputPolicy, type ToolOutputArtifactReference, type ToolOutputPolicy } from './evidence/tool-output.js';
 import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
@@ -133,6 +134,8 @@ Usage:
   tachiko wait observe <id> [--timeout-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko wait await <id> [--timeout-ms <n>] [--poll-interval-ms <n>] [--on-timeout <continue|policy-action>]
   tachiko github snapshot owner/repo#123
+  tachiko tool-output read '<artifact-reference-json>' --channel <stdout|stderr> [--offset <bytes>] [--length <bytes>]
+  tachiko tool-output search '<artifact-reference-json>' --query <text> [--channel <stdout|stderr>]
   tachiko browser bootstrap <profile> [--port <n>] [--host <host>]
   tachiko browser start <profile> [--port <n>] [--host <host>] [--headed | --headless]
   tachiko browser status <profile>
@@ -389,7 +392,11 @@ export function resolveLocalValidationConfiguration(
         `${MIN_LOCAL_VALIDATION_TIMEOUT_MS} and ${MAX_LOCAL_VALIDATION_TIMEOUT_MS}.`,
       );
     }
-    return { argv: command.argv as string[], timeoutMs: command.timeoutMs as number };
+    if (command.captureOutput !== undefined && typeof command.captureOutput !== 'boolean') {
+      throw new Error(`TACHIKO_LOCAL_VALIDATION_CONFIG.commands[${index}].captureOutput must be a boolean when supplied.`);
+    }
+    return { argv: command.argv as string[], timeoutMs: command.timeoutMs as number,
+      ...(command.captureOutput === undefined ? {} : { captureOutput: command.captureOutput }) };
   });
   if (record.workspacePath !== undefined &&
     (typeof record.workspacePath !== 'string' || record.workspacePath.trim() === '' || !path.isAbsolute(record.workspacePath))) {
@@ -473,6 +480,25 @@ export function resolveHostedCheckPolicyConfiguration(
 /** Resolve the directory where run JSON files are stored. */
 export function resolveRunsDir(env: NodeJS.ProcessEnv = process.env): string {
   return env.TACHIKO_DATA_DIR ?? path.join(resolveAccountHomeDirectory(), '.tachiko-conductor', 'runs');
+}
+
+export function resolveToolOutputRoot(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.TACHIKO_EVIDENCE_DIR;
+  if (configured !== undefined && (!path.isAbsolute(configured) || configured.trim() === '')) {
+    throw new Error('TACHIKO_EVIDENCE_DIR must be an absolute non-empty path.');
+  }
+  return configured ?? path.join(path.resolve(resolveRunsDir(env)), '.evidence', 'v1');
+}
+
+export function resolveToolOutputPolicy(env: NodeJS.ProcessEnv = process.env): ToolOutputPolicy {
+  const raw = env.TACHIKO_TOOL_OUTPUT_POLICY;
+  if (raw === undefined) return validateToolOutputPolicy(DEFAULT_TOOL_OUTPUT_POLICY);
+  let value: unknown;
+  try { value = JSON.parse(raw); } catch { throw new Error('TACHIKO_TOOL_OUTPUT_POLICY must be valid JSON.'); }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) throw new Error('TACHIKO_TOOL_OUTPUT_POLICY must be an object.');
+  const policy = value as Record<string, unknown>;
+  return validateToolOutputPolicy({ previewBytes: policy.previewBytes as number, diagnosticBytes: policy.diagnosticBytes as number,
+    maxDiagnostics: policy.maxDiagnostics as number, readBytes: policy.readBytes as number });
 }
 
 export interface BrowserRoots {
@@ -1667,7 +1693,14 @@ function buildWorkflowDeps(
   transport: GhCliTransport = new GhCliTransport(),
 ): WorkflowDependencies {
   const github = new LiveGitHubAdapter({ transport });
-  const localValidation = resolveLocalValidationConfiguration(env);
+  const localValidationConfiguration = resolveLocalValidationConfiguration(env);
+  const localValidation = localValidationConfiguration === undefined ? undefined : {
+    ...localValidationConfiguration,
+    ...(localValidationConfiguration.commands.some((command) => command.captureOutput === true)
+      ? { outputStore: new FileToolOutputStore(resolveToolOutputRoot(env)) }
+      : {}),
+    outputPolicy: resolveToolOutputPolicy(env),
+  };
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);
   let bootstrap: ImplementationBootstrapAdapter | undefined;
   let lunaBootstrap: ImplementationBootstrapAdapter | undefined;
@@ -2258,8 +2291,41 @@ export function printWaitResult(result: WaitCommandResult): void {
 }
 
 export async function main(argv: string[]): Promise<number> {
-  const store = new JsonFileStore({ dir: resolveRunsDir() });
   const [command, subcommand, ...rest] = argv;
+
+  if (command === 'tool-output') {
+    try {
+      const { values, positionals } = parseArgs({ args: rest, allowPositionals: true, options: {
+        channel: { type: 'string' }, offset: { type: 'string' }, length: { type: 'string' }, query: { type: 'string' },
+      } });
+      const referenceText = positionals[0];
+      if (referenceText === undefined) throw new Error('tool-output read|search requires an artifact reference JSON argument.');
+      const reference = JSON.parse(referenceText) as ToolOutputArtifactReference;
+      const evidenceStore = new FileToolOutputStore(resolveToolOutputRoot());
+      if (subcommand === 'read') {
+        if (values.channel !== 'stdout' && values.channel !== 'stderr') throw new Error('tool-output read requires --channel stdout|stderr.');
+        const offset = values.offset === undefined ? undefined : Number(values.offset);
+        const length = values.length === undefined ? undefined : Number(values.length);
+        console.log(JSON.stringify(evidenceStore.read(reference, { channel: values.channel, ...(offset === undefined ? {} : { offset }), ...(length === undefined ? {} : { length }) }), null, 2));
+        return 0;
+      }
+      if (subcommand === 'search') {
+        if (values.query === undefined || values.query === '') throw new Error('tool-output search requires --query TEXT.');
+        if (values.channel !== undefined && values.channel !== 'stdout' && values.channel !== 'stderr') throw new Error('tool-output --channel must be stdout|stderr.');
+        console.log(JSON.stringify(evidenceStore.search(reference, { query: values.query, ...(values.channel === undefined ? {} : { channel: values.channel }) }), null, 2));
+        return 0;
+      }
+      throw new Error('tool-output requires the read or search subcommand.');
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      return 1;
+    }
+  }
+
+  // Keep the evidence-only command independent of Run-store admission. Every
+  // other command constructs the Run store at its original point before help
+  // and command dispatch, preserving existing admission order.
+  const store = new JsonFileStore({ dir: resolveRunsDir() });
 
   if (command === undefined || command === '--help' || command === '-h') {
     console.log(USAGE);

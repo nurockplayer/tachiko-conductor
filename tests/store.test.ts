@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -7,6 +7,8 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
+import { isValidationResultCoherent } from '../src/domain/validation.js';
+import { InMemoryToolOutputStore, TOOL_OUTPUT_POLICY_MAXIMA, boundToolOutput, isToolOutputEnvelope } from '../src/evidence/tool-output.js';
 import type { Run } from '../src/domain/types.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import { isCurrentAccountPathApplicable } from '../src/account-home.js';
@@ -203,7 +205,7 @@ describe('JsonFileStore — persistence round-trips', () => {
     }
   });
 
-  it('publishes canonical Run JSON with a safe mode under umask 002', () => {
+  it('publishes canonical Run JSON with a private mode under umask 002', () => {
     const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-umask-'));
     tmpDirs.push(home);
     const conductor = path.join(home, '.tachiko-conductor');
@@ -218,14 +220,96 @@ describe('JsonFileStore — persistence round-trips', () => {
       const initial = newRun('canonical-umask-run');
       store.create(initial);
       const filePath = path.join(runs, `${initial.id}.json`);
-      assert.equal(statSync(filePath).mode & 0o777, 0o644);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
       store.update(applyTransition(initial, { type: 'start' }, T0));
-      assert.equal(statSync(filePath).mode & 0o777, 0o644);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
       store.read(initial.id);
     } finally {
       process.umask(originalUmask);
       os.userInfo = originalUserInfo;
     }
+  });
+
+  it('keeps Run temp descriptors and final snapshots private across create, update and CAS under permissive umask', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-private-run-'));
+    tmpDirs.push(home);
+    const conductor = path.join(home, '.tachiko-conductor');
+    const runs = path.join(conductor, 'runs');
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(home, 0o755);
+    chmodSync(conductor, 0o755);
+    chmodSync(runs, 0o755);
+    const originalUserInfo = os.userInfo;
+    const originalUmask = process.umask(0);
+    const observedTempModes: number[] = [];
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const store = new JsonFileStore({ dir: runs, syncForDurability: (fd, target) => {
+        if (target !== 'file') { fsyncSync(fd); return; }
+        const descriptorMode = fstatSync(fd).mode & 0o777;
+        observedTempModes.push(descriptorMode);
+        assert.equal(descriptorMode, 0o600, 'the descriptor remains private at the pre-rename file durability seam');
+        const tempName = readdirSync(runs).find((name) => name.startsWith('private-run-writes.json.') && name.endsWith('.tmp'));
+        assert.ok(tempName, 'file durability seam is observing the authoritative Run temporary');
+        const tempPath = path.join(runs, tempName);
+        assert.equal(statSync(tempPath).mode & 0o777, 0o600);
+        const prospectiveBytes = readFileSync(tempPath, 'utf8');
+        assert.ok(prospectiveBytes.includes('COMPLETE-PRIVATE-RUN-OUTPUT'));
+        assert.ok(prospectiveBytes.includes('FALLBACK-PRIVATE-RUN-PREVIEW'));
+        fsyncSync(fd);
+      } });
+      const completeOutput = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'COMPLETE-PRIVATE-RUN-OUTPUT', stderr: '', store: new InMemoryToolOutputStore() });
+      const fallbackText = 'FALLBACK-PRIVATE-RUN-PREVIEW';
+      const fallbackStream = { bytes: Buffer.byteLength(fallbackText), preview: fallbackText,
+        previewBytes: Buffer.byteLength(fallbackText), truncated: false };
+      const validation = validationPassed();
+      const initial = {
+        ...newRun('private-run-writes'),
+        validationResult: {
+          ...validation,
+          local: { ...validation.local, commands: [
+            { commandIndex: 0, executable: 'test', outcome: 'passed' as const, exitCode: 0, durationMs: 1,
+              captureStatus: 'complete' as const, output: completeOutput },
+            { commandIndex: 1, executable: 'test', outcome: 'passed' as const, exitCode: 0, durationMs: 1,
+              captureStatus: 'partial' as const, capturePreview: {
+                stdout: fallbackStream, stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+                diagnostics: [fallbackText], diagnosticsTruncated: false,
+              } },
+          ] },
+        },
+      };
+      store.create(initial);
+      const filePath = path.join(runs, `${initial.id}.json`);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.ok(readFileSync(filePath, 'utf8').includes('COMPLETE-PRIVATE-RUN-OUTPUT'));
+      assert.ok(readFileSync(filePath, 'utf8').includes('FALLBACK-PRIVATE-RUN-PREVIEW'));
+      const updated = applyTransition(initial, { type: 'start' }, T0);
+      store.update(updated);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.equal(store.updateIfUnchanged(updated, updated), true, 'successful CAS still writes through the shared private helper');
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.deepEqual(observedTempModes, [0o600, 0o600, 0o600]);
+    } finally {
+      process.umask(originalUmask);
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('reads legacy 0644 Runs without mutation, leaves failed CAS untouched, and hardens an ordinary update', () => {
+    const { store, dir } = tempStore();
+    const legacy = newRun('legacy-run-permissions');
+    const filePath = path.join(dir, `${legacy.id}.json`);
+    writeFileSync(filePath, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o644 });
+    chmodSync(filePath, 0o644);
+    const legacyBytes = readFileSync(filePath, 'utf8');
+    assert.deepEqual(store.read(legacy.id), legacy);
+    assert.equal(statSync(filePath).mode & 0o777, 0o644, 'read preserves legacy mode');
+    const stale = { ...legacy, updatedAt: '2030-01-01T00:00:00.000Z' };
+    assert.equal(store.updateIfUnchanged(stale, { ...stale, updatedAt: '2030-01-01T00:00:01.000Z' }), false);
+    assert.equal(readFileSync(filePath, 'utf8'), legacyBytes, 'failed CAS preserves legacy bytes');
+    assert.equal(statSync(filePath).mode & 0o777, 0o644, 'failed CAS preserves legacy permissions');
+    store.update({ ...legacy, updatedAt: '2026-10-08T00:00:00.000Z' });
+    assert.equal(statSync(filePath).mode & 0o777, 0o600, 'ordinary authorized rewrite atomically hardens only this Run');
   });
 
   it('rejects a cached canonical Run store after its conductor root is retargeted', () => {
@@ -415,12 +499,40 @@ describe('JsonFileStore — persistence round-trips', () => {
       agentResult: { ...successResult('head-sha'), executor: { provider: 'codex-cli', sessionId: 'secret-session' } },
       pullRequest: { number: 7, headSha: 'head-sha' },
     }, T0);
+    const completeSentinel = 'COMPLETE-RAW-OUTPUT-SENTINEL';
+    const fallbackSentinel = 'FALLBACK-RAW-PREVIEW-SENTINEL';
+    const completeOutput = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: completeSentinel, stderr: '', store: new InMemoryToolOutputStore() });
+    const fallbackStream = { bytes: Buffer.byteLength(fallbackSentinel), preview: fallbackSentinel,
+      previewBytes: Buffer.byteLength(fallbackSentinel), truncated: false };
+    const validation = validationPassed('head-sha');
+    run = {
+      ...run,
+      validationResult: {
+        ...validation,
+        local: {
+          ...validation.local,
+          commands: [
+            { commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+              captureStatus: 'complete' as const, output: completeOutput },
+            { commandIndex: 1, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+              captureStatus: 'partial' as const, capturePreview: {
+                stdout: fallbackStream, stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+                diagnostics: [fallbackSentinel], diagnosticsTruncated: false,
+              } },
+          ],
+        },
+      },
+    };
     store.create(run);
 
     const raw = readFileSync(path.join(dir, 'projected.json'), 'utf8');
     const projection = JSON.parse(readFileSync(operationalProjectionPath(dir, 'projected'), 'utf8')) as Record<string, unknown>;
     assert.equal(projection.schemaVersion, OPERATIONAL_RUN_PROJECTION_VERSION);
     assert.equal(projection.sourceDigest, sha256(raw));
+    assert.equal(raw.includes(completeSentinel), true);
+    assert.equal(raw.includes(fallbackSentinel), true);
+    assert.equal(JSON.stringify(projection).includes(completeSentinel), false, 'derived metadata omits complete raw-output bytes');
+    assert.equal(JSON.stringify(projection).includes(fallbackSentinel), false, 'derived metadata omits fallback raw-preview bytes');
     assert.equal(projection.workflowState, 'VALIDATING');
     assert.deepEqual(projection.target, { owner: 'acme', repo: 'widgets', issueNumber: 42 });
     assert.deepEqual(projection.bootstrap, { workspacePath: '/tmp/projected', branch: 'codex/projected', baseBranch: 'main', baseSha: 'base-sha' });
@@ -1018,6 +1130,521 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.agentResult?.sessionId, 'legacy-session-1');
     assert.deepEqual(loaded?.executor, { provider: 'codex-cli', sessionId: 'thread-1' });
     assert.equal(loaded?.agentResult?.durationMs, 125);
+  });
+
+  it('rejects raw provider output before create, update, or CAS can persist it', () => {
+    const evidence = boundToolOutput({
+      outcome: 'failed',
+      exitCode: 7,
+      stdout: 'stdout '.repeat(100),
+      stderr: 'ERROR: test failed\n',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
+    });
+    const withRawOutput = (run: Run): Run => ({
+      ...run,
+      agentResult: { exitStatus: 'failure', summary: 'failed', output: evidence } as never,
+    });
+
+    const createStore = tempStore();
+    const createRun = withRawOutput(newRun('raw-output-create'));
+    assert.throws(() => createStore.store.create(createRun), /raw provider output artifacts/);
+    assert.equal(existsSync(path.join(createStore.dir, `${createRun.id}.json`)), false);
+
+    const updateStore = tempStore();
+    const updateRun = newRun('raw-output-update');
+    updateStore.store.create(updateRun);
+    const updateRunPath = path.join(updateStore.dir, `${updateRun.id}.json`);
+    const updateBytes = readFileSync(updateRunPath, 'utf8');
+    assert.throws(() => updateStore.store.update(withRawOutput(updateRun)), /raw provider output artifacts/);
+    assert.equal(readFileSync(updateRunPath, 'utf8'), updateBytes);
+
+    const casStore = tempStore();
+    const casRun = newRun('raw-output-cas');
+    casStore.store.create(casRun);
+    const casRunPath = path.join(casStore.dir, `${casRun.id}.json`);
+    const casBytes = readFileSync(casRunPath, 'utf8');
+    assert.throws(() => casStore.store.updateIfUnchanged(casRun, withRawOutput(casRun)), /raw provider output artifacts/);
+    assert.equal(readFileSync(casRunPath, 'utf8'), casBytes);
+  });
+
+  it('round trips an exact joined diagnostic boundary inside local Run validation evidence', () => {
+    const line = `ERROR: ${'x'.repeat(32_761)}`;
+    const output = boundToolOutput({ outcome: 'failed', exitCode: 1, stderr: line, stdout: line,
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 8, diagnosticBytes: 65_536, maxDiagnostics: 2, readBytes: 8 } });
+    assert.equal(Buffer.byteLength(output.diagnostics.join('\n')), 65_536);
+    const validation = validationFailed('diagnostic-roundtrip');
+    let run: Run = applyTransition(newRun('diagnostic-run-roundtrip'), { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('diagnostic-roundtrip'), headSha: 'diagnostic-roundtrip' }, T0);
+    run = applyTransition(run, { type: 'validation_failed', validationResult: validation,
+      pullRequest: { number: 7, headSha: 'diagnostic-roundtrip' } }, T0);
+    run = { ...run, validationResult: { ...validation, local: { ...validation.local, commands: [{ commandIndex: 0,
+      executable: 'test', outcome: 'failed', exitCode: 1, durationMs: 1, captureStatus: 'complete', output }] } } };
+    const { store, dir } = tempStore();
+    store.create(run);
+    const loaded = store.read(run.id);
+    const persisted = loaded?.validationResult?.local.commands[0]?.output;
+    assert.deepEqual(persisted?.diagnostics, output.diagnostics);
+    assert.equal(Buffer.byteLength((persisted?.diagnostics ?? []).join('\n')), 65_536);
+  });
+
+  it('rejects incoherent tool-output payloads before validation admission and on persisted Run read/CAS', () => {
+    const headSha = 'envelope-limits-validation-head';
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'xy', stderr: '',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 1, diagnosticBytes: 2, maxDiagnostics: 1, readBytes: 1 } });
+    const invalidOutput = structuredClone(output) as any;
+    invalidOutput.stdout.preview = 'xy';
+    invalidOutput.stdout.previewBytes = Buffer.byteLength(invalidOutput.stdout.preview);
+    invalidOutput.overflow.retainedBytes = invalidOutput.stdout.previewBytes + invalidOutput.stderr.previewBytes;
+    invalidOutput.overflow.omittedBytes = Math.max(0, invalidOutput.overflow.totalBytes - invalidOutput.overflow.retainedBytes);
+    const validation = validationPassed(headSha);
+    const validValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus: 'complete' as const, output }] },
+    };
+    const invalidValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: invalidOutput }] },
+    };
+    assert.equal(isValidationResultCoherent(validValidation), true);
+    assert.equal(isValidationResultCoherent(invalidValidation), false);
+
+    const implementing = applyTransition(newRun('envelope-limits-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: invalidValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const projectionPath = operationalProjectionPath(dir, validRun.id);
+    const originalRunBytes = readFileSync(runPath, 'utf8');
+    const originalProjectionBytes = readFileSync(projectionPath, 'utf8');
+    assert.equal(isToolOutputEnvelope(store.read(validRun.id)?.validationResult?.local.commands[0]?.output), true,
+      'a legitimate bounded envelope survives Run creation and readback');
+
+    const invalidRun = {
+      ...validRun,
+      validationResult: invalidValidation,
+    };
+    const invalidBytes = JSON.stringify(invalidRun);
+    writeFileSync(runPath, invalidBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected persisted read leaves the original raw bytes untouched');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects a corrupt existing Run before comparing or writing');
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS leaves the original raw bytes untouched');
+
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    class InheritedEnvelopeSerializer {
+      constructor(value: typeof output) { Object.assign(this, value); }
+      toJSON() { return { ...this, rawTranscript }; }
+    }
+    const diagnosticsWithSerializer = [...output.diagnostics];
+    Object.defineProperty(diagnosticsWithSerializer, 'toJSON', { value: () => [...diagnosticsWithSerializer, rawTranscript] });
+    const serializerCases: ReadonlyArray<{ readonly label: string; readonly output: typeof output }> = [
+      { label: 'unknown own envelope field', output: { ...output, rawTranscript } as unknown as typeof output },
+      { label: 'inherited envelope serializer', output: new InheritedEnvelopeSerializer(output) as unknown as typeof output },
+      { label: 'own nonenumerable diagnostics serializer', output: { ...output, diagnostics: diagnosticsWithSerializer } },
+    ];
+    for (const candidate of serializerCases) {
+      const candidateValidation = {
+        ...validation,
+        local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: candidate.output }] },
+      };
+      assert.equal(isToolOutputEnvelope(candidate.output), false, `${candidate.label} is rejected by the envelope guard`);
+      assert.equal(isValidationResultCoherent(candidateValidation), false,
+        `${candidate.label} is rejected as validation evidence`);
+      assert.throws(() => applyTransition(validating, {
+        type: 'validation_passed', validationResult: candidateValidation,
+        pullRequest: { number: 7, headSha },
+      }, T0), /coherent|conflicts/, `transition refuses ${candidate.label}`);
+      const candidateRun = { ...validRun, validationResult: candidateValidation };
+      const candidateBytes = JSON.stringify(candidateRun);
+      assert.ok(candidateBytes.includes(rawTranscript), `${candidate.label} would serialize the unbounded transcript`);
+
+      const { store: rejectedCreateStore, dir: rejectedCreateDir } = tempStore();
+      assert.throws(() => rejectedCreateStore.create(candidateRun), /invalid bounded validation output payload/,
+        `create refuses ${candidate.label} before persistence`);
+      assert.equal(existsSync(path.join(rejectedCreateDir, `${validRun.id}.json`)), false,
+        `${candidate.label} create leaves no authoritative Run`);
+      assert.equal(existsSync(operationalProjectionPath(rejectedCreateDir, validRun.id)), false,
+        `${candidate.label} create leaves no operational projection`);
+
+      writeFileSync(runPath, originalRunBytes, 'utf8');
+      assert.throws(() => store.update(candidateRun), /invalid bounded validation output payload/,
+        `update refuses ${candidate.label} before mutation`);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidate.label} update preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} update preserves projection bytes`);
+      assert.throws(() => store.updateIfUnchanged!(validRun, candidateRun), /invalid bounded validation output payload/,
+        `CAS refuses ${candidate.label} before mutation`);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidate.label} CAS preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} CAS preserves projection bytes`);
+
+      writeFileSync(runPath, candidateBytes, 'utf8');
+      assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), candidateBytes, `${candidate.label} rejected read preserves raw bytes`);
+      assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), candidateBytes, `${candidate.label} rejected CAS preserves raw bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} corrupt read/CAS leaves operational projection unchanged`);
+    }
+
+    const falseTruncatedOutput = structuredClone(output) as any;
+    falseTruncatedOutput.stdout.truncated = false;
+    falseTruncatedOutput.overflow.stdout = false;
+    falseTruncatedOutput.overflow.truncated = falseTruncatedOutput.overflow.capture || falseTruncatedOutput.overflow.summary ||
+      falseTruncatedOutput.overflow.diagnostics || falseTruncatedOutput.overflow.stdout || falseTruncatedOutput.overflow.stderr;
+    const falseTruncatedValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: falseTruncatedOutput }] },
+    };
+    assert.equal(isToolOutputEnvelope(falseTruncatedOutput), false,
+      'a complete envelope cannot report over-limit stream bytes without truncation');
+    assert.equal(isValidationResultCoherent({ ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: falseTruncatedOutput }] } }), false);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: falseTruncatedValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const falseTruncatedRun = { ...validRun, validationResult: falseTruncatedValidation };
+    const falseTruncatedBytes = JSON.stringify(falseTruncatedRun);
+    writeFileSync(runPath, falseTruncatedBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), falseTruncatedBytes,
+      'rejected complete-envelope read preserves original raw bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), falseTruncatedBytes,
+      'rejected complete-envelope CAS preserves original raw bytes');
+  });
+
+  it('roundtrips canonical retention metadata and refuses malformed metadata on Run read and CAS', () => {
+    const headSha = 'retention-metadata-validation-head';
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
+      store: new InMemoryToolOutputStore(), policy: { previewBytes: 8, diagnosticBytes: 8, maxDiagnostics: 1, readBytes: 8 } });
+    const operationId = '00000000-0000-4000-8000-000000000000';
+    const retainedUntil = '2000-01-01T00:00:00.000Z';
+    const retainedOutput = { ...output, artifact: { ...output.artifact, operationId, retainedUntil } };
+    assert.equal(isToolOutputEnvelope(retainedOutput), true, 'canonical past deadline is structurally coherent');
+    const validation = {
+      ...validationPassed(headSha),
+      local: { ...validationPassed(headSha).local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus: 'complete' as const, output: retainedOutput }] },
+    };
+    const implementing = applyTransition(newRun('retention-metadata-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const persistedOutput = store.read(validRun.id)?.validationResult?.local.commands[0]?.output;
+    assert.equal(isToolOutputEnvelope(persistedOutput), true, 'valid paired authority survives store roundtrip');
+
+    const malformedOutputs = [
+      { ...retainedOutput, artifact: { ...retainedOutput.artifact, operationId: 'not-an-operation-id' } },
+      { ...retainedOutput, artifact: { ...retainedOutput.artifact, retainedUntil: '2000-1-1T00:00:00.000Z' } },
+      { ...output, artifact: { ...output.artifact, operationId } },
+    ];
+    for (const malformedOutput of malformedOutputs) {
+      const malformedValidation = {
+        ...validation,
+        local: { ...validation.local, commands: [{ ...validation.local.commands[0]!, output: malformedOutput }] },
+      };
+      const corruptRun = { ...validRun, validationResult: malformedValidation };
+      const originalBytes = JSON.stringify(corruptRun);
+      writeFileSync(runPath, originalBytes, 'utf8');
+      assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalBytes, 'rejected read preserves raw bytes');
+      assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalBytes, 'rejected CAS preserves raw bytes');
+    }
+  });
+
+  it('bounds partial and unavailable fallback diagnostics before validation and persisted Run admission', () => {
+    const headSha = 'fallback-diagnostics-validation-head';
+    const base = validationPassed(headSha);
+    const command = { commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+      exitCode: 0, durationMs: 1, captureStatus: 'partial' as const, capturePreview: {
+        stdout: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        diagnostics: [] as string[], diagnosticsTruncated: false,
+      } };
+    const withDiagnostics = (status: 'partial' | 'unavailable', diagnostics: string[]) => ({
+      ...base,
+      local: { ...base.local, commands: [{ ...command, captureStatus: status, capturePreview: {
+        ...command.capturePreview, diagnostics,
+      } }] },
+    });
+    const rejected: Array<{ name: string; diagnostics: string[] }> = [
+      { name: 'line count', diagnostics: Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics + 1 }, () => 'x') },
+      { name: 'single byte total', diagnostics: ['x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes + 1)] },
+      { name: 'LF joined total', diagnostics: Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics }, () => 'x'.repeat(512)) },
+      { name: 'UTF-8 total', diagnostics: ['界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes / 3)) + '界'.repeat(2)] },
+    ];
+    for (const status of ['partial', 'unavailable'] as const) {
+      for (const candidate of rejected) {
+        assert.equal(isValidationResultCoherent(withDiagnostics(status, candidate.diagnostics)), false,
+          `${status} capture rejects ${candidate.name} above policy`);
+      }
+    }
+
+    const exactJoined = Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics }, (_, index) =>
+      index === TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics - 1 ? 'x'.repeat(385) : 'x'.repeat(512));
+    assert.equal(exactJoined.reduce((bytes, line) => bytes + Buffer.byteLength(line) + 1, -1), TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes,
+      'positive joined-byte fixture includes each LF separator');
+    const exactUtf8 = '😀'.repeat(16_383) + 'abcd';
+    assert.equal(Buffer.byteLength(exactUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes);
+    for (const status of ['partial', 'unavailable'] as const) {
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, exactJoined)), true,
+        `${status} capture accepts exact line-count and joined-byte boundaries`);
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, [exactUtf8])), true,
+        `${status} capture counts UTF-8 bytes at the exact boundary`);
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, [])), true,
+        `${status} capture accepts an empty diagnostic list`);
+    }
+
+    const invalidValidation = withDiagnostics('partial', rejected[2]!.diagnostics);
+    const implementing = applyTransition(newRun('fallback-diagnostics-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: invalidValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const validValidation = withDiagnostics('partial', exactJoined);
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    assert.equal(isValidationResultCoherent(store.read(validRun.id)?.validationResult), true,
+      'legitimate exact-boundary fallback evidence survives create/read');
+
+    const invalidRun = { ...validRun, validationResult: invalidValidation };
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const invalidBytes = JSON.stringify(invalidRun);
+    writeFileSync(runPath, invalidBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected persisted read preserves the malformed raw bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects malformed persisted fallback evidence before writing');
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS preserves the malformed raw bytes');
+  });
+
+  it('rejects unbounded own fields in partial fallback previews before persisted Run read or CAS', () => {
+    const headSha = 'fallback-preview-unknown-payload-head';
+    const base = validationPassed(headSha);
+    const preview = {
+      stdout: { bytes: 1, preview: 'x', previewBytes: 1, truncated: false },
+      stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+      diagnostics: [] as string[], diagnosticsTruncated: false,
+    };
+    const withPreview = (captureStatus: 'partial' | 'unavailable', capturePreview = preview) => ({
+      ...base,
+      local: { ...base.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus, capturePreview }] },
+    });
+    for (const status of ['partial', 'unavailable'] as const) {
+      assert.equal(isValidationResultCoherent(withPreview(status)), true,
+        `${status} capture keeps valid bounded preview fields`);
+      assert.equal(isValidationResultCoherent({ ...base,
+        local: { ...base.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+          exitCode: 0, durationMs: 1, captureStatus: status }] } }), true,
+      `${status} capture still permits legacy evidence without an optional preview`);
+    }
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    const diagnosticsWithSerializer = [...preview.diagnostics];
+    Object.defineProperty(diagnosticsWithSerializer, 'toJSON', { value: () => [...diagnosticsWithSerializer, rawTranscript] });
+    const invalidPreviews = [
+      { ...preview, rawTranscript },
+      { ...preview, stdout: { ...preview.stdout, rawTranscript } },
+      { ...preview, stderr: { ...preview.stderr, rawTranscript } },
+      { ...preview, diagnostics: diagnosticsWithSerializer },
+    ];
+    for (const invalidPreview of invalidPreviews) {
+      assert.equal(isValidationResultCoherent(withPreview('partial', invalidPreview)), false,
+        'partial preview rejects unknown raw payload at the preview and nested stream levels');
+    }
+
+    const validValidation = withPreview('partial');
+    const implementing = applyTransition(newRun('fallback-preview-unknown-payload'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    const unknownPayloadValidation = withPreview('partial', invalidPreviews[3]!);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: unknownPayloadValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/, 'transition refuses unbounded partial-preview payload');
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const projectionPath = operationalProjectionPath(dir, validRun.id);
+    const originalRunBytes = readFileSync(runPath, 'utf8');
+    const originalProjectionBytes = readFileSync(projectionPath, 'utf8');
+    const malformedRun = { ...validRun, validationResult: unknownPayloadValidation };
+    const malformedBytes = JSON.stringify(malformedRun);
+    const { store: rejectedCreateStore, dir: rejectedCreateDir } = tempStore();
+    assert.throws(() => rejectedCreateStore.create(malformedRun), /invalid bounded validation output payload/);
+    assert.equal(existsSync(path.join(rejectedCreateDir, `${validRun.id}.json`)), false,
+      'invalid partial preview creates no authoritative Run');
+    assert.equal(existsSync(operationalProjectionPath(rejectedCreateDir, validRun.id)), false,
+      'invalid partial preview creates no operational projection');
+    assert.throws(() => store.update(malformedRun), /invalid bounded validation output payload/);
+    assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, 'invalid preview update preserves Run bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes, 'invalid preview update preserves projection bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, malformedRun), /invalid bounded validation output payload/);
+    assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, 'invalid preview CAS preserves Run bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes, 'invalid preview CAS preserves projection bytes');
+    writeFileSync(runPath, malformedBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), malformedBytes, 'rejected read preserves original bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects malformed persisted preview before writing');
+    assert.equal(readFileSync(runPath, 'utf8'), malformedBytes, 'rejected CAS preserves original bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+      'rejected malformed preview read/CAS leaves projection unchanged');
+  });
+
+  it('bounds partial and unavailable fallback stream previews to the shared policy before Run admission', () => {
+    const headSha = 'fallback-stream-preview-validation-head';
+    const base = validationPassed(headSha);
+    const exactAscii = 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes);
+    const exactUtf8 = '界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes / 3)) + 'a';
+    const oversizedUtf8 = '界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes / 3)) + 'ab';
+    assert.equal(Buffer.byteLength(exactUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes);
+    assert.equal(Buffer.byteLength(oversizedUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1);
+    const makeValidation = (
+      status: 'partial' | 'unavailable', channel: 'stdout' | 'stderr', preview: string,
+      declaredBytes = Buffer.byteLength(preview, 'utf8'), rawBytes = Buffer.byteLength(preview, 'utf8'), truncated = false,
+    ) => {
+      const stream = { bytes: rawBytes, preview, previewBytes: declaredBytes, truncated };
+      const capturePreview = {
+        stdout: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        diagnostics: [] as string[], diagnosticsTruncated: false,
+      };
+      capturePreview[channel] = stream;
+      return {
+        ...base,
+        local: {
+          ...base.local,
+          commands: [{ ...base.local.commands[0]!, captureStatus: status, capturePreview }],
+        },
+      };
+    };
+    const validatingRun = (id: string) => {
+      let run = newRun(id);
+      run = applyTransition(run, { type: 'start' }, T0);
+      return applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha }, T0);
+    };
+    let storedRun: Run | undefined;
+
+    for (const status of ['partial', 'unavailable'] as const) {
+      for (const channel of ['stdout', 'stderr'] as const) {
+        for (const [label, preview] of [['empty', ''], ['exact ASCII', exactAscii], ['exact UTF-8', exactUtf8]] as const) {
+          const validation = makeValidation(status, channel, preview);
+          assert.equal(isValidationResultCoherent(validation), true, `${status}/${channel} accepts ${label}`);
+          const next = applyTransition(validatingRun(`fallback-preview-${status}-${channel}-${label.replaceAll(' ', '-')}`), {
+            type: 'validation_passed', validationResult: validation,
+            pullRequest: { number: 7, headSha },
+          }, T0);
+          assert.equal(next.state, 'REVIEWING', `${status}/${channel} admits ${label} through the state machine`);
+          if (label === 'exact ASCII' && status === 'partial' && channel === 'stdout') storedRun = next;
+        }
+        const truncatedPrefix = makeValidation(status, channel, 'retained-prefix', undefined, 128, true);
+        assert.equal(isValidationResultCoherent(truncatedPrefix), true,
+          `${status}/${channel} accepts an exact valid truncated prefix whose preview does not exceed observed bytes`);
+        const truncatedRun = applyTransition(validatingRun(`fallback-truncated-${status}-${channel}`), {
+          type: 'validation_passed', validationResult: truncatedPrefix,
+          pullRequest: { number: 7, headSha },
+        }, T0);
+        assert.equal(truncatedRun.state, 'REVIEWING', `${status}/${channel} admits a valid truncated prefix`);
+
+        const largeTruncatedPrefix = makeValidation(status, channel, 'retained-prefix', undefined,
+          TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, true);
+        assert.equal(isValidationResultCoherent(largeTruncatedPrefix), true,
+          `${status}/${channel} accepts a truthful truncated stream above the policy preview maximum`);
+        const largeTruncatedRun = applyTransition(validatingRun(`fallback-large-truncated-${status}-${channel}`), {
+          type: 'validation_passed', validationResult: largeTruncatedPrefix,
+          pullRequest: { number: 7, headSha },
+        }, T0);
+        assert.equal(largeTruncatedRun.state, 'REVIEWING',
+          `${status}/${channel} admits a truthful over-limit raw stream with a bounded retained preview`);
+
+        const rejected: Array<{ name: string; preview: string; declared?: number; raw?: number }> = [
+          { name: 'oversized ASCII', preview: 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1) },
+          { name: 'oversized UTF-8', preview: oversizedUtf8 },
+          { name: '1MiB', preview: 'm'.repeat(1_048_576) },
+          { name: 'negative declared count', preview: 'x', declared: -1 },
+          { name: 'fractional declared count', preview: 'x', declared: 1.5 },
+          { name: 'unsafe declared count', preview: 'x', declared: Number.MAX_SAFE_INTEGER + 1 },
+          { name: 'mismatched declared count', preview: 'xy', declared: 1 },
+          { name: 'preview count exceeds zero observed bytes', preview: 'x', raw: 0 },
+          { name: 'UTF-8 preview count exceeds one observed byte', preview: '😀', raw: 1 },
+          { name: 'over-policy bytes without truncation flag', preview: 'x', raw: TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1 },
+        ];
+        for (const candidate of rejected) {
+          const validation = makeValidation(status, channel, candidate.preview, candidate.declared, candidate.raw);
+          assert.equal(isValidationResultCoherent(validation), false,
+            `${status}/${channel} rejects ${candidate.name}`);
+          assert.throws(() => applyTransition(validatingRun(`invalid-preview-${status}-${channel}-${candidate.name.replaceAll(' ', '-')}`), {
+            type: 'validation_passed', validationResult: validation,
+            pullRequest: { number: 7, headSha },
+          }, T0), /coherent|conflicts/, `${status}/${channel} rejects ${candidate.name} at state-machine admission`);
+        }
+      }
+    }
+
+    assert.ok(storedRun, 'exact-boundary fallback validation reached Run state');
+    const { store, dir } = tempStore();
+    store.create(storedRun);
+    assert.deepEqual(store.read(storedRun.id)?.validationResult, storedRun.validationResult,
+      'legitimate exact-boundary fallback evidence survives JSON create/read');
+
+    const runPath = path.join(dir, `${storedRun.id}.json`);
+    const invalidValidations = [
+      makeValidation('unavailable', 'stderr', 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1)),
+      makeValidation('unavailable', 'stderr', 'corrupt-retained-prefix',
+        Buffer.byteLength('corrupt-retained-prefix'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, false),
+    ];
+    for (const [index, invalidValidation] of invalidValidations.entries()) {
+      const invalidBytes: string = JSON.stringify({ ...storedRun, validationResult: invalidValidation });
+      writeFileSync(runPath, invalidBytes, 'utf8');
+      assert.throws(() => store.read(storedRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
+        `rejected persisted fallback read ${index} preserves original malformed preview bytes`);
+      assert.throws(() => store.updateIfUnchanged!(storedRun, storedRun), /corrupt or incompatible/,
+        `CAS rejects corrupt existing fallback evidence ${index} before writing`);
+      assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
+        `rejected fallback CAS ${index} preserves original malformed preview bytes`);
+    }
   });
 
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {

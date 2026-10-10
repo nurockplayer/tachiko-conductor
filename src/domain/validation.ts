@@ -1,7 +1,98 @@
 import type { HostedValidationEvidence, LocalValidationEvidence, ValidationResult, ValidationStatus } from './types.js';
+import { isToolOutputEnvelope, TOOL_OUTPUT_POLICY_MAXIMA } from '../evidence/tool-output.js';
 
 function isCommandOutcome(value: unknown): value is 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed' {
   return value === 'passed' || value === 'failed' || value === 'timed_out' || value === 'unavailable' || value === 'malformed';
+}
+
+function isCommandOutputCoherent(command: Record<string, unknown>): boolean {
+  if (command.captureStatus !== undefined && !['complete', 'partial', 'unavailable'].includes(command.captureStatus as string)) return false;
+  if (command.capturePreview !== undefined) {
+    if (command.captureStatus === undefined || command.captureStatus === 'complete' ||
+        !isBoundedCapturePreview(command.capturePreview)) return false;
+  }
+  if (command.output === undefined) return command.captureStatus !== 'complete';
+  if (command.capturePreview !== undefined) return false;
+  if (command.captureStatus !== undefined && command.captureStatus !== 'complete') return false;
+  if (!isToolOutputEnvelope(command.output)) return false;
+  const expected = command.outcome === 'passed' ? 'passed'
+    : command.outcome === 'failed' ? 'failed'
+      : command.outcome === 'timed_out' ? 'timed_out' : 'unknown';
+  return command.output.outcome === expected && command.output.exitCode === command.exitCode;
+}
+
+function isBoundedCapturePreview(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const preview = value as Record<string, unknown>;
+  if (!hasOnlyKeys(preview, ['stdout', 'stderr', 'diagnostics', 'diagnosticsTruncated'])) return false;
+  const streamValid = (streamValue: unknown): boolean => {
+    if (typeof streamValue !== 'object' || streamValue === null) return false;
+    const stream = streamValue as Record<string, unknown>;
+    if (!hasOnlyKeys(stream, ['bytes', 'preview', 'previewBytes', 'truncated']) ||
+        !Number.isSafeInteger(stream.bytes) || (stream.bytes as number) < 0 || typeof stream.preview !== 'string' ||
+        !Number.isSafeInteger(stream.previewBytes) || (stream.previewBytes as number) < 0 ||
+        (stream.previewBytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes ||
+        (stream.previewBytes as number) > (stream.bytes as number) ||
+        stream.preview.length > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes || typeof stream.truncated !== 'boolean' ||
+        ((stream.bytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes && stream.truncated !== true)) return false;
+    return Buffer.byteLength(stream.preview, 'utf8') === stream.previewBytes;
+  };
+  if (!streamValid(preview.stdout) || !streamValid(preview.stderr) || !hasSafeDiagnosticsArray(preview.diagnostics) ||
+      preview.diagnostics.length > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||
+      typeof preview.diagnosticsTruncated !== 'boolean') return false;
+  let diagnosticBytes = 0;
+  for (let index = 0; index < preview.diagnostics.length; index += 1) {
+    const line = preview.diagnostics[index];
+    if (typeof line !== 'string') return false;
+    const separatorBytes = index === 0 ? 0 : 1;
+    if (diagnosticBytes + line.length + separatorBytes > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes) return false;
+    diagnosticBytes += Buffer.byteLength(line, 'utf8') + separatorBytes;
+    if (diagnosticBytes > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes) return false;
+  }
+  return true;
+}
+
+/** Validates only the known bounded payloads before durable JSON serialization. */
+export function isKnownBoundedValidationPayloadCoherent(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return true;
+  const local = (value as Record<string, unknown>).local;
+  if (typeof local !== 'object' || local === null) return true;
+  const commands = (local as Record<string, unknown>).commands;
+  if (!Array.isArray(commands)) return true;
+  for (let index = 0; index < commands.length; index += 1) {
+    const command = commands[index];
+    if (typeof command !== 'object' || command === null) continue;
+    const record = command as Record<string, unknown>;
+    if (record.output !== undefined && !isToolOutputEnvelope(record.output)) return false;
+    if (record.capturePreview !== undefined && !isBoundedCapturePreview(record.capturePreview)) return false;
+  }
+  return true;
+}
+
+function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
+  const allowed = new Set(allowedKeys);
+  return !hasCustomToJSON(value) && Reflect.ownKeys(value).every((key) => typeof key === 'string' && allowed.has(key));
+}
+
+function hasCustomToJSON(value: object): boolean {
+  let current: object | null = value;
+  while (current !== null) {
+    const descriptor = Object.getOwnPropertyDescriptor(current, 'toJSON');
+    if (descriptor !== undefined) return typeof descriptor.value === 'function' || descriptor.get !== undefined;
+    current = Object.getPrototypeOf(current) as object | null;
+  }
+  return false;
+}
+
+function hasSafeDiagnosticsArray(value: unknown): value is readonly string[] {
+  if (!Array.isArray(value) || hasCustomToJSON(value)) return false;
+  const hasOnlyIndexes = Reflect.ownKeys(value).every((key) => key === 'length' || (typeof key === 'string' &&
+    /^(0|[1-9]\d*)$/.test(key) && Number(key) < value.length));
+  if (!hasOnlyIndexes) return false;
+  for (let index = 0; index < value.length; index += 1) {
+    if (!Object.prototype.hasOwnProperty.call(value, index) || typeof value[index] !== 'string') return false;
+  }
+  return true;
 }
 
 function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
@@ -16,7 +107,8 @@ function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
     typeof command.executable === 'string' &&
     (command.executable.trim() !== '' || command.outcome === 'malformed') && isCommandOutcome(command.outcome) &&
     (command.exitCode === null || typeof command.exitCode === 'number') &&
-    typeof command.durationMs === 'number' && Number.isSafeInteger(command.durationMs) && command.durationMs >= 0,
+    typeof command.durationMs === 'number' && Number.isSafeInteger(command.durationMs) && command.durationMs >= 0 &&
+    isCommandOutputCoherent(command),
   )) return false;
   const final = commands.at(-1);
   if (evidence.status === 'passed') return commands.length > 0 && commands.every((command) => command.outcome === 'passed' && command.exitCode === 0);

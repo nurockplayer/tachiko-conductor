@@ -6,6 +6,7 @@ import path from 'node:path';
 
 import type { LocalValidationEvidence, LocalValidationCommandEvidence } from '../domain/types.js';
 import type { LocalValidationConfiguration, ValidationAdapter, ValidationRequest } from '../adapters/validation.js';
+import { boundToolOutputFromCapture, ContainedToolOutputCaptureSession, DEFAULT_TOOL_OUTPUT_POLICY, type ToolOutputCaptureSummary, type ToolOutputOperation, type ToolOutputCaptureWriter, type ToolOutputCaptureSessionResult } from '../evidence/tool-output.js';
 
 function malformed(commandIndex: number, executable = ''): LocalValidationCommandEvidence {
   return { commandIndex, executable, outcome: 'malformed', exitCode: null, durationMs: 0 };
@@ -293,11 +294,12 @@ function reconstructedWorkspace(sourcePath: string, headSha: string): Validation
   }
 }
 
-function isCommand(value: unknown): value is { readonly argv: readonly string[]; readonly timeoutMs: number } {
+function isCommand(value: unknown): value is { readonly argv: readonly string[]; readonly timeoutMs: number; readonly captureOutput?: boolean } {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const command = value as { argv?: unknown; timeoutMs?: unknown };
+  const command = value as { argv?: unknown; timeoutMs?: unknown; captureOutput?: unknown };
   return Array.isArray(command.argv) && command.argv.length > 0 &&
     command.argv.every((part) => typeof part === 'string' && part.trim() !== '') &&
+    (command.captureOutput === undefined || typeof command.captureOutput === 'boolean') &&
     Number.isSafeInteger(command.timeoutMs) &&
     (command.timeoutMs as number) >= MIN_LOCAL_VALIDATION_TIMEOUT_MS &&
     (command.timeoutMs as number) <= MAX_LOCAL_VALIDATION_TIMEOUT_MS;
@@ -355,31 +357,75 @@ async function waitForProcessGroupSettlement(pid: number | undefined): Promise<b
 
 async function execute(
   commandIndex: number,
-  command: { readonly argv: readonly string[]; readonly timeoutMs: number },
+  command: { readonly argv: readonly string[]; readonly timeoutMs: number; readonly captureOutput?: boolean },
   workspacePath: string,
   environment: NodeJS.ProcessEnv,
   sandboxProfile?: string,
-): Promise<LocalValidationCommandEvidence> {
+  outputOperation?: ToolOutputOperation,
+  outputStore?: LocalValidationConfiguration['outputStore'],
+  outputPolicy?: LocalValidationConfiguration['outputPolicy'],
+  beforeSpawn?: () => void,
+  captureRequested = command.captureOutput === true,
+): Promise<LocalValidationCommandEvidence & { readonly pendingCapture?: ToolOutputCaptureSummary }> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
+  const policy = outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY;
+  const captureSession = captureRequested ? new ContainedToolOutputCaptureSession(policy) : undefined;
+  let writer: ToolOutputCaptureWriter | undefined;
+  if (captureRequested) {
+    try {
+      writer = outputOperation?.startCapture(policy, { commandIndex, executable }) ?? outputStore?.startCapture(policy);
+    } catch { writer = undefined; }
+  }
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
     let timer: NodeJS.Timeout | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
     let settling = false;
+    let captureForcedIncomplete = false;
+    let directExitBeforeDeadline = false;
+    let directExitCode: number | null = null;
     const finish = (outcome: LocalValidationCommandEvidence['outcome'], exitCode: number | null): void => {
       if (settled) return;
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
       if (forceTimer !== undefined) clearTimeout(forceTimer);
-      resolve({ commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt });
+      let captureResult: ToolOutputCaptureSessionResult | undefined;
+      if (captureSession !== undefined) {
+        if (captureForcedIncomplete) {
+          const observed = captureSession.finish(undefined);
+          captureResult = { ...observed, status: writer === undefined ? 'unavailable' : 'partial' };
+        } else captureResult = captureSession.finish(writer);
+      }
+      const pendingCapture: ToolOutputCaptureSummary | undefined = captureResult?.capture;
+      const captureStatus: LocalValidationCommandEvidence['captureStatus'] = captureResult?.status;
+      const evidence = { commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
+        ...(captureStatus === undefined ? {} : { captureStatus }),
+        ...(captureResult === undefined || captureStatus === 'complete' ? {} : { capturePreview: {
+          stdout: captureResult.stdout, stderr: captureResult.stderr, diagnostics: captureResult.diagnostics,
+          diagnosticsTruncated: captureResult.diagnosticsTruncated,
+        } }),
+        ...(pendingCapture === undefined || outputOperation !== undefined ? {} : { output: boundToolOutputFromCapture({
+          outcome: outcome === 'passed' ? 'passed' : outcome === 'failed' ? 'failed' : outcome === 'timed_out' ? 'timed_out' : 'unknown',
+          exitCode, capture: pendingCapture, policy,
+        }) }),
+        ...(pendingCapture === undefined ? {} : { pendingCapture }),
+      };
+      resolve(evidence);
     };
     const settleTimedOutProcess = async (child: ReturnType<typeof spawn>): Promise<void> => {
       if (settling || settled) return;
       settling = true;
+      // The wall-clock deadline can expire while descendants keep inherited
+      // pipes open after the direct child already exited. Such a deadline
+      // forces incomplete capture and group cleanup, but does not rewrite the
+      // child's observed exit into a timeout.
+      try { writer?.abort?.(); } catch { /* settlement truth is independent of capture cleanup */ }
       if (process.platform === 'win32') {
-        finish((await terminateWindowsProcessTree(child.pid)) ? 'timed_out' : 'unavailable', null);
+        const settledTree = await terminateWindowsProcessTree(child.pid);
+        finish(!settledTree ? 'unavailable' : directExitBeforeDeadline
+          ? (directExitCode === 0 ? 'passed' : 'failed') : 'timed_out', directExitBeforeDeadline ? directExitCode : null);
         return;
       }
       terminateProcessGroup(child.pid, 'SIGKILL');
@@ -387,22 +433,42 @@ async function execute(
       // detached validation command, prove the owned group has no surviving
       // descendants before recording a timeout; otherwise fail closed.
       const groupSettled = await waitForProcessGroupSettlement(child.pid);
-      finish(groupSettled ? 'timed_out' : 'unavailable', null);
+      finish(!groupSettled ? 'unavailable' : directExitBeforeDeadline
+        ? (directExitCode === 0 ? 'passed' : 'failed') : 'timed_out', directExitBeforeDeadline ? directExitCode : null);
     };
     let child: ReturnType<typeof spawn>;
+    // Capture setup has completed; invoke the synchronous host fence directly
+    // before child creation. A refusal rejects validation instead of becoming
+    // a candidate command failure.
+    try { beforeSpawn?.(); }
+    catch (error) { try { writer?.abort?.(); } catch { /* disposal must not mask admission refusal */ } throw error; }
     try {
       child = sandboxProfile === undefined
         ? spawn(executable, command.argv.slice(1), {
-          shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
+          shell: false, stdio: captureRequested ? ['ignore', 'pipe', 'pipe'] : 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
         })
         : spawn('/usr/bin/sandbox-exec', ['-p', sandboxProfile, executable, ...command.argv.slice(1)], {
-        shell: false, stdio: 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
+        shell: false, stdio: captureRequested ? ['ignore', 'pipe', 'pipe'] : 'ignore', cwd: workspacePath, env: environment, detached: process.platform !== 'win32',
       });
     } catch {
+      try { writer?.abort?.(); } catch { /* a spawn refusal cannot retain partial capture */ }
+      writer = undefined;
       finish('unavailable', null);
       return;
     }
+    child.once('exit', (code) => {
+      directExitBeforeDeadline = !timedOut;
+      directExitCode = code;
+    });
+    const captureChunk = (channel: 'stdout' | 'stderr', chunk: Buffer) => {
+      if (captureSession !== undefined) captureSession.writeBytes(captureForcedIncomplete ? undefined : writer, channel, chunk);
+    };
+    child.stdout?.on('data', (chunk: Buffer) => captureChunk('stdout', chunk));
+    child.stderr?.on('data', (chunk: Buffer) => captureChunk('stderr', chunk));
     timer = setTimeout(() => {
+      // Invalidate completeness synchronously before any signal or asynchronous
+      // group settlement. Optional writer cleanup is not the publication gate.
+      captureForcedIncomplete = true;
       timedOut = true;
       if (process.platform === 'win32') {
         void settleTimedOutProcess(child);
@@ -413,7 +479,11 @@ async function execute(
         void settleTimedOutProcess(child);
       }, TERMINATION_GRACE_MS);
     }, command.timeoutMs);
-    child.once('error', () => finish('unavailable', null));
+    child.once('error', () => {
+      try { writer?.abort?.(); } catch { /* contain spawn setup cleanup faults */ }
+      writer = undefined;
+      finish('unavailable', null);
+    });
     child.once('close', (code) => {
       if (timedOut) {
         void settleTimedOutProcess(child);
@@ -587,6 +657,8 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const runtimeRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-runtime-'));
     const environment = credentialFreeValidationEnvironment(runtimeRoot, this.configuration.playwrightBrowsersPath ?? undefined, this.configuration.nodeProgram, this.configuration.pnpmProgram, dependencyStore ?? undefined);
     const configuredToolchain = this.configuration.nodeProgram !== undefined || this.configuration.pnpmProgram !== undefined;
+    let outputOperation: ToolOutputOperation | undefined;
+    let operationFailed = false;
     try {
       // A production plan has one host-provisioned pnpm authority.  Reject a
       // substituted executable before probing a tool or starting validation.
@@ -608,38 +680,84 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // manifest (or the separately captured cold-hydration manifest).
       const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
       if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, initialIgnoredManifest)) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      const outputStore = this.configuration.outputStore;
+      const pending = new Map<number, ToolOutputCaptureSummary>();
+      const finishValidation = (status: LocalValidationEvidence['status']): LocalValidationEvidence => {
+        const managedOperation = outputOperation !== undefined;
+        let committed: readonly import('../evidence/tool-output.js').ToolOutputArtifactReference[] = [];
+        if (outputOperation !== undefined) {
+          const operation = outputOperation;
+          try {
+            if (pending.size === 0) operation.abort();
+            else committed = operation.close();
+            outputOperation = undefined;
+          }
+          catch { try { operation.abort(); } catch { /* do not change validator result */ } outputOperation = undefined; }
+        }
+        const commands = evidence.map((command) => {
+          const capture = pending.get(command.commandIndex);
+          if (capture === undefined) return command;
+          if (!managedOperation && command.output !== undefined) return command;
+          const artifact = managedOperation ? committed.find((item) => item.id === capture.artifact.id) : undefined;
+          if (artifact === undefined) return { ...command, captureStatus: 'unavailable' as const, output: undefined,
+            capturePreview: { stdout: capture.stdout, stderr: capture.stderr, diagnostics: capture.diagnostics,
+              diagnosticsTruncated: capture.diagnosticsTruncated } };
+          const output = boundToolOutputFromCapture({
+            outcome: command.outcome === 'passed' ? 'passed' : command.outcome === 'failed' ? 'failed' : command.outcome === 'timed_out' ? 'timed_out' : 'unknown',
+            exitCode: command.exitCode,
+            capture: { ...capture, artifact },
+            policy: this.configuration.outputPolicy,
+          });
+          return { ...command, captureStatus: 'complete' as const, output };
+        });
+        return { status, configRevision: revision, commands };
+      };
+      const captureStore = (): LocalValidationConfiguration['outputStore'] => operationFailed ? undefined : outputStore;
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
       for (let index = 0; index < configured.length; index += 1) {
         const command = configured[index];
         if (!isCommand(command)) {
           evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
-          return { status: 'unknown', configRevision: revision, commands: evidence };
+          return finishValidation('unknown');
         }
-        const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile);
-        evidence.push(result);
+        if (command.captureOutput === true && outputOperation === undefined && !operationFailed) {
+          try {
+            outputOperation = outputStore?.beginOperation?.({
+              kind: 'validation', owner: request.target.owner, repo: request.target.repo,
+              issueNumber: request.target.issueNumber, headSha: request.headSha,
+              configRevision: revision, ...(request.runId === undefined ? {} : { runId: request.runId }),
+            });
+          } catch { operationFailed = true; }
+        }
+        const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile,
+          outputOperation, captureStore(), this.configuration.outputPolicy, request.beforeSpawn, command.captureOutput === true);
+        if (result.pendingCapture !== undefined) pending.set(index, result.pendingCapture);
+        const { pendingCapture: _pendingCapture, ...commandEvidence } = result;
+        evidence.push(commandEvidence);
         if (result.outcome === 'failed' || result.outcome === 'timed_out') {
-          return { status: 'failed', configRevision: revision, commands: evidence };
+          return finishValidation('failed');
         }
-        if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
+        if (result.outcome !== 'passed') return finishValidation('unknown');
         const manifest = commandWorkspaceManifest(commandWorkspace.path, request.headSha);
         if (manifest === null || (index === 0 && this.configuration.dependencyArtifactPath !== undefined
           ? !isHydratedDependencyManifest(manifest)
           : manifest.join('\n') !== hydratedManifest.join('\n'))) {
           evidence.push(workspaceUnavailable(evidence.length));
-          return { status: 'unknown', configRevision: revision, commands: evidence };
+          return finishValidation('unknown');
         }
         if (index === 0 && this.configuration.dependencyArtifactPath !== undefined) hydratedManifest = manifest;
       }
       if (!commandWorkspaceMatches(commandWorkspace.path, request.headSha, hydratedManifest)) {
         evidence.push(workspaceUnavailable(evidence.length));
-        return { status: 'unknown', configRevision: revision, commands: evidence };
+        return finishValidation('unknown');
       }
       if (workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath) === null) {
         evidence.push(workspaceUnavailable(evidence.length));
-        return { status: 'unknown', configRevision: revision, commands: evidence };
+        return finishValidation('unknown');
       }
-      return { status: 'passed', configRevision: revision, commands: evidence };
+      return finishValidation('passed');
     } finally {
+      if (outputOperation !== undefined) { try { outputOperation.abort(); } catch { /* lifecycle disposal is contained */ } }
       rmSync(runtimeRoot, { recursive: true, force: true });
       commandWorkspace.dispose();
     }

@@ -386,23 +386,92 @@ TACHIKO_CODEX_APP_SERVER_SMOKE=1 node --import tsx --test tests/codex-app-server
 ## Exact-HEAD validation
 
 `VALIDATING` requires a persisted `ValidationResult` for the current exact
-HEAD. Conductor retains compact local-command and hosted-check provenance only;
-it never stores command output, full command arguments, or secrets. A new HEAD
-makes prior evidence stale. Pending hosted checks park in `WAITING_DEPENDENCY`
-for a later re-read; unavailable or unknown evidence fails closed.
+HEAD. Conductor retains compact local-command and hosted-check provenance;
+when an individual local validation command opts in, its output is captured as
+bounded summaries plus a private, hashed file artifact. Commands default to
+transient output; configuring validation or an evidence store alone does not
+authorize retention. The artifact reference carries
+a fixed seven-day deadline measured from the end of the whole validation
+operation. The library store allows a finite `retentionMs` override (default
+seven days), and each operation persists its deadline once; reopening a store
+with different options cannot renew existing references. `release(reference)`
+revokes one committed operation immediately and makes its references
+unavailable; bounded cleanup then reclaims its files. Reads do not extend the
+deadline. Output remains supplemental and does not change the validation
+result. Full command arguments are not recorded as command metadata, but
+opted-in commands can print their arguments, credentials, or other sensitive
+content. Raw stdout, stderr, complete artifacts, and bounded complete or
+fallback previews are unredacted and may contain secrets or echoed arguments.
+Opt in only when that retention is appropriate, keep secrets out of emitted
+output, and restrict access to the private evidence store. A new HEAD makes
+prior validation evidence stale. Pending hosted checks park in
+`WAITING_DEPENDENCY` for a later re-read; unavailable or unknown evidence fails
+closed.
+
+The default evidence root is `$TACHIKO_DATA_DIR/.evidence/v1` (under the runs
+directory when `TACHIKO_DATA_DIR` is unset); `TACHIKO_EVIDENCE_DIR` can name an
+absolute private root. `TACHIKO_TOOL_OUTPUT_POLICY` optionally supplies
+positive `previewBytes`, `diagnosticBytes`, `maxDiagnostics`, and `readBytes`
+limits as JSON. The private store has a persisted fixed capacity of 256
+operation slots, limits registration to at most 16 slot probes per attempt, and
+advances a bounded cleanup cursor during capture setup.
+If the index is incompatible, occupied by protected/corrupt ownership, or at
+capacity, capture becomes unavailable; retained slots are never evicted.
+Generic and provider commands do not create raw output files unless the
+individual command explicitly requests capture.
+
+Committed artifacts preserve the complete bytes admitted during successful
+capture for their declared lifetime. Durable writes share a fixed 64 MiB
+cumulative admission limit per operation (including every captured command and
+both streams); the library may lower this limit with `captureMaxBytes`, but no
+runtime environment setting raises or changes it. When admission or filesystem
+I/O fails, capture is partial and no artifact is published for that writer;
+streaming validation continues draining output and reports the observed command
+result separately. Artifacts retain the exact source bytes. Bounded previews,
+diagnostics, range reads, and search expose valid UTF-8 unchanged and project
+each malformed UTF-8 byte to `?`; their byte counts and offsets still refer to
+the original artifact bytes. This text view is intentionally lossy, while the
+artifact hash and raw artifact remain exact. Search runs over the projected
+text, so `?` can match either a malformed-byte placeholder or a literal question
+mark; text reads and search are not binary export paths. String writes are
+encoded as UTF-8 per write, including Node's replacement of isolated JavaScript
+surrogates; scalar sequences split across separate string writes are not joined.
+This is an admission bound, not a
+guarantee of available disk space or a global filesystem quota. New and
+rewritten authoritative Run
+snapshots are published with mode `0600`; existing legacy Run files are not
+retroactively hardened. Releasing or expiring a tool-output artifact does not
+scrub raw previews already persisted in a Run; those previews follow the
+existing Run lifecycle.
+
+Explicit range reads are limited to 1 MiB. Search queries are limited to 64 KiB
+of UTF-8, with at most 128 matches and 64 KiB per matching line. File capture
+requires supported POSIX ownership and private-mode checks. Existing evidence-
+root and operations directories must already be owned by the effective current
+user and private; the store refuses unsafe permissions without changing them.
+Windows file capture is unavailable under this implementation because it does
+not qualify ACL privacy.
+
+Use the artifact-reference JSON emitted with command evidence for bounded
+drill-down:
+
+```bash
+tachiko tool-output read '{"kind":"tool-output",...}' --channel stdout --offset 0 --length 4096
+tachiko tool-output search '{"kind":"tool-output",...}' --query 'FAILED' --channel stderr
+```
 
 Local commands are repository/run configuration and are never inferred from
 Issue text. Set `TACHIKO_LOCAL_VALIDATION_CONFIG` to a stable revision and
 bounded argv-array commands, for example:
 
 ```bash
-export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","commands":[{"argv":["pnpm","test"],"timeoutMs":120000,"captureOutput":true}]}'
 ```
 
 `commands` 必須至少有一個項目。既存 PR（沒有 Conductor bootstrap 記錄）必須在同一設定中明確提供絕對 `workspacePath`；Conductor 會在執行前後驗證其 clean exact HEAD 與 `origin` 的 GitHub owner/repo，絕不使用 ambient cwd。例如：
 
 ```bash
-export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","workspacePath":"/absolute/clean/worktree","commands":[{"argv":["pnpm","test"],"timeoutMs":120000}]}'
+export TACHIKO_LOCAL_VALIDATION_CONFIG='{"revision":"repo-validation-v1","workspacePath":"/absolute/clean/worktree","commands":[{"argv":["pnpm","test"],"timeoutMs":120000,"captureOutput":true}]}'
 ```
 
 Hosted checks are independently policy-controlled. Set

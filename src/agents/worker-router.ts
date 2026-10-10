@@ -15,7 +15,6 @@ import {
   boundedMessage,
   isWorkerRouterContainerError,
   planCommitOnlyMounts,
-  redactWorkerEnvValues,
   resolveWorkerNetworkMode,
   type ContainerWorkerExecution,
   type ContainerWorkerResult,
@@ -147,13 +146,16 @@ export class WorkerRouterAdapter implements ImplementationAgent {
       result = await this.container.run(spec);
     } catch (error) {
       if (isExecutionAdmissionRefusal(error)) throw error;
-      return this.containerFailure(error, request.signal, startedAt, spec.env);
+      return this.containerFailure(error, request.signal, startedAt);
     }
     const provenance = workerProvenance(result.stderr);
     const diagnostics = boundedDiagnostics(result.stderr, result.stdout, provenance);
     if (result.exitCode !== 0) {
       const durationMs = elapsed(startedAt);
-      return { ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics] };
+      return {
+        ...failure(WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE, `Worker router exited with status ${result.exitCode}.`, durationMs),
+        diagnostics: [`${WORKER_ROUTER_ERROR_CODE.EXIT_FAILURE}: Worker router exited with status ${result.exitCode}.`, ...diagnostics],
+      };
     }
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
     // The exact container is terminal before this point; only now may the
@@ -163,7 +165,10 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     if (isAborted(request.signal)) return failure(WORKER_ROUTER_ERROR_CODE.CANCELLED, 'Worker router was cancelled.', elapsed(startedAt));
     if (head === null) {
       const durationMs = elapsed(startedAt);
-      return { ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs), diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics] };
+      return {
+        ...failure(WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED, `Worker router completed, but an exact 40-hex HEAD could not be read from ${cwd}.`, durationMs),
+        diagnostics: [`${WORKER_ROUTER_ERROR_CODE.HEAD_READ_FAILED}: could not read an exact 40-hex HEAD from ${cwd}.`, ...diagnostics],
+      };
     }
     const ancestry = await this.verifyBaseAncestry(request.signal, cwd, request.baseSha, head);
     if (!ancestry.ok) {
@@ -183,7 +188,14 @@ export class WorkerRouterAdapter implements ImplementationAgent {
         diagnostics: [`${WORKER_ROUTER_ERROR_CODE.PUBLISH_FAILED}: ${published.detail}`, ...diagnostics, ...published.diagnostics],
       };
     }
-    return { exitStatus: 'success', summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.', headSha: head, telemetry: providerTelemetry({ provider: WORKER_ROUTER_PROVIDER }), ...(diagnostics.length === 0 ? {} : { diagnostics }), durationMs: elapsed(startedAt) };
+    return {
+      exitStatus: 'success',
+      summary: 'Worker router completed implementation inside the container boundary and Conductor published the exact committed HEAD.',
+      headSha: head,
+      telemetry: providerTelemetry({ provider: WORKER_ROUTER_PROVIDER }),
+      ...(diagnostics.length === 0 ? {} : { diagnostics }),
+      durationMs: elapsed(startedAt),
+    };
   }
 
   private containerSpec(image: string, cwd: string, task: string, signal: AbortSignal | undefined, beforeExecution: (() => void) | undefined): WorkerContainerSpec {
@@ -212,7 +224,7 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     return forwarded;
   }
 
-  private containerFailure(error: unknown, signal: AbortSignal | undefined, startedAt: number, env: Readonly<Record<string, string>>): AgentResult {
+  private containerFailure(error: unknown, signal: AbortSignal | undefined, startedAt: number): AgentResult {
     const durationMs = elapsed(startedAt);
     const containerCode = isWorkerRouterContainerError(error) ? error.code : undefined;
     if (isAborted(signal) || containerCode === WORKER_ROUTER_CONTAINER_ERROR_CODE.CANCELLED) {
@@ -221,8 +233,11 @@ export class WorkerRouterAdapter implements ImplementationAgent {
     if (containerCode === WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT) {
       return failure(WORKER_ROUTER_ERROR_CODE.TIMEOUT, `Worker router container timed out after ${this.timeoutMs}ms.`, durationMs);
     }
-    const message = redactWorkerEnvValues(boundedMessage(error), env);
-    return failure(adapterCodeFor(containerCode), `Worker router container failed closed: ${message}`, durationMs);
+    // Container/runtime errors are untrusted: they may embed worker stdout,
+    // stderr, prompts, or secrets. Keep only the typed category in durable
+    // AgentResult summaries; arbitrary exception messages remain transient.
+    const safeCategory = containerCode ?? 'unknown container failure';
+    return failure(adapterCodeFor(containerCode), `Worker router container failed closed (${safeCategory}).`, durationMs);
   }
 
   private async verifyBaseAncestry(
@@ -347,7 +362,7 @@ function buildTask(request: ImplementationRequest): string {
 
 function workerProvenance(stderr: string): string | undefined {
   const match = stderr.match(/^\[worker-router\] -> (luna-worker|deepseek-worker)\s*$/m);
-  return match?.[0];
+  return match === null ? undefined : `[worker-router] -> ${match[1]}`;
 }
 
 function boundedDiagnostics(stderr: string, stdout: string, provenance: string | undefined): string[] {
@@ -358,7 +373,11 @@ function boundedDiagnostics(stderr: string, stdout: string, provenance: string |
   return provenance === undefined ? [] : [provenance];
 }
 
-function failure(code: string, summary: string, durationMs: number): AgentResult { return { exitStatus: 'failure', summary, diagnostics: [`${code}: ${summary}`], durationMs }; }
+function failure(code: string, summary: string, durationMs: number): AgentResult {
+  return {
+    exitStatus: 'failure', summary, diagnostics: [`${code}: ${summary}`], durationMs,
+  };
+}
 function elapsed(startedAt: number): number { return Math.max(0, Date.now() - startedAt); }
 function errorCode(error: unknown): unknown { return typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined; }
 function errorMessage(error: unknown): string { return error instanceof Error ? error.message : String(error); }

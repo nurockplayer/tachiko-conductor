@@ -1,8 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import {
-  closeSync, constants, fchmodSync, fsyncSync, linkSync, lstatSync, openSync,
-  readFileSync, readlinkSync, symlinkSync, unlinkSync, writeSync,
+  closeSync, constants, fchmodSync, fstatSync, fsyncSync, linkSync, lstatSync, openSync,
+  readFileSync, readlinkSync, readSync, symlinkSync, unlinkSync, writeSync,
 } from 'node:fs';
 import path from 'node:path';
 import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
@@ -30,6 +30,42 @@ interface VersionedLockRecord extends LegacyLockRecord {
 type LockRecord = LegacyLockRecord | VersionedLockRecord;
 type TakeoverClaim = LockRecord;
 
+export interface PreparedDispatchInvocationPublication {
+  readonly owner: Readonly<VersionedLockRecord>;
+  readonly temporaryPath: string;
+  readonly generation: Readonly<{ readonly dev: bigint; readonly ino: bigint }>;
+}
+
+export interface DispatchInvocationPublicationHandoff {
+  /** Retire the prepared descriptor only when this publication never linked. */
+  discardUnpublished(): void;
+  /** Admit and qualify the shared rollback unlink before it mutates the canonical path. */
+  beforeRollbackUnlink(): void;
+  /** Record the already successful rollback unlink without performing I/O. */
+  afterRollbackUnlink(): void;
+  /** Optional deterministic fault seam immediately before retiring the sibling alias. */
+  beforeTemporaryUnlink?(): void;
+}
+
+export interface DispatchInvocationReadAllowance {
+  /** Consume part of an already charged read reservation before allocation or I/O. */
+  accountRead(bytes: number): void;
+  /** Return unused reserved bytes when the corresponding irreversible step did not occur. */
+  releaseUnused(): void;
+}
+
+export interface DispatchInvocationReadPolicy {
+  readonly maxRecordBytes: number;
+  /** Charge ordinary owner and claim reads before allocating or reading their contents. */
+  readonly accountRead: (bytes: number) => void;
+  /** Atomically charge a finite critical branch against the same aggregate pass ledger. */
+  readonly reserveReadBytes: (bytes: number) => DispatchInvocationReadAllowance;
+  /** Conservative per-symlink readlink precharge, qualified by the caller for this pass. */
+  readonly symlinkReadBytes: number;
+  /** Reserved allowance for releasing an acquired owner after body exhaustion. */
+  readonly releaseRead?: DispatchInvocationReadAllowance;
+}
+
 export interface DispatchInvocationIdentity {
   readonly hostId: string;
   readonly bootId: string;
@@ -43,6 +79,9 @@ export interface DispatchInvocationLockOptions {
   readonly hostBootIdentity?: () => DispatchInvocationIdentity;
   readonly processStartIdentity?: (pid: number) => string | null;
   readonly beforeCanonicalLink?: () => void;
+  readonly preparePublication?: (publication: PreparedDispatchInvocationPublication, accountRead?: (bytes: number) => void) => DispatchInvocationPublicationHandoff;
+  /** Opt-in bounded read/accounting contract. Omitting it preserves legacy dispatch behavior. */
+  readonly readPolicy?: DispatchInvocationReadPolicy;
   readonly syncDirectory?: (directory: string) => void;
   /** Separate path-aware barrier for every component leading to the lock directory. */
   readonly syncDirectoryHierarchy?: SyncDirectoryHierarchy;
@@ -188,6 +227,111 @@ function readLock(lockPath: string): LockRecord | null {
   }
 }
 
+interface BoundedLockRead {
+  readonly record: LockRecord;
+  readonly generation: Readonly<{ readonly dev: bigint; readonly ino: bigint }>;
+}
+
+function boundedRecordFromDescriptor(
+  filePath: string,
+  policy: DispatchInvocationReadPolicy,
+  accountRead: (bytes: number) => void,
+  expectedAlias?: Readonly<{ readonly dev: bigint; readonly ino: bigint }>,
+): BoundedLockRead | null {
+  let pathStats;
+  try { pathStats = lstatSync(filePath, { bigint: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  if (!pathStats.isFile() || pathStats.isSymbolicLink() || pathStats.size < 1n || pathStats.size > BigInt(policy.maxRecordBytes) ||
+      (expectedAlias !== undefined && (pathStats.dev !== expectedAlias.dev || pathStats.ino !== expectedAlias.ino))) return null;
+  if (typeof constants.O_NOFOLLOW !== 'number' || constants.O_NOFOLLOW === 0) throw new Error('Bounded dispatch lock reads require O_NOFOLLOW support.');
+  const size = Number(pathStats.size);
+  if (!Number.isSafeInteger(size) || size < 1) return null;
+  accountRead(size);
+  const descriptor = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW |
+    (typeof constants.O_NONBLOCK === 'number' ? constants.O_NONBLOCK : 0));
+  try {
+    const opened = fstatSync(descriptor, { bigint: true });
+    if (!opened.isFile() || opened.dev !== pathStats.dev || opened.ino !== pathStats.ino || opened.size !== pathStats.size) return null;
+    const data = Buffer.alloc(size);
+    let offset = 0;
+    while (offset < size) {
+      const count = readSync(descriptor, data, offset, size - offset, offset);
+      if (count === 0) return null;
+      offset += count;
+    }
+    const finalDescriptor = fstatSync(descriptor, { bigint: true });
+    const finalPath = lstatSync(filePath, { bigint: true });
+    if (finalDescriptor.dev !== opened.dev || finalDescriptor.ino !== opened.ino || finalDescriptor.size !== opened.size ||
+        finalPath.isSymbolicLink() || !finalPath.isFile() || finalPath.dev !== opened.dev || finalPath.ino !== opened.ino || finalPath.size !== opened.size) return null;
+    if (expectedAlias !== undefined) {
+      const aliasPath = lstatSync(filePath, { bigint: true });
+      if (aliasPath.dev !== expectedAlias.dev || aliasPath.ino !== expectedAlias.ino) return null;
+    }
+    let raw: string;
+    try { raw = new TextDecoder('utf-8', { fatal: true }).decode(data); }
+    catch { return null; }
+    const record = parseLock(raw);
+    if (record === null) return null;
+    return { record, generation: { dev: opened.dev, ino: opened.ino } };
+  } finally { closeSync(descriptor); }
+}
+
+function readLockBounded(
+  lockPath: string,
+  policy: DispatchInvocationReadPolicy,
+  accountRead: (bytes: number) => void = policy.accountRead,
+): BoundedLockRead | null {
+  return boundedRecordFromDescriptor(lockPath, policy, accountRead);
+}
+
+function readSymlinkTakeoverClaimBounded(
+  takeoverPath: string,
+  policy: DispatchInvocationReadPolicy,
+  accountRead: (bytes: number) => void,
+): TakeoverClaim | null {
+  let before;
+  try { before = lstatSync(takeoverPath, { bigint: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  if (!before.isSymbolicLink() || before.size < 1n || before.size > BigInt(policy.maxRecordBytes) ||
+      policy.symlinkReadBytes < policy.maxRecordBytes) return null;
+  accountRead(policy.symlinkReadBytes);
+  const raw = readlinkSync(takeoverPath, { encoding: 'buffer' });
+  const after = lstatSync(takeoverPath, { bigint: true });
+  if (!after.isSymbolicLink() || after.dev !== before.dev || after.ino !== before.ino || after.size !== before.size ||
+      raw.byteLength !== Number(before.size) || raw.byteLength > policy.maxRecordBytes) return null;
+  let text: string;
+  try { text = new TextDecoder('utf-8', { fatal: true }).decode(raw); }
+  catch { return null; }
+  return parseTakeoverClaim(text);
+}
+
+function readTakeoverClaimBounded(
+  takeoverPath: string,
+  lockPath: string,
+  expectedLock: LockRecord,
+  expectedLockGeneration: Readonly<{ readonly dev: bigint; readonly ino: bigint }>,
+  policy: DispatchInvocationReadPolicy,
+  accountRead: (bytes: number) => void,
+): TakeoverClaim | null {
+  let claimStats;
+  try { claimStats = lstatSync(takeoverPath, { bigint: true }); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null; throw error; }
+  if (claimStats.isSymbolicLink()) return readSymlinkTakeoverClaimBounded(takeoverPath, policy, accountRead);
+  if (!claimStats.isFile() || claimStats.size > BigInt(policy.maxRecordBytes) ||
+      claimStats.dev !== expectedLockGeneration.dev || claimStats.ino !== expectedLockGeneration.ino) return null;
+  const lockStats = lstatSync(lockPath, { bigint: true });
+  if (!lockStats.isFile() || lockStats.isSymbolicLink() || lockStats.dev !== expectedLockGeneration.dev ||
+      lockStats.ino !== expectedLockGeneration.ino || lockStats.size !== claimStats.size) return null;
+  const bounded = boundedRecordFromDescriptor(takeoverPath, policy, accountRead, expectedLockGeneration);
+  const claimAfter = lstatSync(takeoverPath, { bigint: true });
+  const lockAfter = lstatSync(lockPath, { bigint: true });
+  if (bounded === null || claimAfter.isSymbolicLink() || !claimAfter.isFile() ||
+      claimAfter.dev !== expectedLockGeneration.dev || claimAfter.ino !== expectedLockGeneration.ino ||
+      lockAfter.isSymbolicLink() || !lockAfter.isFile() || lockAfter.dev !== expectedLockGeneration.dev ||
+      lockAfter.ino !== expectedLockGeneration.ino || !sameLockRecord(bounded.record, expectedLock)) return null;
+  return bounded.record;
+}
+
 function readSymlinkTakeoverClaim(takeoverPath: string): TakeoverClaim | null {
   try {
     return parseTakeoverClaim(readlinkSync(takeoverPath, 'utf8'));
@@ -283,6 +427,12 @@ function compatibleProcessStartSchemes(recorded: string, current: string): boole
 /** Acquire the small same-host fence that complements the GitHub claim lease. */
 export function acquireDispatchInvocationLock(options: DispatchInvocationLockOptions): DispatchInvocationLock {
   if (!path.isAbsolute(options.lockPath)) throw new Error('TACHIKO_DISPATCH_LOCK_PATH must be an absolute path.');
+  const readPolicy = options.readPolicy;
+  if (readPolicy !== undefined && (!Number.isSafeInteger(readPolicy.maxRecordBytes) || readPolicy.maxRecordBytes < 1 ||
+      readPolicy.maxRecordBytes > 4096 || !Number.isSafeInteger(readPolicy.symlinkReadBytes) ||
+      readPolicy.symlinkReadBytes < readPolicy.maxRecordBytes)) {
+    throw new Error('Dispatch invocation bounded-read policy is invalid.');
+  }
   const validatePath = () => assertSafeCurrentAccountPathIfApplicable(options.lockPath, 'file');
   validatePath();
   const makeNonce = options.nonce ?? randomUUID;
@@ -303,13 +453,18 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
   };
 
   const fsyncParent = () => (options.syncDirectory ?? fsyncDirectory)(path.dirname(options.lockPath));
-  const publish = (): boolean => {
+  const ordinaryRead = readPolicy?.accountRead;
+  const publish = (accountRead?: (bytes: number) => void): boolean => {
     const directory = path.dirname(options.lockPath);
     ensureDurableDirectory(directory, { mode: 0o700, syncDirectoryHierarchy: options.syncDirectoryHierarchy });
     validatePath();
     const tempPath = `${options.lockPath}.tmp-${randomBytes(16).toString('hex')}`;
     let descriptor: number | undefined;
     let linked = false;
+    let published = false;
+    let exists = false;
+    let handoff: DispatchInvocationPublicationHandoff | undefined;
+    let discardConsumed = false;
     let failure: unknown;
     try {
       descriptor = openSync(tempPath, 'wx', 0o600);
@@ -322,53 +477,82 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
       }
       fchmodSync(descriptor, 0o600);
       fsyncSync(descriptor);
-      closeSync(descriptor);
-      descriptor = undefined;
+      if (options.preparePublication !== undefined) {
+        const stats = fstatSync(descriptor, { bigint: true });
+        if (!stats.isFile() || stats.size !== BigInt(data.byteLength) || stats.size < 1n || stats.size > 4096n) {
+          throw new Error('Dispatch invocation lock prepared owner is not the expected bounded regular file.');
+        }
+        const publication: PreparedDispatchInvocationPublication = Object.freeze({
+          owner: Object.freeze({ ...owner }),
+          temporaryPath: tempPath,
+          generation: Object.freeze({ dev: stats.dev, ino: stats.ino }),
+        });
+        const closing = descriptor;
+        descriptor = undefined;
+        closeSync(closing);
+        handoff = options.preparePublication(publication, accountRead ?? ordinaryRead);
+      } else {
+        const closing = descriptor;
+        descriptor = undefined;
+        closeSync(closing);
+      }
       options.beforeCanonicalLink?.();
       validatePath();
       try {
         linkSync(tempPath, options.lockPath);
         linked = true;
       } catch (error: unknown) {
-        if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'EEXIST') return false;
-        throw error;
+        if (typeof error === 'object' && error !== null && (error as { code?: unknown }).code === 'EEXIST') exists = true;
+        else throw error;
       }
-      fsyncParent();
-      return true;
+      if (!exists) {
+        fsyncParent();
+        published = true;
+      }
     } catch (error) {
       failure = error;
       if (linked) {
         try {
-          const canonicalStats = lstatSync(options.lockPath);
-          const tempStats = lstatSync(tempPath);
+          const canonicalStats = lstatSync(options.lockPath, { bigint: true });
+          const tempStats = lstatSync(tempPath, { bigint: true });
           if (canonicalStats.isFile() && !canonicalStats.isSymbolicLink() &&
               tempStats.isFile() && !tempStats.isSymbolicLink() &&
               canonicalStats.dev === tempStats.dev && canonicalStats.ino === tempStats.ino) {
+            handoff?.beforeRollbackUnlink();
             validatePath();
             unlinkSync(options.lockPath);
+            handoff?.afterRollbackUnlink();
             fsyncParent();
           }
         } catch {
-          // Preserve the publication error; cleanup must never remove an
-          // unverified successor or turn an uncertain fsync into success.
+          // Preserve the publication error. A failed handoff guard deliberately
+          // leaves the exact published owner for its registered recovery entry.
         }
       }
-      throw error;
     } finally {
       if (descriptor !== undefined) {
-        try { closeSync(descriptor); } catch (error) { if (failure === undefined) throw error; }
+        const closing = descriptor;
+        descriptor = undefined;
+        try { closeSync(closing); } catch (error) { if (failure === undefined) failure = error; }
       }
-      try { validatePath(); unlinkSync(tempPath); } catch (error: unknown) {
+      if (!linked && handoff !== undefined && !discardConsumed) {
+        discardConsumed = true;
+        try { handoff.discardUnpublished(); } catch (error) { if (failure === undefined) failure = error; }
+      }
+      try { handoff?.beforeTemporaryUnlink?.(); validatePath(); unlinkSync(tempPath); } catch (error: unknown) {
         if (typeof error !== 'object' || error === null || (error as { code?: unknown }).code !== 'ENOENT') {
-          if (failure === undefined) throw error;
+          if (failure === undefined) failure = error;
         }
       }
     }
+    if (failure !== undefined) throw failure;
+    return published;
   };
 
   if (!publish()) {
     validatePath();
-    const existing = readLock(options.lockPath);
+    const existingRead = readPolicy === undefined ? undefined : readLockBounded(options.lockPath, readPolicy);
+    const existing = readPolicy === undefined ? readLock(options.lockPath) : existingRead?.record ?? null;
     if (existing === null || !definitelyStale(existing, alive, identity, processStart)) {
       throw new DispatchInvocationLockedError(options.lockPath);
     }
@@ -387,18 +571,29 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
         throw new DispatchInvocationLockedError(options.lockPath);
       }
       visitedTakeoverPaths.add(takeoverPath);
-      if (!createTakeoverClaim(takeoverPath, claim)) {
+      const continuation = readPolicy?.reserveReadBytes(4 * readPolicy.maxRecordBytes);
+      const created = createTakeoverClaim(takeoverPath, claim);
+      if (!created) {
+        continuation?.releaseUnused();
         validatePath();
-        const previousClaim = readTakeoverClaim(takeoverPath, options.lockPath, existing);
+        const previousClaim = readPolicy === undefined
+          ? readTakeoverClaim(takeoverPath, options.lockPath, existing)
+          : existingRead == null ? null : readTakeoverClaimBounded(takeoverPath, options.lockPath, existing,
+            existingRead.generation, readPolicy, ordinaryRead!);
         if (previousClaim === null || !definitelyStale(previousClaim, alive, identity, processStart)) {
           throw new DispatchInvocationLockedError(options.lockPath);
         }
         takeoverPath = staleTakeoverRecoveryPath(takeoverRootPath, previousClaim);
         continue;
       }
-      const current = readLock(options.lockPath);
+      const criticalRead = continuation?.accountRead ?? ordinaryRead;
+      const currentRead = readPolicy === undefined ? undefined : readLockBounded(options.lockPath, readPolicy, criticalRead);
+      const current = readPolicy === undefined ? readLock(options.lockPath) : currentRead?.record ?? null;
       if (current === null || !sameLockRecord(current, existing) ||
+          (readPolicy !== undefined && (currentRead?.generation.dev !== existingRead?.generation.dev ||
+            currentRead?.generation.ino !== existingRead?.generation.ino)) ||
           !definitelyStale(current, alive, identity, processStart)) {
+        continuation?.releaseUnused();
         throw new DispatchInvocationLockedError(options.lockPath);
       }
       try {
@@ -406,22 +601,43 @@ export function acquireDispatchInvocationLock(options: DispatchInvocationLockOpt
         unlinkSync(options.lockPath);
         fsyncParent();
       } catch {
+        continuation?.releaseUnused();
         throw new DispatchInvocationLockedError(options.lockPath);
       }
-      if (!publish()) throw new DispatchInvocationLockedError(options.lockPath);
+      if (!publish(criticalRead)) {
+        continuation?.releaseUnused();
+        throw new DispatchInvocationLockedError(options.lockPath);
+      }
+      if (continuation !== undefined && readPolicy !== undefined) {
+        const published = readLockBounded(options.lockPath, readPolicy, criticalRead);
+        if (published === null || !sameLockRecord(published.record, owner)) {
+          continuation.releaseUnused();
+          throw new DispatchInvocationLockedError(options.lockPath);
+        }
+      }
+      continuation?.releaseUnused();
       break;
     }
-    validatePath();
-    if (!sameLockRecord(readLock(options.lockPath) ?? { nonce: '', pid: 0 }, owner)) {
-      throw new DispatchInvocationLockedError(options.lockPath);
+    if (readPolicy === undefined) {
+      validatePath();
+      if (!sameLockRecord(readLock(options.lockPath) ?? { nonce: '', pid: 0 }, owner)) {
+        throw new DispatchInvocationLockedError(options.lockPath);
+      }
     }
   }
 
   return {
     release() {
       validatePath();
-      const current = readLock(options.lockPath);
+      const currentRead = readPolicy === undefined ? undefined : readLockBounded(options.lockPath, readPolicy,
+        readPolicy.releaseRead?.accountRead ?? readPolicy.accountRead);
+      const current = readPolicy === undefined ? readLock(options.lockPath) : currentRead?.record ?? null;
       if (current === null || !sameLockRecord(current, owner)) return;
+      if (readPolicy !== undefined) {
+        const currentPath = lstatSync(options.lockPath, { bigint: true });
+        if (!currentPath.isFile() || currentPath.isSymbolicLink() || currentPath.dev !== currentRead?.generation.dev ||
+            currentPath.ino !== currentRead?.generation.ino) return;
+      }
       try {
         validatePath();
         unlinkSync(options.lockPath);
