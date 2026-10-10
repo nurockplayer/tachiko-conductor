@@ -55,23 +55,39 @@ function isBoundedCapturePreview(value: unknown): boolean {
 /** Validates only the known bounded payloads before durable JSON serialization. */
 export function isKnownBoundedValidationPayloadCoherent(value: unknown): boolean {
   if (typeof value !== 'object' || value === null) return true;
-  const local = (value as Record<string, unknown>).local;
+  const localDescriptor = Object.getOwnPropertyDescriptor(value, 'local');
+  if (localDescriptor === undefined) return true;
+  if (!('value' in localDescriptor)) return false;
+  const local = localDescriptor.value;
   if (typeof local !== 'object' || local === null) return true;
-  const commands = (local as Record<string, unknown>).commands;
+  const commandsDescriptor = Object.getOwnPropertyDescriptor(local, 'commands');
+  if (commandsDescriptor === undefined) return true;
+  if (!('value' in commandsDescriptor)) return false;
+  const commands = commandsDescriptor.value;
   if (!Array.isArray(commands)) return true;
   for (let index = 0; index < commands.length; index += 1) {
-    const command = commands[index];
+    const commandDescriptor = Object.getOwnPropertyDescriptor(commands, String(index));
+    if (commandDescriptor === undefined) continue;
+    if (!('value' in commandDescriptor)) return false;
+    const command = commandDescriptor.value;
     if (typeof command !== 'object' || command === null) continue;
-    const record = command as Record<string, unknown>;
-    if (record.output !== undefined && !isToolOutputEnvelope(record.output)) return false;
-    if (record.capturePreview !== undefined && !isBoundedCapturePreview(record.capturePreview)) return false;
+    for (const key of ['output', 'capturePreview'] as const) {
+      const descriptor = Object.getOwnPropertyDescriptor(command, key);
+      if (descriptor !== undefined && !('value' in descriptor)) return false;
+      if (key === 'output' && descriptor?.value !== undefined && !isToolOutputEnvelope(descriptor.value)) return false;
+      if (key === 'capturePreview' && descriptor?.value !== undefined && !isBoundedCapturePreview(descriptor.value)) return false;
+    }
   }
   return true;
 }
 
 function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
   const allowed = new Set(allowedKeys);
-  return !hasCustomToJSON(value) && Reflect.ownKeys(value).every((key) => typeof key === 'string' && allowed.has(key));
+  return !hasCustomToJSON(value) && Reflect.ownKeys(value).every((key) => {
+    if (typeof key !== 'string' || !allowed.has(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && 'value' in descriptor;
+  });
 }
 
 function hasCustomToJSON(value: object): boolean {
@@ -90,7 +106,8 @@ function hasSafeDiagnosticsArray(value: unknown): value is readonly string[] {
     /^(0|[1-9]\d*)$/.test(key) && Number(key) < value.length));
   if (!hasOnlyIndexes) return false;
   for (let index = 0; index < value.length; index += 1) {
-    if (!Object.prototype.hasOwnProperty.call(value, index) || typeof value[index] !== 'string') return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !('value' in descriptor) || typeof descriptor.value !== 'string') return false;
   }
   return true;
 }

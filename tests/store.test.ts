@@ -1303,6 +1303,56 @@ describe('JsonFileStore — persistence round-trips', () => {
         `${candidate.label} corrupt read/CAS leaves operational projection unchanged`);
     }
 
+    const accessorCases: Array<{ readonly label: string; readonly make: (calls: { count: number }) => typeof output }> = [
+      { label: 'envelope summary accessor', make: (calls) => {
+        const candidate = { ...output } as any;
+        Object.defineProperty(candidate, 'summary', { enumerable: true, get() { calls.count += 1; return 'ok'; } });
+        return candidate;
+      } },
+      { label: 'nested stream accessor', make: (calls) => {
+        const stdout = { ...output.stdout } as any;
+        Object.defineProperty(stdout, 'preview', { enumerable: true, get() { calls.count += 1; return 'x'; } });
+        return { ...output, stdout };
+      } },
+      { label: 'diagnostic array item accessor', make: (calls) => {
+        const diagnostics = ['ok'];
+        Object.defineProperty(diagnostics, '0', { enumerable: true, configurable: true,
+          get() { calls.count += 1; return 'ok'; } });
+        return { ...output, diagnostics };
+      } },
+    ];
+    for (const candidateCase of accessorCases) {
+      const calls = { count: 0 };
+      const candidateOutput = candidateCase.make(calls);
+      const candidateValidation = {
+        ...validation,
+        local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: candidateOutput }] },
+      };
+      const candidateRun = { ...validRun, validationResult: candidateValidation };
+      assert.equal(isToolOutputEnvelope(candidateOutput), false, `${candidateCase.label} is rejected without evaluating it`);
+      assert.equal(isValidationResultCoherent(candidateValidation), false, `${candidateCase.label} is rejected as evidence`);
+      assert.equal(calls.count, 0, `${candidateCase.label} remains unevaluated by validation guards`);
+
+      const { store: rejectedCreateStore, dir: rejectedCreateDir } = tempStore();
+      assert.throws(() => rejectedCreateStore.create(candidateRun), /invalid bounded validation output payload/);
+      assert.equal(existsSync(path.join(rejectedCreateDir, `${validRun.id}.json`)), false,
+        `${candidateCase.label} create publishes no Run`);
+      assert.equal(existsSync(operationalProjectionPath(rejectedCreateDir, validRun.id)), false,
+        `${candidateCase.label} create publishes no projection`);
+      assert.equal(calls.count, 0);
+
+      writeFileSync(runPath, originalRunBytes, 'utf8');
+      assert.throws(() => store.update(candidateRun), /invalid bounded validation output payload/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidateCase.label} update preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidateCase.label} update preserves projection bytes`);
+      assert.throws(() => store.updateIfUnchanged!(validRun, candidateRun), /invalid bounded validation output payload/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidateCase.label} CAS preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidateCase.label} CAS preserves projection bytes`);
+      assert.equal(calls.count, 0, `${candidateCase.label} stays unevaluated across store writes`);
+    }
+
     const falseTruncatedOutput = structuredClone(output) as any;
     falseTruncatedOutput.stdout.truncated = false;
     falseTruncatedOutput.overflow.stdout = false;

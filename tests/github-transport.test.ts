@@ -206,6 +206,47 @@ describe('GhCliTransport', () => {
   });
 });
 
+describe('NodeProcessRunner capture cleanup', () => {
+  it('automatically aborts its owned capture when the injected store clock fails after writer start', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-runner-invalid-abort-clock-'));
+    try {
+      let currentTime = new Date('2030-01-01T00:00:00.000Z');
+      const storeRoot = path.join(directory, 'evidence');
+      const store = new FileToolOutputStore(storeRoot, {
+        capacity: 1, retentionMs: 1_000, now: () => currentTime,
+      });
+      const marker = 'NODE-PROCESS-RUNNER-DIRECT-17';
+      const script = `process.stdout.write(${JSON.stringify(marker)}); process.exitCode = 17;`;
+      const result = await new NodeProcessRunner().run(process.execPath, ['-e', script], {
+        timeoutMs: 3_000,
+        outputStore: store,
+        // The public runner calls this after starting its private writer and
+        // immediately before spawning the child.
+        beforeSpawn: () => { currentTime = new Date(Number.NaN); },
+      });
+      currentTime = new Date('2030-01-01T00:00:00.000Z');
+
+      assert.equal(result.exitCode, 17, 'capture abort keeps the observed child exit authoritative');
+      assert.equal(result.captureStatus, 'partial');
+      assert.equal(result.output, undefined, 'forced incomplete capture publishes no complete artifact');
+      assert.ok(result.stdout.includes(marker));
+      assert.deepEqual(readdirSync(storeRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [],
+        'the runner disposes both raw streams without exposing its private writer');
+      const operations = path.join(storeRoot, 'operations');
+      const operationFile = readdirSync(operations).find((name) => /^[a-f0-9-]{36}\.json$/.test(name));
+      assert.ok(operationFile);
+      const metadata = JSON.parse(readFileSync(path.join(operations, operationFile!), 'utf8')) as {
+        readonly state: string; readonly retainedUntil?: string;
+      };
+      assert.equal(metadata.state, 'aborted');
+      assert.equal(metadata.retainedUntil, undefined, 'the abort marker does not create a retention deadline');
+      assert.deepEqual(readdirSync(operations).filter((name) => name.endsWith('.lock')), [], 'the operation owner is released');
+      const reusable = store.beginOperation({ kind: 'after-node-runner-invalid-clock-abort' });
+      reusable.abort();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+});
+
 describe('NodeProcessRunner', () => {
   it('runs the admission fence before rejecting invalid captured timeouts without preparing capture or child', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-invalid-captured-timeout-fence-'));

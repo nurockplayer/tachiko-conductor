@@ -303,6 +303,53 @@ describe('ConfiguredLocalValidationAdapter', () => {
     reusable.abort();
   });
 
+  it('cleans the public runner capture after its injected store clock fails', async () => {
+    const owned = request();
+    const evidenceRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-invalid-abort-clock-'));
+    dirs.push(evidenceRoot);
+    let currentTime = new Date('2030-01-01T00:00:00.000Z');
+    const store = new FileToolOutputStore(evidenceRoot, { capacity: 1, retentionMs: 1_000, now: () => currentTime });
+    const script = `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(() => {}, 3500)'], { stdio: 'inherit' }); process.stdout.write('DIRECT-EXIT-17'); setImmediate(() => process.exit(17));`;
+    const childApi = createRequire(import.meta.url)('node:child_process') as { spawn: typeof childProcess.spawn };
+    const originalSpawn = childApi.spawn;
+    childApi.spawn = ((...args: Parameters<typeof childProcess.spawn>) => {
+      const child = originalSpawn(...args);
+      child.once('exit', () => { currentTime = new Date(Number.NaN); });
+      return child;
+    }) as typeof childProcess.spawn;
+    syncBuiltinESMExports();
+    let result;
+    try {
+      result = await new ConfiguredLocalValidationAdapter({
+        ...configuration([process.execPath, '-e', script], 1_000),
+        commands: [{ argv: [process.execPath, '-e', script], timeoutMs: 1_000, captureOutput: true }],
+        outputStore: store,
+      }).validate(owned);
+    } finally {
+      childApi.spawn = originalSpawn;
+      syncBuiltinESMExports();
+      currentTime = new Date('2030-01-01T00:00:00.000Z');
+    }
+
+    assert.equal(result!.status, 'failed');
+    assert.equal(result!.commands[0]?.outcome, 'failed');
+    assert.equal(result!.commands[0]?.exitCode, 17, 'capture cleanup cannot replace the direct exit status');
+    assert.equal(result!.commands[0]?.captureStatus, 'partial');
+    assert.equal(result!.commands[0]?.output, undefined);
+    assert.ok(result!.commands[0]?.capturePreview?.stdout.preview.includes('DIRECT-EXIT-17'));
+    assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), [],
+      'the privately owned writer removes both raw files without a caller retry');
+    const operations = path.join(evidenceRoot, 'operations');
+    const operationFile = readdirSync(operations).find((name) => /^[a-f0-9-]{36}\.json$/.test(name));
+    assert.ok(operationFile, 'the operation terminal record remains inspectable');
+    const metadata = JSON.parse(readFileSync(path.join(operations, operationFile!), 'utf8')) as { readonly state: string; readonly retainedUntil?: string };
+    assert.equal(metadata.state, 'aborted');
+    assert.equal(metadata.retainedUntil, undefined, 'abort records receive no invented retention deadline');
+    assert.deepEqual(readdirSync(operations).filter((name) => name.endsWith('.lock')), [], 'operation ownership is released');
+    const reusable = store.beginOperation({ kind: 'after-public-runner-invalid-clock-abort' });
+    reusable.abort();
+  });
+
   it('keeps forced-incomplete capture partial even when a custom writer cannot abort', async () => {
     const owned = request();
     const marker = 'CUSTOM-WRITER-FORCED-INCOMPLETE';

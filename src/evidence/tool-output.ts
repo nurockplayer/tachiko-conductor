@@ -712,7 +712,11 @@ function isToolOutputArtifactFileIdentity(value: unknown): value is ToolOutputAr
 
 function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
   const allowed = new Set(allowedKeys);
-  return !hasCustomToJSON(value) && Reflect.ownKeys(value).every((key) => typeof key === 'string' && allowed.has(key));
+  return !hasCustomToJSON(value) && Reflect.ownKeys(value).every((key) => {
+    if (typeof key !== 'string' || !allowed.has(key)) return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    return descriptor !== undefined && 'value' in descriptor;
+  });
 }
 
 function hasCustomToJSON(value: object): boolean {
@@ -731,7 +735,8 @@ function hasOnlyStringArrayItems(value: unknown): value is readonly string[] {
     /^(0|[1-9]\d*)$/.test(key) && Number(key) < value.length));
   if (!allowedKeys) return false;
   for (let index = 0; index < value.length; index += 1) {
-    if (!Object.prototype.hasOwnProperty.call(value, index) || typeof value[index] !== 'string') return false;
+    const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+    if (descriptor === undefined || !('value' in descriptor) || typeof descriptor.value !== 'string') return false;
   }
   return true;
 }
@@ -1597,7 +1602,17 @@ export class FileToolOutputStore implements ToolOutputStore {
           return;
         }
         operationState = 'abort-pending';
-        abortTimestamp ??= readStoreClock(this.now).toISOString();
+        if (abortTimestamp === undefined) {
+          try { abortTimestamp = readStoreClock(this.now).toISOString(); }
+          catch (error) {
+            if (!(error instanceof ToolOutputClockError)) throw error;
+            // A bad clock must not prevent disposal of files owned by this
+            // operation. `createdAt` is already validated and durable; here
+            // it is only an abort recovery marker, never a retention deadline
+            // or a claim about the actual abort time.
+            abortTimestamp = createdAt;
+          }
+        }
         let cleanupFailed = false;
         let firstFailure: unknown;
         for (const writer of allWriters.keys()) {
