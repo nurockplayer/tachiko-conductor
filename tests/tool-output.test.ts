@@ -1045,6 +1045,43 @@ describe('UTF-8 tool output ranges', () => {
         } finally { rmSync(directory, { recursive: true, force: true }); }
       });
 
+      it('file: rejects unrepresentable retention deadlines before admission and keeps an overflowing close abortable', () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-retention-deadline-'));
+        try {
+          const absentRoot = path.join(directory, 'absent');
+          assert.throws(() => new FileToolOutputStore(absentRoot, { retentionMs: Number.MAX_SAFE_INTEGER }), /retention deadline.*representable/i);
+          assert.equal(existsSync(absentRoot), false, 'an invalid configured deadline is refused before root creation');
+          assert.throws(() => new FileToolOutputStore(absentRoot, { retentionMs: 1, now: () => new Date(Number.NaN) }), /valid date|representable/i);
+          assert.equal(existsSync(absentRoot), false, 'an invalid injected clock is refused before root creation');
+
+          const maxDateTime = 8.64e15;
+          const atBoundary = new FileToolOutputStore(path.join(directory, 'boundary'), {
+            capacity: 1, retentionMs: 1_000, now: () => new Date(maxDateTime - 1_000),
+          });
+          const boundaryReference = atBoundary.save({ stdout: 'upper date boundary', stderr: '' });
+          assert.equal(boundaryReference.retainedUntil, new Date(maxDateTime).toISOString(), 'the inclusive ECMAScript date boundary remains valid');
+          assert.throws(() => new FileToolOutputStore(path.join(directory, 'past-boundary'), {
+            retentionMs: 1_001, now: () => new Date(maxDateTime - 1_000),
+          }), /retention deadline.*representable/i);
+
+          let now = new Date('2030-01-01T00:00:00.000Z');
+          const root = path.join(directory, 'advancing-clock');
+          const store = new FileToolOutputStore(root, { capacity: 1, retentionMs: 1_000, now: () => now });
+          const operation = store.beginOperation({ kind: 'retention-deadline-overflow' });
+          const writer = operation.startCapture(DEFAULT_TOOL_OUTPUT_POLICY);
+          writer.write('stdout', 'abortable evidence');
+          writer.finish();
+          now = new Date(maxDateTime - 500);
+          assert.throws(() => operation.close(), /retention deadline.*representable/i);
+          operation.abort();
+          const metadataPath = path.join(root, 'operations', `${operation.id}.json`);
+          const metadata = JSON.parse(readFileSync(metadataPath, 'utf8')) as { readonly state: string; readonly retainedUntil?: string; readonly artifacts?: readonly unknown[] };
+          assert.equal(metadata.state, 'aborted', 'a rejected close leaves the operation available for cleanup');
+          assert.equal(metadata.retainedUntil, undefined, 'no invalid closed deadline is persisted');
+          assert.deepEqual(metadata.artifacts, [], 'no artifact reference is published after the rejected close');
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+
       it('file: persists finite per-operation retention and releases only the selected operation early', () => {
         const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-output-release-'));
         try {

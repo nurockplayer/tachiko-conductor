@@ -223,6 +223,24 @@ function assertPositiveInteger(value: number, label: string): void {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${label} must be a positive safe integer.`);
 }
 
+const MAX_DATE_TIME = 8.64e15;
+
+function retentionDeadline(now: () => Date, retentionMs: number): { readonly closedAt: string; readonly retainedUntil: string } {
+  let clock: Date;
+  try { clock = now(); }
+  catch { throw new Error('Tool-output store clock must return a valid date for its retention deadline.'); }
+  const clockMs = clock instanceof Date ? clock.getTime() : Number.NaN;
+  const deadlineMs = clockMs + retentionMs;
+  if (!Number.isFinite(clockMs) || Math.abs(clockMs) > MAX_DATE_TIME || !Number.isFinite(deadlineMs) || Math.abs(deadlineMs) > MAX_DATE_TIME) {
+    throw new Error('Tool-output retention deadline must be representable as a valid date.');
+  }
+  const deadline = new Date(deadlineMs);
+  if (!Number.isFinite(deadline.getTime()) || deadline.getTime() !== deadlineMs) {
+    throw new Error('Tool-output retention deadline must be representable as a valid date.');
+  }
+  return { closedAt: new Date(clockMs).toISOString(), retainedUntil: deadline.toISOString() };
+}
+
 function isCanonicalTimestamp(value: unknown): value is string {
   if (typeof value !== 'string') return false;
   const parsed = Date.parse(value);
@@ -1241,6 +1259,7 @@ export class FileToolOutputStore implements ToolOutputStore {
     assertPositiveInteger(this.captureMaxBytes, 'Tool-output capture byte budget');
     if (this.captureMaxBytes > MAX_TOOL_OUTPUT_CAPTURE_BYTES) throw new Error(`Tool-output capture byte budget exceeds the maximum of ${MAX_TOOL_OUTPUT_CAPTURE_BYTES}.`);
     this.now = options.now ?? (() => new Date());
+    retentionDeadline(this.now, this.retentionMs);
     this.testFaults = options.testFaults;
     const requested = path.resolve(root);
     try {
@@ -1499,8 +1518,9 @@ export class FileToolOutputStore implements ToolOutputStore {
         if (operationState === 'abort-pending') throw new Error('Tool-output operation abort is pending.');
         if (operationState === 'open') {
           if (activeWriters.size > 0 || unresolvedCaptureIds.size > 0) throw new Error('Tool-output operation cannot commit while a capture writer or prepared capture ID is unresolved.');
-          closeTimestamp = this.now().toISOString();
-          retainedUntil = new Date(Date.parse(closeTimestamp) + this.retentionMs).toISOString();
+          const deadline = retentionDeadline(this.now, this.retentionMs);
+          closeTimestamp = deadline.closedAt;
+          retainedUntil = deadline.retainedUntil;
           committedReferences = artifacts.map((artifact) => ({ ...artifact, operationId: id, retainedUntil }));
           operationState = 'close-pending';
           terminalKind = 'close';
