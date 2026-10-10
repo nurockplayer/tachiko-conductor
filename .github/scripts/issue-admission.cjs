@@ -48,7 +48,6 @@ const AUTHORITY_SNAPSHOT_QUERY = `
           pageInfo { hasNextPage endCursor }
         }
       }
-      pullRequest(number: $number) { id number }
     }
   }
 `;
@@ -374,7 +373,7 @@ function connectionPage(connection, label, afterCursor) {
   return { edges, hasNextPage, endCursor };
 }
 
-function issueCore(repository, issue, pullRequest, expected) {
+function issueCore(repository, issue, expected) {
   assertObject(repository, 'repository');
   if (typeof repository.id !== 'string' || repository.id === '' ||
       (expected.repositoryId && repository.id !== expected.repositoryId)) {
@@ -388,7 +387,6 @@ function issueCore(repository, issue, pullRequest, expected) {
     throw snapshotError('Repository owner is not a supported personal User.');
   }
   if (issue === null) {
-    if (pullRequest !== null && typeof pullRequest === 'object' && pullRequest.number === expected.number) return { pullRequest: true, owner };
     throw snapshotError('The target is not a positively identified Issue.');
   }
   assertObject(issue, 'issue');
@@ -460,8 +458,9 @@ async function fetchAuthoritySnapshot(github, { owner, repo, number, expectedRep
     const data = assertObject(assertField(response, 'repository', 'GraphQL response'), 'GraphQL response.repository');
     const repository = assertObject(data, 'repository');
     if (typeof repository.id !== 'string' || repository.id === '') throw snapshotError('Repository ID is unavailable.');
-    const result = issueCore(repository, assertField(repository, 'issue', 'repository'), assertField(repository, 'pullRequest', 'repository'), expected);
-    if (result.pullRequest) return { pullRequest: true, repositoryId: repository.id };
+    // The workflow rejects PRs through REST before this read. A same-number
+    // pullRequest lookup errors for ordinary Issues and poisons their response.
+    const result = issueCore(repository, assertField(repository, 'issue', 'repository'), expected);
     const issue = result.issue;
     const currentCore = {
       id: issue.id,

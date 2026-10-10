@@ -90,7 +90,7 @@ function makeHarness(options: {
   commentWriteFailure?: 'update-once' | 'update-always' | 'create-after-apply' | 'duplicate';
   ordinaryAddFailure?: 'apply-then-throw' | 'throw';
   finalReadyAddFailure?: boolean;
-  graphqlFailure?: (read: number, variables: Record<string, unknown>) => unknown;
+  graphqlFailure?: (read: number, variables: Record<string, unknown>, query: string) => unknown;
   malformedPage?: (response: any, read: number, variables: Record<string, unknown>) => any;
 } = {}) {
   const base = options.snapshots?.[0] ?? {};
@@ -136,10 +136,10 @@ function makeHarness(options: {
   }
 
   const github: any = {
-    graphql: async (_query: string, variables: Record<string, unknown>) => {
+    graphql: async (query: string, variables: Record<string, unknown>) => {
       counts.graphql += 1;
       if (variables.commentCursor === null && variables.deletionCursor === null) read += 1;
-      const fail = options.graphqlFailure?.(read, variables);
+      const fail = options.graphqlFailure?.(read, variables, query);
       if (fail) throw fail;
       const supplied = snapshots[Math.min(read, snapshots.length - 1)] ?? {};
       const currentIssue = { ...issueSnapshot(), ...(supplied.issue ?? {}) };
@@ -248,6 +248,46 @@ function makeHarness(options: {
     get projection() { return comments.find((comment) => comment.user?.login === 'github-actions[bot]' && comment.body?.includes(admission.ADMISSION_MARKER))?.body; },
   };
 }
+
+test('ordinary Issue provenance does not request a nonexistent same-number PullRequest', async () => {
+  const queries: string[] = [];
+  const harness = makeHarness({
+    graphqlFailure(_read, variables, query) {
+      queries.push(query);
+      // GitHub returns a resolver error for this wrong-type lookup, not merely
+      // pullRequest: null. Octokit rejects the whole request despite Issue data.
+      if (/\bpullRequest\s*\(/.test(query)) {
+        return Object.assign(new Error(`Request failed due to following response errors:\n - Could not resolve to a PullRequest with the number of ${variables.number}.`), {
+          errors: [{ type: 'NOT_FOUND', path: ['repository', 'pullRequest'] }],
+        });
+      }
+    },
+    malformedPage(response) {
+      delete response.repository.pullRequest;
+      return response;
+    },
+  });
+  await harness.run();
+  assert.ok(harness.labels.has('dispatch:ready'), harness.projection);
+  assert.equal(harness.failures.length, 0);
+  assert.ok(queries.length >= 2, 'complete provenance is rechecked before projection');
+  assert.ok(queries.every((query) => /\bissue\s*\(number:\s*\$number\)/.test(query)));
+  assert.ok(queries.every((query) => !/\bpullRequest\s*\(/.test(query)));
+});
+
+test('Issue-only lookup still fails closed on missing target and real GraphQL errors', async () => {
+  for (const malformedPage of [
+    (response: any) => { response.repository.issue = null; return response; },
+    (response: any) => { delete response.repository.issue; return response; },
+    (response: any) => ({ ...response, errors: [{ type: 'FORBIDDEN', path: ['repository', 'issue', 'timelineItems'] }] }),
+  ]) {
+    const harness = makeHarness({ malformedPage });
+    await harness.run();
+    assert.equal(harness.labels.has('dispatch:ready'), false);
+    assert.ok(harness.labels.has('dispatch:blocked'));
+    assert.match(harness.projection, /provenance is unavailable/i);
+  }
+});
 
 test('workflow authenticates an unedited OWNER form, preserves concurrent labels, records hashes and is idempotent', async () => {
   const harness = makeHarness();
