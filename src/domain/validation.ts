@@ -1,7 +1,48 @@
 import type { HostedValidationEvidence, LocalValidationEvidence, ValidationResult, ValidationStatus } from './types.js';
+import { isToolOutputEnvelope, TOOL_OUTPUT_POLICY_MAXIMA } from '../evidence/tool-output.js';
 
 function isCommandOutcome(value: unknown): value is 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed' {
   return value === 'passed' || value === 'failed' || value === 'timed_out' || value === 'unavailable' || value === 'malformed';
+}
+
+function isCommandOutputCoherent(command: Record<string, unknown>): boolean {
+  if (command.captureStatus !== undefined && !['complete', 'partial', 'unavailable'].includes(command.captureStatus as string)) return false;
+  if (command.capturePreview !== undefined) {
+    if (command.captureStatus === undefined || command.captureStatus === 'complete' ||
+        typeof command.capturePreview !== 'object' || command.capturePreview === null) return false;
+    const preview = command.capturePreview as Record<string, unknown>;
+    const streamValid = (value: unknown): boolean => {
+      if (typeof value !== 'object' || value === null) return false;
+      const stream = value as Record<string, unknown>;
+      if (!Number.isSafeInteger(stream.bytes) || (stream.bytes as number) < 0 || typeof stream.preview !== 'string' ||
+          !Number.isSafeInteger(stream.previewBytes) || (stream.previewBytes as number) < 0 ||
+          (stream.previewBytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes ||
+          (stream.previewBytes as number) > (stream.bytes as number) ||
+          stream.preview.length > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes || typeof stream.truncated !== 'boolean' ||
+          ((stream.bytes as number) > TOOL_OUTPUT_POLICY_MAXIMA.previewBytes && stream.truncated !== true)) return false;
+      return Buffer.byteLength(stream.preview, 'utf8') === stream.previewBytes;
+    };
+    if (!streamValid(preview.stdout) || !streamValid(preview.stderr) || !Array.isArray(preview.diagnostics) ||
+        preview.diagnostics.length > TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics ||
+        typeof preview.diagnosticsTruncated !== 'boolean') return false;
+    let diagnosticBytes = 0;
+    for (let index = 0; index < preview.diagnostics.length; index += 1) {
+      const line = preview.diagnostics[index];
+      if (typeof line !== 'string') return false;
+      const separatorBytes = index === 0 ? 0 : 1;
+      if (diagnosticBytes + line.length + separatorBytes > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes) return false;
+      diagnosticBytes += Buffer.byteLength(line, 'utf8') + separatorBytes;
+      if (diagnosticBytes > TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes) return false;
+    }
+  }
+  if (command.output === undefined) return command.captureStatus !== 'complete';
+  if (command.capturePreview !== undefined) return false;
+  if (command.captureStatus !== undefined && command.captureStatus !== 'complete') return false;
+  if (!isToolOutputEnvelope(command.output)) return false;
+  const expected = command.outcome === 'passed' ? 'passed'
+    : command.outcome === 'failed' ? 'failed'
+      : command.outcome === 'timed_out' ? 'timed_out' : 'unknown';
+  return command.output.outcome === expected && command.output.exitCode === command.exitCode;
 }
 
 function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
@@ -16,7 +57,8 @@ function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
     typeof command.executable === 'string' &&
     (command.executable.trim() !== '' || command.outcome === 'malformed') && isCommandOutcome(command.outcome) &&
     (command.exitCode === null || typeof command.exitCode === 'number') &&
-    typeof command.durationMs === 'number' && Number.isSafeInteger(command.durationMs) && command.durationMs >= 0,
+    typeof command.durationMs === 'number' && Number.isSafeInteger(command.durationMs) && command.durationMs >= 0 &&
+    isCommandOutputCoherent(command),
   )) return false;
   const final = commands.at(-1);
   if (evidence.status === 'passed') return commands.length > 0 && commands.every((command) => command.outcome === 'passed' && command.exitCode === 0);

@@ -211,6 +211,7 @@ describe('ContainerWorkerBoundary', () => {
     assert.equal(result.restartPolicy, 'no');
     assert.equal(result.stdout, 'out');
     assert.equal(result.stderr, 'err');
+    assert.equal(Object.hasOwn(result, 'output'), false);
     assert.deepEqual(runtime.calls, [
       'create',
       `start:${ID}`,
@@ -232,6 +233,15 @@ describe('ContainerWorkerBoundary', () => {
     assert.equal(runtime.calls.filter((call) => call === `remove:${ID}`).length, 1);
   });
 
+  it('returns terminal logs transiently without creating a provider evidence artifact', async () => {
+    const runtime = new FakeRuntime();
+    runtime.logsResult = { stdout: 'transient worker output', stderr: '' };
+    const result = await new ContainerWorkerBoundary({ runtime }).run(spec());
+    assert.equal(result.stdout, 'transient worker output');
+    assert.equal(Object.hasOwn(result, 'output'), false);
+    assert.equal(runtime.calls.includes(`remove:${ID}`), true);
+  });
+
   it('stops, awaits terminal, kills, and removes by exact ID after a timeout, then rethrows the timeout', async () => {
     const runtime = new FakeRuntime();
     runtime.startError = containerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT, 'timed out');
@@ -249,6 +259,24 @@ describe('ContainerWorkerBoundary', () => {
       `remove:${ID}`,
     ]);
     assert.equal(runtime.calls.filter((call) => call === 'create').length, 1);
+  });
+
+  it('does not persist process evidence attached to a timeout error', async () => {
+    const runtime = new FakeRuntime();
+    runtime.startError = new WorkerRouterContainerError(
+      WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT,
+      'worker timed out',
+    );
+
+    let thrown: unknown;
+    try {
+      await new ContainerWorkerBoundary({ runtime }).run(spec());
+    } catch (error) {
+      thrown = error;
+    }
+    assert.ok(thrown instanceof WorkerRouterContainerError);
+    assert.equal(thrown.code, WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT);
+    assert.equal(Object.hasOwn(thrown, 'output'), false);
   });
 
   it('cleans up by exact ID on cancellation and reports a single bounded cleanup', async () => {

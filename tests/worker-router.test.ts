@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -20,7 +20,10 @@ import {
   type WorkerContainerSpec,
 } from '../src/agents/worker-router-container.js';
 import type { ProcessResult, ProcessRunner, ProcessRunOptions } from '../src/github/transport.js';
-import { TARGET } from './helpers.js';
+import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
+import { applyTransition } from '../src/domain/state-machine.js';
+import { JsonFileStore } from '../src/store/json-file-store.js';
+import { T0, TARGET, newRun } from './helpers.js';
 
 class FakeRunner implements ProcessRunner {
   readonly calls: Array<{ file: string; args: readonly string[]; options: ProcessRunOptions }> = [];
@@ -319,13 +322,79 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(runner.calls.length, 0);
   });
 
-  it('keeps only recognized provenance and never persists worker output', async () => {
-    const ws = workspace();
-    const container = new FakeContainer([containerResult({ exitCode: 7, stderr: `[worker-router] -> deepseek-worker\n${'x'.repeat(5000)}` })]);
-    const response = await new WorkerRouterAdapter({ runner: new FakeRunner([]), container, image: IMAGE }).run(requestFor(ws.workspacePath));
-    assert.equal(response.exitStatus, 'failure');
-    assert.match(response.diagnostics?.join('\n') ?? '', /deepseek-worker/);
-    assert.equal(response.diagnostics?.join('\n').includes('xxxxx'), false);
+  it('returns only the canonical recognized worker marker in success and failure results', async () => {
+    const largeWhitespace = `${' \t\u2003\u00a0'.repeat(2_000)}${'\n\u2028\u3000'.repeat(2_000)}`;
+    for (const worker of ['luna-worker', 'deepseek-worker'] as const) {
+      for (const outcome of ['success', 'failure'] as const) {
+        const ws = workspace();
+        const marker = `[worker-router] -> ${worker}`;
+        const container = new FakeContainer([containerResult({
+          exitCode: outcome === 'success' ? 0 : 7,
+          stderr: `${marker}${largeWhitespace}\nfollowing transcript ${'x'.repeat(5000)}`,
+        })]);
+        const runner = outcome === 'success'
+          ? new FakeRunner([result(HEAD), result(), result('To origin\n')])
+          : new FakeRunner([]);
+        const response = await new WorkerRouterAdapter({ runner, container, image: IMAGE }).run(requestFor(ws.workspacePath));
+        assert.equal(response.exitStatus, outcome);
+        if (outcome === 'success') assert.deepEqual(response.diagnostics, [marker], `${outcome}/${worker} retains only the compact canonical marker`);
+        else {
+          assert.equal(response.diagnostics?.at(-1), marker, `${outcome}/${worker} retains the compact marker after the typed failure`);
+          assert.equal(response.diagnostics?.join('\n').includes('xxxxx'), false, 'failure diagnostics omit the worker transcript');
+        }
+        assert.equal(response.diagnostics?.join('\n').includes('following transcript'), false,
+          `${outcome}/${worker} diagnostics omit transcript text after the marker`);
+
+        const runId = `worker-marker-${worker}-${outcome}`;
+        let run = applyTransition(newRun(runId, TARGET), { type: 'start' }, T0);
+        if (response.exitStatus === 'success') {
+          const headSha = response.headSha;
+          if (headSha === undefined) throw new Error('Successful worker result must include HEAD for persistence.');
+          run = applyTransition(run, { type: 'agent_succeeded', agentResult: response, headSha }, T0);
+        } else {
+          run = applyTransition(run, { type: 'agent_failed', agentResult: response }, T0);
+        }
+
+        const storeDir = mkdtempSync(path.join(os.tmpdir(), 'worker-router-provenance-run-'));
+        cleanupPaths.push(storeDir);
+        new JsonFileStore({ dir: storeDir }).create(run);
+        const persisted = new JsonFileStore({ dir: storeDir }).read(runId);
+        assert.ok(persisted, `${outcome}/${worker} Run is readable from a fresh JsonFileStore`);
+        assert.equal(persisted.state, outcome === 'success' ? 'VALIDATING' : 'FAILED');
+        const { telemetry: _responseTelemetry, ...expectedPersistedResponse } = response;
+        void _responseTelemetry;
+        assert.deepEqual(persisted.agentResult, expectedPersistedResponse,
+          `${outcome}/${worker} durable Run preserves exit status, HEAD, summary, diagnostics, and duration`);
+        assert.equal(Object.hasOwn(persisted.agentResult ?? {}, 'telemetry'), false,
+          'durable Run omits provider telemetry from the worker result');
+        const persistedMarker = persisted.agentResult?.diagnostics?.at(-1);
+        if (persistedMarker === undefined) throw new Error('Persisted worker result must include the canonical marker.');
+        assert.equal(persistedMarker, marker);
+        assert.ok(Buffer.byteLength(persistedMarker, 'utf8') <= 64, 'persisted canonical marker remains compact');
+        const durableBytes = readFileSync(path.join(storeDir, `${runId}.json`), 'utf8');
+        assert.equal(durableBytes.includes(marker), true);
+        const escapedWhitespace = JSON.stringify(largeWhitespace).slice(1, -1);
+        assert.equal(durableBytes.includes(escapedWhitespace), false, 'durable Run excludes JSON-escaped marker whitespace');
+        assert.equal(durableBytes.includes('following transcript'), false, 'durable Run excludes following transcript text');
+      }
+    }
+
+    for (const stderr of [
+      `[worker-router] -> unknown-worker\nfollowing transcript ${'x'.repeat(5000)}`,
+      '[worker-router] -> luna-worker-extra\n',
+      '[worker-router] -> deepseek-worker suffix\n',
+    ]) {
+      const ws = workspace();
+      const response = await new WorkerRouterAdapter({
+        runner: new FakeRunner([]),
+        container: new FakeContainer([containerResult({ exitCode: 7, stderr })]),
+        image: IMAGE,
+      }).run(requestFor(ws.workspacePath));
+      assert.equal(response.exitStatus, 'failure');
+      assert.equal(response.diagnostics?.some((line) => line.includes('[worker-router]')), false,
+        'unknown marker names and unrelated transcript text are not persisted');
+      assert.equal(response.diagnostics?.join('\n').includes('xxxxx'), false);
+    }
   });
 
   it('returns cancellation when the request is already aborted', async () => {
@@ -364,6 +433,22 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(runner.calls.length, 0);
   });
 
+  it('does not attach injected container output evidence to the provider result', async () => {
+    const ws = preparedWorkspace();
+    const output = boundToolOutput({
+      outcome: 'timed_out', exitCode: null, stdout: '', stderr: 'ERROR: worker timeout\n',
+      store: new InMemoryToolOutputStore(),
+    });
+    const container = new FakeContainer([Object.assign(
+      new WorkerRouterContainerError(WORKER_ROUTER_CONTAINER_ERROR_CODE.TIMEOUT, 'timed out'),
+      { output },
+    )]);
+    const response = await new WorkerRouterAdapter({ runner: new FakeRunner([]), container, image: IMAGE }).run(requestFor(ws.workspacePath));
+
+    assert.equal(response.exitStatus, 'failure');
+    assert.equal(Object.hasOwn(response, 'output'), false);
+  });
+
   it('never reads HEAD, proves ancestry, or publishes after a container failure', async () => {
     const ws = workspace();
     const runner = new FakeRunner([]);
@@ -397,7 +482,7 @@ describe('WorkerRouterAdapter container boundary', () => {
     assert.equal(runner.calls.length, 0);
   });
 
-  it('redacts forwarded worker credentials from bounded container diagnostics', async () => {
+  it('keeps raw typed container failure messages out of the durable result', async () => {
     const ws = workspace();
     const container = new FakeContainer([new WorkerRouterContainerError(
       WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED,
@@ -412,7 +497,25 @@ describe('WorkerRouterAdapter container boundary', () => {
     const text = response.diagnostics?.join('\n') ?? '';
     assert.match(text, new RegExp(WORKER_ROUTER_ERROR_CODE.CONTAINER_FAILURE));
     assert.equal(text.includes('sk-live-secret'), false);
-    assert.match(text, /\[redacted\]/);
+    assert.equal(text.includes('--env'), false);
+    assert.match(text, /CREATE_FAILED/);
+  });
+
+  it('keeps unknown container exception messages transient', async () => {
+    const ws = workspace();
+    const sentinel = 'RAW-CONTAINER-TRANSCRIPT-6c57e8';
+    for (const error of [new Error(sentinel), new WorkerRouterContainerError(
+      WORKER_ROUTER_CONTAINER_ERROR_CODE.CREATE_FAILED,
+      `runtime failed with worker output: ${sentinel}`,
+    )]) {
+      const response = await new WorkerRouterAdapter({
+        runner: new FakeRunner([]), container: new FakeContainer([error]), image: IMAGE,
+      }).run(requestFor(ws.workspacePath));
+      const persisted = JSON.stringify(response);
+      assert.equal(persisted.includes(sentinel), false);
+      assert.equal(persisted.includes(error.message), false);
+      assert.equal(response.exitStatus, 'failure');
+    }
   });
 
   it('forwards only the allow-listed container environment', async () => {
