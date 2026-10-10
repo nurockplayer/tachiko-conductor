@@ -167,6 +167,29 @@ function prTransport(): RouteTransport {
 }
 
 describe('LiveGitHubAdapter', () => {
+  for (const state of ['open', 'closed']) {
+    it(`reads the exact requested Issue specification in ${state} state`, async () => {
+      const transport = new RouteTransport()
+        .queue('repos/acme/widgets/issues/42', { ...issue(state), number: 42 });
+      const result = await new LiveGitHubAdapter({ transport }).readIssue(TARGET);
+
+      assert.deepEqual(result, { target: TARGET, title: 'Implement GitHub live state', body: 'Issue specification.', state });
+      assert.deepEqual(transport.calls, [{ kind: 'get', path: 'repos/acme/widgets/issues/42' }]);
+    });
+  }
+
+  for (const method of ['readIssue', 'readLiveSnapshot'] as const) {
+    it(`${method} rejects a mismatched Issue number before reading related state`, async () => {
+      const transport = new RouteTransport()
+        .queue('repos/acme/widgets/issues/42', { ...issue(), number: 99 });
+
+      await assert.rejects(new LiveGitHubAdapter({ transport })[method](TARGET), (error: unknown) =>
+        error instanceof GitHubLiveStateError && error.code === 'GH_INVALID_RESPONSE' &&
+        /issue number 99 does not match the requested 42/.test(error.message));
+      assert.deepEqual(transport.calls, [{ kind: 'get', path: 'repos/acme/widgets/issues/42' }]);
+    });
+  }
+
   it('returns a successful no-PR snapshot without inventing a HEAD', async () => {
     const transport = new RouteTransport()
       .queue('repos/acme/widgets/issues/42', { ...issue(), number: 42 })

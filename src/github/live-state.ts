@@ -214,7 +214,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
 
   async readIssue(target: IssueTarget): Promise<IssueSnapshot> {
     const path = `repos/${target.owner}/${target.repo}/issues/${target.issueNumber}`;
-    const issue = this.normalizeIssue(asRecordOrThrow(await this.transport.get(path), path), path);
+    const issue = this.normalizeIssue(asRecordOrThrow(await this.transport.get(path), path), path, target.issueNumber);
     return {
       target,
       title: issue.title,
@@ -285,7 +285,7 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     const observedAt = this.now();
     const issuePath = `repos/${owner}/${repo}/issues/${issueNumber}`;
 
-    const issue = this.normalizeIssue(asRecordOrThrow(await this.transport.get(issuePath), issuePath), issuePath);
+    const issue = this.normalizeIssue(asRecordOrThrow(await this.transport.get(issuePath), issuePath), issuePath, issueNumber);
 
     const timeline = await this.transport.getPaginated(`${issuePath}/timeline`);
     const numbers = await this.discoverPullRequestNumbers(owner, repo, issueNumber, timeline);
@@ -522,12 +522,16 @@ export class LiveGitHubAdapter implements GitHubAdapter {
     throw invalid(path, `hosted observation exceeded ${String(MAX_HOSTED_PAGES)} pages`);
   }
 
-  private normalizeIssue(record: Record<string, unknown>, path: string): GitHubLiveSnapshot['issue'] {
+  private normalizeIssue(record: Record<string, unknown>, path: string, expectedNumber: number): GitHubLiveSnapshot['issue'] {
     const state = record.state;
     if (state !== 'open' && state !== 'closed') throw invalid(path, `unrecognized issue state "${String(state)}"`);
+    const number = requirePositiveInt(record, 'number', path);
+    if (number !== expectedNumber) {
+      throw invalid(path, `issue number ${String(number)} does not match the requested ${String(expectedNumber)}`);
+    }
     return {
       id: requireString(record, 'node_id', path),
-      number: requirePositiveInt(record, 'number', path),
+      number,
       title: requireString(record, 'title', path),
       body: typeof record.body === 'string' ? record.body : '',
       state,
