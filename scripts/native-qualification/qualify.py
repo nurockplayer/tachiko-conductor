@@ -1,0 +1,614 @@
+#!/usr/bin/python3
+"""Qualification infrastructure; never part of the immutable tested checkout.
+
+Raw subprocess output, process identities and filesystem identities are private.
+Only the fixed-schema summary and recipient-encrypted archive are publishable.
+An infrastructure success is not production/runtime qualification.
+"""
+
+import ast
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import platform
+import re
+import selectors
+import shutil
+import signal
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import time
+import traceback
+
+
+CANDIDATE = 'c9e8a06e660d285746e4da4db252971939073e2d'
+TREE = '00490a7f39b99632fdb31819e753b5b1185cfd41'
+BASE = 'c8c7f0c094f0f51319b1b2890e96bcdf93a0ded8'
+PREVIOUS_CANDIDATE = 'e3cfc972f10cfbe4dca44a1f74d0d28d7943df76'
+PYTHON_SKIP = 'test_process_group_scan_miss_after_fork_remains_unknown'
+PYTHON_SKIP_REASON = 'the synchronized /proc race regression requires Linux'
+SEATBELT = 'runs configured absolute Node and repository-pinned absolute pnpm under the macOS seatbelt'
+NODE_TESTS = 65
+RAW_LIMIT = 32 * 1024 * 1024
+PUBLIC_LIMIT = 8 * 1024 * 1024
+SUMMARY_LIMIT = 16 * 1024
+
+
+def utc():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with pathlib.Path(path).open('rb') as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b''):
+            h.update(block)
+    return h.hexdigest()
+
+
+def write_json(path, value):
+    pathlib.Path(path).write_text(json.dumps(value, sort_keys=True, indent=2) + '\n')
+
+
+def write_summary(path, value):
+    encoded = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
+    if len(encoded) > SUMMARY_LIMIT:
+        value = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
+                 'status': 'FAIL', 'reason': 'summary_oversize', 'evidence_encrypted': False,
+                 'production_qualification': False}
+        encoded = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
+    pathlib.Path(path).write_bytes(encoded)
+    return value
+
+
+def parse_python(text):
+    totals = re.findall(r'^Ran (\d+) tests? in [0-9.]+s$', text, re.M)
+    outcomes = re.findall(r'^(test_\w+) \([^\n]+\) \.\.\. (ok|skipped \'[^\n]*\'|FAIL|ERROR)$', text, re.M)
+    skips = [{'name': name, 'reason': result[9:-1]} for name, result in outcomes if result.startswith("skipped '")]
+    passed = sum(result == 'ok' for _, result in outcomes)
+    failed = sum(result in ('FAIL', 'ERROR') for _, result in outcomes)
+    complete = len(totals) == 1 and int(totals[0]) == len(outcomes)
+    return {'tests': int(totals[0]) if len(totals) == 1 else None, 'pass': passed,
+            'fail': failed, 'skip': len(skips), 'skips': skips, 'counts_complete': complete,
+            'accepted': complete and int(totals[0]) == 108 and passed == 107 and failed == 0
+            and skips == [{'name': PYTHON_SKIP, 'reason': PYTHON_SKIP_REASON}]
+            and re.search(r'^OK \(skipped=1\)$', text, re.M) is not None}
+
+
+def parse_node(text):
+    numbers = {}
+    complete = True
+    for name in ['tests', 'pass', 'fail', 'cancelled', 'skipped', 'todo']:
+        values = re.findall(r'^# ' + name + r' (\d+)$', text, re.M)
+        if len(values) != 1:
+            complete = False
+            numbers[name] = None
+        else:
+            numbers[name] = int(values[0])
+    seatbelt = re.findall(r'^\s*ok \d+ - ' + re.escape(SEATBELT) + r'\s*$', text, re.M)
+    skip_names = re.findall(r'^\s*(?:ok|not ok) \d+ - (.*?)(?:\s+# SKIP(?:\s+.*)?)$', text, re.M)
+    numbers.update({'counts_complete': complete, 'seatbelt_executed': len(seatbelt) == 1,
+                    'skips': skip_names})
+    numbers['accepted'] = complete and numbers['tests'] == NODE_TESTS and numbers['pass'] == NODE_TESTS \
+        and all(numbers[name] == 0 for name in ['fail', 'cancelled', 'skipped', 'todo']) \
+        and len(seatbelt) == 1 and not skip_names
+    return numbers
+
+
+class Qualification:
+    def __init__(self):
+        os.umask(0o077)
+        self.started = time.monotonic()
+        self.runner_temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
+        self.workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
+        self.candidate = (self.workspace / 'candidate').resolve(strict=True)
+        self.infra = pathlib.Path(__file__).resolve().parent
+        self.private = pathlib.Path(tempfile.mkdtemp(prefix='pr93-native-private-', dir=self.runner_temp)).resolve(strict=True)
+        self.public = self.runner_temp / 'pr93-native-public'
+        self.public.mkdir(mode=0o700, exist_ok=False)
+        write_summary(self.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE,
+                      'base': BASE, 'status': 'FAIL', 'reason': 'collector_initializing',
+                      'evidence_encrypted': False, 'production_qualification': False})
+        self.logs = self.private / 'logs'
+        self.logs.mkdir(mode=0o700)
+        self.fixture = self.private / 'fixtures'
+        self.fixture.mkdir(mode=0o700)
+        self.child_home = self.private / 'home'
+        self.child_home.mkdir(mode=0o700)
+        node = shutil.which('node')
+        if node is None:
+            raise RuntimeError('pinned_node_missing')
+        self.node = pathlib.Path(node).resolve(strict=True)
+        self.env = {'PATH': str(self.node.parent) + ':/usr/bin:/bin:/usr/sbin:/sbin',
+                    'HOME': str(self.child_home), 'TMPDIR': str(self.fixture) + '/',
+                    'XDG_CACHE_HOME': str(self.private / 'cache'),
+                    'XDG_CONFIG_HOME': str(self.private / 'config'),
+                    'COREPACK_HOME': str(self.private / 'corepack-cache'),
+                    'COREPACK_ENABLE_DOWNLOAD_PROMPT': '0', 'CI': 'true',
+                    'PYTHONDONTWRITEBYTECODE': '1', 'LANG': 'C', 'LC_ALL': 'C', 'TZ': 'UTC0',
+                    'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_OPTIONAL_LOCKS': '0',
+                    'GIT_TERMINAL_PROMPT': '0', 'GIT_AUTHOR_NAME': 'Native qualification fixture',
+                    'GIT_AUTHOR_EMAIL': 'native-qualification@example.invalid',
+                    'GIT_COMMITTER_NAME': 'Native qualification fixture',
+                    'GIT_COMMITTER_EMAIL': 'native-qualification@example.invalid'}
+        self.records = []
+        self.versions = {}
+        self.before = None
+        self.after = None
+        self.python = None
+        self.node_result = None
+        self.git = pathlib.Path('/usr/bin/git')
+        self.sequence = 0
+        self.failure = None
+        self.provider_proofs = {}
+        self.openssl = pathlib.Path('/usr/bin/openssl')
+        self.finalizing = False
+        self.provenance = {}
+        self.validate_private_root()
+
+    def validate_private_root(self):
+        for root in [self.private, self.fixture, self.child_home, self.logs]:
+            info = root.lstat()
+            if root.resolve(strict=True) != root or not stat.S_ISDIR(info.st_mode) \
+                    or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
+                raise RuntimeError('private_root_unsafe')
+            for parent in root.parents:
+                info = parent.lstat()
+                sticky = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
+                if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) \
+                        or info.st_uid not in (0, os.getuid()) or (info.st_mode & 0o022 and not sticky):
+                    raise RuntimeError('private_ancestry_unsafe')
+
+    def process_table(self):
+        result = subprocess.run(['/bin/ps', '-axo', 'pid=,ppid=,pgid=,lstart=,stat=,comm='],
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=self.env, timeout=5, check=True)
+        table = {}
+        for line in result.stdout.decode('utf-8', errors='strict').splitlines():
+            fields = line.split(None, 9)
+            if len(fields) != 10:
+                raise RuntimeError('process_snapshot_unparseable')
+            pid, ppid, pgid = map(int, fields[:3])
+            table[pid] = {'pid': pid, 'ppid': ppid, 'pgid': pgid, 'start': ' '.join(fields[3:8]),
+                          'state': fields[8], 'command': fields[9]}
+        return table
+
+    def run(self, label, argv, timeout=30, cwd=None, required=True):
+        """One attempt, bounded byte capture; observe/kill only this launched process family.
+
+        A snapshot cannot prove that no unobserved detached descendant ever existed.
+        The receipt reports only observed-family completion and original-group absence.
+        """
+        self.sequence += 1
+        stem = '%03d-%s' % (self.sequence, label)
+        outputs = [self.logs / (stem + '.stdout'), self.logs / (stem + '.stderr')]
+        streams = [path.open('wb') for path in outputs]
+        started = time.monotonic()
+        record = {'label': label, 'argv': [str(arg) for arg in argv], 'cwd': str(cwd or self.candidate),
+                  'started_at': utc(), 'timeout_seconds': timeout, 'exit_code': None,
+                  'timed_out': False, 'raw_capture_complete': True, 'discarded_bytes': 0,
+                  'observed_root': False, 'observed_family_complete': False, 'original_group_absent': False}
+        seen = {}
+        proc = None
+        selector = selectors.DefaultSelector()
+        total = 0
+        root_exited = None
+        termination = None
+        snapshots = self.logs / (stem + '.processes.jsonl')
+        try:
+            budget = timeout if self.finalizing else max(1, min(timeout, 2300 - int(time.monotonic() - self.started)))
+            proc = subprocess.Popen([str(arg) for arg in argv], cwd=cwd or self.candidate, env=self.env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    start_new_session=True, umask=0o022)
+            record['child_umask'] = '022'
+            record['root_pid'] = proc.pid
+            for index, pipe in enumerate([proc.stdout, proc.stderr]):
+                os.set_blocking(pipe.fileno(), False)
+                selector.register(pipe, selectors.EVENT_READ, index)
+            with snapshots.open('w') as observed:
+                while True:
+                    table = self.process_table()
+                    owned = {pid for pid, info in table.items() if info['pgid'] == proc.pid}
+                    owned.update(pid for pid, start in seen.items() if pid in table and table[pid]['start'] == start)
+                    changed = True
+                    while changed:
+                        extra = {pid for pid, info in table.items() if info['ppid'] in owned}
+                        changed = not extra.issubset(owned)
+                        owned.update(extra)
+                    if proc.pid in table and table[proc.pid]['pgid'] == proc.pid:
+                        record['observed_root'] = True
+                    for pid in owned:
+                        seen[pid] = table[pid]['start']
+                    observed.write(json.dumps({'at': utc(), 'family': [table[pid] for pid in sorted(owned)]}) + '\n')
+                    observed.flush()
+                    if snapshots.stat().st_size > RAW_LIMIT:
+                        record['raw_capture_complete'] = False
+                    elapsed = time.monotonic() - started
+                    code = proc.poll()
+                    if code is not None and root_exited is None:
+                        root_exited = time.monotonic()
+                    if elapsed > budget:
+                        record['timed_out'] = True
+                    must_stop = record['timed_out'] or not record['raw_capture_complete'] \
+                        or (root_exited is not None and time.monotonic() - root_exited > 10 and owned)
+                    if must_stop and termination is None:
+                        termination = time.monotonic()
+                    if termination is not None:
+                        kill_signal = signal.SIGTERM if time.monotonic() - termination < 2 else signal.SIGKILL
+                        # Recheck exact observed start identity immediately before each PID signal.
+                        fresh = self.process_table()
+                        for pid in owned:
+                            if pid in fresh and fresh[pid]['start'] == seen.get(pid):
+                                try:
+                                    os.kill(pid, kill_signal)
+                                except ProcessLookupError:
+                                    pass
+                    for key, _events in selector.select(timeout=0.1):
+                        data = os.read(key.fileobj.fileno(), 64 * 1024)
+                        if not data:
+                            selector.unregister(key.fileobj)
+                            key.fileobj.close()
+                        else:
+                            accepted = data[:max(0, RAW_LIMIT - total)]
+                            streams[key.data].write(accepted)
+                            total += len(accepted)
+                            if len(accepted) != len(data):
+                                record['raw_capture_complete'] = False
+                                record['discarded_bytes'] += len(data) - len(accepted)
+                    if code is not None and not owned and not selector.get_map():
+                        record['observed_family_complete'] = True
+                        record['original_group_absent'] = True
+                        break
+                    if termination is not None and time.monotonic() - termination > 10:
+                        break
+            record['exit_code'] = proc.wait(timeout=5)
+        finally:
+            if proc is not None and proc.poll() is None:
+                # Only this unreaped direct child; never an unrelated PID or global group.
+                proc.kill()
+                proc.wait(timeout=5)
+            selector.close()
+            for stream in streams:
+                stream.close()
+            record['ended_at'] = utc()
+            record['elapsed_seconds'] = round(time.monotonic() - started, 3)
+            record['output'] = [{'name': path.name, 'bytes': path.stat().st_size, 'sha256': digest(path)} for path in outputs]
+            record['observed_process_count'] = len(seen)
+            self.records.append(record)
+            write_json(self.logs / (stem + '.receipt.json'), record)
+        success = record['exit_code'] == 0 and not record['timed_out'] and record['raw_capture_complete'] \
+            and record['observed_family_complete'] and record['original_group_absent']
+        if required and not success:
+            raise RuntimeError('command_failed_' + label)
+        return record, outputs
+
+    def text(self, label, argv, timeout=30, cwd=None):
+        _record, output = self.run(label, argv, timeout=timeout, cwd=cwd)
+        if output[0].stat().st_size > 64 * 1024:
+            raise RuntimeError('probe_output_oversize')
+        return output[0].read_text().strip()
+
+    def safe_system_file(self, path):
+        physical = pathlib.Path(path).resolve(strict=True)
+        info = physical.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise RuntimeError('system_provider_unsafe')
+        for parent in physical.parents:
+            info = parent.lstat()
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode) \
+                    or info.st_uid != 0 or info.st_mode & 0o022:
+                raise RuntimeError('system_provider_ancestry_unsafe')
+        return physical
+
+    def apple_tool(self, path, expected_identifier=None):
+        physical = self.safe_system_file(path)
+        info = physical.stat()
+        self.run('apple-signature', ['/usr/bin/codesign', '--verify', '--strict', '-R=anchor apple', physical])
+        _record, output = self.run('apple-identity', ['/usr/bin/codesign', '-dv', '--verbose=4', physical])
+        details = output[0].read_text() + '\n' + output[1].read_text()
+        identifiers = re.findall(r'^Identifier=(.+)$', details, re.M)
+        if len(identifiers) != 1 or (expected_identifier is not None and identifiers[0] != expected_identifier):
+            raise RuntimeError('apple_identifier_mismatch')
+        _record, output = self.run('apple-requirement', ['/usr/bin/codesign', '-d', '-r-', physical])
+        requirement = output[0].read_text() + '\n' + output[1].read_text()
+        if 'identifier "' + identifiers[0] + '"' not in requirement:
+            raise RuntimeError('apple_requirement_missing')
+        proof = {'physical_path': str(physical), 'identifier': identifiers[0], 'sha256': digest(physical),
+                 'mode': stat.S_IMODE(info.st_mode), 'uid': info.st_uid, 'gid': info.st_gid,
+                 'inode': info.st_ino, 'device': info.st_dev, 'anchor_apple_verified': True}
+        self.provider_proofs[str(path)] = proof
+        return physical
+
+    def git_text(self, label, *args):
+        return self.text(label, [self.git, '-C', self.candidate, *args])
+
+    def source_manifest(self, label):
+        head = self.git_text(label + '-head', 'rev-parse', 'HEAD')
+        tree = self.git_text(label + '-tree', 'rev-parse', 'HEAD^{tree}')
+        if (head, tree) != (CANDIDATE, TREE):
+            raise RuntimeError('candidate_identity_mismatch')
+        parents = self.git_text(label + '-parents', 'show', '-s', '--format=%P', 'HEAD').split()
+        if parents != [PREVIOUS_CANDIDATE, BASE]:
+            raise RuntimeError('candidate_parents_mismatch')
+        self.run(label + '-base-ancestry', [self.git, '-C', self.candidate, 'merge-base', '--is-ancestor', BASE, CANDIDATE])
+        _receipt, output = self.run(label + '-tracked', [self.git, '-C', self.candidate, 'ls-files', '--stage', '-z'])
+        listing = output[0].read_bytes()
+        files = []
+        indexed = {}
+        for item in listing.split(b'\0'):
+            if not item:
+                continue
+            metadata, name = item.split(b'\t', 1)
+            mode, blob, stage = metadata.decode().split()
+            filename = os.fsdecode(name)
+            relative = pathlib.PurePosixPath(filename)
+            if relative.is_absolute() or '..' in relative.parts or stage != '0' or mode not in ('100644', '100755', '120000'):
+                raise RuntimeError('tracked_manifest_invalid')
+            path = self.candidate / filename
+            info = path.lstat()
+            content = os.fsencode(os.readlink(path)) if stat.S_ISLNK(info.st_mode) else path.read_bytes()
+            literal_blob = hashlib.sha1(b'blob ' + str(len(content)).encode() + b'\0' + content).hexdigest()
+            if literal_blob != blob or ((mode == '120000') != stat.S_ISLNK(info.st_mode)) \
+                    or (mode == '100755' and not info.st_mode & 0o111) \
+                    or (mode == '100644' and info.st_mode & 0o111):
+                raise RuntimeError('tracked_literal_blob_or_mode_mismatch')
+            indexed[filename] = (mode, blob)
+            files.append({'path': filename, 'index_mode': mode, 'index_blob': blob,
+                          'mode': stat.S_IMODE(info.st_mode), 'sha256': hashlib.sha256(content).hexdigest()})
+        _receipt, output = self.run(label + '-head-tree', [self.git, '-C', self.candidate, 'ls-tree', '-r', '-z', '--full-tree', 'HEAD'])
+        committed = {}
+        for item in output[0].read_bytes().split(b'\0'):
+            if item:
+                metadata, name = item.split(b'\t', 1)
+                mode, kind, blob = metadata.decode().split()
+                if kind != 'blob':
+                    raise RuntimeError('committed_nonblob_source')
+                committed[os.fsdecode(name)] = (mode, blob)
+        if indexed != committed:
+            raise RuntimeError('index_differs_from_candidate_tree')
+        status = self.git_text(label + '-status', 'status', '--porcelain=v1', '--untracked-files=all')
+        flags = self.git_text(label + '-flags', 'ls-files', '-v')
+        if status or any(line and not line.startswith('H ') for line in flags.splitlines()):
+            raise RuntimeError('candidate_not_clean_or_index_flags')
+        index_path = pathlib.Path(self.git_text(label + '-index', 'rev-parse', '--git-path', 'index'))
+        if not index_path.is_absolute():
+            index_path = self.candidate / index_path
+        protected = ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', 'tsconfig.json',
+                     'scripts/bootstrap-heartbeat/test_runner.py', 'scripts/bootstrap-heartbeat/runner.py',
+                     'scripts/bootstrap-heartbeat/providers/corepack-0.34.6.json',
+                     'scripts/bootstrap-heartbeat/providers/corepack-0.34.6.tgz',
+                     'tests/local-command-validation.test.ts', 'tests/dispatch-scheduler.test.ts']
+        value = {'head': head, 'tree': tree, 'base': BASE, 'parents': parents, 'files': files, 'index_sha256': digest(index_path),
+                 'index_listing_sha256': hashlib.sha256(listing).hexdigest(),
+                 'protected': {name: digest(self.candidate / name) for name in protected}, 'worktree_status': status}
+        write_json(self.private / (label + '-source.json'), value)
+        return value
+
+    def providers(self):
+        if platform.system() != 'Darwin' or platform.machine() != 'x86_64':
+            raise RuntimeError('supported_native_platform_required')
+        if sys.version_info < (3, 9):
+            raise RuntimeError('python39_required_for_child_umask')
+        patterns = {'GITHUB_SHA': r'[0-9a-f]{40}', 'GITHUB_RUN_ID': r'[0-9]{1,24}',
+                    'GITHUB_RUN_ATTEMPT': r'[0-9]{1,6}', 'ImageOS': r'macos[0-9]{1,3}',
+                    'ImageVersion': r'[0-9A-Za-z._-]{1,80}'}
+        for key, pattern in patterns.items():
+            value = os.environ.get(key, '')
+            if re.fullmatch(pattern, value) is None:
+                raise RuntimeError('workflow_provenance_missing_or_invalid')
+            self.provenance[key] = value
+        self.safe_system_file('/usr/bin/codesign')
+        self.apple_tool('/usr/bin/codesign', 'com.apple.codesign')
+        self.apple_tool('/usr/bin/python3')
+        self.apple_tool('/usr/bin/xcrun', 'com.apple.xcrun')
+        self.openssl = self.apple_tool('/usr/bin/openssl', 'com.apple.openssl')
+        git_path = self.text('xcrun-find-git', ['/usr/bin/xcrun', '--find', 'git'])
+        if not pathlib.Path(git_path).is_absolute():
+            raise RuntimeError('apple_git_unresolved')
+        self.git = self.apple_tool(git_path, 'com.apple.git')
+        infra_head = self.text('infrastructure-head', [self.git, '-C', self.infra, 'rev-parse', 'HEAD'])
+        if infra_head != self.provenance['GITHUB_SHA']:
+            raise RuntimeError('infrastructure_commit_mismatch')
+        self.provenance['harness_sha256'] = digest(self.infra / 'qualify.py')
+        self.provenance['recipient_sha256'] = digest(self.infra / 'recipient.pem')
+        write_json(self.private / 'workflow-provenance.json', self.provenance)
+        version_commands = {'python': ['/usr/bin/python3', '--version'], 'node': [self.node, '--version'],
+                            'corepack': [self.node.parent / 'corepack', '--version'],
+                            'git': [self.git, '--version'], 'openssl': [self.openssl, 'version'],
+                            'macos': ['/usr/bin/sw_vers', '-productVersion']}
+        for name, command in version_commands.items():
+            value = self.text(name + '-version', command)
+            if not re.fullmatch(r'[A-Za-z0-9 ._()+:-]{1,120}', value):
+                raise RuntimeError('provider_version_unparseable')
+            self.versions[name] = value
+        if self.versions['node'] != 'v24.19.0' or self.versions['corepack'] != '0.34.6':
+            raise RuntimeError('pinned_toolchain_mismatch')
+        resources = {'disk': dict(zip(['total', 'used', 'free'], shutil.disk_usage(self.private))),
+                     'memory_bytes': self.text('memory', ['/usr/sbin/sysctl', '-n', 'hw.memsize']),
+                     'cpu_count': self.text('cpus', ['/usr/sbin/sysctl', '-n', 'hw.ncpu']),
+                     'platform': platform.platform(), 'architecture': platform.machine(),
+                     'node': {'path': str(self.node), 'sha256': digest(self.node)}}
+        write_json(self.private / 'providers.json', self.provider_proofs)
+        write_json(self.private / 'resources.json', resources)
+        if resources['disk']['free'] < 4 * 1024 ** 3:
+            raise RuntimeError('insufficient_disk')
+
+    def crypto_probe(self):
+        certificate = self.infra / 'recipient.pem'
+        if 'PRIVATE KEY' in certificate.read_text():
+            raise RuntimeError('recipient_must_be_public')
+        self.run('recipient-certificate', [self.openssl, 'x509', '-in', certificate, '-noout', '-fingerprint', '-sha256'])
+        probe = self.private / 'cms-probe.txt'
+        probe.write_bytes(b'PR93 native evidence CMS capability probe\n')
+        encrypted = self.private / 'cms-probe.der'
+        self.run('cms-probe', [self.openssl, 'cms', '-encrypt', '-binary', '-aes256', '-outform', 'DER',
+                               '-in', probe, '-out', encrypted, certificate])
+        self.run('cms-probe-parse', [self.openssl, 'cms', '-cmsout', '-inform', 'DER', '-in', encrypted, '-print'])
+        if not encrypted.is_file() or encrypted.stat().st_size == 0:
+            raise RuntimeError('cms_probe_missing')
+
+    def hydrate(self):
+        corepack = self.node.parent / 'corepack'
+        self.run('candidate-frozen-dependencies', [corepack, 'pnpm@10.34.5', 'install', '--frozen-lockfile',
+                                                  '--store-dir', self.private / 'dependency-store'], timeout=300)
+        tool_root = self.private / 'pnpm-tool'
+        tool_root.mkdir(mode=0o700)
+        write_json(tool_root / 'package.json', {'private': True, 'packageManager': 'pnpm@10.34.5'})
+        self.run('real-pnpm-hydration', [corepack, 'pnpm@10.34.5', 'add', 'pnpm@10.34.5', '--ignore-scripts',
+                                        '--store-dir', self.private / 'tool-store'], cwd=tool_root, timeout=180)
+        package = (tool_root / 'node_modules/pnpm').resolve(strict=True)
+        metadata = json.loads((package / 'package.json').read_text())
+        if metadata.get('name') != 'pnpm' or metadata.get('version') != '10.34.5':
+            raise RuntimeError('real_pnpm_package_mismatch')
+        executable = package / 'bin/pnpm.cjs'
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise RuntimeError('real_pnpm_executable_missing')
+        launcher = self.candidate / 'node_modules/.bin/pnpm'
+        if launcher.exists() or launcher.is_symlink():
+            raise RuntimeError('unexpected_pnpm_launcher')
+        launcher.symlink_to(executable)
+        value = self.text('real-pnpm-version', [launcher, '--version'])
+        if value != '10.34.5' or launcher.resolve(strict=True) != executable:
+            raise RuntimeError('real_pnpm_version_mismatch')
+        self.versions['pnpm'] = value
+        files = {str(path.relative_to(package)): digest(path) for path in sorted(package.rglob('*')) if path.is_file()}
+        write_json(self.private / 'pnpm-tool.json', {'package': str(package), 'files': files,
+                   'lock_sha256': digest(tool_root / 'pnpm-lock.yaml'), 'launcher': str(launcher),
+                   'launcher_target': str(executable), 'corepack_shim': False})
+
+    def qualify(self):
+        self.providers()
+        self.crypto_probe()
+        self.before = self.source_manifest('before')
+        self.hydrate()
+        # Expected discovery count is source-derived; no test selection or source rewriting.
+        python_source = ast.parse((self.candidate / 'scripts/bootstrap-heartbeat/test_runner.py').read_text())
+        methods = [node.name for node in ast.walk(python_source) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                   and node.name.startswith('test_')]
+        if len(methods) != 108 or len(set(methods)) != 108:
+            raise RuntimeError('python_discovery_count_changed')
+        record, output = self.run('python108', ['/usr/bin/python3', 'scripts/bootstrap-heartbeat/test_runner.py'],
+                                  timeout=1500, required=False)
+        self.python = parse_python(output[0].read_text() + '\n' + output[1].read_text())
+        self.python['exit_code'] = record['exit_code']
+        self.python['owned_completion'] = record['observed_family_complete'] and record['original_group_absent']
+        if not self.python['owned_completion'] or not record['raw_capture_complete'] or not record['observed_root']:
+            raise RuntimeError('python_family_or_capture_incomplete_no_next_heavy_gate')
+        # Run this second gate once even when the first test gate fails; never overlap.
+        record, output = self.run('node-seatbelt-and-locks', [self.node, '--import', 'tsx', '--test', '--test-reporter=tap',
+                                  'tests/local-command-validation.test.ts', 'tests/dispatch-scheduler.test.ts'],
+                                  timeout=360, required=False)
+        self.node_result = parse_node(output[0].read_text() + '\n' + output[1].read_text())
+        self.node_result['exit_code'] = record['exit_code']
+        self.node_result['owned_completion'] = record['observed_family_complete'] and record['original_group_absent']
+        if not all(item['accepted'] and item['exit_code'] == 0 and item['owned_completion'] for item in [self.python, self.node_result]):
+            raise RuntimeError('native_test_gate_failed')
+
+    def finish(self):
+        self.finalizing = True
+        source_error = None
+        if self.before is not None:
+            try:
+                for name, proof in self.provider_proofs.items():
+                    physical = self.safe_system_file(name)
+                    info = physical.stat()
+                    if str(physical) != proof['physical_path'] or digest(physical) != proof['sha256'] \
+                            or (info.st_ino, info.st_dev) != (proof['inode'], proof['device']):
+                        raise RuntimeError('provider_postflight_identity_changed')
+                self.after = self.source_manifest('after')
+            except BaseException:
+                source_error = traceback.format_exc()
+        unchanged = self.before is not None and self.before == self.after
+        if source_error is not None:
+            (self.private / 'source-postflight-error.txt').write_text(source_error)
+        complete = bool(self.records) and all(record['observed_family_complete'] and record['original_group_absent']
+                       and record['raw_capture_complete'] and not record['timed_out'] for record in self.records)
+        passed = self.failure is None and unchanged and complete and self.python is not None \
+            and self.node_result is not None and self.python['accepted'] and self.node_result['accepted']
+        private_result = {'candidate': CANDIDATE, 'tree': TREE, 'base': BASE, 'provenance': self.provenance,
+                          'failure': self.failure, 'source_unchanged': unchanged,
+                          'python': self.python, 'node': self.node_result, 'commands': self.records,
+                          'environment_keys': sorted(self.env), 'versions': self.versions, 'passed': passed}
+        write_json(self.private / 'result.json', private_result)
+        public_python = None if self.python is None else dict(self.python)
+        if public_python is not None:
+            allowed = {'name': PYTHON_SKIP, 'reason': PYTHON_SKIP_REASON}
+            public_python['skips'] = [allowed] if allowed in self.python['skips'] else []
+            public_python['unexpected_skip_count'] = sum(item != allowed for item in self.python['skips'])
+        public_node = None if self.node_result is None else dict(self.node_result)
+        if public_node is not None:
+            allowed = {SEATBELT, 'keeps a live native macOS owner fenced when only the caller timezone changes'}
+            public_node['skips'] = sorted(allowed.intersection(self.node_result['skips']))
+            public_node['unexpected_skip_count'] = sum(name not in allowed for name in self.node_result['skips'])
+        summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
+                   'provenance': self.provenance,
+                   'status': 'PASS' if passed else 'FAIL', 'source_unchanged': unchanged,
+                   'python': public_python, 'node': public_node, 'versions': self.versions,
+                   'observed_owned_completion': complete, 'global_quiescence_claimed': False,
+                   'raw_capture_complete': all(record['raw_capture_complete'] for record in self.records),
+                   'production_qualification': False, 'evidence_encrypted': False,
+                   'plaintext_sha256': None, 'ciphertext_sha256': None}
+        summary = write_summary(self.public / 'summary.json', summary)
+        archive = self.runner_temp / ('pr93-private-' + self.private.name + '.tar.gz')
+        with tarfile.open(archive, 'w:gz') as tar:
+            # Never archive caches, executable hydration, child homes or fixture trees.
+            allowed = ['logs', 'before-source.json', 'after-source.json', 'providers.json', 'resources.json',
+                       'pnpm-tool.json', 'workflow-provenance.json', 'result.json', 'cms-probe.txt', 'cms-probe.der',
+                       'qualification-error.txt', 'source-postflight-error.txt', 'collector-error.txt']
+            for name in allowed:
+                path = self.private / name
+                if path.exists():
+                    tar.add(path, arcname='evidence/' + name, recursive=True)
+        summary['plaintext_sha256'] = digest(archive)
+        ciphertext = self.public / 'evidence.cms'
+        # Final encryption logs stay private and are not streamed to Actions.
+        # They necessarily postdate the immutable plaintext archive.
+        try:
+            self.run('encrypt-evidence', [self.openssl, 'cms', '-encrypt', '-binary', '-aes256', '-outform', 'DER',
+                     '-in', archive, '-out', ciphertext, self.infra / 'recipient.pem'], timeout=120)
+            summary['evidence_encrypted'] = ciphertext.is_file() and ciphertext.stat().st_size > 0
+            summary['ciphertext_sha256'] = digest(ciphertext)
+            if ciphertext.stat().st_size + len(json.dumps(summary).encode()) + 1024 > PUBLIC_LIMIT:
+                ciphertext.unlink()
+                summary['evidence_encrypted'] = False
+                summary['ciphertext_sha256'] = None
+        except BaseException:
+            (self.private / 'encryption-error.txt').write_text(traceback.format_exc())
+            if ciphertext.exists():
+                ciphertext.unlink()
+        if not summary['evidence_encrypted']:
+            summary['status'] = 'FAIL'
+        summary = write_summary(self.public / 'summary.json', summary)
+        # This is the complete public output surface. No exception text, paths or process IDs.
+        print(json.dumps(summary, sort_keys=True))
+        return 0 if summary['status'] == 'PASS' else 1
+
+
+def main():
+    qualification = Qualification.__new__(Qualification)
+    try:
+        qualification.__init__()
+        try:
+            qualification.qualify()
+        except BaseException:
+            qualification.failure = traceback.format_exc()
+            (qualification.private / 'qualification-error.txt').write_text(qualification.failure)
+        return qualification.finish()
+    except BaseException:
+        # Even an early infrastructure failure must not reveal filesystem identities.
+        if hasattr(qualification, 'private') and hasattr(qualification, 'public') and qualification.public.is_dir():
+            (qualification.private / 'collector-error.txt').write_text(traceback.format_exc())
+            write_summary(qualification.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE,
+                       'tree': TREE, 'base': BASE, 'status': 'FAIL', 'reason': 'collector_failed',
+                       'evidence_encrypted': False, 'production_qualification': False})
+        print('Native qualification collector failed; gate remains FAIL.')
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

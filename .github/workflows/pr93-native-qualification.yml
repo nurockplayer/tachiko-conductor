@@ -1,0 +1,58 @@
+name: PR93 immutable native qualification
+
+on:
+  push:
+    branches: [qualification/pr93-native-stage4]
+    paths:
+      - .github/workflows/pr93-native-qualification.yml
+      - scripts/native-qualification/**
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr93-native-stage4-heavy
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+    steps:
+      - name: Checkout qualification infrastructure
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          path: qualification-infra
+
+      - name: Checkout immutable product candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c9e8a06e660d285746e4da4db252971939073e2d
+          fetch-depth: 0
+          persist-credentials: false
+          path: candidate
+
+      - name: Provision pinned Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 24.19.0
+
+      - name: Run bounded qualification and encrypt private evidence
+        shell: bash
+        run: |
+          set -eu
+          umask 077
+          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py
+
+      - name: Preserve ciphertext and sanitized summary
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr93-native-stage4-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pr93-native-public/evidence.cms
+            ${{ runner.temp }}/pr93-native-public/summary.json
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
