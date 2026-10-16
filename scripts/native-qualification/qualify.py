@@ -527,7 +527,9 @@ class Qualification:
             if not re.fullmatch(r'[A-Za-z0-9 ._()+:-]{1,120}', value):
                 raise RuntimeError('provider_version_unparseable')
             self.versions[name] = value
-        if self.versions['node'] != 'v24.19.0' or self.versions['corepack'] != '0.34.6':
+        # Outer bootstrap uses Node24.19.0's bundled Corepack0.35.0. The unchanged
+        # Python fixture independently verifies its committed Corepack0.34.6 provider.
+        if self.versions['node'] != 'v24.19.0' or self.versions['corepack'] != '0.35.0':
             raise RuntimeError('pinned_toolchain_mismatch')
         resources = {'disk': dict(zip(['total', 'used', 'free'], shutil.disk_usage(self.private))),
                      'memory_bytes': self.text('memory', ['/usr/sbin/sysctl', '-n', 'hw.memsize']),
