@@ -24,6 +24,10 @@ export interface DispatchCommandDependencies {
   readonly releaseAdmissionLock?: () => void;
   /** Reacquire the short control-plane lock for claim heartbeat/finalization writes. */
   readonly withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>;
+  /** Must settle exact live merge proof and admission under the held prepare lock. */
+  readonly reconcileMergedRun?: (run: Run) => Promise<Run | null>;
+  /** Exact released lane/receipt proof; retirement does not establish delivery. */
+  readonly isRunOwnerRetired?: (run: Run) => boolean;
   readonly now?: () => string;
 }
 
@@ -49,6 +53,8 @@ export async function dispatchOnceCommand(
     withAdmissionLock: deps.withAdmissionLock,
     releaseAdmissionLock: deps.releaseAdmissionLock,
     admission: deps.admission,
+    reconcileMergedRun: deps.reconcileMergedRun,
+    isRunOwnerRetired: deps.isRunOwnerRetired,
     async execute(entry, existing, claim) {
       if (existing !== null) {
         if (existing.execution === undefined) {
