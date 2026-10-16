@@ -424,7 +424,14 @@ Committed artifacts preserve the complete bytes admitted during successful
 capture for their declared lifetime. Durable writes share a fixed 64 MiB
 cumulative admission limit per operation (including every captured command and
 both streams); the library may lower this limit with `captureMaxBytes`, but no
-runtime environment setting raises or changes it. When admission or filesystem
+runtime environment setting raises or changes it. The in-memory store applies
+the same default and maximum to each capture or direct save, combining both
+streams and admitting bytes before encoding strings or copying buffers.
+Retained bytes use fixed-size blocks so tiny writes do not accumulate one
+buffer per write. `captureMaxBytes` may lower that bound. Failed buffered writers
+discard their raw chunks and cannot finish; completed artifacts follow the memory store's
+existing `maxArtifacts` retention policy, which is unbounded by default.
+When admission or filesystem
 I/O fails, capture is partial and no artifact is published for that writer;
 streaming validation continues draining output and reports the observed command
 result separately. Artifacts retain the exact source bytes. Bounded previews,
@@ -445,7 +452,9 @@ scrub raw previews already persisted in a Run; those previews follow the
 existing Run lifecycle.
 
 Explicit range reads are limited to 1 MiB. Search queries are limited to 64 KiB
-of UTF-8, with at most 128 matches and 64 KiB per matching line. File capture
+of UTF-8, with at most 128 matches and 64 KiB per matching line. Opaque artifact
+IDs must be nonblank and at most 256 UTF-8 bytes; custom store IDs are supported.
+File capture
 requires supported POSIX ownership and private-mode checks. Existing evidence-
 root and operations directories must already be owned by the effective current
 user and private; the store refuses unsafe permissions without changing them.

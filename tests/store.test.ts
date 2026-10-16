@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
-import { isValidationResultCoherent } from '../src/domain/validation.js';
+import { isKnownBoundedValidationPayloadCoherent, isValidationResultCoherent } from '../src/domain/validation.js';
 import { InMemoryToolOutputStore, TOOL_OUTPUT_POLICY_MAXIMA, boundToolOutput, isToolOutputEnvelope } from '../src/evidence/tool-output.js';
 import type { Run } from '../src/domain/types.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
@@ -1187,6 +1187,152 @@ describe('JsonFileStore — persistence round-trips', () => {
     const persisted = loaded?.validationResult?.local.commands[0]?.output;
     assert.deepEqual(persisted?.diagnostics, output.diagnostics);
     assert.equal(Buffer.byteLength((persisted?.diagnostics ?? []).join('\n')), 65_536);
+  });
+
+  for (const boundary of ['envelope', 'envelope-stream', 'partial-preview', 'partial-stream'] as const) {
+    for (const api of ['guard', 'create', 'update', 'CAS'] as const) {
+      it(`refuses inherited ${boundary} accessors before ${api} evaluates or persists them`, () => {
+        const headSha = 'inherited-accessor-head';
+        const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'x', stderr: '',
+          store: new InMemoryToolOutputStore() });
+        const capturePreview = {
+          stdout: { bytes: 1, preview: 'x', previewBytes: 1, truncated: false },
+          stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+          diagnostics: [] as string[], diagnosticsTruncated: false,
+        };
+        const base = validationPassed(headSha);
+        const validation = { ...base, local: { ...base.local, commands: [{ ...base.local.commands[0]!,
+          ...(boundary.startsWith('envelope') ? { captureStatus: 'complete' as const, output }
+            : { captureStatus: 'partial' as const, capturePreview }),
+        }] } };
+        const implementing = applyTransition(newRun('inherited-accessor'), { type: 'start' }, T0);
+        const validating = applyTransition(implementing, {
+          type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+        }, T0);
+        const validRun = applyTransition(validating, { type: 'validation_passed', validationResult: validation,
+          pullRequest: { number: 7, headSha } }, T0);
+        const { store, dir } = tempStore();
+        if (api === 'update' || api === 'CAS') store.create(validRun);
+        const runPath = path.join(dir, `${validRun.id}.json`);
+        const projectionPath = operationalProjectionPath(dir, validRun.id);
+        const priorRun = existsSync(runPath) ? readFileSync(runPath, 'utf8') : null;
+        const priorProjection = existsSync(projectionPath) ? readFileSync(projectionPath, 'utf8') : null;
+
+        // A fresh candidate for each API: preceding validation must not consume
+        // the getter or append the unknown field before the API under test.
+        const candidate = structuredClone(validRun);
+        const command = candidate.validationResult!.local.commands[0]!;
+        const record = (boundary === 'envelope' ? command.output
+          : boundary === 'envelope-stream' ? command.output!.stdout
+            : boundary === 'partial-preview' ? command.capturePreview
+              : command.capturePreview!.stdout) as unknown as Record<string, unknown>;
+        const key = boundary === 'envelope' ? 'summary'
+          : boundary === 'partial-preview' ? 'diagnosticsTruncated' : 'preview';
+        const retained = record[key];
+        delete record[key];
+        let calls = 0;
+        const prototype = Object.defineProperty({}, key, { get() {
+          calls += 1;
+          record.rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+          return retained;
+        } });
+        Object.setPrototypeOf(record, Object.create(prototype));
+
+        if (api === 'guard') {
+          assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), false);
+          assert.equal(isValidationResultCoherent(candidate.validationResult), false);
+        } else {
+          assert.throws(() => {
+            if (api === 'create') store.create(candidate);
+            else if (api === 'update') store.update(candidate);
+            else store.updateIfUnchanged(validRun, candidate);
+          }, /invalid bounded validation output payload/);
+        }
+        assert.equal(calls, 0, 'inherited getter never executes');
+        assert.equal(Object.hasOwn(record, 'rawTranscript'), false);
+        assert.equal(existsSync(runPath) ? readFileSync(runPath, 'utf8') : null, priorRun);
+        assert.equal(existsSync(projectionPath) ? readFileSync(projectionPath, 'utf8') : null, priorProjection);
+      });
+    }
+  }
+
+  it('preserves bounded own data with null prototypes or shadowed inherited accessors', () => {
+    for (const prototypeKind of ['null', 'shadowed'] as const) {
+      let calls = 0;
+      const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'x', stderr: '',
+        store: new InMemoryToolOutputStore() });
+      const capturePreview = {
+        stdout: { bytes: 1, preview: 'x', previewBytes: 1, truncated: false },
+        stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        diagnostics: [] as string[], diagnosticsTruncated: false,
+      };
+      for (const [record, key] of [[output, 'summary'], [output.stdout, 'preview'],
+        [capturePreview, 'diagnosticsTruncated'], [capturePreview.stdout, 'preview']] as const) {
+        Object.setPrototypeOf(record, prototypeKind === 'null' ? null
+          : Object.defineProperty({}, key, { get() { calls += 1; throw new Error('shadowed getter'); } }));
+      }
+      const base = validationPassed('inherited-control-head');
+      for (const commandOutput of [{ captureStatus: 'complete' as const, output },
+        { captureStatus: 'partial' as const, capturePreview }]) {
+        const validation = { ...base, local: { ...base.local,
+          commands: [{ ...base.local.commands[0]!, ...commandOutput }] } };
+        assert.equal(isKnownBoundedValidationPayloadCoherent(validation), true);
+        assert.equal(isValidationResultCoherent(validation), true);
+        assert.equal(isValidationResultCoherent(JSON.parse(JSON.stringify(validation))), true);
+      }
+      assert.equal(calls, 0);
+    }
+  });
+
+  it('rejects oversized opaque artifact IDs before persistence and on stored Run reads', () => {
+    const headSha = 'artifact-id-bound-head';
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'x', stderr: '',
+      store: new InMemoryToolOutputStore() });
+    const base = validationPassed(headSha);
+    const validation = { ...base, local: { ...base.local, commands: [{ ...base.local.commands[0]!,
+      captureStatus: 'complete' as const, output }] } };
+    const implementing = applyTransition(newRun('artifact-id-bound'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    const validRun = applyTransition(validating, { type: 'validation_passed', validationResult: validation,
+      pullRequest: { number: 7, headSha } }, T0);
+    const withId = (id: string): Run => {
+      const candidate = structuredClone(validRun);
+      (candidate.validationResult!.local.commands[0]!.output!.artifact as { id: string }).id = id;
+      return candidate;
+    };
+    for (const id of ['a'.repeat(257), '界'.repeat(86), 'RAW-' + 'x'.repeat(262_144)]) {
+      const candidate = withId(id);
+      assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), false);
+      assert.equal(isValidationResultCoherent(candidate.validationResult), false);
+      const { store, dir } = tempStore();
+      const runPath = path.join(dir, `${validRun.id}.json`);
+      const projectionPath = operationalProjectionPath(dir, validRun.id);
+      assert.throws(() => store.create(candidate), /invalid bounded validation output payload/);
+      assert.equal(existsSync(runPath), false);
+      assert.equal(existsSync(projectionPath), false);
+      store.create(validRun);
+      const priorRun = readFileSync(runPath, 'utf8');
+      const priorProjection = readFileSync(projectionPath, 'utf8');
+      assert.throws(() => store.update(candidate), /invalid bounded validation output payload/);
+      assert.throws(() => store.updateIfUnchanged(validRun, candidate), /invalid bounded validation output payload/);
+      assert.equal(readFileSync(runPath, 'utf8'), priorRun);
+      assert.equal(readFileSync(projectionPath, 'utf8'), priorProjection);
+      const invalidBytes = JSON.stringify(candidate);
+      writeFileSync(runPath, invalidBytes);
+      assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+      assert.throws(() => store.list(), /corrupt or incompatible/);
+      assert.throws(() => store.updateIfUnchanged(validRun, validRun), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), invalidBytes);
+      assert.equal(readFileSync(projectionPath, 'utf8'), priorProjection);
+    }
+    for (const id of ['custom-store:one', ' x ', 'é'.repeat(128)]) {
+      const candidate = withId(id);
+      const { store } = tempStore();
+      store.create(candidate);
+      assert.equal(store.read(candidate.id)?.validationResult?.local.commands[0]?.output?.artifact.id, id);
+    }
   });
 
   it('rejects incoherent tool-output payloads before validation admission and on persisted Run read/CAS', () => {

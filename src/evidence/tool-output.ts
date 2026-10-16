@@ -716,6 +716,16 @@ function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
     if (typeof key !== 'string' || !allowed.has(key)) return false;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     return descriptor !== undefined && 'value' in descriptor;
+  }) && allowedKeys.every((key) => {
+    // Later property reads can resolve on a prototype even when own keys are
+    // all data properties. Reject the effective accessor without invoking it.
+    let current: object | null = value;
+    while (current !== null) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (descriptor !== undefined) return 'value' in descriptor;
+      current = Object.getPrototypeOf(current) as object | null;
+    }
+    return true;
   });
 }
 
@@ -1188,7 +1198,8 @@ function isToolOutputArtifact(value: unknown): value is ToolOutputArtifactRefere
   if (typeof value !== 'object' || value === null) return false;
   const artifact = value as Record<string, unknown>;
   return hasOnlyKeys(artifact, ['kind', 'id', 'stdoutBytes', 'stderrBytes', 'totalBytes', 'sha256', 'fileIdentity',
-    'operationId', 'retainedUntil']) && artifact.kind === 'tool-output' && typeof artifact.id === 'string' && artifact.id.trim() !== '' &&
+    'operationId', 'retainedUntil']) && artifact.kind === 'tool-output' && typeof artifact.id === 'string' &&
+    artifact.id.length <= 256 && utf8Bytes(artifact.id) <= 256 && artifact.id.trim() !== '' &&
     [artifact.stdoutBytes, artifact.stderrBytes, artifact.totalBytes].every((item) =>
       typeof item === 'number' && Number.isSafeInteger(item) && item >= 0) &&
     typeof artifact.sha256 === 'string' && /^[0-9a-f]{64}$/.test(artifact.sha256) &&
@@ -1241,19 +1252,33 @@ function readUtf8Range(bytes: Buffer, bufferOffset: number, offset: number, leng
 export class InMemoryToolOutputStore implements ToolOutputStore {
   private readonly values = new Map<string, { readonly stdout: Buffer; readonly stderr: Buffer }>();
   private readonly maxArtifacts: number;
+  private readonly captureMaxBytes: number;
   private readonly order: string[] = [];
 
-  constructor(options: { readonly maxArtifacts?: number } = {}) {
+  constructor(options: { readonly maxArtifacts?: number; readonly captureMaxBytes?: number } = {}) {
     this.maxArtifacts = options.maxArtifacts ?? Number.POSITIVE_INFINITY;
     if (this.maxArtifacts !== Number.POSITIVE_INFINITY) assertPositiveInteger(this.maxArtifacts, 'maxArtifacts');
+    this.captureMaxBytes = options.captureMaxBytes ?? MAX_TOOL_OUTPUT_CAPTURE_BYTES;
+    assertPositiveInteger(this.captureMaxBytes, 'Tool-output capture byte budget');
+    if (this.captureMaxBytes > MAX_TOOL_OUTPUT_CAPTURE_BYTES) throw new Error(`Tool-output capture byte budget exceeds the maximum of ${MAX_TOOL_OUTPUT_CAPTURE_BYTES}.`);
   }
 
   save(capture: ToolOutputCapture): ToolOutputArtifactReference {
-    return this.saveRawCapture(Buffer.from(capture.stdout, 'utf8'), Buffer.from(capture.stderr, 'utf8'));
+    const stdout = capture.stdout;
+    const stderr = capture.stderr;
+    this.assertCaptureBytes(utf8Bytes(stdout), utf8Bytes(stderr));
+    return this.saveRawCapture(Buffer.from(stdout, 'utf8'), Buffer.from(stderr, 'utf8'));
+  }
+
+  private assertCaptureBytes(stdoutBytes: number, stderrBytes: number): void {
+    if (stdoutBytes > this.captureMaxBytes || stderrBytes > this.captureMaxBytes - stdoutBytes) {
+      throw new Error('Tool-output capture byte budget exhausted.');
+    }
   }
 
   /** Internal raw-byte path used by the built-in streaming writer. */
   private saveRawCapture(stdout: Buffer, stderr: Buffer): ToolOutputArtifactReference {
+    this.assertCaptureBytes(stdout.length, stderr.length);
     const id = randomUUID();
     const retainedStdout = Buffer.from(stdout);
     const retainedStderr = Buffer.from(stderr);
@@ -1267,7 +1292,7 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
   }
 
   startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
-    return new BufferedToolOutputWriter(this, validateToolOutputPolicy(policy), (stdout, stderr) => this.saveRawCapture(stdout, stderr));
+    return new BufferedToolOutputWriter(this, validateToolOutputPolicy(policy), (stdout, stderr) => this.saveRawCapture(stdout, stderr), this.captureMaxBytes);
   }
 
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
@@ -2828,9 +2853,46 @@ export class ContainedToolOutputCaptureSession {
   }
 }
 
+/** Fixed blocks keep retained buffer overhead proportional to bytes, independent of write chunking. */
+class BufferedToolOutputBytes {
+  private blocks: Buffer[] = [];
+  private tail: Buffer | undefined;
+  private tailBytes = 0;
+  private totalBytes = 0;
+
+  append(bytes: Buffer): void {
+    let offset = 0;
+    while (offset < bytes.length) {
+      this.tail ??= Buffer.allocUnsafe(65_536);
+      const length = Math.min(bytes.length - offset, this.tail.length - this.tailBytes);
+      bytes.copy(this.tail, this.tailBytes, offset, offset + length);
+      this.tailBytes += length;
+      this.totalBytes += length;
+      offset += length;
+      if (this.tailBytes === this.tail.length) {
+        this.blocks.push(this.tail);
+        this.tail = undefined;
+        this.tailBytes = 0;
+      }
+    }
+  }
+
+  concat(): Buffer {
+    const parts = this.tail === undefined ? this.blocks : [...this.blocks, this.tail.subarray(0, this.tailBytes)];
+    return Buffer.concat(parts, this.totalBytes);
+  }
+
+  clear(): void {
+    this.blocks = [];
+    this.tail = undefined;
+    this.tailBytes = 0;
+    this.totalBytes = 0;
+  }
+}
+
 class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
-  private stdoutParts: Buffer[] = [];
-  private stderrParts: Buffer[] = [];
+  private readonly stdoutBytes = new BufferedToolOutputBytes();
+  private readonly stderrBytes = new BufferedToolOutputBytes();
   private readonly stdoutCapture: StreamCapture;
   private readonly stderrCapture: StreamCapture;
   private readonly stdoutDiagnostics: DiagnosticCapture;
@@ -2839,11 +2901,13 @@ class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
   private readonly stderrProjector = new Utf8TextProjector();
   private state: 'open' | 'finished' | 'failed' | 'aborted' = 'open';
   private finalizedViews = false;
+  private admittedBytes = 0;
 
   constructor(
     private readonly store: ToolOutputStore,
     private readonly policy: ToolOutputPolicy,
     private readonly saveRaw?: (stdout: Buffer, stderr: Buffer) => ToolOutputArtifactReference,
+    private readonly captureMaxBytes = MAX_TOOL_OUTPUT_CAPTURE_BYTES,
   ) {
     this.stdoutCapture = new StreamCapture(policy.previewBytes);
     this.stderrCapture = new StreamCapture(policy.previewBytes);
@@ -2852,20 +2916,51 @@ class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
   }
 
   write(channel: 'stdout' | 'stderr', chunk: string): void {
-    this.writeBytes(channel, Buffer.from(chunk, 'utf8'));
+    this.assertWritable();
+    try {
+      const bytes = utf8Bytes(chunk);
+      this.reserveBytes(bytes);
+      if (bytes === 0) return;
+      this.writeAdmittedBytes(channel, Buffer.from(chunk, 'utf8'));
+    } catch (error) { this.fail(); throw error; }
   }
 
   writeBytes(channel: 'stdout' | 'stderr', chunk: Buffer): void {
+    this.assertWritable();
+    try {
+      this.reserveBytes(chunk.length);
+      if (chunk.length === 0) return;
+      this.writeAdmittedBytes(channel, chunk);
+    } catch (error) { this.fail(); throw error; }
+  }
+
+  private assertWritable(): void {
     if (this.state !== 'open') throw new Error('Tool-output capture is no longer writable.');
-    const retained = Buffer.from(chunk);
+  }
+
+  private reserveBytes(bytes: number): void {
+    if (bytes > this.captureMaxBytes - this.admittedBytes) throw new Error('Tool-output capture byte budget exhausted.');
+    this.admittedBytes += bytes;
+  }
+
+  private fail(): void {
+    this.state = 'failed';
+    this.clearRawBytes();
+  }
+
+  private clearRawBytes(): void {
+    this.stdoutBytes.clear();
+    this.stderrBytes.clear();
+  }
+
+  private writeAdmittedBytes(channel: 'stdout' | 'stderr', retained: Buffer): void {
+    (channel === 'stdout' ? this.stdoutBytes : this.stderrBytes).append(retained);
     const projector = channel === 'stdout' ? this.stdoutProjector : this.stderrProjector;
     const text = projector.write(retained);
     if (channel === 'stdout') {
-      this.stdoutParts.push(retained);
       this.stdoutCapture.appendProjected(text, retained.length);
       this.stdoutDiagnostics.append(text);
     } else {
-      this.stderrParts.push(retained);
       this.stderrCapture.appendProjected(text, retained.length);
       this.stderrDiagnostics.append(text);
     }
@@ -2873,11 +2968,11 @@ class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
 
   finish(): ToolOutputCaptureSummary {
     if (this.state !== 'open') throw new Error('Tool-output capture can only finish once.');
-    this.finalizeViews();
-    const stdout = Buffer.concat(this.stdoutParts);
-    const stderr = Buffer.concat(this.stderrParts);
-    let artifact: ToolOutputArtifactReference;
     try {
+      this.finalizeViews();
+      const stdout = this.stdoutBytes.concat();
+      const stderr = this.stderrBytes.concat();
+      let artifact: ToolOutputArtifactReference;
       if (this.saveRaw !== undefined) artifact = this.saveRaw(stdout, stderr);
       else {
         const stdoutText = stdout.toString('utf8');
@@ -2887,19 +2982,19 @@ class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
         }
         artifact = this.store.save({ stdout: stdoutText, stderr: stderrText });
       }
-    }
-    catch (error) { this.state = 'failed'; throw error; }
-    const stdoutDiagnostics = this.stdoutDiagnostics.finish();
-    const stderrDiagnostics = this.stderrDiagnostics.finish();
-    const diagnostics = boundedDiagnostics([...stdoutDiagnostics.lines, ...stderrDiagnostics.lines].join('\n'), '', this.policy);
-    this.state = 'finished';
-    return {
-      artifact,
-      stdout: this.stdoutCapture.value(),
-      stderr: this.stderrCapture.value(),
-      diagnostics: diagnostics.lines,
-      diagnosticsTruncated: stdoutDiagnostics.truncated || stderrDiagnostics.truncated || diagnostics.truncated,
-    };
+      const stdoutDiagnostics = this.stdoutDiagnostics.finish();
+      const stderrDiagnostics = this.stderrDiagnostics.finish();
+      const diagnostics = boundedDiagnostics([...stdoutDiagnostics.lines, ...stderrDiagnostics.lines].join('\n'), '', this.policy);
+      this.state = 'finished';
+      return {
+        artifact,
+        stdout: this.stdoutCapture.value(),
+        stderr: this.stderrCapture.value(),
+        diagnostics: diagnostics.lines,
+        diagnosticsTruncated: stdoutDiagnostics.truncated || stderrDiagnostics.truncated || diagnostics.truncated,
+      };
+    } catch (error) { this.state = 'failed'; throw error; }
+    finally { this.clearRawBytes(); }
   }
 
   private finalizeViews(): void {
@@ -2915,8 +3010,7 @@ class BufferedToolOutputWriter implements ToolOutputCaptureWriter {
 
   abort(): void {
     if (this.state === 'finished' || this.state === 'aborted') return;
-    this.stdoutParts = [];
-    this.stderrParts = [];
+    this.clearRawBytes();
     this.state = 'aborted';
   }
 }

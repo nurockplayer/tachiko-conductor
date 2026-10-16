@@ -87,6 +87,16 @@ function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
     if (typeof key !== 'string' || !allowed.has(key)) return false;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
     return descriptor !== undefined && 'value' in descriptor;
+  }) && allowedKeys.every((key) => {
+    // Later property reads can resolve on a prototype even when own keys are
+    // all data properties. Reject the effective accessor without invoking it.
+    let current: object | null = value;
+    while (current !== null) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (descriptor !== undefined) return 'value' in descriptor;
+      current = Object.getPrototypeOf(current) as object | null;
+    }
+    return true;
   });
 }
 

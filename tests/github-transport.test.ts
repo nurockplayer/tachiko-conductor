@@ -207,6 +207,30 @@ describe('GhCliTransport', () => {
 });
 
 describe('NodeProcessRunner capture cleanup', () => {
+  it('drains real process pipes after memory quota exhaustion and preserves the observed exit code', async () => {
+    const outputStore = new InMemoryToolOutputStore({ captureMaxBytes: 3 });
+    const stdoutBytes = 2 * 1_048_576;
+    const stderrBytes = 1_048_576;
+    const script = `async function write(stream, chunk) { await new Promise((resolve, reject) => stream.write(chunk, error => error ? reject(error) : resolve())); }
+      (async () => { await write(process.stdout, 'x'.repeat(${stdoutBytes}));
+        await write(process.stderr, 'y'.repeat(${stderrBytes}));
+        await write(process.stdout, 'DRAINED-STDOUT'); await write(process.stderr, 'DRAINED-STDERR'); process.exitCode = 7; })();`;
+    const result = await new NodeProcessRunner().run(process.execPath, ['-e', script], {
+      timeoutMs: 5_000, outputStore,
+      outputPolicy: { previewBytes: 32, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 32 },
+    });
+    assert.equal(result.exitCode, 7);
+    assert.equal(result.captureStatus, 'partial');
+    assert.equal(result.output, undefined);
+    assert.equal(result.captureObservation?.status, 'partial');
+    assert.equal(result.captureObservation?.stdout.bytes, stdoutBytes + 14);
+    assert.equal(result.captureObservation?.stderr.bytes, stderrBytes + 14);
+    assert.ok(result.stdout.endsWith('DRAINED-STDOUT'));
+    assert.ok(result.stderr.endsWith('DRAINED-STDERR'));
+    assert.ok(Buffer.byteLength(result.stdout) <= 32);
+    assert.ok(Buffer.byteLength(result.stderr) <= 32);
+  });
+
   it('automatically aborts its owned capture when the injected store clock fails after writer start', async () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-runner-invalid-abort-clock-'));
     try {

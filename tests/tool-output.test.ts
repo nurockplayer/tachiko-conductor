@@ -11,6 +11,7 @@ import {
   ContainedToolOutputCaptureSession,
   FileToolOutputStore,
   InMemoryToolOutputStore,
+  MAX_TOOL_OUTPUT_CAPTURE_BYTES,
   boundToolOutput,
   boundToolOutputFromCapture,
   isToolOutputEnvelope,
@@ -29,6 +30,189 @@ const policy: ToolOutputPolicy = {
 };
 
 describe('bounded tool output contract', () => {
+  it('bounds opaque artifact IDs by UTF-8 bytes while retaining custom IDs and whitespace semantics', () => {
+    const base = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
+      store: new InMemoryToolOutputStore(), policy });
+    for (const id of ['custom-store:one', ' x ', 'a'.repeat(256), 'é'.repeat(128), '🙂'.repeat(64)]) {
+      assert.equal(isToolOutputEnvelope({ ...base, artifact: { ...base.artifact, id } }), true);
+    }
+    for (const id of ['', ' ', 'a'.repeat(257), 'é'.repeat(129), '🙂'.repeat(65), '界'.repeat(86), 'x'.repeat(262_144)]) {
+      assert.equal(isToolOutputEnvelope({ ...base, artifact: { ...base.artifact, id } }), false);
+    }
+  });
+
+  it('validates memory capture quotas and shares one exact raw-byte budget across streams and write APIs', () => {
+    for (const captureMaxBytes of [0, -1, 1.5, Number.NaN, Number.POSITIVE_INFINITY, MAX_TOOL_OUTPUT_CAPTURE_BYTES + 1]) {
+      assert.throws(() => new InMemoryToolOutputStore({ captureMaxBytes }), /positive safe integer|exceeds the maximum/);
+    }
+    const store = new InMemoryToolOutputStore({ captureMaxBytes: 4 });
+    const writer = store.startCapture(policy);
+    writer.write('stdout', 'é');
+    writer.writeBytes!('stderr', Buffer.from([0xff, 0x80]));
+    const summary = writer.finish();
+    assert.equal(summary.artifact.totalBytes, 4);
+    assert.equal(summary.stdout.bytes, 2);
+    assert.equal(summary.stderr.preview, '??');
+    assert.equal(summary.artifact.sha256,
+      createHash('sha256').update(Buffer.from('é')).update('\0').update(Buffer.from([0xff, 0x80])).digest('hex'));
+    assert.equal(store.save({ stdout: 'é', stderr: 'é' }).totalBytes, 4);
+    const failed = store.startCapture(policy);
+    failed.write('stdout', 'é');
+    assert.throws(() => failed.writeBytes!('stderr', Buffer.from([1, 2, 3])), /budget exhausted/);
+    assert.throws(() => failed.write('stdout', ''), /no longer writable/);
+    assert.throws(() => failed.finish(), /can only finish once|cannot finish/);
+    failed.abort?.();
+    failed.abort?.();
+    assert.throws(() => failed.finish(), /can only finish once|cannot finish/);
+  });
+
+  it('refuses memory quota excess before encoding or copying and leaves existing artifacts unchanged', () => {
+    const store = new InMemoryToolOutputStore({ captureMaxBytes: 4, maxArtifacts: 1 });
+    const prior = store.save({ stdout: 'keep', stderr: '' });
+    const stringWriter = store.startCapture(policy);
+    const rawWriter = store.startCapture(policy);
+    const emptyWriter = store.startCapture(policy);
+    const oversized = 'x'.repeat(262_163);
+    const raw = Buffer.alloc(5);
+    const originalFrom = Buffer.from;
+    const originalAllocUnsafe = Buffer.allocUnsafe;
+    let forbiddenAllocations = 0;
+    let emptyAllocations = 0;
+    let retainedAllocations = 0;
+    Buffer.allocUnsafe = new Proxy(originalAllocUnsafe, {
+      apply(target, thisArg, argumentsList: unknown[]) {
+        retainedAllocations += 1;
+        return Reflect.apply(target, thisArg, argumentsList);
+      },
+    }) as typeof Buffer.allocUnsafe;
+    Buffer.from = new Proxy(originalFrom, {
+      apply(target, thisArg, argumentsList: unknown[]) {
+        const value = argumentsList[0];
+        if (value === oversized || value === raw || value === '1234' || value === 'é') forbiddenAllocations += 1;
+        if (value === '' || (Buffer.isBuffer(value) && value.length === 0)) emptyAllocations += 1;
+        return Reflect.apply(target, thisArg, argumentsList);
+      },
+    }) as typeof Buffer.from;
+    try {
+      assert.throws(() => stringWriter.write('stdout', oversized), /budget exhausted/);
+      assert.throws(() => rawWriter.writeBytes!('stdout', raw), /budget exhausted/);
+      assert.throws(() => store.save({ stdout: '1234', stderr: 'é' }), /budget exhausted/);
+      for (let index = 0; index < 10_000; index += 1) {
+        emptyWriter.write('stdout', '');
+        emptyWriter.writeBytes!('stderr', raw.subarray(0, 0));
+      }
+      assert.equal(forbiddenAllocations, 0, 'aggregate admission precedes encoding either stream or copying a raw chunk');
+      assert.equal(emptyAllocations, 0, 'zero-byte writes retain no buffers');
+      assert.equal(retainedAllocations, 0, 'refused and empty writes allocate no raw retention blocks');
+    } finally { Buffer.from = originalFrom; Buffer.allocUnsafe = originalAllocUnsafe; }
+    assert.throws(() => stringWriter.finish(), /can only finish once|cannot finish/);
+    assert.throws(() => rawWriter.finish(), /can only finish once|cannot finish/);
+    assert.equal(store.read(prior, { channel: 'stdout' }).text, 'keep', 'refused direct save does not evict existing artifacts');
+    emptyWriter.abort?.();
+  });
+
+  it('snapshots direct memory save strings once before aggregate admission and encoding', () => {
+    let stdoutReads = 0;
+    let stderrReads = 0;
+    const store = new InMemoryToolOutputStore({ captureMaxBytes: 4 });
+    const artifact = store.save({
+      get stdout() { stdoutReads += 1; return stdoutReads === 1 ? 'é' : 'x'.repeat(262_144); },
+      get stderr() { stderrReads += 1; return stderrReads === 1 ? 'ok' : 'y'.repeat(262_144); },
+    });
+    assert.equal(stdoutReads, 1);
+    assert.equal(stderrReads, 1);
+    assert.equal(artifact.totalBytes, 4);
+    assert.equal(store.read(artifact, { channel: 'stdout' }).text, 'é');
+    assert.equal(store.read(artifact, { channel: 'stderr' }).text, 'ok');
+  });
+
+  it('contains memory quota exhaustion while continuing bounded observations without a complete artifact', () => {
+    const store = new InMemoryToolOutputStore({ captureMaxBytes: 3 });
+    const writer = store.startCapture(policy);
+    const session = new ContainedToolOutputCaptureSession(policy);
+    session.writeBytes(writer, 'stdout', Buffer.from([0xff, 0x80]));
+    session.write(writer, 'stderr', 'é');
+    session.write(writer, 'stdout', 'drained-tail');
+    const result = session.finish(writer);
+    assert.equal(result.status, 'partial');
+    assert.equal(result.capture, undefined);
+    assert.equal(result.stdout.bytes, 14);
+    assert.equal(result.stderr.bytes, 2);
+    assert.equal(result.stdout.preview, '??drained-tail');
+  });
+
+  it('applies the default memory ceiling before encoding and refuses completion after concatenation failure', () => {
+    const defaultWriter = new InMemoryToolOutputStore().startCapture(policy);
+    const oversized = 'x'.repeat(MAX_TOOL_OUTPUT_CAPTURE_BYTES + 1);
+    const originalFrom = Buffer.from;
+    let encoded = false;
+    Buffer.from = new Proxy(originalFrom, {
+      apply(target, thisArg, argumentsList: unknown[]) {
+        if (argumentsList[0] === oversized) encoded = true;
+        return Reflect.apply(target, thisArg, argumentsList);
+      },
+    }) as typeof Buffer.from;
+    try {
+      assert.throws(() => defaultWriter.write('stdout', oversized), /budget exhausted/);
+      assert.equal(encoded, false);
+    } finally { Buffer.from = originalFrom; defaultWriter.abort?.(); }
+
+    const writer = new InMemoryToolOutputStore({ captureMaxBytes: 4 }).startCapture(policy);
+    writer.write('stdout', 'abc');
+    const originalConcat = Buffer.concat;
+    Buffer.concat = (() => { throw new Error('injected concatenation failure'); }) as typeof Buffer.concat;
+    try { assert.throws(() => writer.finish(), /injected concatenation failure/); }
+    finally { Buffer.concat = originalConcat; }
+    assert.throws(() => writer.write('stdout', 'x'), /no longer writable/);
+    assert.throws(() => writer.finish(), /can only finish once|cannot finish/);
+    writer.abort?.();
+    writer.abort?.();
+  });
+
+  it('coalesces one-byte memory writes while preserving the same exact capture as whole chunks', () => {
+    const stdout = Buffer.concat([Buffer.alloc(65_535, 0x61), Buffer.from('🙂'), Buffer.from([0xff, 0x80]), Buffer.from('stdout-tail')]);
+    const stderr = Buffer.concat([Buffer.alloc(65_535, 0x62), Buffer.from('é'), Buffer.from('stderr-tail')]);
+    const totalBytes = stdout.length + stderr.length;
+    const wholeStore = new InMemoryToolOutputStore({ captureMaxBytes: totalBytes });
+    const whole = wholeStore.startCapture(policy);
+    whole.writeBytes!('stdout', stdout);
+    whole.writeBytes!('stderr', stderr);
+    const expected = whole.finish();
+
+    const fragmentedStore = new InMemoryToolOutputStore({ captureMaxBytes: totalBytes });
+    const fragmented = fragmentedStore.startCapture(policy);
+    for (let index = 0; index < Math.max(stdout.length, stderr.length); index += 1) {
+      if (index < stdout.length) fragmented.writeBytes!('stdout', stdout.subarray(index, index + 1));
+      if (index < stderr.length) fragmented.writeBytes!('stderr', stderr.subarray(index, index + 1));
+    }
+    stdout.fill(0);
+    stderr.fill(0);
+    const originalConcat = Buffer.concat;
+    const concatenated: Array<{ parts: number; bytes: number }> = [];
+    Buffer.concat = new Proxy(originalConcat, {
+      apply(target, thisArg, argumentsList: unknown[]) {
+        const parts = argumentsList[0] as readonly Buffer[];
+        concatenated.push({ parts: parts.length, bytes: parts.reduce((sum, part) => sum + part.length, 0) });
+        return Reflect.apply(target, thisArg, argumentsList);
+      },
+    }) as typeof Buffer.concat;
+    let actual: ReturnType<typeof fragmented.finish>;
+    try { actual = fragmented.finish(); }
+    finally { Buffer.concat = originalConcat; }
+    assert.deepEqual(actual.stdout, expected.stdout);
+    assert.deepEqual(actual.stderr, expected.stderr);
+    assert.equal(actual.artifact.sha256, expected.artifact.sha256);
+    assert.equal(actual.artifact.totalBytes, totalBytes);
+    for (const channel of ['stdout', 'stderr'] as const) {
+      assert.deepEqual(fragmentedStore.read(actual.artifact, { channel, length: totalBytes }),
+        wholeStore.read(expected.artifact, { channel, length: totalBytes }));
+    }
+    assert.deepEqual(concatenated.map(({ bytes }) => bytes), [expected.stdout.bytes, expected.stderr.bytes]);
+    for (const { parts, bytes } of concatenated) {
+      assert.ok(parts <= Math.ceil(bytes / 65_536), `${bytes} retained bytes use bounded blocks, observed ${parts} parts`);
+    }
+  });
+
   it('validates optional retention authority as an absent pair or a canonical pair', () => {
     const base = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
       store: new InMemoryToolOutputStore(), policy });
