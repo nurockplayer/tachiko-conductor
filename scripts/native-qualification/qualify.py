@@ -37,6 +37,8 @@ NODE_TESTS = 65
 RAW_LIMIT = 32 * 1024 * 1024
 PUBLIC_LIMIT = 8 * 1024 * 1024
 SUMMARY_LIMIT = 16 * 1024
+CLT_ROOT = pathlib.Path('/Library/Developer/CommandLineTools')
+CLT_GIT = CLT_ROOT / 'usr/bin/git'
 
 
 def utc():
@@ -149,6 +151,7 @@ class Qualification:
         self.openssl = pathlib.Path('/usr/bin/openssl')
         self.finalizing = False
         self.provenance = {}
+        self.developer_selection_prepared = False
         self.validate_private_root()
 
     def validate_private_root(self):
@@ -324,6 +327,100 @@ class Qualification:
         self.provider_proofs[str(path)] = proof
         return physical
 
+    def system_file_identity(self, path):
+        physical = self.safe_system_file(path)
+        info = physical.stat()
+        return {'physical_path': str(physical), 'sha256': digest(physical), 'uid': info.st_uid,
+                'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode),
+                'inode': info.st_ino, 'device': info.st_dev}
+
+    def developer_path_inventory(self, path):
+        """Metadata only: never execute an inventoried Git or repair its permissions."""
+        path = pathlib.Path(path)
+        result = {'requested_path': str(path), 'entries': []}
+        try:
+            if not path.is_absolute() or len(str(path)) > 4096 or len(path.parts) > 64:
+                raise RuntimeError('inventory_path_invalid')
+            physical = path.resolve(strict=True)
+            result['physical_path'] = str(physical)
+            paths = list(dict.fromkeys([path, *path.parents, physical, *physical.parents]))
+        except (OSError, RuntimeError) as error:
+            result['resolution_error'] = {'type': type(error).__name__, 'message': str(error)}
+            paths = [path, *path.parents][:65]
+        for entry in paths:
+            item = {'path': str(entry)}
+            try:
+                info = entry.lstat()
+                item.update({'uid': info.st_uid, 'gid': info.st_gid, 'mode': stat.S_IMODE(info.st_mode),
+                             'type_and_permissions': stat.filemode(info.st_mode),
+                             'inode': info.st_ino, 'device': info.st_dev})
+                if stat.S_ISLNK(info.st_mode):
+                    item['symlink_target'] = os.readlink(entry)
+            except OSError as error:
+                item['error'] = {'type': type(error).__name__, 'message': str(error)}
+            result['entries'].append(item)
+        return result
+
+    def prepare_existing_clt_selection(self):
+        """Only an existing, fully qualified CLT can replace an unsafe selected Git.
+
+        The caller has already qualified codesign and xcrun. A successful switch
+        restarts the ordinary provider preflight; no provider predicate changes.
+        """
+        inventory = {'original_selection': None, 'selected_git': None,
+                     'clt_git': self.developer_path_inventory(CLT_GIT), 'existing_xcode_roots': [],
+                     'switched': False}
+        try:
+            # A bounded, single-level inventory of existing developer roots only.
+            try:
+                with os.scandir('/Applications') as entries:
+                    for index, entry in enumerate(entries):
+                        if index >= 128 or len(inventory['existing_xcode_roots']) >= 8:
+                            inventory['xcode_inventory_limit_reached'] = True
+                            break
+                        if re.fullmatch(r'Xcode(?:_[0-9.]+)?\.app', entry.name):
+                            root = pathlib.Path(entry.path) / 'Contents/Developer'
+                            inventory['existing_xcode_roots'].append(self.developer_path_inventory(root))
+            except OSError as error:
+                inventory['xcode_inventory_error'] = {'type': type(error).__name__, 'message': str(error)}
+            self.safe_system_file('/usr/bin/xcode-select')
+            original = self.text('developer-selection-before', ['/usr/bin/xcode-select', '-p'])
+            inventory['original_selection'] = original
+            selected = self.text('developer-selected-git', ['/usr/bin/xcrun', '--find', 'git'])
+            inventory['selected_git'] = self.developer_path_inventory(selected)
+            if not pathlib.Path(original).is_absolute() or not pathlib.Path(selected).is_absolute():
+                raise RuntimeError('developer_selection_unresolved')
+            try:
+                self.safe_system_file(selected)
+            except (OSError, RuntimeError) as error:
+                inventory['selected_git_filesystem_failure'] = {'type': type(error).__name__, 'message': str(error)}
+            else:
+                return False
+            before = self.system_file_identity(CLT_GIT)
+            self.apple_tool(CLT_GIT, 'com.apple.git')
+            if self.system_file_identity(CLT_GIT) != before:
+                raise RuntimeError('clt_git_changed_during_qualification')
+            inventory['qualified_clt_git'] = before
+            self.safe_system_file('/usr/bin/sudo')
+            switch = ['/usr/bin/sudo', '-n', '/usr/bin/xcode-select', '--switch', str(CLT_ROOT)]
+            inventory['switch_command'] = switch
+            self.run('select-existing-qualified-clt', switch, timeout=30)
+            selection = self.text('developer-selection-after', ['/usr/bin/xcode-select', '-p'])
+            resolved = self.text('developer-git-after', ['/usr/bin/xcrun', '--find', 'git'])
+            inventory['selection_after'] = selection
+            inventory['git_after'] = resolved
+            if pathlib.Path(selection).resolve(strict=True) != CLT_ROOT.resolve(strict=True) \
+                    or str(pathlib.Path(resolved).resolve(strict=True)) != before['physical_path'] \
+                    or self.system_file_identity(CLT_GIT) != before:
+                raise RuntimeError('clt_selection_postflight_mismatch')
+            inventory['switched'] = True
+            return True
+        except BaseException as error:
+            inventory['failure'] = {'type': type(error).__name__, 'message': str(error)}
+            raise
+        finally:
+            write_json(self.private / 'developer-tools-inventory.json', inventory)
+
     def git_text(self, label, *args):
         return self.text(label, [self.git, '-C', self.candidate, *args])
 
@@ -407,6 +504,10 @@ class Qualification:
         self.apple_tool('/usr/bin/python3')
         self.apple_tool('/usr/bin/xcrun', 'com.apple.xcrun')
         self.openssl = self.apple_tool('/usr/bin/openssl', 'com.apple.openssl')
+        if not self.developer_selection_prepared:
+            self.developer_selection_prepared = True
+            if self.prepare_existing_clt_selection():
+                return self.providers()
         git_path = self.text('xcrun-find-git', ['/usr/bin/xcrun', '--find', 'git'])
         if not pathlib.Path(git_path).is_absolute():
             raise RuntimeError('apple_git_unresolved')
@@ -558,7 +659,8 @@ class Qualification:
         with tarfile.open(archive, 'w:gz') as tar:
             # Never archive caches, executable hydration, child homes or fixture trees.
             allowed = ['logs', 'before-source.json', 'after-source.json', 'providers.json', 'resources.json',
-                       'pnpm-tool.json', 'workflow-provenance.json', 'result.json', 'cms-probe.txt', 'cms-probe.der',
+                       'pnpm-tool.json', 'workflow-provenance.json', 'developer-tools-inventory.json',
+                       'result.json', 'cms-probe.txt', 'cms-probe.der',
                        'qualification-error.txt', 'source-postflight-error.txt', 'collector-error.txt']
             for name in allowed:
                 path = self.private / name
