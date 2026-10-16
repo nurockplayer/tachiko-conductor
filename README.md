@@ -176,7 +176,9 @@ open PR remains a model-free wait. Unresolved or parked `FAILED`, `NEEDS_HUMAN`,
 and `WAITING_DEPENDENCY` owners block advancement even if their queue row
 disappears or changes route. Before new work or a claimed workflow resumes, all
 prior dispatch owners in the repository require exact released lane/receipt
-proof; missing, malformed, foreign, or stale proof holds the queue. At an active, parked, or empty boundary it only
+proof plus completed delivery or explicit task disposition. Ordinary `FAILED`
+release and `--stopped` recovery alone leave the task unresolved; missing,
+malformed, foreign, or stale proof holds the queue. At an active, parked, or empty boundary it only
 sleeps and rereads authoritative state; that idle path starts zero model turns.
 `--max-cycles` is an explicit bounded operational/test mode, and
 `--idle-poll-ms` controls the deterministic model-free safety poll. A local
@@ -190,10 +192,20 @@ existing durable Run binds claim, profile, task-shape revision, PR, HEAD, branch
 and base identity, and delivery reconciliation rechecks those identities. A
 closed live Issue is required to skip the same authority; reopening requires an
 explicit new task-shape revision before fresh work can start. Historical or
-current unresolved ownership blocks later rows. An exact released owner receipt
-can retire failed, cancelled, or explicitly stopped historical ownership without
-changing its workflow outcome or treating it as delivery. The same authority
-cannot respawn that work; a fresh task-shape revision may authorize a new Run.
+current unresolved ownership blocks later rows. Explicit cancellation records
+`workDisposition: cancelled` in the existing final released receipt, bound to
+terminal cancellation history. To retire other work intentionally, use
+`tachiko run admission recover <id> --generation <n> --stopped --retire-work`.
+This requires exact Run/lane/receipt proof and records `workDisposition: retired`;
+`--stopped` alone only attests quiescence. An already released legacy receipt
+can receive that disposition through the same explicit, exact-generation reentry
+(using the released generation minus one). Neither disposition changes a failed
+Run into delivery. Repository names compare case-insensitively for claim and
+historical replay checks. The same authority cannot respawn disposed work.
+A fresh task-shape revision may reissue terminal `FAILED` or `MERGED` work;
+released nonterminal work requires an explicit terminal decision (such as the
+existing cancellation choice) before reissue, and holds before a new claim is
+written until that decision exists.
 Automatic merged delivery additionally requires the final tokenless released
 receipt at the exact lane generation, with matching Run/claim/mission/repository/
 Issue/workspace identity and `workflow_settled` provenance. The manual legacy
@@ -203,6 +215,13 @@ failure retains the claim for exact retry before another writer is admitted.
 This is the bounded delivery-reconciliation portion of #128. Automatic merge
 requests, independent review qualification, and end-to-end #128/#91 acceptance
 remain separate obligations; this change does not activate a production queue.
+
+Receipt compatibility is a source-only #104 consideration: `workDisposition` is
+optional in the existing version-1 record. Old records remain readable, but
+missing disposition stays unknown for failed/stopped work. Older runtimes that
+do not recognize the new field reject such records; rollback is fail-closed and
+must retain the evidence. This is not old-runtime compatibility or native
+release qualification.
 
 ## Supervised dispatch driver (macOS)
 

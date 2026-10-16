@@ -23,6 +23,8 @@ export interface RunOwnerReceipt {
   readonly phase: RunOwnerReceiptPhase;
   /** Durable proof that a merge release began from workflow_settled parking. */
   readonly settlementReason?: 'workflow_settled';
+  /** Explicit task disposition, separate from ordinary capability release. */
+  readonly workDisposition?: 'retired' | 'cancelled';
 }
 
 function object(value: unknown): value is Record<string, unknown> {
@@ -33,7 +35,7 @@ function nonEmpty(value: unknown): value is string { return typeof value === 'st
 
 export function validateRunOwnerReceipt(value: unknown): value is RunOwnerReceipt {
   if (!object(value)) return false;
-  const allowed = ['schemaVersion', 'laneId', 'missionId', 'repository', 'runId', 'issue', 'claimId', 'workspace', 'token', 'generation', 'phase', 'settlementReason'];
+  const allowed = ['schemaVersion', 'laneId', 'missionId', 'repository', 'runId', 'issue', 'claimId', 'workspace', 'token', 'generation', 'phase', 'settlementReason', 'workDisposition'];
   const required = ['schemaVersion', 'laneId', 'missionId', 'repository', 'runId', 'generation', 'phase'];
   if (Object.keys(value).some((key) => !allowed.includes(key)) || !required.every((key) => key in value) ||
     value.schemaVersion !== 1 || !nonEmpty(value.laneId) || !nonEmpty(value.missionId) || !/^[a-z0-9_.-]+\/[a-z0-9_.-]+$/.test(String(value.repository)) ||
@@ -41,7 +43,8 @@ export function validateRunOwnerReceipt(value: unknown): value is RunOwnerReceip
     (value.claimId !== undefined && !nonEmpty(value.claimId)) || (value.workspace !== undefined && (!nonEmpty(value.workspace) || !path.isAbsolute(value.workspace))) ||
     !Number.isSafeInteger(value.generation) || (value.generation as number) < 1 ||
     !['pre_execution', 'execution_possible', 'park_transition', 'release_transition', 'parked_release_transition', 'parked', 'released'].includes(String(value.phase)) ||
-    (value.settlementReason !== undefined && (value.settlementReason !== 'workflow_settled' || (value.phase !== 'parked_release_transition' && value.phase !== 'released')))) return false;
+    (value.settlementReason !== undefined && (value.settlementReason !== 'workflow_settled' || (value.phase !== 'parked_release_transition' && value.phase !== 'released'))) ||
+    (value.workDisposition !== undefined && (!['retired', 'cancelled'].includes(String(value.workDisposition)) || value.phase !== 'released'))) return false;
   if ((value.phase === 'pre_execution' || value.phase === 'execution_possible' || value.phase === 'park_transition' || value.phase === 'release_transition') !== (value.token !== undefined)) return false;
   if (value.token !== undefined && (!object(value.token) || Object.keys(value.token).sort().join(',') !== 'generation,laneId,token' ||
     value.token.laneId !== value.laneId || value.token.generation !== value.generation || !nonEmpty(value.token.token))) return false;

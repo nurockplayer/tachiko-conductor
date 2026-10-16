@@ -90,12 +90,12 @@ export type DispatchOnceResult =
   | { readonly outcome: 'dispatched'; readonly entry: DispatchQueueEntry; readonly claim: DispatchRuntimeClaim; readonly execution: DispatchExecution };
 
 function target(entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>) {
-  return { kind: 'issue' as const, owner: options.owner, repo: options.repo, issueNumber: entry.issue };
+  return { kind: 'issue' as const, owner: options.owner.toLowerCase(), repo: options.repo.toLowerCase(), issueNumber: entry.issue };
 }
 
 function isTarget(run: Run, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): boolean {
   const wanted = target(entry, options);
-  return run.target.kind === 'issue' && run.target.owner === wanted.owner && run.target.repo === wanted.repo && run.target.issueNumber === wanted.issueNumber;
+  return run.target.kind === 'issue' && run.target.owner.toLowerCase() === wanted.owner && run.target.repo.toLowerCase() === wanted.repo && run.target.issueNumber === wanted.issueNumber;
 }
 
 function activeRun(store: RunStore, entry: DispatchQueueEntry, options: DispatchOnceOptions): Run | null {
@@ -180,6 +180,9 @@ async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptio
   // comment. A closed issue is required so a reopened incarnation cannot reuse
   // its prior delivery; reissue requires an explicit new authority revision.
   const history = options.store.list().filter((prior) => isTarget(prior, entry, options) && prior.dispatchClaimId !== undefined);
+  if (history.some((prior) => prior.state !== 'FAILED' && prior.state !== 'MERGED' && !sameAuthorityRevision(prior, entry))) {
+    return { run: null, reason: `#${entry.issue}: revised reissue of released nonterminal work requires explicit terminal disposition before a replacement claim`, blocked: true };
+  }
   if (history.some((prior) => prior.state !== 'MERGED' && options.isRunOwnerRetired?.(prior) !== true)) {
     return { run: null, reason: `#${entry.issue}: prior dispatch work lacks proven delivery`, blocked: true };
   }
@@ -423,7 +426,7 @@ function historicalOwnerHold(options: DispatchOnceOptions, currentRunId?: string
   for (const prior of options.store.list()) {
     if (prior.id === currentRunId || prior.dispatchClaimId === undefined ||
       prior.target.owner.toLowerCase() !== options.owner.toLowerCase() || prior.target.repo.toLowerCase() !== options.repo.toLowerCase()) continue;
-    if (options.isRunOwnerRetired?.(prior) !== true) return `Prior dispatch Run ${prior.id} retains unresolved repository ownership (${prior.state}); exact owner retirement is required.`;
+    if (options.isRunOwnerRetired?.(prior) !== true) return `Prior dispatch Run ${prior.id} retains unresolved dispatch work (${prior.state}); exact release and explicit work disposition are required.`;
   }
   return null;
 }
