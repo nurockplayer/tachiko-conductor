@@ -403,7 +403,7 @@ class Qualification:
                 raise RuntimeError('workflow_provenance_missing_or_invalid')
             self.provenance[key] = value
         self.safe_system_file('/usr/bin/codesign')
-        self.apple_tool('/usr/bin/codesign', 'com.apple.codesign')
+        self.apple_tool('/usr/bin/codesign', 'com.apple.security.codesign')
         self.apple_tool('/usr/bin/python3')
         self.apple_tool('/usr/bin/xcrun', 'com.apple.xcrun')
         self.openssl = self.apple_tool('/usr/bin/openssl', 'com.apple.openssl')
