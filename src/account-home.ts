@@ -156,28 +156,30 @@ function applicableAccountHomeForPath(targetPath: string): string | null {
   return null;
 }
 
-function physicalizeThroughDeepestExistingAncestor(target: string): string {
-  let current = target;
+/** Resolve missing descendants without mistaking a concurrent create for an unresolved symlink. */
+export function physicalizeThroughDeepestExistingAncestor(target: string): string {
+  let current = path.resolve(target);
   const missing: string[] = [];
+  const maxReobservations = 3;
+  let reobservations = 0;
   for (;;) {
     try {
       return path.resolve(realpathSync.native(current), ...missing.reverse());
     } catch (error) {
       const code = typeof error === 'object' && error !== null ? (error as NodeJS.ErrnoException).code : undefined;
       if (code !== 'ENOENT') throw error;
-      try {
-        lstatSync(current);
-        // An existing but unresolved component (especially a dangling symlink)
-        // is not a missing descendant and cannot be used for classification.
-        throw error;
-      } catch (statError) {
-        if (statError !== error && typeof statError === 'object' && statError !== null && (statError as NodeJS.ErrnoException).code !== 'ENOENT') {
-          throw statError;
-        }
-        if (statError === error) throw error;
+      const stats = lstatIfPresent(current);
+      if (stats !== null) {
+        // A safe object may have appeared after realpath observed ENOENT.
+        // Reobserve it, but never reinterpret unresolved links or other types
+        // as missing descendants, and never spin under continued churn.
+        if (stats.isSymbolicLink() || (!stats.isFile() && !stats.isDirectory()) ||
+            reobservations >= maxReobservations) throw error;
+        reobservations += 1;
+        continue;
       }
       const parent = path.dirname(current);
-      if (parent === current) return target;
+      if (parent === current) throw error;
       missing.push(path.basename(current));
       current = parent;
     }
