@@ -172,8 +172,11 @@ same claimed Run; an expired lease is never permission to create a second one.
 same-host lock for its lifetime and reconciles settled workflow output immediately.
 A retained queue row permits advancement only after exact live merged PR proof,
 durable `MERGED` publication, and successful admission/receipt release. An exact
-open PR remains a model-free wait. `FAILED`, `NEEDS_HUMAN`, and
-`WAITING_DEPENDENCY` retain ownership even if their queue row disappears. At an active, parked, or empty boundary it only
+open PR remains a model-free wait. Unresolved or parked `FAILED`, `NEEDS_HUMAN`,
+and `WAITING_DEPENDENCY` owners block advancement even if their queue row
+disappears or changes route. Before new work or a claimed workflow resumes, all
+prior dispatch owners in the repository require exact released lane/receipt
+proof; missing, malformed, foreign, or stale proof holds the queue. At an active, parked, or empty boundary it only
 sleeps and rereads authoritative state; that idle path starts zero model turns.
 `--max-cycles` is an explicit bounded operational/test mode, and
 `--idle-poll-ms` controls the deterministic model-free safety poll. A local
@@ -187,7 +190,15 @@ existing durable Run binds claim, profile, task-shape revision, PR, HEAD, branch
 and base identity, and delivery reconciliation rechecks those identities. A
 closed live Issue is required to skip the same authority; reopening requires an
 explicit new task-shape revision before fresh work can start. Historical or
-current unresolved ownership blocks later rows. A receipt or registry release
+current unresolved ownership blocks later rows. An exact released owner receipt
+can retire failed, cancelled, or explicitly stopped historical ownership without
+changing its workflow outcome or treating it as delivery. The same authority
+cannot respawn that work; a fresh task-shape revision may authorize a new Run.
+Automatic merged delivery additionally requires the final tokenless released
+receipt at the exact lane generation, with matching Run/claim/mission/repository/
+Issue/workspace identity and `workflow_settled` provenance. The manual legacy
+merge-retry exception for an absent receipt does not authorize automatic work.
+A receipt or registry release
 failure retains the claim for exact retry before another writer is admitted.
 This is the bounded delivery-reconciliation portion of #128. Automatic merge
 requests, independent review qualification, and end-to-end #128/#91 acceptance

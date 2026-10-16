@@ -1935,6 +1935,28 @@ function casMergedRun(store: RunStore, current: Run): Run {
   return next;
 }
 
+/** Ownership retirement is a strict released capability proof, never delivery. */
+export function isDispatchRunOwnerRetiredCommand(store: RunStore, run: Run, admission: MissionAdmissionRegistry): boolean {
+  if (run.dispatchClaimId === undefined || run.execution === undefined || run.repairTaskShapeAuthority === undefined) return false;
+  const lane = admission.readLane(`run:${run.id}`);
+  if (lane === null || lane.status !== 'released') return false;
+  admission.withExactReleasedLane(lane.laneId, lane.generation, (released) => {
+    const current = store.read(run.id);
+    if (current === null || JSON.stringify(current) !== JSON.stringify(run)) throw new Error(`Run "${run.id}" changed before exact owner retirement proof.`);
+    const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+    const receiptPath = resolveRunOwnerReceiptPath(repository, run.id, evidenceForRun(run));
+    const receipt = readRunOwnerReceipt(receiptPath);
+    if (receipt === null) throw new Error(`Run "${run.id}" lacks its final released owner receipt.`);
+    assertRecoveryOwnerEvidence(run, receipt, released, released.missionId, released.generation - 1);
+    if (receipt.phase !== 'released' || receipt.token !== undefined || receipt.generation !== released.generation ||
+      receipt.workspace !== released.evidence.workspace ||
+      (run.state === 'MERGED' && receipt.settlementReason !== 'workflow_settled')) {
+      throw new Error(`Run "${run.id}" lacks exact final released owner receipt generation or settlement proof.`);
+    }
+  });
+  return true;
+}
+
 /** Model-free dispatch poll. The caller supplies its already-held prepare lock. */
 export async function reconcileDispatchMergedRunCommand(
   store: RunStore, run: Run, github: GitHubAdapter, admission: MissionAdmissionRegistry,
@@ -1947,7 +1969,11 @@ export async function reconcileDispatchMergedRunCommand(
     if (run.state === 'MERGED') throw new Error(`Merged Run "${run.id}" has an open live PR; refusing delivery.`);
     return null;
   }
-  return await runMergedTransitionCommand(store, run.id, github, admission, withHeldDispatchAdmissionLock);
+  const settled = await runMergedTransitionCommand(store, run.id, github, admission, withHeldDispatchAdmissionLock);
+  // The manual command deliberately accepts receipt-less legacy retries. An
+  // automatic delivery must retain the complete released owner receipt.
+  if (!isDispatchRunOwnerRetiredCommand(store, settled, admission)) throw new Error(`Run "${run.id}" lacks exact automatic delivery owner settlement.`);
+  return settled;
 }
 
 /** Apply a normal merged transition only after exact live GitHub proof. Caller holds the canonical dispatch lock. */
@@ -2595,6 +2621,7 @@ export async function main(argv: string[]): Promise<number> {
           releaseAdmissionLock,
           // The outer prepare boundary still owns the canonical lock here.
           // Reacquiring that same lock inside settlement would deadlock.
+          isRunOwnerRetired: (run) => isDispatchRunOwnerRetiredCommand(store, run, admission),
           reconcileMergedRun: async (run) => await reconcileDispatchMergedRunCommand(store, run, workflow.github, admission, async (operation) => await operation()),
           withAdmissionLock: async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation),
           resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),

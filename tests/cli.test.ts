@@ -30,6 +30,7 @@ import {
   runIssueCommand,
   runMergedTransitionCommand,
   reconcileDispatchMergedRunCommand,
+  isDispatchRunOwnerRetiredCommand,
   resumeCommand,
   runShowCommand,
   runShowView,
@@ -917,10 +918,11 @@ describe('workflow run and resume commands', () => {
     });
     let proof = mergedPullRequest();
     let nextMerged = false;
+    let nextIssue = 42;
     let issueState: 'open' | 'closed' = 'closed';
     const github: GitHubAdapter = {
       kind: 'github',
-      readPullRequest: async (_owner, _repo, number) => number === 7 ? proof : mergedPullRequest({ number, state: nextMerged ? 'merged' : 'open', headRef: `tachiko/issue-${number === 8 ? 43 : 42}-next` }),
+      readPullRequest: async (_owner, _repo, number) => number === 7 ? proof : mergedPullRequest({ number, state: nextMerged ? 'merged' : 'open', headRef: `tachiko/issue-${number === 8 ? 43 : nextIssue}-next` }),
       readIssue: async (target) => ({ target, title: 'delivery', body: '', state: target.issueNumber === 42 ? issueState : nextMerged ? 'closed' : 'open' }),
       listPullRequests: async () => [],
       readBranch: async () => { throw new Error('unused'); },
@@ -952,6 +954,7 @@ describe('workflow run and resume commands', () => {
     }, {
       workflow: { store, github } as unknown as WorkflowDependencies, runtime, admission: setup.registry, now: () => T0,
       reconcileMergedRun: reconcile ?? undefined,
+      isRunOwnerRetired: (current) => isDispatchRunOwnerRetiredCommand(store, current, setup.registry),
       resolveExecutionProfile: () => execution,
       resumeClaimedRun: async () => { throw new Error('delivery must never rerun a settled workflow'); },
       runIssue: async (ref, selected, claimId, authority) => {
@@ -959,6 +962,7 @@ describe('workflow run and resume commands', () => {
         assert.equal(setup.registry.readLane(`run:${run.id}`)?.status, 'released');
         assert.equal(readRunOwnerReceipt(setup.receiptPath)?.phase, 'released');
         const issue = Number(ref.split('#')[1]);
+        nextIssue = issue;
         // Controlled workflow boundary supplies readiness, never delivery.
         // Both Runs cross the actual settlement implementation below.
         const id = issue === 43 ? 'delivery-b' : 'delivery-reissue';
@@ -983,13 +987,204 @@ describe('workflow run and resume commands', () => {
         return { outcome: 'merge_ready', run: next };
       },
     });
-    return { run, setup, github, runtime, row, poll, reconcileMergedRun,
+    const addHistoricalOwner = (state: 'FAILED' | 'NEEDS_HUMAN' | 'WAITING_DEPENDENCY', active = false) => {
+      const workspace = path.join(dir, 'historical-workspace');
+      mkdirSync(workspace);
+      const prepared = mergeReadyRun('historical-40', dir, 'claim-40');
+      const implementing: Run = { ...prepared, state: 'IMPLEMENTING', target: { ...TARGET, issueNumber: 40 },
+        execution, repairTaskShapeAuthority: REPAIR_AUTHORITY,
+        bootstrap: { ...prepared.bootstrap!, issueNumber: 40, workspacePath: workspace, branch: 'historical-40' },
+        pullRequest: { number: 40, headSha: MERGE_HEAD } };
+      const historical = applyTransition(implementing, state === 'FAILED' ? { type: 'fail', reason: 'historical failure' } : {
+        type: state === 'NEEDS_HUMAN' ? 'escalate' : 'wait_dependency', reason: 'historical wait',
+        interrupt: { evidence: 'historical fixture', choices: [CANCEL_RUN_DECISION] },
+      }, T0);
+      store.create(historical);
+      const evidence = { repository: 'acme/widgets', issue: 40, run: historical.id, claim: 'claim-40', pullRequest: 40, workspace: realpathSync(workspace) };
+      const admitted = setup.registry.admit({ laneId: `run:${historical.id}`, role: 'production_captain', highAutonomy: true, evidence });
+      assert.equal(admitted.outcome, 'admitted');
+      if (admitted.outcome !== 'admitted') throw new Error('expected historical admission');
+      const receiptPath = resolveRunOwnerReceiptPath('acme/widgets', historical.id, evidence);
+      const receipt = { schemaVersion: 1 as const, laneId: admitted.token.laneId, missionId: admitted.missionId,
+        repository: 'acme/widgets', runId: historical.id, issue: 40, claimId: 'claim-40', workspace: evidence.workspace,
+        token: admitted.token, generation: admitted.token.generation, phase: 'execution_possible' as const };
+      if (active) writeRunOwnerReceipt(receiptPath, receipt);
+      else setup.registry.park(admitted.token, state === 'FAILED' ? 'workflow_settled' : 'workflow_wait',
+        () => writeRunOwnerReceipt(receiptPath, { ...receipt, phase: 'park_transition' }),
+        () => writeRunOwnerReceipt(receiptPath, { ...receipt, token: undefined, generation: admitted.token.generation + 1, phase: 'parked' }));
+      return { run: historical, receiptPath, generation: setup.registry.readLane(`run:${historical.id}`)!.generation };
+    };
+    return { run, setup, github, runtime, row, poll, reconcileMergedRun, addHistoricalOwner,
       get store() { return store; }, get starts() { return starts; }, get comments() { return comments; },
       setProof(next: typeof proof) { proof = next; }, setIssue(next: typeof issueState) { issueState = next; },
       mergeNext() { nextMerged = true; },
       setQueue(body: string) { queue = body; }, clearComments() { comments = []; },
       restart() { store = new JsonFileStore({ dir: path.join(dir, 'runs') }); },
     };
+  }
+
+  for (const historical of [false, true]) {
+    it(`holds automatic delivery without the final receipt and retries exact restoration (${historical ? 'history restart' : 'retained claim'})`, async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-delivery-final-receipt-'));
+      const restore = isolateMergeReceiptRoot(dir);
+      try {
+        const f = dispatchDeliveryFixture(dir);
+        await f.reconcileMergedRun(f.run);
+        const receipt = readRunOwnerReceipt(f.setup.receiptPath)!;
+        rmSync(f.setup.receiptPath);
+        if (historical) { f.clearComments(); f.restart(); }
+        const before = JSON.stringify(f.comments);
+        await assert.rejects(f.poll(), /final released owner receipt/);
+        assert.equal(f.starts, 0);
+        assert.equal(JSON.stringify(f.comments), before);
+        // The explicit manual/legacy command retains its separate no-op contract.
+        assert.equal((await runMergedTransitionForTest(f.store, f.run.id, f.github, f.setup.registry)).state, 'MERGED');
+        writeRunOwnerReceipt(f.setup.receiptPath, receipt);
+        assert.equal((await f.poll()).outcome, 'dispatched');
+        assert.equal((await f.poll()).outcome, 'existing_claim');
+        assert.equal(f.starts, 1);
+      } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  for (const state of ['FAILED', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY'] as const) {
+    for (const row of ['absent', 'human', 'revised'] as const) {
+      it(`holds parked historical ${state} ownership with ${row} row after runtime replacement and restart`, async () => {
+        const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-delivery-history-hold-'));
+        const restore = isolateMergeReceiptRoot(dir);
+        try {
+          const f = dispatchDeliveryFixture(dir);
+          await f.reconcileMergedRun(f.run);
+          const h = f.addHistoricalOwner(state);
+          const prefix = row === 'absent' ? '' : `${row === 'human' ? f.row(40).replace('route: codex', 'route: human') : f.row(40, 'task-shape-v2')}\n`;
+          f.setQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n${prefix}${f.row(42)}\n${f.row(43)}`);
+          for (const restart of [false, true]) {
+            if (restart) f.restart();
+            const before = JSON.stringify(f.comments);
+            const held = await f.poll();
+            assert.equal(held.outcome, 'owner_reconciliation_hold');
+            assert.equal(f.starts, 0);
+            assert.equal(JSON.stringify(f.comments), before);
+            assert.equal(f.setup.registry.readLane(`run:${h.run.id}`)?.status, 'parked');
+          }
+        } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+      });
+    }
+
+    it(`allows B after actual stopped recovery of historical ${state}, without delivery or same-authority respawn`, async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-delivery-history-retired-'));
+      const restore = isolateMergeReceiptRoot(dir);
+      try {
+        const f = dispatchDeliveryFixture(dir);
+        await f.reconcileMergedRun(f.run);
+        const h = f.addHistoricalOwner(state);
+        assert.equal((await f.poll()).outcome, 'owner_reconciliation_hold');
+        recoverRunAdmission(f.store, f.setup.registry, h.run.id, h.generation, true);
+        const prior = f.store.read(h.run.id)!;
+        assert.equal(prior.state, state, 'ownership retirement does not manufacture delivery');
+        f.setQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n${f.row(40)}\n${f.row(42)}\n${f.row(43)}`);
+        f.restart();
+        const result = await f.poll();
+        assert.equal(result.outcome, 'dispatched');
+        if (result.outcome === 'dispatched') assert.equal(result.entry.issue, 43);
+        assert.equal(f.starts, 1);
+        assert.deepEqual(f.store.read(h.run.id), prior);
+        assert.equal((await f.poll()).outcome, 'existing_claim');
+        assert.equal(f.starts, 1);
+      } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  it('permits a fresh revised incarnation of explicitly retired failed work and retains its correct claim', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-delivery-retirement-reissue-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      await f.reconcileMergedRun(f.run);
+      const h = f.addHistoricalOwner('FAILED');
+      recoverRunAdmission(f.store, f.setup.registry, h.run.id, h.generation, true);
+      f.setQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n${f.row(40, 'task-shape-v2')}\n${f.row(43)}`);
+      f.restart();
+      const result = await f.poll();
+      assert.equal(result.outcome, 'dispatched');
+      if (result.outcome === 'dispatched') assert.equal(result.entry.issue, 40);
+      const next = f.store.read('delivery-reissue')!;
+      assert.equal(next.target.kind === 'issue' ? next.target.issueNumber : undefined, 40);
+      assert.equal(next.repairTaskShapeAuthority?.revision, 'task-shape-v2');
+      assert.notEqual(next.dispatchClaimId, h.run.dispatchClaimId);
+      assert.equal((await f.poll()).outcome, 'existing_claim');
+      assert.equal(f.starts, 1);
+      assert.equal(f.store.read(h.run.id)?.state, 'FAILED');
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('keeps the current failed owner gated until actual stopped recovery retires its ownership', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-delivery-current-retirement-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      await f.reconcileMergedRun(f.run);
+      const h = f.addHistoricalOwner('FAILED');
+      await f.runtime.updateRuntimeComment('runtime', renderDispatchRuntime({ issue: 40, claimId: 'claim-40', runId: h.run.id,
+        profile: 'complex', repairTaskShapeAuthority: REPAIR_AUTHORITY, state: 'failed', claimedAt: T0, heartbeatAt: T0, leaseUntil: T0 }));
+      assert.equal((await f.poll()).outcome, 'existing_claim');
+      assert.equal(f.starts, 0);
+      recoverRunAdmission(f.store, f.setup.registry, h.run.id, h.generation, true);
+      const result = await f.poll();
+      assert.equal(result.outcome, 'dispatched');
+      if (result.outcome === 'dispatched') assert.equal(result.entry.issue, 43);
+      assert.equal(f.starts, 1);
+      assert.equal(f.store.read(h.run.id)?.state, 'FAILED');
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('holds an active historical owner before resuming the current workflow', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-delivery-history-active-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      const h = f.addHistoricalOwner('NEEDS_HUMAN', true);
+      const ready = { ...f.run, state: 'READY' as const };
+      f.store.update(ready);
+      assert.equal((await f.poll()).outcome, 'owner_reconciliation_hold');
+      assert.equal(f.starts, 0);
+      assert.equal(f.setup.registry.readLane(`run:${h.run.id}`)?.status, 'active');
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  for (const corruption of ['missing', 'malformed', 'generation', 'claim', 'mission', 'repository', 'issue', 'workspace'] as const) {
+    it(`holds historical owner retirement with ${corruption} released receipt proof`, async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-delivery-history-invalid-'));
+      const restore = isolateMergeReceiptRoot(dir);
+      try {
+        const f = dispatchDeliveryFixture(dir);
+        await f.reconcileMergedRun(f.run);
+        const h = f.addHistoricalOwner('FAILED');
+        recoverRunAdmission(f.store, f.setup.registry, h.run.id, h.generation, true);
+        const receipt = readRunOwnerReceipt(h.receiptPath)!;
+        if (corruption === 'missing') rmSync(h.receiptPath);
+        else {
+          const bad = { ...receipt,
+            ...(corruption === 'malformed' ? { token: { laneId: receipt.laneId, generation: receipt.generation, token: 'foreign' } } : {}),
+            ...(corruption === 'generation' ? { generation: receipt.generation - 1 } : {}),
+            ...(corruption === 'claim' ? { claimId: 'foreign-claim' } : {}),
+            ...(corruption === 'mission' ? { missionId: 'foreign-mission' } : {}),
+            ...(corruption === 'repository' ? { repository: 'foreign/repository' } : {}),
+            ...(corruption === 'issue' ? { issue: 999 } : {}),
+            ...(corruption === 'workspace' ? { workspace: dir } : {}),
+          };
+          writeFileSync(h.receiptPath, JSON.stringify(bad));
+        }
+        f.restart();
+        const before = JSON.stringify(f.comments);
+        await assert.rejects(f.poll(), /receipt|evidence|workspace/);
+        assert.equal(f.starts, 0);
+        assert.equal(JSON.stringify(f.comments), before);
+        writeRunOwnerReceipt(h.receiptPath, receipt);
+        assert.equal((await f.poll()).outcome, 'dispatched');
+        assert.equal(f.starts, 1);
+      } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
   }
 
   it('advances retained delivered A to B through real merge settlement and does not resurrect A after restart', async () => {
@@ -1075,7 +1270,7 @@ describe('workflow run and resume commands', () => {
     });
   }
 
-  it('requires historical settlement proof before a revised authority can create fresh work', async () => {
+  it('requires delivery proof to skip a retained historical delivered authority', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-history-proof-'));
     const restore = isolateMergeReceiptRoot(dir);
     try {
@@ -1083,11 +1278,9 @@ describe('workflow run and resume commands', () => {
       await f.reconcileMergedRun(f.run);
       f.clearComments();
       f.restart();
-      f.setIssue('open');
-      f.setQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n${f.row(42, 'task-shape-v2')}\n${f.row(43)}`);
       const held = await f.poll(null);
       assert.equal(held.outcome, 'no_eligible_work');
-      if (held.outcome === 'no_eligible_work') assert.match(held.reasons[0]!, /previous authority lacks exact delivery settlement/);
+      if (held.outcome === 'no_eligible_work') assert.match(held.reasons[0]!, /historical delivery does not authorize/);
       assert.equal(f.starts, 0);
       assert.equal(f.comments.length, 0);
     } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
