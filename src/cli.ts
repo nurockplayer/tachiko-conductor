@@ -1251,7 +1251,16 @@ export function recoverRunAdmission(
     registry.withExactReleasedLane(laneId, expectedGeneration + 1, (releasedLane) => {
       const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
       const current = fresh.receipt;
-      if (current.phase === 'released' && current.generation === expectedGeneration + 1 && current.token === undefined) return;
+      if (current.phase === 'released' && current.generation === expectedGeneration + 1 && current.token === undefined) {
+        if (current.workspace === undefined && releasedLane.evidence.workspace !== undefined) {
+          if (JSON.stringify(fresh.run) !== JSON.stringify(run) ||
+            !canBindMissingReceiptWorkspace(current, fresh.run, releasedLane.evidence.workspace)) {
+            throw new Error(`Run "${run.id}" changed or lacks exact workspace proof for released receipt strengthening.`);
+          }
+          writeRunOwnerReceipt(canonicalReceiptPath, { ...current, workspace: releasedLane.evidence.workspace });
+        }
+        return;
+      }
       if (current.phase !== 'release_transition' && current.phase !== 'parked_release_transition') throw new Error('Run owner receipt phase is not an exact released transition.');
       const exactActiveTransition = current.phase === 'release_transition' && current.generation === expectedGeneration && current.token?.laneId === laneId && current.token.generation === expectedGeneration && current.token.token === operationTokenSecret;
       const exactParkedTransition = current.phase === 'parked_release_transition' && current.generation === expectedGeneration && current.token === undefined;

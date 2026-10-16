@@ -1028,7 +1028,8 @@ describe('workflow run and resume commands', () => {
 
   for (const changedCase of [false, true]) {
     for (const revised of [false, true]) {
-      it(`holds actual ordinary failure until explicit disposition, then uses real factory with ${changedCase ? 'uppercase' : 'canonical'} repository and ${revised ? 'revised' : 'same'} authority`, async () => {
+      for (const preboundWorkspace of [false, true]) {
+      it(`holds actual ordinary failure until explicit disposition, then uses real factory with ${changedCase ? 'uppercase' : 'canonical'} repository and ${revised ? 'revised' : 'same'} authority (${preboundWorkspace ? 'prebound control' : 'logical start'})`, async () => {
         const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-ordinary-failure-'));
         const restore = isolateMergeReceiptRoot(dir);
         const oldTmpdir = os.tmpdir;
@@ -1040,8 +1041,7 @@ describe('workflow run and resume commands', () => {
           const admission = new MissionAdmissionRegistry({ filePath: path.join(dir, '.tachiko-conductor', 'mission-admission', 'registry.json'), config: {
             schemaVersion: 1, revision: 'ordinary-failure-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 },
           } });
-          const run = createRun(TARGET, T0, 'ordinary-failed-a', fixture.request.execution, 'claim-a', REPAIR_AUTHORITY);
-          store.create(run);
+          if (preboundWorkspace) store.create(createRun(TARGET, T0, 'ordinary-failed-a', fixture.request.execution, 'claim-a', REPAIR_AUTHORITY));
           const live = githubAdapter([fixture.identity.baseSha]);
           const github: GitHubAdapter = { ...live,
             readIssue: async (target) => ({ target, title: 'controlled', body: '', state: 'open' }), listPullRequests: async () => [],
@@ -1052,13 +1052,46 @@ describe('workflow run and resume commands', () => {
           const workflow = { ...deps(store, github, fixture.adapter, new FakeReviewer([])), bootstrapForExecution: () => fixture.bootstrap };
           const outcome = await runIssueCommand(workflow, 'acme/widgets#42', { execution: fixture.request.execution,
             dispatchClaimId: 'claim-a', repairTaskShapeAuthority: REPAIR_AUTHORITY, admission,
-            admissionWorkspace: fixture.identity.workspacePath, now: () => T0 });
-          assert.equal(outcome.run.state, 'FAILED');
+            ...(preboundWorkspace ? { admissionWorkspace: fixture.identity.workspacePath } : {}), now: () => T0 });
+          const run = outcome.run;
+          assert.equal(run.state, 'FAILED');
           assert.match(outcome.outcome === 'failed' ? outcome.reason : '', /exited with status 1/);
           const receiptPath = resolveRunOwnerReceiptPath('acme/widgets', run.id, { repository: 'acme/widgets' });
           const receipt = readRunOwnerReceipt(receiptPath)!;
           assert.equal(receipt.phase, 'released');
           assert.equal(receipt.workDisposition, undefined);
+          if (!preboundWorkspace) {
+            assert.equal(receipt.workspace, undefined, 'logical admission starts without a receipt workspace');
+            const workspace = canonicalizeMissionEvidence({ repository: 'acme/widgets', workspace: run.bootstrap!.workspacePath }).workspace;
+            assert.equal(admission.readLane(`run:${run.id}`)?.evidence.workspace, workspace, 'the real workflow strengthened the lane');
+            assert.throws(() => isDispatchRunOwnerRetiredCommand(store, run, admission), /final released owner receipt/,
+              'the automatic consumer remains strict before trusted strengthening');
+            if (!changedCase && !revised) {
+              const before = readFileSync(receiptPath, 'utf8');
+              writeRunOwnerReceipt(receiptPath, { ...receipt, workspace: dir });
+              const conflicting = readFileSync(receiptPath, 'utf8');
+              assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation - 1, true), /workspace conflicts/);
+              assert.equal(readFileSync(receiptPath, 'utf8'), conflicting, 'conflicting workspace is never repaired');
+              writeRunOwnerReceipt(receiptPath, receipt);
+              store.update({ ...run, bootstrap: undefined });
+              assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation - 1, true), /exact canonical Run receipt|workspace/);
+              assert.equal(readFileSync(receiptPath, 'utf8'), before, 'absent durable bootstrap proof cannot strengthen the receipt');
+              store.update(run);
+              const exactReleasedLane = admission.withExactReleasedLane.bind(admission);
+              admission.withExactReleasedLane = (laneId, generation, reconcile) => {
+                store.update({ ...run, updatedAt: '2026-10-17T00:00:00.000Z' });
+                return exactReleasedLane(laneId, generation, reconcile);
+              };
+              try {
+                assert.throws(() => recoverRunAdmission(store, admission, run.id, receipt.generation - 1, true), /changed or lacks exact workspace proof/);
+                assert.equal(readFileSync(receiptPath, 'utf8'), before, 'Run drift under the released lock prevents strengthening');
+              } finally { admission.withExactReleasedLane = exactReleasedLane; store.update(run); }
+            }
+            if (changedCase) store = new JsonFileStore({ dir: path.join(dir, 'runs') });
+            recoverRunAdmission(store, admission, run.id, receipt.generation - 1, true);
+            assert.equal(readRunOwnerReceipt(receiptPath)?.workspace, workspace, 'exact released recovery fills only the proven workspace');
+            assert.equal(readRunOwnerReceipt(receiptPath)?.workDisposition, undefined, 'strengthening does not invent disposition');
+          }
           assert.equal(isDispatchRunOwnerRetiredCommand(store, outcome.run, admission), false);
           let comments: DispatchRuntimeComment[] = [{ id: 'runtime', body: renderDispatchRuntime({ issue: 42, claimId: 'claim-a', runId: run.id,
             profile: fixture.request.execution.profile, repairTaskShapeAuthority: REPAIR_AUTHORITY, state: 'failed', claimedAt: T0, heartbeatAt: T0, leaseUntil: T0 }) }];
@@ -1124,6 +1157,7 @@ describe('workflow run and resume commands', () => {
           assert.equal(entries, 1);
         } finally { fixture.cleanup(); os.tmpdir = oldTmpdir; restore(); rmSync(dir, { recursive: true, force: true }); }
       });
+      }
     }
   }
 
