@@ -2,7 +2,7 @@
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { existsSync, readFileSync, realpathSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
@@ -83,7 +83,7 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from './
 import { renderDispatchLaunchdPlist } from './dispatch/launchd.js';
 import { preflightProductionPolicy } from './production-policy.js';
 import { createDispatchWakeWaiter, dispatchWakePath, signalDispatchWake } from './dispatch/wake.js';
-import { assertSafeAccountOwnedPath, resolveAccountHomeDirectory } from './account-home.js';
+import { assertSafeAccountOwnedPath, physicalizeThroughDeepestExistingAncestor, resolveAccountHomeDirectory } from './account-home.js';
 import { pullRequestIdentityConflict } from './workflow/pull-request-identity.js';
 import {
   runWorkflow,
@@ -207,18 +207,6 @@ export function printDispatchResult(result: Awaited<ReturnType<typeof dispatchOn
   if (settled) console.log('TACHIKO_HEARTBEAT_SETTLED_V1');
 }
 
-function canonicalPhysicalPath(candidate: string): string {
-  let cursor = path.resolve(candidate);
-  const suffix: string[] = [];
-  while (!existsSync(cursor)) {
-    const parent = path.dirname(cursor);
-    if (parent === cursor) throw new Error('Cannot resolve a physical dispatch lock path.');
-    suffix.unshift(path.basename(cursor));
-    cursor = parent;
-  }
-  return path.resolve(realpathSync.native(cursor), ...suffix);
-}
-
 function canonicalDispatchLockPath(kind: 'once' | 'admission', homeDirectory: string): string {
   const base = path.join(homeDirectory, '.tachiko-conductor', 'dispatch');
   return path.join(base, kind === 'once' ? 'once.lock' : 'once.lock.admission');
@@ -228,10 +216,10 @@ function dispatchLockPath(env: NodeJS.ProcessEnv = process.env): string {
   const homeDirectory = resolveAccountHomeDirectory();
   const lexicalCanonical = canonicalDispatchLockPath('once', homeDirectory);
   assertSafeAccountOwnedPath(homeDirectory, lexicalCanonical, 'file');
-  const canonical = canonicalPhysicalPath(lexicalCanonical);
+  const canonical = physicalizeThroughDeepestExistingAncestor(lexicalCanonical);
   const configured = env.TACHIKO_DISPATCH_LOCK_PATH;
   if (configured === undefined) return canonical;
-  if (!path.isAbsolute(configured) || canonicalPhysicalPath(configured) !== canonical) {
+  if (!path.isAbsolute(configured) || physicalizeThroughDeepestExistingAncestor(configured) !== canonical) {
     throw new Error('TACHIKO_DISPATCH_LOCK_PATH must resolve to the canonical per-account dispatch lock.');
   }
   return canonical;
@@ -251,10 +239,10 @@ function dispatchAdmissionLockPath(env: NodeJS.ProcessEnv = process.env): string
   dispatchLockPath(env);
   const lexicalCanonical = canonicalDispatchLockPath('admission', homeDirectory);
   assertSafeAccountOwnedPath(homeDirectory, lexicalCanonical, 'file');
-  const canonical = canonicalPhysicalPath(lexicalCanonical);
+  const canonical = physicalizeThroughDeepestExistingAncestor(lexicalCanonical);
   const configured = env.TACHIKO_DISPATCH_ADMISSION_LOCK_PATH;
   if (configured === undefined) return canonical;
-  if (!path.isAbsolute(configured) || canonicalPhysicalPath(configured) !== canonical) {
+  if (!path.isAbsolute(configured) || physicalizeThroughDeepestExistingAncestor(configured) !== canonical) {
     throw new Error('TACHIKO_DISPATCH_ADMISSION_LOCK_PATH must resolve to the canonical per-account admission lock.');
   }
   return canonical;
