@@ -1537,12 +1537,14 @@ export class FileToolOutputStore implements ToolOutputStore {
       startCapture: (policy, commandAttribution = {}) => {
         if (operationState !== 'open') throw new Error('Tool-output operation is not accepting captures.');
         const frozenPolicy = validateToolOutputPolicy(policy);
+        const detachedCommandAttribution = snapshotOperationAttribution(commandAttribution);
         const captureId = randomUUID();
         const proposedMetadata = { ...base, state: 'active', activeCaptureIds: [...activeCaptureIds, captureId],
           captures: artifacts.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })) };
         // A deterministic size refusal owns no new files or IDs. After this
         // admission, retain the ID even if publication has an uncertain result.
-        preflightActiveOperationMetadata(proposedMetadata);
+        preflightActiveOperationMetadata({ ...proposedMetadata,
+          captures: [...proposedMetadata.captures, { attribution: detachedCommandAttribution }] });
         activeCaptureIds.push(captureId);
         writeMetadata(proposedMetadata);
         let writer: FileToolOutputWriter;
@@ -1574,7 +1576,7 @@ export class FileToolOutputStore implements ToolOutputStore {
             try { summary = writer.finish(); }
             catch (error) { captureState = 'failed'; throw error; }
             const nextArtifacts = [...artifacts, summary.artifact];
-            const nextAttributions = [...captureAttributions, commandAttribution];
+            const nextAttributions = [...captureAttributions, detachedCommandAttribution];
             try {
               // Keep the registered ID beside the finished reference until the
               // operation's terminal commit. Either old or new metadata then
@@ -1586,7 +1588,7 @@ export class FileToolOutputStore implements ToolOutputStore {
               });
             } catch (error) { captureState = 'failed'; throw error; }
             artifacts.push(summary.artifact);
-            captureAttributions.push(commandAttribution);
+            captureAttributions.push(detachedCommandAttribution);
             activeWriters.delete(writer);
             captureState = 'finished';
             return summary;

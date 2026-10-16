@@ -492,6 +492,101 @@ describe('bounded tool output contract', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
+  it('preflights oversized command attribution before any capture admission', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-command-attribution-oversized-'));
+    try {
+      const store = new FileToolOutputStore(root, { capacity: 1 });
+      const operation = store.beginOperation({ kind: 'command-attribution-preflight' });
+      try {
+        const snapshot = () => readdirSync(root, { recursive: true }).map(String).sort()
+          .filter((name) => lstatSync(path.join(root, name)).isFile())
+          .map((name) => [name, readFileSync(path.join(root, name)).toString('base64')]);
+        const before = snapshot();
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          let writer;
+          try { writer = operation.startCapture(policy, { label: 'x'.repeat(1_048_576) }); }
+          catch (error) { assert.match(String(error), /bounded metadata limit/); }
+          if (writer !== undefined) {
+            writer.write('stdout', 'small capture');
+            let finishFailure: unknown;
+            try { writer.finish(); } catch (error) { finishFailure = error; }
+            assert.fail(`oversized attribution was admitted at start; finish result: ${String(finishFailure)}`);
+          }
+          assert.deepEqual(snapshot(), before, 'refusal changes no ID, metadata, owner, index, cursor or raw file');
+        }
+      } finally { operation.abort(); }
+      const reused = store.beginOperation({ kind: 'reused-after-command-attribution-refusals' });
+      reused.abort();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('includes operation base, existing captures and JSON framing when admitting command attribution', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-command-attribution-envelope-'));
+    try {
+      const store = new FileToolOutputStore(root, { capacity: 1 });
+      const operation = store.beginOperation({ kind: 'command-attribution-framing' });
+      try {
+        const first = operation.startCapture(policy, { label: 'first' });
+        first.write('stdout', 'first capture');
+        first.finish();
+        const metadataPath = path.join(root, 'operations', `${operation.id}.json`);
+        const metadata = JSON.parse(readFileSync(metadataPath, 'utf8'));
+        const { artifacts: _artifacts, ...activeBase } = metadata;
+        const projection = { ...activeBase, activeCaptureIds: [...metadata.activeCaptureIds, '0'.repeat(36)],
+          captures: [...metadata.captures, { attribution: { label: '' } }] };
+        const exactBytes = 1_048_576 - Buffer.byteLength(JSON.stringify(projection));
+        const attribution = { label: 'x'.repeat(exactBytes + 1) };
+        assert.ok(Buffer.byteLength(JSON.stringify(attribution)) < 1_048_576, 'attribution alone fits the limit');
+        const snapshot = () => readdirSync(root, { recursive: true }).map(String).sort()
+          .filter((name) => lstatSync(path.join(root, name)).isFile())
+          .map((name) => [name, readFileSync(path.join(root, name)).toString('base64')]);
+        const before = snapshot();
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          assert.throws(() => operation.startCapture(policy, attribution), /bounded metadata limit/);
+          assert.deepEqual(snapshot(), before, 'a framed-size refusal adds no IDs or files');
+        }
+        for (const invalid of [{ nested: {} }, { label: Number.POSITIVE_INFINITY }, { toJSON() { return {}; } }]) {
+          assert.throws(() => operation.startCapture(policy, invalid as never), /finite JSON scalars/);
+          assert.deepEqual(snapshot(), before, 'invalid scalar attribution is rejected before admission');
+        }
+        const exact = operation.startCapture(policy, { label: 'x'.repeat(exactBytes) });
+        exact.write('stdout', 'abortable exact projection');
+        const active = JSON.parse(readFileSync(metadataPath, 'utf8'));
+        assert.equal(active.activeCaptureIds.length, 2, 'the exact framed projection is admitted');
+        assert.equal(active.captures.length, 1, 'the admission projection does not add a new persisted active schema');
+      } finally { operation.abort(); }
+      const reused = store.beginOperation({ kind: 'reused-after-exact-command-projection-abort' });
+      reused.abort();
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
+  it('detaches command attribution at capture start through completion and close', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-command-attribution-snapshot-'));
+    try {
+      const store = new FileToolOutputStore(root, { capacity: 1 });
+      const operation = store.beginOperation({ kind: 'detached-command-attribution' });
+      const attribution: Record<string, unknown> = { label: 'before', commandIndex: 0 };
+      const writer = operation.startCapture(policy, attribution as never);
+      let serializerCalls = 0;
+      attribution.label = 'x'.repeat(1_048_576);
+      attribution.self = attribution;
+      attribution.toJSON = () => { serializerCalls += 1; throw new Error('mutated caller serializer must not execute'); };
+      writer.write('stdout', 'complete small capture');
+      const summary = writer.finish();
+      const metadataPath = path.join(root, 'operations', `${operation.id}.json`);
+      const active = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      assert.deepEqual(active.captures[0].attribution, { label: 'before', commandIndex: 0 });
+      const committed = operation.close();
+      assert.equal(committed.length, 1);
+      assert.equal(committed[0]!.id, summary.artifact.id);
+      const closed = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      assert.equal(closed.state, 'closed');
+      assert.deepEqual(closed.captures[0].attribution, { label: 'before', commandIndex: 0 });
+      assert.equal(serializerCalls, 0);
+      assert.equal(store.read(committed[0]!, { channel: 'stdout' }).text, 'complete small capture');
+    } finally { rmSync(root, { recursive: true, force: true }); }
+  });
+
   it('fails closed before mutation when private POSIX identity proof is unavailable and prefers effective uid', () => {
     const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
     const effectiveUid = Object.getOwnPropertyDescriptor(process, 'geteuid');

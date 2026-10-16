@@ -417,6 +417,9 @@ operation slots, limits registration to at most 16 slot probes per attempt, and
 advances a bounded cleanup cursor during capture setup.
 Each active metadata update reserves space within the 1 MiB metadata limit for
 an abort record naming every owned capture, including when file cleanup fails.
+Capture start snapshots scalar command attribution and checks its framed size
+with the current operation metadata. Finish and close still validate their
+resulting metadata against that limit.
 If the index is incompatible, occupied by protected/corrupt ownership, or at
 capacity, capture becomes unavailable; retained slots are never evicted.
 Generic and provider commands do not create raw output files unless the
