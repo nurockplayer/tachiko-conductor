@@ -1846,12 +1846,12 @@ export function runTransitionCommand(store: RunStore, id: string, type: Transiti
   return admission === undefined ? transition() : admission.withRunTransitionFence(id, transition);
 }
 
-function assertExactMergedPullRequest(run: Run, pullRequest: GitHubLivePullRequestSnapshot): void {
+function assertExactMergedPullRequest(run: Run, pullRequest: GitHubLivePullRequestSnapshot, allowOpen = false): void {
   const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
   const bootstrap = run.bootstrap;
   const persisted = run.pullRequest;
   if (bootstrap === undefined || persisted === undefined || run.headSha === undefined || run.headSha === '' ||
-    pullRequest.state !== 'merged' || pullRequest.number !== persisted.number ||
+    (pullRequest.state !== 'merged' && !(allowOpen && pullRequest.state === 'open')) || pullRequest.number !== persisted.number ||
     pullRequest.headSha !== run.headSha || persisted.headSha !== run.headSha ||
     bootstrap.owner.toLowerCase() !== run.target.owner.toLowerCase() || bootstrap.repo.toLowerCase() !== run.target.repo.toLowerCase() ||
     (run.target.kind === 'issue' && bootstrap.issueNumber !== run.target.issueNumber) ||
@@ -1933,6 +1933,21 @@ function casMergedRun(store: RunStore, current: Run): Run {
   const next = applyTransition(current, { type: 'merged' });
   if (!store.updateIfUnchanged(current, next)) throw new Error(`Run "${current.id}" changed concurrently; refusing to publish merge settlement.`);
   return next;
+}
+
+/** Model-free dispatch poll. The caller supplies its already-held prepare lock. */
+export async function reconcileDispatchMergedRunCommand(
+  store: RunStore, run: Run, github: GitHubAdapter, admission: MissionAdmissionRegistry,
+  withHeldDispatchAdmissionLock: <T>(operation: () => T | Promise<T>) => Promise<T>,
+): Promise<Run | null> {
+  if (run.pullRequest === undefined || github.readPullRequest === undefined) throw new Error(`Run "${run.id}" lacks direct persisted PR proof.`);
+  const proof = await github.readPullRequest(run.target.owner, run.target.repo, run.pullRequest.number);
+  assertExactMergedPullRequest(run, proof, true);
+  if (proof.state === 'open') {
+    if (run.state === 'MERGED') throw new Error(`Merged Run "${run.id}" has an open live PR; refusing delivery.`);
+    return null;
+  }
+  return await runMergedTransitionCommand(store, run.id, github, admission, withHeldDispatchAdmissionLock);
 }
 
 /** Apply a normal merged transition only after exact live GitHub proof. Caller holds the canonical dispatch lock. */
@@ -2578,6 +2593,9 @@ export async function main(argv: string[]): Promise<number> {
           runtime,
           admission,
           releaseAdmissionLock,
+          // The outer prepare boundary still owns the canonical lock here.
+          // Reacquiring that same lock inside settlement would deadlock.
+          reconcileMergedRun: async (run) => await reconcileDispatchMergedRunCommand(store, run, workflow.github, admission, async (operation) => await operation()),
           withAdmissionLock: async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation),
           resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
           runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock) => {

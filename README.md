@@ -169,9 +169,11 @@ local durable runs. A closed Issue, open PR, non-terminal Run, ambiguous claim,
 or missing/mismatched claimed Run is not eligible. On restart it resumes the
 same claimed Run; an expired lease is never permission to create a second one.
 `tachiko dispatch serve` is the Phase-1 continuous serial driver. It holds the
-same-host lock for its lifetime, reconciles a terminal/merged run immediately,
-and then moves to the next executable queue row when the authoritative queue
-and durable Run permit it. At an active, parked, or empty boundary it only
+same-host lock for its lifetime and reconciles settled workflow output immediately.
+A retained queue row permits advancement only after exact live merged PR proof,
+durable `MERGED` publication, and successful admission/receipt release. An exact
+open PR remains a model-free wait. `FAILED`, `NEEDS_HUMAN`, and
+`WAITING_DEPENDENCY` retain ownership even if their queue row disappears. At an active, parked, or empty boundary it only
 sleeps and rereads authoritative state; that idle path starts zero model turns.
 `--max-cycles` is an explicit bounded operational/test mode, and
 `--idle-poll-ms` controls the deterministic model-free safety poll. A local
@@ -179,6 +181,17 @@ sleeps and rereads authoritative state; that idle path starts zero model turns.
 driver; it changes no queue, Run, or provider state. The driver immediately
 reconciles on that wake, and a missing/unchanged wake always falls back to the
 bounded model-free safety poll.
+
+Completed rows remain safe across runtime-comment replacement and restart: the
+existing durable Run binds claim, profile, task-shape revision, PR, HEAD, branch,
+and base identity, and delivery reconciliation rechecks those identities. A
+closed live Issue is required to skip the same authority; reopening requires an
+explicit new task-shape revision before fresh work can start. Historical or
+current unresolved ownership blocks later rows. A receipt or registry release
+failure retains the claim for exact retry before another writer is admitted.
+This is the bounded delivery-reconciliation portion of #128. Automatic merge
+requests, independent review qualification, and end-to-end #128/#91 acceptance
+remain separate obligations; this change does not activate a production queue.
 
 ## Supervised dispatch driver (macOS)
 

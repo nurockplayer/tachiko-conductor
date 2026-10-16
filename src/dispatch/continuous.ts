@@ -3,8 +3,8 @@ import type { DispatchOnceResult } from './runner.js';
 /**
  * Provider-neutral serial driver for the existing dispatch claim boundary.
  *
- * A completed workflow is reconciled immediately so a removed terminal queue
- * row can make the next eligible item available without a scheduler gap. All
+ * A settled workflow is reconciled immediately so exact merged delivery can
+ * make the next eligible item available with its prior row retained. All
  * other boundaries wait locally: sleeping and the next GitHub reconciliation
  * never start a model by themselves.
  */
@@ -45,7 +45,8 @@ export async function dispatchContinuously(options: DispatchContinuousOptions): 
   while (options.maxCycles === undefined || cycles < options.maxCycles) {
     last = await options.dispatchOnce();
     cycles += 1;
-    // A terminal result can release/supersede its retained claim immediately.
+    // Recheck settled workflow output immediately; only proven merge delivery
+    // can release/supersede its retained claim.
     // An active result must not cause a second model invocation merely because
     // the driver is alive; wait for its next deterministic reconciliation.
     if (isTerminalDispatch(last)) continue;

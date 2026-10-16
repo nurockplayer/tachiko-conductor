@@ -29,6 +29,7 @@ import {
   runCreateCommand,
   runIssueCommand,
   runMergedTransitionCommand,
+  reconcileDispatchMergedRunCommand,
   resumeCommand,
   runShowCommand,
   runShowView,
@@ -52,8 +53,9 @@ import { resolveManualOwnerReceiptPath, resolveRunOwnerReceiptPath } from '../sr
 import { readManualOwnerReceipt, writeManualOwnerReceipt, type ManualOwnerReceipt } from '../src/mission-admission/manual-owner-receipt.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { DispatchAdmissionWaitError } from '../src/dispatch/runner.js';
+import { dispatchOnceCommand } from '../src/dispatch/command.js';
 import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../src/dispatch/invocation-lock.js';
-import type { DispatchRuntimeClaim } from '../src/dispatch/queue.js';
+import { DISPATCH_QUEUE_MARKER, renderDispatchRuntime, parseDispatchRuntime, type DispatchRuntimeClaim, type DispatchRuntimeComment } from '../src/dispatch/queue.js';
 import { operationalRuntimeProjectionPath, readOperationalRuntimeProjection, readOperationalRuntimeProjectionState, writeOperationalRuntimeProjection } from '../src/operational/runtime-projection.js';
 import { T0, TARGET, TEST_VALIDATION_AUTHORITY, successResult, validationPassed } from './helpers.js';
 import { createGenuineLunaFixture } from './support/genuine-luna.js';
@@ -904,6 +906,226 @@ describe('workflow run and resume commands', () => {
       generation: result.token.generation, phase: 'pre_execution',
     });
     return { store, run, registry, receiptPath, token: result.token, workspacePath };
+  }
+
+  function dispatchDeliveryFixture(dir: string, failure: { registry?: boolean; receipt?: boolean } = {}) {
+    let store = new JsonFileStore({ dir: path.join(dir, 'runs') });
+    const execution = { profile: 'complex' as const, revision: 'profiles-v1', executor: 'codex-cli', timeoutMs: 1 };
+    const run = { ...mergeReadyRun('delivery-a', dir, 'claim-a'), execution, repairTaskShapeAuthority: REPAIR_AUTHORITY };
+    const setup = setupParkedMerge(dir, store, run, 'workflow_settled', {
+      beforePublish: () => { if (failure.registry) throw new Error('delivery registry fault'); },
+    });
+    let proof = mergedPullRequest();
+    let nextMerged = false;
+    let issueState: 'open' | 'closed' = 'closed';
+    const github: GitHubAdapter = {
+      kind: 'github',
+      readPullRequest: async (_owner, _repo, number) => number === 7 ? proof : mergedPullRequest({ number, state: nextMerged ? 'merged' : 'open', headRef: `tachiko/issue-${number === 8 ? 43 : 42}-next` }),
+      readIssue: async (target) => ({ target, title: 'delivery', body: '', state: target.issueNumber === 42 ? issueState : nextMerged ? 'closed' : 'open' }),
+      listPullRequests: async () => [],
+      readBranch: async () => { throw new Error('unused'); },
+      readLiveSnapshot: async () => { throw new Error('unused'); },
+    };
+    let comments: DispatchRuntimeComment[] = [{ id: 'runtime', body: renderDispatchRuntime({
+      issue: 42, claimId: 'claim-a', runId: run.id, profile: 'complex', repairTaskShapeAuthority: REPAIR_AUTHORITY,
+      state: 'running', claimedAt: T0, heartbeatAt: T0, leaseUntil: T0,
+    }) }];
+    const row = (issue: number, revision = REPAIR_AUTHORITY.revision, profile = 'complex') =>
+      `  - issue: ${issue}\n    route: codex\n    profile: ${profile}\n    task-shape-revision: ${revision}\n    task-shape: bounded`;
+    let queue = `${DISPATCH_QUEUE_MARKER}\nready:\n${row(42)}\n${row(43)}`;
+    const runtime = {
+      readQueueComment: async () => queue,
+      listRuntimeComments: async () => comments,
+      createRuntimeComment: async (body: string) => { const comment = { id: 'runtime', body }; comments = [comment]; return comment; },
+      updateRuntimeComment: async (id: string, body: string) => { const comment = { id, body }; comments = [comment]; return comment; },
+    };
+    let starts = 0;
+    const reconcileMergedRun = async (current: Run) => {
+      if (failure.receipt) {
+        const prior = readRunOwnerReceipt(setup.receiptPath)!;
+        writeRunOwnerReceipt(setup.receiptPath, { ...prior, generation: prior.generation + 10 });
+      }
+      return await reconcileDispatchMergedRunCommand(store, current, github, setup.registry, async (operation) => await operation());
+    };
+    const poll = async (reconcile: typeof reconcileMergedRun | null = reconcileMergedRun) => await dispatchOnceCommand({
+      revision: 'dispatch-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60_000,
+    }, {
+      workflow: { store, github } as unknown as WorkflowDependencies, runtime, admission: setup.registry, now: () => T0,
+      reconcileMergedRun: reconcile ?? undefined,
+      resolveExecutionProfile: () => execution,
+      resumeClaimedRun: async () => { throw new Error('delivery must never rerun a settled workflow'); },
+      runIssue: async (ref, selected, claimId, authority) => {
+        starts += 1;
+        assert.equal(setup.registry.readLane(`run:${run.id}`)?.status, 'released');
+        assert.equal(readRunOwnerReceipt(setup.receiptPath)?.phase, 'released');
+        const issue = Number(ref.split('#')[1]);
+        // Controlled workflow boundary supplies readiness, never delivery.
+        // Both Runs cross the actual settlement implementation below.
+        const id = issue === 43 ? 'delivery-b' : 'delivery-reissue';
+        const prepared = mergeReadyRun(id, dir, claimId);
+        const next: Run = { ...prepared, target: { ...TARGET, issueNumber: issue }, execution: selected,
+          repairTaskShapeAuthority: authority,
+          bootstrap: { ...prepared.bootstrap!, issueNumber: issue, branch: `tachiko/issue-${issue}-next` },
+          pullRequest: { number: issue === 43 ? 8 : 9, headSha: MERGE_HEAD } };
+        store.create(next);
+        const workspace = realpathSync(next.bootstrap!.workspacePath);
+        const evidence = { repository: 'acme/widgets', issue, run: next.id, claim: claimId, pullRequest: next.pullRequest!.number, workspace };
+        const admitted = setup.registry.admit({ laneId: `run:${next.id}`, role: 'production_captain', highAutonomy: true, evidence });
+        assert.equal(admitted.outcome, 'admitted');
+        if (admitted.outcome !== 'admitted') throw new Error('expected successor admission');
+        const receiptPath = resolveRunOwnerReceiptPath('acme/widgets', next.id, evidence);
+        const receipt = { schemaVersion: 1 as const, laneId: admitted.token.laneId, missionId: admitted.missionId,
+          repository: 'acme/widgets', runId: next.id, issue, claimId, workspace, token: admitted.token,
+          generation: admitted.token.generation, phase: 'park_transition' as const };
+        setup.registry.park(admitted.token, 'workflow_settled',
+          () => writeRunOwnerReceipt(receiptPath, receipt),
+          () => writeRunOwnerReceipt(receiptPath, { ...receipt, token: undefined, generation: admitted.token.generation + 1, phase: 'parked' }));
+        return { outcome: 'merge_ready', run: next };
+      },
+    });
+    return { run, setup, github, runtime, row, poll, reconcileMergedRun,
+      get store() { return store; }, get starts() { return starts; }, get comments() { return comments; },
+      setProof(next: typeof proof) { proof = next; }, setIssue(next: typeof issueState) { issueState = next; },
+      mergeNext() { nextMerged = true; },
+      setQueue(body: string) { queue = body; }, clearComments() { comments = []; },
+      restart() { store = new JsonFileStore({ dir: path.join(dir, 'runs') }); },
+    };
+  }
+
+  it('advances retained delivered A to B through real merge settlement and does not resurrect A after restart', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-delivery-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      const result = await f.poll();
+      assert.equal(result.outcome, 'dispatched');
+      if (result.outcome === 'dispatched') assert.equal(result.entry.issue, 43);
+      assert.equal(f.store.read(f.run.id)?.state, 'MERGED');
+      assert.equal(f.starts, 1);
+      assert.equal(parseDispatchRuntime(f.comments[0]!.body)?.issue, 43);
+      f.restart();
+      assert.equal((await f.poll()).outcome, 'existing_claim', 'B remains the sole held owner');
+      f.mergeNext();
+      const deliveredB = await f.poll();
+      assert.equal(deliveredB.outcome, 'no_eligible_work');
+      assert.equal(f.store.read('delivery-b')?.state, 'MERGED');
+      assert.equal(parseDispatchRuntime(f.comments[0]!.body)?.state, 'retired');
+      f.restart();
+      const historical = await f.poll();
+      assert.equal(historical.outcome, 'no_eligible_work');
+      if (historical.outcome === 'no_eligible_work') assert.match(historical.reasons[0]!, /exact dispatch delivery is complete/);
+      assert.equal(f.starts, 1, 'historical A and B remain completed after runtime replacement and process restart');
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  for (const fault of ['registry', 'receipt', 'wrong-proof', 'open-pr', 'no-callback', 'foreign-result', 'throws', 'active-target', 'open-issue', 'profile', 'shape'] as const) {
+    it(`retains the claim and starts no later writer for delivery ${fault}`, async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), `tachiko-dispatch-${fault}-`));
+      const restore = isolateMergeReceiptRoot(dir);
+      try {
+        const failure: { registry?: boolean; receipt?: boolean } = {};
+        const f = dispatchDeliveryFixture(dir, failure);
+        if (fault === 'registry') failure.registry = true;
+        if (fault === 'receipt') failure.receipt = true;
+        if (fault === 'wrong-proof') f.setProof(mergedPullRequest({ headSha: 'f'.repeat(40) }));
+        if (fault === 'open-pr') f.setProof(mergedPullRequest({ state: 'open' }));
+        if (fault === 'open-issue') f.setIssue('open');
+        if (fault === 'active-target') f.store.create(createRun(TARGET, T0, 'unrelated-active'));
+        if (fault === 'profile' || fault === 'shape') {
+          await f.reconcileMergedRun(f.run);
+          f.clearComments();
+          f.setQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n${fault === 'profile' ? f.row(42, REPAIR_AUTHORITY.revision, 'standard') : f.row(42).replace('task-shape: bounded', 'task-shape: interacting')}\n${f.row(43)}`);
+        }
+        const callback = fault === 'foreign-result' ? async () => ({ ...f.run, id: 'foreign', state: 'MERGED' as const })
+          : fault === 'throws' ? async () => { throw new Error('callback fault'); }
+          : fault === 'no-callback' ? undefined : f.reconcileMergedRun;
+        if (['registry', 'receipt', 'wrong-proof', 'foreign-result', 'throws', 'active-target'].includes(fault)) {
+          await assert.rejects(f.poll(callback), /fault|proof|identity|receipt|generation|settlement|active work/);
+
+        } else {
+          const result = await f.poll(fault === 'no-callback' ? null : callback);
+          assert.ok(result.outcome === 'existing_claim' || result.outcome === 'no_eligible_work');
+        }
+        assert.equal(f.starts, 0);
+        if (fault !== 'profile' && fault !== 'shape') assert.equal(parseDispatchRuntime(f.comments[0]!.body)?.claimId, 'claim-a');
+      } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  for (const fault of ['registry', 'receipt'] as const) {
+    it(`recovers interrupted delivery ${fault} settlement before starting B exactly once`, async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), `tachiko-dispatch-retry-${fault}-`));
+      const restore = isolateMergeReceiptRoot(dir);
+      try {
+        const failure: { registry?: boolean; receipt?: boolean } = {};
+        const f = dispatchDeliveryFixture(dir, failure);
+        const receipt = readRunOwnerReceipt(f.setup.receiptPath)!;
+        failure[fault] = true;
+        await assert.rejects(f.poll(), /fault|receipt|generation/);
+        assert.equal(f.starts, 0);
+        assert.equal(parseDispatchRuntime(f.comments[0]!.body)?.claimId, 'claim-a');
+        failure[fault] = false;
+        if (fault === 'receipt') writeRunOwnerReceipt(f.setup.receiptPath, receipt);
+        f.restart();
+        assert.equal((await f.poll()).outcome, 'dispatched');
+        assert.equal(f.starts, 1);
+        assert.equal((await f.poll()).outcome, 'existing_claim');
+        assert.equal(f.starts, 1);
+      } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
+  }
+
+  it('requires historical settlement proof before a revised authority can create fresh work', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-history-proof-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      await f.reconcileMergedRun(f.run);
+      f.clearComments();
+      f.restart();
+      f.setIssue('open');
+      f.setQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n${f.row(42, 'task-shape-v2')}\n${f.row(43)}`);
+      const held = await f.poll(null);
+      assert.equal(held.outcome, 'no_eligible_work');
+      if (held.outcome === 'no_eligible_work') assert.match(held.reasons[0]!, /previous authority lacks exact delivery settlement/);
+      assert.equal(f.starts, 0);
+      assert.equal(f.comments.length, 0);
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  for (const historical of [false, true]) {
+    it(`requires explicit revised authority for a reopened delivered issue (${historical ? 'historical restart' : 'retained claim'})`, async () => {
+      const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-reissue-'));
+      const restore = isolateMergeReceiptRoot(dir);
+      try {
+        const f = dispatchDeliveryFixture(dir);
+        if (historical) {
+          await f.reconcileMergedRun(f.run);
+          f.clearComments();
+          f.restart();
+        }
+        f.setIssue('open');
+        const held = await f.poll();
+        assert.ok(held.outcome === 'existing_claim' || held.outcome === 'no_eligible_work');
+        assert.equal(f.starts, 0);
+        f.setQueue(`${DISPATCH_QUEUE_MARKER}\nready:\n${f.row(42, 'task-shape-v2')}\n${f.row(43)}`);
+        const reissued = await f.poll();
+        assert.equal(reissued.outcome, 'dispatched');
+        if (reissued.outcome === 'dispatched') {
+          assert.equal(reissued.entry.issue, 42);
+          assert.equal(reissued.claim.repairTaskShapeAuthority?.revision, 'task-shape-v2');
+          assert.notEqual(reissued.claim.claimId, 'claim-a');
+        }
+        assert.equal(f.starts, 1);
+        const incarnation = f.store.read('delivery-reissue')!;
+        assert.equal(incarnation.target.kind === 'issue' ? incarnation.target.issueNumber : undefined, 42);
+        assert.equal(incarnation.repairTaskShapeAuthority?.revision, 'task-shape-v2');
+        assert.equal((await f.poll()).outcome, 'existing_claim');
+        assert.equal(f.starts, 1);
+        assert.equal(parseDispatchRuntime(f.comments[0]!.body)?.runId, incarnation.id);
+        assert.equal(f.store.read(f.run.id)?.state, 'MERGED');
+      } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+    });
   }
 
   it('requires exact live merged PR proof before any Run, registry, or receipt write', async () => {
