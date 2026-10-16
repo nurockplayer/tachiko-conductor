@@ -114,7 +114,7 @@ const USAGE = `Tachiko Conductor — local orchestration core.
 Usage:
   tachiko run owner/repo#123 --execution-profile <routine|standard|complex|critical> --repair-task-shape-authority <json> [--browser-profile <profile>]
   tachiko run resume <id> --decision <choice> [--browser-profile <profile>]
-  tachiko run admission recover <id> --generation <n> [--stopped]
+  tachiko run admission recover <id> --generation <n> [--stopped [--retire-work]]
   tachiko run create --owner <owner> --repo <repo> (--issue <n> | --branch <branch>) --execution-profile <routine|standard|complex|critical> --repair-task-shape-authority <json>
   tachiko run show <id>
   tachiko run inspect <id>
@@ -965,14 +965,14 @@ function receiptForCurrentToken(receiptPath: string, token: AdmissionToken, phas
   return { ...receipt, phase, token };
 }
 
-function finalizeRunOwnerReceipt(receiptPath: string | undefined, token: AdmissionToken, phase: 'parked' | 'released', generation: number): void {
+function finalizeRunOwnerReceipt(receiptPath: string | undefined, token: AdmissionToken, phase: 'parked' | 'released', generation: number, workDisposition?: 'cancelled'): void {
   if (receiptPath === undefined) return;
   const current = readRunOwnerReceipt(receiptPath);
   if (current === null || current.laneId !== token.laneId || current.generation !== token.generation || current.token?.token !== token.token) {
     throw new Error(`Run owner receipt does not match exact admission generation ${token.generation} after registry settlement.`);
   }
   const { token: _token, ...withoutToken } = current;
-  writeRunOwnerReceipt(receiptPath, { ...withoutToken, phase, generation });
+  writeRunOwnerReceipt(receiptPath, { ...withoutToken, phase, generation, ...(workDisposition === undefined ? {} : { workDisposition }) });
 }
 
 function sameRunReceiptIdentity(receipt: RunOwnerReceipt, run: Run, missionId: string): boolean {
@@ -1207,10 +1207,10 @@ function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, recei
   return result.token;
 }
 
-function settleRunAdmission(registry: MissionAdmissionRegistry, token: AdmissionToken, run: Run, receiptPath?: string): void {
+function settleRunAdmission(registry: MissionAdmissionRegistry, token: AdmissionToken, run: Run, receiptPath?: string, workDisposition?: 'cancelled'): void {
   if (run.state === 'FAILED' || run.state === 'MERGED') {
     registry.release(token, true, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'release_transition')),
-      receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1));
+      receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1, workDisposition));
   } else {
     const reason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
     registry.park(token, reason, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'park_transition')),
@@ -1223,7 +1223,7 @@ function releasePreExecutionRunAdmission(registry: MissionAdmissionRegistry, tok
     receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1));
 }
 
-/** Settle only the exact receipt generation. This retires authority and never resumes or spawns work. */
+/** Recover only the exact execution capability; task retirement additionally requires explicit retireWork intent. */
 export function recoverRunAdmission(
   store: RunStore,
   registry: MissionAdmissionRegistry,
@@ -1231,8 +1231,9 @@ export function recoverRunAdmission(
   expectedGeneration: number,
   operatorStopped: boolean,
   receiptPath?: string,
-  crashAfter?: { readonly parkReceiptNormalization?: () => void; readonly parkReceiptFinalization?: () => void },
+  recoveryOptions?: { readonly parkReceiptNormalization?: () => void; readonly parkReceiptFinalization?: () => void; readonly retireWork?: boolean },
 ): 'released' {
+  if (recoveryOptions?.retireWork === true && !operatorStopped) throw new Error('--retire-work requires explicit --stopped attestation.');
   if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw new Error('Run admission recovery requires --generation <positive integer>.');
   const run = store.read(runId);
   if (run === null) throw new Error(`No run with id "${runId}" found.`);
@@ -1256,11 +1257,36 @@ export function recoverRunAdmission(
     throw new Error(`Run owner receipt does not match the canonical registry owner for Run "${run.id}".`);
   }
   assertRecoveryOwnerEvidence(run, receipt, lane, lane.missionId, expectedGeneration);
+  const recordRetirement = () => {
+    if (recoveryOptions?.retireWork !== true) return;
+    registry.withExactReleasedLane(laneId, expectedGeneration + 1, (released) => {
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, released, run.id, lane.missionId, expectedGeneration);
+      if (JSON.stringify(fresh.run) !== JSON.stringify(run) || fresh.receipt.phase !== 'released' ||
+        fresh.receipt.generation !== released.generation || fresh.receipt.token !== undefined ||
+        canonicalReceiptWorkspace(fresh.receipt) !== released.evidence.workspace) {
+        throw new Error(`Run "${run.id}" lacks exact final owner proof for explicit work retirement.`);
+      }
+      if (fresh.receipt.workDisposition === 'cancelled' && (fresh.run.state !== 'FAILED' ||
+        fresh.run.history.at(-1)?.type !== 'fail' || fresh.run.history.at(-1)?.reason !== CANCEL_RUN_DECISION)) {
+        throw new Error(`Run "${run.id}" cancellation disposition conflicts with durable history.`);
+      }
+      if (fresh.receipt.workDisposition === undefined) writeRunOwnerReceipt(canonicalReceiptPath, { ...fresh.receipt, workDisposition: 'retired' });
+    });
+  };
   if (lane.status === 'released' && lane.generation === expectedGeneration + 1) {
     registry.withExactReleasedLane(laneId, expectedGeneration + 1, (releasedLane) => {
       const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
       const current = fresh.receipt;
-      if (current.phase === 'released' && current.generation === expectedGeneration + 1 && current.token === undefined) return;
+      if (current.phase === 'released' && current.generation === expectedGeneration + 1 && current.token === undefined) {
+        if (current.workspace === undefined && releasedLane.evidence.workspace !== undefined) {
+          if (JSON.stringify(fresh.run) !== JSON.stringify(run) ||
+            !canBindMissingReceiptWorkspace(current, fresh.run, releasedLane.evidence.workspace)) {
+            throw new Error(`Run "${run.id}" changed or lacks exact workspace proof for released receipt strengthening.`);
+          }
+          writeRunOwnerReceipt(canonicalReceiptPath, { ...current, workspace: releasedLane.evidence.workspace });
+        }
+        return;
+      }
       if (current.phase !== 'release_transition' && current.phase !== 'parked_release_transition') throw new Error('Run owner receipt phase is not an exact released transition.');
       const exactActiveTransition = current.phase === 'release_transition' && current.generation === expectedGeneration && current.token?.laneId === laneId && current.token.generation === expectedGeneration && current.token.token === operationTokenSecret;
       const exactParkedTransition = current.phase === 'parked_release_transition' && current.generation === expectedGeneration && current.token === undefined;
@@ -1275,6 +1301,7 @@ export function recoverRunAdmission(
         phase: 'released', generation: expectedGeneration + 1,
       });
     });
+    recordRetirement();
     return 'released';
   }
   if (lane.status === 'parked') {
@@ -1303,18 +1330,19 @@ export function recoverRunAdmission(
         const fresh = readRecoveryEvidence(store, canonicalReceiptPath, lockedParkedLane, run.id, lane.missionId, expectedGeneration);
         writeParkedReleaseTransition(canonicalReceiptPath, fresh.run, lane.missionId, lane.generation, lockedParkedLane.evidence.workspace,
           canBindMissingReceiptWorkspace(fresh.receipt, fresh.run, lockedParkedLane.evidence.workspace), lockedParkedLane.parkedReason === 'workflow_settled');
-        if (interruptedParkPublication) crashAfter?.parkReceiptNormalization?.();
+        if (interruptedParkPublication) recoveryOptions?.parkReceiptNormalization?.();
       },
       (releasedLane) => {
         const fresh = readRecoveryEvidence(store, canonicalReceiptPath, releasedLane, run.id, lane.missionId, expectedGeneration);
         finalizeParkedRunOwnerReceipt(canonicalReceiptPath, fresh.run, lane.missionId, lane.generation, releasedLane.evidence.workspace);
-        crashAfter?.parkReceiptFinalization?.();
+        recoveryOptions?.parkReceiptFinalization?.();
       },
       (lockedParkedLane) => {
         assertLockedLaneUnchanged(lane, lockedParkedLane, 'parked');
         const fresh = readRecoveryEvidence(store, canonicalReceiptPath, lockedParkedLane, run.id, lane.missionId, expectedGeneration);
         assertParkedReleaseTransition(fresh.receipt, fresh.run, lane.missionId, lane.generation, lockedParkedLane.parkedReason === 'workflow_settled');
       });
+    recordRetirement();
     return 'released';
   }
   if (lane.status !== 'active' || receipt.token === undefined || receipt.token.generation !== expectedGeneration || receipt.token.laneId !== laneId) {
@@ -1339,6 +1367,7 @@ export function recoverRunAdmission(
       const fresh = readRecoveryEvidence(store, canonicalReceiptPath, activeLane, run.id, lane.missionId, expectedGeneration);
       assertActiveReleaseTransition(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
     });
+  recordRetirement();
   return 'released';
 }
 
@@ -1530,7 +1559,7 @@ export async function resumeCommand(
     mayReleaseAsPreExecution = false;
     if (admissionToken !== undefined) {
       const settleAndProject = () => {
-        settleRunAdmission(options.admission!, admissionToken, cancelled, runOwnerReceiptPath);
+        settleRunAdmission(options.admission!, admissionToken, cancelled, runOwnerReceiptPath, 'cancelled');
         options.publishRuntimeProjection?.(options.admission!, deps.store, { stage: 'failed', supervisor: 'stopped' });
       };
       // The executable caller still owns its short admission lock here. Do
@@ -1879,12 +1908,12 @@ export function runTransitionCommand(store: RunStore, id: string, type: Transiti
   return admission === undefined ? transition() : admission.withRunTransitionFence(id, transition);
 }
 
-function assertExactMergedPullRequest(run: Run, pullRequest: GitHubLivePullRequestSnapshot): void {
+function assertExactMergedPullRequest(run: Run, pullRequest: GitHubLivePullRequestSnapshot, allowOpen = false): void {
   const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
   const bootstrap = run.bootstrap;
   const persisted = run.pullRequest;
   if (bootstrap === undefined || persisted === undefined || run.headSha === undefined || run.headSha === '' ||
-    pullRequest.state !== 'merged' || pullRequest.number !== persisted.number ||
+    (pullRequest.state !== 'merged' && !(allowOpen && pullRequest.state === 'open')) || pullRequest.number !== persisted.number ||
     pullRequest.headSha !== run.headSha || persisted.headSha !== run.headSha ||
     bootstrap.owner.toLowerCase() !== run.target.owner.toLowerCase() || bootstrap.repo.toLowerCase() !== run.target.repo.toLowerCase() ||
     (run.target.kind === 'issue' && bootstrap.issueNumber !== run.target.issueNumber) ||
@@ -1966,6 +1995,55 @@ function casMergedRun(store: RunStore, current: Run): Run {
   const next = applyTransition(current, { type: 'merged' });
   if (!store.updateIfUnchanged(current, next)) throw new Error(`Run "${current.id}" changed concurrently; refusing to publish merge settlement.`);
   return next;
+}
+
+/** Work retirement needs explicit disposition and exact owner proof; release alone is not disposition. */
+export function isDispatchRunOwnerRetiredCommand(store: RunStore, run: Run, admission: MissionAdmissionRegistry): boolean {
+  if (run.dispatchClaimId === undefined || run.execution === undefined || run.repairTaskShapeAuthority === undefined) return false;
+  const lane = admission.readLane(`run:${run.id}`);
+  if (lane === null || lane.status !== 'released') return false;
+  let retired = run.state === 'MERGED';
+  admission.withExactReleasedLane(lane.laneId, lane.generation, (released) => {
+    const current = store.read(run.id);
+    if (current === null || JSON.stringify(current) !== JSON.stringify(run)) throw new Error(`Run "${run.id}" changed before exact owner retirement proof.`);
+    const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+    const receiptPath = resolveRunOwnerReceiptPath(repository, run.id, evidenceForRun(run));
+    const receipt = readRunOwnerReceipt(receiptPath);
+    if (receipt === null) throw new Error(`Run "${run.id}" lacks its final released owner receipt.`);
+    assertRecoveryOwnerEvidence(run, receipt, released, released.missionId, released.generation - 1);
+    if (receipt.phase !== 'released' || receipt.token !== undefined || receipt.generation !== released.generation ||
+      receipt.workspace !== released.evidence.workspace ||
+      (run.state === 'MERGED' && receipt.settlementReason !== 'workflow_settled')) {
+      throw new Error(`Run "${run.id}" lacks exact final released owner receipt generation or settlement proof.`);
+    }
+    if (run.state !== 'MERGED') {
+      if (receipt.workDisposition === 'cancelled' && (run.state !== 'FAILED' ||
+        run.history.at(-1)?.type !== 'fail' || run.history.at(-1)?.reason !== CANCEL_RUN_DECISION)) {
+        throw new Error(`Run "${run.id}" cancellation disposition conflicts with durable history.`);
+      }
+      retired = receipt.workDisposition === 'retired' || receipt.workDisposition === 'cancelled';
+    }
+  });
+  return retired;
+}
+
+/** Model-free dispatch poll. The caller supplies its already-held prepare lock. */
+export async function reconcileDispatchMergedRunCommand(
+  store: RunStore, run: Run, github: GitHubAdapter, admission: MissionAdmissionRegistry,
+  withHeldDispatchAdmissionLock: <T>(operation: () => T | Promise<T>) => Promise<T>,
+): Promise<Run | null> {
+  if (run.pullRequest === undefined || github.readPullRequest === undefined) throw new Error(`Run "${run.id}" lacks direct persisted PR proof.`);
+  const proof = await github.readPullRequest(run.target.owner, run.target.repo, run.pullRequest.number);
+  assertExactMergedPullRequest(run, proof, true);
+  if (proof.state === 'open') {
+    if (run.state === 'MERGED') throw new Error(`Merged Run "${run.id}" has an open live PR; refusing delivery.`);
+    return null;
+  }
+  const settled = await runMergedTransitionCommand(store, run.id, github, admission, withHeldDispatchAdmissionLock);
+  // The manual command deliberately accepts receipt-less legacy retries. An
+  // automatic delivery must retain the complete released owner receipt.
+  if (!isDispatchRunOwnerRetiredCommand(store, settled, admission)) throw new Error(`Run "${run.id}" lacks exact automatic delivery owner settlement.`);
+  return settled;
 }
 
 /** Apply a normal merged transition only after exact live GitHub proof. Caller holds the canonical dispatch lock. */
@@ -2644,6 +2722,10 @@ export async function main(argv: string[]): Promise<number> {
           runtime,
           admission,
           releaseAdmissionLock,
+          // The outer prepare boundary still owns the canonical lock here.
+          // Reacquiring that same lock inside settlement would deadlock.
+          isRunOwnerRetired: (run) => isDispatchRunOwnerRetiredCommand(store, run, admission),
+          reconcileMergedRun: async (run) => await reconcileDispatchMergedRunCommand(store, run, workflow.github, admission, async (operation) => await operation()),
           withAdmissionLock: async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation),
           resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
           runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock) => {
@@ -2804,13 +2886,13 @@ export async function main(argv: string[]): Promise<number> {
   if (subcommand === 'admission' && rest[0] === 'recover') {
     const { values, positionals } = parseArgs({
       args: rest.slice(1), allowPositionals: true,
-      options: { generation: { type: 'string' }, stopped: { type: 'boolean' } },
+      options: { generation: { type: 'string' }, stopped: { type: 'boolean' }, 'retire-work': { type: 'boolean' } },
     });
     const [id] = positionals;
     if (id === undefined || values.generation === undefined) throw new Error('run admission recover requires <run-id> --generation <n>.');
     const generation = Number(values.generation);
     if (!Number.isSafeInteger(generation) || generation < 1) throw new Error('--generation must be a positive safe integer.');
-    const disposition = await withDispatchAdmissionLock(() => recoverRunAdmission(store, createHostAdmissionRegistry(), id, generation, values.stopped === true));
+    const disposition = await withDispatchAdmissionLock(() => recoverRunAdmission(store, createHostAdmissionRegistry(), id, generation, values.stopped === true, undefined, { retireWork: values['retire-work'] === true }));
     console.log(JSON.stringify({ outcome: disposition, runId: id, generation }));
     return 0;
   }

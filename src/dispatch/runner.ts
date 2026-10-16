@@ -69,6 +69,11 @@ export interface DispatchOnceOptions {
   readonly leaseDurationMs: number;
   readonly now: () => string;
   readonly execute: (entry: DispatchQueueEntry, existing: Run | null, claim: DispatchRuntimeClaim) => Promise<DispatchExecution>;
+  /** Trusted composition boundary: exact live proof, CAS, and admission/receipt settlement.
+   * null means the exact PR is still open. Called while the prepare lock is held. */
+  readonly reconcileMergedRun?: (run: Run) => Promise<Run | null>;
+  /** Trusted exact released owner proof; grants no delivery or repair authority. */
+  readonly isRunOwnerRetired?: (run: Run) => boolean;
   readonly createClaimId?: () => string;
   readonly withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>;
   readonly releaseAdmissionLock?: () => void;
@@ -85,16 +90,16 @@ export type DispatchOnceResult =
   | { readonly outcome: 'dispatched'; readonly entry: DispatchQueueEntry; readonly claim: DispatchRuntimeClaim; readonly execution: DispatchExecution };
 
 function target(entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>) {
-  return { kind: 'issue' as const, owner: options.owner, repo: options.repo, issueNumber: entry.issue };
+  return { kind: 'issue' as const, owner: options.owner.toLowerCase(), repo: options.repo.toLowerCase(), issueNumber: entry.issue };
 }
 
 function isTarget(run: Run, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): boolean {
   const wanted = target(entry, options);
-  return run.target.kind === 'issue' && run.target.owner === wanted.owner && run.target.repo === wanted.repo && run.target.issueNumber === wanted.issueNumber;
+  return run.target.kind === 'issue' && run.target.owner.toLowerCase() === wanted.owner && run.target.repo.toLowerCase() === wanted.repo && run.target.issueNumber === wanted.issueNumber;
 }
 
-function activeRun(store: RunStore, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): Run | null {
-  return store.list().find((run) => isTarget(run, entry, options) && isActiveRun(run)) ?? null;
+function activeRun(store: RunStore, entry: DispatchQueueEntry, options: DispatchOnceOptions): Run | null {
+  return store.list().find((run) => isTarget(run, entry, options) && isActiveRun(run) && options.isRunOwnerRetired?.(run) !== true) ?? null;
 }
 
 export function claimedRun(store: RunStore, claim: DispatchRuntimeClaim, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): Run | null {
@@ -137,10 +142,69 @@ function isSettledRun(run: Run): boolean {
   return run.state === 'MERGED' || run.state === 'MERGE_READY' || run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' || run.state === 'FAILED';
 }
 
-async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptions): Promise<{ readonly run: Run | null; readonly reason: string | null }> {
+function sameAuthorityRevision(run: Run, entry: DispatchQueueEntry): boolean {
+  return run.repairTaskShapeAuthority?.revision === entry.repairTaskShapeAuthority?.revision;
+}
+
+async function delivered(run: Run, entry: DispatchQueueEntry, options: DispatchOnceOptions, reissued = false): Promise<boolean> {
+  if (run.dispatchClaimId === undefined || run.execution?.profile !== entry.profile ||
+    run.repairTaskShapeAuthority === undefined || entry.repairTaskShapeAuthority === undefined ||
+    !sameAuthorityRevision(run, entry) || run.repairTaskShapeAuthority.shape !== entry.repairTaskShapeAuthority.shape ||
+    options.reconcileMergedRun === undefined) return false;
+  if (options.store.list().some((other) => other.id !== run.id && isTarget(other, entry, options) && isActiveRun(other) && options.isRunOwnerRetired?.(other) !== true)) {
+    throw new DispatchProtocolError(`Run ${run.id} has unrelated active work for #${entry.issue}; refusing delivery supersession.`);
+  }
+  const settled = await options.reconcileMergedRun(run);
+  if (settled === null) return false;
+  const durable = options.store.read(run.id);
+  if (settled.state !== 'MERGED' || durable === null || JSON.stringify(durable) !== JSON.stringify(settled) ||
+    settled.dispatchClaimId !== run.dispatchClaimId || settled.execution?.profile !== entry.profile ||
+    settled.repairTaskShapeAuthority?.revision !== entry.repairTaskShapeAuthority.revision ||
+    settled.repairTaskShapeAuthority.shape !== entry.repairTaskShapeAuthority.shape || !isTarget(settled, entry, options) ||
+    JSON.stringify(settled.execution) !== JSON.stringify(run.execution) ||
+    JSON.stringify(settled.bootstrap) !== JSON.stringify(run.bootstrap) ||
+    JSON.stringify(settled.pullRequest) !== JSON.stringify(run.pullRequest) || settled.headSha !== run.headSha) {
+    throw new DispatchProtocolError(`Run ${run.id} lacks exact durable dispatch delivery settlement.`);
+  }
+  if (options.admission !== undefined && options.admission.readLane(`run:${run.id}`)?.status !== 'released') {
+    throw new DispatchProtocolError(`Run ${run.id} lacks released admission delivery settlement.`);
+  }
+  return (await options.github.readIssue(target(entry, options))).state === 'closed' || reissued;
+}
+
+async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptions): Promise<{ readonly run: Run | null; readonly reason: string | null; readonly blocked?: boolean }> {
   const issueTarget = target(entry, options);
   const run = activeRun(options.store, entry, options);
-  if (run !== null) return { run, reason: `#${entry.issue}: existing durable run ${run.id} is ${run.state}` };
+  if (run !== null) return { run, reason: `#${entry.issue}: existing durable run ${run.id} is ${run.state}`, blocked: true };
+  // Run/claim/profile/revision identity survives replacement of the one runtime
+  // comment. A closed issue is required so a reopened incarnation cannot reuse
+  // its prior delivery; reissue requires an explicit new authority revision.
+  const history = options.store.list().filter((prior) => isTarget(prior, entry, options) && prior.dispatchClaimId !== undefined);
+  if (history.some((prior) => prior.state !== 'FAILED' && prior.state !== 'MERGED' && !sameAuthorityRevision(prior, entry))) {
+    return { run: null, reason: `#${entry.issue}: revised reissue of released nonterminal work requires explicit terminal disposition before a replacement claim`, blocked: true };
+  }
+  if (history.some((prior) => prior.state !== 'MERGED' && options.isRunOwnerRetired?.(prior) !== true)) {
+    return { run: null, reason: `#${entry.issue}: prior dispatch work lacks proven delivery`, blocked: true };
+  }
+  // A new authority revision permits a new incarnation, but cannot hide an
+  // interrupted release from an older one merely because its Run says MERGED.
+  for (const prior of history.filter((candidate) => !sameAuthorityRevision(candidate, entry) && candidate.repairTaskShapeAuthority !== undefined)) {
+    const priorEntry: DispatchQueueEntry = { issue: entry.issue, route: 'codex', profile: prior.execution?.profile ?? '', repairTaskShapeAuthority: prior.repairTaskShapeAuthority };
+    if (options.isRunOwnerRetired?.(prior) !== true && !await delivered(prior, priorEntry, options, true)) {
+      return { run: null, reason: `#${entry.issue}: previous authority lacks exact delivery settlement`, blocked: true };
+    }
+  }
+  const matching = history.filter((prior) => sameAuthorityRevision(prior, entry) || prior.repairTaskShapeAuthority === undefined);
+  if (matching.length > 0) {
+    if (matching.length === 1 && matching[0]!.state === 'MERGED' && await delivered(matching[0]!, entry, options)) {
+      return { run: null, reason: `#${entry.issue}: exact dispatch delivery is complete` };
+    }
+    if (matching.length === 1 && matching[0]!.state !== 'MERGED' && options.isRunOwnerRetired?.(matching[0]!) === true &&
+      matching[0]!.execution?.profile === entry.profile && matching[0]!.repairTaskShapeAuthority?.shape === entry.repairTaskShapeAuthority?.shape) {
+      return { run: null, reason: `#${entry.issue}: exact prior owner retirement prevents same-authority respawn` };
+    }
+    return { run: null, reason: `#${entry.issue}: historical delivery does not authorize this queue incarnation`, blocked: true };
+  }
   const issue = await options.github.readIssue(issueTarget);
   if (issue.state !== 'open') return { run, reason: `#${entry.issue}: Issue is ${issue.state}` };
   const pulls = await options.github.listPullRequests(issueTarget);
@@ -357,6 +421,16 @@ async function retireTerminalClaim(
   return observed.claim;
 }
 
+/** All same-repository prior dispatch owners count, even absent/rerouted rows. */
+function historicalOwnerHold(options: DispatchOnceOptions, currentRunId?: string): string | null {
+  for (const prior of options.store.list()) {
+    if (prior.id === currentRunId || prior.dispatchClaimId === undefined ||
+      prior.target.owner.toLowerCase() !== options.owner.toLowerCase() || prior.target.repo.toLowerCase() !== options.repo.toLowerCase()) continue;
+    if (options.isRunOwnerRetired?.(prior) !== true) return `Prior dispatch Run ${prior.id} retains unresolved dispatch work (${prior.state}); exact release and explicit work disposition are required.`;
+  }
+  return null;
+}
+
 /**
  * Perform one v0 serial dispatch attempt. A queue comment cannot by itself
  * authorize work: every candidate is checked against current Issue/PR/Run
@@ -372,39 +446,18 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       ...(existing.claim.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: existing.claim.repairTaskShapeAuthority }),
     };
     const queue = parseDispatchQueue(options.queueBody);
-    if (existing.claim.state === 'retired') {
-      const reasons: string[] = [];
-      for (const queued of queue) {
-        if (queued.route !== 'codex') {
-          reasons.push(`#${queued.issue}: route ${queued.route} is not executable by this dispatcher`);
-          continue;
-        }
-        const authorityUnavailable = authorityReason(queued);
-        if (authorityUnavailable !== null) {
-          reasons.push(authorityUnavailable);
-          continue;
-        }
-        const checked = await eligibility(queued, options);
-        if (checked.reason !== null) {
-          reasons.push(checked.reason);
-          continue;
-        }
-        const claim = await supersedeTerminalClaim(options.runtime, existing.id, existing.claim, queued, options);
-        const dispatched = await executeWithHeartbeat(options, existing.id, queued, checked.run, claim);
-        if ('wait' in dispatched) return { outcome: 'admission_wait', waitKind: dispatched.wait.waitKind, entry: queued, runId: dispatched.wait.runId, claim: dispatched.claim, reason: dispatched.wait.message, ...(dispatched.wait.admission === undefined ? {} : { admission: dispatched.wait.admission }) };
-        return { outcome: 'dispatched', entry: queued, ...dispatched };
-      }
-      return { outcome: 'no_eligible_work', reasons };
-    }
-    const run = claimedRun(options.store, existing.claim, entry, options);
-    if (run === null && !hasValidDispatchAuthority(entry)) {
+    let run = claimedRun(options.store, existing.claim, entry, options);
+    if (run === null && (existing.claim.state === 'retired' || !hasValidDispatchAuthority(entry))) {
       return {
         outcome: 'owner_reconciliation_hold', entry, claim: existing.claim,
         reason: `Legacy dispatch claim ${existing.claim.claimId} has no retained Run or task-shape authority; owner reconciliation is required before any new Run can be created.`,
       };
     }
     if (run !== null) assertClaimAuthorityMatchesRun(existing.claim, run);
-    if (run === null || !isSettledRun(run)) {
+    const historicalHold = historicalOwnerHold(options, run?.id);
+    if (historicalHold !== null) return { outcome: 'owner_reconciliation_hold', entry, claim: existing.claim, reason: historicalHold };
+    const ownerRetired = run !== null && run.state !== 'MERGED' && options.isRunOwnerRetired?.(run) === true;
+    if (!ownerRetired && (run === null || !isSettledRun(run))) {
       if (run !== null && options.admission?.readLane(`run:${run.id}`)?.status === 'active') {
         return {
           outcome: 'admission_wait', waitKind: 'owner', entry, runId: run.id, claim: existing.claim,
@@ -416,18 +469,21 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       return { outcome: 'dispatched', entry, ...dispatched };
     }
 
-    // A terminal durable Run must never be executed again. Retain its claim
-    // while its queue entry is still present, but allow the same sole runtime
-    // comment to be safely superseded once the Steward has removed it.
-    const reconciled = needsTerminalReconciliation(existing.claim, run)
+    if (run === null) throw new DispatchProtocolError('Dispatch owner retirement requires a retained Run.');
+    // Only exact delivery or explicit owner retirement can release a retained row. FAILED and human or
+    // dependency holds remain ownership fences even when a queue row vanishes.
+    const reissued = queue.some((queued) => queued.issue === entry.issue && queued.route === 'codex' && hasValidDispatchAuthority(queued) &&
+      entry.repairTaskShapeAuthority !== undefined && queued.repairTaskShapeAuthority.revision !== entry.repairTaskShapeAuthority.revision);
+    const complete = (run.state === 'MERGE_READY' || run.state === 'MERGED') && await delivered(run, entry, options, reissued);
+    run = options.store.read(run.id) ?? run;
+    const reconciled = existing.claim.state === 'retired' && (run.state === 'MERGED' || ownerRetired)
+      ? existing.claim
+      : needsTerminalReconciliation(existing.claim, run)
       ? await updateClaim(options.runtime, existing.id, existing.claim, options.now(), options.leaseDurationMs, {
-        runId: run.id,
-        state: run.state,
+        runId: run.id, state: run.state,
       })
       : existing.claim;
-    if (queue.some((queued) => queued.issue === entry.issue && queued.route === 'codex' && queued.profile === entry.profile)) {
-      return { outcome: 'existing_claim', claim: reconciled };
-    }
+    if (!complete && !ownerRetired) return { outcome: 'existing_claim', claim: reconciled };
     const reasons: string[] = [];
     for (const queued of queue) {
       if (queued.route !== 'codex') {
@@ -442,16 +498,19 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       const checked = await eligibility(queued, options);
       if (checked.reason !== null) {
         reasons.push(checked.reason);
+        if (checked.blocked) return { outcome: 'no_eligible_work', reasons };
         continue;
       }
-      const claim = await supersedeTerminalClaim(options.runtime, existing.id, existing.claim, queued, options);
+      const claim = await supersedeTerminalClaim(options.runtime, existing.id, reconciled, queued, options);
       const dispatched = await executeWithHeartbeat(options, existing.id, queued, checked.run, claim);
       if ('wait' in dispatched) return { outcome: 'admission_wait', waitKind: dispatched.wait.waitKind, entry: queued, runId: dispatched.wait.runId, claim: dispatched.claim, reason: dispatched.wait.message, ...(dispatched.wait.admission === undefined ? {} : { admission: dispatched.wait.admission }) };
       return { outcome: 'dispatched', entry: queued, ...dispatched };
     }
-    await retireTerminalClaim(options.runtime, existing.id, reconciled, options.now());
+    if (reconciled.state !== 'retired') await retireTerminalClaim(options.runtime, existing.id, reconciled, options.now());
     return { outcome: 'no_eligible_work', reasons };
   }
+  const historicalHold = historicalOwnerHold(options);
+  if (historicalHold !== null) return { outcome: 'no_eligible_work', reasons: [historicalHold] };
   const queue = parseDispatchQueue(options.queueBody);
   const reasons: string[] = [];
   for (const entry of queue) {
@@ -467,6 +526,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     const checked = await eligibility(entry, options);
     if (checked.reason !== null) {
       reasons.push(checked.reason);
+      if (checked.blocked) return { outcome: 'no_eligible_work', reasons };
       continue;
     }
     const claimed = await claimDispatchEntry(options.runtime, entry, {
