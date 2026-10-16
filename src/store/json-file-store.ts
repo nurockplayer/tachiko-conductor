@@ -6,7 +6,8 @@ import { DispatchInvocationLockedError, acquireDispatchInvocationLock } from '..
 
 import { TRANSITION_TYPES, WORKFLOW_STATES, type Run, type WorkflowState } from '../domain/types.js';
 import { isProviderExecutionTelemetry, isRunTelemetry } from '../domain/telemetry.js';
-import { isKnownBoundedValidationPayloadCoherent, isValidationResultCoherent } from '../domain/validation.js';
+import { isKnownBoundedValidationPayloadCoherent, isSerializedBoundedValidationPayloadCoherent, isValidationResultCoherent,
+  snapshotBoundedValidationDeclarations, type BoundedValidationDeclarations } from '../domain/validation.js';
 import { deleteOperationalProjection, writeOperationalProjection } from '../operational/projection.js';
 import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIMEOUT_MS } from '../execution-profiles.js';
 import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, sameRepairExecutorIdentity, unfinishedBoundRepairAttempt, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
@@ -336,8 +337,10 @@ function assertNoRawProviderOutput(run: Run): void {
   }
 }
 
-function assertNoInvalidBoundedValidationPayload(run: Run): void {
-  if (!isKnownBoundedValidationPayloadCoherent(run.validationResult)) {
+function assertNoInvalidBoundedValidationPayload(run: Run, declarations?: BoundedValidationDeclarations): void {
+  const coherent = declarations !== undefined ? isSerializedBoundedValidationPayloadCoherent(run.validationResult, declarations)
+    : isKnownBoundedValidationPayloadCoherent(run.validationResult);
+  if (!coherent) {
     throw new Error('Refusing to persist an invalid bounded validation output payload.');
   }
 }
@@ -349,7 +352,14 @@ function serializedJson(value: unknown): string {
 
 function writeJsonAtomic(filePath: string, value: unknown, syncForDurability: (fd: number, target: 'file' | 'directory') => void, validatePath: () => void): string {
   validatePath();
+  const validation = typeof value === 'object' && value !== null ? Object.getOwnPropertyDescriptor(value, 'validationResult') : undefined;
+  const declarations = snapshotBoundedValidationDeclarations(validation !== undefined && 'value' in validation ? validation.value : undefined);
   const serialized = serializedJson(value);
+  // Ancestor serializers can replace a previously checked nested payload.
+  // Check exactly the bytes being published, without invoking the caller again.
+  const snapshot = JSON.parse(serialized) as Run;
+  assertNoRawProviderOutput(snapshot);
+  assertNoInvalidBoundedValidationPayload(snapshot, declarations);
   const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
   let fd: number | undefined = openSync(tmpPath, 'wx', 0o600);
   try {

@@ -65,6 +65,42 @@ function casFixture(id: string): Run {
   return run as Run;
 }
 
+function boundedValidationRun(id: string): Run {
+  const headSha = `${id}-head`;
+  const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'ok', stderr: '',
+    store: new InMemoryToolOutputStore() });
+  const base = validationPassed(headSha);
+  const validation = { ...base, local: { ...base.local, commands: [{ ...base.local.commands[0]!,
+    captureStatus: 'complete' as const, output }] } };
+  const started = applyTransition(newRun(id), { type: 'start' }, T0);
+  const validating = applyTransition(started, {
+    type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+  }, T0);
+  return applyTransition(validating, { type: 'validation_passed', validationResult: validation,
+    pullRequest: { number: 7, headSha } }, T0);
+}
+
+function assertBoundedRunWriteRefused(validRun: Run, candidate: Run | (() => Run), expected: RegExp): void {
+  for (const api of ['create', 'update', 'CAS'] as const) {
+    const attempt = typeof candidate === 'function' ? candidate() : candidate;
+    const { store, dir } = tempStore();
+    if (api !== 'create') store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const projectionPath = operationalProjectionPath(dir, validRun.id);
+    const beforeRun = existsSync(runPath) ? readFileSync(runPath, 'utf8') : null;
+    const beforeProjection = existsSync(projectionPath) ? readFileSync(projectionPath, 'utf8') : null;
+    assert.throws(() => {
+      if (api === 'create') store.create(attempt);
+      else if (api === 'update') store.update(attempt);
+      else store.updateIfUnchanged(validRun, attempt);
+    }, expected, `${api} rejects the candidate`);
+    assert.equal(existsSync(runPath) ? readFileSync(runPath, 'utf8') : null, beforeRun, `${api} preserves Run bytes`);
+    assert.equal(existsSync(projectionPath) ? readFileSync(projectionPath, 'utf8') : null, beforeProjection,
+      `${api} preserves projection bytes`);
+    assert.equal(readdirSync(dir).some((name) => name.endsWith('.tmp')), false);
+  }
+}
+
 afterEach(() => {
   for (const dir of tmpDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
@@ -1187,6 +1223,236 @@ describe('JsonFileStore — persistence round-trips', () => {
     const persisted = loaded?.validationResult?.local.commands[0]?.output;
     assert.deepEqual(persisted?.diagnostics, output.diagnostics);
     assert.equal(Buffer.byteLength((persisted?.diagnostics ?? []).join('\n')), 65_536);
+  });
+
+  it('refuses unbounded file identity scalars before persistence and on stored Run reads', () => {
+    const validRun = boundedValidationRun('file-identity-bounds');
+    const output = validRun.validationResult!.local.commands[0]!.output!;
+    (output.artifact as { fileIdentity: unknown }).fileIdentity = {
+      stdout: { dev: '0'.repeat(256), ino: '001' }, stderr: { dev: '02', ino: '0'.repeat(256) },
+    };
+    assert.equal(isToolOutputEnvelope(output), true, '256 digits and leading zeros remain supported');
+    const control = tempStore();
+    control.store.create(validRun);
+    assert.deepEqual(control.store.read(validRun.id)?.validationResult?.local.commands[0]?.output?.artifact.fileIdentity,
+      output.artifact.fileIdentity);
+    for (const channel of ['stdout', 'stderr'] as const) {
+      for (const key of ['dev', 'ino'] as const) {
+        const candidate = structuredClone(validRun);
+        const part = candidate.validationResult!.local.commands[0]!.output!.artifact.fileIdentity![channel] as { dev: string; ino: string };
+        part[key] = '1'.repeat(257);
+        assert.equal(isToolOutputEnvelope(candidate.validationResult!.local.commands[0]!.output), false);
+        assert.equal(isValidationResultCoherent(candidate.validationResult), false);
+        assertBoundedRunWriteRefused(validRun, candidate, /invalid bounded validation output payload/);
+        const { store, dir } = tempStore();
+        const runPath = path.join(dir, `${validRun.id}.json`);
+        const raw = JSON.stringify(candidate);
+        writeFileSync(runPath, raw);
+        assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+        assert.throws(() => store.updateIfUnchanged(validRun, validRun), /corrupt or incompatible/);
+        assert.equal(readFileSync(runPath, 'utf8'), raw);
+      }
+    }
+  });
+
+  it('refuses inherited data and nonenumerable fixed bounded payload fields before persistence', () => {
+    for (const boundary of ['envelope', 'stream', 'artifact', 'identity', 'identity-part', 'overflow', 'partial-preview', 'partial-stream'] as const) {
+      for (const shape of ['inherited-data', 'nonenumerable'] as const) {
+        const validRun = boundedValidationRun('fixed-record-serialization');
+        const candidate = structuredClone(validRun);
+        const command = candidate.validationResult!.local.commands[0]!;
+        (command.output!.artifact as { fileIdentity: unknown }).fileIdentity = {
+          stdout: { dev: '1', ino: '2' }, stderr: { dev: '3', ino: '4' },
+        };
+        const preview = { stdout: { bytes: 2, preview: 'ok', previewBytes: 2, truncated: false },
+          stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false }, diagnostics: [] as string[], diagnosticsTruncated: false };
+        let record: object;
+        let key: string;
+        switch (boundary) {
+          case 'envelope': record = command.output!; key = 'version'; break;
+          case 'stream': record = command.output!.stdout; key = 'preview'; break;
+          case 'artifact': record = command.output!.artifact; key = 'id'; break;
+          case 'identity': record = command.output!.artifact.fileIdentity!; key = 'stdout'; break;
+          case 'identity-part': record = command.output!.artifact.fileIdentity!.stderr; key = 'ino'; break;
+          case 'overflow': record = command.output!.overflow; key = 'stdout'; break;
+          default:
+            delete (command as { output?: unknown }).output;
+            (command as { captureStatus: string }).captureStatus = 'partial';
+            Object.assign(command, { capturePreview: preview });
+            record = boundary === 'partial-preview' ? preview : preview.stdout;
+            key = boundary === 'partial-preview' ? 'diagnosticsTruncated' : 'preview';
+        }
+        const value = (record as Record<string, unknown>)[key];
+        if (shape === 'nonenumerable') Object.defineProperty(record, key, { value, enumerable: false });
+        else {
+          delete (record as Record<string, unknown>)[key];
+          Object.setPrototypeOf(record, Object.defineProperty({}, key, { value, enumerable: true }));
+        }
+        assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), false, `${boundary}: ${shape}`);
+        assert.equal(isValidationResultCoherent(candidate.validationResult), false, `${boundary}: ${shape}`);
+        assertBoundedRunWriteRefused(validRun, candidate, /invalid bounded validation output payload/);
+      }
+    }
+  });
+
+  it('checks the exact serialized Run snapshot when ancestor serializers inject bounded payload violations', () => {
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    for (const ancestor of ['command', 'local', 'validation', 'Run'] as const) {
+      const validRun = boundedValidationRun('serialized-bounded-snapshot');
+      const candidate = structuredClone(validRun);
+      const serialized = structuredClone(validRun);
+      Object.assign(serialized.validationResult!.local.commands[0]!.output!, { rawTranscript });
+      const target = ancestor === 'Run' ? candidate : ancestor === 'validation' ? candidate.validationResult!
+        : ancestor === 'local' ? candidate.validationResult!.local : candidate.validationResult!.local.commands[0]!;
+      const replacement = ancestor === 'Run' ? serialized : ancestor === 'validation' ? serialized.validationResult!
+        : ancestor === 'local' ? serialized.validationResult!.local : serialized.validationResult!.local.commands[0]!;
+      Object.defineProperty(target, 'toJSON', { value() { return replacement; } });
+      assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), true, 'the caller shape alone is bounded');
+      assertBoundedRunWriteRefused(validRun, candidate, /invalid bounded validation output payload/);
+    }
+    for (const ancestor of ['agentResult', 'Run'] as const) {
+      const validRun = boundedValidationRun('serialized-provider-snapshot');
+      const candidate = structuredClone(validRun);
+      const serialized = structuredClone(validRun);
+      Object.assign(serialized.agentResult!, { output: validRun.validationResult!.local.commands[0]!.output });
+      Object.defineProperty(ancestor === 'Run' ? candidate : candidate.agentResult!, 'toJSON', {
+        value() { return ancestor === 'Run' ? serialized : serialized.agentResult; },
+      });
+      assertBoundedRunWriteRefused(validRun, candidate, /raw provider output artifacts/);
+    }
+  });
+
+  it('persists one checked benign serializer snapshot and preserves future unknown and legacy fields', () => {
+    for (const api of ['create', 'update', 'CAS'] as const) {
+      const validRun = boundedValidationRun('benign-serialized-snapshot');
+      const candidate = structuredClone(validRun);
+      let calls = 0;
+      Object.defineProperty(candidate, 'toJSON', { value() {
+        calls += 1;
+        const snapshot = structuredClone(validRun);
+        return { ...snapshot, futureUnknown: { retained: true },
+          validationResult: { ...snapshot.validationResult!, local: { ...snapshot.validationResult!.local,
+            commands: [{ ...snapshot.validationResult!.local.commands[0]!, output: {
+              ...snapshot.validationResult!.local.commands[0]!.output!, summary: `bounded-snapshot-${calls}`,
+            } }] } } };
+      } });
+      const { store, dir } = tempStore();
+      if (api !== 'create') store.create(validRun);
+      if (api === 'create') store.create(candidate);
+      else if (api === 'update') store.update(candidate);
+      else assert.equal(store.updateIfUnchanged(validRun, candidate), true);
+      assert.equal(calls, 1, 'the checked snapshot is written without serializing the caller again');
+      const raw = JSON.parse(readFileSync(path.join(dir, `${validRun.id}.json`), 'utf8'));
+      assert.deepEqual(raw.futureUnknown, { retained: true });
+      assert.equal(store.read(validRun.id)?.validationResult?.local.commands[0]?.output?.summary, 'bounded-snapshot-1');
+    }
+    const { store, dir } = tempStore();
+    const legacy = casFixture('legacy-known-bounds-only');
+    delete (legacy as { createdAt?: string }).createdAt;
+    store.create(legacy);
+    const raw = JSON.parse(readFileSync(path.join(dir, `${legacy.id}.json`), 'utf8'));
+    assert.deepEqual(raw.futureUnknown, { metadata: { second: 2, first: 1 }, ordered: ['first', 'second'] });
+    assert.equal(raw.createdAt, undefined, 'the writer does not introduce a full Run validation gate');
+  });
+
+  it('refuses incoherent capture markers in the exact serialized snapshot before any Run publication', () => {
+    for (const ancestor of ['command', 'local', 'validation', 'Run'] as const) {
+      const validRun = boundedValidationRun('serialized-complete-output-required');
+      const candidate = structuredClone(validRun);
+      const serialized = structuredClone(validRun);
+      delete (serialized.validationResult!.local.commands[0]! as { output?: unknown }).output;
+      const target = ancestor === 'Run' ? candidate : ancestor === 'validation' ? candidate.validationResult!
+        : ancestor === 'local' ? candidate.validationResult!.local : candidate.validationResult!.local.commands[0]!;
+      const replacement = ancestor === 'Run' ? serialized : ancestor === 'validation' ? serialized.validationResult!
+        : ancestor === 'local' ? serialized.validationResult!.local : serialized.validationResult!.local.commands[0]!;
+      Object.defineProperty(target, 'toJSON', { value() { return replacement; } });
+      assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), true);
+      assertBoundedRunWriteRefused(validRun, candidate, /invalid bounded validation output payload/);
+    }
+  });
+
+  it('preserves immutable declared capture fields across ancestor serialization and original-object mutation', () => {
+    for (const variant of ['command', 'local', 'validation', 'Run', 'remove-command', 'remove-validation',
+      'null-command', 'mutate-command', 'mutate-Run', 'drop-status', 'drop-preview'] as const) {
+      const validRun = boundedValidationRun('serialized-declaration-preservation');
+      const makeCandidate = (): Run => {
+        const candidate = structuredClone(validRun);
+        const command = candidate.validationResult!.local.commands[0]!;
+        if (variant === 'drop-preview') {
+          delete (command as { output?: unknown }).output;
+          Object.assign(command, { captureStatus: 'partial', capturePreview: {
+            stdout: { bytes: 2, preview: 'ok', previewBytes: 2, truncated: false },
+            stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false }, diagnostics: [], diagnosticsTruncated: false,
+          } });
+        }
+        const serialized = structuredClone(candidate);
+        const serializedCommand = serialized.validationResult!.local.commands[0]!;
+        if (variant === 'drop-status') delete (serializedCommand as { captureStatus?: unknown }).captureStatus;
+        else if (variant === 'drop-preview') delete (serializedCommand as { capturePreview?: unknown }).capturePreview;
+        else {
+          delete (serializedCommand as { output?: unknown }).output;
+          delete (serializedCommand as { capturePreview?: unknown }).capturePreview;
+          delete (serializedCommand as { captureStatus?: unknown }).captureStatus;
+        }
+        const ancestor = variant === 'command' || variant === 'mutate-command' || variant === 'null-command' ? 'command'
+          : variant === 'local' || variant === 'remove-command' ? 'local'
+            : variant === 'validation' ? 'validation' : 'Run';
+        const target = ancestor === 'Run' ? candidate : ancestor === 'validation' ? candidate.validationResult!
+          : ancestor === 'local' ? candidate.validationResult!.local : command;
+        const replacement = ancestor === 'Run' ? serialized : ancestor === 'validation' ? serialized.validationResult!
+          : ancestor === 'local' ? serialized.validationResult!.local : serializedCommand;
+        if (variant === 'remove-command') (serialized.validationResult!.local as { commands: unknown }).commands = [];
+        if (variant === 'remove-validation') delete (serialized as { validationResult?: unknown }).validationResult;
+        Object.defineProperty(target, 'toJSON', { value() {
+          if (variant === 'mutate-command') {
+            delete (command as { output?: unknown }).output;
+            delete (command as { captureStatus?: unknown }).captureStatus;
+          }
+          if (variant === 'mutate-Run') delete (candidate as { validationResult?: unknown }).validationResult;
+          return variant === 'null-command' ? null : replacement;
+        } });
+        return candidate;
+      };
+      assertBoundedRunWriteRefused(validRun, makeCandidate, /invalid bounded validation output payload/);
+    }
+  });
+
+  it('preserves valid serialized capture markers and marker-free legacy command shapes', () => {
+    for (const shape of ['complete', 'output-only', 'partial-preview', 'partial', 'unavailable', 'no-markers', 'undefined-markers',
+      'null-slot', 'sparse-slot', 'null-commands', 'missing-commands'] as const) {
+      for (const api of ['create', 'update', 'CAS'] as const) {
+        const validRun = boundedValidationRun('serialized-capture-control');
+        const serialized = structuredClone(validRun);
+        const command = serialized.validationResult!.local.commands[0]!;
+        if (shape === 'output-only') delete (command as { captureStatus?: unknown }).captureStatus;
+        if (shape !== 'complete' && shape !== 'output-only') {
+          delete (command as { output?: unknown }).output;
+          delete (command as { captureStatus?: unknown }).captureStatus;
+        }
+        if (shape === 'partial' || shape === 'unavailable' || shape === 'partial-preview') {
+          (command as { captureStatus: string }).captureStatus = shape === 'unavailable' ? 'unavailable' : 'partial';
+        }
+        if (shape === 'partial-preview') (command as { capturePreview: unknown }).capturePreview = {
+          stdout: { bytes: 2, preview: 'ok', previewBytes: 2, truncated: false },
+          stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false }, diagnostics: [], diagnosticsTruncated: false,
+        };
+        if (shape === 'null-slot') (serialized.validationResult!.local as { commands: unknown }).commands = [null];
+        if (shape === 'sparse-slot') (serialized.validationResult!.local as { commands: unknown }).commands = new Array(1);
+        if (shape === 'null-commands') (serialized.validationResult!.local as { commands: unknown }).commands = null;
+        if (shape === 'missing-commands') delete (serialized.validationResult!.local as { commands?: unknown }).commands;
+        if (shape === 'undefined-markers') Object.assign(command, { output: undefined, capturePreview: undefined, captureStatus: undefined });
+        const candidate = structuredClone(serialized);
+        Object.defineProperty(candidate, 'toJSON', { value() { return serialized; } });
+        const { store, dir } = tempStore();
+        if (api !== 'create') store.create(validRun);
+        if (api === 'create') store.create(candidate);
+        else if (api === 'update') store.update(candidate);
+        else assert.equal(store.updateIfUnchanged(validRun, candidate), true);
+        const raw = JSON.parse(readFileSync(path.join(dir, `${validRun.id}.json`), 'utf8'));
+        assert.deepEqual(raw.validationResult.local.commands, JSON.parse(JSON.stringify(serialized.validationResult!.local)).commands,
+          `${shape}: ${api} preserves the admitted serialized shape`);
+      }
+    }
   });
 
   for (const boundary of ['envelope', 'envelope-stream', 'partial-preview', 'partial-stream'] as const) {

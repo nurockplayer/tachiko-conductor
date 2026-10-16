@@ -54,6 +54,49 @@ function isBoundedCapturePreview(value: unknown): boolean {
 
 /** Validates only the known bounded payloads before durable JSON serialization. */
 export function isKnownBoundedValidationPayloadCoherent(value: unknown): boolean {
+  return boundedValidationPayloadCoherent(value, false);
+}
+
+/** Checks known capture markers after JSON serialization, without imposing the full Run schema. */
+export function isSerializedBoundedValidationPayloadCoherent(value: unknown, declarations: BoundedValidationDeclarations = []): boolean {
+  const commands = ownDataValue(ownDataValue(value, 'local'), 'commands');
+  for (const { index, fields } of declarations) {
+    if (!Array.isArray(commands)) return false;
+    const command = ownDataValue(commands, String(index));
+    for (let field = 0; field < BOUNDED_COMMAND_FIELDS.length; field += 1) {
+      if ((fields & (1 << field)) !== 0 && ownDataValue(command, BOUNDED_COMMAND_FIELDS[field]!) === undefined) return false;
+    }
+  }
+  return boundedValidationPayloadCoherent(value, true);
+}
+
+const BOUNDED_COMMAND_FIELDS = ['output', 'capturePreview', 'captureStatus'] as const;
+export type BoundedValidationDeclarations = readonly { readonly index: number; readonly fields: number }[];
+
+function ownDataValue(value: unknown, key: string): unknown {
+  if (typeof value !== 'object' || value === null) return undefined;
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  return descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+}
+
+/** Detached declaration bits survive serializers that mutate or replace their original objects. */
+export function snapshotBoundedValidationDeclarations(value: unknown): BoundedValidationDeclarations {
+  const commands = ownDataValue(ownDataValue(value, 'local'), 'commands');
+  const declarations: Array<{ readonly index: number; readonly fields: number }> = [];
+  if (Array.isArray(commands)) {
+    for (let index = 0; index < commands.length; index += 1) {
+      const command = ownDataValue(commands, String(index));
+      let fields = 0;
+      for (let field = 0; field < BOUNDED_COMMAND_FIELDS.length; field += 1) {
+        if (ownDataValue(command, BOUNDED_COMMAND_FIELDS[field]!) !== undefined) fields |= 1 << field;
+      }
+      if (fields !== 0) declarations.push(Object.freeze({ index, fields }));
+    }
+  }
+  return Object.freeze(declarations);
+}
+
+function boundedValidationPayloadCoherent(value: unknown, serializedSnapshot: boolean): boolean {
   if (typeof value !== 'object' || value === null) return true;
   const localDescriptor = Object.getOwnPropertyDescriptor(value, 'local');
   if (localDescriptor === undefined) return true;
@@ -77,6 +120,8 @@ export function isKnownBoundedValidationPayloadCoherent(value: unknown): boolean
       if (key === 'output' && descriptor?.value !== undefined && !isToolOutputEnvelope(descriptor.value)) return false;
       if (key === 'capturePreview' && descriptor?.value !== undefined && !isBoundedCapturePreview(descriptor.value)) return false;
     }
+    if (serializedSnapshot && ['output', 'capturePreview', 'captureStatus'].some((key) => Object.hasOwn(command, key)) &&
+        !isCommandOutputCoherent(command as Record<string, unknown>)) return false;
   }
   return true;
 }
@@ -86,14 +131,14 @@ function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
   return !hasCustomToJSON(value) && Reflect.ownKeys(value).every((key) => {
     if (typeof key !== 'string' || !allowed.has(key)) return false;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor !== undefined && 'value' in descriptor;
+    return descriptor !== undefined && descriptor.enumerable === true && 'value' in descriptor;
   }) && allowedKeys.every((key) => {
-    // Later property reads can resolve on a prototype even when own keys are
-    // all data properties. Reject the effective accessor without invoking it.
+    // JSON retains only own enumerable data. Effective inherited values would
+    // pass ordinary property reads and then disappear during serialization.
     let current: object | null = value;
     while (current !== null) {
       const descriptor = Object.getOwnPropertyDescriptor(current, key);
-      if (descriptor !== undefined) return 'value' in descriptor;
+      if (descriptor !== undefined) return current === value && descriptor.enumerable === true && 'value' in descriptor;
       current = Object.getPrototypeOf(current) as object | null;
     }
     return true;

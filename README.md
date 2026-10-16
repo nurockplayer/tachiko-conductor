@@ -415,6 +415,8 @@ positive `previewBytes`, `diagnosticBytes`, `maxDiagnostics`, and `readBytes`
 limits as JSON. The private store has a persisted fixed capacity of 256
 operation slots, limits registration to at most 16 slot probes per attempt, and
 advances a bounded cleanup cursor during capture setup.
+Each active metadata update reserves space within the 1 MiB metadata limit for
+an abort record naming every owned capture, including when file cleanup fails.
 If the index is incompatible, occupied by protected/corrupt ownership, or at
 capacity, capture becomes unavailable; retained slots are never evicted.
 Generic and provider commands do not create raw output files unless the
@@ -447,13 +449,19 @@ This is an admission bound, not a
 guarantee of available disk space or a global filesystem quota. New and
 rewritten authoritative Run
 snapshots are published with mode `0600`; existing legacy Run files are not
-retroactively hardened. Releasing or expiring a tool-output artifact does not
+retroactively hardened. Fixed bounded-output records require own enumerable
+data fields. Run writes check the exact serialized output payloads and declared
+capture markers before creating their temporary publication file. Serializers
+must preserve each declared capture field at its original command position.
+Releasing or expiring a tool-output artifact does not
 scrub raw previews already persisted in a Run; those previews follow the
 existing Run lifecycle.
 
 Explicit range reads are limited to 1 MiB. Search queries are limited to 64 KiB
 of UTF-8, with at most 128 matches and 64 KiB per matching line. Opaque artifact
 IDs must be nonblank and at most 256 UTF-8 bytes; custom store IDs are supported.
+Each device or inode identity is a string of 1–256 ASCII digits; leading zeros
+are preserved.
 File capture
 requires supported POSIX ownership and private-mode checks. Existing evidence-
 root and operations directories must already be owned by the effective current

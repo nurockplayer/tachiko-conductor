@@ -30,6 +30,21 @@ const policy: ToolOutputPolicy = {
 };
 
 describe('bounded tool output contract', () => {
+  it('bounds all file identity strings to 256 ASCII digits while preserving padded decimal identities', () => {
+    const base = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '', store: new InMemoryToolOutputStore() });
+    const withValue = (channel: 'stdout' | 'stderr', key: 'dev' | 'ino', value: unknown) => ({ ...base,
+      artifact: { ...base.artifact, fileIdentity: { stdout: { dev: '001', ino: '02' }, stderr: { dev: '03', ino: '004' },
+        [channel]: { dev: '001', ino: '02', [key]: value } } } });
+    for (const channel of ['stdout', 'stderr'] as const) {
+      for (const key of ['dev', 'ino'] as const) {
+        for (const value of ['0', '001', '0'.repeat(256)]) assert.equal(isToolOutputEnvelope(withValue(channel, key, value)), true);
+        for (const value of ['', '1'.repeat(257), '1'.repeat(262_144), '１２', '12x', ' 12', 12]) {
+          assert.equal(isToolOutputEnvelope(withValue(channel, key, value)), false, `${channel}.${key}`);
+        }
+      }
+    }
+  });
+
   it('bounds opaque artifact IDs by UTF-8 bytes while retaining custom IDs and whitespace semantics', () => {
     const base = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
       store: new InMemoryToolOutputStore(), policy });
@@ -401,14 +416,28 @@ describe('bounded tool output contract', () => {
     } finally { rmSync(root, { recursive: true, force: true }); }
 
     const exactRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-attribution-exact-bound-'));
+    const activeOnlyRoot = path.join(exactRoot, 'active-only');
+    const overRoot = path.join(exactRoot, 'abort-over');
     try {
       const fixed = { schemaVersion: 1, id: '0'.repeat(36), slot: 0, ownerNonce: '0'.repeat(36), createdAt: '2030-01-01T00:00:00.000Z', attribution: { value: '' }, state: 'active', artifacts: [], activeCaptureIds: [] };
-      const exactBytes = 1_048_576 - Buffer.byteLength(JSON.stringify(fixed), 'utf8');
-      const exact = new FileToolOutputStore(exactRoot, { capacity: 1, now: () => new Date('2030-01-01T00:00:00.000Z') });
+      const activeOnlyBytes = 1_048_576 - Buffer.byteLength(JSON.stringify(fixed), 'utf8');
+      assert.throws(() => new FileToolOutputStore(activeOnlyRoot, { capacity: 1 }).beginOperation({ value: 'x'.repeat(activeOnlyBytes) }), /bounded metadata limit/);
+      assert.equal(existsSync(activeOnlyRoot), false, 'an exact active envelope without abort headroom is rejected before filesystem mutation');
+      const worstClosedAt = '-000001-01-01T00:00:00.000Z';
+      assert.equal(worstClosedAt.length, 27);
+      const worstAbort = { ...fixed, state: 'aborted', closedAt: worstClosedAt };
+      const exactBytes = 1_048_576 - Buffer.byteLength(JSON.stringify(worstAbort), 'utf8');
+      assert.throws(() => new FileToolOutputStore(overRoot, { capacity: 1 }).beginOperation({ value: 'x'.repeat(exactBytes + 1) }), /bounded metadata limit/);
+      assert.equal(existsSync(overRoot), false, 'one byte above abort capacity creates no evidence root');
+      const exact = new FileToolOutputStore(exactRoot, { capacity: 1, now: () => new Date(worstClosedAt) });
       const operation = exact.beginOperation({ value: 'x'.repeat(exactBytes) });
+      operation.abort();
       assert.equal(Buffer.byteLength(readFileSync(path.join(exactRoot, 'operations', `${operation.id}.json`)), 'utf8'), 1_048_576,
-        'the complete initial envelope admits the exact UTF-8 metadata limit');
-      rmSync(exactRoot, { recursive: true, force: true });
+        'the exact worst-case abort envelope fits the unchanged metadata limit');
+      const metadata = JSON.parse(readFileSync(path.join(exactRoot, 'operations', `${operation.id}.json`), 'utf8'));
+      assert.equal(metadata.closedAt, worstClosedAt, 'a real extended-year timestamp uses all 27 reserved characters');
+      const reused = exact.beginOperation({ kind: 'capacity-reused-after-abort' });
+      reused.abort();
     } finally { rmSync(exactRoot, { recursive: true, force: true }); }
 
     const conservativeRoot = path.join(os.tmpdir(), `tachiko-attribution-conservative-${process.pid}-${Date.now()}`);
@@ -418,6 +447,49 @@ describe('bounded tool output contract', () => {
       .beginOperation({ value: 'x'.repeat(slotZeroExactBytes) }), /bounded metadata limit/,
     'the maximum slot width may conservatively refuse metadata that would fit the first slot');
     assert.equal(existsSync(conservativeRoot), false, 'conservative boundary refusal still precedes all filesystem mutation');
+  });
+
+  it('reserves abort headroom before adding capture IDs and retains cleanup debt at the exact metadata boundary', () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-active-abort-headroom-'));
+    try {
+      const closedAt = '-000001-01-01T00:00:00.000Z';
+      const abortShape = { schemaVersion: 1, id: '0'.repeat(36), slot: 0, ownerNonce: '0'.repeat(36),
+        createdAt: '2030-01-01T00:00:00.000Z', attribution: { value: '' }, state: 'aborted', closedAt,
+        activeCaptureIds: ['0'.repeat(36)], artifacts: [] };
+      const payloadBytes = 1_048_576 - Buffer.byteLength(JSON.stringify(abortShape));
+      let failCleanup = false;
+      const store = new FileToolOutputStore(root, { capacity: 1, now: () => new Date(closedAt), testFaults: {
+        beforeUnlink: () => { if (failCleanup) throw new Error('injected boundary cleanup failure'); },
+      } });
+      const operation = store.beginOperation({ value: 'x'.repeat(payloadBytes) });
+      const writer = operation.startCapture(policy);
+      writer.write('stdout', 'owned');
+      const metadataPath = path.join(root, 'operations', `${operation.id}.json`);
+      const initial = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      const snapshot = () => readdirSync(root, { recursive: true }).map(String).sort()
+        .filter((name) => lstatSync(path.join(root, name)).isFile())
+        .map((name) => [name, readFileSync(path.join(root, name)).toString('base64')]);
+      const before = snapshot();
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        assert.throws(() => operation.startCapture(policy), /bounded metadata limit/);
+        assert.deepEqual(snapshot(), before, 'deterministic capture refusal adds no IDs or files and changes no metadata');
+      }
+      failCleanup = true;
+      assert.throws(() => operation.abort(), /injected boundary cleanup failure/);
+      const aborted = JSON.parse(readFileSync(metadataPath, 'utf8'));
+      assert.equal(aborted.state, 'aborted');
+      assert.equal(aborted.closedAt, closedAt);
+      assert.deepEqual(aborted.activeCaptureIds, initial.activeCaptureIds, 'every owned file remains named after cleanup failure');
+      assert.deepEqual(aborted.artifacts, []);
+      assert.equal(Buffer.byteLength(readFileSync(metadataPath)), 1_048_576);
+      assert.equal(existsSync(path.join(root, 'operations', `${operation.id}.lock`)), false, 'bounded abort metadata permits owner release');
+      failCleanup = false;
+      store.cleanupExpired({ maxSlotProbes: 1, maxDeletions: 32 });
+      assert.equal(existsSync(path.join(root, `${initial.activeCaptureIds[0]}.stdout`)), false);
+      assert.equal(existsSync(metadataPath), false);
+      const reused = store.beginOperation({ kind: 'capacity-reused-after-cleanup-debt' });
+      reused.abort();
+    } finally { rmSync(root, { recursive: true, force: true }); }
   });
 
   it('fails closed before mutation when private POSIX identity proof is unavailable and prefers effective uid', () => {

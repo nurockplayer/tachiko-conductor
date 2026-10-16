@@ -705,9 +705,13 @@ function isToolOutputArtifactFileIdentity(value: unknown): value is ToolOutputAr
   if (!hasOnlyKeys(identity, ['stdout', 'stderr'])) return false;
   const validPart = (part: unknown): boolean => typeof part === 'object' && part !== null &&
     hasOnlyKeys(part, ['dev', 'ino']) &&
-    typeof (part as Record<string, unknown>).dev === 'string' && /^\d+$/.test((part as Record<string, unknown>).dev as string) &&
-    typeof (part as Record<string, unknown>).ino === 'string' && /^\d+$/.test((part as Record<string, unknown>).ino as string);
+    isBoundedFileIdentityScalar((part as Record<string, unknown>).dev) &&
+    isBoundedFileIdentityScalar((part as Record<string, unknown>).ino);
   return validPart(identity.stdout) && validPart(identity.stderr);
+}
+
+function isBoundedFileIdentityScalar(value: unknown): value is string {
+  return typeof value === 'string' && value.length >= 1 && value.length <= 256 && /^\d+$/.test(value);
 }
 
 function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
@@ -715,14 +719,14 @@ function hasOnlyKeys(value: object, allowedKeys: readonly string[]): boolean {
   return !hasCustomToJSON(value) && Reflect.ownKeys(value).every((key) => {
     if (typeof key !== 'string' || !allowed.has(key)) return false;
     const descriptor = Object.getOwnPropertyDescriptor(value, key);
-    return descriptor !== undefined && 'value' in descriptor;
+    return descriptor !== undefined && descriptor.enumerable === true && 'value' in descriptor;
   }) && allowedKeys.every((key) => {
-    // Later property reads can resolve on a prototype even when own keys are
-    // all data properties. Reject the effective accessor without invoking it.
+    // JSON retains only own enumerable data. Effective inherited values would
+    // pass ordinary property reads and then disappear during serialization.
     let current: object | null = value;
     while (current !== null) {
       const descriptor = Object.getOwnPropertyDescriptor(current, key);
-      if (descriptor !== undefined) return 'value' in descriptor;
+      if (descriptor !== undefined) return current === value && descriptor.enumerable === true && 'value' in descriptor;
       current = Object.getPrototypeOf(current) as object | null;
     }
     return true;
@@ -1457,7 +1461,7 @@ export class FileToolOutputStore implements ToolOutputStore {
     const ownerNonce = randomUUID();
     const createdAt = new Date().toISOString();
     const preflightBase = { schemaVersion: 1, id, slot: this.capacity - 1, ownerNonce, createdAt, attribution: detachedAttribution };
-    encodeBoundedMetadata({ ...preflightBase, state: 'active', artifacts: [], activeCaptureIds: [] });
+    preflightActiveOperationMetadata({ ...preflightBase, state: 'active', artifacts: [], activeCaptureIds: [] });
     ensurePrivateDirectory(this.root);
     const operations = this.operationsDir;
     ensurePrivateDirectory(operations);
@@ -1489,10 +1493,12 @@ export class FileToolOutputStore implements ToolOutputStore {
       captureBytesAdmitted += bytes;
     };
     const metadataPath = path.join(operations, `${id}.json`);
-    const writeMetadata = (value: unknown) => writeAtomicJson(operations, metadataPath, value, () => {
-      const state = typeof value === 'object' && value !== null ? (value as Record<string, unknown>).state : undefined;
-      if (state === 'closed' || state === 'aborted') this.testFaults?.beforeOperationMetadataDirectoryFsync?.(value);
-    });
+    const writeMetadata = (value: Record<string, unknown>): void => {
+      if (value.state === 'active') preflightActiveOperationMetadata(value);
+      writeAtomicJson(operations, metadataPath, value, () => {
+        if (value.state === 'closed' || value.state === 'aborted') this.testFaults?.beforeOperationMetadataDirectoryFsync?.(value);
+      });
+    };
     const base = { schemaVersion: 1, id, slot, ownerNonce, createdAt, attribution: detachedAttribution };
     try { writeMetadata({ ...base, state: 'active', artifacts: [], activeCaptureIds }); }
     catch (error) { try { ownerFence.release(); } catch { /* initial metadata bootstrap debt remains protected */ } throw error; }
@@ -1532,8 +1538,13 @@ export class FileToolOutputStore implements ToolOutputStore {
         if (operationState !== 'open') throw new Error('Tool-output operation is not accepting captures.');
         const frozenPolicy = validateToolOutputPolicy(policy);
         const captureId = randomUUID();
+        const proposedMetadata = { ...base, state: 'active', activeCaptureIds: [...activeCaptureIds, captureId],
+          captures: artifacts.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })) };
+        // A deterministic size refusal owns no new files or IDs. After this
+        // admission, retain the ID even if publication has an uncertain result.
+        preflightActiveOperationMetadata(proposedMetadata);
         activeCaptureIds.push(captureId);
-        writeMetadata({ ...base, state: 'active', activeCaptureIds, captures: artifacts.map((artifact, index) => ({ artifact, attribution: captureAttributions[index] })) });
+        writeMetadata(proposedMetadata);
         let writer: FileToolOutputWriter;
         try {
           this.testFaults?.beforeCaptureStart?.();
@@ -2669,6 +2680,14 @@ function encodeBoundedMetadata(value: unknown): string {
   if (encoded === undefined) throw new Error('Tool-output metadata is not JSON serializable.');
   if (Buffer.byteLength(encoded, 'utf8') > 1_048_576) throw new Error('Tool-output metadata exceeds the bounded metadata limit.');
   return encoded;
+}
+
+function preflightActiveOperationMetadata(value: Record<string, unknown>): void {
+  encodeBoundedMetadata(value);
+  // An abort may retain every registered ID when disposal fails. Reserve that
+  // exact recovery shape, including the longest canonical Date timestamp.
+  const { captures: _captures, artifacts: _artifacts, ...base } = value;
+  encodeBoundedMetadata({ ...base, state: 'aborted', closedAt: '-000001-01-01T00:00:00.000Z', artifacts: [] });
 }
 
 function snapshotOperationAttribution(value: Readonly<Record<string, string | number | null>>): Readonly<Record<string, string | number | null>> {
