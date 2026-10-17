@@ -694,6 +694,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
         if ((run.nativeLead?.requests.length ?? 0) >= 20 || (run.nativeLead?.requests.filter(r => r.identity.incarnation === incarnation).length ?? 0) >= 2)
           return wait('Native lead finite request/replacement allowance exhausted.');
         await c.assertInitiation?.();
+        c.assertInitiationCurrent?.();
         const requestId = randomUUID();
         const identity: NativeLeadIdentity = { requestId, correlationId: requestId, incarnation, runId: run.id, claimId: run.dispatchClaimId, missionId: c.owner.missionId, laneId: c.owner.laneId, ownerGeneration: c.owner.generation, phase: 'lead-disposition', role: 'bounded-lead', repository: origin.identity.repository, targetKey: origin.identity.targetKey, pullRequestNumber: origin.identity.pullRequestNumber, baseSha: base, headSha: run.headSha, origin: { requestId: origin.identity.requestId, receiptId: origin.id, digest: oracleDigest(origin) }, authoritySha256, sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256, packetSha256, blockingFindingIds: packet.blockingFindingIds, repairOrdinal: run.history.filter(h => h.type === 'start_fix').length + 1, repairLimit: c.maxAttempts, bindingId: host.binding.bindingId, policyRevision: host.binding.policyRevision, requestedModel: host.binding.model, requestedEffort: 'High' };
         const evidence: NativeLeadEvidence = { id: `${requestId}.request`, kind: 'request', identity, packet };
@@ -731,6 +732,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
           await c.assertInitiation?.();
           await c.assertLiveClaim!();
           c.assertCurrent();
+          c.assertInitiationCurrent?.();
           const marked = { ...active!, submissionPossible: true };
           if (!save(update(marked)))
             return null;
@@ -740,6 +742,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
           await c.assertInitiation?.();
           await c.assertLiveClaim!();
           c.assertCurrent();
+          c.assertInitiationCurrent?.();
           if (c.store.updateIfUnchanged?.(run, run) !== true)
             return null;
           // Initiate synchronously inside the short serialized issue boundary;

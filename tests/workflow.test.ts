@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { installedFixture } from './production-host-fixture.js';
 import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -3555,5 +3556,12 @@ describe('runWorkflow', { concurrency: false }, () => {
 
     assert.equal(result.outcome, 'needs_human');
     assert.match(result.reason, /merge state is BLOCKED/);
+  });
+});
+
+
+describe('captured production normal effect fence',()=>{
+  for(const cut of ['initial-worker','resumed-worker','publication','validation'] as const)it(`removes initiation after awaited ${cut} preparation at the actual workflow callback`,async()=>{
+    const f=await installedFixture();try{const captured=f.resolve();const store=new MemoryStore();let run=createRun(TARGET,T0,`production-final-${cut}`);if(cut==='resumed-worker')run=applyTransition(run,{type:'start'},T0);if(cut==='validation'){run=applyTransition(run,{type:'start'},T0);run=applyTransition(run,{type:'agent_succeeded',agentResult:successResult(HEAD),headSha:HEAD,pullRequest:{number:7,headSha:HEAD}},T0);}store.create(run);let effects=0;const revoke=async()=>{await Promise.resolve();f.enable(false);};const implementation:ImplementationAgent={kind:'implementation-agent',async run(request){if(cut==='initial-worker'||cut==='resumed-worker'){await revoke();request.beforeExecution?.();effects++;}return successResult(HEAD);}};const bootstrap=new class extends FakeBootstrap{override async verifyDurable(request:VerifyDurableRequest){if(cut==='publication'){await revoke();request.beforePublish?.();effects++;}return{headSha:request.expectedHeadSha,branch:this.identity.branch};}}();const validation:ValidationAdapter={kind:'validation',configRevision:'test-config-v1',async validate(request){await revoke();request.beforeExecution?.();effects++;return validationPassed(request.headSha).local;}};const outcome=await runWorkflow({store,github:githubAdapter(cut==='publication'?[null,null,HEAD]:[HEAD]),implementation,reviewer:new FakeReviewer([]),...(cut==='publication'?{bootstrap}:{}),...(cut==='validation'?{validation,hostedCheckPolicy:TEST_HOSTED_POLICY}:{}),assertNormalInitiation:()=>captured.assertInitiation()},run.id,{maxReviewAttempts:1,now:()=>T0});assert.equal(effects,0);assert.equal(outcome.outcome,'needs_human');assert.throws(captured.assertInitiation,/latched/);}finally{f.cleanup();}
   });
 });

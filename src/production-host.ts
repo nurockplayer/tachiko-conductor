@@ -20,6 +20,7 @@ const COMMIT = /^[a-f0-9]{40}$/;
 const COMPONENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$/;
 const ENV_KEYS = new Set(['TACHIKO_IMPLEMENTATION_AGENT', 'TACHIKO_EXECUTION_PROFILE_CONFIG', 'TACHIKO_LOCAL_VALIDATION_CONFIG', 'TACHIKO_HOSTED_CHECK_POLICY_CONFIG', 'TACHIKO_LUNA_CODEX_HOME', 'TACHIKO_NODE_PROGRAM', 'TACHIKO_PNPM_PROGRAM', 'TACHIKO_GIT_PROGRAM', 'TACHIKO_PNPM_DEPENDENCY_ARTIFACT', 'TACHIKO_PLAYWRIGHT_BROWSERS_PATH']);
 export interface AcceptedProgram { readonly path: string; readonly sha256: string }
+export interface AcceptedTool extends AcceptedProgram { readonly runtimeDirectory: string; readonly manifest: Readonly<Record<string,string>>; readonly manifestDigest: string }
 /** Host acceptance evidence only. Builds never create this record. No credentials or executable configuration. */
 export interface AcceptedRelease {
   readonly schemaVersion: 1;
@@ -34,6 +35,8 @@ export interface AcceptedRelease {
   readonly node: AcceptedProgram;
   readonly git: AcceptedProgram;
   readonly gh: AcceptedProgram;
+  readonly codex: AcceptedTool;
+  readonly pnpm: AcceptedTool;
   readonly repository: { readonly owner: string; readonly repo: string; readonly objectRoot: string };
   readonly github: { readonly configDirectory: string; readonly actorId: string; readonly qualification: string; readonly observationQualification: string; readonly confinementQualification: string };
   readonly mergePolicy: NativeMergePolicy;
@@ -52,6 +55,9 @@ export interface ProductionHostSnapshot {
   readonly nativeMergeHost?: NativeMergeHost;
   readonly transport?: GhCliTransport;
   readonly gitRunner?: ProcessRunner;
+  readonly codexExecutable?: string;
+  readonly workerRunner?: ProcessRunner;
+  readonly workerTransportSourceOwned?: boolean;
   readonly historicalCompletionHosts: readonly NativeCompletionHosts[];
   readonly historicalVerification: Readonly<Record<'review' | 'lead', { readonly available: boolean; readonly reason: string }>>;
   readonly reviewer: { readonly available: false; readonly reason: string };
@@ -62,6 +68,7 @@ export interface ProductionHostSnapshot {
   readonly assertRecoveryScope: (owner: string, repo: string) => void;
 }
 const snapshots = new WeakSet<object>();
+const originalNodeRun=NodeProcessRunner.prototype.run;
 export function isProductionHostSnapshot(value: unknown): value is ProductionHostSnapshot { return typeof value === 'object' && value !== null && snapshots.has(value); }
 const digest = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 export function distributionManifestDigest(manifest: Readonly<Record<string, string>>): string {
@@ -81,14 +88,18 @@ export function acceptedReleaseId(record: AcceptedRelease): string {
 function assertClosedNodeResolution(root: string): void {
   // Node's ESM ancestor lookup and CommonJS global fallback must not supply
   // unmanifested code when an installed dependency is missing.
-  for (let ancestor=path.dirname(root);;ancestor=path.dirname(ancestor)) {
-    if (existsSync(path.join(ancestor,'node_modules'))) throw new Error('Node ancestor dependency fallback is outside the accepted distribution.');
-    if (path.dirname(ancestor)===ancestor) break;
-  }
+  assertNoAncestorDependencies(root);
   for (const global of (Module as unknown as {globalPaths: readonly string[]}).globalPaths) if (existsSync(global)) throw new Error('CommonJS global dependency fallback is outside the accepted distribution.');
   const required=createRequire(path.join(root,'package.json')).resolve('@modelcontextprotocol/sdk/client/index.js');
   if (!inside(path.join(root,'node_modules'),realpathSync(required))) throw new Error('Required runtime dependency resolves outside the accepted distribution.');
 }
+function assertNoAncestorDependencies(root: string): void {
+  for (let ancestor=path.dirname(root);;ancestor=path.dirname(ancestor)) {
+    if (existsSync(path.join(ancestor,'node_modules'))) throw new Error('Node ancestor dependency fallback is outside the accepted distribution.');
+    if (path.dirname(ancestor)===ancestor) break;
+  }
+}
+
 function exact(value: unknown, keys: string): asserts value is Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value) || Object.keys(value).sort().join(',') !== keys.split(',').sort().join(',')) throw new Error('Unsupported accepted-release record shape.');
 }
@@ -106,26 +117,45 @@ function program(home: string, p: AcceptedProgram): void {
   if (!SHA.test(p.sha256)) throw new Error('Invalid accepted program digest.');
   // Pinned programs may be OS-owned outside the conductor root; inspect every ancestor.
   if (!path.isAbsolute(p.path) || path.normalize(p.path) !== p.path || realpathSync(p.path) !== p.path) throw new Error('Accepted program must use its physical absolute path.');
+  if (inside(path.join(home,'.tachiko-conductor'),p.path)) { protectedPath(home,p.path,'file'); }
   let current = p.path;
   for (;;) {
     const s = lstatSync(current);
-    if (s.isSymbolicLink() || s.uid !== 0 && s.uid !== process.getuid?.() || (s.mode & 0o022) !== 0 || (s.mode & 0o7000) !== 0) throw new Error('Unsafe accepted program ancestry.');
+    if (inside(path.join(home,'.tachiko-conductor'),p.path)) break;
+    if (s.isSymbolicLink() || s.uid !== 0 && s.uid !== process.getuid?.() || (s.mode & 0o022) !== 0 || (s.mode & 0o7000) !== 0) throw new Error(`Unsafe accepted program ancestry: ${current}; uid=${s.uid}; mode=${(s.mode&0o7777).toString(8)}.`);
     if (current === p.path && (!s.isFile() || (s.mode & 0o111) === 0)) throw new Error('Accepted program is not executable.');
     const parent = path.dirname(current); if (parent === current) break; current = parent;
   }
+  if(!lstatSync(p.path).isFile()||(lstatSync(p.path).mode&0o111)===0)throw new Error('Accepted program is not executable.');
   if (digest(readFileSync(p.path)) !== p.sha256) throw new Error('Accepted program bytes changed.');
 }
-function manifestFiles(home: string, root: string, directory = root): Record<string, string> {
+function manifestFiles(home: string, root: string, directory = root, excludeRecord = true): Record<string, string> {
   protectedPath(home, directory, 'directory');
   const result: Record<string, string> = Object.create(null) as Record<string,string>;
   for (const name of readdirSync(directory).sort()) {
     const full = path.join(directory, name); const relative = path.relative(root, full).split(path.sep).join('/');
-    if (relative === 'accepted-release.json') continue;
+    if (excludeRecord && relative === 'accepted-release.json') continue;
     const s = lstatSync(full);
-    if (s.isDirectory()) Object.assign(result, manifestFiles(home, root, full));
+    if (s.isDirectory()) Object.assign(result, manifestFiles(home, root, full, excludeRecord));
     else { protectedPath(home, full, 'file'); result[relative] = digest(readFileSync(full)); }
   }
   return result;
+}
+function validateTool(home: string, tool: AcceptedTool, node: AcceptedProgram): void {
+  exact(tool,'path,sha256,runtimeDirectory,manifest,manifestDigest');
+  protectedPath(home,tool.runtimeDirectory,'directory');
+  if (!inside(tool.runtimeDirectory,tool.path) || tool.path===tool.runtimeDirectory) throw new Error('Accepted tool executable escapes its complete runtime directory.');
+  for(const surface of ['releases','production','repositories','workspaces','runs','dispatch','mission-admission']) {
+    const forbidden=path.join(home,'.tachiko-conductor',surface);
+    if(inside(forbidden,tool.runtimeDirectory)||inside(tool.runtimeDirectory,forbidden))throw new Error('Accepted tool runtime overlaps a mutable or authority surface.');
+  }
+  program(home,{path:tool.path,sha256:tool.sha256});
+  const bytes=readFileSync(tool.path);const magic=bytes.subarray(0,4).toString('hex');
+  const native=['7f454c46','cffaedfe','cefaedfe','feedfacf','feedface','cafebabe'].includes(magic);
+  if(!native&&!bytes.toString('utf8').startsWith(`#!${node.path} --no-global-search-paths\n`))throw new Error('Accepted tool must be a native program or a script with the exact pinned Node/no-global-search-paths interpreter.');
+  assertNoAncestorDependencies(tool.runtimeDirectory);
+  const files=manifestFiles(home,tool.runtimeDirectory,tool.runtimeDirectory,false);
+  if(distributionManifestDigest(files)!==tool.manifestDigest||distributionManifestDigest(tool.manifest)!==tool.manifestDigest)throw new Error('Accepted executable runtime/dependency closure changed.');
 }
 function installationInventory(home: string, root: string, r: AcceptedRelease): string {
   protectedPath(home,root,'directory'); protectedPath(home,r.repository.objectRoot,'directory'); protectedPath(home,r.github.configDirectory,'directory');
@@ -137,7 +167,8 @@ function installationInventory(home: string, root: string, r: AcceptedRelease): 
   };
   const walk=(directory:string)=>{inspect(directory,true);for(const name of readdirSync(directory).sort()){const file=path.join(directory,name);const s=inspect(file,true);if(s.isFile()&&s.nlink!==1n)throw new Error('Installed distribution has a hardlink alias.');if(s.isSymbolicLink()||!s.isFile()&&!s.isDirectory())throw new Error('Installed distribution filesystem type changed.');if(s.isDirectory())walk(file);}};
   walk(root);
-  for(const p of [r.node,r.git,r.gh]){inspect(p.path,true);for(let parent=path.dirname(p.path);;parent=path.dirname(parent)){inspect(parent,false);if(path.dirname(parent)===parent)break;}}
+  for(const tool of [r.codex,r.pnpm]) { protectedPath(home,tool.runtimeDirectory,'directory');walk(tool.runtimeDirectory);assertNoAncestorDependencies(tool.runtimeDirectory); }
+  for(const p of [r.node,r.git,r.gh,r.codex,r.pnpm]){inspect(p.path,true);for(let parent=path.dirname(p.path);;parent=path.dirname(parent)){inspect(parent,false);if(path.dirname(parent)===parent)break;}}
   inspect(r.repository.objectRoot,false);inspect(r.github.configDirectory,false);
   return digest(JSON.stringify(entries));
 }
@@ -148,7 +179,7 @@ function assertRuntime(record: AcceptedRelease, entry: string): void {
 function readProtected(home: string, file: string): string { protectedPath(home, file, 'file'); return readFileSync(file, 'utf8'); }
 function validateRelease(home: string, root: string, entry: string, raw: string): AcceptedRelease {
   const r = JSON.parse(raw) as AcceptedRelease;
-  exact(r, 'schemaVersion,releaseId,sourceCommit,sourceTree,stateCompatibility,runtimePolicyRevision,entry,manifest,manifestDigest,node,git,gh,repository,github,mergePolicy,environment');
+  exact(r, 'schemaVersion,releaseId,sourceCommit,sourceTree,stateCompatibility,runtimePolicyRevision,entry,manifest,manifestDigest,node,git,gh,codex,pnpm,repository,github,mergePolicy,environment');
   if (r.schemaVersion !== 1 || !COMPONENT.test(r.releaseId) || r.releaseId === '.' || r.releaseId === '..' || !COMMIT.test(r.sourceCommit) || !COMMIT.test(r.sourceTree) || r.stateCompatibility !== ACCEPTED_STATE_COMPATIBILITY || r.runtimePolicyRevision !== 'issue-104-production-v7' || r.entry !== PRODUCTION_ENTRY || root !== path.join(home, '.tachiko-conductor', 'releases', r.releaseId) || entry !== path.join(root, PRODUCTION_ENTRY)) throw new Error('Installation identity or state compatibility is unavailable.');
   exact(r.repository, 'owner,repo,objectRoot'); exact(r.github, 'configDirectory,actorId,qualification,observationQualification,confinementQualification');
   for (const v of Object.values(r.github)) nonempty(v);
@@ -157,9 +188,11 @@ function validateRelease(home: string, root: string, entry: string, raw: string)
   for (const location of [root, path.join(home, '.tachiko-conductor', 'production'), path.join(home, '.tachiko-conductor', 'runs'), path.join(home, '.tachiko-conductor', 'mission-admission'), path.join(home, '.tachiko-conductor', 'workspaces')]) {
     if (inside(location, r.repository.objectRoot) || inside(r.repository.objectRoot, location)) throw new Error('Accepted object root overlaps an authority or candidate mutation surface.');
   }
+  for(const location of [r.repository.objectRoot,...['releases','repositories','workspaces','runs','dispatch','mission-admission','tools'].map(name=>path.join(home,'.tachiko-conductor',name))]) { if(inside(location,r.github.configDirectory)||inside(r.github.configDirectory,location))throw new Error('Accepted GitHub namespace overlaps a candidate, immutable release or authority surface.'); }
   if (!r.environment || typeof r.environment !== 'object' || Array.isArray(r.environment) || Object.entries(r.environment).some(([k, v]) => !ENV_KEYS.has(k) || typeof v !== 'string' || v.includes('\0'))) throw new Error('Unsupported accepted environment field.');
-  if (r.environment.TACHIKO_NODE_PROGRAM !== r.node.path || r.environment.TACHIKO_GIT_PROGRAM !== r.git.path) throw new Error('Accepted runtime policy programs disagree.');
+  if (r.environment.TACHIKO_NODE_PROGRAM !== r.node.path || r.environment.TACHIKO_GIT_PROGRAM !== r.git.path || r.environment.TACHIKO_PNPM_PROGRAM !== r.pnpm.path) throw new Error('Accepted runtime policy programs disagree.');
   for (const p of [r.node, r.git, r.gh]) program(home, p);
+  for(const tool of [r.codex,r.pnpm]) validateTool(home,tool,r.node);
   assertRuntime(r,entry);
   if (!r.manifest || typeof r.manifest !== 'object' || Array.isArray(r.manifest) || Object.entries(r.manifest).some(([k,v]) => k === 'accepted-release.json' || k.startsWith('/') || k.split('/').some(p => !p || p === '.' || p === '..') || !SHA.test(v))) throw new Error('Invalid distribution manifest.');
   if (!r.manifest['package.json'] || !r.manifest[PRODUCTION_ENTRY] || !r.manifest['dist/production-host.js'] || !Object.keys(r.manifest).some(k => k.startsWith('node_modules/'))) throw new Error('Distribution/dependency closure is incomplete.');
@@ -216,12 +249,14 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
         reason = 'Accepted merge constructor configured; actual host/service qualification remains external.';
       }
     } catch (e) { reason = `Merge unavailable: ${e instanceof Error ? e.message : String(e)}`; }
-    const hostEnv: NodeJS.ProcessEnv = Object.freeze({ HOME: home, PATH: `${path.dirname(r.git.path)}:/usr/bin:/bin`, LANG:'C', LC_ALL:'C', GH_CONFIG_DIR:r.github.configDirectory, GH_HOST:'github.com', GH_PROMPT_DISABLED:'1', GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null', GIT_CONFIG_COUNT:'0', GIT_TERMINAL_PROMPT:'0', GIT_NO_REPLACE_OBJECTS:'1' });
+    const hostEnv: NodeJS.ProcessEnv = Object.freeze({ HOME: home, PATH: `${path.dirname(r.node.path)}:${path.dirname(r.git.path)}:/usr/bin:/bin`, LANG:'C', LC_ALL:'C', GH_CONFIG_DIR:r.github.configDirectory, GH_HOST:'github.com', GH_PROMPT_DISABLED:'1', GIT_CONFIG_NOSYSTEM:'1', GIT_CONFIG_GLOBAL:'/dev/null', GIT_CONFIG_COUNT:'0', GIT_TERMINAL_PROMPT:'0', GIT_NO_REPLACE_OBJECTS:'1' });
     const environment = Object.freeze({ ...hostEnv, ...r.environment, ...(dispatchRaw === undefined ? {} : { TACHIKO_DISPATCH_CONFIG: dispatchRaw }) });
     // Validate dispatch only on the ordinary CLI route. Malformed/absent current config must not suppress issued readback.
     const gitRunner: ProcessRunner = Object.freeze({ run: async (_file: string, args: readonly string[], options: ProcessRunOptions) => { assertInstallation(); return runner.run(r.git.path, ['-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','core.attributesFile=/dev/null','-c','core.useReplaceRefs=false',...args], { ...options, env:hostEnv, beforeSpawn: () => { assertInstallation(); options.beforeSpawn?.(); } }); } });
+    const sourceOwnedRunner=Object.getPrototypeOf(runner)===NodeProcessRunner.prototype&&!Object.hasOwn(runner,'run')&&NodeProcessRunner.prototype.run===originalNodeRun;
+    const workerRunner:ProcessRunner=Object.freeze({run:async(file:string,args:readonly string[],options:ProcessRunOptions)=>{assertInitiation();if(sourceOwnedRunner&&(Object.getPrototypeOf(runner)!==NodeProcessRunner.prototype||Object.hasOwn(runner,'run')||NodeProcessRunner.prototype.run!==originalNodeRun))throw new Error('Accepted worker process transport changed.');if(file!==r.codex.path)throw new Error('Worker executable differs from accepted Codex.');return runner.run(file,args,{...options,beforeSpawn:()=>{assertInitiation();options.beforeSpawn?.();}});}});
     const transport = new GhCliTransport({ runner, executable:r.gh.path, hostname:'github.com', acceptedActorId:r.github.actorId, cwd:r.repository.objectRoot, env:hostEnv, beforeSpawn:assertInstallation, beforeMerge:assertInitiation, repository:{owner:r.repository.owner,repo:r.repository.repo} });
-    const snapshot: ProductionHostSnapshot = Object.freeze({ installation:'accepted', reason, artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, releaseId:r.releaseId, manifestDigest:r.manifestDigest, repositoryRoot:r.repository.objectRoot, runsDirectory, initiationPolicy, environment, nativeMergeHost, transport, gitRunner, historicalCompletionHosts, historicalVerification,
+    const snapshot: ProductionHostSnapshot = Object.freeze({ installation:'accepted', reason, artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, releaseId:r.releaseId, manifestDigest:r.manifestDigest, repositoryRoot:r.repository.objectRoot, codexExecutable:r.codex.path, workerRunner, workerTransportSourceOwned:sourceOwnedRunner, runsDirectory, initiationPolicy, environment, nativeMergeHost, transport, gitRunner, historicalCompletionHosts, historicalVerification,
       reviewer:Object.freeze({available:false as const,reason:'Oracle service contract unavailable.'}), lead:Object.freeze({available:false as const,reason:'Sol service contract unavailable.'}), assertInstallation, assertInitiation, assertRunInitiation,
       assertRecoveryScope: (owner: string, repo: string) => { assertInstallation(); if (owner !== r.repository.owner || repo !== r.repository.repo) throw new Error('Issued recovery scope differs from the compatible accepted installation.'); },
     }); snapshots.add(snapshot); return snapshot;

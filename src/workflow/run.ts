@@ -124,6 +124,7 @@ function lunaPacketInput(
 }
 
 export interface WorkflowDependencies {
+  readonly assertNormalInitiation?: (run:Run)=>void;
   readonly nativeMergeHost?: NativeMergeHost;
   readonly nativeLead?: NativeLeadBoundary;
   readonly store: RunStore;
@@ -143,6 +144,7 @@ export interface WorkflowDependencies {
 }
 
 export interface WorkflowOptions {
+  readonly assertNormalInitiation?: (run:Run)=>void;
   readonly admittedRun?: Run;
   /** Bounded review attempts before the loop escalates to NEEDS_HUMAN. */
   readonly maxReviewAttempts: number;
@@ -288,6 +290,7 @@ function assertFinalExecutionAdmission(
   try {
     assertCurrentMutationAdmission(options);
     if (checkPublication) assertPublicationAdmission(options);
+    options.assertNormalInitiation?.(expected);
   } catch (cause) {
     if (isExecutionAdmissionRefusal(cause)) throw cause;
     throw new ExecutionAdmissionRefusal('The final host boundary could not confirm current mission admission.', false, { cause });
@@ -518,7 +521,7 @@ async function validateExactHead(
   if (local === undefined) {
     onExecutionStart?.();
     beforeValidation?.();
-    local = await validation!.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+    local = await validation!.validate({ target, headSha: run.headSha, beforeExecution:beforeValidation, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
   }
   return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
 }
@@ -593,6 +596,9 @@ export async function runWorkflow(
   runId: string,
   options: WorkflowOptions,
 ): Promise<WorkflowOutcome> {
+  options={...options,assertNormalInitiation:deps.assertNormalInitiation??options.assertNormalInitiation};
+  const initiate=options.assertLeadInitiation;
+  if(initiate&&options.assertNormalInitiation)options={...options,assertLeadInitiation:async(run)=>{await initiate(run);options.assertNormalInitiation?.(run);}};
   const { store, github, implementation, reviewer } = deps;
   const now = options.now ?? (() => new Date().toISOString());
 
@@ -636,7 +642,7 @@ export async function runWorkflow(
     const snapshot=await github.readLiveSnapshot(target);
     const context={run,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(store.read(run.id)??run),
       ...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}}),
-      withIssueBoundary:options.withMergeBoundary,assertInitiation:options.assertLeadInitiation===undefined?undefined:()=>options.assertLeadInitiation!(store.read(run.id)??run),recoveryConfiguration:options.leadRecoveryConfiguration,
+      withIssueBoundary:options.withMergeBoundary,assertInitiationCurrent:()=>options.assertNormalInitiation?.(store.read(run.id)??run),assertInitiation:options.assertLeadInitiation===undefined?undefined:()=>options.assertLeadInitiation!(store.read(run.id)??run),recoveryConfiguration:options.leadRecoveryConfiguration,
       onSubmission:(current:Run)=>{
         options.onExecutionStart?.();
         if(!unresolvedNativeLead(current))return recordSpawnTelemetry(current,{role:'reviewer',attemptKind:'review',headSha:current.headSha,contextMode:'bounded',contextJustification:'live-target-bounded'},now()).run;
@@ -1164,6 +1170,7 @@ export async function runWorkflow(
               [GOVERNED_PUBLICATION_REENTRY_ACTION, CANCEL_RUN_DECISION],
             );
           }
+          options.assertNormalInitiation?.(workerHandoff);
           result = await (qualifiedGovernedAgent !== undefined
             ? qualifiedGovernedAgent.run(implementationRequest)
             : implementation.run(implementationRequest));
@@ -1313,6 +1320,7 @@ export async function runWorkflow(
               options.onExecutionStart?.();
               if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before implementation publication; preserving the newer Run.');
               assertPublicationAdmission(options);
+              options.assertNormalInitiation?.(run);
               await deps.github.createImplementationPullRequest({
                 target,
                 headBranch: bootstrap.branch,
@@ -1634,7 +1642,7 @@ export async function runWorkflow(
             github,
             implementation,
             reviewer,
-            nativeLead: deps.nativeLead, withNativeEffectBoundary:options.withNativeEffectBoundary, withLeadBoundary: options.withMergeBoundary, assertLeadInitiation: options.assertLeadInitiation === undefined ? undefined : () => options.assertLeadInitiation!(run), leadObservationOnly: options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration,
+            assertNormalInitiation:deps.assertNormalInitiation, nativeLead: deps.nativeLead, withNativeEffectBoundary:options.withNativeEffectBoundary, withLeadBoundary: options.withMergeBoundary, assertLeadInitiation: options.assertLeadInitiation === undefined ? undefined : () => options.assertLeadInitiation!(run), leadObservationOnly: options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration,
             assertReviewClaim: options.assertReviewClaim,
             ...(options.admissionFence === undefined ? {} : { reviewOwner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
             bootstrap: deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap,

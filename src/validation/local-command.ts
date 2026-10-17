@@ -1014,6 +1014,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         root.split('/').some((part) => part === '' || part === '.' || part === '..') || root.split('/').at(-1) !== 'node_modules')) {
       return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
     }
+    request.beforeExecution?.();
     const evidence: LocalValidationCommandEvidence[] = [];
     const configuredWorkspace = this.configuration.workspacePath;
     const workspacePath = request.workspacePath ?? configuredWorkspace;
@@ -1029,6 +1030,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     const cleanPrivateTrees: PrivateTreeCleaner = (paths) => cleanPrivateTreesWithSettlement(paths, settlement, this.cleanPrivateTrees);
     const gitEnvironment = validatorGitEnvironment();
     const admittedIgnoredManifest = await workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment, settlement);
+    request.beforeExecution?.();
     if (admittedIgnoredManifest === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     // A configured baseline is host-owned and already proved byte-identical
     // for every ignored dependency.  It is therefore the only place those
@@ -1043,6 +1045,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     }
     let runtimeRoot: string | undefined;
     try {
+      request.beforeExecution?.();
       if (!validHostBrowserArtifacts(this.configuration.playwrightBrowsersPath)) {
         return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       }
@@ -1064,6 +1067,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // pnpm writes project metadata even during offline hydration. Give each
       // command sequence a private copy, preserving the host artifact's bytes.
       const privateStore = dependencyStore === null ? undefined : path.join(runtimeRoot, 'store');
+      request.beforeExecution?.();
       if (dependencyStore !== null && privateStore !== undefined) {
         if (!(await (this.copyStore === copyDependencyStore
           ? copyDependencyStoreWithSettlement(dependencyStore, privateStore, {}, settlement)
@@ -1078,6 +1082,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       if (this.configuration.pnpmProgram !== undefined && configured.some((command) => !isCommand(command) || command.argv[0] !== this.configuration.pnpmProgram)) {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0)] };
       }
+      request.beforeExecution?.();
       if (this.configuration.pnpmProgram !== undefined && !hasPinnedPnpmAuthority(commandWorkspace.path, this.configuration.pnpmProgram, environment)) {
         return { status: 'unknown', configRevision: revision, commands: [malformed(0, this.configuration.pnpmProgram)] };
       }
@@ -1101,6 +1106,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
           evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
           return { status: 'unknown', configRevision: revision, commands: evidence };
         }
+        request.beforeExecution?.();
         const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile, settlement);
         evidence.push(result);
         if (result.outcome === 'failed' || result.outcome === 'timed_out') {

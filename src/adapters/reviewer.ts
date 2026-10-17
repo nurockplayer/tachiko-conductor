@@ -13,6 +13,8 @@ export interface NativeReviewContext {
   readonly cachedOnly?: boolean;
   readonly withIssueBoundary?: <T>(operation: () => Promise<T>) => Promise<T>;
   readonly assertInitiation?: () => Promise<void>;
+  /** Synchronous captured production fence after the last awaited issue authority read. */
+  readonly assertInitiationCurrent?: ()=>void;
 }
 
 export interface NativeReviewBoundary {

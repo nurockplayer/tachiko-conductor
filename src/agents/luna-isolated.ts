@@ -6,18 +6,20 @@ import { assertExecutionSupportedByProvider } from '../execution-profiles.js';
 import type { AgentResult } from '../domain/types.js';
 import { CodexCliAdapter, hasOriginalCodexCliRun } from './codex-cli.js';
 import { hasPreparedStandaloneLunaInvocation } from '../workspace/standalone-git-bootstrap.js';
+import { isProductionHostSnapshot, type ProductionHostSnapshot } from '../production-host.js';
+import type { ProcessRunner } from '../github/transport.js';
 
 /** The sole production name for the #92-qualified subscription transport. */
 export const LUNA_ISOLATED_PROVIDER = 'luna-isolated';
 export const LUNA_ISOLATED_MODEL = 'gpt-5.6-luna';
 export const LUNA_TRUSTED_RUNTIME_REVISION = 'luna-qualified-runtime-v1';
 
-const qualifiedRuntimes = new WeakMap<object, { readonly run: Function; readonly prepare?: Function }>();
+const qualifiedRuntimes = new WeakMap<object, { readonly run: Function; readonly prepare?: Function; readonly runner?: unknown; readonly executable?: unknown }>();
 
 /** Read-only source-owned qualification; concrete methods are checked again to reject post-construction replacement. */
 export function hasGovernedPublicationConfinement(adapter: object): boolean {
   const qualification = qualifiedRuntimes.get(adapter);
-  if (qualification === undefined) return false;
+  if (qualification === undefined || Object.getOwnPropertyDescriptor(adapter,'runner')?.value!==qualification.runner || Object.getOwnPropertyDescriptor(adapter,'executable')?.value!==qualification.executable) return false;
   if (adapter instanceof IsolatedLunaAdapter) {
     return Object.getPrototypeOf(adapter) === IsolatedLunaAdapter.prototype &&
       qualification.run === ORIGINAL_LUNA_RUN && hasOriginalDataMethod(adapter, 'run', qualification.run) &&
@@ -38,6 +40,9 @@ export interface IsolatedLunaAdapterOptions {
   readonly codexHome: string;
   readonly timeoutMs: number;
   readonly path?: string;
+  readonly executable?: string;
+  readonly runner?: ProcessRunner;
+  readonly production?: ProductionHostSnapshot;
 }
 
 /**
@@ -51,6 +56,8 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
   private readonly timeoutMs: number;
   private readonly executablePath: string | undefined;
   private readonly runtimeConfig: readonly string[];
+  private readonly executable: string | undefined;
+  private readonly runner: ProcessRunner | undefined;
 
   constructor(options: IsolatedLunaAdapterOptions) {
     if (!path.isAbsolute(options.codexHome) || !existsSync(options.codexHome)) throw new Error('Qualified Luna CODEX_HOME must be an existing absolute directory.');
@@ -60,10 +67,13 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     if (!existsSync(configPath)) throw new Error('Qualified Luna CODEX_HOME is missing its trusted config.toml.');
     this.runtimeConfig = parseTrustedLunaConfig(readFileSync(configPath, 'utf8'));
     this.timeoutMs = options.timeoutMs;
-    this.executablePath = options.path;
-    if (new.target === IsolatedLunaAdapter && hasOriginalDataMethod(this, 'run', ORIGINAL_LUNA_RUN) &&
+    if(options.production!==undefined&&!isProductionHostSnapshot(options.production))throw new Error('Unvalidated production Luna composition.');
+    this.executablePath = options.production?.environment.PATH??options.path;
+    this.executable = options.production?.codexExecutable??options.executable;
+    this.runner = options.production?.workerRunner??options.runner;
+    if ((options.production===undefined?options.runner===undefined:options.production.workerTransportSourceOwned===true) && new.target === IsolatedLunaAdapter && hasOriginalDataMethod(this, 'run', ORIGINAL_LUNA_RUN) &&
         hasOriginalDataMethod(this, 'prepareGovernedInvocation', ORIGINAL_LUNA_PREPARE)) {
-      qualifiedRuntimes.set(this, { run: ORIGINAL_LUNA_RUN, prepare: ORIGINAL_LUNA_PREPARE });
+      qualifiedRuntimes.set(this, { run: ORIGINAL_LUNA_RUN, prepare: ORIGINAL_LUNA_PREPARE, runner:this.runner, executable:this.executable });
     }
   }
 
@@ -89,6 +99,7 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
       cwd: request.workspacePath, model: LUNA_ISOLATED_MODEL,
       reasoningEffort: request.execution.reasoningEffort, sandboxMode: 'workspace-write', approvalPolicy: 'never',
       timeoutMs: this.timeoutMs, env, requiredConfig: this.runtimeConfig,
+      executable: this.executable, runner: this.runner,
     });
     const nestedRun = getDataMethod(CodexCliAdapter.prototype, 'run');
     if (nestedRun === undefined || !hasOriginalCodexCliRun(isolatedCli)) {
@@ -97,7 +108,7 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
         request);
     }
     if (hasPreparedStandaloneLunaInvocation(request)) {
-      qualifiedRuntimes.set(isolatedCli, { run: nestedRun });
+      qualifiedRuntimes.set(isolatedCli, { run: nestedRun, runner:Object.getOwnPropertyDescriptor(isolatedCli,'runner')?.value,executable:Object.getOwnPropertyDescriptor(isolatedCli,'executable')?.value });
     }
     if (!hasOriginalCodexCliRun(isolatedCli)) {
       return failure(GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED,

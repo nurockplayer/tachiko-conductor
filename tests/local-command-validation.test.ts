@@ -1353,3 +1353,8 @@ exec ${JSON.stringify(realGit)} "$@"
     assert.equal(missingExecutable.commands[0]?.exitCode, null);
   });
 });
+
+
+it('cleans the reconstructed validation tree when current authority is revoked before materialization',async()=>{
+  const owned=request();const proof=mkdtempSync(path.join(os.tmpdir(),'tachiko-validation-revoked-proof-'));dirs.push(proof);const marker=path.join(proof,'candidate-executed');const cleaned:string[]=[];let fences=0;const adapter=new ConfiguredLocalValidationAdapter(configuration([process.execPath,'-e',`require('node:fs').writeFileSync(${JSON.stringify(marker)},'ran')`]),undefined,async paths=>{cleaned.push(...paths);return disposePrivateTrees(paths);});await assert.rejects(adapter.validate({...owned,beforeExecution(){fences++;if(fences===3)throw new Error('Controlled post-reconstruction authority revoked');}}),/Controlled post-reconstruction authority revoked/);assert.equal(fences,3);assert.ok(cleaned.some(root=>path.basename(root).startsWith('tachiko-validation-snapshot-')),'the reconstructed command tree reached cleanup despite revoked initiation');assert.ok(cleaned.every(root=>!existsSync(root)));assert.equal(existsSync(marker),false);
+});

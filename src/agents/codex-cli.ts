@@ -58,6 +58,8 @@ export const CODEX_ERROR_CODE = {
 export type CodexErrorCode = (typeof CODEX_ERROR_CODE)[keyof typeof CODEX_ERROR_CODE];
 
 export interface CodexCliAdapterOptions {
+  /** Explicit trusted executable; bare command remains the development default. */
+  readonly executable?: string;
   readonly runner?: ProcessRunner;
   readonly cwd?: string;
   readonly timeoutMs?: number;
@@ -101,6 +103,7 @@ export class CodexCliAdapter implements ImplementationAgent {
   private readonly capabilityCatalog: ModelCapabilityCatalog;
   private readonly env: NodeJS.ProcessEnv | undefined;
   private readonly requiredConfig: readonly string[];
+  private readonly executable: string;
 
   constructor(options: CodexCliAdapterOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
@@ -113,6 +116,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     this.capabilityCatalog = options.capabilityCatalog ?? codexFallbackCapabilityCatalog();
     this.env = options.env;
     this.requiredConfig = options.requiredConfig ?? [];
+    this.executable = options.executable ?? 'codex';
   }
 
   async run(request: ImplementationRequest): Promise<AgentResult> {
@@ -152,7 +156,7 @@ export class CodexCliAdapter implements ImplementationAgent {
     let result: ProcessResult;
     try {
       result = await this.runner.run(
-        'codex',
+        this.executable,
         this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort),
         {...this.processOptions(request.signal, cwd, request.beforeExecution), ...(request.withExecutionBoundary===undefined?{}:{withSpawnBoundary:request.withExecutionBoundary})},
       );

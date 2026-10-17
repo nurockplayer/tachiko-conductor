@@ -48,6 +48,8 @@ export interface HostedCheckPolicyConfiguration {
 
 /** Per-invocation context for local validation. */
 export interface ValidationRequest {
+  /** Removal-only host fence, checked again after awaits before tool effects. */
+  readonly beforeExecution?: ()=>void;
   /** Issue whose implementation is being validated. */
   readonly target: IssueTarget;
   /** Exact implementation HEAD that the caller observed before validation. */

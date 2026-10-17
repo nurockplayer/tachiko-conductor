@@ -61,6 +61,15 @@ and workers cannot promote their own manifests. Its closed schema contains:
   of `[path, sha256]` entries, using the exported `distributionManifestDigest`;
 - `node`, `git`, `gh`: each exactly `{ "path": "<physical absolute program>",
   "sha256": "<accepted program bytes>" }`;
+- `codex`, `pnpm`: each exactly `{ "path", "sha256", "runtimeDirectory", "manifest", "manifestDigest" }`.
+  The protected account-owned tool directory contains the entire executable/runtime dependency
+  closure, with every file hashed and no symlinks/hardlinks. It is disjoint from mutable
+  workspaces, repositories and authority/release stores. The selected executable is either
+  a native binary or a Node script whose exact shebang names the accepted Node plus
+  `--no-global-search-paths`; ambient env-node/shell wrappers are unsupported. Wrapper code,
+  loaded package files and interpreter identity are all pinned. Outside ancestor package
+  resolution is refused at acceptance and every current fence. pnpm's selected path must
+  equal `environment.TACHIKO_PNPM_PROGRAM`; a version probe alone grants no identity;
 - `repository`: exactly `{ "owner", "repo", "objectRoot" }`;
 - `github`: exactly `{ "configDirectory", "actorId", "qualification",
   "observationQualification", "confinementQualification" }`. `actorId` is the
@@ -72,6 +81,16 @@ and workers cannot promote their own manifests. Its closed schema contains:
   hosted-policy and pinned runtime/artifact/Luna-home values allowed by the resolver.
 
 Program/ancestry checks reject aliases, unsafe ownership/modes and changed bytes.
+Account-contained programs use the existing physical account-root guard, including its
+root-owned sticky ancestor rule; externally installed OS programs retain strict complete
+ancestry checks. A private tool copy is a distinct program identity, never an assertion
+that the already-running process used those bytes. The running Node path must match.
+The GitHub namespace must also be physically disjoint from candidate/workspace/object
+roots, immutable releases, tools and Run/admission/dispatch authority stores.
+The real Luna/Codex chain invokes the accepted Codex path explicitly. An injected test
+process runner cannot acquire source-owned governed-runtime qualification. Only the
+validated static composition with the original concrete process transport retains that
+eligibility, rechecked before creation; this is separate from actual host qualification.
 The runtime must be the accepted physical Node 24.21.0, with exactly the fixed `--no-global-search-paths` option and no
 loaders, preloads, NODE_PATH or dynamic linker injection. The package shebang,
 driver and held helper all select that option; a bare Node invocation cannot
@@ -168,3 +187,12 @@ the root of trust. An unrestricted malicious process with the host owner's write
 access can replace acceptance records or programs; in-process hashing cannot
 retroactively authenticate already executed malicious code. Activation remains
 blocked until the actual host boundary and service facts have attributable proof.
+
+Normal workflow effects carry the captured production Run fence through final review/lead
+preparation, marker and request cuts, worker/repair creation, validation probes/commands
+and governed publication. Synchronous issue checks run after the last awaited claim read.
+Current descriptor/installation drift only removes eligibility; observation callbacks do
+not inherit this initiation gate. Explicit `run transition <id> merged` authenticates all
+retained terminal review/lead/inactive proof records again before admission/owner writes,
+using original configured verifiers. Legacy structural readability and separately guarded
+stopped-owner attestation do not become authenticated completion or merge authority.

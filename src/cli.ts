@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { isProductionHostSnapshot, type ProductionHostSnapshot } from './production-host.js';
-import type { NativeCompletionHosts } from './oracle/completion-proof.js';
+import { authenticateNativeRun, hasAuthenticatedCompletion, type NativeCompletionHosts } from './oracle/completion-proof.js';
 import { ExecutionAdmissionRefusal } from './adapters/agent.js';
 import { oracleDigest } from './oracle/source-evidence.js';
 import { resolveNativeLead, unresolvedNativeLead, nativeLeadStopped, issuedLeadRecoveryConfiguration, emptyLeadLedger, type NativeLeadHost, type LeadOwnerSuccession } from './oracle/native-lead.js';
@@ -1206,7 +1206,11 @@ function assertIssuedMergeReadmissionReceipt(receiptPath: string, run: Run, lane
   if (receipt.settlementReason !== undefined || !(exactParked || completedParkPublication || interruptedReadmission || exactStoppedRelease)) throw new Error('Issued merge receipt phase/token/generation does not match its exact current predecessor lane.');
 }
 
+const recoveryAuthentication = new WeakMap<RunStore,(run:Run)=>void>();
+function assertRecoveryAuthentication(store:RunStore|undefined,run:Run):void { if(store)recoveryAuthentication.get(store)?.(run); }
+
 function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, receiptPath?: string, workspace?: string, store?: RunStore): { readonly token: AdmissionToken; readonly run: Run } {
+  assertRecoveryAuthentication(store,run);
   let succession: LeadOwnerSuccession | undefined;
   const leadRecovery = run.nativeLead !== undefined && run.nativeLead.requests.length > 0;
   const persist = (next: Run) => { if (!store || store.updateIfUnchanged?.(run,next) !== true) throw new Error('Lead owner succession Run CAS lost; no owner capability may be issued.'); run=next; };
@@ -1214,6 +1218,7 @@ function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, recei
   const evidence = evidenceForRun(run, workspace === undefined ? {} : { workspace });
   const result = registry.admit({ laneId, role: 'production_captain', evidence, highAutonomy: true }, {
     ...(receiptPath === undefined ? {} : { beforePublish: (candidate: Extract<AdmissionResult, { outcome: 'admitted' }>, previousLane?: Readonly<AdmissionLaneView> | null) => {
+      assertRecoveryAuthentication(store,run);
       if (run.mergeAttempt?.submissionPossible) assertIssuedMergeReadmissionReceipt(receiptPath, run, previousLane ?? null, candidate);
       if (leadRecovery) {
         const previous = previousLane;
@@ -1238,6 +1243,7 @@ function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, recei
           if (!existing) persist({...run,nativeLead:{...run.nativeLead!,ownerSuccessions:[...run.nativeLead!.ownerSuccessions,succession]}});
         }
       }
+      assertRecoveryAuthentication(store,run);
       writeRunOwnerReceipt(receiptPath, runReceiptFor(run, candidate.missionId, candidate.token, 'pre_execution', evidence.workspace));
     } }),
   });
@@ -1978,12 +1984,14 @@ export function buildWorkflowDeps(
         }),
         [LUNA_ISOLATED_PROVIDER]: (execution) => new IsolatedLunaAdapter({
           codexHome: requiredLunaHome(env), timeoutMs: execution?.timeoutMs ?? 10 * 60_000,
+          ...(production===undefined?{}:{production}),
         }),
       },
     }),
     reviewer: resolveNativeReviewer(nativeReviewerHost),
     nativeLead: resolveNativeLead(nativeLeadHost),
     nativeMergeHost: resolveNativeMergeHost(nativeMergeHost),
+    assertNormalInitiation:production?.assertRunInitiation,
     bootstrap: lazyBootstrap,
     bootstrapForExecution: (execution) => {
       if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;
@@ -2233,6 +2241,7 @@ export async function runMergedTransitionCommand(
   withDispatchAdmissionLock: <T>(operation: () => T | Promise<T>) => Promise<T>,
 ): Promise<Run> {
   const initial = store.read(id);
+  if(initial)assertRecoveryAuthentication(store,initial);
   if (initial === null) throw new Error(`No run with id "${id}" found.`);
   if (initial.state !== 'MERGE_READY' && initial.state !== 'MERGED' && !(initial.mergeAttempt?.submissionPossible && initial.state === 'WAITING_DEPENDENCY' && initial.interruptedFrom === 'MERGE_READY')) {
     throw new Error(`Run "${id}" is ${initial.state}; only MERGE_READY or an exact merged retry may be reconciled.`);
@@ -2299,6 +2308,7 @@ export async function runMergedTransitionCommand(
         throw new Error(`Run "${id}" changed after live merge proof and before locked reconciliation; refusing a stale transition.`);
       }
     }
+    assertRecoveryAuthentication(store,current);
     assertExactMergedPullRequest(current, proof);
     if (current.state !== 'MERGE_READY' && current.state !== 'MERGED') throw new Error(`Run "${id}" changed to ${current.state} during merge reconciliation.`);
 
@@ -2601,13 +2611,19 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
     if (issuedOnly) return { ...workflow,
       github: { kind:'github' as const, readIssue:workflow.github.readIssue.bind(workflow.github), readBranch:workflow.github.readBranch.bind(workflow.github), listPullRequests:workflow.github.listPullRequests.bind(workflow.github), readLiveSnapshot:workflow.github.readLiveSnapshot.bind(workflow.github), readPullRequest:workflow.github.readPullRequest?.bind(workflow.github), readDefaultBranch:workflow.github.readDefaultBranch?.bind(workflow.github), readCommit:workflow.github.readCommit?.bind(workflow.github), isAncestor:workflow.github.isAncestor?.bind(workflow.github) },
       implementation: { kind: 'implementation-agent' as const, async run() { throw new Error('Issued-only recovery cannot start a model.'); } },
-      bootstrap: undefined, bootstrapForExecution: undefined, validation: undefined, resolveRepairExecutionProfile: () => undefined,
+      assertNormalInitiation:undefined, bootstrap: undefined, bootstrapForExecution: undefined, validation: undefined, resolveRepairExecutionProfile: () => undefined,
     };
     return { ...workflow, ...(native.validation ? { validation:native.validation } : {}), ...(native.implementation ? { implementation:native.implementation } : {}) };
   };
   const historical = production?.historicalCompletionHosts ?? (native.historicalCompletionHosts === undefined ? [] : Array.isArray(native.historicalCompletionHosts) ? native.historicalCompletionHosts : [native.historicalCompletionHosts]);
   // Must precede every command's initial read/list, including model-free stopped recovery.
   const store = new JsonFileStore({ dir: resolveRunsDir(commandEnvironment), nativeCompletionHosts: [...historical, { review: native.nativeReviewerHost, lead: native.nativeLeadHost }] });
+  if(production)recoveryAuthentication.set(store,run=>{
+    authenticateNativeRun(run,historical,true);
+    for(const role of ['review','lead'] as const) for(const request of (role==='review'?run.nativeReview?.requests:run.nativeLead?.requests)??[]) {
+      if(request.terminalDigest!==undefined&&!hasAuthenticatedCompletion(request.identity,request.terminalDigest,request.completionProof,role))throw new Error('Historical completion authentication is required before recovery authority writes.');
+    }
+  });
   const [command, subcommand, ...rest] = argv;
 
   if (command === undefined || command === '--help' || command === '-h') {
@@ -2986,12 +3002,12 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(commandEnvironment), registry, runStore, update),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
               assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible && !recoveryDecision, nativeRecoveryDecisionOnly:recoveryDecision, leadRecoveryConfiguration,
-              assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);},
+              assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);production?.assertRunInitiation(run);},
               assertMergeInitiation: async (run) => {
                 if (readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
                 production?.assertRunInitiation(run);
                 if (!assertMergeInitiation) throw new Error('Merge dispatch authority unavailable.');
-                await assertMergeInitiation(run);
+                await assertMergeInitiation(run);production?.assertRunInitiation(run);
               },
             });
           },
@@ -3008,12 +3024,12 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
               ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
               assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible && !recoveryDecision, nativeRecoveryDecisionOnly:recoveryDecision, leadRecoveryConfiguration,
-              assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);},
+              assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);production?.assertRunInitiation(run);},
               assertMergeInitiation: async (run) => {
                 if (readOperationalRuntimeProjection(resolveRunsDir(commandEnvironment))?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
                 production?.assertRunInitiation(run);
                 if (!assertMergeInitiation) throw new Error('Merge dispatch authority unavailable.');
-                await assertMergeInitiation(run);
+                await assertMergeInitiation(run);production?.assertRunInitiation(run);
               },
             });
           },
