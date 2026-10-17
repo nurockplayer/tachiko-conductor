@@ -19,6 +19,7 @@ import selectors
 import shutil
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import tarfile
@@ -40,6 +41,65 @@ PUBLIC_LIMIT = 8 * 1024 * 1024
 SUMMARY_LIMIT = 16 * 1024
 CLT_ROOT = pathlib.Path('/Library/Developer/CommandLineTools')
 CLT_GIT = CLT_ROOT / 'usr/bin/git'
+DYLD_LIMIT = 4 * 1024 * 1024
+DYLD_CRASH_UUID = '7331d12c-0f65-3aae-808e-12f9ff0eca3a'
+
+
+def dyld_x86_uuid(data):
+    """Read only bounded Mach-O headers/load commands; never load or execute an image."""
+    if not 32 <= len(data) <= DYLD_LIMIT:
+        raise RuntimeError('dyld_image_size_unsupported')
+    start, size = 0, len(data)
+    fat = {b'\xca\xfe\xba\xbe': ('>', False), b'\xbe\xba\xfe\xca': ('<', False),
+           b'\xca\xfe\xba\xbf': ('>', True), b'\xbf\xba\xfe\xca': ('<', True)}
+    if data[:4] in fat:
+        endian, wide = fat[data[:4]]
+        count = struct.unpack_from(endian + 'I', data, 4)[0]
+        width = 32 if wide else 20
+        table_end = 8 + count * width
+        if not 1 <= count <= 16 or table_end > len(data):
+            raise RuntimeError('dyld_fat_table_unsupported')
+        slices, selected = [], []
+        for index in range(count):
+            fields = struct.unpack_from(endian + ('IIQQII' if wide else 'IIIII'), data, 8 + index * width)
+            cpu, _subtype, offset, length, align = fields[:5]
+            if (wide and fields[5] != 0) or align > 31 or offset < table_end or length < 32 \
+                    or offset + length > len(data) or offset % (1 << align):
+                raise RuntimeError('dyld_fat_slice_unsupported')
+            if any(offset < other + span and other < offset + length for other, span in slices):
+                raise RuntimeError('dyld_fat_slices_overlap')
+            slices.append((offset, length))
+            if cpu == 0x01000007:
+                selected.append((offset, length))
+        if len(selected) != 1:
+            raise RuntimeError('dyld_x86_slice_not_unique')
+        start, size = selected[0]
+    magics = {b'\xcf\xfa\xed\xfe': '<', b'\xfe\xed\xfa\xcf': '>'}
+    endian = magics.get(data[start:start + 4])
+    if endian is None:
+        raise RuntimeError('dyld_macho64_unsupported')
+    header = struct.unpack_from(endian + '8I', data, start)
+    cpu, commands, command_bytes = header[1], header[4], header[5]
+    if cpu != 0x01000007 or not 1 <= commands <= 256 or command_bytes > 1024 * 1024 \
+            or 32 + command_bytes > size:
+        raise RuntimeError('dyld_x86_commands_unsupported')
+    cursor, end = start + 32, start + 32 + command_bytes
+    uuids = []
+    for _index in range(commands):
+        if cursor + 8 > end:
+            raise RuntimeError('dyld_command_truncated')
+        command, length = struct.unpack_from(endian + 'II', data, cursor)
+        if length < 8 or length % 8 or cursor + length > end:
+            raise RuntimeError('dyld_command_size_unsupported')
+        if command == 0x1b:
+            if length != 24:
+                raise RuntimeError('dyld_uuid_command_unsupported')
+            value = data[cursor + 8:cursor + 24].hex()
+            uuids.append('-'.join([value[:8], value[8:12], value[12:16], value[16:20], value[20:]]))
+        cursor += length
+    if cursor != end or len(uuids) != 1:
+        raise RuntimeError('dyld_uuid_not_unique_or_command_size_mismatch')
+    return {'uuid': uuids[0], 'slice_offset': start, 'slice_bytes': size, 'cpu_type': cpu, 'ncmds': commands}
 
 
 def utc():
@@ -64,7 +124,7 @@ def write_summary(path, value):
         mode = value.get('mode', 'native_qualification')
         value = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                  'mode': mode, 'native_gates': 'UNKNOWN' if mode == 'native_qualification' else 'NOT_RUN',
-                 'selection': 'captured_crash_only' if mode == 'diagnostics_only' else None,
+                 'selection': 'dyld_image_only' if mode == 'diagnostics_only' else None,
                  'status': {'provider_preflight_only': 'PREFLIGHT_FAIL',
                             'diagnostics_only': 'DIAGNOSTIC_FAIL'}.get(mode, 'FAIL'),
                  'reason': 'summary_oversize', 'evidence_encrypted': False,
@@ -117,7 +177,7 @@ class Qualification:
         self.failure_status = 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL'
         self.success_status = 'DIAGNOSTIC_COMPLETE' if diagnostics_only else 'PREFLIGHT_PASS' if preflight_only else 'PASS'
         self.git_capability = None
-        self.diagnostics = {'selection': 'captured_crash_only', 'node': None, 'crash': None, 'complete': False} if diagnostics_only else None
+        self.diagnostics = {'selection': 'dyld_image_only', 'image': None, 'complete': False} if diagnostics_only else None
         self.diagnostic_files = []
         self.started = time.monotonic()
         self.runner_temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
@@ -129,7 +189,7 @@ class Qualification:
         self.public.mkdir(mode=0o700, exist_ok=False)
         write_summary(self.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE,
                       'base': BASE, 'mode': self.mode, 'native_gates': 'NOT_RUN',
-                      'selection': 'captured_crash_only' if diagnostics_only else None,
+                      'selection': 'dyld_image_only' if diagnostics_only else None,
                       'status': self.failure_status, 'reason': 'collector_initializing',
                       'evidence_encrypted': False, 'production_qualification': False})
         self.logs = self.private / 'logs'
@@ -615,6 +675,59 @@ class Qualification:
         if not accepted:
             raise RuntimeError('git_required_syntax_local_object_failed')
 
+    def capture_dyld_image(self):
+        """Evidence copy only; the image never becomes a provider or executable."""
+        def snapshot():
+            physical = self.safe_system_file('/usr/lib/dyld')
+            initial = physical.stat()
+            def identity(info):
+                return {'physical_path': str(physical), 'uid': info.st_uid, 'gid': info.st_gid,
+                        'mode': stat.S_IMODE(info.st_mode), 'device': info.st_dev, 'inode': info.st_ino,
+                        'size': info.st_size, 'mtime_ns': info.st_mtime_ns, 'ctime_ns': info.st_ctime_ns}
+            before = identity(initial)
+            if not 32 <= initial.st_size <= DYLD_LIMIT:
+                raise RuntimeError('dyld_image_read_cap_or_size_unsupported')
+            descriptor = os.open(physical, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+            with os.fdopen(descriptor, 'rb') as stream:
+                opened = os.fstat(stream.fileno())
+                if not stat.S_ISREG(opened.st_mode) or identity(opened) != before:
+                    raise RuntimeError('dyld_image_open_identity_changed')
+                raw = stream.read(initial.st_size)
+                if len(raw) != initial.st_size or identity(os.fstat(stream.fileno())) != before:
+                    raise RuntimeError('dyld_image_read_identity_changed')
+            if self.safe_system_file('/usr/lib/dyld') != physical or identity(physical.stat()) != before:
+                raise RuntimeError('dyld_image_path_identity_changed')
+            before['sha256'] = hashlib.sha256(raw).hexdigest()
+            return raw, before
+
+        raw, before = snapshot()
+        macho = dyld_x86_uuid(raw)
+        matched = macho['uuid'] == DYLD_CRASH_UUID
+        self.diagnostics['image'] = {'bytes': len(raw), 'sha256': before['sha256'], 'uuid_match': matched}
+        if not matched:
+            raise RuntimeError('dyld_crash_uuid_mismatch_not_qualified')
+        physical = before['physical_path']
+        self.run('dyld-evidence-signature', ['/usr/bin/codesign', '--verify', '--strict', '-R=anchor apple', physical])
+        _record, output = self.run('dyld-evidence-identity', ['/usr/bin/codesign', '-dv', '--verbose=4', physical])
+        if sum(path.stat().st_size for path in output) > 64 * 1024:
+            raise RuntimeError('dyld_signature_metadata_oversize')
+        identifiers = re.findall(r'^Identifier=(.+)$', output[0].read_text() + '\n' + output[1].read_text(), re.M)
+        if len(identifiers) != 1 or re.fullmatch(r'[A-Za-z0-9._-]{1,256}', identifiers[0]) is None:
+            raise RuntimeError('dyld_signature_identifier_unknown')
+        after_raw, after = snapshot()
+        if before != after or raw != after_raw:
+            raise RuntimeError('dyld_image_changed_during_signature_binding')
+        proof = {'evidence_only': True, 'executable_provider': False, 'before': before, 'after': after,
+                 'macho': macho, 'expected_crash_uuid': DYLD_CRASH_UUID, 'uuid_match': True,
+                 'signature': {'anchor_apple_strict_verified': True, 'observed_identifier': identifiers[0],
+                               'verification_receipt': 'dyld-evidence-signature',
+                               'identity_receipt': 'dyld-evidence-identity'}}
+        # Nothing is retained as an image/proof until UUID/signature/stable bytes bind.
+        (self.private / 'dyld-image.bin').write_bytes(raw)
+        write_json(self.private / 'dyld-image.json', proof)
+        self.diagnostics['complete'] = True
+        write_json(self.private / 'diagnostics.json', self.diagnostics)
+
     def diagnose(self):
         # One captured adapter call, with no control, Python selection or retry.
         write_json(self.private / 'diagnostics.json', self.diagnostics)
@@ -856,10 +969,10 @@ class Qualification:
             self.git_capability_probe()
         if self.preflight_only:
             return
-        self.hydrate()
         if self.diagnostics_only:
-            self.diagnose()
+            self.capture_dyld_image()
             return
+        self.hydrate()
         # Expected discovery count is source-derived; no test selection or source rewriting.
         python_source = ast.parse((self.candidate / 'scripts/bootstrap-heartbeat/test_runner.py').read_text())
         methods = [node.name for node in ast.walk(python_source) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -936,7 +1049,7 @@ class Qualification:
         summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                    'provenance': self.provenance,
                    'mode': self.mode, 'native_gates': native_gates,
-                   'selection': 'captured_crash_only' if self.diagnostics_only else None,
+                   'selection': 'dyld_image_only' if self.diagnostics_only else None,
                    'diagnostics': self.diagnostics,
                    'status': self.success_status if passed else self.failure_status, 'source_unchanged': unchanged,
                    'python': public_python, 'node': public_node, 'versions': self.versions,
@@ -951,7 +1064,8 @@ class Qualification:
             allowed = ['logs', 'before-source.json', 'after-source.json', 'providers.json', 'resources.json',
                        'pnpm-tool.json', 'workflow-provenance.json', 'developer-tools-inventory.json', 'git-capability.json',
                        'result.json', 'cms-probe.txt', 'cms-probe.der', 'diagnostics.json', 'diagnostic-archive-error.txt',
-                       'qualification-error.txt', 'source-postflight-error.txt', 'collector-error.txt']
+                       'qualification-error.txt', 'source-postflight-error.txt', 'collector-error.txt',
+                       'dyld-image.bin', 'dyld-image.json']
             for name in allowed:
                 path = self.private / name
                 if path.exists():
@@ -1006,7 +1120,7 @@ def main():
                        'tree': TREE, 'base': BASE,
                        'mode': 'diagnostics_only' if diagnostics_only else 'provider_preflight_only' if preflight_only else 'native_qualification',
                        'native_gates': 'NOT_RUN' if preflight_only or diagnostics_only else 'UNKNOWN',
-                       'selection': 'captured_crash_only' if diagnostics_only else None,
+                       'selection': 'dyld_image_only' if diagnostics_only else None,
                        'status': 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL', 'reason': 'collector_failed',
                        'evidence_encrypted': False, 'production_qualification': False})
         print('Diagnostic collector failed; native gates NOT_RUN.' if diagnostics_only else
