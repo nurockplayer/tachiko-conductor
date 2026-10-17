@@ -14,6 +14,7 @@ import {
 
 const root = fileURLToPath(new URL('..', import.meta.url));
 const fixturePreload = new URL('./fixtures/account-home-preload.mjs', import.meta.url).href;
+const isolatedLockPreload = new URL('./fixtures/isolated-lock-preload.mjs', import.meta.url).href;
 const isolatedFixturePreload = new URL('./fixtures/account-home-preload.mjs?isolated=kernel-ids-v1', import.meta.url).href;
 
 describe('test tier runner', () => {
@@ -32,10 +33,10 @@ describe('test tier runner', () => {
     assert.deepEqual(environmentForTier('unit', { PATH: '/bin' }), { PATH: '/bin' });
   });
 
-  it('replaces inherited Node options with the sole fixed account fixture only for isolated tests', () => {
+  it('replaces inherited Node options with the sole fixed account and lock fixture only for isolated tests', () => {
     const inherited = { PATH: '/bin', HOME: '/fixture', NODE_OPTIONS: '--import=/untrusted-preload.mjs --inspect' };
     assert.deepEqual(environmentForTier('isolated', inherited), {
-      ...inherited, NODE_OPTIONS: `--import=${isolatedFixturePreload}`,
+      ...inherited, NODE_OPTIONS: `--import=${isolatedLockPreload}`,
     });
     assert.equal(inherited.NODE_OPTIONS, '--import=/untrusted-preload.mjs --inspect');
     for (const tier of ['unit', 'integration', 'smoke:claude', 'smoke:codex', 'smoke:worker-router', 'smoke:browser-agent']) {
@@ -90,6 +91,127 @@ it('keeps the initial fixture account across worker and fresh child HOME mutatio
       assert.equal(result.error, undefined);
       assert.equal(result.status, 0, result.stderr + result.stdout);
       assert.equal(readFileSync(completion, 'utf8'), 'FIXTURE_WORKER_OK');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('keeps the exact lock delegate synchronous and guarded in tsx workers and fresh children', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-tier-lock-'));
+    const home = path.join(directory, 'home');
+    mkdirSync(home, { mode: 0o700 });
+    const target = new URL('../src/dispatch/invocation-lock.ts', import.meta.url).href;
+    const alias = new URL('../src/dispatch/invocation-lock.js', import.meta.url).href;
+    const bystander = new URL('../src/account-home.ts', import.meta.url).href;
+    // Real built output is verified separately after building in an owned
+    // scratch context; this pre-build worker requires source only.
+    const proof = `
+const assert = (await import('node:assert/strict')).default;
+const fs = await import('node:fs');
+const { createHash } = await import('node:crypto');
+const target = ${JSON.stringify(target)};
+await assert.rejects(import(target + '?tachiko-test-lock-original=1'));
+await assert.rejects(import(${JSON.stringify(alias)} + '?tachiko-test-lock-original=1'));
+const lock = await import(target);
+const alias = await import(${JSON.stringify(alias)});
+assert.equal(alias.acquireDispatchInvocationLock, lock.acquireDispatchInvocationLock);
+assert.equal(alias.DispatchInvocationLockedError, lock.DispatchInvocationLockedError);
+const bystander = await import(${JSON.stringify(bystander)});
+assert.equal(typeof bystander.resolveAccountHomeDirectory, 'function');
+assert.equal(bystander.acquireDispatchInvocationLock, undefined);
+const lockPath = ${JSON.stringify(path.join(directory, 'once.lock'))};
+const read = () => JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+const first = lock.acquireDispatchInvocationLock({ lockPath, nonce: () => 'simulated-owner' });
+try {
+  assert.equal(typeof first.release, 'function');
+  assert.equal(first.then, undefined, 'delegate must not return a Promise');
+  const record = read();
+  assert.equal(record.processStartId, 'simulated-start:' + process.pid);
+  assert.equal(record.hostId, createHash('sha256').update('tachiko isolated TEST host').digest('hex'));
+  // Deliberately different untrusted simulated values cannot establish PID reuse.
+  fs.writeFileSync(lockPath, JSON.stringify({ ...record, processStartId: 'simulated-start:different' }));
+  assert.throws(() => lock.acquireDispatchInvocationLock({ lockPath }), lock.DispatchInvocationLockedError);
+  assert.equal(read().nonce, record.nonce, 'real live PID remains fenced');
+  fs.writeFileSync(lockPath, JSON.stringify(record));
+} finally { first.release(); }
+const explicit = { hostId: 'a'.repeat(64), bootId: 'b'.repeat(64) };
+const calls = [];
+const supplied = lock.acquireDispatchInvocationLock({ lockPath,
+  hostBootIdentity: () => { calls.push('host'); return explicit; },
+  processStartIdentity: (pid) => { calls.push(pid); return 'explicit-start'; },
+});
+try { assert.equal(read().hostId, explicit.hostId); assert.equal(read().processStartId, 'explicit-start'); assert.deepEqual(calls, ['host', process.pid]); }
+finally { supplied.release(); }
+const sentinel = new Error('explicit identity failure');
+assert.throws(() => lock.acquireDispatchInvocationLock({ lockPath, hostBootIdentity: () => { throw sentinel; } }), (error) => error === sentinel);
+assert.throws(() => lock.acquireDispatchInvocationLock({ lockPath, processStartIdentity: () => null }), /valid owner incarnation/);
+// Null reaches the real native default. A supported host can succeed; a
+// restricted host must preserve its actual identity error rather than simulate.
+for (const key of ['hostBootIdentity', 'processStartIdentity']) {
+  let native;
+  try {
+    native = lock.acquireDispatchInvocationLock({ lockPath, [key]: null });
+    if (key === 'hostBootIdentity') assert.notEqual(read().hostId, createHash('sha256').update('tachiko isolated TEST host').digest('hex'));
+    else assert.doesNotMatch(read().processStartId, /^simulated-start:/);
+  } catch (error) {
+    assert.match(error.message, /Dispatch invocation lock (could not establish|requires a supported)/);
+  } finally { native?.release(); }
+}
+await assert.rejects(import(target + '?tachiko-test-lock-original=1'), /original-module bypass/);
+await assert.rejects(import(target + '?unrecognized=1'), /original-module bypass/);
+await assert.rejects(import(${JSON.stringify(alias)} + '?tachiko-test-lock-original=1'), /original-module bypass/);
+await assert.rejects(import(target + '#unrecognized'), /original-module bypass/);
+console.log('LOCK_DELEGATE_PROOF_OK');
+`;
+    try {
+      const worker = path.join(directory, 'lock.test.ts');
+      const completion = path.join(directory, 'complete');
+      writeFileSync(path.join(directory, 'package.json'), '{"type":"module"}\n');
+      writeFileSync(worker, `import { it } from 'node:test';import { writeFileSync } from 'node:fs';it('real tsx lock worker', async () => {${proof}\nwriteFileSync(${JSON.stringify(completion)}, 'ok');});`);
+      const environment = environmentForTier('isolated', { ...process.env, HOME: home });
+      delete environment.NODE_TEST_CONTEXT;
+      const invocation = tsxInvocation(root);
+      const workerResult = spawnSync(invocation.command, [...invocation.arguments, '--test', '--test-concurrency=1', worker], {
+        cwd: root, env: environment, encoding: 'utf8', timeout: 20_000,
+      });
+      assert.equal(workerResult.error, undefined);
+      assert.equal(workerResult.status, 0, workerResult.stdout + workerResult.stderr);
+      assert.equal(readFileSync(completion, 'utf8'), 'ok');
+      const child = spawnSync(process.execPath, ['--import', 'tsx', '--input-type=module', '-e', proof], {
+        cwd: root, env: environment, encoding: 'utf8', timeout: 15_000,
+      });
+      assert.equal(child.error, undefined);
+      assert.equal(child.status, 0, child.stdout + child.stderr);
+      assert.match(child.stdout, /LOCK_DELEGATE_PROOF_OK/);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('keeps unavailable native defaults fail-closed without the fixture and passes explicit null through it', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-tier-native-default-'));
+    const target = new URL('../src/dispatch/invocation-lock.ts', import.meta.url).href;
+    try {
+      for (const isolated of [false, true]) {
+        const source = `
+import assert from 'node:assert/strict';
+const { acquireDispatchInvocationLock } = await import(${JSON.stringify(target)});
+const originalPlatform = Object.getOwnPropertyDescriptor(process, 'platform');
+try {
+  // A child-local unsupported-platform control makes real defaults unavailable
+  // without replacing a builtin, process probe or production implementation.
+  Object.defineProperty(process, 'platform', { value: 'unsupported-test' });
+  assert.throws(() => acquireDispatchInvocationLock({ lockPath: ${JSON.stringify(path.join(directory, 'once.lock'))}, ${isolated ? 'hostBootIdentity: null,' : ''} }),
+    /requires a supported host identity source/);
+  console.log('REAL_DEFAULT_IDENTITY_REJECTED');
+} finally { Object.defineProperty(process, 'platform', originalPlatform); }
+`;
+        const environment = isolated
+          ? environmentForTier('isolated', { ...process.env, HOME: directory })
+          : { ...process.env, HOME: directory, NODE_OPTIONS: '' };
+        const result = spawnSync(process.execPath, [...(isolated ? [] : ['--import', isolatedFixturePreload]), '--import', 'tsx', '--input-type=module', '-e', source], {
+          cwd: root, env: environment, encoding: 'utf8', timeout: 10_000,
+        });
+        assert.equal(result.error, undefined);
+        assert.equal(result.status, 0, result.stderr);
+        assert.match(result.stdout, /REAL_DEFAULT_IDENTITY_REJECTED/);
+      }
     } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 

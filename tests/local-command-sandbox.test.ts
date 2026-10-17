@@ -8,6 +8,7 @@ import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
 import { ConfiguredLocalValidationAdapter, copyDependencyStore, disposePrivateTrees, hasSupportedProductionGitRuntime } from '../src/validation/local-command.js';
+import { acquireDispatchInvocationLock, DispatchInvocationLockedError } from '../src/dispatch/invocation-lock.js';
 import { TARGET } from './helpers.js';
 
 const dirs: string[] = [];
@@ -27,6 +28,37 @@ function request() {
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
 describe('ConfiguredLocalValidationAdapter sandbox boundary', () => {
+  it('keeps a live native macOS owner fenced when only the caller timezone changes', (t) => {
+    if (process.platform !== 'darwin') {
+      t.skip('native macOS ps timezone regression');
+      return;
+    }
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-native-tz-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const priorTimezone = process.env.TZ;
+    let first: ReturnType<typeof acquireDispatchInvocationLock> | undefined;
+    try {
+      process.env.TZ = 'Asia/Tokyo';
+      first = acquireDispatchInvocationLock({ lockPath, nonce: () => 'native-tokyo-owner' });
+      const originalOwner = readFileSync(lockPath, 'utf8');
+      assert.match((JSON.parse(originalOwner) as { processStartId: string }).processStartId, /^darwin-ps-start-utc:/,
+        'mandatory host coverage must use native ps identity, never the isolated simulation');
+      assert.doesNotMatch(process.env.NODE_OPTIONS ?? '', /isolated-lock-preload/);
+
+      process.env.TZ = 'UTC0';
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'native-utc-contender',
+      }), DispatchInvocationLockedError);
+      assert.equal(readFileSync(lockPath, 'utf8'), originalOwner,
+        'a TZ-only environment change cannot reclaim or replace the live canonical owner');
+    } finally {
+      if (priorTimezone === undefined) delete process.env.TZ;
+      else process.env.TZ = priorTimezone;
+      first?.release();
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
   it('rejects an installed Homebrew Git runtime before executing candidate validation', { skip: process.platform !== 'darwin' }, async (t) => {
     const git = '/opt/homebrew/bin/git';
     if (!existsSync(git)) { t.skip('Homebrew Git is not installed on this host'); return; }

@@ -294,34 +294,6 @@ describe('dispatch scheduler boundary', () => {
     }
   });
 
-  it('keeps a live native macOS owner fenced when only the caller timezone changes', (t) => {
-    if (process.platform !== 'darwin') {
-      t.skip('native macOS ps timezone regression');
-      return;
-    }
-    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-native-tz-'));
-    const lockPath = path.join(directory, 'once.lock');
-    const priorTimezone = process.env.TZ;
-    let first: ReturnType<typeof acquireDispatchInvocationLock> | undefined;
-    try {
-      process.env.TZ = 'Asia/Tokyo';
-      first = acquireDispatchInvocationLock({ lockPath, nonce: () => 'native-tokyo-owner' });
-      const originalOwner = readFileSync(lockPath, 'utf8');
-
-      process.env.TZ = 'UTC0';
-      assert.throws(() => acquireDispatchInvocationLock({
-        lockPath, nonce: () => 'native-utc-contender',
-      }), DispatchInvocationLockedError);
-      assert.equal(readFileSync(lockPath, 'utf8'), originalOwner,
-        'a TZ-only environment change cannot reclaim or replace the live canonical owner');
-    } finally {
-      if (priorTimezone === undefined) delete process.env.TZ;
-      else process.env.TZ = priorTimezone;
-      first?.release();
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
-
   it('traverses more than sixteen immutable dead claims to acquire a fresh takeover claim', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-deep-claims-'));
     const lockPath = path.join(directory, 'once.lock');

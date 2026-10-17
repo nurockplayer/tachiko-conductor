@@ -35,7 +35,7 @@ export function environmentForTier(tier, inherited = process.env) {
   if (tier === 'isolated') {
     // Test-owned account identity follows the private fixture HOME, including
     // fresh Node children. Replace inherited options with this sole fixed import.
-    return { ...inherited, NODE_OPTIONS: `--import=${new URL('../tests/fixtures/account-home-preload.mjs?isolated=kernel-ids-v1', import.meta.url).href}` };
+    return { ...inherited, NODE_OPTIONS: `--import=${new URL('../tests/fixtures/isolated-lock-preload.mjs', import.meta.url).href}` };
   }
   const smoke = smokeTiers.get(tier);
   return smoke === undefined ? inherited : { ...inherited, [smoke.environment]: '1' };

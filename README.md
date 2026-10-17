@@ -530,8 +530,8 @@ before merge. The sandbox test must run through pinned pnpm and fails if its rea
 start; it verifies private IPC plus denial of host files, host sockets, signals,
 and IP networking. The isolated tier never treats a denied network operation as
 a reason to skip additional tests; all other validator and timeout tests remain
-isolated. The isolated test runner selects the existing test-only account-home
-preload's explicit kernel-ID mode through one fixed `NODE_OPTIONS` import query,
+isolated. The isolated test runner selects one fixed test-owned preload through
+`NODE_OPTIONS`, including the existing account-home preload's explicit kernel-ID mode,
 replacing inherited Node options. This mode captures each process's absolute
 private fixture `HOME` and actual kernel UID/GID, requiring matching real and
 effective IDs; missing or inconsistent identity fails closed. Name and shell
@@ -540,7 +540,17 @@ converts lookup errors into success; it supports default/`utf8` options and
 rejects unsupported options. Per-case account mocks still override and restore
 it. Default preload imports retain original account lookup, arguments and error
 delegation. Full host, integration and smoke tiers retain their account behavior;
-production account-home resolution and credential-free environments are unchanged.
+production account-home resolution and credential-free environments are unchanged. The
+same isolated preload wraps only the exact source/built invocation-lock module
+exports and calls the real synchronous acquisition algorithm and real error class.
+Only undefined host/boot and process-start callbacks receive stable simulated test
+identity; explicit callbacks and null retain their real semantics. Simulated
+process-start labels are untrusted for PID reuse: real process liveness, lock
+filesystem barriers, CAS, stale claims and release remain unchanged. This tier
+qualifies simulated OS identity only. The existing native macOS ps/timezone
+regression remains mandatory in the full host sandbox test file, where its native
+identity scheme is asserted. Other tiers and production identity defaults are
+unchanged; private-original queries and unrecognized target aliases fail closed.
 
 Without explicit configuration, local validation is unknown and the run cannot
 advance to review. The configured runner refuses an ambient directory: it
