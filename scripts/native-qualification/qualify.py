@@ -60,8 +60,12 @@ def write_json(path, value):
 def write_summary(path, value):
     encoded = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
     if len(encoded) > SUMMARY_LIMIT:
+        preflight_only = value.get('mode') == 'provider_preflight_only'
         value = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
-                 'status': 'FAIL', 'reason': 'summary_oversize', 'evidence_encrypted': False,
+                 'mode': 'provider_preflight_only' if preflight_only else 'native_qualification',
+                 'native_gates': 'NOT_RUN' if preflight_only else 'UNKNOWN',
+                 'status': 'PREFLIGHT_FAIL' if preflight_only else 'FAIL',
+                 'reason': 'summary_oversize', 'evidence_encrypted': False,
                  'production_qualification': False}
         encoded = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
     pathlib.Path(path).write_bytes(encoded)
@@ -103,8 +107,13 @@ def parse_node(text):
 
 
 class Qualification:
-    def __init__(self):
+    def __init__(self, preflight_only=False):
         os.umask(0o077)
+        self.preflight_only = preflight_only
+        self.mode = 'provider_preflight_only' if preflight_only else 'native_qualification'
+        self.failure_status = 'PREFLIGHT_FAIL' if preflight_only else 'FAIL'
+        self.success_status = 'PREFLIGHT_PASS' if preflight_only else 'PASS'
+        self.git_capability = None
         self.started = time.monotonic()
         self.runner_temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
         self.workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
@@ -114,7 +123,8 @@ class Qualification:
         self.public = self.runner_temp / 'pr93-native-public'
         self.public.mkdir(mode=0o700, exist_ok=False)
         write_summary(self.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE,
-                      'base': BASE, 'status': 'FAIL', 'reason': 'collector_initializing',
+                      'base': BASE, 'mode': self.mode, 'native_gates': 'NOT_RUN',
+                      'status': self.failure_status, 'reason': 'collector_initializing',
                       'evidence_encrypted': False, 'production_qualification': False})
         self.logs = self.private / 'logs'
         self.logs.mkdir(mode=0o700)
@@ -588,6 +598,20 @@ class Qualification:
         self.providers()
         self.crypto_probe()
         self.before = self.source_manifest('before')
+        if self.preflight_only:
+            argv = [self.git, '--no-replace-objects', '--no-lazy-fetch', '-c', 'core.fsmonitor=false',
+                    '-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=',
+                    '-C', self.candidate, 'cat-file', '-e', 'HEAD^{commit}']
+            record, _output = self.run('git-required-syntax-local-object', argv, required=False)
+            accepted = record['exit_code'] == 0 and not record['timed_out'] and record['raw_capture_complete'] \
+                and record['observed_family_complete'] and record['original_group_absent']
+            self.git_capability = {'argv': [str(arg) for arg in argv], 'exit_code': record['exit_code'],
+                                   'version': self.versions['git'], 'sha256': digest(self.git),
+                                   'accepted': accepted}
+            write_json(self.private / 'git-capability.json', self.git_capability)
+            if not accepted:
+                raise RuntimeError('git_required_syntax_local_object_failed')
+            return
         self.hydrate()
         # Expected discovery count is source-derived; no test selection or source rewriting.
         python_source = ast.parse((self.candidate / 'scripts/bootstrap-heartbeat/test_runner.py').read_text())
@@ -631,9 +655,15 @@ class Qualification:
             (self.private / 'source-postflight-error.txt').write_text(source_error)
         complete = bool(self.records) and all(record['observed_family_complete'] and record['original_group_absent']
                        and record['raw_capture_complete'] and not record['timed_out'] for record in self.records)
-        passed = self.failure is None and unchanged and complete and self.python is not None \
+        native_passed = self.python is not None \
             and self.node_result is not None and self.python['accepted'] and self.node_result['accepted']
+        capability_passed = self.git_capability is not None and self.git_capability['accepted'] \
+            and self.python is None and self.node_result is None
+        passed = self.failure is None and unchanged and complete \
+            and (capability_passed if self.preflight_only else native_passed)
+        native_gates = 'NOT_RUN' if self.python is None and self.node_result is None else 'PASS' if native_passed else 'FAIL'
         private_result = {'candidate': CANDIDATE, 'tree': TREE, 'base': BASE, 'provenance': self.provenance,
+                          'mode': self.mode, 'native_gates': native_gates, 'git_capability': self.git_capability,
                           'failure': self.failure, 'source_unchanged': unchanged,
                           'python': self.python, 'node': self.node_result, 'commands': self.records,
                           'environment_keys': sorted(self.env), 'versions': self.versions, 'passed': passed}
@@ -650,7 +680,8 @@ class Qualification:
             public_node['unexpected_skip_count'] = sum(name not in allowed for name in self.node_result['skips'])
         summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                    'provenance': self.provenance,
-                   'status': 'PASS' if passed else 'FAIL', 'source_unchanged': unchanged,
+                   'mode': self.mode, 'native_gates': native_gates,
+                   'status': self.success_status if passed else self.failure_status, 'source_unchanged': unchanged,
                    'python': public_python, 'node': public_node, 'versions': self.versions,
                    'observed_owned_completion': complete, 'global_quiescence_claimed': False,
                    'raw_capture_complete': all(record['raw_capture_complete'] for record in self.records),
@@ -661,7 +692,7 @@ class Qualification:
         with tarfile.open(archive, 'w:gz') as tar:
             # Never archive caches, executable hydration, child homes or fixture trees.
             allowed = ['logs', 'before-source.json', 'after-source.json', 'providers.json', 'resources.json',
-                       'pnpm-tool.json', 'workflow-provenance.json', 'developer-tools-inventory.json',
+                       'pnpm-tool.json', 'workflow-provenance.json', 'developer-tools-inventory.json', 'git-capability.json',
                        'result.json', 'cms-probe.txt', 'cms-probe.der',
                        'qualification-error.txt', 'source-postflight-error.txt', 'collector-error.txt']
             for name in allowed:
@@ -686,17 +717,21 @@ class Qualification:
             if ciphertext.exists():
                 ciphertext.unlink()
         if not summary['evidence_encrypted']:
-            summary['status'] = 'FAIL'
+            summary['status'] = self.failure_status
         summary = write_summary(self.public / 'summary.json', summary)
         # This is the complete public output surface. No exception text, paths or process IDs.
         print(json.dumps(summary, sort_keys=True))
-        return 0 if summary['status'] == 'PASS' else 1
+        return 0 if summary['status'] == self.success_status else 1
 
 
 def main():
+    if sys.argv[1:] not in ([], ['--preflight-only']):
+        print('Qualification requires no arguments or exactly --preflight-only.')
+        return 1
+    preflight_only = sys.argv[1:] == ['--preflight-only']
     qualification = Qualification.__new__(Qualification)
     try:
-        qualification.__init__()
+        qualification.__init__(preflight_only=preflight_only)
         try:
             qualification.qualify()
         except BaseException:
@@ -708,9 +743,13 @@ def main():
         if hasattr(qualification, 'private') and hasattr(qualification, 'public') and qualification.public.is_dir():
             (qualification.private / 'collector-error.txt').write_text(traceback.format_exc())
             write_summary(qualification.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE,
-                       'tree': TREE, 'base': BASE, 'status': 'FAIL', 'reason': 'collector_failed',
+                       'tree': TREE, 'base': BASE,
+                       'mode': 'provider_preflight_only' if preflight_only else 'native_qualification',
+                       'native_gates': 'NOT_RUN' if preflight_only else 'UNKNOWN',
+                       'status': 'PREFLIGHT_FAIL' if preflight_only else 'FAIL', 'reason': 'collector_failed',
                        'evidence_encrypted': False, 'production_qualification': False})
-        print('Native qualification collector failed; gate remains FAIL.')
+        print('Provider preflight collector failed; native gates NOT_RUN.' if preflight_only
+              else 'Native qualification collector failed; gate remains FAIL.')
         return 1
 
 

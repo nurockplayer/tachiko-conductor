@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   qualify:
-    runs-on: macos-15-intel
+    runs-on: macos-26-intel
     timeout-minutes: 45
     steps:
       - name: Checkout qualification infrastructure
@@ -38,12 +38,12 @@ jobs:
         with:
           node-version: 24.19.0
 
-      - name: Run bounded qualification and encrypt private evidence
+      - name: Run provider preflight only and encrypt private evidence
         shell: bash
         run: |
           set -eu
           umask 077
-          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py
+          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py --preflight-only
 
       - name: Preserve ciphertext and sanitized summary
         if: always()
