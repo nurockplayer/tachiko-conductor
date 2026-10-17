@@ -863,7 +863,7 @@ function macosValidationSandboxProfile(
   const usesCltGit = gitExecPath === '/Library/Developer/CommandLineTools/usr/libexec/git-core';
   const appleGitLauncher = usesCltGit
     ? `(allow file-read-metadata (subpath "/Library/Developer/CommandLineTools"))
-(allow file-read* (literal "/Library/Developer/CommandLineTools") (literal "/Library/Developer/CommandLineTools/usr/bin/git") (literal "/Library/Developer/CommandLineTools/usr/lib/libxcrun.dylib") (literal "/private/var/db/xcode_select_link") (literal "/var/db/xcode_select_link"))`
+(allow file-read* (literal "/Library/Developer/CommandLineTools") (literal "/Library/Developer/CommandLineTools/usr/bin/git") (literal "/Library/Developer/CommandLineTools/usr/lib/libxcrun.dylib") (literal "/private/var/db/xcode_select_link") (literal "/var/db/xcode_select_link") (literal "/private/var/select/developer_dir") (literal "/var/select/developer_dir"))`
     : '';
   return `(version 1)
 (deny default)
