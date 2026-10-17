@@ -31,6 +31,28 @@ function runIn(state: WorkflowState, overrides: Partial<Run> = {}): Run {
 }
 
 describe('validation closure regressions', () => {
+  it('disambiguates typed command collisions while keeping typed and untyped refusal evidence conservative', () => {
+    const base = validationPassed(OLD_HEAD);
+    for (const kind of [undefined, 'process_family_settlement', 'command'] as const) {
+      const command = { ...(kind === undefined ? {} : { evidenceKind: kind }), commandIndex: 0,
+        executable: 'process-family-settlement', outcome: 'unavailable' as const, exitCode: null, durationMs: 0 };
+      const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [command] };
+      const result = { ...base, local, hosted: { ...base.hosted, status: 'failed' as const, overall: 'failing' as const },
+        status: kind === 'command' ? 'failed' : 'unknown' };
+      assert.equal(localValidationHasUnsettledProcessFamily(local), kind !== 'command');
+      assert.equal(isValidationResultCoherent(JSON.parse(JSON.stringify(result))), true);
+      assert.equal(isValidationResultCoherent({ ...result, status: kind === 'command' ? 'unknown' : 'failed' }), false);
+    }
+    const typed = { evidenceKind: 'process_family_settlement', commandIndex: 0, executable: 'process-family-settlement',
+      outcome: 'unavailable', exitCode: null, durationMs: 0 };
+    for (const change of [{ evidenceKind: 'invalid' }, { executable: 'node' }, { outcome: 'passed' }, { exitCode: 0 }, { durationMs: 1 }]) {
+      assert.equal(isValidationResultCoherent({ ...base, status: 'unknown', local: { ...base.local, status: 'unknown', commands: [{ ...typed, ...change }] } }), false);
+    }
+    assert.equal(isValidationResultCoherent({ ...base, status: 'unknown', local: { ...base.local, status: 'unknown', commands: [
+      typed, { commandIndex: 1, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+    ] } }), false, 'typed refusal cannot precede a later command');
+  });
+
   it('keeps explicit family-settlement uncertainty unknown ahead of hosted failure only', () => {
     for (const code of [0, 7]) {
       const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [

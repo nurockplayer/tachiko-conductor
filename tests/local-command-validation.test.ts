@@ -13,7 +13,7 @@ import { afterEach, describe, it } from 'node:test';
 import { ConfiguredLocalValidationAdapter, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
 import { FileToolOutputStore, InMemoryToolOutputStore, readToolOutput } from '../src/evidence/tool-output.js';
-import { isValidationResultCoherent } from '../src/domain/validation.js';
+import { isValidationResultCoherent, localValidationHasUnsettledProcessFamily } from '../src/domain/validation.js';
 import { TARGET, validationPassed } from './helpers.js';
 
 const dirs: string[] = [];
@@ -54,6 +54,21 @@ function pinnedPnpm(workspacePath: string, version: string, exitCode = 0): strin
 }
 
 describe('ConfiguredLocalValidationAdapter', () => {
+  it('keeps a configured executable collision ordinary after actual spawn unavailability', async () => {
+    const owned = request();
+    const result = await new ConfiguredLocalValidationAdapter(configuration(['process-family-settlement'])).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.commands.length, 1);
+    assert.equal(result.commands[0]?.evidenceKind, 'command');
+    assert.equal(result.commands[0]?.executable, 'process-family-settlement');
+    assert.equal(result.commands[0]?.outcome, 'unavailable');
+    assert.equal(localValidationHasUnsettledProcessFamily(result), false);
+    const base = validationPassed(owned.headSha);
+    assert.equal(isValidationResultCoherent({ ...base, status: 'unknown', local: result }), true);
+    assert.equal(isValidationResultCoherent({ ...base, status: 'failed', local: result,
+      hosted: { ...base.hosted, status: 'failed', overall: 'failing' } }), true, 'ordinary unknown keeps hosted failure precedence');
+  });
+
   it('runs configured absolute Node and repository-pinned absolute pnpm under the macOS seatbelt', { skip: process.platform !== 'darwin' || !existsSync(path.resolve('node_modules/.bin/pnpm')) }, async () => {
     const owned = request();
     const pnpm = path.resolve('node_modules/.bin/pnpm');
@@ -476,7 +491,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
           'forced-incomplete capture cannot become a complete artifact, including an unsupported private store');
         assert.equal(result!.commands[0]?.output, undefined);
         assert.ok(result!.commands[0]?.capturePreview?.stdout.preview.includes(marker));
-        assert.deepEqual(result!.commands[1], { commandIndex: 1, executable: 'process-family-settlement',
+        assert.deepEqual(result!.commands[1], { evidenceKind: 'process_family_settlement', commandIndex: 1, executable: 'process-family-settlement',
           outcome: 'unavailable', exitCode: null, durationMs: 0 }, 'the second record is a settlement sentinel, not another executed command');
         assert.equal(result!.commands.length, 2);
         assert.equal(commandSpawns, 1);
@@ -484,7 +499,8 @@ describe('ConfiguredLocalValidationAdapter', () => {
         assert.ok(result!.commands.every((command) => !Object.hasOwn(command, 'settlementIncomplete') && !Object.hasOwn(command, 'pendingCapture')));
         assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
         const ledger = { ...validationPassed(owned.headSha), status: 'unknown', local: result! };
-        assert.equal(isValidationResultCoherent(ledger), true, 'the existing schema accepts the HOLD ledger');
+        assert.equal(isValidationResultCoherent(ledger), true, 'the typed schema accepts the HOLD ledger');
+        assert.equal(localValidationHasUnsettledProcessFamily(JSON.parse(JSON.stringify(result))), true);
         assert.equal(isValidationResultCoherent({ ...ledger, status: 'passed' }), false, 'the same evidence cannot establish passed validation');
         const reusable = store.beginOperation({ kind: 'after-unproven-settlement' });
         reusable.abort();

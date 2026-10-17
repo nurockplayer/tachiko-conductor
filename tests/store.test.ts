@@ -7,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
-import { isKnownBoundedValidationPayloadCoherent, isValidationResultCoherent } from '../src/domain/validation.js';
+import { isKnownBoundedValidationPayloadCoherent, isValidationResultCoherent, localValidationHasUnsettledProcessFamily } from '../src/domain/validation.js';
 import { InMemoryToolOutputStore, TOOL_OUTPUT_POLICY_MAXIMA, boundToolOutput, isToolOutputEnvelope } from '../src/evidence/tool-output.js';
 import type { Run } from '../src/domain/types.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
@@ -78,6 +78,14 @@ function boundedValidationRun(id: string): Run {
   }, T0);
   return applyTransition(validating, { type: 'validation_passed', validationResult: validation,
     pullRequest: { number: 7, headSha } }, T0);
+}
+
+function settlementValidationRun(kind?: 'command' | 'process_family_settlement'): Run {
+  const base = boundedValidationRun('settlement-identity');
+  return { ...base, validationResult: { ...base.validationResult!, status: 'unknown', local: {
+    status: 'unknown', configRevision: 'test-config-v1', commands: [{ ...(kind === undefined ? {} : { evidenceKind: kind }),
+      commandIndex: 0, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 }],
+  } } };
 }
 
 function assertBoundedRunWriteRefused(validRun: Run, candidate: Run | (() => Run), expected: RegExp): void {
@@ -1353,6 +1361,72 @@ describe('JsonFileStore — persistence round-trips', () => {
     const raw = JSON.parse(readFileSync(path.join(dir, `${legacy.id}.json`), 'utf8'));
     assert.deepEqual(raw.futureUnknown, { metadata: { second: 2, first: 1 }, ordered: ['first', 'second'] });
     assert.equal(raw.createdAt, undefined, 'the writer does not introduce a full Run validation gate');
+  });
+
+  it('roundtrips explicit command kinds and conservative legacy refusal evidence without changing their authority', () => {
+    for (const kind of [undefined, 'process_family_settlement', 'command'] as const) {
+      const value = settlementValidationRun(kind);
+      const { store } = tempStore();
+      store.create(value);
+      const loaded = store.read(value.id)!;
+      assert.deepEqual(loaded.validationResult, JSON.parse(JSON.stringify(value.validationResult)));
+      assert.equal(isValidationResultCoherent(loaded.validationResult), true);
+      assert.equal(localValidationHasUnsettledProcessFamily(loaded.validationResult?.local), kind !== 'command');
+      store.update(loaded);
+      assert.equal(store.updateIfUnchanged(loaded, loaded), true);
+    }
+  });
+
+  it('pins typed and legacy refusal identity across ancestor serializers and rejects relevant accessors before publication', () => {
+    for (const kind of [undefined, 'process_family_settlement'] as const) {
+      const valid = settlementValidationRun(kind);
+      for (const attack of ['flip-kind', 'drop-tag', 'replace', 'move', 'mutate-original', 'flip-status'] as const) {
+        assertBoundedRunWriteRefused(valid, () => {
+          const candidate = structuredClone(valid);
+          const serialized = structuredClone(valid);
+          const command = serialized.validationResult!.local.commands[0]!;
+          if (attack === 'flip-kind' || attack === 'mutate-original') Object.assign(command, { evidenceKind: 'command' });
+          else if (attack === 'drop-tag') {
+            // Untyped legacy evidence cannot be removed; typed evidence cannot lose its tag.
+            if (kind === undefined) (serialized.validationResult!.local as { commands: unknown }).commands = [];
+            else delete (command as { evidenceKind?: unknown }).evidenceKind;
+          } else if (attack === 'replace') Object.assign(command, { executable: 'git' });
+          else if (attack === 'move') (serialized.validationResult!.local as { commands: unknown }).commands = [
+            { evidenceKind: 'command', commandIndex: 0, executable: 'node', outcome: 'passed', exitCode: 0, durationMs: 1 },
+            { ...command, commandIndex: 1 },
+          ];
+          else Object.assign(serialized.validationResult!, { status: 'passed' });
+          const ancestor = attack === 'drop-tag' ? candidate.validationResult!.local.commands
+            : attack === 'replace' ? candidate.validationResult
+              : attack === 'flip-kind' ? candidate.validationResult!.local.commands[0]
+                : attack === 'move' ? candidate.validationResult!.local : candidate;
+          const replacement = attack === 'drop-tag' ? serialized.validationResult!.local.commands
+            : attack === 'replace' ? serialized.validationResult
+              : attack === 'flip-kind' ? command
+                : attack === 'move' ? serialized.validationResult!.local : serialized;
+          Object.defineProperty(ancestor!, 'toJSON', { value() {
+            if (attack === 'mutate-original') Object.assign(candidate.validationResult!.local.commands[0]!, { evidenceKind: 'command' });
+            return replacement;
+          } });
+          return candidate;
+        }, /invalid bounded validation output payload/);
+      }
+    }
+    for (const field of ['validationResult', 'local', 'commands', 'index', 'evidenceKind', 'executable', 'outcome'] as const) {
+      let calls = 0;
+      const valid = settlementValidationRun('process_family_settlement');
+      assertBoundedRunWriteRefused(valid, () => {
+        const candidate = structuredClone(valid);
+        const target = field === 'validationResult' ? candidate : field === 'local' ? candidate.validationResult!
+          : field === 'commands' ? candidate.validationResult!.local
+            : field === 'index' ? candidate.validationResult!.local.commands : candidate.validationResult!.local.commands[0]!;
+        const key = field === 'index' ? '0' : field;
+        const value = Object.getOwnPropertyDescriptor(target, key)?.value;
+        Object.defineProperty(target, key, { enumerable: true, configurable: true, get() { calls += 1; return value; } });
+        return candidate;
+      }, /invalid bounded validation output payload/);
+      assert.equal(calls, 0, `${field} accessor was never evaluated`);
+    }
   });
 
   it('refuses incoherent capture markers in the exact serialized snapshot before any Run publication', () => {

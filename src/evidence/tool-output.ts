@@ -1254,7 +1254,7 @@ function readUtf8Range(bytes: Buffer, bufferOffset: number, offset: number, leng
 }
 
 export class InMemoryToolOutputStore implements ToolOutputStore {
-  private readonly values = new Map<string, { readonly stdout: Buffer; readonly stderr: Buffer }>();
+  private readonly values = new Map<string, { readonly stdout: Buffer; readonly stderr: Buffer; readonly reference: ToolOutputArtifactReference }>();
   private readonly maxArtifacts: number;
   private readonly captureMaxBytes: number;
   private readonly order: string[] = [];
@@ -1286,23 +1286,34 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
     const id = randomUUID();
     const retainedStdout = Buffer.from(stdout);
     const retainedStderr = Buffer.from(stderr);
-    this.values.set(id, { stdout: retainedStdout, stderr: retainedStderr });
+    const reference = Object.freeze(referenceBytes(id, retainedStdout, retainedStderr));
+    this.values.set(id, { stdout: retainedStdout, stderr: retainedStderr, reference });
     this.order.push(id);
     while (this.order.length > this.maxArtifacts) {
       const evicted = this.order.shift();
       if (evicted !== undefined) this.values.delete(evicted);
     }
-    return referenceBytes(id, retainedStdout, retainedStderr);
+    return { ...reference };
   }
 
   startCapture(policy: ToolOutputPolicy): ToolOutputCaptureWriter {
     return new BufferedToolOutputWriter(this, validateToolOutputPolicy(policy), (stdout, stderr) => this.saveRawCapture(stdout, stderr), this.captureMaxBytes);
   }
 
+  private assertAvailable(referenceValue: ToolOutputArtifactReference) {
+    if (!isToolOutputArtifact(referenceValue)) throw new Error('Tool-output artifact reference is invalid.');
+    const capture = this.values.get(referenceValue.id);
+    if (capture === undefined ||
+        ['kind', 'id', 'stdoutBytes', 'stderrBytes', 'totalBytes', 'sha256', 'fileIdentity', 'operationId', 'retainedUntil']
+          .some((key) => referenceValue[key as keyof ToolOutputArtifactReference] !== capture.reference[key as keyof ToolOutputArtifactReference])) {
+      throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable or its reference differs from committed metadata.`);
+    }
+    return capture;
+  }
+
   read(referenceValue: ToolOutputArtifactReference, request: ToolOutputReadRequest): ToolOutputReadResult {
     validateReadLength(request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
-    const capture = this.values.get(referenceValue.id);
-    if (capture === undefined) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable.`);
+    const capture = this.assertAvailable(referenceValue);
     const range = validateReadRequest(referenceValue, request, DEFAULT_TOOL_OUTPUT_POLICY.readBytes);
     const bytes = request.channel === 'stdout' ? capture.stdout : capture.stderr;
     const result = readUtf8Range(bytes, 0, range.offset, range.length, bytes.length);
@@ -1311,8 +1322,7 @@ export class InMemoryToolOutputStore implements ToolOutputStore {
 
   search(referenceValue: ToolOutputArtifactReference, request: ToolOutputSearchRequest): readonly ToolOutputMatch[] {
     validateSearchRequest(request);
-    const capture = this.values.get(referenceValue.id);
-    if (capture === undefined) throw new Error(`Tool-output artifact ${referenceValue.id} is unavailable.`);
+    const capture = this.assertAvailable(referenceValue);
     return searchRawCapture(capture, request);
   }
 }

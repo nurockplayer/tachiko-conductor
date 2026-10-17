@@ -149,6 +149,8 @@ export type ValidationStatus = 'passed' | 'failed' | 'waiting' | 'unknown';
 
 /** Compact, secret-free result for one explicitly configured local command. */
 export interface LocalValidationCommandEvidence {
+  /** New records distinguish configured commands from internal refusal evidence; absent legacy tags remain conservative. */
+  readonly evidenceKind?: 'command' | 'process_family_settlement';
   readonly commandIndex: number;
   readonly executable: string;
   readonly outcome: 'passed' | 'failed' | 'timed_out' | 'unavailable' | 'malformed';

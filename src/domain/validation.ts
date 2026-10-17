@@ -60,9 +60,11 @@ export function isKnownBoundedValidationPayloadCoherent(value: unknown): boolean
 /** Checks known capture markers after JSON serialization, without imposing the full Run schema. */
 export function isSerializedBoundedValidationPayloadCoherent(value: unknown, declarations: BoundedValidationDeclarations = []): boolean {
   const commands = ownDataValue(ownDataValue(value, 'local'), 'commands');
-  for (const { index, fields } of declarations) {
+  for (const { index, fields, evidenceKind, settlement } of declarations) {
     if (!Array.isArray(commands)) return false;
     const command = ownDataValue(commands, String(index));
+    if (evidenceKind !== undefined && ownDataValue(command, 'evidenceKind') !== evidenceKind) return false;
+    if (settlement !== undefined && settlementDeclaration(command) !== settlement) return false;
     for (let field = 0; field < BOUNDED_COMMAND_FIELDS.length; field += 1) {
       if ((fields & (1 << field)) !== 0 && ownDataValue(command, BOUNDED_COMMAND_FIELDS[field]!) === undefined) return false;
     }
@@ -70,8 +72,12 @@ export function isSerializedBoundedValidationPayloadCoherent(value: unknown, dec
   return boundedValidationPayloadCoherent(value, true);
 }
 
-const BOUNDED_COMMAND_FIELDS = ['output', 'capturePreview', 'captureStatus'] as const;
-export type BoundedValidationDeclarations = readonly { readonly index: number; readonly fields: number }[];
+const BOUNDED_COMMAND_FIELDS = ['output', 'capturePreview', 'captureStatus', 'evidenceKind'] as const;
+const COMMAND_IDENTITY_FIELDS = ['evidenceKind', 'commandIndex', 'executable', 'outcome', 'exitCode', 'durationMs'] as const;
+export type BoundedValidationDeclarations = readonly {
+  readonly index: number; readonly fields: number;
+  readonly evidenceKind?: 'command' | 'process_family_settlement'; readonly settlement?: string;
+}[];
 
 function ownDataValue(value: unknown, key: string): unknown {
   if (typeof value !== 'object' || value === null) return undefined;
@@ -82,7 +88,7 @@ function ownDataValue(value: unknown, key: string): unknown {
 /** Detached declaration bits survive serializers that mutate or replace their original objects. */
 export function snapshotBoundedValidationDeclarations(value: unknown): BoundedValidationDeclarations {
   const commands = ownDataValue(ownDataValue(value, 'local'), 'commands');
-  const declarations: Array<{ readonly index: number; readonly fields: number }> = [];
+  const declarations: Array<BoundedValidationDeclarations[number]> = [];
   if (Array.isArray(commands)) {
     for (let index = 0; index < commands.length; index += 1) {
       const command = ownDataValue(commands, String(index));
@@ -90,30 +96,79 @@ export function snapshotBoundedValidationDeclarations(value: unknown): BoundedVa
       for (let field = 0; field < BOUNDED_COMMAND_FIELDS.length; field += 1) {
         if (ownDataValue(command, BOUNDED_COMMAND_FIELDS[field]!) !== undefined) fields |= 1 << field;
       }
-      if (fields !== 0) declarations.push(Object.freeze({ index, fields }));
+      const evidenceKind = ownDataValue(command, 'evidenceKind') as 'command' | 'process_family_settlement' | undefined;
+      const settlement = settlementDeclaration(command);
+      if (fields !== 0 || settlement !== undefined) declarations.push(Object.freeze({ index, fields, evidenceKind, settlement }));
     }
   }
   return Object.freeze(declarations);
 }
 
+function hasSafeDataFields(value: object, keys: readonly string[], required = false): boolean {
+  return keys.every((key) => {
+    let current: object | null = value;
+    while (current !== null) {
+      const descriptor = Object.getOwnPropertyDescriptor(current, key);
+      if (descriptor !== undefined) return current === value && descriptor.enumerable === true && 'value' in descriptor;
+      current = Object.getPrototypeOf(current) as object | null;
+    }
+    return !required;
+  });
+}
+
+function isCommandKindCoherent(command: object): boolean {
+  if (!hasSafeDataFields(command, COMMAND_IDENTITY_FIELDS)) return false;
+  const kind = ownDataValue(command, 'evidenceKind');
+  if (kind !== undefined && kind !== 'command' && kind !== 'process_family_settlement') return false;
+  return kind !== 'process_family_settlement' ||
+    (ownDataValue(command, 'executable') === 'process-family-settlement' && ownDataValue(command, 'outcome') === 'unavailable' &&
+      ownDataValue(command, 'exitCode') === null && ownDataValue(command, 'durationMs') === 0);
+}
+
+function isSettlementCommand(command: unknown): boolean {
+  const kind = ownDataValue(command, 'evidenceKind');
+  return kind === 'process_family_settlement' || (kind !== 'command' &&
+    ownDataValue(command, 'executable') === 'process-family-settlement' && ownDataValue(command, 'outcome') === 'unavailable');
+}
+
+/** Detached primitive identity pins genuine and conservative legacy refusal records across serialization. */
+function settlementDeclaration(command: unknown): string | undefined {
+  if (typeof command !== 'object' || command === null || !isSettlementCommand(command) ||
+      !isCommandKindCoherent(command) || !hasSafeDataFields(command, COMMAND_IDENTITY_FIELDS.slice(1), true)) return undefined;
+  const index = ownDataValue(command, 'commandIndex');
+  const duration = ownDataValue(command, 'durationMs');
+  if (!Number.isSafeInteger(index) || (index as number) < 0 || !Number.isSafeInteger(duration) || (duration as number) < 0 ||
+      ownDataValue(command, 'exitCode') !== null) return undefined;
+  const values = COMMAND_IDENTITY_FIELDS.map((key) => ownDataValue(command, key));
+  if (!values.every((value) => value === undefined || value === null || typeof value === 'string' || typeof value === 'number')) return undefined;
+  return JSON.stringify(values);
+}
+
 function boundedValidationPayloadCoherent(value: unknown, serializedSnapshot: boolean): boolean {
   if (typeof value !== 'object' || value === null) return true;
+  if (!hasSafeDataFields(value, ['local'])) return false;
   const localDescriptor = Object.getOwnPropertyDescriptor(value, 'local');
   if (localDescriptor === undefined) return true;
   if (!('value' in localDescriptor)) return false;
   const local = localDescriptor.value;
   if (typeof local !== 'object' || local === null) return true;
+  if (!hasSafeDataFields(local, ['commands'])) return false;
   const commandsDescriptor = Object.getOwnPropertyDescriptor(local, 'commands');
   if (commandsDescriptor === undefined) return true;
   if (!('value' in commandsDescriptor)) return false;
   const commands = commandsDescriptor.value;
   if (!Array.isArray(commands)) return true;
+  if (localValidationHasUnsettledProcessFamily(local) &&
+      (ownDataValue(local, 'status') !== 'unknown' || ownDataValue(value, 'status') !== 'unknown')) return false;
   for (let index = 0; index < commands.length; index += 1) {
     const commandDescriptor = Object.getOwnPropertyDescriptor(commands, String(index));
-    if (commandDescriptor === undefined) continue;
+    if (commandDescriptor === undefined) { if (String(index) in commands) return false; continue; }
     if (!('value' in commandDescriptor)) return false;
     const command = commandDescriptor.value;
     if (typeof command !== 'object' || command === null) continue;
+    if (!isCommandKindCoherent(command) ||
+        (ownDataValue(command, 'evidenceKind') === 'process_family_settlement' && index !== commands.length - 1)) return false;
+    if (isSettlementCommand(command) && settlementDeclaration(command) === undefined) return false;
     for (const key of ['output', 'capturePreview'] as const) {
       const descriptor = Object.getOwnPropertyDescriptor(command, key);
       if (descriptor !== undefined && !('value' in descriptor)) return false;
@@ -170,12 +225,19 @@ function hasSafeDiagnosticsArray(value: unknown): value is readonly string[] {
 function isLocalEvidence(value: unknown): value is LocalValidationEvidence {
   if (typeof value !== 'object' || value === null) return false;
   const evidence = value as Record<string, unknown>;
-  if (!['passed', 'failed', 'unknown'].includes(evidence.status as string) ||
+  if (!hasSafeDataFields(value, ['status', 'configRevision', 'commands'], true) ||
+      !['passed', 'failed', 'unknown'].includes(evidence.status as string) ||
       (evidence.configRevision !== null && (typeof evidence.configRevision !== 'string' || evidence.configRevision.trim() === '')) ||
       !Array.isArray(evidence.commands)) return false;
   const commands = evidence.commands as Array<Record<string, unknown>>;
+  for (let index = 0; index < commands.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(commands, String(index));
+    if (descriptor === undefined || !('value' in descriptor) || descriptor.enumerable !== true) return false;
+  }
   if (!commands.every((command, index) =>
-    typeof command === 'object' && command !== null && command.commandIndex === index &&
+    typeof command === 'object' && command !== null && isCommandKindCoherent(command) &&
+    hasSafeDataFields(command, COMMAND_IDENTITY_FIELDS.slice(1), true) && command.commandIndex === index &&
+    (command.evidenceKind !== 'process_family_settlement' || index === commands.length - 1) &&
     typeof command.executable === 'string' &&
     (command.executable.trim() !== '' || command.outcome === 'malformed') && isCommandOutcome(command.outcome) &&
     (command.exitCode === null || typeof command.exitCode === 'number') &&
@@ -237,8 +299,7 @@ export function localValidationHasUnsettledProcessFamily(value: unknown): boolea
   if (!Array.isArray(commands)) return false;
   for (let index = 0; index < commands.length; index += 1) {
     const command = ownDataValue(commands, String(index));
-    if (ownDataValue(command, 'executable') === 'process-family-settlement' &&
-        ownDataValue(command, 'outcome') === 'unavailable') return true;
+    if (isSettlementCommand(command)) return true;
   }
   return false;
 }
@@ -247,7 +308,8 @@ export function localValidationHasUnsettledProcessFamily(value: unknown): boolea
 export function isValidationResultCoherent(value: unknown): value is ValidationResult {
   if (typeof value !== 'object' || value === null) return false;
   const result = value as Record<string, unknown>;
-  if (typeof result.headSha !== 'string' || result.headSha.trim() === '' ||
+  if (!hasSafeDataFields(value, ['headSha', 'status', 'local', 'hosted'], true) ||
+      typeof result.headSha !== 'string' || result.headSha.trim() === '' ||
       !['passed', 'failed', 'waiting', 'unknown'].includes(result.status as string) ||
       !isLocalEvidence(result.local) || !isHostedEvidence(result.hosted)) return false;
   const local = result.local;

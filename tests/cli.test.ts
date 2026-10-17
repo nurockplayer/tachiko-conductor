@@ -1278,6 +1278,29 @@ describe('workflow run and resume commands', () => {
     });
   }
 
+  it('accepts ordinary cancellation for a newly typed configured executable-name collision', async () => {
+    const configuration = resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
+      revision: 'test-config-v1', commands: [{ argv: ['process-family-settlement'], timeoutMs: 1000 }],
+    }) });
+    assert.ok(configuration);
+    assert.equal(configuration.commands[0]?.argv[0], 'process-family-settlement');
+    const store = new MemoryStore();
+    let run = applyTransition(createRun(TARGET, T0, 'ordinary-settlement-name'), { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    const base = validationPassed(HEAD);
+    run = applyTransition(run, { type: 'escalate', reason: 'ordinary unavailable configured command',
+      validationResult: { ...base, status: 'unknown', local: { status: 'unknown', configRevision: configuration.revision, commands: [
+        { evidenceKind: 'command', commandIndex: 0, executable: configuration.commands[0]!.argv[0]!, outcome: 'unavailable', exitCode: null, durationMs: 1 },
+      ] } }, pullRequest: { number: 7, headSha: HEAD }, interrupt: { evidence: 'ordinary spawn unavailable', choices: [CANCEL_RUN_DECISION] } }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]), reviewer = new FakeReviewer([]);
+    const result = await resumeCommand(deps(store, githubAdapter([]), implementation, reviewer), run.id, CANCEL_RUN_DECISION, { now: () => T0 });
+    assert.equal(result.outcome, 'failed');
+    assert.equal(result.run.history.at(-1)?.reason, CANCEL_RUN_DECISION);
+    assert.deepEqual(result.run.validationResult, run.validationResult);
+    assert.equal(implementation.calls + reviewer.calls, 0);
+  });
+
   it('refuses ordinary settlement-marker cancellation without changing the owner and requires attested recovery', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-cancel-held-'));
     const restore = isolateMergeReceiptRoot(dir);

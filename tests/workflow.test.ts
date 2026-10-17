@@ -20,7 +20,7 @@ import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE, type ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
-import { runWorkflow } from '../src/workflow/run.js';
+import { runWorkflow, type WorkflowDependencies } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
@@ -602,6 +602,41 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(result.run.validationResult?.local.status, 'unknown');
   });
 
+  it('keeps typed and legacy refusals held while a typed ordinary collision follows the normal retry path', async () => {
+    for (const kind of [undefined, 'process_family_settlement', 'command'] as const) {
+      const store = new MemoryStore();
+      let run = applyTransition(createRun(TARGET, T0, `kind-${kind ?? 'legacy'}`), { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      store.create(run);
+      const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+        { ...(kind === undefined ? {} : { evidenceKind: kind }), commandIndex: 0, executable: 'process-family-settlement',
+          outcome: 'unavailable', exitCode: null, durationMs: 0 },
+      ] };
+      const github = githubAdapter([]);
+      let reads = 0, validations = 0;
+      github.readLiveSnapshot = async () => { reads += 1; return snapshot(HEAD); };
+      const implementation = new FakeImplementation([]), reviewer = new FakeReviewer([]);
+      const dependencies: WorkflowDependencies = { store, github, implementation, reviewer,
+        validation: { kind: 'validation', configRevision: 'test-config-v1', async validate() { validations += 1; return local; } }, hostedCheckPolicy: TEST_HOSTED_POLICY };
+      const result = await runWorkflow(dependencies, run.id, { maxReviewAttempts: 3, now: () => T0 });
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.validationResult?.status, 'unknown');
+      assert.equal(validations, 1);
+      assert.equal(reads, kind === 'command' ? 2 : 1);
+      if (kind === 'command') assert.ok(result.run.interrupt?.choices?.some((choice) => /retry/i.test(choice)));
+      else {
+        assert.deepEqual(result.run.interrupt?.choices, ['Cancel the run']);
+        store.update(applyTransition(JSON.parse(JSON.stringify(result.run)), { type: 'human_resolved', reason: 'legacy retry' }, T0));
+        const reentry = await runWorkflow(dependencies, run.id, { maxReviewAttempts: 3, now: () => T0 });
+        assert.equal(reentry.outcome, 'needs_human');
+        assert.deepEqual(reentry.run.validationResult, result.run.validationResult);
+        assert.equal(validations, 1);
+        assert.equal(reads, 1);
+      }
+      assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+    }
+  });
+
   it('retains fresh settlement refusal before later GitHub or policy observation and keeps resume fenced', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-fresh-settlement-retention-'));
     try {
@@ -824,7 +859,11 @@ describe('runWorkflow', { concurrency: false }, () => {
             { commandIndex: 0, executable: 'node', outcome: 'failed', exitCode: 7, durationMs: 1 },
             { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
           ] }, hosted: { ...seed.hosted, status: 'failed', overall: 'failing' } } };
-      new JsonFileStore({ dir }).create(run);
+      assert.throws(() => new JsonFileStore({ dir }).create(run), /invalid bounded validation output payload/,
+        'new writes refuse an incoherent known-refusal ledger before publication');
+      // Reconstruct historical bytes directly; the current writer cannot
+      // manufacture this pre-existing incompatible ledger anymore.
+      writeFileSync(path.join(dir, `${run.id}.json`), JSON.stringify(run), { mode: 0o600 });
       const before = readFileSync(path.join(dir, `${run.id}.json`));
       const implementation = new FakeImplementation([]);
       const reviewer = new FakeReviewer([]);

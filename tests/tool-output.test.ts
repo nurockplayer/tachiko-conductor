@@ -30,6 +30,33 @@ const policy: ToolOutputPolicy = {
 };
 
 describe('bounded tool output contract', () => {
+  it('matches detached canonical memory references for read and search despite genuine-id forgeries or caller mutation', () => {
+    const store = new InMemoryToolOutputStore();
+    const returned = store.save({ stdout: 'visible evidence\n', stderr: 'err' });
+    const original = { ...returned };
+    const forgeries = [
+      { ...original, stdoutBytes: 0, stderrBytes: 0, totalBytes: 0 },
+      { ...original, stdoutBytes: 1 }, { ...original, stderrBytes: 0 }, { ...original, totalBytes: 0 },
+      { ...original, sha256: '0'.repeat(64) }, { ...original, kind: 'other' }, { ...original, id: 'other' },
+      { ...original, operationId: '0'.repeat(36), retainedUntil: '2030-01-01T00:00:00.000Z' },
+      { ...original, fileIdentity: { stdout: { dev: '1', ino: '2' }, stderr: { dev: '1', ino: '3' } } },
+      { ...original, unknownReferenceField: true },
+    ];
+    for (const forged of forgeries) {
+      for (const method of ['read', 'search'] as const) {
+        assert.throws(() => method === 'read'
+          ? store.read(forged as typeof original, { channel: 'stdout', length: 64 })
+          : store.search(forged as typeof original, { query: 'visible' }), /artifact.*(invalid|unavailable|reference)/i);
+      }
+    }
+    Object.assign(returned, { stdoutBytes: 0, stderrBytes: 0, totalBytes: 0, sha256: '0'.repeat(64) });
+    assert.throws(() => store.read(returned, { channel: 'stdout' }), /reference differs/);
+    assert.throws(() => store.search(returned, { query: 'visible' }), /reference differs/);
+    assert.equal(store.read(original, { channel: 'stdout', length: 64 }).text, 'visible evidence\n');
+    assert.equal(store.search(original, { query: 'visible' }).length, 1);
+    assert.equal(store.read(original, { channel: 'stderr', length: 64 }).text, 'err');
+  });
+
   it('bounds all file identity strings to 256 ASCII digits while preserving padded decimal identities', () => {
     const base = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '', store: new InMemoryToolOutputStore() });
     const withValue = (channel: 'stdout' | 'stderr', key: 'dev' | 'ino', value: unknown) => ({ ...base,

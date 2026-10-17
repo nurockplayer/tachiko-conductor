@@ -338,8 +338,11 @@ function assertNoRawProviderOutput(run: Run): void {
 }
 
 function assertNoInvalidBoundedValidationPayload(run: Run, declarations?: BoundedValidationDeclarations): void {
-  const coherent = declarations !== undefined ? isSerializedBoundedValidationPayloadCoherent(run.validationResult, declarations)
-    : isKnownBoundedValidationPayloadCoherent(run.validationResult);
+  const descriptor = Object.getOwnPropertyDescriptor(run, 'validationResult');
+  const ownData = descriptor === undefined ? !('validationResult' in run) : descriptor.enumerable === true && 'value' in descriptor;
+  const value = descriptor !== undefined && 'value' in descriptor ? descriptor.value : undefined;
+  const coherent = ownData && (declarations !== undefined ? isSerializedBoundedValidationPayloadCoherent(value, declarations)
+    : isKnownBoundedValidationPayloadCoherent(value));
   if (!coherent) {
     throw new Error('Refusing to persist an invalid bounded validation output payload.');
   }

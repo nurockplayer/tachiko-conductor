@@ -400,7 +400,7 @@ async function execute(
       }
       const pendingCapture: ToolOutputCaptureSummary | undefined = captureResult?.capture;
       const captureStatus: LocalValidationCommandEvidence['captureStatus'] = captureResult?.status;
-      const evidence = { commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
+      const evidence = { evidenceKind: 'command' as const, commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
         ...(settlementIncomplete ? { settlementIncomplete: true as const } : {}),
         ...(captureStatus === undefined ? {} : { captureStatus }),
         ...(captureResult === undefined || captureStatus === 'complete' ? {} : { capturePreview: {
@@ -741,7 +741,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         // Direct-child truth is evidence, not permission to continue while
         // process-family settlement remains unproven. Keep this signal private.
         if (settlementIncomplete === true) {
-          evidence.push({ commandIndex: evidence.length, executable: 'process-family-settlement',
+          evidence.push({ evidenceKind: 'process_family_settlement', commandIndex: evidence.length, executable: 'process-family-settlement',
             outcome: 'unavailable', exitCode: null, durationMs: 0 });
           return finishValidation('unknown');
         }
