@@ -279,6 +279,13 @@ export interface Run {
   readonly pullRequest?: ImplementationPullRequestIdentity;
   /** Latest review result, bound to an exact HEAD SHA. */
   readonly reviewResult?: ReviewResult;
+  /** Native review lifecycle is owned exclusively by this Run's CAS. */
+  readonly nativeReview?: {
+    readonly requests: readonly import('../oracle/types.js').NativeReviewRequestState[];
+    readonly activeRequestId?: string;
+    readonly accepted?: import('../oracle/types.js').NativeReviewAcceptance;
+    readonly wait?: { readonly kind: 'binding' | 'request' | 'lead' | 'qualification'; readonly nextAttemptAt: string };
+  };
   /** Latest validation result, bound to an exact HEAD SHA. */
   readonly validationResult?: ValidationResult;
   /** Current HEAD SHA of the implementation, when known. */

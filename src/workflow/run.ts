@@ -27,6 +27,7 @@ import {
 } from '../domain/telemetry.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
+import { nativeReviewReentry, parkNativeReview } from '../oracle/native-reviewer.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import { activeRepairAdmission, generationlessAppServerPredecessor, resolveRepairPredecessor, unfinishedBoundRepairAttempt, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
@@ -141,6 +142,7 @@ export interface WorkflowOptions {
   readonly telemetryThresholds?: Partial<Omit<EfficiencyThresholds, 'revision'>> & { readonly revision?: string };
   /** Called immediately before a model, reviewer, or other delegated execution boundary. */
   readonly onExecutionStart?: () => void;
+  readonly assertReviewClaim?: (run: Run) => Promise<void>;
   /** Host admission capability enforced at mutation and publication boundaries. */
   readonly admissionFence?: { readonly registry: MissionAdmissionRegistry; readonly token: AdmissionToken; readonly productionMissionId: string; readonly executionWorkspace?: string };
 }
@@ -568,9 +570,9 @@ export async function runWorkflow(
   const { store, github, implementation, reviewer } = deps;
   const now = options.now ?? (() => new Date().toISOString());
 
-  let run = store.read(runId);
-  if (run === null) throw new Error(`No run with id "${runId}" found.`);
-  const loaded = run;
+  const loaded = store.read(runId);
+  if (loaded === null) throw new Error(`No run with id "${runId}" found.`);
+  let run: Run = loaded;
   run = withRunTelemetryThresholds(run, options.telemetryThresholds ?? {});
   if (!updateIfCurrent(store, loaded, run)) {
     return staleWorkflowOutcome(run.id, loaded, store, 'Run changed while workflow telemetry was being initialized; preserving the newer Run.');
@@ -581,6 +583,12 @@ export async function runWorkflow(
   const target = run.target;
 
   for (;;) {
+    if (reviewer.native !== undefined && (!reviewer.native.available() || options.assertReviewClaim === undefined) && ['READY', 'IMPLEMENTING', 'CHANGES_REQUESTED'].includes(run.state)) {
+      const reason = 'Native review unavailable: no accepted trusted host reviewer binding; implementation and repair are waiting.';
+      const parked = parkNativeReview(run, 'binding', reason, now());
+      if (!updateIfCurrent(store, run, parked)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before native reviewer availability wait.');
+      return { outcome: 'waiting_dependency', run: parked, reason };
+    }
     switch (run.state) {
       case 'READY':
         {
@@ -1473,6 +1481,8 @@ export async function runWorkflow(
             github,
             implementation,
             reviewer,
+            assertReviewClaim: options.assertReviewClaim,
+            ...(options.admissionFence === undefined ? {} : { reviewOwner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
             bootstrap: deps.bootstrapForExecution?.(bootstrapExecution(run)) ?? deps.bootstrap,
             bootstrapForExecution: deps.bootstrapForExecution,
             resolveValidationAuthority: () => activeValidationConfiguration(deps),
@@ -1502,6 +1512,7 @@ export async function runWorkflow(
           return staleWorkflowOutcome(loop.run.id, loop.run, store, loop.reason);
         }
         if (loop.outcome === 'needs_human') return { outcome: 'needs_human', run, reason: loop.reason };
+        if (loop.outcome === 'waiting_dependency') return { outcome: 'waiting_dependency', run, reason: loop.reason };
         if (loop.outcome === 'unsupported_cas') return { outcome: 'unsupported_cas', run: loop.run, reason: loop.reason };
         if (loop.outcome === 'failed') return { outcome: 'failed', run, reason: loop.reason };
         break;
@@ -1550,6 +1561,15 @@ export async function runWorkflow(
           return githubFailureOutcome(run, error, store, now);
         }
         if (!updateIfCurrent(store, finalGateExpected, finalGateExpected)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
+        if (reviewer.native !== undefined) await options.assertReviewClaim?.(run);
+        if ((reviewer.native !== undefined || run.nativeReview !== undefined) && (options.assertReviewClaim === undefined || !reviewer.native?.validate({ run, snapshot,
+          ...(options.admissionFence === undefined ? {} : { owner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
+          assertCurrent: () => assertCurrentMutationAdmission(options) }))) {
+          const reason = 'Final gate requires authenticated immutable native review evidence under current host authority.';
+          const parked = parkNativeReview(run, 'qualification', reason, now());
+          if (!updateIfCurrent(store, run, parked)) return staleWorkflowOutcome(run.id, run, store, reason);
+          return { outcome: 'waiting_dependency', run: parked, reason };
+        }
         const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
         if (conflict !== null) return park(run, conflict, store, now);
         if (snapshot.headSha !== run.headSha) {
@@ -1664,6 +1684,19 @@ export async function runWorkflow(
       }
 
       case 'MERGE_READY':
+        if (reviewer.native !== undefined || run.nativeReview !== undefined) {
+          const snapshot = await github.readLiveSnapshot(target);
+          await options.assertReviewClaim?.(run);
+          if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed while cached native readiness was being checked.');
+          if (options.assertReviewClaim === undefined || !reviewer.native?.validate({ run, snapshot,
+            ...(options.admissionFence === undefined ? {} : { owner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
+            assertCurrent: () => assertCurrentMutationAdmission(options) })) {
+            const reason = 'Cached readiness lacks current authenticated native review qualification.';
+            const parked = parkNativeReview(run, 'qualification', reason, now());
+            if (!updateIfCurrent(store, run, parked)) return staleWorkflowOutcome(run.id, run, store, reason);
+            return { outcome: 'waiting_dependency', run: parked, reason };
+          }
+        }
         if (hasUnreestablishedLegacyGate(run)) {
           const reason = 'Historical gate_passed readiness is read-compatible only; current validation, review, and live GitHub authority must be re-established.';
           return park(run, reason, store, now, [REESTABLISH_READINESS_DECISION, CANCEL_RUN_DECISION]);
@@ -1677,6 +1710,13 @@ export async function runWorkflow(
         return { outcome: 'needs_human', run, reason: run.interrupt?.reason ?? 'Awaiting a human decision.' };
 
       case 'WAITING_DEPENDENCY':
+        if (reviewer.native !== undefined && nativeReviewReentry(run, now())) {
+          const resumed = applyTransition(run, { type: 'dependency_satisfied', reason: 'Model-free native review dependency observation.' }, now());
+          const next: Run = { ...resumed, nativeReview: { ...run.nativeReview!, wait: undefined } };
+          if (!updateIfCurrent(store, run, next)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before native review dependency observation.');
+          run = next;
+          break;
+        }
         return { outcome: 'waiting_dependency', run, reason: run.interrupt?.reason ?? 'Awaiting an external dependency.' };
 
       case 'FAILED':

@@ -12,6 +12,7 @@ import { CANONICAL_REASONING_EFFORTS, EXECUTION_PROFILE_NAMES, MAX_EXECUTION_TIM
 import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairHandoffCompatible, isRepairHandoffRecord, isRepairTaskShapeAuthority, sameRepairExecutorIdentity, unfinishedBoundRepairAttempt, type RepairExecutorHandoff, type RepairHandoffRecord } from '../domain/repair-admission.js';
 import { ensureDurableDirectory, type SyncDirectoryHierarchy } from '../durable-directory.js';
 import { assertSafeCurrentAccountPathIfApplicable, isCurrentAccountPathApplicable } from '../account-home.js';
+import { nativeReviewCoherent, nativeReviewProgresses } from '../oracle/native-reviewer.js';
 
 /**
  * Durable local storage for runs. Synchronous by design: the conductor is a
@@ -322,6 +323,7 @@ function isRun(value: unknown): value is Run {
     (v.reviewResult === undefined || isReviewResult(v.reviewResult)) &&
     (v.validationResult === undefined || isValidationResultCoherent(v.validationResult)) &&
     (v.telemetry === undefined || isRunTelemetry(v.telemetry)) &&
+    nativeReviewCoherent(v as unknown as Run) &&
     isRepairHistoryCoherent(v) &&
     (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
@@ -551,6 +553,7 @@ export class JsonFileStore implements RunStore {
   }
 
   create(run: Run): void {
+    if (!nativeReviewCoherent(run)) throw new Error('Invalid native review Run ledger.');
     this.withMutationLock(run.id, () => {
       const filePath = this.filePathFor(run.id);
       this.assertSafeRunFile(filePath);
@@ -574,6 +577,7 @@ export class JsonFileStore implements RunStore {
       const filePath = this.filePathFor(run.id);
       this.assertSafeRunFile(filePath);
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
+      if (!nativeReviewCoherent(run) || current !== null && !nativeReviewProgresses(current, run)) throw new Error('Native review ledger must remain coherent and monotonic.');
       assertRepairAdmissionsAppendOnly(current, run);
       assertHistoryAppendOnly(current, run);
       const serialized = writeJsonAtomic(filePath, run, this.syncForDurability, () => this.assertSafeRunFile(filePath));
@@ -588,6 +592,7 @@ export class JsonFileStore implements RunStore {
       this.assertSafeRunFile(filePath);
       const current = readRun(filePath, expected.id);
       if (runFingerprint(current) !== runFingerprint(expected)) return false;
+      if (!nativeReviewCoherent(next) || !nativeReviewProgresses(current, next)) throw new Error('Native review ledger must remain coherent and monotonic.');
       assertRepairAdmissionsAppendOnly(current, next);
       assertHistoryAppendOnly(current, next);
       this.beforeConditionalWrite?.();

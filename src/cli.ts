@@ -71,7 +71,8 @@ import {
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
-import { DeepSeekApiClient, DeepSeekReviewer, GhPullRequestDiffReader } from './reviewers/deepseek.js';
+import { resolveNativeReviewer, unresolvedNativeReview } from './oracle/native-reviewer.js';
+import type { NativeReviewerHost } from './oracle/types.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
 import { StandaloneGitBootstrap } from './workspace/standalone-git-bootstrap.js';
@@ -1257,6 +1258,7 @@ export function recoverRunAdmission(
   if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw new Error('Run admission recovery requires --generation <positive integer>.');
   const run = store.read(runId);
   if (run === null) throw new Error(`No run with id "${runId}" found.`);
+  if (recoveryOptions?.retireWork === true && unresolvedNativeReview(run)) throw new Error('Native review remote submission is unresolved; stopped local execution cannot retire its external work.');
   const laneId = `run:${run.id}`;
   const repo = `${run.target.owner}/${run.target.repo}`.toLowerCase();
   const canonicalReceiptPath = receiptPath ?? resolveRunOwnerReceiptPath(repo, run.id, evidenceForRun(run));
@@ -1424,6 +1426,7 @@ export function parseGitHubRepositoryRemote(remote: string): string {
 }
 
 export interface WorkflowCommandOptions {
+  readonly assertReviewClaim?: (run: Run) => Promise<void>;
   readonly maxReviewAttempts?: number;
   readonly now?: () => string;
   /** Required for a newly-created production issue run; persisted runs retain their own snapshot. */
@@ -1494,14 +1497,18 @@ export async function runIssueCommand(
   const precreatedRun = isNewRun && (options.dispatchClaimId !== undefined || options.admission !== undefined);
   if (precreatedRun) deps.store.create(run);
   const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
-  let mayReleaseAsPreExecution = admissionToken !== undefined;
+  let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeReview(run);
   try {
+    if (admissionToken !== undefined && runOwnerReceiptPath !== undefined && unresolvedNativeReview(run)) {
+      options.admission!.renew(admissionToken, () => writeRunOwnerReceipt(runOwnerReceiptPath, receiptForCurrentToken(runOwnerReceiptPath, admissionToken, 'execution_possible')));
+    }
     if (isNewRun && !precreatedRun) deps.store.create(run);
     if (admissionToken !== undefined && options.publishRuntimeProjection !== undefined) {
       options.publishRuntimeProjection(options.admission!, deps.store, { stage: 'implementation_admitted', supervisor: 'running' });
     }
     options.releaseDispatchAdmissionLock?.();
     const outcome = await runWorkflow(deps, run.id, {
+      assertReviewClaim: options.assertReviewClaim,
       maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
       now: options.now,
       ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
@@ -1520,6 +1527,10 @@ export async function runIssueCommand(
     });
     return outcome;
   } catch (error) {
+    // A marker CAS may have become durable even if a subsequent owner fence,
+    // accounting hook, or file/directory sync failed before it returned.
+    try { if (unresolvedNativeReview(deps.store.read(run.id) ?? run)) mayReleaseAsPreExecution = false; }
+    catch { mayReleaseAsPreExecution = false; }
     if (admissionToken !== undefined && mayReleaseAsPreExecution) {
       options.releaseDispatchAdmissionLock?.();
       await withRunAdmissionBoundary(options, () => {
@@ -1553,6 +1564,7 @@ export async function resumeCommand(
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
   if (decision.trim() === '') throw new Error('A non-empty --decision is required to resume a parked run.');
+  if (decision.trim() === CANCEL_RUN_DECISION && unresolvedNativeReview(run)) throw new Error('Native review submission remains uncertain; local cancellation cannot prove remote cancellation or release its owner.');
   const choices = run.interrupt?.choices ?? [];
   if (choices.length > 0 && !choices.includes(decision)) {
     throw new Error(`Invalid decision "${decision}". Choose exactly one of: ${choices.join(' | ')}.`);
@@ -1561,7 +1573,7 @@ export async function resumeCommand(
   if (targetOwner !== null && targetOwner.id !== id) throw new Error(`Run "${id}" is not the unique active durable Run for its target.`);
   const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
   const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
-  let mayReleaseAsPreExecution = admissionToken !== undefined;
+  let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeReview(run);
   try {
   const now = options.now ?? (() => new Date().toISOString());
   if (
@@ -1651,6 +1663,7 @@ export async function resumeCommand(
   }
   options.releaseDispatchAdmissionLock?.();
   const outcome = await runWorkflow(deps, id, {
+    assertReviewClaim: options.assertReviewClaim,
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
     now: options.now,
     ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
@@ -1669,6 +1682,8 @@ export async function resumeCommand(
   });
   return outcome;
   } catch (error) {
+    try { if (unresolvedNativeReview(deps.store.read(run.id) ?? run)) mayReleaseAsPreExecution = false; }
+    catch { mayReleaseAsPreExecution = false; }
     if (admissionToken !== undefined && mayReleaseAsPreExecution) {
       options.releaseDispatchAdmissionLock?.();
       await withRunAdmissionBoundary(options, () => {
@@ -1723,11 +1738,12 @@ export function outcomeExitCode(outcome: WorkflowOutcome): number {
 }
 
 /** Production wiring: durable implementation routing, local gh, and independent review. */
-function buildWorkflowDeps(
+export function buildWorkflowDeps(
   store: RunStore,
   resolveImplementationCapabilities?: ImplementationCapabilityResolver,
   env: NodeJS.ProcessEnv = process.env,
   transport: GhCliTransport = new GhCliTransport(),
+  nativeReviewerHost?: NativeReviewerHost,
 ): WorkflowDependencies {
   const github = new LiveGitHubAdapter({ transport });
   const localValidation = resolveLocalValidationConfiguration(env);
@@ -1825,11 +1841,7 @@ function buildWorkflowDeps(
         }),
       },
     }),
-    reviewer: new DeepSeekReviewer({
-      github,
-      diffReader: new GhPullRequestDiffReader(transport),
-      client: new DeepSeekApiClient(),
-    }),
+    reviewer: resolveNativeReviewer(nativeReviewerHost),
     bootstrap: lazyBootstrap,
     bootstrapForExecution: (execution) => {
       if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;
@@ -2002,6 +2014,7 @@ function finalizeMergeReleaseReceipt(receiptPath: string, run: Run, missionId: s
 }
 
 function casMergedRun(store: RunStore, current: Run): Run {
+  if (current.nativeReview !== undefined) throw new Error('Native review-bearing Run requires qualified merge settlement authority; the automatic merge bridge is unavailable.');
   if (current.state === 'MERGED') return current;
   if (current.state !== 'MERGE_READY') throw new Error(`Run "${current.id}" is ${current.state}; only MERGE_READY can be merged.`);
   if (store.updateIfUnchanged === undefined) throw new Error(`Run store cannot compare-and-swap merged Run "${current.id}"; refusing an unfenced transition.`);
@@ -2076,6 +2089,15 @@ export async function runMergedTransitionCommand(
   if (github.readPullRequest === undefined) throw new Error('GitHub adapter cannot directly read the persisted pull request; refusing an operator-claimed merge.');
   const proof = await github.readPullRequest(initial.target.owner, initial.target.repo, initial.pullRequest.number);
   assertExactMergedPullRequest(initial, proof);
+  if (initial.nativeReview !== undefined) {
+    // This slice can qualify review readiness, but cannot qualify merge
+    // integration/settlement. Retain the external fact without releasing work.
+    const reason = 'Merged PR observed; native settlement remains unqualified because the accepted-release merge bridge is unavailable.';
+    if (initial.state === 'MERGED') throw new Error(`${reason} Historical terminal Run remains readable and unchanged; observed proof: ${JSON.stringify(proof)}`);
+    const observed = applyTransition(initial, { type: 'wait_dependency', reason, interrupt: { evidence: JSON.stringify(proof) } });
+    if (store.updateIfUnchanged?.(initial, observed) !== true) throw new Error('Run changed while retaining observed merged-but-unsettled evidence.');
+    throw new Error(`${reason} The exact observed proof is retained; Run and owner remain fenced.`);
+  }
 
   const reconcile = (): Run => {
     let parkedGeneration: number | undefined;
@@ -2710,14 +2732,15 @@ export async function main(argv: string[]): Promise<number> {
           reconcileMergedRun: async (run) => await reconcileDispatchMergedRunCommand(store, run, workflow.github, admission, async (operation) => await operation()),
           withAdmissionLock: async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation),
           resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock) => {
+          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock, assertReviewClaim) => {
             return await runIssueCommand(workflow, ref, {
               ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
+              assertReviewClaim,
             });
           },
-          resumeClaimedRun: async (run, dispatchClaimId, missionAdmission, release, withLock) => {
+          resumeClaimedRun: async (run, dispatchClaimId, missionAdmission, release, withLock, assertReviewClaim) => {
             if (run.target.kind !== 'issue') throw new Error(`Dispatch claimed Run ${run.id} is not an issue Run.`);
             const workspace = persistedRunWorkspace(run);
             return await runIssueCommand(workflow, `${run.target.owner}/${run.target.repo}#${run.target.issueNumber}`, {
@@ -2728,6 +2751,7 @@ export async function main(argv: string[]): Promise<number> {
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
+              assertReviewClaim,
             });
           },
         });

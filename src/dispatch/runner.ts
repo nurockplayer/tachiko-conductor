@@ -4,6 +4,7 @@ import type { GitHubAdapter } from '../adapters/github.js';
 import type { Run, WorkflowState } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
 import type { MissionAdmissionRegistry } from '../mission-admission/registry.js';
+import { nativeReviewReentry } from '../oracle/native-reviewer.js';
 import {
   DispatchProtocolError,
   claimDispatchEntry,
@@ -457,7 +458,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     const historicalHold = historicalOwnerHold(options, run?.id);
     if (historicalHold !== null) return { outcome: 'owner_reconciliation_hold', entry, claim: existing.claim, reason: historicalHold };
     const ownerRetired = run !== null && run.state !== 'MERGED' && options.isRunOwnerRetired?.(run) === true;
-    if (!ownerRetired && (run === null || !isSettledRun(run))) {
+    if (!ownerRetired && (run === null || !isSettledRun(run) || nativeReviewReentry(run, options.now()))) {
       if (run !== null && options.admission?.readLane(`run:${run.id}`)?.status === 'active') {
         return {
           outcome: 'admission_wait', waitKind: 'owner', entry, runId: run.id, claim: existing.claim,

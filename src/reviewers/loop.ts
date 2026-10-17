@@ -33,6 +33,7 @@ import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUE
 import { createBootstrapFailureRun } from '../workflow/bootstrap-failure.js';
 import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 import { acceptedScopeFromHandoff, buildImplementationPacket, preflightImplementationPacket, type ImplementationPacket, type ImplementationPacketInput } from '../agents/implementation-packet.js';
+import { parkNativeReview } from '../oracle/native-reviewer.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
@@ -41,6 +42,8 @@ export interface ReviewLoopDependencies {
   readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly bootstrapForExecution?: (execution: ResolvedExecutionConfiguration | undefined) => ImplementationBootstrapAdapter | undefined;
   readonly reviewer: ReviewerAdapter;
+  readonly reviewOwner?: { readonly missionId: string; readonly laneId: string; readonly generation: number };
+  readonly assertReviewClaim?: (run: Run) => Promise<void>;
   /**
    * Resolves the active validation-policy identity at each reviewer effect
    * boundary. It is required even for direct callers so no public review path
@@ -74,6 +77,7 @@ export interface ReviewLoopOptions {
 
 export type ReviewLoopResult =
   | { readonly outcome: 'approved'; readonly run: Run }
+  | { readonly outcome: 'waiting_dependency'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'revalidating'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'needs_human'; readonly run: Run; readonly reason: string }
   | { readonly outcome: 'unsupported_cas'; readonly run: Run; readonly reason: string }
@@ -444,6 +448,12 @@ export async function runReviewLoop(
 
   for (;;) {
     if (run.state === 'CHANGES_REQUESTED') {
+      if (reviewer.native !== undefined && run.reviewResult?.verdict === 'request_changes') {
+        const reason = 'Native review findings retained; qualified lead disposition is unavailable, so repair is parked.';
+        const parked = parkNativeReview(run, 'lead', reason, now());
+        if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
+        return { outcome: 'waiting_dependency', run: parked, reason };
+      }
       const validationFailure = run.validationResult?.status === 'failed';
       if (validationFailure) {
         let activeValidation: ActiveValidationConfiguration;
@@ -1156,6 +1166,27 @@ export async function runReviewLoop(
     const reviewHeadSha = run.headSha;
     if (reviewHeadSha === undefined) return parkBootstrap(run, new Error('Reviewer admission requires an exact candidate HEAD.'), store, now);
     if (!updateReviewRun(store, run, run)) return staleReviewOutcome(run.id, run, store);
+    let reviewResult: ReviewResult;
+    if (reviewer.native !== undefined) {
+      const advanced = await reviewer.native.advance({
+        run, snapshot: liveSnapshot, store, now, owner: deps.reviewOwner,
+        ...(deps.assertReviewClaim === undefined ? {} : { assertLiveClaim: async () => await deps.assertReviewClaim!(store.read(run.id) ?? run) }),
+        assertCurrent: () => deps.assertCurrentMutation?.(),
+        onSubmission: (markedRun) => {
+          deps.assertCurrentMutation?.();
+          options.onExecutionStart?.();
+          return recordSpawnTelemetry(markedRun, { role: 'reviewer', attemptKind: 'review', headSha: reviewHeadSha, contextMode: 'bounded', contextJustification: 'live-target-bounded' }, now()).run;
+        },
+      });
+      run = advanced.run;
+      if (advanced.outcome === 'superseded') return { outcome: 'superseded', run, reason: advanced.reason };
+      if (advanced.outcome === 'wait') {
+        const parked = parkNativeReview(run, run.nativeReview?.activeRequestId === undefined ? 'binding' : 'request', advanced.reason, now());
+        if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
+        return { outcome: 'waiting_dependency', run: parked, reason: advanced.reason };
+      }
+      reviewResult = advanced.result;
+    } else {
     const reviewerSpawnsForHead = (run.telemetry?.events ?? []).filter(
       (event) => event.kind === 'spawn' && event.role === 'reviewer' && event.headSha === reviewHeadSha,
     ).length;
@@ -1169,7 +1200,6 @@ export async function runReviewLoop(
     if (!updateReviewRun(store, run, reviewerSpawn.run)) return staleReviewOutcome(run.id, run, store);
     run = reviewerSpawn.run;
     const reviewerRun = run;
-    let reviewResult: ReviewResult;
     try {
       options.onExecutionStart?.();
       if (!updateReviewRun(store, reviewerRun, reviewerRun)) return staleReviewOutcome(run.id, reviewerRun, store);
@@ -1213,6 +1243,7 @@ export async function runReviewLoop(
     }, {}, 'reviewer', reviewerSpawn.invocationId), now());
     if (!updateReviewRun(store, reviewerRun, completedReview)) return staleReviewOutcome(run.id, reviewerRun, store);
     run = completedReview;
+    }
 
     let postReviewSnapshot: GitHubLiveSnapshot;
     try {
@@ -1225,6 +1256,13 @@ export async function runReviewLoop(
     const afterReview = reviewAdmission(run, postReviewSnapshot, resolveValidationAuthority);
     if (afterReview.kind === 'revalidate') return persistRevalidation(run, afterReview.reason, store, now);
     if (afterReview.kind === 'needs_human') return parkAdmission(run, afterReview.reason, store, now);
+    if (reviewer.native !== undefined) await deps.assertReviewClaim?.(run);
+    if (reviewer.native !== undefined && !reviewer.native.validate({ run: { ...run, reviewResult }, snapshot: postReviewSnapshot, owner: deps.reviewOwner, assertCurrent: () => deps.assertCurrentMutation?.() })) {
+      const reason = 'Native review qualification changed or immutable receipt does not bind this exact Run/candidate.';
+      const parked = parkNativeReview(run, 'qualification', reason, now());
+      if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
+      return { outcome: 'waiting_dependency', run: parked, reason };
+    }
 
     if (reviewResult.headSha !== run.headSha) {
       const reason = `Reviewer returned HEAD ${reviewResult.headSha} for run HEAD ${run.headSha ?? '(none)'}.`;
