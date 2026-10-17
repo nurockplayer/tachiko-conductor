@@ -1,12 +1,12 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
-import { ConfiguredLocalValidationAdapter, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
+import { ConfiguredLocalValidationAdapter, copyDependencyStore, disposePrivateTrees, hasPinnedPnpmAuthority, ignoredManifest } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
 import { TARGET } from './helpers.js';
 
@@ -31,10 +31,75 @@ function preExistingPullRequestRequest() {
   return request();
 }
 
+function linkedWorktreeRequest() {
+  const source = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-linked-source-'));
+  const workspaceParent = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-linked-root-'));
+  const workspacePath = path.join(workspaceParent, 'worktree');
+  // Remove the workspace path from cleanup before its parent so Git's linked
+  // worktree metadata is no longer needed when the fixture is torn down.
+  dirs.push(workspacePath, workspaceParent, source);
+  for (const args of [['init'], ['config', 'user.email', 'validation@example.test'], ['config', 'user.name', 'Validation']]) {
+    assert.equal(spawnSync('git', ['-C', source, ...args], { encoding: 'utf8' }).status, 0);
+  }
+  writeFileSync(path.join(source, 'README.md'), 'validation\n');
+  assert.equal(spawnSync('git', ['-C', source, 'add', 'README.md'], { encoding: 'utf8' }).status, 0);
+  assert.equal(spawnSync('git', ['-C', source, 'commit', '-m', 'initial'], { encoding: 'utf8' }).status, 0);
+  const headSha = spawnSync('git', ['-C', source, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+  assert.equal(spawnSync('git', ['-C', source, 'worktree', 'add', '--detach', workspacePath, headSha], { encoding: 'utf8' }).status, 0);
+  return { target: TARGET, headSha, workspacePath };
+}
+
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 
-function configuration(argv: readonly string[], timeoutMs = 1_000): LocalValidationConfiguration {
+function configuration(argv: readonly string[], timeoutMs = 5_000): LocalValidationConfiguration {
   return { revision: 'test-v1', commands: [{ argv, timeoutMs }] };
+}
+
+function fixtureGroupIsGone(pgid: number): boolean {
+  assert.ok(Number.isSafeInteger(pgid) && pgid > 1 && pgid !== process.pid);
+  try { process.kill(-pgid, 0); return false; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+    throw error;
+  }
+}
+
+async function cleanFixtureGroup(receiptPath: string): Promise<void> {
+  if (!existsSync(receiptPath)) return;
+  const { pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pgid: number };
+  if (fixtureGroupIsGone(pgid)) return;
+  try { process.kill(-pgid, 'SIGKILL'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+  const deadline = Date.now() + 2_000;
+  while (!fixtureGroupIsGone(pgid) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(fixtureGroupIsGone(pgid), true, 'owned fixture group must be reaped before cleanup');
+}
+
+function fixturePrivateTrees(receiptPath: string): string[] {
+  const receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) as { workspace: string; temporary: string };
+  const snapshot = path.dirname(receipt.workspace);
+  const runtime = path.dirname(receipt.temporary);
+  assert.equal(path.basename(receipt.workspace), 'workspace');
+  assert.ok(path.basename(snapshot).startsWith('tachiko-validation-snapshot-'));
+  assert.ok(path.basename(runtime).startsWith('tcv-'));
+  return [snapshot, runtime];
+}
+
+function manifestFixturePrivateTrees(receiptPath: string): string[] {
+  const [, temporary, metadata] = readFileSync(receiptPath, 'utf8').trim().split('\n');
+  assert.ok(temporary && metadata);
+  assert.ok(path.basename(temporary).startsWith('tcv-manifest-'));
+  assert.equal(path.basename(metadata), 'git');
+  assert.ok(path.basename(path.dirname(metadata)).startsWith('tachiko-validation-baseline-'));
+  return [temporary, path.dirname(metadata)];
+}
+
+function normalExitWithDescendant(receiptPath: string, exitCode: number, resistant: boolean, naturalExitMs?: number): string {
+  const ready = `${receiptPath}.ready`;
+  const descendant = `${resistant ? "process.on('SIGTERM',()=>{});" : ''}require('node:fs').writeFileSync(${JSON.stringify(ready)},'ready');${naturalExitMs === undefined ? 'setInterval(()=>{},1000);' : `setTimeout(()=>process.exit(0),${naturalExitMs});`}`;
+  return `const fs=require('node:fs');const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:child.pid,pgid:process.pid,workspace:process.cwd(),temporary:process.env.TMPDIR}));let checks=0;const readiness=setInterval(()=>{if(fs.existsSync(${JSON.stringify(ready)})){clearInterval(readiness);process.exit(${exitCode});}if(++checks>200)process.exit(18);},10);`;
 }
 
 function pinnedPnpm(workspacePath: string, version: string, exitCode = 0): string {
@@ -48,18 +113,102 @@ function pinnedPnpm(workspacePath: string, version: string, exitCode = 0): strin
 }
 
 describe('ConfiguredLocalValidationAdapter', () => {
-  it('runs configured absolute Node and repository-pinned absolute pnpm under the macOS seatbelt', { skip: process.platform !== 'darwin' || !existsSync(path.resolve('node_modules/.bin/pnpm')) }, async () => {
+  it('fails closed when bounded ignored-manifest limits are exceeded', async () => {
     const owned = request();
-    const pnpm = path.resolve('node_modules/.bin/pnpm');
-    writeFileSync(path.join(owned.workspacePath, 'package.json'), JSON.stringify({ packageManager: 'pnpm@10.34.5' }));
-    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'package.json'], { encoding: 'utf8' }).status, 0);
-    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'pin package manager'], { encoding: 'utf8' }).status, 0);
-    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
-    const result = await new ConfiguredLocalValidationAdapter({
-      revision: 'darwin-real-toolchain-v1', nodeProgram: process.execPath, pnpmProgram: pnpm,
-      commands: [{ argv: [pnpm, '--version'], timeoutMs: 30_000 }],
-    }).validate(owned);
-    assert.equal(result.status, 'passed');
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'ignored\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore fixture'], { encoding: 'utf8' }).status, 0);
+    mkdirSync(path.join(owned.workspacePath, 'ignored', 'deep', 'more'), { recursive: true });
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'deep', 'more', 'leaf'), 'deep');
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'tiny'), 'ok');
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'large'), 'x'.repeat(32));
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'sparse'), '');
+    truncateSync(path.join(owned.workspacePath, 'ignored', 'sparse'), 128);
+    const authority = { path: owned.workspacePath, gitDir: path.join(owned.workspacePath, '.git') };
+    assert.notEqual(await ignoredManifest(authority, 'git', { maxEntries: 100, maxDepth: 10, maxFileBytes: 256, maxTotalBytes: 1_024, maxOutputBytes: 1_024 * 1_024 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxEntries: 100, maxDepth: 10, maxFileBytes: 64, maxTotalBytes: 1_024, maxOutputBytes: 1_024 * 1_024 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxEntries: 100, maxDepth: 10, maxFileBytes: 256, maxTotalBytes: 100, maxOutputBytes: 1_024 * 1_024 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxEntries: 1 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxDepth: 1 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxFileBytes: 16 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxTotalBytes: 16 }), null);
+    assert.equal(await ignoredManifest(authority, 'git', { maxOutputBytes: 16 }), null);
+  });
+
+  it('passes selected Windows Git runtime variables to the nested ignored-manifest helper without dispatcher credentials', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'ignored/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore fixture'], { encoding: 'utf8' }).status, 0);
+    mkdirSync(path.join(owned.workspacePath, 'ignored'), { recursive: true });
+    writeFileSync(path.join(owned.workspacePath, 'ignored', 'fixture.txt'), 'fixture\n');
+    const authority = { path: owned.workspacePath, gitDir: path.join(owned.workspacePath, '.git') };
+
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-windows-git-env-'));
+    dirs.push(tools);
+    const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(actualGit, '');
+    const log = path.join(tools, 'git-environment.log');
+    const configuredGit = path.join(tools, 'git');
+    writeFileSync(configuredGit, `#!/bin/sh
+printf 'PATH=%s\\n' "$PATH" >> ${JSON.stringify(log)}
+printf 'SystemRoot=%s\\n' "$SystemRoot" >> ${JSON.stringify(log)}
+printf 'COMSPEC=%s\\n' "$COMSPEC" >> ${JSON.stringify(log)}
+printf 'PATHEXT=%s\\n' "$PATHEXT" >> ${JSON.stringify(log)}
+printf 'GITHUB_TOKEN=%s\\n' "$GITHUB_TOKEN" >> ${JSON.stringify(log)}
+printf 'UNRELATED_DISPATCHER_SECRET=%s\\n' "$UNRELATED_DISPATCHER_SECRET" >> ${JSON.stringify(log)}
+exec ${JSON.stringify(actualGit)} "$@"
+`);
+    chmodSync(configuredGit, 0o755);
+
+    const preload = path.join(tools, 'win32-platform.cjs');
+    writeFileSync(preload, "Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' });\n");
+    const nodeShim = path.join(tools, 'node-win32-shim');
+    writeFileSync(nodeShim, `#!/bin/sh
+exec ${JSON.stringify(process.execPath)} --require ${JSON.stringify(preload)} "$@"
+`);
+    chmodSync(nodeShim, 0o755);
+
+    const selectedPath = path.join(tools, 'selected-windows-path');
+    mkdirSync(selectedPath);
+    const environmentKeys = ['Path', 'PATH', 'SystemRoot', 'COMSPEC', 'PATHEXT', 'GITHUB_TOKEN', 'UNRELATED_DISPATCHER_SECRET'];
+    const inherited = Object.fromEntries(environmentKeys.map((key) => [key, process.env[key]]));
+    const platformDescriptor = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.assign(process.env, {
+      Path: selectedPath,
+      PATH: '/ambient/path-that-must-not-win',
+      SystemRoot: 'C:\\SelectedSystemRoot',
+      COMSPEC: 'C:\\SelectedSystemRoot\\System32\\cmd.exe',
+      PATHEXT: '.COM;.EXE;.BAT;.CMD',
+      GITHUB_TOKEN: 'github-secret',
+      UNRELATED_DISPATCHER_SECRET: 'dispatcher-secret',
+    });
+    try {
+      Object.defineProperty(process, 'platform', { configurable: true, value: 'win32' });
+      const manifest = await ignoredManifest(authority, configuredGit, {
+        nodeProgram: nodeShim,
+        maxEntries: 100,
+        maxDepth: 10,
+        maxFileBytes: 1_024,
+        maxTotalBytes: 1_024,
+        maxOutputBytes: 1_024 * 1_024,
+      });
+      assert.ok(manifest?.some((entry) => entry.includes('ignored/fixture.txt')));
+      const invocationEnvironment = readFileSync(log, 'utf8');
+      assert.match(invocationEnvironment, new RegExp(`PATH=${selectedPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
+      assert.match(invocationEnvironment, /SystemRoot=C:\\SelectedSystemRoot/);
+      assert.match(invocationEnvironment, /COMSPEC=C:\\SelectedSystemRoot\\System32\\cmd\.exe/);
+      assert.match(invocationEnvironment, /PATHEXT=\.COM;\.EXE;\.BAT;\.CMD/);
+      assert.match(invocationEnvironment, /GITHUB_TOKEN=\n/);
+      assert.match(invocationEnvironment, /UNRELATED_DISPATCHER_SECRET=\n/);
+      assert.doesNotMatch(invocationEnvironment, /ambient\/path-that-must-not-win/);
+    } finally {
+      if (platformDescriptor === undefined) delete (process as unknown as { platform?: string }).platform;
+      else Object.defineProperty(process, 'platform', platformDescriptor);
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
   });
 
   it('binds pnpm validation authority to the exact repository packageManager pin', () => {
@@ -76,6 +225,108 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(hasPinnedPnpmAuthority(owned.workspacePath, matching, environment), false);
   });
 
+  it('uses a configured Git executable for validator admission and reconstruction probes', async () => {
+    const owned = request();
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-configured-git-'));
+    dirs.push(tools);
+    const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(actualGit, '');
+    const marker = path.join(tools, 'configured-git-ran');
+    const configuredGit = path.join(tools, 'git');
+    writeFileSync(configuredGit, `#!/bin/sh\n: > ${JSON.stringify(marker)}\nexec ${JSON.stringify(actualGit)} "$@"\n`);
+    chmodSync(configuredGit, 0o755);
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'configured-git-v1', gitProgram: configuredGit,
+      commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(marker), true);
+  });
+
+  it('runs admission, reconstruction, and command-workspace Git probes without dispatcher credentials', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitattributes'), 'README.md text\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitattributes'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'exercise immutable attribute probe'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-sanitized-git-'));
+    dirs.push(tools);
+    const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(actualGit, '');
+    const log = path.join(tools, 'invocations');
+    const configuredGit = path.join(tools, 'git');
+    writeFileSync(configuredGit, `#!/bin/sh
+for key in GITHUB_TOKEN GH_TOKEN SSH_AUTH_SOCK AWS_SECRET_ACCESS_KEY OPENAI_API_KEY PROVIDER_API_TOKEN UNRELATED_DISPATCHER_SECRET GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+  printenv "$key" >/dev/null && exit 92
+done
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+exec ${JSON.stringify(actualGit)} "$@"
+`);
+    chmodSync(configuredGit, 0o755);
+    const inherited = Object.fromEntries(['GITHUB_TOKEN', 'GH_TOKEN', 'SSH_AUTH_SOCK', 'AWS_SECRET_ACCESS_KEY', 'OPENAI_API_KEY', 'PROVIDER_API_TOKEN', 'UNRELATED_DISPATCHER_SECRET', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'].map((key) => [key, process.env[key]]));
+    Object.assign(process.env, {
+      GITHUB_TOKEN: 'github-secret', GH_TOKEN: 'gh-secret', SSH_AUTH_SOCK: '/tmp/agent.sock', AWS_SECRET_ACCESS_KEY: 'provider-secret',
+      OPENAI_API_KEY: 'api-secret', PROVIDER_API_TOKEN: 'provider-token', UNRELATED_DISPATCHER_SECRET: 'dispatcher-secret',
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '!false',
+    });
+    try {
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: 'sanitized-git-reconstruction-v1', gitProgram: configuredGit,
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
+      }).validate(owned);
+      assert.equal(result.status, 'passed');
+      const invocations = readFileSync(log, 'utf8');
+      for (const probe of [' ls-files ', ' rev-parse ', ' clone ', ' remote remove', ' ls-tree ', ' cat-file ', ' checkout ']) {
+        assert.match(` ${invocations}`, new RegExp(probe));
+      }
+    } finally {
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
+  it('runs trusted-baseline admission and settlement Git probes without dispatcher credentials', async () => {
+    const owned = request();
+    const baseline = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-sanitized-git-'));
+    dirs.push(baseline, tools);
+    assert.equal(spawnSync('git', ['clone', owned.workspacePath, baseline], { encoding: 'utf8' }).status, 0);
+    const actualGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.notEqual(actualGit, '');
+    const log = path.join(tools, 'invocations');
+    const configuredGit = path.join(tools, 'git');
+    writeFileSync(configuredGit, `#!/bin/sh
+for key in GITHUB_TOKEN GH_TOKEN SSH_AUTH_SOCK AWS_SECRET_ACCESS_KEY OPENAI_API_KEY PROVIDER_API_TOKEN UNRELATED_DISPATCHER_SECRET GIT_CONFIG_COUNT GIT_CONFIG_KEY_0 GIT_CONFIG_VALUE_0; do
+  printenv "$key" >/dev/null && exit 92
+done
+printf '%s\\n' "$*" >> ${JSON.stringify(log)}
+exec ${JSON.stringify(actualGit)} "$@"
+`);
+    chmodSync(configuredGit, 0o755);
+    const inherited = Object.fromEntries(['GITHUB_TOKEN', 'GH_TOKEN', 'SSH_AUTH_SOCK', 'AWS_SECRET_ACCESS_KEY', 'OPENAI_API_KEY', 'PROVIDER_API_TOKEN', 'UNRELATED_DISPATCHER_SECRET', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0'].map((key) => [key, process.env[key]]));
+    Object.assign(process.env, {
+      GITHUB_TOKEN: 'github-secret', GH_TOKEN: 'gh-secret', SSH_AUTH_SOCK: '/tmp/agent.sock', AWS_SECRET_ACCESS_KEY: 'provider-secret',
+      OPENAI_API_KEY: 'api-secret', PROVIDER_API_TOKEN: 'provider-token', UNRELATED_DISPATCHER_SECRET: 'dispatcher-secret',
+      GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'credential.helper', GIT_CONFIG_VALUE_0: '!false',
+    });
+    try {
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: 'sanitized-git-baseline-v1', gitProgram: configuredGit, trustedIgnoredBaselinePath: baseline,
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
+      }).validate(owned);
+      assert.equal(result.status, 'passed');
+      const invocations = readFileSync(log, 'utf8');
+      assert.match(` ${invocations}`, / ls-files /);
+      assert.match(` ${invocations}`, / rev-parse /);
+      assert.match(` ${invocations}`, / ls-files /);
+    } finally {
+      for (const [key, value] of Object.entries(inherited)) {
+        if (value === undefined) delete process.env[key]; else process.env[key] = value;
+      }
+    }
+  });
+
   it('rejects substituted or mismatched pnpm before a validation command can run', async () => {
     const owned = request('pnpm@10.34.5');
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
@@ -87,14 +338,14 @@ describe('ConfiguredLocalValidationAdapter', () => {
 
     const result = await new ConfiguredLocalValidationAdapter({
       revision: 'pinned-pnpm-gate-v1', pnpmProgram: pnpm,
-      commands: [{ argv: [pnpm, 'test'], timeoutMs: 1_000 }],
+      commands: [{ argv: [pnpm, 'test'], timeoutMs: 5_000 }],
     }).validate(owned);
     assert.equal(result.status, 'unknown');
     assert.equal(existsSync(marker), false);
 
     const substituted = await new ConfiguredLocalValidationAdapter({
       revision: 'substituted-pnpm-gate-v1', pnpmProgram: pnpm,
-      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 }],
+      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 5_000 }],
     }).validate(owned);
     assert.equal(substituted.status, 'unknown');
     assert.equal(substituted.commands[0]?.outcome, 'malformed');
@@ -140,8 +391,11 @@ describe('ConfiguredLocalValidationAdapter', () => {
       // macOS may add __CF_USER_TEXT_ENCODING at exec time. Assert the real
       // denial invariant instead of treating that platform metadata as a
       // credential inherited from the dispatcher.
-      assert.match(environment.HOME!, /tachiko-validation-runtime-/);
-      assert.match(environment.XDG_CACHE_HOME!, /tachiko-validation-runtime-/);
+    assert.match(environment.HOME!, /[/\\]tcv-[^/\\]+[/\\]home$/);
+    assert.match(environment.XDG_CACHE_HOME!, /[/\\]tcv-[^/\\]+[/\\]cache$/);
+    assert.match(environment.TMPDIR!, /[/\\]tcv-[^/\\]+[/\\]tmp$/);
+    assert.equal(environment.TMP, environment.TMPDIR);
+    assert.equal(environment.TEMP, environment.TMPDIR);
       assert.equal(environment.GITHUB_TOKEN, undefined);
       assert.equal(environment.SSH_AUTH_SOCK, undefined);
       assert.equal(environment.CHATGPT_API_KEY, undefined);
@@ -152,6 +406,51 @@ describe('ConfiguredLocalValidationAdapter', () => {
       for (const [key, value] of Object.entries(inherited)) {
         if (value === undefined) delete process.env[key]; else process.env[key] = value;
       }
+    }
+  });
+
+  it('freezes ignored state between commands and admits an authorized terminal generated root only at the end', async () => {
+    const prepareIgnoredDistWorkspace = () => {
+      const owned = request();
+      writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'dist/\n');
+      assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+      assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore build output'], { encoding: 'utf8' }).status, 0);
+      owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+      return owned;
+    };
+    const build = "require('node:fs').mkdirSync('dist', {recursive:true}); require('node:fs').writeFileSync('dist/output.js', 'ok')";
+    for (const root of ['dist/', 'dist//', './dist/']) {
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: `terminal-generated-root-${root.length}-v1`, terminalGeneratedIgnoredRoots: [root],
+        commands: [
+          { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 },
+          { argv: [process.execPath, '-e', build], timeoutMs: 5_000 },
+        ],
+      }).validate(prepareIgnoredDistWorkspace());
+      assert.equal(result.status, 'passed');
+    }
+
+    const rejected = await new ConfiguredLocalValidationAdapter({
+      revision: 'terminal-generated-root-reject-v1', terminalGeneratedIgnoredRoots: ['dist'],
+      commands: [
+        { argv: [process.execPath, '-e', build], timeoutMs: 5_000 },
+        { argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 },
+      ],
+    }).validate(prepareIgnoredDistWorkspace());
+    assert.equal(rejected.status, 'unknown');
+    assert.equal(rejected.commands.length, 2);
+    assert.equal(rejected.commands[1]?.outcome, 'unavailable');
+
+    for (const roots of [['./'], ['../'], ['./../'], ['dist/../../'], ['dist', 'dist/']] as const) {
+      const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-terminal-root-proof-'));
+      dirs.push(proofDir);
+      const marker = path.join(proofDir, 'ran');
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: 'terminal-generated-root-invalid-v1', terminalGeneratedIgnoredRoots: roots,
+        commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 5_000 }],
+      }).validate(request());
+      assert.equal(result.status, 'unknown');
+      assert.equal(existsSync(marker), false);
     }
   });
 
@@ -217,6 +516,74 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(wrongHead.status, 'unknown');
   });
 
+  it('validates an ordinary linked worktree with a .git file indirection', async () => {
+    const owned = linkedWorktreeRequest();
+    assert.equal(readFileSync(path.join(owned.workspacePath, '.git'), 'utf8').startsWith('gitdir:'), true);
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, '-e', 'process.exit(0)']),
+    ).validate(owned);
+    assert.equal(result.status, 'passed');
+  });
+
+  it('accepts a linked worktree as the trusted ignored-state baseline', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'node_modules/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitignore'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'ignore dependencies'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const source = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-source-'));
+    const baselineParent = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-baseline-root-'));
+    const baseline = path.join(baselineParent, 'worktree');
+    dirs.push(baseline, baselineParent, source);
+    assert.equal(spawnSync('git', ['clone', owned.workspacePath, source], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', source, 'worktree', 'add', '--detach', baseline, owned.headSha], { encoding: 'utf8' }).status, 0);
+    assert.equal(readFileSync(path.join(baseline, '.git'), 'utf8').startsWith('gitdir:'), true);
+    for (const workspace of [owned.workspacePath, baseline]) {
+      mkdirSync(path.join(workspace, 'node_modules', 'trusted'), { recursive: true });
+      writeFileSync(path.join(workspace, 'node_modules', 'trusted', 'index.js'), 'module.exports = true\n');
+    }
+    const marker = path.join(baselineParent, 'validation-ran');
+    const result = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+      trustedIgnoredBaselinePath: baseline,
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(existsSync(marker), true);
+  });
+
+  it('rejects tracked drift despite worker Git replace, worktree, or include metadata', async () => {
+    for (const mode of ['replace', 'worktree', 'include'] as const) {
+      const owned = request();
+      const proofDir = mkdtempSync(path.join(os.tmpdir(), `tachiko-git-${mode}-proof-`));
+      dirs.push(proofDir);
+      const marker = path.join(proofDir, 'validation-ran');
+      const replacementWorktree = path.join(proofDir, 'replacement-worktree');
+      mkdirSync(replacementWorktree);
+      if (mode === 'replace') {
+        const tree = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD^{tree}'], { encoding: 'utf8' }).stdout.trim();
+        const replacement = spawnSync('git', ['-C', owned.workspacePath, 'commit-tree', tree, '-m', 'replacement'], {
+          encoding: 'utf8', env: { ...process.env, GIT_AUTHOR_NAME: 'Validation', GIT_AUTHOR_EMAIL: 'validation@example.test', GIT_COMMITTER_NAME: 'Validation', GIT_COMMITTER_EMAIL: 'validation@example.test' },
+        }).stdout.trim();
+        assert.match(replacement, /^[0-9a-f]{40}$/);
+        assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'replace', owned.headSha, replacement], { encoding: 'utf8' }).status, 0);
+      } else {
+        const config = path.join(owned.workspacePath, '.git', 'config');
+        const include = path.join(proofDir, 'included-config');
+        if (mode === 'worktree') writeFileSync(config, `${readFileSync(config, 'utf8')}\n[core]\n\tworktree = ${replacementWorktree}\n`);
+        else {
+          writeFileSync(include, `[core]\n\tworktree = ${replacementWorktree}\n`);
+          writeFileSync(config, `${readFileSync(config, 'utf8')}\n[include]\n\tpath = ${include}\n`);
+        }
+      }
+      writeFileSync(path.join(owned.workspacePath, 'README.md'), `${mode} hidden drift\n`);
+      const result = await new ConfiguredLocalValidationAdapter(
+        configuration([process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`]),
+      ).validate(owned);
+      assert.equal(result.status, 'unknown', mode);
+      assert.equal(existsSync(marker), false, mode);
+    }
+  });
+
   it('never executes a candidate-planted fsmonitor while verifying validation Git metadata', async () => {
     const owned = request();
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
@@ -241,8 +608,8 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const result = await new ConfiguredLocalValidationAdapter({
       revision: 'untracked-command-v1',
       commands: [
-        { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('worker-created-source.js', 'unexpected')"], timeoutMs: 1_000 },
-        { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 1_000 },
+        { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('worker-created-source.js', 'unexpected')"], timeoutMs: 5_000 },
+        { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 5_000 },
       ],
     }).validate(owned);
     assert.equal(result.status, 'unknown');
@@ -262,22 +629,202 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-offline-pnpm-'));
     dirs.push(artifact, tools);
     mkdirSync(path.join(artifact, 'store'));
+    writeFileSync(path.join(artifact, 'store', 'trusted'), 'immutable');
     writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
     const pnpm = path.join(tools, 'pnpm');
     const marker = path.join(tools, 'validated');
-    writeFileSync(pnpm, `#!/bin/sh\n[ \"$npm_config_offline\" = true ] && [ \"$npm_config_store_dir\" = ${JSON.stringify(path.join(artifact, 'store'))} ] || exit 91\nmkdir -p node_modules/fixture\nprintf fixture > node_modules/fixture/index.js\n`);
+    writeFileSync(pnpm, `#!/bin/sh\n[ \"$npm_config_offline\" = true ] && [ \"$npm_config_store_dir\" != ${JSON.stringify(path.join(artifact, 'store'))} ] && [ -f \"$npm_config_store_dir/trusted\" ] || exit 91\nprintf changed > \"$npm_config_store_dir/trusted\"\nmkdir -p node_modules/fixture\nprintf fixture > node_modules/fixture/index.js\n`);
     chmodSync(pnpm, 0o755);
     const result = await new ConfiguredLocalValidationAdapter({
       revision: 'cold-offline-fixture-v1', dependencyArtifactPath: artifact,
       commands: [
-        { argv: [pnpm], timeoutMs: 1_000 },
-        { argv: ['/bin/sh', '-c', `[ -f node_modules/fixture/index.js ] && : > ${JSON.stringify(marker)}`], timeoutMs: 1_000 },
+        { argv: [pnpm], timeoutMs: 5_000 },
+        { argv: ['/bin/sh', '-c', `[ -f node_modules/fixture/index.js ] && : > ${JSON.stringify(marker)}`], timeoutMs: 5_000 },
       ],
     }).validate({ ...owned, headSha });
     assert.equal(result.status, 'passed');
     assert.equal(existsSync(marker), true);
+    assert.equal(readFileSync(path.join(artifact, 'store', 'trusted'), 'utf8'), 'immutable');
     writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), '0'.repeat(64));
-    assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 1_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
+    assert.equal((await new ConfiguredLocalValidationAdapter({ revision: 'mismatch-v1', dependencyArtifactPath: artifact, commands: [{ argv: [pnpm], timeoutMs: 5_000 }] }).validate({ ...owned, headSha })).status, 'unknown');
+  });
+
+  it('copies dependency artifacts in a child process without dereferencing links', async () => {
+    const source = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-source-'));
+    const destinationRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-destination-'));
+    dirs.push(source, destinationRoot);
+    writeFileSync(path.join(source, 'host-artifact'), 'immutable host bytes');
+    symlinkSync('host-artifact', path.join(source, 'artifact-link'));
+
+    const destination = path.join(destinationRoot, 'store');
+    assert.equal(await copyDependencyStore(source, destination), true);
+    assert.equal(readFileSync(path.join(destination, 'host-artifact'), 'utf8'), 'immutable host bytes');
+    assert.equal(readlinkSync(path.join(destination, 'artifact-link')), 'host-artifact');
+    writeFileSync(path.join(destination, 'host-artifact'), 'private mutation');
+    assert.equal(readFileSync(path.join(source, 'host-artifact'), 'utf8'), 'immutable host bytes');
+    assert.equal(readlinkSync(path.join(source, 'artifact-link')), 'host-artifact');
+    assert.equal(await copyDependencyStore(path.join(source, 'missing'), path.join(destinationRoot, 'failed-store')), false);
+  });
+
+  it('bounds a stalled copy child without blocking the event loop and waits for its process group', async () => {
+    const source = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-stall-source-'));
+    const destinationRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-stall-destination-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-stall-tool-'));
+    dirs.push(source, destinationRoot, tools);
+    const pidFile = path.join(tools, 'copier.pid');
+    const stalledCopier = path.join(tools, 'stalled-copier');
+    writeFileSync(stalledCopier, `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\ntrap '' TERM\nwhile :; do :; done\n`);
+    chmodSync(stalledCopier, 0o755);
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 10);
+    const startedAt = Date.now();
+    try {
+      assert.equal(await copyDependencyStore(source, path.join(destinationRoot, 'store'), { nodeProgram: stalledCopier, timeoutMs: 1_000 }), false);
+    } finally {
+      clearInterval(ticker);
+    }
+    assert.ok(ticks > 0);
+    assert.ok(Date.now() - startedAt < 5_000);
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    assert.ok(Number.isSafeInteger(pid));
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+  });
+
+  it('cleans every owned private tree in one bounded child invocation', async () => {
+    const first = mkdtempSync(path.join(os.tmpdir(), 'tachiko-clean-first-'));
+    const second = mkdtempSync(path.join(os.tmpdir(), 'tachiko-clean-second-'));
+    dirs.push(first, second);
+    writeFileSync(path.join(first, 'first'), 'private');
+    mkdirSync(path.join(second, 'nested'));
+    writeFileSync(path.join(second, 'nested', 'second'), 'private');
+    assert.equal(await disposePrivateTrees([first, second]), true);
+    assert.equal(existsSync(first), false);
+    assert.equal(existsSync(second), false);
+  });
+
+  it('rejects unsafe cleanup targets before invoking a child', async () => {
+    for (const targets of [[], ['relative-path'], [path.parse(process.cwd()).root], ['/tmp/invalid\0path']]) {
+      assert.equal(await disposePrivateTrees(targets), false);
+    }
+  });
+
+  it('bounds a stalled cleanup child while the event loop remains responsive', async () => {
+    const privateTree = mkdtempSync(path.join(os.tmpdir(), 'tachiko-clean-stall-tree-'));
+    const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-clean-stall-tool-'));
+    dirs.push(privateTree, tools);
+    const pidFile = path.join(tools, 'cleaner.pid');
+    const stalledCleaner = path.join(tools, 'stalled-cleaner');
+    writeFileSync(stalledCleaner, `#!/bin/sh\necho $$ > ${JSON.stringify(pidFile)}\ntrap '' TERM\nwhile :; do :; done\n`);
+    chmodSync(stalledCleaner, 0o755);
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 10);
+    const startedAt = Date.now();
+    try {
+      assert.equal(await disposePrivateTrees([privateTree], { nodeProgram: stalledCleaner, timeoutMs: 1_000 }), false);
+    } finally {
+      clearInterval(ticker);
+    }
+    assert.ok(ticks > 0);
+    assert.ok(Date.now() - startedAt < 5_000);
+    assert.equal(existsSync(pidFile), true);
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    assert.ok(Number.isSafeInteger(pid));
+    assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+  });
+
+  it('fails closed when private cleanup cannot be proven after passed commands', async () => {
+    const owned = request();
+    const attempted: string[][] = [];
+    const result = await new ConfiguredLocalValidationAdapter(
+      configuration([process.execPath, '-e', 'process.exit(0)']),
+      undefined,
+      async (paths) => { attempted.push([...paths]); return false; },
+    ).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.commands[0]?.outcome, 'passed');
+    assert.equal(result.commands[1]?.outcome, 'unavailable');
+    assert.equal(attempted.length, 1);
+    assert.equal(attempted[0]?.length, 2);
+    for (const privateTree of attempted[0]!) {
+      assert.equal(existsSync(privateTree), true);
+      dirs.push(privateTree);
+    }
+  });
+
+  it('removes its snapshot when validation returns before creating its runtime', async () => {
+    const owned = request();
+    const attempted: string[][] = [];
+    const result = await new ConfiguredLocalValidationAdapter({
+      ...configuration([process.execPath, '-e', 'process.exit(0)']), playwrightBrowsersPath: 'relative-path',
+    }, undefined, async (paths) => {
+      attempted.push([...paths]);
+      dirs.push(...paths);
+      return disposePrivateTrees(paths);
+    }).validate(owned);
+    assert.equal(result.status, 'unknown');
+    assert.equal(attempted.length, 1);
+    assert.equal(attempted[0]?.length, 1);
+    assert.equal(existsSync(attempted[0]![0]!), false);
+  });
+
+  for (const copyOutcome of ['failed', 'timed_out'] as const) it(`reports unavailable ${copyOutcome} copy evidence before commands and removes its private runtime`, async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', 'pnpm-lock.yaml'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'lock dependency graph'], { encoding: 'utf8' }).status, 0);
+    const headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const artifact = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-failure-artifact-'));
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-copy-failure-proof-'));
+    dirs.push(artifact, proof);
+    mkdirSync(path.join(artifact, 'store'));
+    writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
+    const marker = path.join(proof, 'candidate-ran');
+    const copier = path.join(proof, 'copier');
+    const copierStarted = path.join(proof, 'copier-started');
+    writeFileSync(copier, `#!/bin/sh\n: > ${JSON.stringify(copierStarted)}\n${copyOutcome === 'failed' ? 'exit 17' : "trap '' TERM\nwhile :; do :; done"}\n`);
+    chmodSync(copier, 0o755);
+    let privateStore: string | undefined;
+    const adapter = new ConfiguredLocalValidationAdapter({
+      revision: 'copy-failure-v1', dependencyArtifactPath: artifact,
+      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`], timeoutMs: 5_000 }],
+    }, async (_source, destination) => {
+      privateStore = destination;
+      mkdirSync(destination);
+      writeFileSync(path.join(destination, 'partial'), 'partial copy');
+      return copyDependencyStore(_source, destination, { nodeProgram: copier, timeoutMs: 1_000 });
+    });
+
+    const result = await adapter.validate({ ...owned, headSha });
+    assert.equal(result.status, 'unknown');
+    assert.equal(result.commands[0]?.outcome, 'unavailable');
+    assert.equal(existsSync(copierStarted), true);
+    assert.equal(existsSync(marker), false);
+    assert.notEqual(privateStore, undefined);
+    assert.equal(existsSync(path.dirname(privateStore!)), false);
+  });
+
+  it('admits only explicitly configured workspace dependency roots and freezes their bytes', async () => {
+    const owned = request();
+    writeFileSync(path.join(owned.workspacePath, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    writeFileSync(path.join(owned.workspacePath, '.gitignore'), 'node_modules/\n');
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.'], { encoding: 'utf8' }).status, 0);
+    assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'workspace dependency fixture'], { encoding: 'utf8' }).status, 0);
+    owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+    const artifact = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workspace-artifact-'));
+    dirs.push(artifact);
+    mkdirSync(path.join(artifact, 'store'));
+    writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update('lockfileVersion: 9.0\n').digest('hex'));
+    const roots = ['node_modules', 'apps/example/node_modules'];
+    const hydrate = { argv: [process.execPath, '-e', `const fs=require('node:fs'); for(const root of ${JSON.stringify(roots)}) {fs.mkdirSync(root,{recursive:true});fs.writeFileSync(root+'/fixture.js','frozen');}`], timeoutMs: 5_000 };
+    const config = { revision: 'workspace-hydration-v1', dependencyArtifactPath: artifact, commands: [hydrate] };
+    assert.equal((await new ConfiguredLocalValidationAdapter(config).validate(owned)).status, 'unknown');
+    assert.equal((await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: roots }).validate(owned)).status, 'passed');
+    const changed = { argv: [process.execPath, '-e', "require('node:fs').writeFileSync('apps/example/node_modules/fixture.js','changed')"], timeoutMs: 5_000 };
+    assert.equal((await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: roots, commands: [hydrate, changed] }).validate(owned)).status, 'unknown');
+    for (const invalid of [['../node_modules'], ['apps/../node_modules'], ['dist'], []]) {
+      const result = await new ConfiguredLocalValidationAdapter({ ...config, hydratedDependencyRoots: invalid }).validate(owned);
+      assert.equal(result.commands[0]?.outcome, 'malformed');
+    }
   });
 
   it('uses a dedicated reconstruction budget rather than a short validation-command timeout', async () => {
@@ -287,21 +834,16 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     assert.notEqual(realGit, '');
     const wrapper = path.join(wrapperDir, 'git');
-    writeFileSync(wrapper, `#!/bin/sh\nif [ "$1" = clone ]; then sleep 1.5; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
+    const delayedClone = path.join(wrapperDir, 'clone-delayed');
+    writeFileSync(wrapper, `#!/bin/sh\nfor argument in "$@"; do\n  if [ "$argument" = clone ]; then sleep 1.1; : > ${JSON.stringify(delayedClone)}; break; fi\ndone\nexec ${JSON.stringify(realGit)} "$@"\n`);
     chmodSync(wrapper, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
-    try {
-      const nativeTrue = '/usr/bin/true';
-      assert.ok(existsSync(nativeTrue), `expected local absolute native no-op at ${nativeTrue}`);
-      const result = await new ConfiguredLocalValidationAdapter(
-        configuration([nativeTrue], 100),
-      ).validate(owned);
-      assert.equal(result.status, 'passed', JSON.stringify(result.commands));
-    } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
-    }
+    const nativeTrue = '/usr/bin/true';
+    assert.ok(existsSync(nativeTrue), `expected local absolute native no-op at ${nativeTrue}`);
+    const result = await new ConfiguredLocalValidationAdapter({
+      ...configuration([nativeTrue], 100), gitProgram: wrapper,
+    }).validate(owned);
+    assert.equal(result.status, 'passed', JSON.stringify(result.commands));
+    assert.equal(existsSync(delayedClone), true);
   });
 
   it('uses a dedicated ignored-manifest budget rather than the short Git probe timeout', async () => {
@@ -311,21 +853,16 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
     assert.notEqual(realGit, '');
     const wrapper = path.join(wrapperDir, 'git');
-    writeFileSync(wrapper, `#!/bin/sh\ncase " $* " in *" status "*) sleep 1.1 ;; esac\nexec ${JSON.stringify(realGit)} "$@"\n`);
+    const delayedStatus = path.join(wrapperDir, 'status-delayed');
+    writeFileSync(wrapper, `#!/bin/sh\ncase " $* " in *" status "*) sleep 1.1; : > ${JSON.stringify(delayedStatus)} ;; esac\nexec ${JSON.stringify(realGit)} "$@"\n`);
     chmodSync(wrapper, 0o755);
-    const originalPath = process.env.PATH;
-    process.env.PATH = `${wrapperDir}${path.delimiter}${originalPath ?? ''}`;
-    try {
-      const nativeTrue = '/usr/bin/true';
-      assert.ok(existsSync(nativeTrue), `expected local absolute native no-op at ${nativeTrue}`);
-      const result = await new ConfiguredLocalValidationAdapter(
-        configuration([nativeTrue], 100),
-      ).validate(owned);
-      assert.equal(result.status, 'passed', JSON.stringify(result.commands));
-    } finally {
-      if (originalPath === undefined) delete process.env.PATH;
-      else process.env.PATH = originalPath;
-    }
+    const nativeTrue = '/usr/bin/true';
+    assert.ok(existsSync(nativeTrue), `expected local absolute native no-op at ${nativeTrue}`);
+    const result = await new ConfiguredLocalValidationAdapter({
+      ...configuration([nativeTrue], 100), gitProgram: wrapper,
+    }).validate(owned);
+    assert.equal(result.status, 'passed', JSON.stringify(result.commands));
+    assert.equal(existsSync(delayedStatus), true);
   });
 
   it('does not authorize worker-controlled .git bytes through a tracked validation script', async () => {
@@ -392,7 +929,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(existsSync(marker), false);
   });
 
-  it('rejects tracked filter attributes before snapshot checkout can invoke an ambient smudge command', async () => {
+  it('rejects tracked filter attributes before snapshot checkout can invoke ambient clean or smudge commands', async () => {
     const owned = request();
     const proofDir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-proof-'));
     dirs.push(proofDir);
@@ -401,7 +938,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const globalConfig = path.join(proofDir, 'gitconfig');
     writeFileSync(smudge, `#!/bin/sh\ntouch ${JSON.stringify(marker)}\ncat\n`);
     chmodSync(smudge, 0o755);
-    writeFileSync(globalConfig, `[filter "marker"]\n\tsmudge = ${JSON.stringify(smudge)}\n`);
+    writeFileSync(globalConfig, `[filter "marker"]\n\tclean = ${JSON.stringify(smudge)}\n\tsmudge = ${JSON.stringify(smudge)}\n`);
     writeFileSync(path.join(owned.workspacePath, '.gitattributes'), 'probe.txt filter=marker\n');
     writeFileSync(path.join(owned.workspacePath, 'probe.txt'), 'candidate bytes\n');
     assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.gitattributes', 'probe.txt'], { encoding: 'utf8' }).status, 0);
@@ -553,7 +1090,7 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const adapter = new ConfiguredLocalValidationAdapter({
       revision: 'pre-existing-pr-v1',
       workspacePath: existing.workspacePath,
-      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(cwdProof)}, process.cwd())`], timeoutMs: 1_000 }],
+      commands: [{ argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(cwdProof)}, process.cwd())`], timeoutMs: 5_000 }],
     });
     const result = await adapter.validate({ target: TARGET, headSha: existing.headSha });
     assert.equal(result.status, 'passed');
@@ -563,11 +1100,193 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(
       (await new ConfiguredLocalValidationAdapter({
         revision: 'wrong-repository-v1', workspacePath: existing.workspacePath,
-        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 1_000 }],
+        commands: [{ argv: [process.execPath, '-e', 'process.exit(0)'], timeoutMs: 5_000 }],
       }).validate({ target: { ...TARGET, repo: 'other' }, headSha: existing.headSha })).status,
       'unknown',
     );
   });
+
+  it('allows a normally exiting group to settle naturally within the bounded grace', { skip: process.platform === 'win32' }, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-natural-exit-group-'));
+    dirs.push(proof);
+    const receiptPath = path.join(proof, 'owned.json');
+    try {
+      const result = await new ConfiguredLocalValidationAdapter(configuration([
+        process.execPath, '-e', normalExitWithDescendant(receiptPath, 0, false, 150),
+      ])).validate(owned);
+      assert.equal(result.status, 'passed', JSON.stringify(result));
+      assert.equal(result.commands[0]?.outcome, 'passed');
+      const { pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pgid: number };
+      assert.equal(fixtureGroupIsGone(pgid), true);
+    } finally {
+      await cleanFixtureGroup(receiptPath);
+      if (existsSync(receiptPath)) {
+        dirs.push(...fixturePrivateTrees(receiptPath));
+      }
+    }
+  });
+
+  it('waits through transient group probes after close without requiring termination', { skip: process.platform === 'win32' }, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-transient-group-probes-'));
+    dirs.push(proof);
+    const receiptPath = path.join(proof, 'owned.json');
+    const actualKill = process.kill;
+    let pendingProbes = 3;
+    let interventions = 0;
+    process.kill = (pid, signal) => {
+      if (existsSync(receiptPath) && pid === -Number(JSON.parse(readFileSync(receiptPath, 'utf8')).pgid)) {
+        if (signal === 0 && pendingProbes-- > 0) return true;
+        if (signal !== 0) interventions += 1;
+      }
+      return actualKill(pid, signal);
+    };
+    try {
+      const result = await new ConfiguredLocalValidationAdapter(configuration([
+        process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pgid:process.pid}))`,
+      ])).validate(owned);
+      assert.equal(result.status, 'passed', JSON.stringify(result));
+      assert.ok(pendingProbes < 0, 'natural settlement polls through the transient group');
+      assert.equal(interventions, 0, 'natural settlement must not terminate the group');
+    } finally { process.kill = actualKill; await cleanFixtureGroup(receiptPath); }
+  });
+
+  it('retains private command trees and blocks later commands when group absence cannot be proved', { skip: process.platform === 'win32' }, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-unproven-exit-group-'));
+    dirs.push(proof);
+    const receiptPath = path.join(proof, 'owned.json');
+    const laterCommand = path.join(proof, 'later-command');
+    const actualKill = process.kill;
+    let cleanupCalls = 0;
+    let refusedProbes = 0;
+    process.kill = (pid, signal) => {
+      if (existsSync(receiptPath)) {
+        const { pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pgid: number };
+        if (pid === -pgid) {
+          refusedProbes += 1;
+          throw Object.assign(new Error('owned fixture group probe is unavailable'), { code: 'EPERM' });
+        }
+      }
+      return actualKill(pid, signal);
+    };
+    try {
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: 'unproven-exit-group-v1', commands: [
+          { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pgid:process.pid,workspace:process.cwd(),temporary:process.env.TMPDIR}))`], timeoutMs: 5_000 },
+          { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(laterCommand)},'ran')`], timeoutMs: 5_000 },
+        ],
+      }, undefined, async (paths) => { cleanupCalls += 1; return disposePrivateTrees(paths); }).validate(owned);
+      const retainedTrees = fixturePrivateTrees(receiptPath);
+      dirs.push(...retainedTrees);
+      assert.equal(result.status, 'unknown', JSON.stringify(result));
+      assert.equal(result.commands[0]?.outcome, 'unavailable');
+      assert.equal(result.commands[0]?.exitCode, null);
+      assert.equal(existsSync(laterCommand), false);
+      assert.equal(cleanupCalls, 0, 'uncertainty cannot initiate destructive cleanup');
+      assert.ok(refusedProbes > 1);
+      for (const tree of retainedTrees) assert.equal(existsSync(tree), true);
+    } finally {
+      process.kill = actualKill;
+      await cleanFixtureGroup(receiptPath);
+      if (existsSync(receiptPath)) {
+        dirs.push(...fixturePrivateTrees(receiptPath));
+      }
+    }
+  });
+
+  it('propagates unproved manifest-group settlement through admission without deleting its private trees', { skip: process.platform === 'win32' }, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-unproven-manifest-group-'));
+    dirs.push(proof);
+    const receiptPath = path.join(proof, 'owned.txt');
+    const git = path.join(proof, 'git');
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.ok(path.isAbsolute(realGit));
+    writeFileSync(git, `#!/bin/sh
+metadata=
+for argument in "$@"; do
+  case "$argument" in --git-dir=*) metadata=\${argument#--git-dir=} ;; esac
+done
+case " $* " in *" status "*) printf '%s\\n%s\\n%s\\n' "$PPID" "$PWD" "$metadata" > ${JSON.stringify(receiptPath)} ;; esac
+exec ${JSON.stringify(realGit)} "$@"
+`);
+    chmodSync(git, 0o755);
+    const actualKill = process.kill;
+    let refusedProbes = 0;
+    process.kill = (pid, signal) => {
+      if (existsSync(receiptPath) && pid === -Number(readFileSync(receiptPath, 'utf8').split('\n')[0])) {
+        refusedProbes += 1;
+        throw Object.assign(new Error('owned manifest group probe is unavailable'), { code: 'EPERM' });
+      }
+      return actualKill(pid, signal);
+    };
+    try {
+      const result = await new ConfiguredLocalValidationAdapter({
+        ...configuration([process.execPath, '-e', 'process.exit(0)']), gitProgram: git,
+      }).validate(owned);
+      const [, temporary, metadata] = readFileSync(receiptPath, 'utf8').trim().split('\n');
+      assert.ok(temporary && metadata);
+      dirs.push(...manifestFixturePrivateTrees(receiptPath));
+      assert.equal(result.status, 'unknown', JSON.stringify(result));
+      assert.equal(result.commands[0]?.outcome, 'unavailable');
+      assert.ok(refusedProbes > 1);
+      assert.equal(existsSync(path.join(temporary, 'result.json')), true);
+      assert.equal(existsSync(metadata), true, 'admission cannot delete metadata used by an unproved helper group');
+    } finally {
+      process.kill = actualKill;
+      if (existsSync(receiptPath)) {
+        const [pgid] = readFileSync(receiptPath, 'utf8').trim().split('\n');
+        assert.equal(fixtureGroupIsGone(Number(pgid)), true);
+        dirs.push(...manifestFixturePrivateTrees(receiptPath));
+      }
+    }
+  });
+
+  for (const [exitCode, resistant] of [[0, false], [0, true], [7, true]] as const) {
+    it(`settles a ${resistant ? 'signal-resistant' : 'persistent'} owned descendant after normal exit ${exitCode} before cleanup`, { skip: process.platform === 'win32' }, async () => {
+      const owned = request();
+      const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-normal-exit-group-'));
+      dirs.push(proof);
+      const receiptPath = path.join(proof, 'owned.json');
+      const laterCommand = path.join(proof, 'later-command');
+      const cleanedTrees: string[] = [];
+      let cleanupSawSettledGroup = false;
+      try {
+        const result = await new ConfiguredLocalValidationAdapter({
+          revision: 'normal-exit-group-v1',
+          commands: [
+            { argv: [process.execPath, '-e', normalExitWithDescendant(receiptPath, exitCode, resistant)], timeoutMs: 5_000 },
+            { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(laterCommand)},'ran')`], timeoutMs: 5_000 },
+          ],
+        }, undefined, async (paths) => {
+          cleanedTrees.push(...paths);
+          dirs.push(...paths);
+          const { pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pgid: number };
+          cleanupSawSettledGroup = fixtureGroupIsGone(pgid);
+          return disposePrivateTrees(paths);
+        }).validate(owned);
+        assert.equal(result.status, exitCode === 0 ? 'unknown' : 'failed', JSON.stringify(result));
+        assert.equal(result.commands.length, 1, JSON.stringify(result));
+        assert.equal(result.commands[0]?.outcome, exitCode === 0 ? 'unavailable' : 'failed');
+        assert.equal(result.commands[0]?.exitCode, exitCode === 0 ? null : 7);
+        assert.equal(existsSync(laterCommand), false);
+        assert.equal(cleanupSawSettledGroup, true);
+        assert.equal(cleanedTrees.length, 2);
+        for (const tree of cleanedTrees) assert.equal(existsSync(tree), false);
+        const { pid, pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pid: number; pgid: number };
+        assert.ok(Number.isSafeInteger(pid) && pid > 1);
+        assert.equal(fixtureGroupIsGone(pgid), true);
+        assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+      } finally {
+        await cleanFixtureGroup(receiptPath);
+        if (existsSync(receiptPath)) {
+          dirs.push(...fixturePrivateTrees(receiptPath));
+        }
+      }
+    });
+  }
 
   it('forces a signal-resistant command to settle after the bounded grace period', async () => {
     const startedAt = Date.now();
@@ -628,6 +1347,9 @@ describe('ConfiguredLocalValidationAdapter', () => {
     ).validate(request());
 
     assert.equal((await malformed).status, 'unknown');
-    assert.equal((await unavailable).status, 'unknown');
+    const missingExecutable = await unavailable;
+    assert.equal(missingExecutable.status, 'unknown');
+    assert.equal(missingExecutable.commands[0]?.outcome, 'unavailable');
+    assert.equal(missingExecutable.commands[0]?.exitCode, null);
   });
 });

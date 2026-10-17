@@ -1,6 +1,13 @@
 import path from 'node:path';
 
 export const integrationTest = 'browser-runtime-integration.test.ts';
+// These tests require genuine TCP listeners or host sandbox context unavailable in production.
+export const isolatedExcludedTests = Object.freeze([
+  'browser-bootstrap-client.test.ts',
+  'browser-runtime.test.ts',
+  'control-tower-browser.test.ts',
+  'local-command-sandbox.test.ts',
+]);
 export const smokeTiers = new Map([
   ['smoke:claude', { test: 'claude-code-smoke.test.ts', environment: 'TACHIKO_SMOKE' }],
   ['smoke:codex', { test: 'codex-cli-smoke.test.ts', environment: 'TACHIKO_CODEX_SMOKE' }],
@@ -9,9 +16,13 @@ export const smokeTiers = new Map([
 ]);
 
 export function selectTests(tier, allTests) {
-  if (tier === 'unit') {
+  if (tier === 'unit' || tier === 'isolated') {
     const smokeTests = new Set([...smokeTiers.values()].map(({ test }) => test));
-    return allTests.filter((test) => test !== integrationTest && !smokeTests.has(test));
+    const excludedTests = new Set([integrationTest, ...smokeTests]);
+    if (tier === 'isolated') {
+      for (const test of isolatedExcludedTests) excludedTests.add(test);
+    }
+    return allTests.filter((test) => !excludedTests.has(test));
   }
   if (tier === 'integration') return [integrationTest];
 
@@ -21,6 +32,11 @@ export function selectTests(tier, allTests) {
 }
 
 export function environmentForTier(tier, inherited = process.env) {
+  if (tier === 'isolated') {
+    // Test-owned account identity follows the private fixture HOME, including
+    // fresh Node children. Replace inherited options with this sole fixed import.
+    return { ...inherited, NODE_OPTIONS: `--import=${new URL('../tests/fixtures/isolated-lock-preload.mjs', import.meta.url).href}` };
+  }
   const smoke = smokeTiers.get(tier);
   return smoke === undefined ? inherited : { ...inherited, [smoke.environment]: '1' };
 }

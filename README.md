@@ -254,6 +254,7 @@ pnpm exec tsx src/cli.ts dispatch launchd render \
   --program '/absolute/path/to/run-dispatch-driver.sh' \
   --node-program '/stable/absolute/path/to/node' \
   --pnpm-program '/stable/absolute/path/to/pnpm' \
+  --git-program '/stable/absolute/path/to/git' \
   --dependency-artifact-path '/absolute/path/to/lockfile-bound-pnpm-artifact' \
   --luna-codex-home '/absolute/path/to/luna-codex-home' \
   --playwright-browsers-path '/absolute/path/to/playwright-artifacts' \
@@ -480,24 +481,76 @@ operator configuration: Conductor parks before validation or review executes.
 `scripts/issue-104-production-policy.sh` is the checked-in, revisioned
 reboot-safe policy source for the qualified Luna lane. It pins `routine` to
 `luna-isolated` / `gpt-5.6-luna`, an absolute `TACHIKO_LUNA_CODEX_HOME`,
-frozen-lockfile `pnpm` hydration plus test/typecheck/build in the reconstructed
+frozen-lockfile `pnpm` hydration plus `test:isolated`/typecheck/build in the reconstructed
 exact candidate, and the hosted-check policy. Luna rejects `standard`,
 `complex`, and `critical` before provider construction; they are not quiet
 fallback routes.
 
-From a stable merged checkout, set `TACHIKO_NODE_PROGRAM` and
-`TACHIKO_PNPM_PROGRAM` to the host-provisioned absolute Node and pnpm paths,
-and `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` to a private host-created directory
+The repository pins Node.js **24.21.0 LTS (Krypton)** in `.node-version` and supports the current Node 24 LTS line from 24.21.0 onward. Production preflight rejects older Node releases and non-24 majors.
+
+From a stable merged checkout, set `TACHIKO_NODE_PROGRAM`,
+`TACHIKO_PNPM_PROGRAM`, and `TACHIKO_GIT_PROGRAM` to the host-provisioned absolute Node, pnpm, and Git paths.
+Git must use the qualified Apple Command Line Tools runtime: its credential-free
+`--exec-path` probe must resolve exactly to `/Library/Developer/CommandLineTools/usr/libexec/git-core`.
+Direct CLT Git, `/usr/bin/git` selecting CLT, and wrappers selecting that same runtime are supported;
+Homebrew Git and other installations are rejected before production activation because their runtime dependencies are not qualified for this sandbox.
+Set `TACHIKO_PNPM_DEPENDENCY_ARTIFACT` to a private host-created directory
 containing `store/` and `pnpm-lock.yaml.sha256` (the SHA-256 of the candidate
 lockfile),
-then run `scripts/issue-104-deploy.sh preflight`. This reads only local policy
-and the qualified Luna config—no GitHub, pnpm install, or model turn. The
+then run `scripts/issue-104-deploy.sh preflight`. This reads local policy
+and the qualified Luna config and probes Git without credentials; it makes no GitHub request, pnpm install, or model turn. The
+offline hydration is host-owned and allows exactly `node_modules` and
+`apps/control-tower/node_modules` as dependency roots.
 production validator executes pnpm only by that explicit path, under macOS
-`sandbox-exec` with network and default filesystem access denied. The store is
-read-only to candidate code and hydration is offline; a missing, dirty, or
+`sandbox-exec` with IP networking and default filesystem access denied. A fresh
+private copy of the lockfile-bound store permits pnpm's project metadata writes;
+the host artifact remains read-only and hydration is offline. Fixed macOS
+loader metadata, tool executables, and Unix sockets under the private runtime
+root are admitted; host homes and sockets remain outside the boundary. Git
+uses the explicit configured executable, validation temp files stay under the
+private runtime root, and only the final build may create the configured
+non-authoritative `dist/` output. A missing, dirty, or
 lockfile-mismatched artifact makes validation unknown. `scripts/issue-104-deploy.sh restart` first persists the existing
 maintenance hold, preflights, and then restarts launchd; leave the hold in
 place until an operator explicitly verifies and releases it.
+
+The sandbox's fixed ancestor directory reads cover the canonical `/private/tmp`
+qualification route: read-only opens and entry names at `/private` and
+`/private/tmp`, without granting file contents below those nodes. Private roots
+still follow `os.tmpdir()`. Arbitrary or personal temporary layouts, including
+`/private/var/folders`, remain unqualified and fail closed when inaccessible.
+
+The production `test:isolated` tier excludes exactly `browser-bootstrap-client.test.ts`,
+`browser-runtime.test.ts`, `control-tower-browser.test.ts`, and
+`local-command-sandbox.test.ts` from the ordinary unit tier. The three browser
+test files start TCP servers, while the sandbox install-boundary test requires
+host Darwin sandbox context. `pnpm test` retains all four files, including both
+bootstrap MCP stream readiness cases, and remains required for captain validation
+before merge. The sandbox test must run through pinned pnpm and fails if its real toolchain cannot
+start; it verifies private IPC plus denial of host files, host sockets, signals,
+and IP networking. The isolated tier never treats a denied network operation as
+a reason to skip additional tests; all other validator and timeout tests remain
+isolated. The isolated test runner selects one fixed test-owned preload through
+`NODE_OPTIONS`, including the existing account-home preload's explicit kernel-ID mode,
+replacing inherited Node options. This mode captures each process's absolute
+private fixture `HOME` and actual kernel UID/GID, requiring matching real and
+effective IDs; missing or inconsistent identity fails closed. Name and shell
+labels are non-authoritative test data. This mode never consults passwd or
+converts lookup errors into success; it supports default/`utf8` options and
+rejects unsupported options. Per-case account mocks still override and restore
+it. Default preload imports retain original account lookup, arguments and error
+delegation. Full host, integration and smoke tiers retain their account behavior;
+production account-home resolution and credential-free environments are unchanged. The
+same isolated preload wraps only the exact source/built invocation-lock module
+exports and calls the real synchronous acquisition algorithm and real error class.
+Only undefined host/boot and process-start callbacks receive stable simulated test
+identity; explicit callbacks and null retain their real semantics. Simulated
+process-start labels are untrusted for PID reuse: real process liveness, lock
+filesystem barriers, CAS, stale claims and release remain unchanged. This tier
+qualifies simulated OS identity only. The existing native macOS ps/timezone
+regression remains mandatory in the full host sandbox test file, where its native
+identity scheme is asserted. Other tiers and production identity defaults are
+unchanged; private-original queries and unrecognized target aliases fail closed.
 
 Without explicit configuration, local validation is unknown and the run cannot
 advance to review. The configured runner refuses an ambient directory: it

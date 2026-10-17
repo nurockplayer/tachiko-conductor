@@ -18,8 +18,12 @@ export interface LocalValidationConfiguration {
   readonly nodeProgram?: string;
   /** Absolute host-provisioned pnpm executable; never resolved from PATH. */
   readonly pnpmProgram?: string;
+  /** Absolute host-provisioned Git executable used by repository validation probes. */
+  readonly gitProgram?: string;
   /** Read-only host artifact containing a lockfile-bound pnpm store. */
   readonly dependencyArtifactPath?: string;
+  /** Host-owned dependency roots that offline hydration may populate. */
+  readonly hydratedDependencyRoots?: readonly string[];
   /**
    * Explicit clean checkout for a supported pre-existing-PR run. It is never
    * inferred from the conductor process cwd and must prove target repository
@@ -32,6 +36,8 @@ export interface LocalValidationConfiguration {
    * must exactly match before local commands may consume those bytes.
    */
   readonly trustedIgnoredBaselinePath?: string;
+  /** Ignored output roots only the final configured command may create. */
+  readonly terminalGeneratedIgnoredRoots?: readonly string[];
 }
 
 /** Explicit repository/run policy used to interpret the live hosted check list. */

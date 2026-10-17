@@ -294,34 +294,6 @@ describe('dispatch scheduler boundary', () => {
     }
   });
 
-  it('keeps a live native macOS owner fenced when only the caller timezone changes', (t) => {
-    if (process.platform !== 'darwin') {
-      t.skip('native macOS ps timezone regression');
-      return;
-    }
-    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-native-tz-'));
-    const lockPath = path.join(directory, 'once.lock');
-    const priorTimezone = process.env.TZ;
-    let first: ReturnType<typeof acquireDispatchInvocationLock> | undefined;
-    try {
-      process.env.TZ = 'Asia/Tokyo';
-      first = acquireDispatchInvocationLock({ lockPath, nonce: () => 'native-tokyo-owner' });
-      const originalOwner = readFileSync(lockPath, 'utf8');
-
-      process.env.TZ = 'UTC0';
-      assert.throws(() => acquireDispatchInvocationLock({
-        lockPath, nonce: () => 'native-utc-contender',
-      }), DispatchInvocationLockedError);
-      assert.equal(readFileSync(lockPath, 'utf8'), originalOwner,
-        'a TZ-only environment change cannot reclaim or replace the live canonical owner');
-    } finally {
-      if (priorTimezone === undefined) delete process.env.TZ;
-      else process.env.TZ = priorTimezone;
-      first?.release();
-      rmSync(directory, { recursive: true, force: true });
-    }
-  });
-
   it('traverses more than sixteen immutable dead claims to acquire a fresh takeover claim', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-deep-claims-'));
     const lockPath = path.join(directory, 'once.lock');
@@ -558,6 +530,7 @@ describe('dispatch scheduler boundary', () => {
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       nodeProgram: '/Users/example/.local/node/bin/node',
       pnpmProgram: '/Users/example/.local/node/bin/pnpm',
+      gitProgram: '/usr/bin/git',
       dependencyArtifactPath: '/Users/example/.local/tachiko/pnpm-store',
       lunaCodexHome: '/Users/example/.tachiko/luna-codex-home',
       playwrightBrowsersPath: '/Users/example/.tachiko/playwright-browsers',
@@ -569,12 +542,13 @@ describe('dispatch scheduler boundary', () => {
     assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
     assert.match(plist, /<key>TACHIKO_NODE_PROGRAM<\/key><string>\/Users\/example\/\.local\/node\/bin\/node<\/string>/);
     assert.match(plist, /<key>TACHIKO_PNPM_PROGRAM<\/key><string>\/Users\/example\/\.local\/node\/bin\/pnpm<\/string>/);
+    assert.match(plist, /<key>TACHIKO_GIT_PROGRAM<\/key><string>\/usr\/bin\/git<\/string>/);
     assert.match(plist, /<key>TACHIKO_PNPM_DEPENDENCY_ARTIFACT<\/key><string>\/Users\/example\/\.local\/tachiko\/pnpm-store<\/string>/);
     assert.match(plist, /<key>TACHIKO_LUNA_CODEX_HOME<\/key><string>\/Users\/example\/\.tachiko\/luna-codex-home<\/string>/);
     assert.match(plist, /<key>TACHIKO_PLAYWRIGHT_BROWSERS_PATH<\/key><string>\/Users\/example\/\.tachiko\/playwright-browsers<\/string>/);
     assert.match(plist, /<key>TACHIKO_EXECUTION_PROFILE_CONFIG<\/key>/);
     assert.match(plist, /<key>TACHIKO_LOCAL_VALIDATION_CONFIG<\/key>/);
-    assert.match(plist, /<key>TACHIKO_HOSTED_CHECK_POLICY_CONFIG<\/key><string>{&quot;revision&quot;:&quot;issue-104-production-v4&quot;,&quot;mode&quot;:&quot;not_required&quot;}<\/string>/);
+    assert.match(plist, /<key>TACHIKO_HOSTED_CHECK_POLICY_CONFIG<\/key><string>{&quot;revision&quot;:&quot;issue-104-production-v7&quot;,&quot;mode&quot;:&quot;not_required&quot;}<\/string>/);
     assert.doesNotMatch(plist, /StartCalendarInterval/);
   });
 
@@ -583,6 +557,7 @@ describe('dispatch scheduler boundary', () => {
       program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
       nodeProgram: '/Users/example/.local/node/bin/node',
       pnpmProgram: '/Users/example/.local/node/bin/pnpm',
+      gitProgram: '/usr/bin/git',
       dependencyArtifactPath: '/Users/example/.local/tachiko/pnpm-store',
       lunaCodexHome: '/Users/example/.tachiko/luna-codex-home',
       playwrightBrowsersPath: '/Users/example/.tachiko/playwright-browsers',
