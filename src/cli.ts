@@ -1875,6 +1875,7 @@ export function buildWorkflowDeps(
   nativeMergeHost?: NativeMergeHost,
   nativeLeadHost?: NativeLeadHost,
 ): WorkflowDependencies {
+  store.configureNativeCompletionHosts?.({ review: nativeReviewerHost, lead: nativeLeadHost });
   const github = new LiveGitHubAdapter({ transport });
   const localValidation = resolveLocalValidationConfiguration(env);
   const hostedCheckPolicy = resolveHostedCheckPolicyConfiguration(env);

@@ -103,6 +103,7 @@ export interface OracleReceiptStore {
   recordLead?(evidence: import('./native-lead.js').NativeLeadEvidence): void;
   readLead?(id: string): import('./native-lead.js').NativeLeadEvidence | null;
   /** Trusted host authentication must succeed before immutable completion publication. */
+  verifyAuthenticatedCompletion?(namespace: 'review' | 'lead', identity: NativeReviewIdentity | import('./native-lead.js').NativeLeadIdentity, terminalDigest: string | undefined, proof: import('./completion-proof.js').NativeCompletionProof, authenticate: (evidence: import('./completion-proof.js').CompletionEvidence) => boolean): boolean;
   recordAuthenticatedCompletion?(namespace: 'review' | 'lead', evidence: import('./completion-proof.js').CompletionEvidence, authenticate: (evidence: import('./completion-proof.js').CompletionEvidence) => boolean): import('./completion-proof.js').NativeCompletionProof;
 }
 

@@ -100,23 +100,25 @@ it('missing imported historical initial provenance cannot be manufactured at fir
 });
 
 for (const role of ['lead', 'review'] as const) {
-  it(`rejects raw ${role} completion at update/CAS/reducer/load and cannot retire across retries`, async () => {
+  it(`fences raw ${role} completion at update/CAS/reducer and readable historical import cannot retire across retries`, async () => {
     const f = fixture(); try {
       if (role === 'lead') f.setLeadSubmit(async () => ({ outcome: 'pending' })); else Object.assign(f.reviewer, { submit: async () => ({ outcome: 'pending' }) });
       await f.poll(); const r = f.run();
-      const forged: Run = role === 'lead' ? { ...r, nativeLead: { ...r.nativeLead!, requests: r.nativeLead!.requests.map(q => ({ ...q, terminalDigest: 'a'.repeat(64) })) } } :
+      const forged: Run = role === 'lead' ? { ...r, nativeLead: { ...r.nativeLead!, requests: r.nativeLead!.requests.map(q => ({ ...q, status: 'qualified_complete', terminalDigest: 'a'.repeat(64) })) } } :
         { ...r, nativeReview: { ...r.nativeReview!, requests: r.nativeReview!.requests.map(q => ({ ...q, status: 'qualified_complete', terminalDigest: 'b'.repeat(64) })) } };
-      assert.equal(role === 'lead' ? nativeLeadCoherent(forged) : nativeReviewCoherent(forged), false);
+      assert.equal(role === 'lead' ? nativeLeadCoherent(forged) : nativeReviewCoherent(forged), true, 'prior-schema shape is readable; digest is not completion authority');
       assert.equal(role === 'lead' ? unresolvedNativeLead(forged) : unresolvedNativeReview(forged), true);
       assert.throws(() => f.store().update(forged), /coherent/);
       assert.throws(() => f.store().updateIfUnchanged(r, forged), /coherent/);
-      assert.throws(() => applyTransition(forged, { type: 'dependency_satisfied' }), /authenticated completion/);
+      assert.throws(() => applyTransition(forged, { type: 'start_fix' }), /Unresolved native history/);
       const generation = f.registry().readLane(`run:${r.id}`)!.generation;
       for (let i = 0; i < 2; i++) assert.throws(() => recoverRunAdmission(f.store(), f.registry(), r.id, generation, true, f.receiptPath, { retireWork: true }), /unresolved/);
       assert.notEqual(readRunOwnerReceipt(f.receiptPath)?.workDisposition, 'retired');
       writeFileSync(path.join(f.root, 'runs', `${r.id}.json`), JSON.stringify(forged));
-      assert.throws(() => f.store().read(r.id), /corrupt|incompatible/);
-      assert.throws(() => recoverRunAdmission(f.store(), f.registry(), r.id, generation, true, f.receiptPath, { retireWork: true }), /corrupt|incompatible/);
+      const historical = f.store().read(r.id)!;
+      assert.equal(role === 'lead' ? unresolvedNativeLead(historical) : unresolvedNativeReview(historical), true);
+      assert.throws(() => recoverRunAdmission(f.store(), f.registry(), r.id, generation, true, f.receiptPath, { retireWork: true }), /unresolved/);
+      assert.notEqual(readRunOwnerReceipt(f.receiptPath)?.workDisposition, 'retired');
     } finally { f.cleanup(); }
   });
 }

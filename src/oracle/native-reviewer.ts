@@ -1,4 +1,5 @@
-import { hasAuthenticatedCompletion } from './completion-proof.js';
+import { JsonFileOracleReceiptStore } from './receipt-store.js';
+import { authenticatedCompletionEvidence, hasAuthenticatedCompletion, validCompletionProof } from './completion-proof.js';
 import { originalImplementationMatches } from '../domain/implementation-authority.js';
 import { randomUUID } from 'node:crypto';
 import type { NativeReviewBoundary, NativeReviewContext, ReviewerAdapter } from '../adapters/reviewer.js';
@@ -15,7 +16,7 @@ const SHA = /^[0-9a-f]{40}$/;
 const DIGEST = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9._:-]{1,300}$/;
 const text = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0 && v.length <= 500;
-const same = (a: unknown, b: unknown) => oracleDigest(a) === oracleDigest(b);
+const same = (a: unknown, b: unknown) => a === b || a !== undefined && b !== undefined && oracleDigest(a) === oracleDigest(b);
 
 /** Match the state machine's durable review projection. Authentication and
  * receipt digests still cover the full terminal result, including telemetry. */
@@ -56,7 +57,7 @@ export function validNativeEvidence(e: NativeOracleEvidence): boolean {
 }
 
 /** Read compatibility never supplies missing native qualification. */
-export function nativeReviewCoherent(run: Run): boolean {
+export function nativeReviewCoherent(run: Run, inspectOnly = false): boolean {
   try {
     const ledger = run.nativeReview;
     if (ledger === undefined) return true;
@@ -68,7 +69,7 @@ export function nativeReviewCoherent(run: Run): boolean {
       if (!Object.keys(r).every(k => ['identity','status','submissionPossible','observations','nextObservationAt','conversationUrl','failure','replacedBy','terminalDigest','completionProof','terminalStatus','retirementReason'].includes(k)) || !validNativeIdentity(r.identity) || r.identity.runId !== run.id || r.identity.claimId !== run.dispatchClaimId || r.identity.targetKey !== canonicalReviewTarget(run.target)?.key || r.identity.repository !== `${run.target.owner}/${run.target.repo}`.toLowerCase() ||
         !['pending', 'qualified_complete', 'incomplete', 'terminal_unknown', 'retired', 'replaced'].includes(r.status) || typeof r.submissionPossible !== 'boolean' || !Number.isSafeInteger(r.observations) || r.observations < 0 || r.observations > NATIVE_REVIEW_OBSERVATIONS || !Number.isFinite(Date.parse(r.nextObservationAt)) ||
         (r.conversationUrl !== undefined && !validUrl(r.conversationUrl)) || (r.failure !== undefined && !['transport_failure', 'safety_refusal', 'missing_evidence'].includes(r.failure)) ||
-        (r.terminalDigest !== undefined && (!DIGEST.test(r.terminalDigest) || !['qualified_complete','retired','replaced'].includes(r.status) || !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'review'))) || (r.completionProof !== undefined && r.terminalDigest === undefined) || (r.status === 'qualified_complete' && (!r.submissionPossible || r.terminalDigest === undefined)) ||
+        (r.terminalDigest !== undefined && (!DIGEST.test(r.terminalDigest) || !['qualified_complete','retired','replaced'].includes(r.status) || r.completionProof !== undefined && (!validCompletionProof(r.completionProof) || !inspectOnly && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'review')))) || (r.completionProof !== undefined && r.terminalDigest === undefined) || (r.status === 'qualified_complete' && (!r.submissionPossible || r.terminalDigest === undefined)) ||
         (r.terminalStatus !== undefined && !['incomplete', 'terminal_unknown'].includes(r.terminalStatus)) || (r.retirementReason !== undefined && r.retirementReason !== 'irrecoverable_transport') ||
         (r.status === 'replaced' && (r.failure !== 'transport_failure' && !(r.terminalStatus === 'terminal_unknown' && r.retirementReason === 'irrecoverable_transport') || !ledger.requests.some((n) => n.identity.requestId === r.replacedBy && sameCandidate(r.identity, n.identity))))) return false;
       if (ledger.requests.filter((n) => sameCandidate(r.identity, n.identity)).length > 2) return false;
@@ -83,8 +84,18 @@ export function nativeReviewCoherent(run: Run): boolean {
   } catch { return false; }
 }
 
+/** Fresh transition payloads must match the complete authenticated terminal,
+ * including telemetry. Cached validation separately uses the durable projection. */
+export function authenticatedReviewMatches(run: Run, result: ReviewResult | undefined): boolean {
+  const active = activeNativeReview(run), accepted = run.nativeReview?.accepted;
+  if (!active || !accepted || active.identity.requestId !== accepted.requestId) return false;
+  const evidence = authenticatedCompletionEvidence(active.identity, active.terminalDigest, active.completionProof, 'review');
+  return !!evidence && evidence.kind === 'terminal' && 'result' in evidence && evidence.id === accepted.receiptId && oracleDigest(evidence) === accepted.digest && validNativeEvidence({ ...evidence, result } as NativeOracleEvidence) && same(evidence.result, result);
+}
+
 /** Enforced by the real store for every write, including non-CAS legacy callers. */
 export function nativeReviewProgresses(previous: Run, next: Run): boolean {
+  if (next.nativeReview?.requests.some(n => n.terminalDigest !== undefined && !previous.nativeReview?.requests.some(r => r.identity.requestId === n.identity.requestId && r.terminalDigest === n.terminalDigest) && !hasAuthenticatedCompletion(n.identity, n.terminalDigest, n.completionProof, 'review'))) return false;
   const old = previous.nativeReview;
   if (old === undefined) return true;
   const ledger = next.nativeReview;
@@ -92,7 +103,7 @@ export function nativeReviewProgresses(previous: Run, next: Run): boolean {
   return old.requests.every((r, i) => {
     const n = ledger.requests[i];
     if (!n || r.terminalDigest===undefined && n.terminalDigest!==undefined && n.status!=='qualified_complete' || !same(r.identity, n.identity) || r.submissionPossible && !n.submissionPossible || n.observations < r.observations ||
-      r.conversationUrl !== undefined && n.conversationUrl !== r.conversationUrl || r.failure !== undefined && n.failure !== r.failure || r.terminalDigest !== undefined && (n.terminalDigest !== r.terminalDigest || !same(r.completionProof, n.completionProof)) ||
+      r.conversationUrl !== undefined && n.conversationUrl !== r.conversationUrl || r.failure !== undefined && n.failure !== r.failure || r.terminalDigest !== undefined && (n.terminalDigest !== r.terminalDigest || r.completionProof !== undefined && !same(r.completionProof, n.completionProof) || r.completionProof === undefined && n.completionProof !== undefined && !hasAuthenticatedCompletion(n.identity, n.terminalDigest, n.completionProof, 'review')) ||
       r.replacedBy !== undefined && n.replacedBy !== r.replacedBy || r.terminalStatus !== undefined && n.terminalStatus !== r.terminalStatus || r.retirementReason !== undefined && n.retirementReason !== r.retirementReason) return false;
     return r.status === n.status || r.status === 'pending' || r.status === 'terminal_unknown' && ['pending', 'qualified_complete', 'incomplete'].includes(n.status) || r.status === 'incomplete' && r.failure === 'transport_failure' && n.status === 'replaced' ||
       r.status === 'terminal_unknown' && n.status === 'replaced' && n.retirementReason === 'irrecoverable_transport' || ['qualified_complete', 'incomplete', 'terminal_unknown'].includes(r.status) && n.status === 'retired';
@@ -134,7 +145,7 @@ function usableHost(host: NativeReviewerHost | undefined): host is NativeReviewe
       b.supportedEfforts.includes('Extra High') &&
       Array.isArray(b.authorActorIds) && b.authorActorIds.length > 0 && b.authorActorIds.every(text) && typeof b.allowTransportReplacement === 'boolean' &&
       (host.observe === undefined || typeof host.observe === 'function') && (host.replacementDisposition === undefined || typeof host.replacementDisposition === 'function') &&
-      typeof host.receipts?.recordAuthenticatedCompletion === 'function' && typeof host.receipts?.recordNative === 'function' && typeof host.receipts.readNative === 'function' && typeof host.source === 'function' && typeof host.submit === 'function' && typeof host.authenticate === 'function';
+      host.receipts instanceof JsonFileOracleReceiptStore && typeof host.receipts.recordAuthenticatedCompletion === 'function' && typeof host.receipts?.recordNative === 'function' && typeof host.receipts.readNative === 'function' && typeof host.source === 'function' && typeof host.submit === 'function' && typeof host.authenticate === 'function';
   } catch { return false; }
 }
 
@@ -271,7 +282,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
         const accepted = run.nativeReview?.accepted;
         const active = activeNativeReview(run);
         const owner = context.owner;
-        if (!accepted || !active || !owner || active.status !== 'qualified_complete' || active.identity.requestId !== accepted.requestId || active.identity.claimId !== run.dispatchClaimId || active.identity.missionId !== owner.missionId || active.identity.laneId !== owner.laneId || owner.generation < active.identity.ownerGeneration ||
+        if (!accepted || !active || !hasAuthenticatedCompletion(active.identity, active.terminalDigest, active.completionProof, 'review') || !owner || active.status !== 'qualified_complete' || active.identity.requestId !== accepted.requestId || active.identity.claimId !== run.dispatchClaimId || active.identity.missionId !== owner.missionId || active.identity.laneId !== owner.laneId || owner.generation < active.identity.ownerGeneration ||
           active.identity.headSha !== run.headSha || active.identity.headSha !== context.snapshot.headSha || active.identity.baseSha !== context.snapshot.pullRequest?.baseSha || active.identity.pullRequestNumber !== context.snapshot.pullRequest?.number ||
           active.identity.contractRevision !== JSON.stringify([run.repairTaskShapeAuthority?.revision, host.binding.contractRevision]) || active.identity.policyRevision !== host.binding.policyRevision || active.identity.scope !== host.binding.scope || active.identity.bindingId !== host.binding.bindingId || active.identity.requestedModel !== host.binding.model || !host.binding.supportedEfforts.includes(active.identity.requestedEffort)) return false;
         const request = host.receipts.readNative!(`${accepted.requestId}.request`);

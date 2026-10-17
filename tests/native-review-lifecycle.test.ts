@@ -70,7 +70,7 @@ function fixture(mergeComposition = false) {
   let submit: (r: RequestEvidence) => Promise<NativeReviewObservation> = async () => ({ outcome: 'pending', conversationUrl: 'https://review.example.invalid/exact?conversation=returned' });
   let observe: NonNullable<NativeReviewerHost['observe']> = async () => ({ outcome: 'pending' });
   const now = () => new Date(clock).toISOString();
-  const store = () => new JsonFileStore({ dir: path.join(directory, 'runs') });
+  const store = () => new JsonFileStore({ dir: path.join(directory, 'runs'), nativeCompletionHosts: { review: host } });
   let onRegistryPublish = () => {};
   const registry = () => new MissionAdmissionRegistry({ beforePublish: () => onRegistryPublish(), filePath: path.join(directory, 'host', 'admission.json'), config: admissionConfig, now });
   const receipts = () => new JsonFileOracleReceiptStore(path.join(directory, 'oracle'));
@@ -799,7 +799,7 @@ describe('native review through the real factory / durable dispatcher', () => {
       assert.deepEqual(f.registry().readLane('run:run-native'), owner);
       // Historical terminal records are read-compatible; no new transition or native credit.
       const historical: Run = { ...ready, state: 'MERGED' };
-      const historyStore = new JsonFileStore({ dir: path.join(f.directory, 'historical') }); historyStore.create(historical);
+      const historyStore = new JsonFileStore({ dir: path.join(f.directory, 'historical'), nativeCompletionHosts: { review: f.host } }); historyStore.create(historical);
       const beforeRetry = historyStore.read(historical.id);
       await assert.rejects(runMergedTransitionCommand(historyStore, historical.id, f.github, f.registry(), async (op) => op()), /Historical terminal Run remains readable and unchanged/);
       assert.deepEqual(historyStore.read(historical.id), beforeRetry);
@@ -1092,7 +1092,7 @@ describe('native merge crash and authority fences', () => {
       assert.throws(() => f.store().update({ ...run, mergeAttempt: { ...attempt, submissionPossible: false } }), /monotonic/);
       assert.throws(() => f.store().update({ ...run, mergeAttempt: { ...attempt, observations: 0 } }), /monotonic/);
       assert.throws(() => f.store().update({ ...run, state: 'MERGED' }), /monotonic/);
-      const history = new JsonFileStore({ dir: path.join(f.directory, 'historical-merge') });
+      const history = new JsonFileStore({ dir: path.join(f.directory, 'historical-merge'), nativeCompletionHosts: { review: f.host } });
       history.create({ ...run, state: 'MERGED' });
       f.setMergeState('merged'); f.setMain(f.squash); f.setCommit({ sha: f.squash, treeSha: 'f'.repeat(40), parents: [f.base] });
       await assert.rejects(runMergedTransitionCommand(history, run.id, f.github, new MissionAdmissionRegistry({ filePath: path.join(f.directory, 'absent-registry.json'), config: admissionConfig }), async (op) => op()), /parent|tree|quali/i);

@@ -51,7 +51,7 @@ export function fixture() {
   const now = () => new Date(clock).toISOString();
   let comments: DispatchRuntimeComment[] = [];
   const runtime = { async readQueueComment() { return queue; }, async listRuntimeComments() { return structuredClone(comments); }, async createRuntimeComment(body: string) { const c = { id: 'runtime', body }; comments.push(c); return c; }, async updateRuntimeComment(id: string, body: string) { comments = [{ id, body }]; return { id, body }; } };
-  const store = () => new JsonFileStore({ dir: path.join(root, 'runs') });
+  const store = () => new JsonFileStore({ dir: path.join(root, 'runs'), nativeCompletionHosts: { review: reviewer, lead } });
   let registryFault = () => { };
   const registry = () => new MissionAdmissionRegistry({ filePath: path.join(root, 'admission.json'), config: { schemaVersion: 1, revision: 'admission-fixture-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } }, now, beforePublish: () => registryFault() });
   const receipts = new JsonFileOracleReceiptStore(path.join(root, 'oracle'));

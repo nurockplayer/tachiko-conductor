@@ -1,4 +1,4 @@
-import { validCompletionRecord, type AuthenticatedCompletionRecord, type CompletionEvidence, type NativeCompletionProof } from './completion-proof.js';
+import { verifyConfiguredCompletion, validCompletionRecord, type AuthenticatedCompletionRecord, type CompletionEvidence, type NativeCompletionProof } from './completion-proof.js';
 import { validLeadEvidence, type NativeLeadEvidence } from './native-lead.js';
 import { closeSync, existsSync, fsyncSync, linkSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -51,12 +51,12 @@ function valid(value: unknown): value is OracleReceipt {
 
 export class JsonFileOracleReceiptStore implements OracleReceiptStore {
   private readonly dir: string;
-  private readonly nativeDir: string;
+  readonly #nativeDir: string;
   constructor(dir: string) {
     this.dir = ensureDurableDirectory(path.resolve(dir), { mode: 0o700 });
     // Every legacy id can contain dots, so no filename suffix is a disjoint
     // namespace. Native evidence lives below this same store's root instead.
-    this.nativeDir = path.join(this.dir, 'native');
+    this.#nativeDir = path.join(this.dir, 'native');
   }
   record(receipt: OracleReceipt): void {
     if (!valid(receipt)) throw new Error('Invalid Oracle receipt.');
@@ -76,7 +76,7 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
   recordLead(evidence: NativeLeadEvidence): void { this.recordImmutable(evidence, true); }
   readLead(id: string): NativeLeadEvidence | null {
     if (!/^[A-Za-z0-9._-]{1,300}$/.test(id)) throw new Error('Invalid native lead evidence id.');
-    const file = path.join(this.nativeDir, 'lead', `${id}.json`);
+    const file = path.join(this.#nativeDir, 'lead', `${id}.json`);
     if (!existsSync(file)) return null;
     const value = JSON.parse(readFileSync(file, 'utf8')) as NativeLeadEvidence;
     if (!validLeadEvidence(value) || value.id !== id) throw new Error('Invalid immutable native lead evidence.');
@@ -89,7 +89,7 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
     const record = { version: 'native-authenticated-completion/v1' as const, namespace, request, evidence } as AuthenticatedCompletionRecord;
     if (!validCompletionRecord(record) || !terminal || oracleDigest(terminal) !== oracleDigest(evidence) || authenticate(structuredClone(evidence)) !== true)
       throw new Error('Exact immutable request/terminal authentication is required for completion proof.');
-    const directory = path.join(this.nativeDir, 'authenticated');
+    const directory = path.join(this.#nativeDir, 'authenticated');
     const id = `${namespace}.${evidence.identity.requestId}`;
     const file = path.join(directory, `${id}.json`);
     const readRecord = () => {
@@ -101,8 +101,12 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
     this.publishImmutable(directory, id, record, readRecord);
     return { file, digest: oracleDigest(record) };
   }
+  verifyAuthenticatedCompletion(namespace: 'review' | 'lead', identity: import('./types.js').NativeReviewIdentity | import('./native-lead.js').NativeLeadIdentity,
+    terminalDigest: string | undefined, proof: NativeCompletionProof, authenticate: (e: CompletionEvidence) => boolean): boolean {
+    return verifyConfiguredCompletion(this.#nativeDir, authenticate, identity, terminalDigest, proof, namespace);
+  }
   private recordImmutable(evidence: NativeOracleEvidence | NativeLeadEvidence, lead: boolean): void {
-    const directoryPath = lead ? path.join(this.nativeDir, 'lead') : this.nativeDir;
+    const directoryPath = lead ? path.join(this.#nativeDir, 'lead') : this.#nativeDir;
     const read = (id: string) => lead ? this.readLead(id) : this.readNative(id);
     if (!(lead ? validLeadEvidence(evidence as NativeLeadEvidence) : validNativeEvidence(evidence as NativeOracleEvidence))) throw new Error('Invalid immutable native Oracle evidence.');
     this.publishImmutable(directoryPath, evidence.id, evidence, () => read(evidence.id));
@@ -133,7 +137,7 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
     if (!/^[A-Za-z0-9._-]{1,300}$/.test(id)) throw new Error('Invalid native Oracle evidence id.');
     // Do not adopt an ambiguous flat *.native.json file from an earlier
     // unqualified format; it may be a valid legacy receipt with that suffix.
-    const file = path.join(this.nativeDir, `${id}.json`);
+    const file = path.join(this.#nativeDir, `${id}.json`);
     if (!existsSync(file)) return null;
     const value = JSON.parse(readFileSync(file, 'utf8')) as NativeOracleEvidence;
     if (!validNativeEvidence(value) || value.id !== id) throw new Error('Invalid immutable native Oracle evidence.');

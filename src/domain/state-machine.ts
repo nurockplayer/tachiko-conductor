@@ -1,5 +1,5 @@
-import { nativeReviewCoherent } from '../oracle/native-reviewer.js';
-import { nativeLeadCoherent } from '../oracle/native-lead.js';
+import { authenticatedReviewMatches, nativeReviewCoherent, unresolvedNativeReview } from '../oracle/native-reviewer.js';
+import { nativeLeadCoherent, unresolvedNativeLead } from '../oracle/native-lead.js';
 import { leadConsumptionValid, acceptedNativeLead } from '../oracle/native-lead.js';
 import {
   LIVE_HEAD_SYNC_DECISION,
@@ -734,6 +734,8 @@ export function applyTransition(
   activeValidation?: ActiveValidationConfiguration,
 ): Run {
   if (!nativeReviewCoherent(run) || !nativeLeadCoherent(run)) throw new InvalidTransitionError('invalid-native-evidence', run.state, input.type, 'Native ledger lacks coherent immutable authenticated completion proof.');
+  if (['start', 'start_fix', 'review_approved', 'changes_requested', 'merged', 'final_gate_verified', 'agent_succeeded'].includes(input.type) && (unresolvedNativeReview(run) || unresolvedNativeLead(run))) throw new InvalidTransitionError('invalid-native-evidence', run.state, input.type, 'Unresolved native history cannot authorize execution, acceptance, publication, or settlement.');
+  if (['review_approved', 'changes_requested'].includes(input.type) && run.nativeReview !== undefined && !authenticatedReviewMatches(run, input.reviewResult)) throw new InvalidTransitionError('invalid-native-evidence', run.state, input.type, 'Review payload must match the exact authenticated immutable terminal.');
   const from = run.state;
   const target = TRANSITION_TABLE[from][input.type];
 
