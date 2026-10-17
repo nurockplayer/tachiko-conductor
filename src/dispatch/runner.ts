@@ -68,6 +68,7 @@ export interface DispatchOnceOptions {
   readonly maintenanceHold?: boolean;
   readonly issuedMergeRecoveryOnly?: boolean;
   readonly issuedLeadRecoveryOnly?: boolean;
+  readonly nativeObservationEligible?: (run: Run, now: string) => boolean;
   readonly owner: string;
   readonly repo: string;
   readonly github: GitHubAdapter;
@@ -477,6 +478,10 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       };
     }
     if (run !== null) assertClaimAuthorityMatchesRun(existing.claim, run);
+    if (run && !run.mergeAttempt?.submissionPossible && (unresolvedNativeLead(run) || unresolvedNativeReview(run)) &&
+      options.nativeObservationEligible?.(run,options.now()) !== true) {
+      return {outcome:'existing_claim',claim:existing.claim};
+    }
     if (options.issuedMergeRecoveryOnly && !run?.mergeAttempt?.submissionPossible) return { outcome: 'existing_claim', claim: existing.claim };
     if (options.issuedLeadRecoveryOnly && (!run || !unresolvedNativeLead(run) && !unresolvedNativeReview(run))) return {outcome:'existing_claim',claim:existing.claim};
     if (options.maintenanceHold && !run?.mergeAttempt?.submissionPossible && (!run || !unresolvedNativeLead(run) && !unresolvedNativeReview(run))) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD permits only observation/settlement of an already-issued merge.' };

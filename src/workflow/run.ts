@@ -629,7 +629,7 @@ export async function runWorkflow(
   };
   if (options.leadObservationOnly || unresolvedNativeLead(run) && !(run.state==='CHANGES_REQUESTED' || run.state==='WAITING_DEPENDENCY' && run.interruptedFrom==='CHANGES_REQUESTED')) {
     const snapshot=await github.readLiveSnapshot(run.target);
-    const context=(current:Run)=>({run:current,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(current),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
+    const context=(current:Run)=>({run:current,snapshot,store,now,cachedOnly:options.leadObservationOnly && (current.nativeLead?.wait?.kind==='qualification'||current.nativeLead?.wait?.kind==='stop'||current.nativeReview?.wait?.kind==='qualification'),assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(current),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
     const reasons:string[]=[];
     if(unresolvedNativeReview(run)) {const observed=await reviewer.native?.observe?.(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified Oracle observation unavailable.');}
     if(unresolvedNativeLead(run)) {const observed=await deps.nativeLead?.observe(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified lead observation unavailable.');}

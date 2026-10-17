@@ -943,12 +943,12 @@ export function publishAdmissionRuntimeProjection(
   return projection;
 }
 
-export function assertCanonicalDispatchResumeClaim(run: Run, claim: DispatchRuntimeClaim | null, config: ReturnType<typeof resolveDispatchConfiguration>, claimBoundRun: Run | null = null): asserts claim is DispatchRuntimeClaim {
+export function assertCanonicalDispatchResumeClaim(run: Run, claim: DispatchRuntimeClaim | null, config: ReturnType<typeof resolveDispatchConfiguration>, claimBoundRun: Run | null = null, observationOnly = false): asserts claim is DispatchRuntimeClaim {
   const uniqueUnboundRunProof = claimBoundRun?.id === run.id && claimBoundRun.dispatchClaimId === claim?.claimId;
   if (run.target.kind !== 'issue' || run.dispatchClaimId === undefined || run.execution === undefined ||
     (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') ||
     `${run.target.owner}/${run.target.repo}`.toLowerCase() !== `${config.owner}/${config.repo}`.toLowerCase() ||
-    claim === null || claim.state !== 'needs_human' || (claim.runId !== run.id && !(claim.runId === null && uniqueUnboundRunProof)) || claim.claimId !== run.dispatchClaimId ||
+    claim === null || !(claim.state === 'needs_human' || observationOnly && ['running','claimed'].includes(claim.state)) || (claim.runId !== run.id && !(claim.runId === null && uniqueUnboundRunProof)) || claim.claimId !== run.dispatchClaimId ||
     claim.issue !== run.target.issueNumber || claim.profile !== run.execution.profile ||
     (claim.repairTaskShapeAuthority !== undefined &&
       (run.repairTaskShapeAuthority?.revision !== claim.repairTaskShapeAuthority.revision ||
@@ -1762,7 +1762,7 @@ export async function resumeCommand(
     synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
     if (synchronizeLiveHead) synchronizedHead = snapshot.headSha;
   }
-  const resumed = applyTransition(
+  const resumed = options.leadObservationOnly ? run : applyTransition(
     run,
     {
       type: transition,
@@ -2904,19 +2904,29 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         // admission lock serializes an operator hold/release with this entire
         // interval, so a transition cannot be overwritten mid-reconcile.
         const maintenanceHold = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
-        const issued = store.list().filter((run) => {
-          if (!run.mergeAttempt?.submissionPossible && !unresolvedNativeLead(run) && !(unresolvedNativeReview(run) && run.nativeReview?.wait?.kind !== 'qualification')) return false;
+        const retained = store.list();
+        const uncertain = retained.filter((run) => {
+          if (!run.mergeAttempt?.submissionPossible && !unresolvedNativeLead(run) && !unresolvedNativeReview(run)) return false;
           if (run.state !== 'MERGED') return true;
           try { return !isDispatchRunOwnerRetiredCommand(store, run, admission); } catch { return true; }
         });
-        if (issued.length > 1) throw new Error('Multiple issued merge owners require explicit reconciliation; refusing ambiguous recovery.');
+        if (uncertain.length > 1) throw new Error('Multiple issued merge owners require explicit reconciliation; refusing ambiguous recovery.');
+        const observedAt = new Date().toISOString();
+        const leadObservable = (run: Run) => resolveNativeLead(native.nativeLeadHost).canObserve?.(run,observedAt) === true;
+        const reviewObservable = (run: Run) => resolveNativeReviewer(native.nativeReviewerHost).native?.canObserve?.(run,observedAt) === true;
+        const issued = uncertain.filter(run => run.mergeAttempt?.submissionPossible || leadObservable(run) || reviewObservable(run));
         const recovering = issued[0];
+        if (recovering === undefined && (uncertain.length > 0 || retained.some(run => run.state === 'WAITING_DEPENDENCY' &&
+          (run.nativeLead?.wait?.kind === 'qualification' || run.nativeLead?.wait?.kind === 'stop' || run.nativeReview?.wait?.kind === 'qualification') && !isDispatchRunOwnerRetiredCommand(store,run,admission)))) {
+          publishRuntime(maintenanceHold ? 'maintenance_hold' : 'idle','parked',nextPollAt());
+          return {outcome:'no_eligible_work' as const,reasons:['Issued native work requires explicit attention or is not due; retaining its claim and owner without readmission.']};
+        }
         if (maintenanceHold && recovering === undefined) {
           publishRuntime('maintenance_hold', 'parked', nextPollAt());
           return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
         }
         publishRuntime('scanning', 'running', nextPollAt());
-        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : unresolvedNativeLead(recovering) ? issuedLeadRecoveryConfiguration(recovering) : issuedReviewRecoveryConfiguration(recovering);
+        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : leadObservable(recovering) ? issuedLeadRecoveryConfiguration(recovering) : issuedReviewRecoveryConfiguration(recovering);
         const transport = new GhCliTransport();
         const runtime = new GitHubDispatchRuntime(transport, config);
         const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost) : buildWorkflowDeps(store, undefined, {}, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost);
@@ -3176,9 +3186,11 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
       const admissionWorkspace = persistedRunWorkspace(run);
       const withLock = async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation);
       let commitDispatchResumeTransition: WorkflowCommandOptions['commitDispatchResumeTransition'];
+      let assertReviewClaim: WorkflowCommandOptions['assertReviewClaim'];
+      const attentionObservation = unresolvedNativeWork(run) && (run.nativeLead?.wait?.kind === 'qualification' || run.nativeLead?.wait?.kind === 'stop' || run.nativeReview?.wait?.kind === 'qualification');
       if (run.dispatchClaimId !== undefined) {
         if (run.target.kind !== 'issue' || run.execution === undefined) throw new Error(`Dispatch-bound Run "${id}" has no canonical issue/profile binding.`);
-        const config = resolveDispatchConfiguration();
+        const config = attentionObservation ? unresolvedNativeLead(run) ? issuedLeadRecoveryConfiguration(run) : issuedReviewRecoveryConfiguration(run) : resolveDispatchConfiguration();
         if (`${run.target.owner}/${run.target.repo}`.toLowerCase() !== `${config.owner}/${config.repo}`.toLowerCase()) throw new Error('Dispatch-bound Run does not belong to the configured canonical runtime repository.');
         const runtime = new GitHubDispatchRuntime(new GhCliTransport(), config);
         const assertLiveClaim = async (expectedRun: Run) => {
@@ -3188,10 +3200,11 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           const claimBoundRun = claim.runId === null && expectedRun.target.kind === 'issue'
             ? claimedRun(store, claim, { issue: expectedRun.target.issueNumber, route: 'codex', profile: expectedRun.execution!.profile }, { owner: config.owner, repo: config.repo })
             : null;
-          assertCanonicalDispatchResumeClaim(expectedRun, claim, config, claimBoundRun);
+          assertCanonicalDispatchResumeClaim(expectedRun, claim, config, claimBoundRun, attentionObservation);
           return selected;
         };
         await assertLiveClaim(run);
+        if (attentionObservation) assertReviewClaim = async current => { await assertLiveClaim(current); };
         commitDispatchResumeTransition = async (expectedRun, nextRun, commitRun) => {
           const live = await assertLiveClaim(expectedRun);
           const now = new Date().toISOString();
@@ -3213,6 +3226,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         ...(admissionWorkspace === undefined ? {} : { admissionWorkspace }),
         releaseDispatchAdmissionLock: releaseAdmissionLock,
         withDispatchAdmissionLock: withLock,
+        assertReviewClaim, leadObservationOnly:attentionObservation,
         ...(run.dispatchClaimId === undefined ? {} : { dispatchClaimId: run.dispatchClaimId, commitDispatchResumeTransition }),
       });
     });

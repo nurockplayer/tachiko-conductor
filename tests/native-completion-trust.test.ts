@@ -18,7 +18,7 @@ import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNat
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { canonicalReviewTarget } from '../src/reviewers/risk-policy.js';
 import { oracleDigest, textDigest } from '../src/oracle/source-evidence.js';
-import { recoverRunAdmission, resumeCommand, isDispatchRunOwnerRetiredCommand, buildWorkflowDeps, main, publishAdmissionRuntimeProjection } from '../src/cli.js';
+import { recoverRunAdmission, resumeCommand, runIssueCommand, isDispatchRunOwnerRetiredCommand, buildWorkflowDeps, main, publishAdmissionRuntimeProjection } from '../src/cli.js';
 import { createHostAdmissionRegistry, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { GitHubDispatchRuntime } from '../src/dispatch/github-runtime.js';
@@ -26,6 +26,7 @@ import { renderDispatchRuntime, selectDispatchRuntime } from '../src/dispatch/qu
 import { LiveGitHubAdapter } from '../src/github/live-state.js';
 import { NodeProcessRunner } from '../src/github/transport.js';
 import { runWorkflow } from '../src/workflow/run.js';
+import { dispatchOnceCommand } from '../src/dispatch/command.js';
 import { MissionAdmissionRegistry, deterministicMissionId } from '../src/mission-admission/registry.js';
 
 // No Git, service, worker, or subprocess fixture. Real file persistence, immutable
@@ -801,7 +802,7 @@ function oracleWorkflow(f: ReturnType<typeof inactiveOracleFixture>) {
   const live = () => ({ ...f.snapshot, observedAt: f.now(), pullRequest: { ...f.snapshot.pullRequest, id: 'PR_7', title: 'Bounded fixture', url: '', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN' }, checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: f.now() }] }, reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 }, conversations: [] });
   const deps: any = { store: f.store(), github: { async readLiveSnapshot() { snapshots++; return live(); } }, implementation: { kind: 'implementation', async implement() { workers++; throw new Error('No bounded Oracle control may create a repair worker'); } }, reviewer: f.reviewer, validation: { kind: 'validation', configRevision: 'test-config-v1', async validate() { throw new Error('Seeded fresh validation must not be rerun by this bounded control'); } }, hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } } };
   const poll = (held = false) => runWorkflow(deps, f.run.id, { maxReviewAttempts: 1, now: f.now, assertReviewClaim: async r => { assert.equal(r.dispatchClaimId, f.run.dispatchClaimId); }, admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: f.run.bootstrap!.workspacePath }, leadObservationOnly: held, leadRecoveryConfiguration: f.config });
-  return { poll, deps, registry, workers: () => workers, snapshots: () => snapshots };
+  return { poll, deps, registry, token:admitted.token, workers: () => workers, snapshots: () => snapshots };
 }
 for (const verdict of ['approve', 'request_changes'] as const) for (const held of [true, false]) {
   it(`C2 actual workflow retains ${verdict} replacement wait, reconciles old via ${held ? 'HOLD' : 'ordinary'} caller, then freshly qualifies current verdict`, async () => {
@@ -1106,3 +1107,105 @@ it('D1 explicit resume command cannot restore the historical gate before its req
     assert.equal(workflow.workers(), 0); assert.equal(f.submissions(), 2); assert.equal(f.reads().length, 0);
   } finally { f.cleanup(); }
 });
+
+for (const phase of ['FINAL_GATE','MERGE_READY'] as const) {
+  it(`E1 actual owned explicit ${phase} qualification-attention resume schedules fresh validation without automatic attention reentry`, async () => {
+    const f = inactiveOracleFixture(); try {
+      await f.issue(); const original = f.store().read(f.run.id)!, [old, active] = original.nativeReview!.requests;
+      f.store().update({...original,state:phase,reviewResult:f.terminal(active!.identity).result});
+      const w = oracleWorkflow(f); let validations = 0;
+      w.deps.validation.validate = async (run: Run) => {validations++;return validationPassed(run.headSha).local;};
+      for (let i=0;i<3;i++) {f.tick();await w.poll();}
+      const attention = f.store().read(f.run.id)!;
+      assert.equal(attention.nativeReview!.wait!.kind,'qualification'); assert.equal(nativeReviewReentry(attention,f.now()),false);
+      assert.equal(f.reads().length,3); f.tick(); await w.poll(); assert.equal(f.reads().length,3);
+      f.receipts.recordNative(f.terminal(old!.identity,'request_changes'));
+      const settled = await w.poll(true); assert.equal(unresolvedNativeReview(settled.run),false);
+      assert.equal(settled.run.nativeReview!.wait!.kind,'qualification'); assert.equal(nativeReviewReentry(settled.run,f.now()),false);
+      assert.equal(validations,0); assert.equal(w.workers(),0);
+      const r=settled.run,receipt=path.join(f.root,'explicit-owner.json');
+      const base: any={schemaVersion:1,laneId:`run:${r.id}`,missionId:f.context().owner.missionId,repository:'acme/widgets',runId:r.id,issue:42,claimId:r.dispatchClaimId,workspace:r.bootstrap!.workspacePath};
+      w.registry.park(w.token,'workflow_wait',()=>writeRunOwnerReceipt(receipt,{...base,phase:'park_transition',generation:1,token:w.token}),()=>writeRunOwnerReceipt(receipt,{...base,phase:'parked',generation:2}));
+      const options={admission:w.registry,runOwnerReceiptPath:receipt,dispatchClaimId:r.dispatchClaimId,maxReviewAttempts:1,now:f.now,async assertReviewClaim(current:Run){assert.equal(current.dispatchClaimId,r.dispatchClaimId);}};
+      const scheduled=await resumeCommand(w.deps,r.id,'Explicitly reconcile settled historical Oracle attention',options);
+      assert.equal(scheduled.run.state,'VALIDATING'); assert.equal(scheduled.run.reviewResult,undefined); assert.equal(scheduled.run.validationResult,undefined);
+      assert.equal(validations,0); assert.equal(w.registry.readLane(`run:${r.id}`)!.status,'parked'); assert.equal(readRunOwnerReceipt(receipt)!.phase,'parked');
+      assert.equal(w.registry.readLane(`run:${r.id}`)!.generation,4);
+      const fresh=await runIssueCommand(w.deps,'acme/widgets#42',{...options,execution:r.execution,repairTaskShapeAuthority:r.repairTaskShapeAuthority});
+      assert.equal(fresh.run.state,'MERGE_READY',JSON.stringify({outcome:fresh.outcome,reason:'reason' in fresh?fresh.reason:undefined,state:fresh.run.state}));
+      assert.equal(validations,1); assert.equal(fresh.run.reviewResult?.verdict,'approve');
+      assert.equal(f.submissions(),2); assert.equal(f.reads().length,3); assert.equal(w.workers(),0); assert.equal(fresh.run.repairAdmissions?.length??0,0);
+    } finally {f.cleanup();}
+  });
+}
+
+async function leadAttentionCliControl(command: string[],held: boolean,cached: boolean,explicit: 'none'|'active'|'inactive'|'foreign'|'revoked'|'observer-unavailable' = 'none',bounded: 'attention'|'future'|'refusal'|'unavailable'|'revoked-observer' = 'attention') {
+  const f=observationFixture(true),originalUserInfo=os.userInfo,data=process.env.TACHIKO_DATA_DIR,log=console.log;
+  const originals={list:GitHubDispatchRuntime.prototype.listRuntimeComments,update:GitHubDispatchRuntime.prototype.updateRuntimeComment,queue:GitHubDispatchRuntime.prototype.readQueueComment,create:GitHubDispatchRuntime.prototype.createRuntimeComment,snapshot:LiveGitHubAdapter.prototype.readLiveSnapshot,processRun:NodeProcessRunner.prototype.run};
+  let children=0,submits=0,reads=0,queueReads=0;
+  try {
+    os.userInfo=(()=>({...originalUserInfo(),homedir:f.root})) as typeof os.userInfo;
+    process.env.TACHIKO_DATA_DIR=path.join(f.root,'runs'); console.log=()=>{};
+    if(explicit==='inactive')f.replacement(3);
+    const stored=f.store().read(f.run.id)!;
+    const r: Run={...stored,state:'WAITING_DEPENDENCY',interruptedFrom:'CHANGES_REQUESTED',reviewResult:f.request.packet.origin.result,validationResult:f.request.packet.authority.validation,nativeLead:{...stored.nativeLead!,wait:{kind:'qualification',nextAttemptAt:T0},recoveryConfiguration:{revision:'original-dispatch',owner:'acme',repo:'widgets',controlIssue:90,queueCommentId:91,leaseDurationMs:60000},requests:stored.nativeLead!.requests.map((q,i)=>({...q,observations:i===0?3:q.observations}))}};
+    if(bounded!=='attention')Object.assign(r.nativeLead!,{wait:{kind:'request',nextAttemptAt:bounded==='future'?'2099-01-01T00:00:00.000Z':T0},requests:r.nativeLead!.requests.map(q=>({...q,observations:0,...(bounded==='future'?{nextObservationAt:'2099-01-01T00:00:00.000Z'}:bounded==='refusal'?{status:'incomplete' as const,failure:'safety_refusal' as const}:{})}))});
+    f.store().update(r);
+    const registry=createHostAdmissionRegistry(),evidence={repository:'acme/widgets',run:r.id,issue:42,pullRequest:7,claim:r.dispatchClaimId!,workspace:r.bootstrap!.workspacePath};
+    const owner=registry.admit({laneId:`run:${r.id}`,role:'production_captain',evidence,highAutonomy:true});
+    assert.equal(owner.outcome,'admitted');if(owner.outcome!=='admitted')throw new Error('Controlled canonical owner admission failed');
+    const receipt=resolveRunOwnerReceiptPath('acme/widgets',r.id,evidence),base: any={schemaVersion:1,laneId:`run:${r.id}`,missionId:owner.missionId,repository:'acme/widgets',runId:r.id,issue:42,claimId:r.dispatchClaimId,workspace:r.bootstrap!.workspacePath};
+    registry.park(owner.token,'workflow_wait',()=>writeRunOwnerReceipt(receipt,{...base,phase:'park_transition',generation:1,token:owner.token}),()=>writeRunOwnerReceipt(receipt,{...base,phase:'parked',generation:2}));
+    publishAdmissionRuntimeProjection(path.join(f.root,'runs'),registry,f.store(),{stage:held?'maintenance_hold':'idle',supervisor:'parked',maintenanceHold:{active:held}});
+    let comments=[{id:'attention-retained',body:renderDispatchRuntime({issue:42,claimId:r.dispatchClaimId!,runId:r.id,profile:'routine',repairTaskShapeAuthority:r.repairTaskShapeAuthority,state:'running',claimedAt:T0,heartbeatAt:T0,leaseUntil:'2099-01-01T00:00:00.000Z'})}];
+    GitHubDispatchRuntime.prototype.listRuntimeComments=async()=>structuredClone(comments);
+    GitHubDispatchRuntime.prototype.updateRuntimeComment=async(_id,body)=>{comments=[{id:'attention-retained',body}];return comments[0]!;};
+    GitHubDispatchRuntime.prototype.readQueueComment=async()=>{queueReads++;throw new Error('Attention cannot read a new queue');};
+    GitHubDispatchRuntime.prototype.createRuntimeComment=async()=>{throw new Error('Attention cannot claim B');};
+    LiveGitHubAdapter.prototype.readLiveSnapshot=async()=>({headSha:r.headSha}) as any;
+    NodeProcessRunner.prototype.run=async()=>{children++;throw new Error('Attention cannot start a child');};
+    f.host.submit=async()=>{submits++;throw new Error('Attention cannot submit');};f.setObserve(async()=>{reads++;return{outcome:'pending'};});
+    const beforeReceipt=readFileSync(receipt,'utf8');
+    if(cached)f.terminal(r.nativeLead!.requests[0]!.identity,explicit==='inactive'?'stop':'repair');
+    if(explicit==='foreign')f.host.authenticate=()=>false;
+    if(explicit==='revoked'||bounded==='revoked-observer')f.host.binding.model='revoked-current-model';
+    if(bounded==='unavailable'||explicit==='observer-unavailable')delete f.host.observe;
+    for(let i=0;i<2;i++)assert.equal(await main(command,{historicalCompletionHosts:f.hosts,nativeLeadHost:f.host}),0);
+    const runtime={async readQueueComment(){queueReads++;throw new Error('Issued runner cannot read queue');},async listRuntimeComments(){return structuredClone(comments);},async updateRuntimeComment(_id:string,body:string){comments=[{id:'attention-retained',body}];return comments[0]!;},async createRuntimeComment(){throw new Error('Runner cannot claim B');}};
+    const forbidden=async()=>{throw new Error('Runner must reject attention before workflow/admission');};
+    const direct=await dispatchOnceCommand(r.nativeLead!.recoveryConfiguration!,{workflow:buildWorkflowDeps(f.store(),undefined,{},undefined,undefined,undefined,f.host),runtime,admission:registry,issuedLeadRecoveryOnly:true,maintenanceHold:held,runIssue:forbidden,resumeClaimedRun:forbidden,resolveExecutionProfile:()=>r.execution!,now:()=>T0});
+    assert.equal(direct.outcome,'existing_claim');
+    let current=f.store().read(r.id)!;
+    assert.equal(current.nativeLead!.ownerSuccessions.length,0);assert.equal(registry.readLane(`run:${r.id}`)!.generation,2);
+    assert.equal(readFileSync(receipt,'utf8'),beforeReceipt); assert.equal(unresolvedNativeLead(current),true);
+    assert.equal(reads,0);assert.equal(children,0);assert.equal(submits,0);assert.equal(queueReads,0);
+    if(explicit!=='none') {
+      assert.equal(await main(['run','resume',r.id,'--decision','Explicitly reconcile cached native attention'],{historicalCompletionHosts:f.hosts,nativeLeadHost:f.host}),0);
+      current=f.store().read(r.id)!;
+      assert.equal(current.state,'WAITING_DEPENDENCY');assert.equal(current.nativeLead!.wait!.kind,'qualification');
+      assert.equal(current.nativeLead!.ownerSuccessions.length,1);assert.equal(registry.readLane(`run:${r.id}`)!.generation,4);
+      assert.equal(registry.readLane(`run:${r.id}`)!.status,'parked');assert.equal(readRunOwnerReceipt(receipt)!.workDisposition,undefined);
+      assert.equal(unresolvedNativeLead(current),explicit!=='active'&&explicit!=='revoked'&&explicit!=='observer-unavailable');
+      assert.equal(current.nativeLead!.requests[0]!.completionProof!==undefined,explicit!=='foreign');
+      if(explicit==='inactive')assert.equal(current.nativeLead!.requests[0]!.status,'replaced');
+      assert.equal(reads,0);assert.equal(children,0);assert.equal(submits,0);assert.equal(current.repairAdmissions,undefined);
+      assert.equal(current.history.some(h=>h.type==='start_fix'),false);
+      assert.equal(await main(command,{historicalCompletionHosts:f.hosts,nativeLeadHost:f.host}),0);
+      assert.equal(f.store().read(r.id)!.nativeLead!.ownerSuccessions.length,1);
+      assert.equal(registry.readLane(`run:${r.id}`)!.generation,4);
+    }
+    assert.equal(selectDispatchRuntime(comments)!.claim.issue,42);
+  } finally {
+    GitHubDispatchRuntime.prototype.listRuntimeComments=originals.list;GitHubDispatchRuntime.prototype.updateRuntimeComment=originals.update;GitHubDispatchRuntime.prototype.readQueueComment=originals.queue;GitHubDispatchRuntime.prototype.createRuntimeComment=originals.create;LiveGitHubAdapter.prototype.readLiveSnapshot=originals.snapshot;NodeProcessRunner.prototype.run=originals.processRun;
+    os.userInfo=originalUserInfo;console.log=log;if(data===undefined)delete process.env.TACHIKO_DATA_DIR;else process.env.TACHIKO_DATA_DIR=data;f.cleanup();
+  }
+}
+for(const command of [['dispatch','once'],['dispatch','serve','--max-cycles','1']])for(const held of [true,false])for(const cached of [true,false]) {
+  it(`E2 actual ${command.join(' ')} held=${held}/cached=${cached} attention never readmits or polls`,()=>leadAttentionCliControl(command,held,cached));
+}
+for(const explicit of ['active','inactive','foreign','revoked','observer-unavailable'] as const)for(const held of [true,false]) {
+  it(`E2 actual explicit owned cached ${explicit} attention held=${held} remains evidence only`,()=>leadAttentionCliControl(['dispatch','once'],held,true,explicit));
+}
+for(const bounded of ['future','refusal','unavailable','revoked-observer'] as const)for(const held of [true,false]) {
+  it(`E2 actual automatic ${bounded} retained work held=${held} cannot readmit before an eligible observation`,()=>leadAttentionCliControl(['dispatch','once'],held,false,'none',bounded));
+}

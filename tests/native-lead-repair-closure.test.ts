@@ -54,12 +54,21 @@ async function canonical<T>(f: Fixture, operation: (receipt: string) => Promise<
 for (const window of ['before-first-oracle', 'before-first-lead', 'before-consumption', 'before-publication'] as const) {
   it(`retains initial implementation authority across ${window} live scope expansion`, async () => {
     const f = fixture(); try {
+      let publicationCut = false;
       if (window === 'before-first-oracle') f.setSnapshotHook(() => { if (f.counts().validationCalls > 0 && f.counts().reviewCalls === 0) expand(f); });
       if (window === 'before-first-lead') { const submit = f.reviewer.submit; Object.assign(f.reviewer, { submit: async (q: Parameters<NativeReviewerHost['submit']>[0]) => { const e = await submit(q); expand(f); return e; } }); }
       if (window === 'before-consumption') f.setLeadSubmit(async q => { const e = f.terminal(q); expand(f); return { outcome: 'complete', evidence: e }; });
-      if (window === 'before-publication') f.setSnapshotHook(() => { const r = f.store().list()[0]; if (r?.bootstrap && existsSync(path.join(r.bootstrap.workspacePath, 'repair.txt'))) expand(f); });
-      await f.poll();
+      if (window === 'before-publication') f.setSnapshotHook(() => { const r = f.store().list()[0]; if (r?.bootstrap && existsSync(path.join(r.bootstrap.workspacePath, 'repair.txt'))) { publicationCut = true; expand(f); } });
+      const outcome = await f.poll();
       const r = f.run();
+      if (window === 'before-publication') console.log(JSON.stringify({control:'initial-authority-publication-scope',outcome:outcome.outcome,state:r.state,reason:r.interrupt?.reason,
+        initialPacketPresent:existsSync(f.prompts)&&readFileSync(f.prompts,'utf8').includes('Packet: tachiko.implementation-packet.v1'),initialAuthorityPresent:r.implementationAuthority!==undefined,
+        workerStatus:r.agentResult?.exitStatus,initialFilePresent:r.bootstrap!==undefined&&existsSync(path.join(r.bootstrap.workspacePath,'implementation.txt')),
+        repairFilePresent:r.bootstrap!==undefined&&existsSync(path.join(r.bootstrap.workspacePath,'repair.txt')),publicationCut,counts:f.counts(),
+        historyCount:r.history.length,startFixCount:r.history.filter(h=>h.type==='start_fix').length,repairAdmissionCount:r.repairAdmissions?.length??0,
+        validationStatus:r.validationResult?.status,reviewVerdict:r.reviewResult?.verdict,headPresent:r.headSha!==undefined,
+        leadRequests:r.nativeLead?.requests.map(q=>({status:q.status,failure:q.failure,observations:q.observations,digestPresent:q.terminalDigest!==undefined})),
+        oracleRequests:r.nativeReview?.requests.map(q=>({status:q.status,failure:q.failure,observations:q.observations,digestPresent:q.terminalDigest!==undefined}))}));
       assert.ok(r.implementationAuthority);
       assert.ok(r.implementationAuthority.input.authority.acceptedScope.text.includes('preserve all other authority'));
       assert.equal(readFileSync(f.prompts, 'utf8').includes('Expanded unadmitted'), false);

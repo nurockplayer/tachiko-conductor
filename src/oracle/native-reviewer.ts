@@ -125,11 +125,21 @@ export function activeNativeReview(run: Run): NativeReviewRequestState | undefin
 export function unresolvedNativeReview(run: Run): boolean {
   return run.nativeReview?.requests.some((r) => r.submissionPossible && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'review')) === true;
 }
-/** A request wait from a historical gate is evidence recovery, not readiness. */
+/** Historical recovery, including explicit attention resume, is not readiness. */
 export function settledHistoricalReviewGate(run: Run): boolean {
   const phase = run.state === 'WAITING_DEPENDENCY' ? run.interruptedFrom : run.state;
-  return (phase === 'FINAL_GATE' || phase === 'MERGE_READY') && run.nativeReview?.wait?.kind === 'request' &&
+  return (phase === 'FINAL_GATE' || phase === 'MERGE_READY') && (run.nativeReview?.wait?.kind === 'request' || run.nativeReview?.wait?.kind === 'qualification') &&
     activeNativeReview(run)?.status === 'qualified_complete' && !unresolvedNativeReview(run) && !nativeLeadStopped(run);
+}
+/** Automatic recovery never polls intentional attention, exhausted or future work. */
+export function nativeReviewObservationDue(run: Run, now: string, binding?: {readonly bindingId: string; readonly model: string}): boolean {
+  if (run.nativeReview?.wait?.kind === 'qualification' || nativeLeadStopped(run)) return false;
+  if (run.nativeReview?.wait && Date.parse(run.nativeReview.wait.nextAttemptAt) > Date.parse(now)) return false;
+  return run.nativeReview?.requests.some(r => r.submissionPossible &&
+    !hasAuthenticatedCompletion(r.identity,r.terminalDigest,r.completionProof,'review') &&
+    (!binding || r.identity.bindingId === binding.bindingId && r.identity.requestedModel === binding.model) &&
+    r.failure !== 'safety_refusal' && (r.status !== 'incomplete' || r.failure === 'transport_failure') &&
+    r.observations < NATIVE_REVIEW_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(now)) === true;
 }
 export function nativeReviewReentry(run: Run, now = new Date().toISOString()): boolean {
   if (run.state === 'WAITING_DEPENDENCY' && run.nativeReview?.wait?.kind === 'binding') return Date.parse(run.nativeReview.wait.nextAttemptAt) <= Date.parse(now);
@@ -205,6 +215,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
       if(cached?.kind==='terminal') reconciled = await complete(request,cached) || reconciled;
     }
     if(reconciled)return result('Exact cached Oracle terminals reconciled as evidence only; no verdict adopted or service read.');
+    if(context.cachedOnly)return result('Explicit Oracle attention recovery found no exact cached completion; no service read permitted.');
     const request=eligible().filter(r=>r.identity.bindingId===host.binding.bindingId&&r.identity.requestedModel===host.binding.model&&r.observations<NATIVE_REVIEW_OBSERVATIONS&&Date.parse(r.nextObservationAt)<=Date.parse(context.now())).sort((a,b)=>a.observations-b.observations||Date.parse(a.nextObservationAt)-Date.parse(b.nextObservationAt))[0];
     if(!request||!host.observe)return result('Native review finite observation unavailable or not due; uncertainty retained.');
     let observing={...request,observations:request.observations+1,nextObservationAt:new Date(Date.parse(context.now())+NATIVE_REVIEW_BACKOFF_MS).toISOString()};
@@ -229,6 +240,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
   const boundary: NativeReviewBoundary = {
     observe,
     available: () => usableHost(host),
+    canObserve: (run,now) => usableHost(host) && typeof host.observe === 'function' && nativeReviewObservationDue(run,now,host.binding),
     async advance(context) {
       let run = context.run;
       const wait = (reason: string) => ({ outcome: 'wait' as const, run, reason });

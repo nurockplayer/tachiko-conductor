@@ -312,12 +312,22 @@ export function nativeLeadReentry(run: Run, now: string): boolean {
   const l = run.nativeLead;
   if (!l)
     return run.nativeReview?.wait?.kind === 'lead' && Date.parse(run.nativeReview.wait.nextAttemptAt) <= Date.parse(now);
-  if (l.requests.some(r => r.identity.requestId !== l.activeRequestId && r.submissionPossible && !r.terminalDigest && r.observations < LEAD_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(now)))
-    return true;
   if (l.wait?.kind === 'stop' || l.wait?.kind === 'qualification' || l.wait && Date.parse(l.wait.nextAttemptAt) > Date.parse(now))
     return false;
+  if (l.requests.some(r => r.identity.requestId !== l.activeRequestId && r.submissionPossible && !r.terminalDigest && r.observations < LEAD_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(now)))
+    return true;
   const active = activeNativeLead(run);
   return !active || active.status === 'qualified_complete' || active.status === 'terminal_unknown' || active.status === 'incomplete' && active.failure === 'transport_failure' || active.observations < LEAD_OBSERVATIONS && Date.parse(active.nextObservationAt) <= Date.parse(now);
+}
+/** Read-only scheduling policy; never derives receipt or execution authority. */
+export function nativeLeadObservationDue(run: Run, now: string, binding?: {readonly bindingId: string; readonly model: string}): boolean {
+  const l = run.nativeLead;
+  if (!l || l.wait?.kind === 'stop' || l.wait?.kind === 'qualification' || nativeLeadStopped(run)) return false;
+  if (l.wait && Date.parse(l.wait.nextAttemptAt) > Date.parse(now)) return false;
+  return l.requests.some(r => r.submissionPossible && !hasAuthenticatedCompletion(r.identity,r.terminalDigest,r.completionProof,'lead') &&
+    (!binding || r.identity.bindingId === binding.bindingId && r.identity.requestedModel === binding.model) &&
+    r.failure !== 'safety_refusal' && (r.status !== 'incomplete' || r.failure === 'transport_failure') &&
+    r.observations < LEAD_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(now));
 }
 export function nativeLeadCoherent(run: Run, inspectOnly = false): boolean {
   try {
@@ -423,6 +433,8 @@ export interface NativeLeadContext extends NativeReviewContext {
 }
 export interface NativeLeadBoundary {
   available(): boolean;
+  /** Configured-host scheduling only; grants no cached or executable authority. */
+  canObserve?(run: Run, now: string): boolean;
   observe(context: NativeReviewContext & {
     readonly store: RunStore;
     readonly now: () => string;
@@ -486,7 +498,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       return wait('Lead observation unavailable: qualified host/current owner/claim missing.');
     await c.assertLiveClaim();
     c.assertCurrent();
-    const eligible = () => (run.nativeLead?.requests ?? []).filter(r => r.submissionPossible && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'lead') && leadOwnerProved(run, r.identity, c.owner) && r.identity.bindingId === host.binding.bindingId && r.identity.requestedModel === host.binding.model);
+    const eligible = () => (run.nativeLead?.requests ?? []).filter(r => r.submissionPossible && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'lead') && leadOwnerProved(run, r.identity, c.owner));
     if (eligible().length === 0)
       return wait('No exact unresolved lead request is observable by this current owner/binding.');
     const save = (next: Run) => {
@@ -543,7 +555,8 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       reconciled ||= hasAuthenticatedCompletion(current.identity, current.terminalDigest, current.completionProof, 'lead');
     }
     if (reconciled) return wait('Exact cached lead terminals reconciled as evidence only; no service read or repair initiated.');
-    const pending = eligible().filter(r => r.observations < LEAD_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(c.now()))
+    if (c.cachedOnly) return wait('Explicit lead attention recovery found no exact cached completion; no service read permitted.');
+    const pending = eligible().filter(r => r.identity.bindingId === host.binding.bindingId && r.identity.requestedModel === host.binding.model && r.observations < LEAD_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(c.now()))
       .sort((a, b) => a.observations - b.observations || Date.parse(a.nextObservationAt) - Date.parse(b.nextObservationAt) || Number(b.identity.requestId === run.nativeLead!.activeRequestId) - Number(a.identity.requestId === run.nativeLead!.activeRequestId))[0];
     if (!pending) return wait('Lead finite observation unavailable or not due; ownership retained.');
     request = pending;
@@ -586,7 +599,9 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       return wait('Lead observation status CAS lost.');
     return wait('Original lead request observed; uncertainty/finite budget retained.');
   };
-  return { available: () => usable(host), validate, observe, async advance(c) {
+  return { available: () => usable(host),
+    canObserve: (run,now) => usable(host) && typeof host.observe === 'function' && nativeLeadObservationDue(run,now,host.binding),
+    validate, observe, async advance(c) {
       let run = c.run;
       const wait = (reason: string) => ({ outcome: 'wait' as const, run, reason });
       const stale = () => ({ outcome: 'superseded' as const, run: c.store.read(run.id) ?? run, reason: 'Lead Run or owner changed; immutable evidence retained.' });
