@@ -527,7 +527,7 @@ describe('dispatch scheduler boundary', () => {
 
   it('persists the revisioned #104 policy and owner-controlled Luna home across restarts', () => {
     const plist = renderDispatchLaunchdPlist({
-      program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
+      program: '/Users/example/.tachiko-conductor/releases/accepted-v1/scripts/dispatch-driver.sh',
       nodeProgram: '/Users/example/.local/node/bin/node',
       pnpmProgram: '/Users/example/.local/node/bin/pnpm',
       gitProgram: '/usr/bin/git',
@@ -536,7 +536,7 @@ describe('dispatch scheduler boundary', () => {
       playwrightBrowsersPath: '/Users/example/.tachiko/playwright-browsers',
       workingDirectory: '/Users/example/Developer/tachiko-conductor',
     });
-    assert.match(plist, /<key>ProgramArguments<\/key><array><string>\/Users\/example\/Library/);
+    assert.match(plist, /<key>ProgramArguments<\/key><array><string>\/Users\/example\/\.tachiko-conductor\/releases/);
     assert.doesNotMatch(plist, /TACHIKO_DISPATCH_CONFIG/);
     assert.match(plist, /<key>RunAtLoad<\/key><true\/>/);
     assert.match(plist, /<key>KeepAlive<\/key><true\/>/);
@@ -554,7 +554,7 @@ describe('dispatch scheduler boundary', () => {
 
   it('renders the same supervisor across reinstall without creating a timer wake', () => {
     const options = {
-      program: '/Users/example/Library/Application Support/tachiko-dispatch/run.sh',
+      program: '/Users/example/.tachiko-conductor/releases/accepted-v1/scripts/dispatch-driver.sh',
       nodeProgram: '/Users/example/.local/node/bin/node',
       pnpmProgram: '/Users/example/.local/node/bin/pnpm',
       gitProgram: '/usr/bin/git',
@@ -573,16 +573,11 @@ describe('dispatch scheduler boundary', () => {
     assert.doesNotMatch(configured, /StartCalendarInterval/);
   });
 
-  it('pins the canonical #101 queue location and sources the #104 production policy in the stable driver', () => {
+  it('uses the fixed accepted compiled entry and leaves durable dispatch policy to the protected record', () => {
     const wrapper = readFileSync(path.resolve('scripts/dispatch-driver.sh'), 'utf8');
-    const match = wrapper.match(/export TACHIKO_DISPATCH_CONFIG='([^']+)'/);
-    assert.ok(match);
-    assert.deepEqual(parseDispatchConfiguration(match[1]!), {
-      revision: 'dispatch-production-v1', owner: 'nurockplayer', repo: 'tachiko-conductor', controlIssue: 101, queueCommentId: 5755262217, leaseDurationMs: 900_000,
-    });
-    assert.match(wrapper, /issue-104-production-policy\.sh/);
+    assert.match(wrapper, /dist\/production-entry\.js/);
     assert.match(wrapper, /TACHIKO_NODE_PROGRAM/);
-    assert.match(wrapper, /TACHIKO_PNPM_PROGRAM/);
+    assert.doesNotMatch(wrapper, /export TACHIKO_DISPATCH_CONFIG|src\/cli|node_modules\/tsx|\. \"/);
     assert.doesNotMatch(wrapper, /exec corepack/);
   });
 

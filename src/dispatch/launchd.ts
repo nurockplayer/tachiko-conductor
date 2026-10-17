@@ -9,6 +9,7 @@ export const DEFAULT_DISPATCH_LAUNCHD_LABEL = 'io.tachiko.conductor.dispatch-dri
 
 export interface DispatchLaunchdOptions {
   readonly label?: string;
+  /** Absolute fixed driver in releases/<releaseId>/scripts; no current symlink. */
   readonly program: string;
   /** Stable absolute Node runtime supplied by the post-merge installer. */
   readonly nodeProgram: string;
@@ -41,6 +42,7 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   const label = options.label ?? DEFAULT_DISPATCH_LAUNCHD_LABEL;
   if (!/^[A-Za-z0-9][A-Za-z0-9.-]*$/.test(label)) throw new Error('launchd label contains unsupported characters.');
   const program = absolute(options.program, 'launchd program');
+  if (!/\/\.tachiko-conductor\/releases\/[A-Za-z0-9][A-Za-z0-9._-]{0,79}\/scripts\/dispatch-driver\.sh$/.test(program) || path.normalize(program) !== program) throw new Error('launchd driver must select one fixed accepted-release distribution.');
   const nodeProgram = absolute(options.nodeProgram, 'launchd node program');
   const pnpmProgram = absolute(options.pnpmProgram, 'launchd pnpm program');
   const gitProgram = absolute(options.gitProgram, 'launchd git program');
@@ -48,8 +50,16 @@ export function renderDispatchLaunchdPlist(options: DispatchLaunchdOptions): str
   const lunaCodexHome = absolute(options.lunaCodexHome, 'launchd Luna CODEX_HOME');
   const playwrightBrowsersPath = absolute(options.playwrightBrowsersPath, 'launchd Playwright browser artifact path');
   const workingDirectory = absolute(options.workingDirectory, 'launchd working directory');
-  const stdout = absolute(options.standardOutPath ?? path.join(path.dirname(program), `${label}.stdout.log`), 'launchd stdout path');
-  const stderr = absolute(options.standardErrorPath ?? path.join(path.dirname(program), `${label}.stderr.log`), 'launchd stderr path');
+  const releasesDirectory = path.dirname(path.dirname(path.dirname(program)));
+  const logDirectory = path.join(path.dirname(releasesDirectory), 'dispatch');
+  const logPath = (value: string, name: string) => {
+    const file = absolute(value, name);
+    const relative = path.relative(releasesDirectory, path.normalize(file));
+    if (relative === '' || relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) throw new Error('launchd logs must be outside immutable accepted-release distributions.');
+    return file;
+  };
+  const stdout = logPath(options.standardOutPath ?? path.join(logDirectory, `${label}.stdout.log`), 'launchd stdout path');
+  const stderr = logPath(options.standardErrorPath ?? path.join(logDirectory, `${label}.stderr.log`), 'launchd stderr path');
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

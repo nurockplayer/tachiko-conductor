@@ -12,8 +12,8 @@ import { hasSupportedProductionGitRuntime } from './validation/local-command.js'
 
 /**
  * #104's checked-in, revisioned policy values.  The shell policy file is the
- * reboot-safe transport used by launchd/deployment; these values make its
- * contract testable without sourcing a user shell.
+ * candidate template for host acceptance. Accepted installations persist these
+ * nonsecret values in their immutable record, independently of interactive exports.
  */
 export const PRODUCTION_POLICY_REVISION = 'issue-104-production-v7';
 export const PRODUCTION_NODE_MIN_VERSION = '24.21.0';
@@ -124,6 +124,41 @@ function isAbsoluteExecutableFile(file: string | undefined): boolean {
   } catch { return false; }
 }
 
+/** Pure ordinary-initiation policy check; historical observation does not depend on it. */
+export function assertProductionPolicyConfiguration(env: NodeJS.ProcessEnv): void {
+  const executionRaw=env.TACHIKO_EXECUTION_PROFILE_CONFIG;
+  const localRaw=env.TACHIKO_LOCAL_VALIDATION_CONFIG;
+  const hostedRaw=env.TACHIKO_HOSTED_CHECK_POLICY_CONFIG;
+  if(executionRaw===undefined||localRaw===undefined||hostedRaw===undefined)throw new Error('Issue #104 production requires its complete revisioned v7 policy.');
+  let suppliedExecution: unknown;
+  let suppliedLocal: unknown;
+  let suppliedHosted: unknown;
+  try { suppliedExecution = JSON.parse(executionRaw); } catch { throw new Error('Issue #104 production execution profile configuration must be valid JSON.'); }
+  try { suppliedLocal = JSON.parse(localRaw); } catch { throw new Error('Issue #104 production local validation configuration must be valid JSON.'); }
+  try { suppliedHosted = JSON.parse(hostedRaw); } catch { throw new Error('Issue #104 production hosted-check policy configuration must be valid JSON.'); }
+  if (!sameJson(suppliedExecution, PRODUCTION_EXECUTION_PROFILE_CONFIG)) {
+    throw new Error('Issue #104 production execution profile configuration does not match its revisioned policy.');
+  }
+  const execution = parseExecutionProfileConfiguration(executionRaw);
+  const routine = resolveExecutionProfile(execution, 'routine', ['luna-isolated']);
+  assertExecutionSupportedByProvider(routine);
+  for (const profile of ['standard', 'complex', 'critical']) {
+    const unsupported = resolveExecutionProfile(execution, profile, ['luna-isolated']);
+    try {
+      assertExecutionSupportedByProvider(unsupported);
+    } catch {
+      continue;
+    }
+    throw new Error(`Issue #104 production policy unexpectedly admits unattended ${profile}.`);
+  }
+  if (!sameJson(suppliedLocal, PRODUCTION_LOCAL_VALIDATION_CONFIG)) {
+    throw new Error('Issue #104 production local validation must be the model-free frozen-lockfile exact-candidate policy without an ignored-state baseline.');
+  }
+  if (!sameJson(suppliedHosted, PRODUCTION_HOSTED_CHECK_POLICY_CONFIG)) {
+    throw new Error('Issue #104 production hosted-check policy does not match its revisioned policy.');
+  }
+}
+
 /**
  * Validate the complete deployed policy before dispatch/restart. This uses
  * configuration, local filesystem work and a credential-free bounded Git
@@ -171,33 +206,7 @@ export function preflightProductionPolicy(
     !isPrivateBrowserArtifactDirectory(path.join(dependencyArtifact, 'store')) || !isPrivateRegularFile(path.join(dependencyArtifact, 'pnpm-lock.yaml.sha256'))) {
     throw new Error('Issue #104 production preflight requires a private absolute TACHIKO_PNPM_DEPENDENCY_ARTIFACT with store and pnpm-lock.yaml.sha256.');
   }
-  let suppliedExecution: unknown;
-  let suppliedLocal: unknown;
-  let suppliedHosted: unknown;
-  try { suppliedExecution = JSON.parse(executionRaw); } catch { throw new Error('Issue #104 production execution profile configuration must be valid JSON.'); }
-  try { suppliedLocal = JSON.parse(localRaw); } catch { throw new Error('Issue #104 production local validation configuration must be valid JSON.'); }
-  try { suppliedHosted = JSON.parse(hostedRaw); } catch { throw new Error('Issue #104 production hosted-check policy configuration must be valid JSON.'); }
-  if (!sameJson(suppliedExecution, PRODUCTION_EXECUTION_PROFILE_CONFIG)) {
-    throw new Error('Issue #104 production execution profile configuration does not match its revisioned policy.');
-  }
-  const execution = parseExecutionProfileConfiguration(executionRaw);
-  const routine = resolveExecutionProfile(execution, 'routine', ['luna-isolated']);
-  assertExecutionSupportedByProvider(routine);
-  for (const profile of ['standard', 'complex', 'critical']) {
-    const unsupported = resolveExecutionProfile(execution, profile, ['luna-isolated']);
-    try {
-      assertExecutionSupportedByProvider(unsupported);
-    } catch {
-      continue;
-    }
-    throw new Error(`Issue #104 production policy unexpectedly admits unattended ${profile}.`);
-  }
-  if (!sameJson(suppliedLocal, PRODUCTION_LOCAL_VALIDATION_CONFIG)) {
-    throw new Error('Issue #104 production local validation must be the model-free frozen-lockfile exact-candidate policy without an ignored-state baseline.');
-  }
-  if (!sameJson(suppliedHosted, PRODUCTION_HOSTED_CHECK_POLICY_CONFIG)) {
-    throw new Error('Issue #104 production hosted-check policy does not match its revisioned policy.');
-  }
+  assertProductionPolicyConfiguration(env);
   if (!existsSync(lunaHome) || !existsSync(path.join(lunaHome, 'config.toml'))) {
     throw new Error('Issue #104 production Luna CODEX_HOME must exist and contain config.toml.');
   }

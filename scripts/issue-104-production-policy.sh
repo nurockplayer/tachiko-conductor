@@ -1,5 +1,6 @@
 #!/bin/sh
-# Source only from a stable, merged checkout.  This file contains no secrets
+# Candidate policy template only; accepted installations persist these nonsecret values in accepted-release.json.
+# The driver never shell-sources this file.  This file contains no secrets
 # and is deliberately independent of the #101 queue-driver wrapper.
 set -eu
 

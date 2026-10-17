@@ -75,3 +75,10 @@ parking, the existing explicit operator-stopped recovery establishes real
 `workflow_settled` parking and uses the existing stopped release protocol. Fresh
 integration proof is still required for MERGED settlement. An arbitrary released
 receipt, timeout or active invocation cannot substitute for that stopped evidence.
+
+The fixed package entry now composes the existing merge bridge from a protected
+accepted release, with separate current opt-in, pinned Git/gh context, canonical
+stores and issued-only recovery. See [accepted-release-host.md](accepted-release-host.md)
+for the exact disabled record, held procedure and historical-authentication limits.
+Source wiring and controlled fixture success do not establish installation,
+activation, actor/service qualification or native delivery.

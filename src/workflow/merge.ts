@@ -45,18 +45,23 @@ export interface NativeMergeHost {
   /** Accepted host object database, outside the candidate workspace. No fetch or executable candidate config. */
   readonly candidate: (base: string, head: string) => { readonly treeSha: string; readonly baseIsAncestor: boolean };
 }
+const initiationFences = new WeakMap<NativeMergeHost, () => void>();
+/** Built-in composition attaches a removal-only fence without widening serialized host shape. */
+export function bindNativeMergeFence(host: NativeMergeHost, fence: () => void): NativeMergeHost { initiationFences.set(host, fence); return host; }
 export function resolveNativeMergeHost(host?: NativeMergeHost): NativeMergeHost | undefined {
   try {
     if (!host || !validMergePolicy(host.policy) || typeof host.candidate !== 'function' || Object.keys(host).sort().join(',') !== 'candidate,policy') return undefined;
-    return Object.freeze({ policy: Object.freeze(structuredClone(host.policy)), candidate: host.candidate });
+    const resolved = Object.freeze({ policy: Object.freeze(structuredClone(host.policy)), candidate: host.candidate });
+    const fence = initiationFences.get(host); if (fence) initiationFences.set(resolved, fence);
+    return resolved;
   } catch { return undefined; }
 }
 /** Concrete local-only trusted object reader; the accepted host selects repositoryRoot. */
-export function readMergeCandidate(repositoryRoot: string, base: string, head: string): { treeSha: string; baseIsAncestor: boolean } {
+export function readMergeCandidate(repositoryRoot: string, base: string, head: string, program = 'git', environment?: NodeJS.ProcessEnv): { treeSha: string; baseIsAncestor: boolean } {
   if (!SHA.test(base) || !SHA.test(head)) throw new Error('Merge candidate requires exact commit identities.');
-  const git = (...args: string[]) => execFileSync('git', ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'protocol.allow=never', ...args], {
+  const git = (...args: string[]) => execFileSync(program, ['--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'protocol.allow=never', ...args], {
     cwd: repositoryRoot, timeout: 15_000, maxBuffer: 4096, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'],
-    env: { PATH: process.env.PATH, LANG: 'C', LC_ALL: 'C', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '0' },
+    env: { PATH: environment?.PATH ?? process.env.PATH, HOME: environment?.HOME, LANG: 'C', LC_ALL: 'C', GIT_NO_REPLACE_OBJECTS: '1', GIT_NO_LAZY_FETCH: '1', GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_COUNT: '0' },
   }).trim();
   for (const sha of [base, head]) if (git('cat-file', '-t', sha) !== 'commit') throw new Error('Merge source is not a commit.');
   const treeSha = git('rev-parse', `${head}^{tree}`);
@@ -217,7 +222,7 @@ export async function initiateNativeMerge(context: MergeContext, host: NativeMer
     const p = host.policy;
     const snapshotPr = snapshot.pullRequest;
     const save = (next: Run) => { context.assertCurrent(); if (context.store.updateIfUnchanged?.(run, next) !== true) throw new Error('Run changed before native merge issuance.'); run = next; };
-    await context.assertInitiation!(run); await context.assertClaim!(run); context.assertCurrent();
+    initiationFences.get(host)?.(); await context.assertInitiation!(run); await context.assertClaim!(run); context.assertCurrent();
     if (!hasMergeIssuanceCapabilities(context.github)) return run;
     const owner = context.owner!;
     if (run.state !== 'MERGE_READY' || !nativeReviewCoherent(run) || !run.nativeReview?.accepted || !run.bootstrap || !run.headSha || snapshot.headSha !== run.headSha || snapshotPr?.state !== 'open' || snapshotPr.number !== run.pullRequest?.number ||
@@ -241,10 +246,12 @@ export async function initiateNativeMerge(context: MergeContext, host: NativeMer
     if (!hasMergeIssuanceCapabilities(context.github)) return run;
     // Mark local ownership before the durable uncertainty cut. Any exception
     // after this cut conservatively retains the same owner and never resends.
+    initiationFences.get(host)?.();
     context.onSubmission();
     if (!hasMergeIssuanceCapabilities(context.github)) return run;
+    initiationFences.get(host)?.();
     save({ ...run, mergeAttempt: { ...a, submissionPossible: true, issuanceGeneration: owner.generation } });
-    await context.assertInitiation!(run); await context.assertClaim!(run); context.assertCurrent();
+    initiationFences.get(host)?.(); await context.assertInitiation!(run); await context.assertClaim!(run); context.assertCurrent();
     if (context.store.updateIfUnchanged?.(run, run) !== true) throw new Error('Run changed at merge publication fence.');
     if (!hasMergeIssuanceCapabilities(context.github)) return run;
     try { await context.github.squashPullRequest!(p.owner, p.repo, a.identity.pullRequestNumber, a.identity.headSha); } catch { /* Lost acknowledgement is uncertainty, never retry authority. */ }

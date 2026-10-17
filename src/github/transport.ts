@@ -121,6 +121,14 @@ export class NodeProcessRunner implements ProcessRunner {
 export interface GhCliTransportOptions {
   readonly runner?: ProcessRunner;
   readonly timeoutMs?: number;
+  readonly executable?: string;
+  readonly hostname?: string;
+  readonly acceptedActorId?: string;
+  readonly beforeMerge?: () => void;
+  readonly repository?: { readonly owner: string; readonly repo: string };
+  readonly cwd?: string;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly beforeSpawn?: () => void;
 }
 
 function errorCode(error: unknown): unknown {
@@ -180,7 +188,7 @@ export class GhCliTransport implements GitHubApiTransport {
   private readonly runner: ProcessRunner;
   private readonly timeoutMs: number;
 
-  constructor(options: GhCliTransportOptions = {}) {
+  constructor(private readonly options: GhCliTransportOptions = {}) {
     this.runner = options.runner ?? new NodeProcessRunner();
     this.timeoutMs = options.timeoutMs ?? 30_000;
   }
@@ -209,7 +217,13 @@ export class GhCliTransport implements GitHubApiTransport {
   private async execute(path: string, args: readonly string[]): Promise<string> {
     let result: ProcessResult;
     try {
-      result = await this.runner.run('gh', args, { timeoutMs: this.timeoutMs });
+      const scope = this.options.repository;
+      if (scope) {
+        const prefix = `repos/${scope.owner}/${scope.repo}`;
+        const graphqlScope = path === 'graphql' && args.includes(`owner=${scope.owner}`) && args.includes(`repo=${scope.repo}`);
+        if (path !== 'user' && path !== prefix && !path.startsWith(`${prefix}/`) && !graphqlScope) throw new Error('GitHub target is outside the accepted installation repository.');
+      }
+      result = await this.runner.run(this.options.executable ?? 'gh', this.options.hostname ? [args[0]!, '--hostname', this.options.hostname, ...args.slice(1)] : args, { timeoutMs: this.timeoutMs, cwd: this.options.cwd, env: this.options.env, beforeSpawn: () => { this.options.beforeSpawn?.(); if (args.includes('PUT') && args.some(a => /\/pulls\/[0-9]+\/merge$/.test(a))) this.options.beforeMerge?.(); } });
     } catch (error) {
       throw mapThrownError(error, path);
     }
@@ -275,6 +289,10 @@ export class GhCliTransport implements GitHubApiTransport {
   }
 
   async write(path: string, method: 'POST' | 'PATCH' | 'PUT', body: Readonly<Record<string, unknown>>): Promise<unknown> {
+    if (method === 'PUT' && /\/pulls\/[0-9]+\/merge$/.test(path) && this.options.acceptedActorId !== undefined) {
+      const actor = await this.get('user') as { id?: unknown };
+      if (String(actor?.id) !== this.options.acceptedActorId) throw new Error('GitHub actor differs from the accepted host binding.');
+    }
     const args = this.args(path).map((arg) => arg === 'GET' ? method : arg);
     for (const [key, value] of Object.entries(body).sort(([a], [b]) => a.localeCompare(b))) {
       args.push('-f', `${key}=${typeof value === 'string' ? value : JSON.stringify(value)}`);

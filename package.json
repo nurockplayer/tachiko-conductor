@@ -10,7 +10,7 @@
     "node": ">=24.21.0 <25"
   },
   "bin": {
-    "tachiko": "dist/cli.js"
+    "tachiko": "dist/production-entry.js"
   },
   "scripts": {
     "browser:install": "playwright install chromium",

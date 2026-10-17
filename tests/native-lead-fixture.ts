@@ -30,7 +30,7 @@ type LeadTerminal = Extract<NativeLeadEvidence, {
 /** Controlled service/authentication/GitHub/CLI executable boundaries. Real file
 * CAS, dispatcher, registry/receipts, standalone Git preparation/publication and
 * concrete isolated adapter are exercised. This is ZERO native qualification. */
-export function fixture() {
+export function fixture(options: { executionRevision?: string; timeoutMs?: number; localValidationRevision?: string; hostedPolicy?: WorkflowDependencies['hostedCheckPolicy'] } = {}) {
   const git = createBootstrapGitFixture();
   const root = git.root;
   const home = path.join(root, 'luna-home');
@@ -43,7 +43,7 @@ export function fixture() {
   writeFileSync(executable, `#!/bin/sh\nfor arg do prompt="$arg"; done\nprintf '%s\\n' "$prompt" >> '${prompts}'\nif test -f implementation.txt; then printf 'bounded repair\\n' > repair.txt; else printf 'implementation\\n' > implementation.txt; fi\ngit add implementation.txt\nif test -f repair.txt; then git add repair.txt; fi\ngit -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm 'bounded fixture change' || exit 1\nprintf '%s\\n' '{"type":"thread.started","thread_id":"fixture-worker"}' '{"type":"turn.started"}' '{"type":"item.completed","item":{"id":"message","type":"agent_message","text":"bounded fixture committed"}}' '{"type":"turn.completed"}'\n`);
   chmodSync(executable, 0o700);
   symlinkSync('/usr/bin/git', path.join(bin, 'git'));
-  const execution = { profile: 'routine' as const, revision: 'isolated-fixture-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', reasoningEffort: 'high' as const, timeoutMs: 30000, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
+  const execution = { profile: 'routine' as const, revision: options.executionRevision ?? 'isolated-fixture-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', reasoningEffort: 'high' as const, timeoutMs: options.timeoutMs ?? 30000, sandboxMode: 'workspace-write' as const, approvalPolicy: 'never' as const };
   const shape = { revision: 'bounded-contract-v1', shape: 'bounded' as const };
   const config = { revision: 'dispatch-fixture-v1', owner: 'acme', repo: 'widgets', controlIssue: 1, queueCommentId: 2, leaseDurationMs: 60000 };
   const queue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 42\n    route: codex\n    profile: routine\n    task-shape-revision: bounded-contract-v1\n    task-shape: bounded\n  - issue: 43\n    route: codex\n    profile: routine\n    task-shape-revision: bounded-contract-v1\n    task-shape: bounded`;
@@ -57,7 +57,7 @@ export function fixture() {
   const receipts = new JsonFileOracleReceiptStore(path.join(root, 'oracle'));
   const receiptPath = path.join(root, 'owner.json');
   const bootstrap = new StandaloneGitBootstrap({ repositoryRoot: git.source, workspaceRoot: git.workspaceRoot, runner: git.runner });
-  const implementation = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 30000, path: bin });
+  const implementation = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: options.timeoutMs ?? 30000, path: bin });
   let head: string | null = null;
   let branch = '';
   let pr = false;
@@ -89,7 +89,7 @@ export function fixture() {
   let leadObserve: NonNullable<NativeLeadHost['observe']> = async () => ({ outcome: 'pending' });
   const leadRequests: LeadRequest[] = [];
   const lead: NativeLeadHost = { binding: { bindingId: 'fixture-sol', policyRevision: 'bounded-lead-v1', model: 'fixture-sol', effort: 'High', readOnly: true, qualified: true, allowTransportReplacement: true }, receipts, source: reviewer.source, authenticate: e => e.authentication.transportReceipt === (e.kind === 'completion' ? e.terminalSha256 : leadPayloadDigest(e)), async submit(r) { leadCalls++; leadRequests.push(r); return leadSubmit(r); }, async observe(i, url) { observations++; return leadObserve(i, url); }, replacementDisposition: () => 'unavailable' };
-  const workflow = (host: NativeLeadHost | undefined = lead, durable = store()): WorkflowDependencies => ({ ...buildWorkflowDeps(durable, undefined, {}, undefined, reviewer, undefined, host), github, implementation, bootstrap, bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => executionUnavailable ? undefined : execution, validation: { kind: 'validation', configRevision: 'test-config-v1', async validate(r) { validationCalls++; return (failFirstValidation && validationCalls === 1 ? validationFailed(r.headSha) : validationPassed(r.headSha)).local; } }, hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } } });
+  const workflow = (host: NativeLeadHost | undefined = lead, durable = store()): WorkflowDependencies => ({ ...buildWorkflowDeps(durable, undefined, {}, undefined, reviewer, undefined, host), github, implementation, bootstrap, bootstrapForExecution: () => bootstrap, resolveRepairExecutionProfile: () => executionUnavailable ? undefined : execution, validation: { kind: 'validation', configRevision: options.localValidationRevision ?? 'test-config-v1', async validate(r) { validationCalls++; return { ...(failFirstValidation && validationCalls === 1 ? validationFailed(r.headSha) : validationPassed(r.headSha)).local, configRevision: options.localValidationRevision ?? 'test-config-v1' }; } }, hostedCheckPolicy: options.hostedPolicy ?? { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } } });
   const poll = async (host: NativeLeadHost | undefined = lead, durable = store(), maxAttempts = 1) => {
     const wf = workflow(host, durable);
     const admission = registry();
