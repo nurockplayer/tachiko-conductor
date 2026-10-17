@@ -1,4 +1,4 @@
-name: PR93 immutable native qualification
+name: PR93 immutable captured adapter diagnostic
 
 on:
   push:
@@ -39,12 +39,12 @@ jobs:
           node-version: 24.19.0
           architecture: arm64
 
-      - name: Run full native qualification and encrypt private evidence
+      - name: Run one captured adapter diagnostic and encrypt private evidence
         shell: bash
         run: |
           set -eu
           umask 077
-          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py
+          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py --diagnostics-only
 
       - name: Preserve ciphertext and sanitized summary
         if: always()

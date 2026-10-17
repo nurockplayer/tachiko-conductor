@@ -126,7 +126,7 @@ def write_summary(path, value):
         mode = value.get('mode', 'native_qualification')
         value = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                  'mode': mode, 'native_gates': 'UNKNOWN' if mode == 'native_qualification' else 'NOT_RUN',
-                 'selection': 'exec_failure_timing_only' if mode == 'diagnostics_only' else None,
+                 'selection': 'one_captured_adapter_call' if mode == 'diagnostics_only' else None,
                  'status': {'provider_preflight_only': 'PREFLIGHT_FAIL',
                             'diagnostics_only': 'DIAGNOSTIC_FAIL'}.get(mode, 'FAIL'),
                  'reason': 'summary_oversize', 'evidence_encrypted': False,
@@ -182,7 +182,7 @@ class Qualification:
         self.failure_status = 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL'
         self.success_status = 'DIAGNOSTIC_COMPLETE' if diagnostics_only else 'PREFLIGHT_PASS' if preflight_only else 'PASS'
         self.git_capability = None
-        self.diagnostics = {'selection': 'exec_failure_timing_only', 'test': None, 'timing': None, 'complete': False} if diagnostics_only else None
+        self.diagnostics = {'selection': 'one_captured_adapter_call', 'node': None, 'crash': None, 'complete': False} if diagnostics_only else None
         self.diagnostic_files = []
         self.started = time.monotonic()
         self.runner_temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
@@ -194,7 +194,7 @@ class Qualification:
         self.public.mkdir(mode=0o700, exist_ok=False)
         write_summary(self.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE,
                       'base': BASE, 'mode': self.mode, 'native_gates': 'NOT_RUN',
-                      'selection': 'exec_failure_timing_only' if diagnostics_only else None,
+                      'selection': 'one_captured_adapter_call' if diagnostics_only else None,
                       'status': self.failure_status, 'reason': 'collector_initializing',
                       'evidence_encrypted': False, 'production_qualification': False})
         self.logs = self.private / 'logs'
@@ -1054,7 +1054,7 @@ class Qualification:
             return
         if self.diagnostics_only:
             self.hydrate()
-            self.observe_exec_failure()
+            self.diagnose()
             return
         self.hydrate()
         # Expected discovery count is source-derived; no test selection or source rewriting.
@@ -1135,7 +1135,7 @@ class Qualification:
         summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                    'provenance': self.provenance,
                    'mode': self.mode, 'native_gates': native_gates,
-                   'selection': 'exec_failure_timing_only' if self.diagnostics_only else None,
+                   'selection': 'one_captured_adapter_call' if self.diagnostics_only else None,
                    'diagnostics': self.diagnostics,
                    'status': self.success_status if passed else self.failure_status, 'source_unchanged': unchanged,
                    'python': public_python, 'node': public_node, 'versions': self.versions,
@@ -1207,7 +1207,7 @@ def main():
                        'tree': TREE, 'base': BASE,
                        'mode': 'diagnostics_only' if diagnostics_only else 'provider_preflight_only' if preflight_only else 'native_qualification',
                        'native_gates': 'NOT_RUN' if preflight_only or diagnostics_only else 'UNKNOWN',
-                       'selection': 'exec_failure_timing_only' if diagnostics_only else None,
+                       'selection': 'one_captured_adapter_call' if diagnostics_only else None,
                        'status': 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL', 'reason': 'collector_failed',
                        'evidence_encrypted': False, 'production_qualification': False})
         print('Diagnostic collector failed; native gates NOT_RUN.' if diagnostics_only else
