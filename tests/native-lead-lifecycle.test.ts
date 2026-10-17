@@ -12,6 +12,7 @@ import { DISPATCH_QUEUE_MARKER, selectDispatchRuntime, type DispatchRuntimeComme
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { readNativeSourceManifest, oracleDigest } from '../src/oracle/source-evidence.js';
+import { hasAuthenticatedCompletion } from '../src/oracle/completion-proof.js';
 import { activeNativeLead, acceptedNativeLead, nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, type NativeLeadHost, type NativeLeadEvidence, type NativeLeadObservation, issuedLeadRecoveryConfiguration, leadPayloadDigest } from '../src/oracle/native-lead.js';
 import type { NativeOracleEvidence, NativeReviewerHost } from '../src/oracle/types.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
@@ -827,7 +828,23 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
       recoverRunAdmission(f.store(),f.registry(),run.id,lane.generation,true,f.receiptPath);
       f.tick();await f.poll();assert.equal(f.counts().reviewCalls,0);assert.equal(f.counts().leadCalls,0);assert.equal(f.run().repairAdmissions,undefined);
       f.setHold(false);f.tick();await f.poll();
-      assert.equal(f.counts().leadCalls,1);assert.equal(f.run().repairAdmissions?.length,1);assert.equal(f.run().state,'MERGE_READY');assert.equal(f.counts().reviewCalls,2);
+      assert.equal(f.counts().leadCalls,1);assert.equal(f.run().repairAdmissions?.length,1);
+      if(f.run().state==='WAITING_DEPENDENCY') {
+        const waiting=f.run(),retired=waiting.nativeReview!.requests.find(q=>q.identity.requestId===request.identity.requestId)!;
+        assert.equal(waiting.interrupt?.reason,'Native review original retired from active review after candidate movement; remote cancellation is unknown and its evidence remains retained.');
+        assert.equal(waiting.interruptedFrom,'REVIEWING');assert.equal(waiting.nativeReview!.wait?.kind,'binding');
+        assert.equal(retired.status,'retired');assert.notEqual(retired.identity.headSha,waiting.headSha);assert.equal(retired.observations,0);
+        assert.equal(hasAuthenticatedCompletion(retired.identity,retired.terminalDigest,retired.completionProof,'review'),true);
+        assert.equal(waiting.nativeReview!.activeRequestId,undefined);assert.equal(waiting.nativeReview!.accepted,undefined);
+        assert.equal(waiting.reviewResult,undefined);assert.equal(waiting.validationResult?.status,'passed');assert.equal(waiting.validationResult?.headSha,waiting.headSha);
+        assert.equal(f.counts().reviewCalls,1);assert.equal(waiting.history.filter(h=>h.type==='start_fix').length,1);
+        f.tick();await f.poll();
+      }
+      const ready=f.run();assert.equal(ready.state,'MERGE_READY');assert.equal(f.counts().reviewCalls,2);
+      assert.equal(ready.reviewResult?.verdict,'approve');assert.equal(ready.validationResult?.headSha,ready.headSha);
+      assert.equal(f.reviewRequests.length,2);assert.equal(f.reviewRequests[0]!.identity.requestId,request.identity.requestId);
+      assert.notEqual(f.reviewRequests[1]!.identity.requestId,request.identity.requestId);assert.equal(f.reviewRequests[1]!.identity.headSha,ready.headSha);
+      assert.notEqual(ready.headSha,request.identity.headSha);assert.equal(ready.repairAdmissions?.length,1);assert.equal(ready.history.filter(h=>h.type==='start_fix').length,1);
     }finally{f.cleanup();}
   });
   it('enforces HOLD at actual isolated process creation after admission without starting a second logical repair', async () => {

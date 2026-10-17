@@ -19,6 +19,8 @@ export interface NativeReviewBoundary {
   available(): boolean;
   /** Configured-host scheduling only; performs no receipt/service observation. */
   canObserve?(run: Run, now: string): boolean;
+  /** One historical gate cache turn; does not poll intentional attention. */
+  canReconcileHistorical?(run: Run): boolean;
   /** Scheduling for one qualified replacement decision, never a permit or read. */
   canRecover?(run: Run, now: string): boolean;
   /** Bounded evidence-only recovery; cannot issue, accept a verdict, or run a worker. */

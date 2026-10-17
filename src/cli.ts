@@ -76,7 +76,7 @@ import {
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
-import { resolveNativeReviewer, unresolvedNativeReview, settledHistoricalReviewGate, issuedReviewRecoveryConfiguration } from './oracle/native-reviewer.js';
+import { resolveNativeReviewer, unresolvedNativeReview, historicalReviewUncertainty, settledHistoricalReviewGate, issuedReviewRecoveryConfiguration } from './oracle/native-reviewer.js';
 import type { NativeReviewerHost } from './oracle/types.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
@@ -946,7 +946,7 @@ export function publishAdmissionRuntimeProjection(
 export function assertCanonicalDispatchResumeClaim(run: Run, claim: DispatchRuntimeClaim | null, config: ReturnType<typeof resolveDispatchConfiguration>, claimBoundRun: Run | null = null, observationOnly = false): asserts claim is DispatchRuntimeClaim {
   const uniqueUnboundRunProof = claimBoundRun?.id === run.id && claimBoundRun.dispatchClaimId === claim?.claimId;
   if (run.target.kind !== 'issue' || run.dispatchClaimId === undefined || run.execution === undefined ||
-    (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') ||
+    (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY' && !(observationOnly && (historicalReviewUncertainty(run) || settledHistoricalReviewGate(run)))) ||
     `${run.target.owner}/${run.target.repo}`.toLowerCase() !== `${config.owner}/${config.repo}`.toLowerCase() ||
     claim === null || !(claim.state === 'needs_human' || observationOnly && ['running','claimed'].includes(claim.state)) || (claim.runId !== run.id && !(claim.runId === null && uniqueUnboundRunProof)) || claim.claimId !== run.dispatchClaimId ||
     claim.issue !== run.target.issueNumber || claim.profile !== run.execution.profile ||
@@ -1681,7 +1681,8 @@ export async function resumeCommand(
   if (run.dispatchClaimId !== options.dispatchClaimId) {
     throw new Error(`Run "${id}" is bound to dispatch claim "${run.dispatchClaimId}"; matching dispatch ownership is required to resume it.`);
   }
-  if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY') {
+  const historicalGateResume=(run.state==='FINAL_GATE'||run.state==='MERGE_READY') && (options.leadObservationOnly && historicalReviewUncertainty(run) || settledHistoricalReviewGate(run));
+  if (run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY' && !historicalGateResume) {
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
   if (decision.trim() === '') throw new Error('A non-empty --decision is required to resume a parked run.');
@@ -1764,7 +1765,7 @@ export async function resumeCommand(
     synchronizedPullRequest = { number: snapshot.pullRequest.number, headSha: snapshot.headSha };
     if (synchronizeLiveHead) synchronizedHead = snapshot.headSha;
   }
-  const resumed = options.leadObservationOnly ? run : applyTransition(
+  const resumed = options.leadObservationOnly || historicalGateResume ? run : applyTransition(
     run,
     {
       type: transition,
@@ -2915,7 +2916,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         if (uncertain.length > 1) throw new Error('Multiple issued merge owners require explicit reconciliation; refusing ambiguous recovery.');
         const observedAt = new Date().toISOString();
         const leadObservable = (run: Run) => resolveNativeLead(native.nativeLeadHost).canObserve?.(run,observedAt) === true;
-        const reviewObservable = (run: Run) => resolveNativeReviewer(native.nativeReviewerHost).native?.canObserve?.(run,observedAt) === true;
+        const reviewObservable = (run: Run) => {const reviewer=resolveNativeReviewer(native.nativeReviewerHost).native;return reviewer?.canObserve?.(run,observedAt)===true || reviewer?.canReconcileHistorical?.(run)===true;};
         const leadRecoverable=(run:Run)=>!maintenanceHold && resolveNativeLead(native.nativeLeadHost).canRecover?.(run,observedAt)===true;
         const reviewRecoverable=(run:Run)=>!maintenanceHold && resolveNativeReviewer(native.nativeReviewerHost).native?.canRecover?.(run,observedAt)===true;
         const issued = uncertain.filter(run => run.mergeAttempt?.submissionPossible || leadObservable(run) || reviewObservable(run) || leadRecoverable(run) || reviewRecoverable(run));

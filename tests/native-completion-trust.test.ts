@@ -15,7 +15,7 @@ import { JsonFileStore } from '../src/store/json-file-store.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { hasAuthenticatedCompletion, type NativeCompletionHosts } from '../src/oracle/completion-proof.js';
 import { nativeReviewCoherent, nativeReviewProgresses, authenticatedReviewMatches, unresolvedNativeReview, resolveNativeReviewer, issuedReviewRecoveryConfiguration, nativeReviewReentry } from '../src/oracle/native-reviewer.js';
-import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid, nativeLeadReentry, leadPayloadDigest } from '../src/oracle/native-lead.js';
+import { nativeLeadProgresses, acceptedNativeLead, nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid, nativeLeadReentry, leadPayloadDigest } from '../src/oracle/native-lead.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { canonicalReviewTarget } from '../src/reviewers/risk-policy.js';
 import { oracleDigest, textDigest } from '../src/oracle/source-evidence.js';
@@ -1294,7 +1294,7 @@ for(const cacheKind of ['active','inactive','foreign','absent'] as const)it(`N1 
 
 // Configured production composition and actual CLI/runner owner admission. No
 // service, Git or worker runs: the host returns controlled remote observations.
-async function qualifiedRecoveryCaller(role:'lead'|'review',command:string[],held:boolean,observations:number,caller:'main'|'runner'='main',denied=false) {
+async function qualifiedRecoveryCaller(role:'lead'|'review',command:string[],held:boolean,observations:number,caller:'main'|'runner'='main',denied=false,semantic?:'safety_refusal'|'missing_evidence') {
   const f:any=role==='lead'?observationFixture(true):inactiveOracleFixture();
   const previousUser=os.userInfo,log=console.log,env={...process.env};
   const original={list:GitHubDispatchRuntime.prototype.listRuntimeComments,update:GitHubDispatchRuntime.prototype.updateRuntimeComment,queue:GitHubDispatchRuntime.prototype.readQueueComment,create:GitHubDispatchRuntime.prototype.createRuntimeComment,snapshot:LiveGitHubAdapter.prototype.readLiveSnapshot,processRun:NodeProcessRunner.prototype.run};
@@ -1312,11 +1312,15 @@ async function qualifiedRecoveryCaller(role:'lead'|'review',command:string[],hel
     const home=path.join(f.root,'qualified-home');mkdirSync(home);
     writeFileSync(path.join(home,'config.toml'),'tachiko_luna_runtime_revision = "luna-qualified-runtime-v1"\n[features]\nplugins = false\napps = false\nmcp_servers = {}\nweb_search = false\n[sandbox_workspace_write]\nnetwork_access = false\n');process.env.TACHIKO_LUNA_CODEX_HOME=home;
     if(role==='review')await f.boundary.advance(f.context()); // actual first transport result
+    if(semantic){
+      if(role==='lead'){f.setObserve(async()=>({outcome:'incomplete',reason:'transport_failure'}));await f.boundary.observe(f.context());}
+      f.tick();f.setObserve(async()=>({outcome:'incomplete',reason:semantic}));await f.boundary.observe(f.context());
+    }
     const seeded:any=f.store().read(f.run.id)!;
     const key=role==='lead'?'nativeLead':'nativeReview';
     const r:any={...seeded,state:'WAITING_DEPENDENCY',interruptedFrom:role==='lead'?'CHANGES_REQUESTED':'REVIEWING',validationResult:a.validation,
       ...(role==='lead'?{reviewResult:a?f.request.packet.origin.result:undefined}:{}),
-      [key]:{...seeded[key],wait:{kind:'request',nextAttemptAt:T0},recoveryConfiguration:config,requests:seeded[key].requests.map((q:any)=>({...q,status:'incomplete',failure:'transport_failure',observations,nextObservationAt:T0}))}};
+      [key]:{...seeded[key],wait:{kind:'request',nextAttemptAt:T0},recoveryConfiguration:config,requests:seeded[key].requests.map((q:any)=>({...q,status:'incomplete',failure:semantic??'transport_failure',observations:semantic?q.observations:observations,nextObservationAt:T0}))}};
     f.store().update(r);
     const snapshot=role==='review'?f.snapshot:{repository:{owner:'acme',repo:'widgets'},issue:a.issue,headSha:r.headSha,pullRequest:{...r.pullRequest,state:'open',baseSha:f.request.identity.baseSha},handoff:{sourceId:a.scope.sourceId,sourceScope:a.scope.sourceScope,sourceUpdatedAt:a.scope.sourceUpdatedAt,freshness:'current',sections:{scope:a.scope.text}},problems:[]};
     f.host.replacementDisposition=()=>{dispositions++;return denied?'unavailable':'irrecoverable_transport';};
@@ -1331,7 +1335,7 @@ async function qualifiedRecoveryCaller(role:'lead'|'review',command:string[],hel
     GitHubDispatchRuntime.prototype.listRuntimeComments=runtime.listRuntimeComments;GitHubDispatchRuntime.prototype.updateRuntimeComment=runtime.updateRuntimeComment;GitHubDispatchRuntime.prototype.readQueueComment=runtime.readQueueComment;GitHubDispatchRuntime.prototype.createRuntimeComment=runtime.createRuntimeComment;
     LiveGitHubAdapter.prototype.readLiveSnapshot=async()=>snapshot;NodeProcessRunner.prototype.run=async()=>{children++;throw new Error('No child in read-only recovery decision');};
     const native:any={historicalCompletionHosts:f.hosts,...(role==='lead'?{nativeLeadHost:f.host}:{nativeReviewerHost:f.host})};
-    assert.equal(f.boundary.canRecover!(f.store().read(r.id)!,new Date().toISOString()),true);
+    assert.equal(f.boundary.canRecover!(f.store().read(r.id)!,new Date().toISOString()),!semantic);
     if(caller==='main')assert.equal(await main(command,native),0);
     else {
       const deps=buildWorkflowDeps(f.store(),undefined,process.env,undefined,native.nativeReviewerHost,undefined,native.nativeLeadHost);
@@ -1339,6 +1343,15 @@ async function qualifiedRecoveryCaller(role:'lead'|'review',command:string[],hel
       await dispatchOnceCommand(config,{workflow:deps,runtime,admission:registry,maintenanceHold:held,issuedLeadRecoveryOnly:true,withAdmissionLock:async op=>op(),resolveExecutionProfile:()=>r.execution,resumeClaimedRun:invoke,runIssue:async()=>{throw new Error('No new run');}});
     }
     const current:any=f.store().read(r.id)!;
+    if(semantic){
+      assert.equal(current[key].requests[0].failure,semantic);assert.equal(current[key].requests.length,1);
+      assert.equal(current[key].requests[0].observations,role==='lead'?2:1);assert.equal(f.reads().length,role==='lead'?2:1);
+      assert.equal(registry.readLane(`run:${r.id}`)!.generation,2);assert.equal(registry.readLane(`run:${r.id}`)!.status,'parked');
+      assert.equal(readRunOwnerReceipt(receipt)?.phase,'parked');assert.equal(readRunOwnerReceipt(receipt)?.workDisposition,undefined);
+      assert.equal(submits,0);assert.equal(dispositions,0);assert.equal(reads,0);assert.equal(children,0);assert.equal(queues,0);
+      assert.equal(current.repairAdmissions,undefined);assert.equal(current.history.some((h:any)=>h.type==='start_fix'),false);
+      assert.equal(selectDispatchRuntime(comments)!.claim.claimId,r.dispatchClaimId);return;
+    }
     assert.equal(current[key].requests.length,held||denied?1:2);
     assert.equal(submits,held||denied?0:1);assert.equal(dispositions,held?0:1);assert.equal(reads,held&&observations<3?1:0);
     assert.equal(current.repairAdmissions,undefined);assert.equal(current.history.some((h:any)=>h.type==='start_fix'),false);
@@ -1476,4 +1489,145 @@ for(const boundary of ['submission','observation'] as const) {
       assert.equal(submits,boundary==='submission'?0:1);assert.equal(bookkeeping,boundary==='submission'?0:1);assert.equal(r.telemetry?.events.filter(e=>e.kind==='spawn').length??0,boundary==='submission'?0:1);
     }finally{f.cleanup();}
   });
+}
+
+// Later semantic outcomes refine transport uncertainty in the shared durable
+// ledger. Controlled hosts supply outcomes; actual observer/CAS/restart paths run.
+for(const role of ['review','lead'] as const)for(const failure of ['safety_refusal','missing_evidence'] as const) {
+ it(`R1 ${role} transport upgrades to ${failure}, survives clones and cannot replace or regain verdict authority`,async()=>{
+  const f:any=role==='review'?inactiveOracleFixture():observationFixture();try {
+   const key=role==='review'?'nativeReview':'nativeLead';
+   if(role==='review')await f.boundary.advance(f.context());
+   else{f.setObserve(async()=>({outcome:'incomplete',reason:'transport_failure'}));await f.boundary.observe(f.context());}
+   const transport=f.store().read(f.run.id);assert.equal(transport[key].requests[0].failure,'transport_failure');
+   f.tick();f.setObserve(async()=>({outcome:'incomplete',reason:failure}));await f.boundary.observe(f.context());
+   const upgraded=f.store().read(f.run.id),q=upgraded[key].requests[0];assert.equal(q.failure,failure);
+   assert.equal(q.observations,role==='review'?1:2);assert.equal(f.reads().length,role==='review'?1:2);
+   assert.equal(role==='review'?nativeReviewProgresses(transport,upgraded):nativeLeadProgresses(transport,upgraded),true);
+   let dispositions=0;f.host.replacementDisposition=()=>{dispositions++;return 'irrecoverable_transport';};f.tick();
+   assert.equal(f.boundary.canRecover(upgraded,f.context().now()),false);assert.equal(f.boundary.canObserve(upgraded,f.context().now()),false);
+   const advanced=role==='review'?await f.boundary.advance(f.context()):await f.advance();assert.equal(advanced.outcome,'wait');
+   assert.equal(dispositions,0);assert.equal(f.store().read(f.run.id)[key].requests.length,1);
+   // A single raw write cannot both discover refusal and create a new
+   // replacement. Only an already replaced original can later refine evidence.
+   const forged:any=structuredClone(transport),first=forged[key].requests[0],replacement=structuredClone(first);
+   Object.assign(first,{status:'replaced',failure,replacedBy:'forbidden-semantic-replacement'});
+   if(role==='review')first.terminalStatus='incomplete';else first.replacementReason='irrecoverable_transport';
+   replacement.identity={...replacement.identity,requestId:'forbidden-semantic-replacement',correlationId:'forbidden-semantic-replacement'};
+   replacement.status='pending';replacement.observations=0;delete replacement.failure;
+   forged[key].requests.push(replacement);forged[key].activeRequestId=replacement.identity.requestId;
+   assert.equal(role==='review'?nativeReviewProgresses(transport,forged):nativeLeadProgresses(transport,forged),false);
+   const transportStore=new JsonFileStore({dir:path.join(f.root,'transport-import'),nativeCompletionHosts:f.hosts});transportStore.create(structuredClone(transport));
+   assert.throws(()=>transportStore.update(forged),/monotonic/);assert.throws(()=>transportStore.updateIfUnchanged(transportStore.read(transport.id)!,forged),/monotonic/);
+   if(role==='lead') {f.setObserve(async()=>failure==='safety_refusal'?{outcome:'pending'}:{outcome:'incomplete',reason:'transport_failure'});await f.boundary.observe(f.context());assert.equal(f.store().read(f.run.id).nativeLead.requests[0].failure,failure);}
+   const current=f.store().read(f.run.id);
+   const imported=new JsonFileStore({dir:path.join(f.root,'semantic-import'),nativeCompletionHosts:f.hosts});imported.create(structuredClone(current));
+   let r=imported.read(current.id)!;assert.equal((r as any)[key].requests[0].failure,failure);
+   assert.equal(imported.updateIfUnchanged(r,structuredClone(r)),true);r=imported.read(r.id)!;
+   imported.update(applyTransition(r,{type:'wait_dependency',reason:'Semantic outcome remains nonexecutable'},T0));
+   for(const downgrade of [undefined,'transport_failure',failure==='safety_refusal'?'missing_evidence':'safety_refusal']) {
+    const before=imported.read(r.id)!,bad:any=structuredClone(before);if(downgrade===undefined)delete bad[key].requests[0].failure;else bad[key].requests[0].failure=downgrade;
+    assert.equal(role==='review'?nativeReviewProgresses(before,bad):nativeLeadProgresses(before,bad),false);
+    assert.throws(()=>imported.update(bad),/monotonic/);assert.throws(()=>imported.updateIfUnchanged(before,bad),/monotonic/);
+   }
+   // A genuine cached terminal closes only the remote uncertainty. Current
+   // issuance opt-out cannot erase its history or convert refusal to acceptance.
+   const identity=f.store().read(f.run.id)[key].requests[0].identity;
+   if(role==='review')f.receipts.recordNative(f.terminal(identity));else f.terminal(identity);
+   f.host.binding.model='revoked-current-model';const settled=(await f.boundary.observe({...f.context(),cachedOnly:true})).run;
+   const terminal=(settled as any)[key].requests[0];assert.equal(terminal.failure,failure);assert.equal(terminal.status,'incomplete');assert.ok(terminal.completionProof);
+   assert.equal(role==='review'?unresolvedNativeReview(settled):unresolvedNativeLead(settled),false);
+   assert.equal(role==='review'?settled.nativeReview?.accepted:acceptedNativeLead(settled),undefined);
+   assert.equal((settled as any)[key].wait.kind,'qualification');assert.equal(settled.repairAdmissions,undefined);
+   const restart=new JsonFileStore({dir:path.join(f.root,role==='review'?f.directory:'runs'),nativeCompletionHosts:f.hosts}).read(settled.id)!;
+   assert.equal(role==='review'?unresolvedNativeReview(restart):unresolvedNativeLead(restart),false);
+   assert.equal((restart as any)[key].requests[0].failure,failure);assert.equal((restart as any)[key].requests.length,1);
+  }finally{f.cleanup();}
+ });
+ it(`R1 inactive ${role} later ${failure} preserves replacement provenance and current eligibility`,async()=>{
+  const f:any=role==='review'?inactiveOracleFixture():observationFixture();try {
+   if(role==='review')await f.issue();else {
+    f.replacement(0);const r=f.store().read(f.run.id);
+    f.store().update({...r,nativeLead:{...r.nativeLead,requests:r.nativeLead.requests.map((q:any,i:number)=>({...q,nextObservationAt:i===0?T0:'2099-01-01T00:00:00.000Z'}))}});
+   }
+   const key=role==='review'?'nativeReview':'nativeLead',before=f.store().read(f.run.id),active=before[key].activeRequestId;
+   // Make only the inactive original due, then observe its later semantic outcome.
+   f.tick();f.setObserve(async()=>({outcome:'incomplete',reason:failure}));await f.boundary.observe(f.context());
+   const r=f.store().read(f.run.id),old=r[key].requests[0];assert.equal(old.status,'replaced');assert.equal(old.failure,failure);
+   assert.equal(r[key].activeRequestId,active);assert.equal(old.replacedBy,active);assert.equal(r[key].requests.length,2);
+   assert.equal(role==='review'?nativeReviewProgresses(before,r):nativeLeadProgresses(before,r),true);
+   if(role==='review') {assert.equal(r.nativeReview.accepted.requestId,active);f.receipts.recordNative(f.terminal(old.identity,'request_changes'));}
+   else {f.terminal(old.identity,'stop');f.terminal(r.nativeLead.requests[1].identity);}
+   const closed=(await f.boundary.observe({...f.context(),cachedOnly:true})).run;
+   assert.equal(role==='review'?unresolvedNativeReview(closed):unresolvedNativeLead(closed),false);
+   assert.equal((closed as any)[key].activeRequestId,active);assert.equal((closed as any)[key].requests[0].failure,failure);
+   assert.notEqual((closed as any)[key].wait?.kind,'qualification','late inactive semantic evidence cannot veto the current replacement');
+   if(role==='review')assert.equal((await f.boundary.advance(f.context())).outcome,'complete');else assert.equal(acceptedNativeLead(closed)?.requestId,active);
+  }finally{f.cleanup();}
+ });
+}
+
+for(const phase of ['FINAL_GATE','MERGE_READY'] as const)for(const entry of ['explicit','once','serve','held','missing','drift'] as const)it(`R2 proofless inactive ${phase} ${entry} public recovery closes evidence then freshly qualifies current gates`,async()=>{
+ const f:any=inactiveOracleFixture(),originalUserInfo=os.userInfo,log=console.log;
+ const env={data:process.env.TACHIKO_DATA_DIR,config:process.env.TACHIKO_DISPATCH_CONFIG};
+ const originals={list:GitHubDispatchRuntime.prototype.listRuntimeComments,update:GitHubDispatchRuntime.prototype.updateRuntimeComment,queue:GitHubDispatchRuntime.prototype.readQueueComment,create:GitHubDispatchRuntime.prototype.createRuntimeComment,snapshot:LiveGitHubAdapter.prototype.readLiveSnapshot,processRun:NodeProcessRunner.prototype.run};
+ let children=0,queueReads=0;
+ try{
+  os.userInfo=(()=>({...originalUserInfo(),homedir:f.root})) as typeof os.userInfo;process.env.TACHIKO_DATA_DIR=path.join(f.root,f.directory);process.env.TACHIKO_DISPATCH_CONFIG=JSON.stringify(f.config);console.log=()=>{};
+  await f.issue();const initial=f.store().read(f.run.id),[old,active]=initial.nativeReview.requests;
+  const oldTerminal=f.terminal(old.identity,'request_changes');
+  const historical={...initial,state:phase,reviewResult:f.terminal(active.identity).result,nativeReview:{...initial.nativeReview,requests:initial.nativeReview.requests.map((q:any,i:number)=>i===0?{...q,terminalDigest:oracleDigest(oldTerminal),observations:3}:q)}};
+  // Explicit prior-schema compatibility input: genuine issued identities, raw
+  // readable digest without proof. This is not current initial delivery.
+  writeFileSync(path.join(f.root,f.directory,`${historical.id}.json`),JSON.stringify(historical));
+  assert.equal(unresolvedNativeReview(f.store().read(initial.id)),true);
+  assert.equal(f.boundary.canObserve(f.store().read(initial.id),f.now()),false);
+  assert.equal(f.boundary.canRecover(f.store().read(initial.id),f.now()),false);
+  f.registry=()=>createHostAdmissionRegistry();const w=oracleWorkflow(f);
+  const r=f.store().read(f.run.id);assert.equal(f.reads().length,0);
+  const evidence={repository:'acme/widgets',run:r.id,issue:42,pullRequest:7,claim:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+  const receipt=resolveRunOwnerReceiptPath('acme/widgets',r.id,evidence),base:any={schemaVersion:1,laneId:`run:${r.id}`,missionId:f.context().owner.missionId,repository:'acme/widgets',runId:r.id,issue:42,claimId:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+  w.registry.park(w.token,'workflow_wait',()=>writeRunOwnerReceipt(receipt,{...base,phase:'park_transition',generation:1,token:w.token}),()=>writeRunOwnerReceipt(receipt,{...base,phase:'parked',generation:2}));
+  publishAdmissionRuntimeProjection(process.env.TACHIKO_DATA_DIR,w.registry,f.store(),{stage:'idle',supervisor:'parked',maintenanceHold:{active:entry==='held'}});
+  let comments=[{id:'retained-oracle-attention',body:renderDispatchRuntime({issue:42,claimId:r.dispatchClaimId,runId:r.id,profile:'routine',repairTaskShapeAuthority:r.repairTaskShapeAuthority,state:'running',claimedAt:T0,heartbeatAt:T0,leaseUntil:'2099-01-01T00:00:00.000Z'})}];
+  GitHubDispatchRuntime.prototype.listRuntimeComments=async()=>structuredClone(comments);
+  GitHubDispatchRuntime.prototype.updateRuntimeComment=async(_id,body)=>{comments=[{id:'retained-oracle-attention',body}];return comments[0]!;};
+  GitHubDispatchRuntime.prototype.readQueueComment=async()=>{queueReads++;throw new Error('No new queue read');};
+  GitHubDispatchRuntime.prototype.createRuntimeComment=async()=>{throw new Error('No new claim');};
+  LiveGitHubAdapter.prototype.readLiveSnapshot=async()=>f.snapshot;
+  NodeProcessRunner.prototype.run=async()=>{children++;throw new Error('No child in attention scheduling control');};
+  if(entry!=='missing')f.receipts.recordNative(oldTerminal);
+  const native={historicalCompletionHosts:f.hosts,nativeReviewerHost:f.host};
+  const firstExit=await main(entry==='explicit'||entry==='drift'?['run','resume',r.id,'--decision','Explicitly reconcile proofless historical Oracle evidence']:entry==='serve'?['dispatch','serve','--max-cycles','1']:['dispatch','once'],native);
+  if(entry==='missing') {
+   const unknown=f.store().read(r.id);assert.equal(unknown.state,'WAITING_DEPENDENCY');assert.equal(unknown.nativeReview.wait.kind,'qualification');assert.equal(unresolvedNativeReview(unknown),true);
+   assert.equal(unknown.nativeReview.requests[0].completionProof,undefined);const generation=w.registry.readLane(`run:${r.id}`)!.generation;
+   assert.equal(await main(['dispatch','once'],native),0);assert.equal(w.registry.readLane(`run:${r.id}`)!.generation,generation,'attention must not be polled automatically');
+   f.receipts.recordNative(oldTerminal);assert.equal(await main(['run','resume',r.id,'--decision','Reconcile newly available exact cache only'],native),0);
+  }
+  if(entry==='held')publishAdmissionRuntimeProjection(process.env.TACHIKO_DATA_DIR,w.registry,f.store(),{stage:'idle',supervisor:'parked',maintenanceHold:{active:false}});
+  const settled=f.store().read(r.id);assert.equal(firstExit,0);assert.equal(unresolvedNativeReview(settled),false);assert.ok(['request','qualification'].includes(settled.nativeReview.wait.kind));assert.equal(settled.nativeReview.requests[0].observations,3);assert.equal(settled.nativeReview.accepted.requestId,active.identity.requestId);assert.equal(settled.nativeReview.requests.length,2);assert.equal(settled.state,'WAITING_DEPENDENCY');assert.equal(selectDispatchRuntime(comments)!.claim.state,entry==='once'||entry==='serve'||entry==='held'?'needs_human':'running');
+  assert.equal(w.registry.readLane(`run:${r.id}`)!.status,'parked');assert.equal(readRunOwnerReceipt(receipt)?.phase,'parked');assert.equal(readRunOwnerReceipt(receipt)?.workDisposition,undefined);assert.equal(selectDispatchRuntime(comments)!.claim.claimId,r.dispatchClaimId);assert.equal(children,0);assert.equal(queueReads,0);assert.equal(w.workers(),0);
+  const parkedBefore=w.registry.readLane(`run:${r.id}`)!.generation;
+  let secondExit,error;try{secondExit=await main(['run','resume',r.id,'--decision','Explicitly schedule fresh gates after authenticated settlement'],native);}catch(e){error=String(e);}
+  const final=f.store().read(r.id);
+  log(JSON.stringify({control:'proofless-public-cache-then-current-qualification',phase,entry,firstExit,secondExit:secondExit??null,error:error??null,state:final.state,wait:final.nativeReview.wait?.kind,unresolved:unresolvedNativeReview(final),claim:selectDispatchRuntime(comments)!.claim.state,oldReviewPresent:!!final.reviewResult,oldValidationPresent:!!final.validationResult,generationBefore:parkedBefore,generationAfter:w.registry.readLane(`run:${r.id}`)!.generation,receiptPhase:readRunOwnerReceipt(receipt)?.phase,reads:f.reads().length,submits:f.submissions(),workers:w.workers(),children,queueReads}));
+  assert.equal(error,undefined,'public explicit recovery must remain usable after evidence-only settlement, without manual runtime-comment editing');
+  assert.equal(secondExit,0);assert.equal(final.state,'VALIDATING');assert.equal(final.reviewResult,undefined);assert.equal(final.validationResult,undefined);
+  // Continue through the actual owned command with controlled validation (no
+  // Git reconstruction in this fixture); public CLI claim selection above is real.
+  let validations=0;w.deps.validation.validate=async(current:Run)=>{validations++;return validationPassed(current.headSha).local;};
+  if(entry==='drift')f.host.binding.model='revoked-current-model';
+  const fresh=await runIssueCommand(w.deps,'acme/widgets#42',{execution:r.execution,repairTaskShapeAuthority:r.repairTaskShapeAuthority,dispatchClaimId:r.dispatchClaimId,admission:w.registry,runOwnerReceiptPath:receipt,maxReviewAttempts:1,now:f.now,async assertReviewClaim(current){assert.equal(selectDispatchRuntime(comments)!.claim.claimId,current.dispatchClaimId);}});
+  assert.equal(fresh.run.state,entry==='drift'?'WAITING_DEPENDENCY':'MERGE_READY');assert.equal(validations,1);assert.equal(fresh.run.reviewResult?.verdict,entry==='drift'?undefined:'approve');assert.equal(fresh.run.repairAdmissions?.length??0,0);assert.equal(f.submissions(),2);assert.equal(f.reads().length,0);assert.equal(children,0);assert.equal(w.workers(),0);
+
+ }finally{
+  GitHubDispatchRuntime.prototype.listRuntimeComments=originals.list;GitHubDispatchRuntime.prototype.updateRuntimeComment=originals.update;GitHubDispatchRuntime.prototype.readQueueComment=originals.queue;GitHubDispatchRuntime.prototype.createRuntimeComment=originals.create;LiveGitHubAdapter.prototype.readLiveSnapshot=originals.snapshot;NodeProcessRunner.prototype.run=originals.processRun;os.userInfo=originalUserInfo;console.log=log;
+  for(const [key,value] of [['TACHIKO_DATA_DIR',env.data],['TACHIKO_DISPATCH_CONFIG',env.config]] as const){if(value===undefined)delete process.env[key];else process.env[key]=value;}f.cleanup();
+ }
+});
+
+for(const role of ['lead','review'] as const)for(const failure of ['safety_refusal','missing_evidence'] as const) {
+ for(const held of [false,true])it(`R1 actual public ${role} later ${failure} held=${held} never readmits or calls replacement`,()=>qualifiedRecoveryCaller(role,['dispatch','once'],held,0,'main',false,failure));
+ it(`R1 actual runner ${role} later ${failure} never readmits or replaces`,()=>qualifiedRecoveryCaller(role,['dispatch','once'],false,0,'runner',false,failure));
 }

@@ -32,7 +32,7 @@ import {
 } from '../domain/telemetry.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
-import { nativeReviewReentry, parkNativeReview, unresolvedNativeReview, nativeReviewWaitKind, settledHistoricalReviewGate } from '../oracle/native-reviewer.js';
+import { nativeReviewReentry, parkNativeReview, unresolvedNativeReview, nativeReviewWaitKind, historicalReviewUncertainty, settledHistoricalReviewGate } from '../oracle/native-reviewer.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import { activeRepairAdmission, generationlessAppServerPredecessor, resolveRepairPredecessor, unfinishedBoundRepairAttempt, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
@@ -617,10 +617,10 @@ export async function runWorkflow(
   // Issued attempts recover independently of reviewer/config availability and
   // never re-enter implementation, review, validation or merge submission.
   if (run.mergeAttempt?.submissionPossible) return { outcome: 'merge_ready', run: await observeNativeMerge(mergeContext(run)) };
-  const historicalGateObservation = unresolvedNativeReview(run) && run.nativeReview?.requests.some(r=>r.identity.requestId!==run.nativeReview?.activeRequestId&&r.submissionPossible&&!r.terminalDigest) &&
-    (run.state === 'FINAL_GATE' || run.state === 'MERGE_READY' || run.state === 'WAITING_DEPENDENCY' && (run.interruptedFrom === 'FINAL_GATE' || run.interruptedFrom === 'MERGE_READY')) && run.nativeReview.wait?.kind !== 'qualification' && !nativeLeadStopped(run);
+  const historicalGateRecovery=historicalReviewUncertainty(run);
+  const historicalGateObservation=historicalGateRecovery && run.nativeReview?.wait?.kind!=='qualification';
   const historicalReviewWait = (current: Run, reason: string): Run => current.state === 'WAITING_DEPENDENCY'
-    ? {...current,nativeReview:{...current.nativeReview!,wait:{kind:nativeReviewWaitKind(current),nextAttemptAt:new Date(Date.parse(now())+30_000).toISOString()}}}
+    ? {...current,nativeReview:{...current.nativeReview!,wait:{kind:current.nativeReview?.wait?.kind==='qualification'?'qualification' as const:nativeReviewWaitKind(current),nextAttemptAt:new Date(Date.parse(now())+30_000).toISOString()}}}
     : parkNativeReview(current,nativeReviewWaitKind(current),reason,now());
   const revalidateHistoricalGate = (current: Run): Run => {
     const gate = current.state === 'MERGE_READY' ? applyTransition(current, {type:'recheck_readiness'}, now()) : current;
@@ -673,7 +673,7 @@ export async function runWorkflow(
     const reasons:string[]=[];
     if(unresolvedNativeReview(run)) {const observed=await reviewer.native?.observe?.(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified Oracle observation unavailable.');}
     if(unresolvedNativeLead(run)) {const observed=await deps.nativeLead?.observe(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified lead observation unavailable.');}
-    if (historicalGateObservation) {
+    if (historicalGateRecovery) {
       const next = historicalReviewWait(run, reasons.join(' '));
       if(!updateIfCurrent(store,run,next))return staleWorkflowOutcome(run.id,run,store,'Run changed before historical Oracle recovery wait.');run=next;
     }
