@@ -1,4 +1,4 @@
-name: Issue 104 isolated account and lock fixture prerequisite
+name: Issue 104 native offline qualification
 on:
   push:
     branches: [qualification/issue104-stage6-native]
@@ -84,17 +84,33 @@ jobs:
           printf 'PNPM_PROGRAM=%s\n' "$pnpm_program" >> "$GITHUB_ENV"
           node -e 'const f=require("fs"),c=require("crypto"),p=require("path");const lock=c.createHash("sha256").update(f.readFileSync("pnpm-lock.yaml")).digest("hex");f.writeFileSync(p.join(process.env.QUAL_ROOT,"artifact/pnpm-lock.yaml.sha256"),lock+"\n",{mode:0o600});f.writeFileSync(p.join(process.env.QUAL_ROOT,"artifact/candidate.json"),JSON.stringify({head:process.env.CANDIDATE_SHA,tree:process.env.CANDIDATE_TREE,lockSha256:lock})+"\n",{mode:0o600});console.log(JSON.stringify({head:process.env.CANDIDATE_SHA,tree:process.env.CANDIDATE_TREE,lockSha256:lock}))'
           chmod -R go-w "$QUAL_ROOT/artifact" "$QUAL_ROOT/browsers"
+      - name: Full host unit and real Darwin confinement tests
+        working-directory: candidate
+        timeout-minutes: 15
+        run: pnpm test
+      - name: Browser integration tests
+        working-directory: candidate
+        timeout-minutes: 5
+        run: pnpm test:integration
+      - name: Typecheck
+        working-directory: candidate
+        timeout-minutes: 3
+        run: pnpm typecheck
       - name: Root build
         working-directory: candidate
         timeout-minutes: 3
         run: pnpm build
-      - name: Diagnostic-only complete account store and admission fixture files
+      - name: Control Tower build
+        working-directory: candidate
+        timeout-minutes: 3
+        run: pnpm --dir apps/control-tower build
+      - name: Actual offline production adapter in both workspace modes
         timeout-minutes: 30
         shell: bash
         run: |
           set -euo pipefail
           node_program=$(node -p 'require("fs").realpathSync(process.execPath)')
-          env -i PATH="$PATH" HOME="$QUAL_ROOT/host-home" TMPDIR=/private/tmp Q_ROOT="$QUAL_ROOT" Q_CANDIDATE="$GITHUB_WORKSPACE/candidate" Q_NODE="$node_program" Q_PNPM="$PNPM_PROGRAM" Q_GIT=/Library/Developer/CommandLineTools/usr/bin/git Q_EXPECTED_SHA="$CANDIDATE_SHA" Q_EXPECTED_TREE="$CANDIDATE_TREE" "$node_program" --import "$GITHUB_WORKSPACE/infrastructure/.github/scripts/issue104-isolated-output.mjs" infrastructure/.github/scripts/issue104-native-qualification.mjs
+          env -i PATH="$PATH" HOME="$QUAL_ROOT/host-home" TMPDIR=/private/tmp Q_ROOT="$QUAL_ROOT" Q_CANDIDATE="$GITHUB_WORKSPACE/candidate" Q_NODE="$node_program" Q_PNPM="$PNPM_PROGRAM" Q_GIT=/Library/Developer/CommandLineTools/usr/bin/git Q_EXPECTED_SHA="$CANDIDATE_SHA" Q_EXPECTED_TREE="$CANDIDATE_TREE" "$node_program" infrastructure/.github/scripts/issue104-native-qualification.mjs
       - name: Dispose owned private preparation data
         if: always()
         timeout-minutes: 2
