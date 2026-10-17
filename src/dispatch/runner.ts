@@ -5,7 +5,7 @@ import type { GitHubAdapter } from '../adapters/github.js';
 import type { Run, WorkflowState } from '../domain/types.js';
 import type { RunStore } from '../store/json-file-store.js';
 import type { MissionAdmissionRegistry } from '../mission-admission/registry.js';
-import { nativeReviewReentry } from '../oracle/native-reviewer.js';
+import { nativeReviewReentry, unresolvedNativeReview } from '../oracle/native-reviewer.js';
 import {
   DispatchProtocolError,
   claimDispatchEntry,
@@ -107,6 +107,13 @@ function isTarget(run: Run, entry: DispatchQueueEntry, options: Pick<DispatchOnc
 
 async function retiredForProgression(run: Run, options: DispatchOnceOptions): Promise<boolean> {
   if (options.isRunOwnerRetired?.(run) !== true) return false;
+  // For a non-MERGED Run, this exact owner proof means an explicit existing
+  // retirement/cancellation disposition, not delivery. Preserve that authority
+  // without requiring retired unissued work to merge or reopening its wait.
+  if (run.state !== 'MERGED') {
+    if (unresolvedNativeReview(run) || run.mergeAttempt?.submissionPossible === true) throw new DispatchProtocolError('Non-delivery retirement conflicts with unresolved or possibly issued external work.');
+    return true;
+  }
   return run.nativeReview === undefined && run.mergeAttempt === undefined ||
     options.qualifyNativeProgression !== undefined && await options.qualifyNativeProgression(run);
 }

@@ -60,8 +60,12 @@ recovery still requires the existing explicit operator attestation; stopping a
 process cannot retire or cancel an issued external merge attempt. Only exact
 qualified settlement allows normal dispatch to advance to the next eligible
 issue while retaining the earlier queue row. Every historical or released-owner
-shortcut also requires a fresh model-free integration read before successor
-admission, even if the old runtime claim or queue row is absent or rerouted.
+shortcut for native delivered work also requires a fresh model-free integration
+read before successor admission, even if the old runtime claim or queue row is
+absent or rerouted. Exact explicit non-delivery retirement or cancellation of
+unissued work retains its existing disposition authority and cannot reopen A
+merely because its native binding wait is due. Release alone is not disposition;
+unresolved native review and possibly issued merges remain fenced.
 A historical qualification remains immutable evidence, not a freshness lease.
 
 Exact-proof normalization validates the prior receipt phase, token and generation

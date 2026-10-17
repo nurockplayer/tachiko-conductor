@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
-import { buildWorkflowDeps, recoverRunAdmission, runIssueCommand, runMergedTransitionCommand, reconcileDispatchMergedRunCommand, isDispatchRunOwnerRetiredCommand } from '../src/cli.js';
+import { buildWorkflowDeps, recoverRunAdmission, resumeCommand, runIssueCommand, runMergedTransitionCommand, reconcileDispatchMergedRunCommand, isDispatchRunOwnerRetiredCommand } from '../src/cli.js';
 import { createRun } from '../src/domain/run.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import type { Run } from '../src/domain/types.js';
@@ -1397,4 +1397,139 @@ it('recovers every interrupted stopped-parking/release publication through MERGE
       assert.equal(successor.entry.issue, 43); assert.equal(f.store().list().length, 2); assert.equal(f.mergeCounts().squashes, 1); assert.equal(f.counts().modelCalls, 0);
     } finally { f.cleanup(); }
   }
+});
+
+describe('non-delivery native retirement classification', () => {
+  const bQueue = `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 43\n    route: codex\n    profile: complex\n    task-shape-revision: task-v1\n    task-shape: interacting`;
+  function claimAndRows(f: ReturnType<typeof fixture>, claim: 'retained' | 'missing' | 'changed', row: 'retained' | 'absent' | 'rerouted') {
+    if (claim === 'missing') f.runtime.comments = [];
+    if (claim === 'changed') f.runtime.comments = [{ id: 'runtime', body: renderDispatchRuntime({ issue: 43, claimId: 'new-b-claim', runId: null, profile: 'complex', repairTaskShapeAuthority: authority, state: 'claimed', claimedAt: T0, heartbeatAt: T0, leaseUntil: T0 }) }];
+    if (row !== 'retained') f.runtime.readQueueComment = async () => row === 'absent' ? bQueue : `${DISPATCH_QUEUE_MARKER}\nready:\n  - issue: 42\n    route: human\n    profile: complex\n    task-shape-revision: task-v1\n    task-shape: interacting\n${bQueue.split('ready:\n')[1]}`;
+  }
+  async function retiredBindingWait(f: ReturnType<typeof fixture>) {
+    f.seed('READY'); await f.poll({} as NativeReviewerHost);
+    const run = f.store().read('run-native')!;
+    assert.equal(run.nativeReview!.wait!.kind, 'binding'); assert.deepEqual(run.nativeReview!.requests, []); assert.equal(run.mergeAttempt, undefined);
+    const receipt = readRunOwnerReceipt(f.receiptPath)!;
+    recoverRunAdmission(f.store(), f.registry(), run.id, receipt.generation, true, f.receiptPath, { retireWork: true });
+    assert.equal(isDispatchRunOwnerRetiredCommand(f.store(), run, f.registry()), true);
+    assert.equal(readRunOwnerReceipt(f.receiptPath)!.workDisposition, 'retired');
+    return { run, receipt: readFileSync(f.receiptPath), lane: f.registry().readLane('run:run-native')! };
+  }
+
+  it('preserves legal explicit unissued retirement immediately and when due across retained/missing/changed claims and retained/absent/rerouted rows', async () => {
+    for (const due of [false, true]) for (const claim of ['retained', 'missing', 'changed'] as const) for (const row of ['retained', 'absent', 'rerouted'] as const) {
+      const f = fixture(true);
+      try {
+        const retired = await retiredBindingWait(f);
+        if (due) f.tick(); claimAndRows(f, claim, row);
+        // Non-delivery retirement must not demand a GitHub integration proof.
+        f.github.readDefaultBranch = async () => { throw new Error('retired unissued work has no merge integration'); };
+        const result = await f.poll({} as NativeReviewerHost);
+        assert.equal(result.outcome, 'dispatched', `${due}/${claim}/${row}`);
+        if (result.outcome !== 'dispatched') throw new Error('Expected actual successor admission.');
+        assert.equal(result.entry.issue, 43); assert.equal(result.execution.state, 'WAITING_DEPENDENCY');
+        assert.deepEqual(readFileSync(f.receiptPath), retired.receipt, 'A receipt cannot be overwritten by due wait reentry');
+        assert.deepEqual(f.store().read(retired.run.id), retired.run); assert.deepEqual(f.registry().readLane('run:run-native'), retired.lane);
+        assert.equal(f.store().list().length, 2); assert.equal(f.counts().submissions, 0); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('preserves a legally offered unissued cancellation as non-delivery and admits B without claiming A merged', async () => {
+    for (const claim of ['retained', 'missing', 'changed'] as const) {
+      const f = fixture(true);
+      try {
+        f.seed(); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) }));
+        f.setSnapshotHook(() => { if (f.counts().snapshotReads === 3) f.setLiveHead('e'.repeat(40)); });
+        await f.poll();
+        const offered = f.store().read('run-native')!;
+        assert.equal(offered.state, 'NEEDS_HUMAN'); assert.ok(offered.interrupt!.choices!.includes('Cancel the run'));
+        assert.equal(offered.mergeAttempt, undefined); assert.ok(activeNativeReview(offered), 'control must complete native review before the final-gate HEAD drift'); assert.equal(activeNativeReview(offered)!.status, 'qualified_complete');
+        const cancelled = await resumeCommand(f.workflow(), offered.id, 'Cancel the run', { dispatchClaimId: offered.dispatchClaimId, admission: f.registry(), runOwnerReceiptPath: f.receiptPath, admissionWorkspace: f.repository, now: f.now, withDispatchAdmissionLock: async (op) => op() });
+        assert.equal(cancelled.run.state, 'FAILED'); assert.equal(cancelled.run.history.at(-1)!.reason, 'Cancel the run');
+        assert.equal(readRunOwnerReceipt(f.receiptPath)!.workDisposition, 'cancelled');
+        const receipt = readFileSync(f.receiptPath); const lane = f.registry().readLane('run:run-native');
+        const cancelledDurable = f.store().read(offered.id)!; const cancelledBytes = readFileSync(path.join(f.directory, 'runs', `${offered.id}.json`));
+        f.tick(); claimAndRows(f, claim, claim === 'retained' ? 'retained' : 'absent');
+        f.github.readDefaultBranch = async () => { throw new Error('cancelled unissued work has no merge integration'); };
+        const result = await f.poll({} as NativeReviewerHost);
+        assert.equal(result.outcome, 'dispatched'); if (result.outcome !== 'dispatched') throw new Error('Expected successor.');
+        assert.equal(result.entry.issue, 43); assert.equal(f.store().list().length, 2);
+        assert.deepEqual(readFileSync(f.receiptPath), receipt); assert.deepEqual(f.registry().readLane('run:run-native'), lane); assert.deepEqual(f.store().read(offered.id), cancelledDurable); assert.deepEqual(readFileSync(path.join(f.directory, 'runs', `${offered.id}.json`)), cancelledBytes);
+        assert.equal(f.counts().submissions, 1, 'completed review is retained; no subsequent review or implementation runs'); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('keeps bare stopped release distinct from explicit work disposition and retains unresolved review/merge fences', async () => {
+    for (const kind of ['release-only', 'pending-review', 'possible-merge'] as const) {
+      const f = fixture(true);
+      try {
+        if (kind === 'release-only') { f.seed('READY'); await f.poll({} as NativeReviewerHost); }
+        else if (kind === 'pending-review') { f.seed(); await f.poll(); }
+        else {
+          f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge();
+          f.setMergeOperation(async () => { throw new Error('possible merge unknown'); }); await f.poll();
+        }
+        const run = f.store().read('run-native')!; const receipt = readRunOwnerReceipt(f.receiptPath)!; const bytes = readFileSync(f.receiptPath);
+        if (kind === 'release-only') {
+          recoverRunAdmission(f.store(), f.registry(), run.id, receipt.generation, true, f.receiptPath);
+          assert.equal(readRunOwnerReceipt(f.receiptPath)!.workDisposition, undefined);
+          assert.equal(isDispatchRunOwnerRetiredCommand(f.store(), run, f.registry()), false);
+          const held = await f.poll({} as NativeReviewerHost); assert.notEqual(held.outcome, 'dispatched');
+          f.tick(); const resumed = await f.poll({} as NativeReviewerHost);
+          assert.equal(resumed.outcome, 'dispatched'); if (resumed.outcome !== 'dispatched') throw new Error('Expected unretired A to resume.');
+          assert.equal(resumed.entry.issue, 42, 'capability release without disposition cannot authorize successor B');
+          assert.equal(readRunOwnerReceipt(f.receiptPath)!.workDisposition, undefined);
+        } else {
+          assert.throws(() => recoverRunAdmission(f.store(), f.registry(), run.id, receipt.generation, true, f.receiptPath, { retireWork: true }), /cannot retire/);
+          assert.deepEqual(readFileSync(f.receiptPath), bytes);
+          assert.equal((await f.poll()).outcome, 'existing_claim');
+        }
+        assert.equal(f.store().list().length, 1); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, kind === 'possible-merge' ? 1 : 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('continues to require fresh native delivered ancestry even when historical claim/row are absent', async () => {
+    const f = fixture(true);
+    try {
+      f.seed('VALIDATING'); f.setSubmit(async (r) => ({ outcome: 'complete', evidence: f.terminal(r) })); await f.poll(); f.armMerge(); await f.poll();
+      await runMergedTransitionCommand(f.store(), 'run-native', f.github, f.registry(), async (op) => op());
+      const run = f.store().read('run-native')!; const receipt = readFileSync(f.receiptPath);
+      claimAndRows(f, 'missing', 'absent'); f.setMain(f.base); f.setAncestry(false);
+      const held = await f.poll({} as NativeReviewerHost);
+      assert.notEqual(held.outcome, 'dispatched'); assert.equal(f.store().list().length, 1);
+      assert.deepEqual(f.store().read(run.id), run); assert.deepEqual(readFileSync(f.receiptPath), receipt); assert.equal(f.mergeCounts().squashes, 1);
+    } finally { f.cleanup(); }
+  });
+  it('does not respawn same-authority retired A or treat a revised nonterminal row as a new incarnation', async () => {
+    for (const variant of ['same-authority', 'revised-nonterminal'] as const) {
+      const f = fixture(true);
+      try {
+        const retired = await retiredBindingWait(f); f.tick();
+        f.runtime.readQueueComment = async () => variant === 'same-authority'
+          ? queue.replace(/  - issue: 43[\s\S]*$/, '')
+          : queue.replace('task-shape-revision: task-v1', 'task-shape-revision: task-v2');
+        const result = await f.poll({} as NativeReviewerHost);
+        assert.equal(result.outcome, 'no_eligible_work'); assert.equal(f.store().list().length, 1);
+        assert.deepEqual(readFileSync(f.receiptPath), retired.receipt); assert.deepEqual(f.store().read(retired.run.id), retired.run);
+        assert.equal(f.counts().submissions, 0); assert.equal(f.counts().modelCalls, 0); assert.equal(f.mergeCounts().squashes, 0);
+        if (result.outcome === 'no_eligible_work') assert.match(result.reasons.join(' '), variant === 'same-authority' ? /retirement prevents.*respawn/ : /terminal disposition/);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('keeps retired unissued work behind maintenance HOLD without reopening A or admitting B', async () => {
+    const f = fixture(true);
+    try {
+      const retired = await retiredBindingWait(f); f.tick(); f.setHold(true);
+      assert.equal((await f.poll({} as NativeReviewerHost)).outcome, 'maintenance_hold');
+      assert.deepEqual(readFileSync(f.receiptPath), retired.receipt); assert.deepEqual(f.store().read(retired.run.id), retired.run);
+      assert.deepEqual(f.registry().readLane('run:run-native'), retired.lane); assert.equal(f.store().list().length, 1);
+      assert.equal(f.counts().modelCalls, 0); assert.equal(f.counts().submissions, 0); assert.equal(f.mergeCounts().squashes, 0);
+    } finally { f.cleanup(); }
+  });
+
 });
