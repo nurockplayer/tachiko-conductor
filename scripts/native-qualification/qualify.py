@@ -651,6 +651,8 @@ class Qualification:
     def crash_entries(self, directory, limitations):
         entries = {}
         try:
+            if any(path.is_symlink() for path in [directory, *directory.parents]):
+                raise OSError('nonphysical_report_directory')
             if directory.resolve(strict=True) != directory or not directory.is_dir():
                 raise OSError('nonphysical_report_directory')
             with os.scandir(directory) as listing:
@@ -662,6 +664,8 @@ class Qualification:
                         info = entry.stat(follow_symlinks=False)
                         if stat.S_ISREG(info.st_mode):
                             entries[entry.name] = (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns)
+        except FileNotFoundError:
+            return entries
         except (OSError, RuntimeError):
             limitations.append('report_directory_unavailable_or_nonphysical')
             return None
@@ -751,7 +755,7 @@ class Qualification:
                             info = os.fstat(stream.fileno())
                             if not stat.S_ISREG(info.st_mode) or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns) != identity:
                                 raise ValueError('candidate_changed')
-                            raw = stream.read(info.st_size + 1)
+                            raw = stream.read(info.st_size)
                             after = os.fstat(stream.fileno())
                         read_bytes += len(raw)
                         if len(raw) != info.st_size or (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) != identity:
