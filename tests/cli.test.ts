@@ -4389,54 +4389,71 @@ describe('CLI end-to-end across processes', () => {
 
   it('retries only a capacity-parked manual lane and preserves the manual checkpoint fence', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-manual-capacity-'));
-    const accountHome = path.join(dir, 'account-home');
-    const runs = path.join(dir, 'runs');
-    mkdirSync(accountHome);
-    const preload = path.join(dir, 'account-home-preload.mjs');
-    writeFileSync(preload, [
-      "import os from 'node:os';",
-      'const original = os.userInfo.bind(os);',
-      "Object.defineProperty(os, 'userInfo', { configurable: true, value: (...args) => ({ ...original(...args), homedir: process.env.TACHIKO_TEST_ACCOUNT_HOME }) });",
-      '',
-    ].join('\n'));
-    const helper = path.join(dir, 'registry-fixture.mjs');
-    const hostRegistryUrl = pathToFileURL(path.join(REPO_ROOT, 'src/mission-admission/host-registry.js')).href;
-    writeFileSync(helper, [
-      "import { readFileSync, readdirSync, writeFileSync } from 'node:fs';",
-      `import { createHostAdmissionRegistry } from ${JSON.stringify(hostRegistryUrl)};`,
-      "const registry = createHostAdmissionRegistry();",
-      "if (process.argv[2] === 'hold') { const result = registry.admit({ laneId: 'manual-test-capacity-holder', role: 'production_captain', evidence: { repository: 'other/repo', issue: 9 }, highAutonomy: true }); if (result.outcome !== 'admitted') throw new Error('could not create capacity holder'); writeFileSync(process.env.TACHIKO_TEST_TOKEN_PATH, JSON.stringify(result.token)); }",
-      "if (process.argv[2] === 'release') { const token = JSON.parse(readFileSync(process.env.TACHIKO_TEST_TOKEN_PATH, 'utf8')); registry.release(token, true); }",
-      "if (process.argv[2] === 'checkpoint') { const files = readdirSync(process.env.TACHIKO_MANUAL_OWNER_RECEIPTS_DIR); const receipt = JSON.parse(readFileSync(process.env.TACHIKO_MANUAL_OWNER_RECEIPTS_DIR + '/' + files[0], 'utf8')); registry.parkManual(receipt.token, { worktree: process.cwd(), branch: process.env.TACHIKO_TEST_BRANCH, checkpointSha: process.env.TACHIKO_TEST_HEAD, clean: true, stopped: true }); }",
-      '',
-    ].join('\n'));
-    const admissionConfig = JSON.stringify({ schemaVersion: 1, revision: 'manual-capacity-test-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } });
-    const env = {
-      ...process.env,
-      HOME: path.join(dir, 'ambient-home'),
-      TACHIKO_TEST_ACCOUNT_HOME: accountHome,
-      TACHIKO_DATA_DIR: runs,
-      TACHIKO_MISSION_ADMISSION_CONFIG: admissionConfig,
-      TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'manual-receipts'),
-      TACHIKO_DISPATCH_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock'),
-      TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock.admission'),
-      TACHIKO_TEST_BRANCH: spawnSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout.trim(),
-      TACHIKO_TEST_HEAD: spawnSync('git', ['rev-parse', 'HEAD'], { cwd: REPO_ROOT, encoding: 'utf8' }).stdout.trim(),
-      TACHIKO_TEST_TOKEN_PATH: path.join(dir, 'holder-token.json'),
-    };
-    const invoke = (args: string[]): Promise<CliResult> => new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, ['--import', preload, '--import', 'tsx', path.join(REPO_ROOT, 'src/cli.ts'), ...args], { cwd: REPO_ROOT, env, stdio: ['ignore', 'pipe', 'pipe'] });
-      let stdout = '';
-      let stderr = '';
-      child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
-      child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
-      child.on('error', reject);
-      child.on('close', (status) => resolve({ stdout, stderr, status }));
-    });
-    const fixture = (action: string) => spawnSync(process.execPath, ['--import', preload, '--import', 'tsx', helper, action], { cwd: REPO_ROOT, env, encoding: 'utf8' });
-    const registryFile = path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'registry.json');
-    const manualArgs = ['dispatch', 'manual', 'register'];
     try {
+      const workspace = path.join(dir, 'workspace');
+      mkdirSync(workspace);
+      for (const args of [
+        ['init', '--initial-branch=manual-capacity-fixture'],
+        ['config', 'user.email', 'manual-capacity@example.test'],
+        ['config', 'user.name', 'Manual Capacity Fixture'],
+        ['-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-m', 'manual capacity fixture'],
+        ['remote', 'add', 'origin', 'https://github.com/acme/widgets.git'],
+      ]) {
+        const result = spawnSync('git', args, { cwd: workspace, encoding: 'utf8' });
+        assert.equal(result.status, 0, result.stderr);
+      }
+      const initialStatus = spawnSync('git', ['status', '--porcelain'], { cwd: workspace, encoding: 'utf8' });
+      assert.equal(initialStatus.status, 0, initialStatus.stderr);
+      assert.equal(initialStatus.stdout, '');
+      const accountHome = path.join(dir, 'account-home');
+      const runs = path.join(dir, 'runs');
+      mkdirSync(accountHome);
+      const preload = path.join(dir, 'account-home-preload.mjs');
+      writeFileSync(preload, [
+        "import os from 'node:os';",
+        'const original = os.userInfo.bind(os);',
+        "Object.defineProperty(os, 'userInfo', { configurable: true, value: (...args) => ({ ...original(...args), homedir: process.env.TACHIKO_TEST_ACCOUNT_HOME }) });",
+        '',
+      ].join('\n'));
+      const helper = path.join(dir, 'registry-fixture.mjs');
+      const hostRegistryUrl = pathToFileURL(path.join(REPO_ROOT, 'src/mission-admission/host-registry.js')).href;
+      writeFileSync(helper, [
+        "import { readFileSync, readdirSync, writeFileSync } from 'node:fs';",
+        `import { createHostAdmissionRegistry } from ${JSON.stringify(hostRegistryUrl)};`,
+        "const registry = createHostAdmissionRegistry();",
+        "if (process.argv[2] === 'hold') { const result = registry.admit({ laneId: 'manual-test-capacity-holder', role: 'production_captain', evidence: { repository: 'other/repo', issue: 9 }, highAutonomy: true }); if (result.outcome !== 'admitted') throw new Error('could not create capacity holder'); writeFileSync(process.env.TACHIKO_TEST_TOKEN_PATH, JSON.stringify(result.token)); }",
+        "if (process.argv[2] === 'release') { const token = JSON.parse(readFileSync(process.env.TACHIKO_TEST_TOKEN_PATH, 'utf8')); registry.release(token, true); }",
+        "if (process.argv[2] === 'checkpoint') { const files = readdirSync(process.env.TACHIKO_MANUAL_OWNER_RECEIPTS_DIR); const receipt = JSON.parse(readFileSync(process.env.TACHIKO_MANUAL_OWNER_RECEIPTS_DIR + '/' + files[0], 'utf8')); registry.parkManual(receipt.token, { worktree: process.cwd(), branch: process.env.TACHIKO_TEST_BRANCH, checkpointSha: process.env.TACHIKO_TEST_HEAD, clean: true, stopped: true }); }",
+        '',
+      ].join('\n'));
+      const admissionConfig = JSON.stringify({ schemaVersion: 1, revision: 'manual-capacity-test-v1', limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } });
+      const env = {
+        ...process.env,
+        HOME: path.join(dir, 'ambient-home'),
+        TACHIKO_TEST_ACCOUNT_HOME: accountHome,
+        TACHIKO_DATA_DIR: runs,
+        TACHIKO_MISSION_ADMISSION_CONFIG: admissionConfig,
+        TACHIKO_MANUAL_OWNER_RECEIPTS_DIR: path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'manual-receipts'),
+        TACHIKO_DISPATCH_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock'),
+        TACHIKO_DISPATCH_ADMISSION_LOCK_PATH: path.join(accountHome, '.tachiko-conductor', 'dispatch', 'once.lock.admission'),
+        TACHIKO_TEST_BRANCH: spawnSync('git', ['symbolic-ref', '--quiet', '--short', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).stdout.trim(),
+        TACHIKO_TEST_HEAD: spawnSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).stdout.trim(),
+        TACHIKO_TEST_TOKEN_PATH: path.join(dir, 'holder-token.json'),
+      };
+      const invoke = (args: string[]): Promise<CliResult> => new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, ['--import', preload, '--import', path.join(REPO_ROOT, 'node_modules/tsx/dist/loader.mjs'), path.join(REPO_ROOT, 'src/cli.ts'), ...args], { cwd: workspace, env, stdio: ['ignore', 'pipe', 'pipe'] });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.setEncoding('utf8').on('data', (chunk: string) => { stdout += chunk; });
+        child.stderr.setEncoding('utf8').on('data', (chunk: string) => { stderr += chunk; });
+        child.on('error', reject);
+        child.on('close', (status) => resolve({ stdout, stderr, status }));
+      });
+      const fixture = (action: string) => spawnSync(process.execPath, ['--import', preload, '--import', path.join(REPO_ROOT, 'node_modules/tsx/dist/loader.mjs'), helper, action], { cwd: workspace, env, encoding: 'utf8' });
+      const registryFile = path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'registry.json');
+      const manualArgs = ['dispatch', 'manual', 'register'];
+      assert.equal(env.TACHIKO_TEST_BRANCH, 'manual-capacity-fixture');
+      assert.match(env.TACHIKO_TEST_HEAD, /^[0-9a-f]{40}$/);
       assert.equal(fixture('hold').status, 0);
       const firstWait = await invoke(manualArgs);
       assert.equal(firstWait.status, 1);
@@ -4462,6 +4479,9 @@ describe('CLI end-to-end across processes', () => {
       assert.equal(activeManual.generation, 2);
       assert.ok(existsSync(path.join(accountHome, '.tachiko-conductor', 'mission-admission', 'manual-receipts')));
 
+      const checkpointStatus = spawnSync('git', ['status', '--porcelain'], { cwd: workspace, encoding: 'utf8' });
+      assert.equal(checkpointStatus.status, 0, checkpointStatus.stderr);
+      assert.equal(checkpointStatus.stdout, '');
       assert.equal(fixture('checkpoint').status, 0);
       const checkpointRetry = await invoke(manualArgs);
       assert.equal(checkpointRetry.status, 1);
