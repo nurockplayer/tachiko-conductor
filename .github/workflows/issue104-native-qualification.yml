@@ -1,4 +1,4 @@
-name: Issue 104 isolated lock dependency facts
+name: Issue 104 isolated account and lock fixture prerequisite
 on:
   push:
     branches: [qualification/issue104-stage6-native]
@@ -12,8 +12,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     env:
-      CANDIDATE_SHA: 7b80e613a89019aa7241170dba2d625afba46da7
-      CANDIDATE_TREE: 6efc2a41f3507f45ce54ca89ec93d302ecda0921
+      CANDIDATE_SHA: 217dff599d8f5a24587d5ecd90daaf79eef66da9
+      CANDIDATE_TREE: fa4bf0b3ee7200fdfa7512f889fe723ebea8f858
     steps:
       - uses: actions/checkout@v7
         with:
@@ -21,7 +21,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: 7b80e613a89019aa7241170dba2d625afba46da7
+          ref: 217dff599d8f5a24587d5ecd90daaf79eef66da9
           path: candidate
           persist-credentials: false
       - uses: actions/setup-node@v7
@@ -88,7 +88,7 @@ jobs:
         working-directory: candidate
         timeout-minutes: 3
         run: pnpm build
-      - name: Diagnostic-only fixed boot stderr categories and passive ps metadata
+      - name: Diagnostic-only complete account store and admission fixture files
         timeout-minutes: 30
         shell: bash
         run: |
