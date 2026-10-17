@@ -1,3 +1,4 @@
+import { JsonFileOracleReceiptStore } from '../oracle/receipt-store.js';
 import { authenticateNativeRun, type NativeCompletionHosts } from '../oracle/completion-proof.js';
 import { implementationAuthorityCoherent, assertImplementationAuthorityProgresses } from '../domain/implementation-authority.js';
 import { nativeLeadCoherent, nativeLeadProgresses, assertNativeLeadTransition } from '../oracle/native-lead.js';
@@ -42,7 +43,7 @@ export interface RunStore {
 
 export interface JsonFileStoreOptions {
   /** Trusted factory dependencies; never inferred from persisted Run fields. */
-  readonly nativeCompletionHosts?: NativeCompletionHosts;
+  readonly nativeCompletionHosts?: NativeCompletionHosts | readonly NativeCompletionHosts[];
   /** Directory that will hold one `<id>.json` file per run. */
   readonly dir: string;
   /** Bound for waiting on another same-host Run writer. */
@@ -383,7 +384,7 @@ function writeOperationalProjectionBestEffort(runsDir: string, run: Run, committ
   }
 }
 
-function readRun(filePath: string, id: string, hosts: NativeCompletionHosts): Run {
+function readRun(filePath: string, id: string, hosts: readonly NativeCompletionHosts[]): Run {
   let raw: string;
   try {
     raw = readFileSync(filePath, 'utf8');
@@ -490,8 +491,21 @@ function sleepSync(milliseconds: number): void {
 
 export class JsonFileStore implements RunStore {
   readonly name = 'json-file';
-  private nativeCompletionHosts: NativeCompletionHosts;
-  configureNativeCompletionHosts(hosts: NativeCompletionHosts): void { this.nativeCompletionHosts = hosts; }
+  private readonly nativeCompletionHosts: NativeCompletionHosts[] = [];
+  private readonly completionHostIdentities: { role: 'review' | 'lead'; receipts: object; authenticate: Function }[] = [];
+  /** Register trusted historical verification independently from current role
+   * availability. Opt-out/model-free factory construction cannot erase it. */
+  configureNativeCompletionHosts(hosts: NativeCompletionHosts): void {
+    for (const role of ['review', 'lead'] as const) {
+      const host = hosts[role];
+      if (!(host?.receipts instanceof JsonFileOracleReceiptStore) || typeof host.authenticate !== 'function') continue;
+      const { receipts, authenticate } = host;
+      if (this.completionHostIdentities.some(prior => prior.role === role && prior.receipts === receipts && prior.authenticate === authenticate)) continue;
+      this.completionHostIdentities.push({ role, receipts, authenticate });
+      const verifier = Object.freeze({ receipts, authenticate: authenticate.bind(host) });
+      this.nativeCompletionHosts.push(Object.freeze({ [role]: verifier }));
+    }
+  }
   private readonly dir: string;
   private readonly mutationLockTimeoutMs: number;
   private readonly mutationLockRetryMs: number;
@@ -499,7 +513,7 @@ export class JsonFileStore implements RunStore {
   private readonly syncForDurability: (fd: number, target: 'file' | 'directory') => void;
 
   constructor(options: JsonFileStoreOptions) {
-    this.nativeCompletionHosts = options.nativeCompletionHosts ?? {};
+    for (const context of Array.isArray(options.nativeCompletionHosts) ? options.nativeCompletionHosts : [options.nativeCompletionHosts ?? {}]) this.configureNativeCompletionHosts(context);
     this.mutationLockTimeoutMs = options.mutationLockTimeoutMs ?? DEFAULT_RUN_MUTATION_LOCK_TIMEOUT_MS;
     this.mutationLockRetryMs = options.mutationLockRetryMs ?? DEFAULT_RUN_MUTATION_LOCK_RETRY_MS;
     this.beforeConditionalWrite = options.beforeConditionalWrite;

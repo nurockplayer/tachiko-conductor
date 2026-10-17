@@ -1,5 +1,5 @@
 import { originalImplementationMatches } from '../domain/implementation-authority.js';
-import { resolveNativeLead, activeNativeLead, acceptedNativeLead, emptyLeadLedger, leadConsumptionValid, type NativeLeadBoundary, type NativeLeadContext, type LeadRepairReference } from '../oracle/native-lead.js';
+import { resolveNativeLead, activeNativeLead, acceptedNativeLead, emptyLeadLedger, unresolvedNativeRepairHistory, leadConsumptionValid, type NativeLeadBoundary, type NativeLeadContext, type LeadRepairReference } from '../oracle/native-lead.js';
 import { oracleDigest } from '../oracle/source-evidence.js';
 import {
   GOVERNED_PUBLICATION_REENTRY_ACTION,
@@ -660,7 +660,8 @@ export async function runReviewLoop(
           if (decision.outcome === 'wait' || deps.leadObservationOnly) {
             const reason = decision.outcome === 'wait' ? decision.reason : 'HOLD retained lead terminal as evidence only.';
             const parked = parkNativeReview(run, 'lead', reason, now());
-            const kind = decision.outcome === 'wait' && (decision.reason.includes('unsupported') || acceptedNativeLead(run) !== undefined || run.nativeLead?.requests.some(r => r.status === 'incomplete' && r.failure !== 'transport_failure')) ? 'qualification' as const : 'request' as const;
+            const observationWait = acceptedNativeLead(run)?.disposition.outcome === 'repair' && (unresolvedNativeRepairHistory(run) || reason.includes('evidence only'));
+            const kind = !observationWait && decision.outcome === 'wait' && (decision.reason.includes('unsupported') || decision.reason.includes('observation budget exhausted') || acceptedNativeLead(run) !== undefined || run.nativeLead?.requests.some(r => r.status === 'incomplete' && r.failure !== 'transport_failure')) ? 'qualification' as const : 'request' as const;
             const next = { ...parked, nativeLead: { ...(run.nativeLead ?? emptyLeadLedger()), wait: {kind, nextAttemptAt: new Date(Date.parse(now()) + 30_000).toISOString()} } };
             if (!updateReviewRun(store, run, next)) return staleReviewOutcome(run.id, run, store);
             return {outcome:'waiting_dependency',run:next,reason};
@@ -673,6 +674,13 @@ export async function runReviewLoop(
             const next={...stopped,nativeLead:{...run.nativeLead!,wait:{kind:'stop' as const,nextAttemptAt:now()}}};
             if (!updateReviewRun(store,run,next)) return staleReviewOutcome(run.id,run,store);
             return {outcome:'needs_human',run:next,reason};
+          }
+          if (unresolvedNativeRepairHistory(run)) {
+            const reason = 'Qualified active lead disposition retained; waiting for exact original/inactive remote completion before repair.';
+            const parked = parkNativeReview(run, 'lead', reason, now());
+            const next = { ...parked, nativeLead: { ...run.nativeLead!, wait: { kind: 'request' as const, nextAttemptAt: new Date(Date.parse(now()) + 30_000).toISOString() } } };
+            if (!updateReviewRun(store, run, next)) return staleReviewOutcome(run.id, run, store);
+            return { outcome: 'waiting_dependency', run: next, reason };
           }
           await deps.assertReviewClaim?.(run);
           deps.assertCurrentMutation?.();

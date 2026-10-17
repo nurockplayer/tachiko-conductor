@@ -317,7 +317,7 @@ export function nativeLeadReentry(run: Run, now: string): boolean {
   if (l.wait?.kind === 'stop' || l.wait?.kind === 'qualification' || l.wait && Date.parse(l.wait.nextAttemptAt) > Date.parse(now))
     return false;
   const active = activeNativeLead(run);
-  return !active || active.status === 'qualified_complete' || active.status === 'incomplete' && active.failure === 'transport_failure' || active.observations < LEAD_OBSERVATIONS && Date.parse(active.nextObservationAt) <= Date.parse(now);
+  return !active || active.status === 'qualified_complete' || active.status === 'terminal_unknown' || active.status === 'incomplete' && active.failure === 'transport_failure' || active.observations < LEAD_OBSERVATIONS && Date.parse(active.nextObservationAt) <= Date.parse(now);
 }
 export function nativeLeadCoherent(run: Run, inspectOnly = false): boolean {
   try {
@@ -486,8 +486,8 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       return wait('Lead observation unavailable: qualified host/current owner/claim missing.');
     await c.assertLiveClaim();
     c.assertCurrent();
-    const pending = run.nativeLead?.requests.find(r => r.submissionPossible && r.terminalDigest === undefined && leadOwnerProved(run, r.identity, c.owner) && r.identity.bindingId === host.binding.bindingId && r.identity.requestedModel === host.binding.model);
-    if (!pending)
+    const eligible = () => (run.nativeLead?.requests ?? []).filter(r => r.submissionPossible && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'lead') && leadOwnerProved(run, r.identity, c.owner) && r.identity.bindingId === host.binding.bindingId && r.identity.requestedModel === host.binding.model);
+    if (eligible().length === 0)
       return wait('No exact unresolved lead request is observable by this current owner/binding.');
     const save = (next: Run) => {
       c.assertCurrent();
@@ -496,7 +496,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       run = next;
       return true;
     };
-    let request = pending;
+    let request = eligible()[0]!;
     const complete = (e: Extract<NativeLeadEvidence, {
       kind: 'terminal';
     }>) => {
@@ -524,14 +524,29 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
         return wait('Completion proof retained after lost Run CAS.');
       return wait('Authenticated external completion retained; rejected semantic disposition cannot authorize repair.');
     };
-    const persisted = host.receipts.readLead!(`${request.identity.requestId}.terminal`);
-    if (persisted?.kind === 'terminal')
-      return complete(persisted);
-    const rejected = host.receipts.readLead!(`${request.identity.requestId}.completion`);
-    if (rejected?.kind === 'completion' && same(rejected.identity, request.identity) && host.authenticate(frozen(rejected))) {
-      save({ ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? { ...r, terminalDigest: oracleDigest(rejected), completionProof: host.receipts.recordAuthenticatedCompletion!('lead', rejected, x => host.authenticate(x as Exclude<NativeLeadEvidence,{kind:'request'}>)), ...(r.status === 'retired' || r.status === 'replaced' ? {} : { status: 'incomplete' as const, failure: 'missing_evidence' as const }) } : r) } });
-      return wait('Immutable rejected-terminal completion reconciled without a service read.');
+    // Immutable cache reconciliation is independent of service-read budgets,
+    // due times and active eligibility. Never let an exhausted original hide a
+    // different exact request's already-authenticated terminal.
+    let reconciled = false;
+    for (const candidate of eligible()) {
+      request = run.nativeLead!.requests.find(r => r.identity.requestId === candidate.identity.requestId)!;
+      const persisted = host.receipts.readLead!(`${request.identity.requestId}.terminal`);
+      const rejected = host.receipts.readLead!(`${request.identity.requestId}.completion`);
+      if (persisted?.kind === 'terminal') {
+        await c.assertLiveClaim(); c.assertCurrent();
+        complete(persisted);
+      } else if (rejected?.kind === 'completion' && same(rejected.identity, request.identity) && host.authenticate(frozen(rejected))) {
+        await c.assertLiveClaim(); c.assertCurrent();
+        save({ ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? { ...r, terminalDigest: oracleDigest(rejected), completionProof: host.receipts.recordAuthenticatedCompletion!('lead', rejected, x => host.authenticate(x as Exclude<NativeLeadEvidence,{kind:'request'}>)), ...(r.status === 'retired' || r.status === 'replaced' ? {} : { status: 'incomplete' as const, failure: r.failure === 'safety_refusal' ? r.failure : 'missing_evidence' as const }) } : r) } });
+      }
+      const current = run.nativeLead!.requests.find(r => r.identity.requestId === candidate.identity.requestId)!;
+      reconciled ||= hasAuthenticatedCompletion(current.identity, current.terminalDigest, current.completionProof, 'lead');
     }
+    if (reconciled) return wait('Exact cached lead terminals reconciled as evidence only; no service read or repair initiated.');
+    const pending = eligible().filter(r => r.observations < LEAD_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(c.now()))
+      .sort((a, b) => a.observations - b.observations || Date.parse(a.nextObservationAt) - Date.parse(b.nextObservationAt) || Number(b.identity.requestId === run.nativeLead!.activeRequestId) - Number(a.identity.requestId === run.nativeLead!.activeRequestId))[0];
+    if (!pending) return wait('Lead finite observation unavailable or not due; ownership retained.');
+    request = pending;
     if (!host.observe || request.observations >= LEAD_OBSERVATIONS || Date.parse(request.nextObservationAt) > Date.parse(c.now()))
       return wait('Lead finite observation unavailable or not due; ownership retained.');
     request = { ...request, observations: request.observations + 1, nextObservationAt: new Date(Date.parse(c.now()) + LEAD_BACKOFF_MS).toISOString() };
@@ -542,7 +557,14 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       response = await host.observe(frozen(request.identity), request.conversationUrl);
     }
     catch {
-      return wait('Lead observation failed; external state remains unknown.');
+      await c.assertLiveClaim();
+      c.assertCurrent();
+      // A thrown read proves no remote terminal/cancellation/irrecoverability.
+      // Preserve known refusal/stop/inactive evidence and the already-spent read.
+      const uncertain = { ...request, ...(['pending', 'terminal_unknown'].includes(request.status) ? { status: 'terminal_unknown' as const } : {}) };
+      if (!save({ ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? uncertain : r) } }))
+        return wait('Lead thrown-observation status CAS lost; uncertainty retained.');
+      return wait('Lead observation failed; typed external uncertainty and finite budget retained.');
     }
     c.assertCurrent();
     await c.assertLiveClaim();
@@ -632,8 +654,8 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
         return isActive ? { outcome: 'complete' as const, run, acceptance } : wait('Inactive lead terminal reconciled as evidence only.');
       };
       // Inactive originals remain observable: eligibility retirement never erases remote uncertainty.
-      const inactive = run.nativeLead?.requests.find(r => r.identity.requestId !== run.nativeLead?.activeRequestId && r.submissionPossible && !r.terminalDigest && r.observations < LEAD_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(c.now()));
-      if (inactive && (host.observe || host.receipts.readLead!(`${inactive.identity.requestId}.terminal`))) {
+      const inactive = run.nativeLead?.requests.find(r => r.identity.requestId !== run.nativeLead?.activeRequestId && r.submissionPossible && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'lead') && (host.receipts.readLead!(`${r.identity.requestId}.terminal`) || host.receipts.readLead!(`${r.identity.requestId}.completion`) || host.observe && r.observations < LEAD_OBSERVATIONS && Date.parse(r.nextObservationAt) <= Date.parse(c.now())));
+      if (inactive) {
         const result = await observe({ ...c, run });
         run = result.run;
         return wait(result.reason);
@@ -716,7 +738,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       }
       else {
         if (active.observations >= LEAD_OBSERVATIONS || Date.parse(active.nextObservationAt) > Date.parse(c.now()))
-          return wait('Native lead bounded observation parked.');
+          return wait(active.observations >= LEAD_OBSERVATIONS ? 'Native lead observation budget exhausted; explicit qualified disposition or attention required.' : 'Native lead bounded observation parked.');
         if (!host.observe) {
           if (!save(update({ ...active, status: 'terminal_unknown' })))
             return stale();

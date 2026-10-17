@@ -335,6 +335,10 @@ it('a late inactive authenticated stop reconciles only its original uncertainty 
     await f.poll(); const original = f.leadRequests[0]!;
     f.tick(); await f.poll();
     assert.equal(f.counts().leadCalls, 2);
+    assert.equal(f.run().state, 'WAITING_DEPENDENCY');
+    assert.equal(f.run().repairAdmissions?.length ?? 0, 0, 'replacement cannot consume while the original is unknown');
+    assert.equal(f.run().history.filter(h => h.type === 'start_fix').length, 0);
+    assert.equal(f.counts().boundaries, 1, 'only the initial worker boundary has run');
     f.setLeadObserve(async identity => { assert.equal(identity.requestId, original.identity.requestId); return { outcome: 'complete', evidence: f.terminal(original, 'stop') }; });
     for (let i = 0; i < 4 && (f.run().state !== 'MERGE_READY' || unresolvedNativeLead(f.run())); i++) { f.tick(); await f.poll(); }
     const r = f.run(); assert.equal(r.state, 'MERGE_READY'); assert.equal(unresolvedNativeLead(r), false);
@@ -343,7 +347,28 @@ it('a late inactive authenticated stop reconciles only its original uncertainty 
     assert.equal(r.repairAdmissions!.length, 1); assert.equal(r.repairAdmissions![0]!.leadDisposition!.requestId, f.leadRequests[1]!.identity.requestId);
     const m = mergeFixture(f); await m.issue(); assert.equal(m.writes(), 1); assertNativeMergeSettlement(f.run());
     assert.equal(f.registry().readLane(`run:${r.id}`)!.parkedReason, 'workflow_settled');
-    await canonical(f, async () => { const settled = await reconcileDispatchMergedRunCommand(f.store(), f.run(), m.github, f.registry(), async op => op()); assert.equal(settled!.state, 'MERGED'); });
+    await canonical(f, async receipt => {
+      const settled = await reconcileDispatchMergedRunCommand(f.store(), f.run(), m.github, f.registry(), async op => op());
+      assert.equal(settled!.state, 'MERGED'); assert.equal(f.registry().readLane(`run:${r.id}`)!.status, 'released');
+      assert.equal(readRunOwnerReceipt(receipt)?.settlementReason, 'workflow_settled');
+      let successors = 0;
+      await dispatchOnceCommand({ ...f.config, merge: m.policy }, {
+        workflow: m.workflow, runtime: f.runtime, admission: f.registry(), now: f.now, resolveExecutionProfile: () => f.execution,
+        reconcileMergedRun: x => reconcileDispatchMergedRunCommand(f.store(), x, m.github, f.registry(), async op => op()),
+        isRunOwnerRetired: x => isDispatchRunOwnerRetiredCommand(f.store(), x, f.registry()),
+        runIssue: async (ref, execution, claimId, shape) => {
+          successors++; assert.equal(f.store().read(r.id)!.state, 'MERGED');
+          assert.equal(isDispatchRunOwnerRetiredCommand(f.store(), f.store().read(r.id)!, f.registry()), true);
+          return runIssueCommand({ ...buildWorkflowDeps(f.store()), github: m.github }, ref, { execution, repairTaskShapeAuthority: shape, dispatchClaimId: claimId, admission: f.registry(), now: f.now, maxReviewAttempts: 1 });
+        },
+        resumeClaimedRun: async () => { throw new Error('settled A cannot execute again'); },
+      });
+      assert.equal(successors, 1); const claim = selectDispatchRuntime(await f.runtime.listRuntimeComments())!.claim;
+      assert.equal(claim.issue, 43); const next = f.store().read(claim.runId!)!;
+      assert.equal(next.state, 'WAITING_DEPENDENCY'); assert.equal(next.nativeReview!.requests.length, 0);
+      assert.equal(f.registry().readLane(`run:${next.id}`)!.status, 'parked');
+      assert.equal(f.store().read(r.id)!.state, 'MERGED'); assert.equal(m.writes(), 1);
+    });
     assert.equal(f.counts().leadCalls, 2); assert.equal(f.counts().boundaries, 2);
   } finally { f.cleanup(); }
 });

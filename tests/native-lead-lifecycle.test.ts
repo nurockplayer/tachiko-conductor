@@ -370,20 +370,26 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
       await f.poll(host);
       const replacement = f.run();
       assert.equal(replacement.nativeLead?.requests.length, 2);
-      assert.equal(replacement.repairAdmissions?.length, 1);
+      assert.equal(replacement.repairAdmissions?.length ?? 0, 0, 'unknown original prevents admission until its exact completion');
+      assert.equal(replacement.history.filter(h => h.type === 'start_fix').length, 0);
+      assert.equal(replacement.telemetry?.events.filter(e => e.kind === 'spawn' && e.role === 'worker').length, 1, 'only original implementation ran');
+      assert.equal(replacement.state, 'WAITING_DEPENDENCY');
       assert.equal(replacement.telemetry?.events.filter(e => e.kind === 'spawn' && e.role === 'lead').length, 2, 'each replacement request is a distinct possible model invocation');
       assert.equal(f.counts().leadCalls, 2);
-      assert.notEqual(replacement.repairAdmissions![0]!.leadDisposition!.requestId, first.identity.requestId);
+      assert.notEqual(replacement.nativeLead!.activeRequestId, first.identity.requestId);
       assert.equal(unresolvedNativeLead(replacement), true);
       f.setLeadObserve(async (i, url) => { assert.equal(i.requestId, first.identity.requestId); assert.equal(url, 'https://fixture.invalid/old'); return { outcome: 'complete', evidence: f.terminal(first) }; });
       f.tick();
       await f.poll(host);
       assert.equal(unresolvedNativeLead(f.run()), false);
-      assert.equal(f.run().repairAdmissions?.length, 1);
+      assert.equal(f.run().repairAdmissions?.length ?? 0, 0, 'late original reconciliation is evidence-only on this poll');
       assert.equal(f.run().nativeLead?.acceptances.length, 2);
       f.tick();
       await f.poll(host);
       assert.equal(f.counts().leadCalls, 2);
+      assert.equal(f.run().repairAdmissions?.length, 1);
+      assert.notEqual(f.run().repairAdmissions![0]!.leadDisposition!.requestId, first.identity.requestId);
+      assert.equal(f.run().history.filter(h => h.type === 'start_fix').length, 1);
     }
     finally {
       f.cleanup();
@@ -534,7 +540,7 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
       await f.poll();
       const pending = f.run();
       const resumed = applyTransition(pending, { type: 'dependency_satisfied', reason: 'bounded fixture check' }, f.now());
-      assert.throws(() => applyTransition(resumed, { type: 'start_fix' }, f.now()), /qualified|admission|budget/);
+      assert.throws(() => applyTransition(resumed, { type: 'start_fix' }, f.now()), /Unresolved native history|qualified|admission|budget/);
       assert.throws(() => f.store().update({ ...pending, history: [...pending.history, { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: f.now() }], state: 'IMPLEMENTING' }), /Native repair|atomic|admission/);
       f.setLeadObserve(async () => ({ outcome: 'complete', evidence: f.terminal(f.leadRequests[0]!) }));
       f.tick();

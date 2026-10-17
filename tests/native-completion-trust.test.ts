@@ -14,10 +14,13 @@ import { JsonFileStore } from '../src/store/json-file-store.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { hasAuthenticatedCompletion, type NativeCompletionHosts } from '../src/oracle/completion-proof.js';
 import { nativeReviewCoherent, unresolvedNativeReview, resolveNativeReviewer } from '../src/oracle/native-reviewer.js';
-import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid } from '../src/oracle/native-lead.js';
+import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid, nativeLeadReentry } from '../src/oracle/native-lead.js';
+import { runReviewLoop } from '../src/reviewers/loop.js';
 import { canonicalReviewTarget } from '../src/reviewers/risk-policy.js';
 import { oracleDigest, textDigest } from '../src/oracle/source-evidence.js';
-import { recoverRunAdmission, resumeCommand, isDispatchRunOwnerRetiredCommand } from '../src/cli.js';
+import { recoverRunAdmission, resumeCommand, isDispatchRunOwnerRetiredCommand, buildWorkflowDeps, main } from '../src/cli.js';
+import { createHostAdmissionRegistry, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
+import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 
 // No Git, service, worker, or subprocess fixture. Real file persistence, immutable
@@ -36,7 +39,7 @@ function fixture(role: 'review' | 'lead') {
   const diff = 'controlled original source manifest';
   const manifest = { baseSha, headSha, files, diff, sourceSha256: oracleDigest(files), diffSha256: textDigest(diff) };
   const run: any = { ...newRun(`trust-${role}`), dispatchClaimId: 'claim-trust', headSha, pullRequest: { number: 7, headSha } };
-  const reviewIdentity: any = { runId: run.id, claimId: run.dispatchClaimId, missionId: 'mission-trust', laneId: `run:${run.id}`, phase: 'review', role: 'independent-reviewer', targetKey: canonicalReviewTarget(run.target)!.key, repository: 'acme/widgets', pullRequestNumber: 7, baseSha, headSha, scope: 'complete-candidate', sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256, floor: 'R5', requestedEffort: 'Extra High', requestedModel: 'controlled-oracle', requestId: 'review-request', correlationId: 'review-request', ownerGeneration: 1, contractRevision: 'original-contract', policyRevision: 'independent-unpromoted-v1', bindingId: 'controlled-host' };
+  const reviewIdentity: any = { runId: run.id, claimId: run.dispatchClaimId, missionId: 'mission-trust', laneId: `run:${run.id}`, phase: 'review', role: 'independent-reviewer', targetKey: canonicalReviewTarget(run.target)!.key, repository: 'acme/widgets', pullRequestNumber: 7, baseSha, headSha, scope: 'complete-candidate', sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256, floor: 'R5', requestedEffort: 'Extra High', requestedModel: 'controlled-oracle', requestId: 'review-request', correlationId: 'review-request', ownerGeneration: 1, contractRevision: JSON.stringify([role === 'lead' ? 'original-contract' : undefined, 'original-contract']), policyRevision: 'independent-unpromoted-v1', bindingId: 'controlled-host' };
   const reviewRequest: any = { kind: 'request', id: 'review-request.request', identity: reviewIdentity, manifest };
   const origin: any = { kind: 'terminal', id: 'review-request.terminal', identity: reviewIdentity, result: { verdict: role === 'lead' ? 'request_changes' : 'approve', reviewerName: 'controlled-independent', headSha, findings: role === 'lead' ? [{ severity: 'blocking', summary: 'Bounded original finding' }] : [] }, authentication: { actorId: 'independent', model: reviewIdentity.requestedModel, effort: reviewIdentity.requestedEffort, transportReceipt: '' } };
   origin.authentication.transportReceipt = sign(origin);
@@ -60,7 +63,7 @@ function fixture(role: 'review' | 'lead') {
     authority.implementationAuthoritySha256 = oracleDigest(run.implementationAuthority);
     const blockingFindingIds = [`${oracleDigest(origin)}:0`];
     const packet = { origin, manifest, authority, blockingFindingIds, remainingRepairs: 1 };
-    const identity: any = { requestId: 'lead-request', correlationId: 'lead-request', incarnation: 'd'.repeat(64), runId: run.id, claimId: run.dispatchClaimId, missionId: reviewIdentity.missionId, laneId: reviewIdentity.laneId, ownerGeneration: 1, phase: 'lead-disposition', role: 'bounded-lead', repository: 'acme/widgets', targetKey: reviewIdentity.targetKey, pullRequestNumber: 7, baseSha, headSha, origin: { requestId: origin.identity.requestId, receiptId: origin.id, digest: oracleDigest(origin) }, authoritySha256: oracleDigest(authority), sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256, packetSha256: oracleDigest(packet), blockingFindingIds, repairOrdinal: 1, repairLimit: 1, bindingId: 'controlled-sol', policyRevision: 'bounded-lead-v1', requestedModel: 'controlled-sol', requestedEffort: 'High' };
+    const identity: any = { requestId: 'lead-request', correlationId: 'lead-request', incarnation: oracleDigest({ runId: run.id, claimId: run.dispatchClaimId, missionId: reviewIdentity.missionId, origin: run.nativeReview.accepted, packetSha256: oracleDigest(packet), blockingFindingIds, repairOrdinal: 1 }), runId: run.id, claimId: run.dispatchClaimId, missionId: reviewIdentity.missionId, laneId: reviewIdentity.laneId, ownerGeneration: 1, phase: 'lead-disposition', role: 'bounded-lead', repository: 'acme/widgets', targetKey: reviewIdentity.targetKey, pullRequestNumber: 7, baseSha, headSha, origin: { requestId: origin.identity.requestId, receiptId: origin.id, digest: oracleDigest(origin) }, authoritySha256: oracleDigest(authority), sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256, packetSha256: oracleDigest(packet), blockingFindingIds, repairOrdinal: 1, repairLimit: 1, bindingId: 'controlled-sol', policyRevision: 'bounded-lead-v1', requestedModel: 'controlled-sol', requestedEffort: 'High' };
     request = { kind: 'request', id: `${identity.requestId}.request`, identity, packet };
     terminal = { kind: 'terminal', id: `${identity.requestId}.terminal`, identity, disposition: { outcome: 'repair', origin: identity.origin, authoritySha256: identity.authoritySha256, acceptedFindingIds: blockingFindingIds, instructions: 'Repair the exact original blocking finding within implementation.txt.' }, authentication: { actorId: 'bounded-sol', role: 'bounded-lead', readOnly: true, model: identity.requestedModel, effort: 'High', transportReceipt: '' } };
     terminal.authentication.transportReceipt = sign(terminal);
@@ -250,6 +253,8 @@ for (const role of ['review', 'lead'] as const) {
         const drifted: any = { ...f.hosts[role], binding: { bindingId: 'revoked-current-binding', model: 'different-current-model', qualified: false }, source() { throw new Error('Historical authentication must not read current execution/source'); }, async submit() { throw new Error('Historical authentication must not submit'); } };
         const hosts = { ...f.hosts, [role]: drifted };
         const imported = f.store(hosts, `historical-${status}`); imported.create(historical);
+        buildWorkflowDeps(imported, undefined, {}); imported.configureNativeCompletionHosts({});
+        assert.equal(f.unresolved(imported.list()[0]!), false, 'model-free factory cannot erase historical authentication');
         const loaded = f.store(hosts, `historical-${status}`).read(historical.id)!;
         assert.equal(f.unresolved(loaded), false, 'genuine old completion remains terminal independently of current role/binding');
         assert.deepEqual((loaded as any)[f.key], ledger);
@@ -436,6 +441,218 @@ for (const uncertainty of ['proofless-oracle', 'inactive-oracle', 'inactive-lead
       assert.equal(boundary.validate(context(restarted)), null, 'uncertainty cannot reuse a consumed reference as current execution permission');
       assert.equal(restarted.repairAdmissions!.length, 1);
       assert.equal(restarted.history.filter(h => h.type === 'start_fix').length, 1);
+    } finally { f.cleanup(); }
+  });
+}
+
+// B1: trusted historical verification is an installed dependency, independent
+// of whether a current execution role is enabled. These remain no-Git controls.
+for (const role of ['review', 'lead'] as const) {
+  it(`${role}: disabled factories preserve explicit historical roots through list, restart and reducer cloning`, () => {
+    const f = fixture(role);
+    try {
+      const store = f.store(); store.update(f.complete());
+      const before = store.read(f.run.id)!;
+      buildWorkflowDeps(store, undefined, {});
+      store.configureNativeCompletionHosts({});
+      const wrong = new JsonFileOracleReceiptStore(path.join(f.root, 'different-current-root'));
+      store.configureNativeCompletionHosts({ [role]: { receipts: wrong, authenticate: () => false } });
+      assert.equal(f.unresolved(store.list()[0]!), false);
+      assert.equal(f.unresolved(store.read(f.run.id)!), false);
+      const restarted = new JsonFileStore({ dir: path.join(f.root, 'runs'), nativeCompletionHosts: [{ [role]: { receipts: wrong, authenticate: () => false } }, f.hosts] });
+      assert.equal(f.unresolved(restarted.read(f.run.id)!), false);
+      const cloned = structuredClone(before);
+      assert.equal(restarted.updateIfUnchanged(before, cloned), true);
+      assert.equal(applyTransition(restarted.read(f.run.id)!, { type: 'start' }).state, 'IMPLEMENTING');
+      assert.equal(f.unresolved(f.store({}).read(f.run.id)!), true, 'no-context history remains readable and unresolved');
+      assert.equal(resolveNativeLead().available(), false);
+      assert.equal(resolveNativeReviewer().native!.available(), false);
+    } finally { f.cleanup(); }
+  });
+
+  it(`${role}: actual CLI initial list and model-free stopped retirement use explicit historical trust`, async () => {
+    const f = fixture(role), originalUserInfo = os.userInfo, data = process.env.TACHIKO_DATA_DIR, log = console.log;
+    const output: string[] = [];
+    try {
+      const completed: any = f.complete();
+      if (role === 'review') {
+        completed.execution = { profile: 'routine', revision: 'test-execution-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', reasoningEffort: 'high', timeoutMs: 30000, sandboxMode: 'workspace-write', approvalPolicy: 'never' };
+        completed.repairTaskShapeAuthority = { revision: 'original-contract', shape: 'bounded' };
+      }
+      f.store().update(completed);
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: f.root })) as typeof os.userInfo;
+      process.env.TACHIKO_DATA_DIR = path.join(f.root, 'runs'); console.log = (...values) => { output.push(values.join(' ')); };
+      let authentications = 0;
+      const historical: NativeCompletionHosts = {};
+      for (const key of ['review', 'lead'] as const) Object.assign(historical, { [key]: { receipts: f.receipts, authenticate: (e: any) => { authentications++; return f.hosts[key]!.authenticate(e); } } });
+      assert.equal(await main(['run', 'list'], { historicalCompletionHosts: historical }), 0);
+      assert.ok(authentications > 0, 'authentication occurs on the initial list before any workflow factory');
+      const registry = createHostAdmissionRegistry(), r = f.store().read(f.run.id)!;
+      const evidence = { repository: 'acme/widgets', run: r.id, issue: 42, pullRequest: 7, claim: r.dispatchClaimId!, ...(r.bootstrap ? { workspace: r.bootstrap.workspacePath } : {}) };
+      const admitted = registry.admit({ laneId: `run:${r.id}`, role: 'production_captain', evidence });
+      assert.equal(admitted.outcome, 'admitted'); if (admitted.outcome !== 'admitted') throw new Error('Controlled owner admission failed');
+      const receipt = resolveRunOwnerReceiptPath('acme/widgets', r.id, evidence);
+      writeRunOwnerReceipt(receipt, { schemaVersion: 1, laneId: `run:${r.id}`, missionId: admitted.missionId, repository: 'acme/widgets', runId: r.id, issue: 42, claimId: r.dispatchClaimId, ...(r.bootstrap ? { workspace: r.bootstrap.workspacePath } : {}), generation: 1, phase: 'execution_possible', token: admitted.token });
+      await assert.rejects(main(['run', 'admission', 'recover', r.id, '--generation', '1', '--stopped', '--retire-work']), /unresolved/);
+      assert.equal(registry.readLane(`run:${r.id}`)!.status, 'active');
+      assert.equal(await main(['run', 'admission', 'recover', r.id, '--generation', '1', '--stopped', '--retire-work'], { historicalCompletionHosts: historical }), 0);
+      assert.equal(registry.readLane(`run:${r.id}`)!.status, 'released');
+      assert.equal(readRunOwnerReceipt(receipt)!.workDisposition, 'retired');
+      const restarted = new JsonFileStore({ dir: path.join(f.root, 'runs'), nativeCompletionHosts: historical });
+      assert.equal(await isDispatchRunOwnerRetiredCommand(restarted, restarted.read(r.id)!, registry), true);
+      assert.equal(await isDispatchRunOwnerRetiredCommand(f.store({}), f.store({}).read(r.id)!, registry), false);
+      assert.ok(output.some(line => line.includes(r.id)));
+    } finally { os.userInfo = originalUserInfo; console.log = log; if (data === undefined) delete process.env.TACHIKO_DATA_DIR; else process.env.TACHIKO_DATA_DIR = data; f.cleanup(); }
+  });
+}
+
+function observationFixture() {
+  const f = fixture('lead');
+  let reads: string[] = [], time = Date.parse(T0);
+  let observe: (identity: any) => Promise<any> = async () => { throw new Error('Controlled service-read failure'); };
+  const host: any = { ...f.hosts.lead, binding: { bindingId: 'controlled-sol', policyRevision: 'bounded-lead-v1', model: 'controlled-sol', effort: 'High', readOnly: true, qualified: true, allowTransportReplacement: true }, source: () => f.request.packet.manifest, async submit() { throw new Error('No observation control may submit'); }, async observe(identity: any) { reads.push(identity.requestId); return observe(identity); }, replacementDisposition: () => 'irrecoverable_transport' };
+  const boundary = resolveNativeLead(host);
+  const context = (extra: any = {}) => ({ run: f.store().read(f.run.id)!, store: f.store(), now: () => new Date(time).toISOString(), owner: { missionId: 'mission-trust', laneId: `run:${f.run.id}`, generation: 1 }, assertCurrent() {}, async assertLiveClaim() {}, ...extra });
+  const replacement = (observations = 3) => {
+    const run: any = f.store().read(f.run.id)!, original = run.nativeLead.requests[0];
+    const identity = { ...original.identity, requestId: 'replacement-request', correlationId: 'replacement-request' };
+    Object.assign(original, { status: 'replaced', observations, nextObservationAt: new Date(time + 300000).toISOString(), replacedBy: identity.requestId, replacementReason: 'irrecoverable_transport', failure: 'transport_failure' });
+    run.nativeLead.requests.push({ identity, status: 'pending', submissionPossible: true, observations: 0, nextObservationAt: T0 }); run.nativeLead.activeRequestId = identity.requestId;
+    f.receipts.recordLead({ ...f.request, id: `${identity.requestId}.request`, identity }); f.store().update(run);
+    return identity;
+  };
+  const terminal = (identity: any, outcome: 'repair' | 'stop' = 'repair') => {
+    const e: any = { ...structuredClone(f.terminal), id: `${identity.requestId}.terminal`, identity, ...(outcome === 'stop' ? { disposition: { outcome: 'stop', reason: 'cannot_safely_repair', evidence: 'Controlled late original stop' } } : {}) };
+    e.authentication.transportReceipt = createHmac('sha256', 'controlled-test-authenticator-not-production').update(oracleDigest({ kind: e.kind, identity: e.identity, disposition: e.disposition })).digest('hex');
+    f.receipts.recordLead(e); return e;
+  };
+  const advance = (extra: any = {}) => {
+    const a = f.request.packet.authority;
+    const r: any = f.store().read(f.run.id)!;
+    return boundary.advance({ ...context(), run: r, snapshot: { repository: { owner: 'acme', repo: 'widgets' }, issue: a.issue, headSha: r.headSha, pullRequest: { ...r.pullRequest, baseSha: f.request.identity.baseSha }, handoff: { sourceId: a.scope.sourceId, sourceScope: a.scope.sourceScope, sourceUpdatedAt: a.scope.sourceUpdatedAt, freshness: 'current', sections: { scope: a.scope.text } }, problems: [] }, execution: a.execution, maxAttempts: 1, onSubmission: (run: Run) => run, ...extra } as any);
+  };
+  return { ...f, host, boundary, context, replacement, terminal, advance, reads: () => reads, tick: () => { time += 30000; }, setObserve: (fn: typeof observe) => { observe = fn; } };
+}
+
+it('B3 thrown observation persists typed finite uncertainty and reentry without issuance or retirement', async () => {
+  const f = observationFixture(); try {
+    const r: any = f.store().read(f.run.id)!; r.state = 'WAITING_DEPENDENCY'; r.interruptedFrom = 'CHANGES_REQUESTED'; f.store().update(r);
+    for (let i = 1; i <= 3; i++) {
+      const result = await f.boundary.observe(f.context() as any), q = result.run.nativeLead!.requests[0]!;
+      assert.equal(q.observations, i); assert.equal(q.status, 'terminal_unknown'); assert.equal(q.failure, undefined);
+      assert.equal(q.terminalDigest, undefined); assert.equal(f.unresolved(result.run), true); f.tick();
+    }
+    const result = await f.boundary.observe(f.context() as any);
+    assert.equal(result.run.nativeLead!.requests.length, 1); assert.equal(f.reads().length, 3);
+    assert.equal(nativeLeadReentry(result.run, f.context().now()), true, 'separate unheld qualification can examine an explicit bounded disposition');
+    assert.equal(result.run.repairAdmissions?.length ?? 0, 0); assert.equal((result.run as any).workDisposition, undefined);
+    assert.equal(await isDispatchRunOwnerRetiredCommand(f.store(), result.run, f.registry()), false);
+  } finally { f.cleanup(); }
+});
+it('B3 thrown read preserves refusal and refuses stale claim/status writes', async () => {
+  const f = observationFixture(); try {
+    const r: any = f.store().read(f.run.id)!; Object.assign(r.nativeLead.requests[0], { status: 'incomplete', failure: 'safety_refusal' }); f.store().update(r);
+    const result = await f.boundary.observe(f.context() as any);
+    assert.equal(result.run.nativeLead!.requests[0]!.status, 'incomplete'); assert.equal(result.run.nativeLead!.requests[0]!.failure, 'safety_refusal');
+    f.tick(); let checks = 0;
+    await assert.rejects(f.boundary.observe(f.context({ async assertLiveClaim() { if (++checks > 1) throw new Error('Controlled lost current claim'); } }) as any), /lost current claim/);
+    const current = f.store().read(f.run.id)!;
+    assert.equal(current.nativeLead!.requests[0]!.observations, 2, 'the already-issued read debit survives lost ownership');
+    assert.equal(current.nativeLead!.requests[0]!.failure, 'safety_refusal'); assert.equal(current.nativeLead!.requests.length, 1);
+  } finally { f.cleanup(); }
+});
+for (const observations of [0, 3]) {
+  it(`B4 cached active and inactive terminals reconcile despite original budget ${observations} and future due time`, async () => {
+    const f = observationFixture(); try {
+      const identity = f.replacement(observations); f.terminal(identity); f.terminal(f.request.identity, 'stop');
+      const result = await f.boundary.observe(f.context() as any);
+      assert.equal(f.reads().length, 0); assert.equal(result.run.nativeLead!.acceptances.length, 2);
+      assert.equal(result.run.nativeLead!.requests[0]!.status, 'replaced'); assert.equal(result.run.nativeLead!.requests[0]!.observations, observations);
+      assert.equal(result.run.nativeLead!.requests[1]!.observations, 0); assert.equal(f.unresolved(result.run), false);
+      assert.equal(result.run.repairAdmissions?.length ?? 0, 0); assert.equal(result.run.history.some(h => h.nativeLeadStop !== undefined), false);
+    } finally { f.cleanup(); }
+  });
+}
+it('B4 a due active replacement is observed when original is exhausted', async () => {
+  const f = observationFixture(); try {
+    const identity = f.replacement(); f.setObserve(async () => ({ outcome: 'pending' }));
+    await f.boundary.observe(f.context() as any); assert.deepEqual(f.reads(), [identity.requestId]);
+    const r: any = f.store().read(f.run.id)!;
+    assert.equal(r.nativeLead.requests[0].observations, 3); assert.equal(r.nativeLead.requests[1].observations, 1);
+    assert.equal(f.unresolved(r), true);
+  } finally { f.cleanup(); }
+});
+it('B4 two due unresolved identities receive bounded fair service reads without another identity', async () => {
+  const f = observationFixture(); try {
+    const identity = f.replacement(0), r: any = f.store().read(f.run.id)!;
+    r.nativeLead.requests[0].nextObservationAt = T0; f.store().update(r);
+    f.setObserve(async () => ({ outcome: 'pending' }));
+    await f.boundary.observe(f.context() as any); f.tick(); await f.boundary.observe(f.context() as any);
+    assert.deepEqual(f.reads(), [identity.requestId, f.request.identity.requestId]);
+    const next = f.store().read(f.run.id)!;
+    assert.deepEqual(next.nativeLead!.requests.map(q => q.observations), [1, 1]);
+    assert.equal(next.nativeLead!.requests[0]!.status, 'replaced'); assert.equal(next.nativeLead!.requests.length, 2);
+    assert.equal(f.unresolved(next), true); assert.equal(next.repairAdmissions?.length ?? 0, 0);
+  } finally { f.cleanup(); }
+});
+it('B4 cached rejected completion reconciles after exhausted service allowance without accepting a disposition', async () => {
+  const f = observationFixture(); try {
+    const r: any = f.store().read(f.run.id)!;
+    Object.assign(r.nativeLead.requests[0], { observations: 3, nextObservationAt: '2099-01-01T00:00:00.000Z' }); f.store().update(r);
+    const e: any = { kind: 'completion', id: `${f.request.identity.requestId}.completion`, identity: f.request.identity, terminalSha256: 'f'.repeat(64), reason: 'rejected_disposition', authentication: { actorId: 'bounded-sol', role: 'bounded-lead', readOnly: true, model: f.request.identity.requestedModel, effort: 'High', transportReceipt: '' } };
+    e.authentication.transportReceipt = createHmac('sha256', 'controlled-test-authenticator-not-production').update(oracleDigest({ kind: e.kind, identity: e.identity, terminalSha256: e.terminalSha256 })).digest('hex');
+    f.receipts.recordLead(e);
+    const result = await f.boundary.observe(f.context() as any), q = result.run.nativeLead!.requests[0]!;
+    assert.equal(f.reads().length, 0); assert.equal(q.observations, 3); assert.equal(q.status, 'incomplete'); assert.equal(q.failure, 'missing_evidence');
+    assert.equal(f.unresolved(result.run), false); assert.equal(result.run.nativeLead!.acceptances.length, 0);
+    assert.equal(result.run.repairAdmissions?.length ?? 0, 0);
+  } finally { f.cleanup(); }
+});
+it('B3 three thrown reads permit only a separately qualified unheld replacement, never a HOLD submission', async () => {
+  const f = observationFixture(); try {
+    const r: any = f.store().read(f.run.id)!;
+    r.state = 'CHANGES_REQUESTED'; r.reviewResult = f.request.packet.origin.result; r.validationResult = f.request.packet.authority.validation; f.store().update(r);
+    for (let i = 0; i < 3; i++) { await f.boundary.observe(f.context() as any); f.tick(); }
+    let submitted = 0; f.host.submit = async () => { submitted++; return { outcome: 'terminal_unknown' }; };
+    const held = await f.advance({ observationOnly: true });
+    assert.equal(submitted, 0); assert.equal(held.run.nativeLead!.requests.length, 1);
+    const result = await f.advance({ assertInitiation: async () => {}, withIssueBoundary: async (operation: () => Promise<any>) => operation() });
+    assert.equal(submitted, 1); assert.equal(result.run.nativeLead!.requests.length, 2);
+    assert.equal(result.run.nativeLead!.requests[0]!.observations, 3); assert.equal(result.run.nativeLead!.requests[0]!.status, 'replaced');
+    f.tick(); await f.advance({ assertInitiation: async () => {}, withIssueBoundary: async (operation: () => Promise<any>) => operation() });
+    assert.equal(submitted, 1); assert.equal(f.store().read(f.run.id)!.nativeLead!.requests.length, 2);
+    assert.equal(result.run.repairAdmissions?.length ?? 0, 0); assert.equal(f.unresolved(result.run), true);
+  } finally { f.cleanup(); }
+});
+it('B4 ordinary advance reconciles cached exhausted inactive stop before current replacement acceptance', async () => {
+  const f = observationFixture(); try {
+    const r: any = f.store().read(f.run.id)!; r.state = 'CHANGES_REQUESTED'; r.reviewResult = f.request.packet.origin.result; r.validationResult = f.request.packet.authority.validation; f.store().update(r);
+    const identity = f.replacement(); f.terminal(f.request.identity, 'stop'); f.terminal(identity);
+    const result = await f.advance();
+    assert.equal(result.outcome, 'wait'); assert.equal(f.reads().length, 0);
+    assert.equal(result.run.nativeLead!.acceptances.length, 2); assert.equal(f.unresolved(result.run), false);
+    assert.equal(result.run.nativeLead!.requests[0]!.status, 'replaced'); assert.equal(result.run.nativeLead!.requests[1]!.status, 'qualified_complete');
+    assert.equal(result.run.repairAdmissions?.length ?? 0, 0);
+  } finally { f.cleanup(); }
+});
+for (const original of ['unknown', 'cached-stop'] as const) {
+  it(`B2 actual review loop retains a reenterable replacement wait with ${original} original`, async () => {
+    const f = observationFixture(); try {
+      const r: any = f.store().read(f.run.id)!;
+      r.state = 'CHANGES_REQUESTED'; r.reviewResult = f.request.packet.origin.result; r.validationResult = f.request.packet.authority.validation; f.store().update(r);
+      const identity = f.replacement(); f.terminal(identity);
+      if (original === 'cached-stop') f.terminal(f.request.identity, 'stop');
+      const a = f.request.packet.authority;
+      const snapshot: any = { repository: { owner: 'acme', repo: 'widgets' }, issue: a.issue, headSha: r.headSha, pullRequest: { ...r.pullRequest, state: 'open', baseSha: identity.baseSha, headRef: r.bootstrap.branch, baseRef: 'main', headRepository: { owner: 'acme', repo: 'widgets' } }, handoff: { sourceId: a.scope.sourceId, sourceScope: a.scope.sourceScope, sourceUpdatedAt: a.scope.sourceUpdatedAt, freshness: 'current', sections: { scope: a.scope.text } }, problems: [] };
+      const reviewer = resolveNativeReviewer({ ...f.hosts.review, binding: { bindingId: 'controlled-host', contractRevision: 'original-contract', policyRevision: 'independent-unpromoted-v1', scope: 'complete-candidate', model: 'controlled-oracle', supportedEfforts: ['Extra High'], authorActorIds: ['author'], allowTransportReplacement: false }, source: () => f.request.packet.manifest, async submit() { throw new Error('Wait must not issue another Oracle'); } } as any);
+      const result = await runReviewLoop({ store: f.store(), github: { async readLiveSnapshot() { return snapshot; } } as any, implementation: { async implement() { throw new Error('Unresolved/evidence-only wait must not run a worker'); } } as any, reviewer, nativeLead: f.boundary, reviewOwner: f.context().owner, resolveValidationAuthority: () => TEST_VALIDATION_AUTHORITY, resolveRepairExecutionProfile: () => a.execution, assertReviewClaim: async () => {}, assertLeadInitiation: async () => {}, withLeadBoundary: async operation => operation(), withNativeEffectBoundary: operation => operation() }, r.id, { maxAttempts: 1, now: f.context().now });
+      assert.equal(result.outcome, 'waiting_dependency', JSON.stringify(result)); assert.equal(result.run.state, 'WAITING_DEPENDENCY');
+      assert.equal(result.run.nativeLead!.wait!.kind, 'request'); f.tick();
+      assert.equal(nativeLeadReentry(result.run, f.context().now()), true);
+      assert.equal(result.run.repairAdmissions?.length ?? 0, 0); assert.equal(result.run.history.filter(h => h.type === 'start_fix').length, 0);
+      assert.equal(f.unresolved(result.run), original === 'unknown');
+      assert.equal(result.run.history.some(h => h.nativeLeadStop !== undefined), false);
+      assert.equal(f.reads().length, 0, 'these polls use exact immutable cache or retain unknown evidence without service reads');
     } finally { f.cleanup(); }
   });
 }

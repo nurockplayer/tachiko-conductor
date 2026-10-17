@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import type { NativeCompletionHosts } from './oracle/completion-proof.js';
 import { ExecutionAdmissionRefusal } from './adapters/agent.js';
 import { oracleDigest } from './oracle/source-evidence.js';
 import { resolveNativeLead, unresolvedNativeLead, nativeLeadStopped, issuedLeadRecoveryConfiguration, emptyLeadLedger, type NativeLeadHost, type LeadOwnerSuccession } from './oracle/native-lead.js';
@@ -2569,8 +2570,18 @@ export function printWaitResult(result: WaitCommandResult): void {
   else if (result.idle) console.log('TACHIKO_WAIT_IDLE_V1');
 }
 
-export async function main(argv: string[]): Promise<number> {
-  const store = new JsonFileStore({ dir: resolveRunsDir() });
+/** Trusted installed composition only. Historical authentication does not opt
+ * a current model role into execution; defaults remain unavailable. */
+export interface CliNativeDependencies {
+  readonly historicalCompletionHosts?: NativeCompletionHosts | readonly NativeCompletionHosts[];
+  readonly nativeReviewerHost?: NativeReviewerHost;
+  readonly nativeLeadHost?: NativeLeadHost;
+  readonly nativeMergeHost?: NativeMergeHost;
+}
+export async function main(argv: string[], native: CliNativeDependencies = {}): Promise<number> {
+  const historical = native.historicalCompletionHosts === undefined ? [] : Array.isArray(native.historicalCompletionHosts) ? native.historicalCompletionHosts : [native.historicalCompletionHosts];
+  // Must precede every command's initial read/list, including model-free stopped recovery.
+  const store = new JsonFileStore({ dir: resolveRunsDir(), nativeCompletionHosts: [...historical, { review: native.nativeReviewerHost, lead: native.nativeLeadHost }] });
   const [command, subcommand, ...rest] = argv;
 
   if (command === undefined || command === '--help' || command === '-h') {
@@ -2908,7 +2919,7 @@ export async function main(argv: string[]): Promise<number> {
         const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : issuedLeadRecoveryConfiguration(recovering);
         const transport = new GhCliTransport();
         const runtime = new GitHubDispatchRuntime(transport, config);
-        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport) : buildWorkflowDeps(store, undefined, {}, transport);
+        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost) : buildWorkflowDeps(store, undefined, {}, transport);
         return await dispatchOnceCommand(config, {
           workflow,
           runtime,
@@ -3196,7 +3207,7 @@ export async function main(argv: string[]): Promise<number> {
           assertDispatchRuntimeClaimReadback(live.id, transitionClaim, observed);
         };
       }
-      return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities), id, values.decision!, {
+      return await resumeCommand(buildWorkflowDeps(store, resolveCapabilities, process.env, undefined, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost), id, values.decision!, {
         admission: createHostAdmissionRegistry(),
         publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
         ...(admissionWorkspace === undefined ? {} : { admissionWorkspace }),
@@ -3241,7 +3252,7 @@ export async function main(argv: string[]): Promise<number> {
     const repairTaskShapeAuthority = values['repair-task-shape-authority'] === undefined
       ? undefined
       : parseRepairTaskShapeAuthority(values['repair-task-shape-authority']);
-    return runIssueCommand(buildWorkflowDeps(store, resolveCapabilities), ref, {
+    return runIssueCommand(buildWorkflowDeps(store, resolveCapabilities, process.env, undefined, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost), ref, {
       execution, repairTaskShapeAuthority, admission: createHostAdmissionRegistry(),
       publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
       releaseDispatchAdmissionLock: releaseAdmissionLock,

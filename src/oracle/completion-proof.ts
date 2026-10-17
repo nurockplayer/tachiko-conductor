@@ -65,22 +65,21 @@ export function verifyConfiguredCompletion(nativeDirectory: string, authenticate
 }
 /** Store/factory composition must supply the actual hosts. There is no API to
  * stamp a proof with a caller boolean, digest, or serialized root. */
-export function authenticateNativeRun(run: Run, hosts: NativeCompletionHosts, writing = false): void {
+export function authenticateNativeRun(run: Run, contexts: readonly NativeCompletionHosts[], writing = false): void {
   for (const namespace of ['review', 'lead'] as const) {
-    const host = hosts[namespace];
+    const hosts = contexts.map(context => context[namespace]).filter(host => host?.receipts instanceof JsonFileOracleReceiptStore);
     const requests = namespace === 'review' ? run.nativeReview?.requests : run.nativeLead?.requests;
     for (const r of requests ?? []) {
       const proof = r.completionProof;
       if (!proof) continue; // Prior-schema history is readable, never authenticated.
       bindings.delete(proof);
       if (!validCompletionProof(proof)) throw new Error('Invalid native completion proof.');
-      if (!(host?.receipts instanceof JsonFileOracleReceiptStore)) {
+      if (hosts.length === 0) {
         if (writing) throw new Error('Native completion requires configured host authentication.');
         continue;
       }
-      const receipts = host.receipts;
-      const verify = () => JsonFileOracleReceiptStore.prototype.verifyAuthenticatedCompletion.call(receipts, namespace, r.identity, r.terminalDigest, proof,
-        e => namespace === 'review' ? hosts.review!.authenticate(e as Extract<NativeOracleEvidence, {kind:'terminal'}>) : hosts.lead!.authenticate(e as Exclude<NativeLeadEvidence, {kind:'request'}>));
+      const verify = () => hosts.some(host => JsonFileOracleReceiptStore.prototype.verifyAuthenticatedCompletion.call(host!.receipts, namespace, r.identity, r.terminalDigest, proof,
+        e => (host!.authenticate as (e: CompletionEvidence) => boolean)(e)));
       if (!verify()) throw new Error('Invalid configured immutable authenticated completion proof.');
       bindings.set(proof, verify);
     }
