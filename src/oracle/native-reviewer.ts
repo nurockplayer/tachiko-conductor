@@ -1,6 +1,7 @@
 import { JsonFileOracleReceiptStore } from './receipt-store.js';
 import { authenticatedCompletionEvidence, hasAuthenticatedCompletion, validCompletionProof } from './completion-proof.js';
 import { originalImplementationMatches } from '../domain/implementation-authority.js';
+import { nativeLeadStopped } from './native-lead.js';
 import { randomUUID } from 'node:crypto';
 import type { NativeReviewBoundary, NativeReviewContext, ReviewerAdapter } from '../adapters/reviewer.js';
 import type { ReviewResult, Run } from '../domain/types.js';
@@ -124,11 +125,21 @@ export function activeNativeReview(run: Run): NativeReviewRequestState | undefin
 export function unresolvedNativeReview(run: Run): boolean {
   return run.nativeReview?.requests.some((r) => r.submissionPossible && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'review')) === true;
 }
+/** A request wait from a historical gate is evidence recovery, not readiness. */
+export function settledHistoricalReviewGate(run: Run): boolean {
+  const phase = run.state === 'WAITING_DEPENDENCY' ? run.interruptedFrom : run.state;
+  return (phase === 'FINAL_GATE' || phase === 'MERGE_READY') && run.nativeReview?.wait?.kind === 'request' &&
+    activeNativeReview(run)?.status === 'qualified_complete' && !unresolvedNativeReview(run) && !nativeLeadStopped(run);
+}
 export function nativeReviewReentry(run: Run, now = new Date().toISOString()): boolean {
   if (run.state === 'WAITING_DEPENDENCY' && run.nativeReview?.wait?.kind === 'binding') return Date.parse(run.nativeReview.wait.nextAttemptAt) <= Date.parse(now);
   if (run.nativeReview?.wait !== undefined && Date.parse(run.nativeReview.wait.nextAttemptAt) > Date.parse(now)) return false;
   if (run.nativeReview?.wait?.kind === 'qualification') return false;
   const active = activeNativeReview(run);
+  // Older Runs could reach a gate while a replaced original was still
+  // remotely unresolved. Its eventual completion settles evidence only;
+  // the caller must revalidate before using the retained current result.
+  if (run.state === 'WAITING_DEPENDENCY' && settledHistoricalReviewGate(run)) return true;
   return run.state === 'WAITING_DEPENDENCY' && run.interruptedFrom === 'REVIEWING' && active !== undefined &&
     (['pending', 'terminal_unknown'].includes(active.status) && active.observations < NATIVE_REVIEW_OBSERVATIONS || active.status === 'qualified_complete' || active.status === 'incomplete' && active.failure === 'transport_failure') &&
     Date.parse(active.nextObservationAt) <= Date.parse(now);

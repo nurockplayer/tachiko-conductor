@@ -736,12 +736,42 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
         Object.assign(e.disposition, { acceptedFindingIds: [e.disposition.acceptedFindingIds[0]] }); return { outcome: 'complete', evidence: { ...e, authentication: { ...e.authentication, transportReceipt: leadPayloadDigest(e) } } }; });
       const durable = f.store(), update = durable.updateIfUnchanged.bind(durable);
       let crashed = false;
-      durable.updateIfUnchanged = (a, b) => { if (!crashed && activeNativeLead(b)?.terminalDigest && activeNativeLead(b)?.status === 'incomplete') {
+      let returned: {outcome: string; reason?: string} | undefined;
+      const casTrace: unknown[] = [];
+      let faultReceipt: {present: boolean; kind?: string; exactRequest: boolean} | undefined;
+      durable.updateIfUnchanged = (a, b) => {
+        const request = activeNativeLead(b);
+        casTrace.push({ from: a.state, to: b.state, status: request?.status, digestPresent: request?.terminalDigest !== undefined, failure: request?.failure });
+        if (!crashed && request?.terminalDigest && request.status === 'incomplete') {
+        const receipt = f.receipts.readLead(`${request.identity.requestId}.completion`);
+        faultReceipt = {present:receipt !== null,kind:receipt?.kind,exactRequest:receipt?.identity.requestId === request.identity.requestId};
         crashed = true;
         throw new Error('injected completion CAS crash');
       } return update(a, b); };
-      await assert.rejects(() => f.poll(f.lead, durable), /completion CAS crash/);
+      try {
+        await assert.rejects(async () => {
+          const outcome = await f.poll(f.lead, durable);
+          returned = {outcome:outcome.outcome,...('reason' in outcome && typeof outcome.reason === 'string' ? {reason:outcome.reason} : {})};
+        }, /completion CAS crash/);
+      } catch (error) {
+        // Keep the original rejection assertion. If an earlier workflow wait
+        // prevents the injected cut, CI must expose its actual state/reason,
+        // service counts and CAS path rather than guessing from a green retry.
+        const runs = f.store().list().map(run => ({state:run.state,interruptedFrom:run.interruptedFrom,reason:run.interrupt?.reason,
+          historyCount:run.history.length,startFixCount:run.history.filter(h=>h.type==='start_fix').length,repairAdmissionCount:run.repairAdmissions?.length ?? 0,
+          requests:run.nativeLead?.requests.map(r=>({status:r.status,failure:r.failure,submissionPossible:r.submissionPossible,observations:r.observations,digestPresent:r.terminalDigest!==undefined,proofPresent:r.completionProof!==undefined})),
+          receiptCounts:{requests:f.leadRequests.filter(q=>f.receipts.readLead(q.id)!==null).length,terminals:f.leadRequests.filter(q=>f.receipts.readLead(`${q.identity.requestId}.terminal`)!==null).length,rejectedCompletions:f.leadRequests.filter(q=>f.receipts.readLead(`${q.identity.requestId}.completion`)!==null).length}}));
+        console.error(JSON.stringify({ control: 'rejected-completion-CAS-crash', crashed, returned, counts: f.counts(), runs, casTrace, faultReceipt }));
+        throw error;
+      }
+      assert.equal(crashed, true);
+      assert.equal(faultReceipt?.kind, 'completion', 'immutable authenticated rejected-terminal evidence precedes the injected Run CAS');
+      assert.equal(faultReceipt?.exactRequest, true);
       const run = f.run(), lane = f.registry().readLane(`run:${run.id}`)!;
+      assert.equal(activeNativeLead(run)?.terminalDigest, undefined);
+      assert.equal(run.repairAdmissions, undefined);
+      assert.equal(f.counts().leadCalls, 1);
+      assert.equal(f.counts().observations, 0);
       recoverRunAdmission(f.store(), f.registry(), run.id, lane.generation, true, f.receiptPath);
       f.tick();
       await f.poll();

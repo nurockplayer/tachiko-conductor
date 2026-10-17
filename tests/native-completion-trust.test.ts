@@ -13,8 +13,8 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { hasAuthenticatedCompletion, type NativeCompletionHosts } from '../src/oracle/completion-proof.js';
-import { nativeReviewCoherent, unresolvedNativeReview, resolveNativeReviewer, issuedReviewRecoveryConfiguration } from '../src/oracle/native-reviewer.js';
-import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid, nativeLeadReentry } from '../src/oracle/native-lead.js';
+import { nativeReviewCoherent, unresolvedNativeReview, resolveNativeReviewer, issuedReviewRecoveryConfiguration, nativeReviewReentry } from '../src/oracle/native-reviewer.js';
+import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid, nativeLeadReentry, leadPayloadDigest } from '../src/oracle/native-lead.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { canonicalReviewTarget } from '../src/reviewers/risk-policy.js';
 import { oracleDigest, textDigest } from '../src/oracle/source-evidence.js';
@@ -961,3 +961,148 @@ for (const operation of ['update', 'CAS'] as const) {
     } finally { f.cleanup(); }
   });
 }
+
+// Compatibility replay: these gates were adopted under historical semantics.
+// Genuine requests/receipts and the current file store/owner/workflow are real;
+// this does not claim a historical native implementation delivery.
+for (const phase of ['FINAL_GATE', 'MERGE_READY'] as const) for (const held of [false, true]) {
+  it(`D1 historical ${phase} settles through ${held ? 'HOLD' : 'ordinary'} observation then freshly validates and qualifies`, async () => {
+    const f = inactiveOracleFixture(); try {
+      await f.issue(); const original = f.store().read(f.run.id)!, [old, active] = original.nativeReview!.requests;
+      const r: Run = {...original,state:phase,reviewResult:f.terminal(active!.identity).result}; f.store().update(r);
+      const workflow = oracleWorkflow(f); let validations = 0;
+      workflow.deps.validation.validate = async (run: Run) => { validations++; return validationPassed(run.headSha).local; };
+      f.receipts.recordNative(f.terminal(old!.identity, 'request_changes'));
+      const settled = await workflow.poll(held);
+      assert.equal(unresolvedNativeReview(settled.run), false); assert.equal(validations, 0);
+      assert.equal(settled.run.state, 'WAITING_DEPENDENCY'); assert.equal(settled.run.interruptedFrom, phase);
+      assert.equal(workflow.workers(), 0); assert.equal(f.submissions(), 2); assert.equal(f.reads().length, 0);
+      // HOLD can settle evidence and retain its wait, but only a later ordinary
+      // turn may schedule fresh validation and current qualification.
+      f.tick(); const scheduled = await workflow.poll();
+      assert.equal(scheduled.run.state, 'VALIDATING'); assert.equal(scheduled.run.reviewResult, undefined);
+      assert.equal(validations, 0, 'reentry schedules validation without same-turn execution');
+      const fresh = await workflow.poll();
+      assert.equal(validations, 1); assert.equal(fresh.run.state, 'MERGE_READY', JSON.stringify(fresh));
+      assert.equal(fresh.run.reviewResult?.verdict, 'approve'); assert.equal(f.submissions(), 2);
+      assert.equal(fresh.run.nativeReview!.requests.length, 2); assert.equal(workflow.workers(), 0);
+      assert.equal(fresh.run.repairAdmissions?.length ?? 0, 0);
+    } finally { f.cleanup(); }
+  });
+}
+it('D1 historical gate remains observable while old uncertainty persists, then settles without a repeated wait transition', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.issue(); const original = f.store().read(f.run.id)!, [old, active] = original.nativeReview!.requests;
+    const r: Run = {...original,state:'FINAL_GATE',reviewResult:f.terminal(active!.identity).result}; f.store().update(r);
+    const workflow = oracleWorkflow(f); await workflow.poll(); f.tick();
+    const unknown = await workflow.poll(); assert.equal(unknown.run.state, 'WAITING_DEPENDENCY');
+    assert.equal(unknown.run.interruptedFrom, 'FINAL_GATE'); assert.equal(unresolvedNativeReview(unknown.run), true);
+    assert.equal(nativeReviewReentry(unknown.run, f.now()), false); assert.equal(workflow.workers(), 0);
+    f.receipts.recordNative(f.terminal(old!.identity)); f.tick(); const settled = await workflow.poll();
+    assert.equal(unresolvedNativeReview(settled.run), false); f.tick();
+    assert.equal(nativeReviewReentry(settled.run, f.now()), true);
+    assert.equal((await workflow.poll()).run.state, 'VALIDATING'); assert.equal(f.submissions(), 2);
+  } finally { f.cleanup(); }
+});
+it('D1 historical settlement cannot reuse a revoked current Oracle binding', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.issue(); const original = f.store().read(f.run.id)!, [old, active] = original.nativeReview!.requests;
+    const r: Run = {...original,state:'FINAL_GATE',reviewResult:f.terminal(active!.identity).result}; f.store().update(r);
+    const workflow = oracleWorkflow(f); let validations = 0;
+    workflow.deps.validation.validate = async (run: Run) => { validations++; return validationPassed(run.headSha).local; };
+    f.receipts.recordNative(f.terminal(old!.identity)); await workflow.poll(); f.tick(); await workflow.poll();
+    f.host.binding.model = 'revoked-current-model'; const refused = await workflow.poll();
+    assert.equal(validations, 1); assert.equal(refused.run.state, 'WAITING_DEPENDENCY');
+    assert.equal(refused.run.reviewResult, undefined); assert.equal(refused.run.history.some(h => h.type === 'gate_passed'), false);
+    assert.equal(workflow.workers(), 0); assert.equal(f.submissions(), 2); assert.equal(refused.run.repairAdmissions?.length ?? 0, 0);
+  } finally { f.cleanup(); }
+});
+for (const state of ['NEEDS_HUMAN','FAILED','MERGED'] as const) {
+  it(`D1 historical request wait never automatically resumes ${state}`, async () => {
+    const f = inactiveOracleFixture(); try {
+      await f.issue(); const r = f.store().read(f.run.id)!;
+      // Predicate control only: terminal-looking projections are not imported
+      // as fabricated coherent merge records into the actual store.
+      const projected = { ...r, state, interruptedFrom:'FINAL_GATE' as const, nativeReview:{...r.nativeReview!,wait:{kind:'request' as const,nextAttemptAt:T0}} };
+      assert.equal(nativeReviewReentry(projected, f.now()), false);
+      assert.equal(nativeReviewReentry({...projected,state:'WAITING_DEPENDENCY',nativeReview:{...projected.nativeReview,wait:{kind:'qualification',nextAttemptAt:T0}}}, f.now()), false);
+    } finally { f.cleanup(); }
+  });
+}
+
+function legacyInitialWorkflow(withShape: boolean) {
+  const f = fixture('lead'), r: any = structuredClone(f.run), a = f.request.packet.authority;
+  for (const key of ['nativeLead','nativeReview','implementationAuthority','headSha','pullRequest','reviewResult','validationResult','agentResult','executor']) delete r[key];
+  if (!withShape) delete r.repairTaskShapeAuthority;
+  r.state = 'IMPLEMENTING'; const store = f.store(f.hosts, 'legacy-initial'); store.create(r);
+  let workers = 0, prepared = 0, pins = 0;
+  const update = store.updateIfUnchanged.bind(store);
+  store.updateIfUnchanged = (before, after) => {
+    if (after.implementationAuthority && !before.implementationAuthority) {
+      pins++; const result = update(before, after); assert.equal(result, true);
+      throw new Error('Controlled positive: original authority persisted before worker');
+    }
+    return update(before, after);
+  };
+  const snapshot: any = { repository:{owner:'acme',repo:'widgets',defaultBranch:'main',defaultBranchHeadSha:r.bootstrap.baseSha},issue:a.issue,headSha:null,pullRequest:null,handoff:{sourceId:a.scope.sourceId,sourceScope:a.scope.sourceScope,sourceUpdatedAt:a.scope.sourceUpdatedAt,freshness:'unknown',sections:{scope:a.scope.text}},problems:[] };
+  const deps: any = {store,github:{async readLiveSnapshot(){return snapshot;}},reviewer:{kind:'reviewer',native:{available:()=>true}},implementation:{kind:'implementation',async implement(){workers++;throw new Error('Forbidden legacy worker');}},bootstrap:{kind:'implementation-bootstrap',bootstrapKind:'standalone-isolated',async prepare(request: any){prepared++;return request.existing;},guard(){return {};}}};
+  return {f,r,store,counts:()=>({workers,prepared,pins}),poll:()=>runWorkflow(deps,r.id,{maxReviewAttempts:1,now:()=>T0,async assertReviewClaim(){}})};
+}
+it('D2 legacy absent original task shape enters readable non-executing attention before packet/bootstrap/pin, including restart', async () => {
+  const c = legacyInitialWorkflow(false); try {
+    const result = await c.poll(); assert.equal(result.outcome, 'needs_human');
+    assert.match(result.reason ?? '', /Original admitted implementation task-shape authority is unavailable/);
+    assert.equal(result.run.state, 'NEEDS_HUMAN'); assert.equal(result.run.interruptedFrom, 'IMPLEMENTING');
+    assert.equal(result.run.implementationAuthority, undefined); assert.equal(result.run.repairTaskShapeAuthority, undefined);
+    assert.deepEqual(c.counts(), {workers:0,prepared:0,pins:0}); assert.equal(result.run.repairAdmissions, undefined);
+    const restarted = c.f.store(c.f.hosts,'legacy-initial').read(c.r.id)!; assert.deepEqual(restarted, result.run);
+    assert.equal((await c.poll()).outcome, 'needs_human'); assert.deepEqual(c.counts(), {workers:0,prepared:0,pins:0});
+    assert.equal(result.run.telemetry?.events.some(e => e.kind === 'spawn') ?? false, false);
+  } finally { c.f.cleanup(); }
+});
+it('D2 actual initial admission pins the supplied immutable original task shape before worker', async () => {
+  const c = legacyInitialWorkflow(true); try {
+    await assert.rejects(c.poll(), /Controlled positive: original authority persisted before worker/);
+    assert.deepEqual(c.store.read(c.r.id)!.implementationAuthority!.taskShape, c.r.repairTaskShapeAuthority);
+    assert.deepEqual(c.counts(), {workers:0,prepared:1,pins:1});
+  } finally { c.f.cleanup(); }
+});
+it('D3 no-Git authenticated rejected completion persists before the crashing CAS and reconciles after restart without another observation', async () => {
+  const f = observationFixture(); try {
+    const authenticate = (e: any) => e.authentication.transportReceipt === (e.kind === 'completion' ? e.terminalSha256 : leadPayloadDigest(e));
+    f.host.authenticate = authenticate; Object.assign(f.hosts.lead!, {authenticate});
+    const e: any = {id:`${f.request.identity.requestId}.terminal`,kind:'terminal',identity:f.request.identity,disposition:{outcome:'repair',origin:f.request.identity.origin,authoritySha256:f.request.identity.authoritySha256,acceptedFindingIds:[],instructions:'Invalid omitted findings'},authentication:{actorId:'bounded-sol',role:'bounded-lead',readOnly:true,model:f.request.identity.requestedModel,effort:'High',transportReceipt:''}};
+    e.authentication.transportReceipt = leadPayloadDigest(e);
+    f.setObserve(async () => ({outcome:'complete',evidence:e}));
+    const durable = f.store(), update = durable.updateIfUnchanged.bind(durable); let crashed = false;
+    durable.updateIfUnchanged = (before, after) => {
+      const q = after.nativeLead!.requests[0]!;
+      if (q.status === 'incomplete' && q.terminalDigest) {
+        assert.equal(f.receipts.readLead(`${q.identity.requestId}.completion`)?.kind, 'completion');
+        crashed = true; throw new Error('controlled rejected completion CAS crash');
+      }
+      return update(before, after);
+    };
+    await assert.rejects(f.boundary.observe(f.context({store:durable}) as any), /rejected completion CAS crash/);
+    assert.equal(crashed, true); assert.equal(f.reads().length, 1);
+    const pending = f.store().read(f.run.id)!; assert.equal(pending.nativeLead!.requests[0]!.terminalDigest, undefined);
+    assert.equal(pending.nativeLead!.requests[0]!.observations, 1); assert.equal(unresolvedNativeLead(pending), true);
+    const reconciled = await resolveNativeLead(f.host).observe(f.context() as any);
+    assert.equal(unresolvedNativeLead(reconciled.run), false); assert.equal(reconciled.run.nativeLead!.requests[0]!.status, 'incomplete');
+    assert.equal(f.reads().length, 1); assert.equal(reconciled.run.nativeLead!.acceptances.length, 0);
+    assert.equal(reconciled.run.repairAdmissions, undefined);
+  } finally { f.cleanup(); }
+});
+it('D1 explicit resume command cannot restore the historical gate before its request backoff expires', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.issue(); const original = f.store().read(f.run.id)!, [old, active] = original.nativeReview!.requests;
+    const r: Run = {...original,state:'FINAL_GATE',reviewResult:f.terminal(active!.identity).result}; f.store().update(r);
+    const workflow = oracleWorkflow(f); f.receipts.recordNative(f.terminal(old!.identity));
+    const settled = await workflow.poll(); assert.equal(nativeReviewReentry(settled.run, f.now()), false);
+    // Actual resume reducer/store/workflow caller; ownership for later effects
+    // remains the separately admitted workflow fixture's current real token.
+    const resumed = await resumeCommand(workflow.deps, r.id, 'Reconcile settled historical request', {dispatchClaimId:r.dispatchClaimId,maxReviewAttempts:1,now:f.now,async assertReviewClaim(){}});
+    assert.equal(resumed.run.state, 'VALIDATING'); assert.equal(resumed.run.reviewResult, undefined); assert.equal(resumed.run.validationResult, undefined);
+    assert.equal(workflow.workers(), 0); assert.equal(f.submissions(), 2); assert.equal(f.reads().length, 0);
+  } finally { f.cleanup(); }
+});
