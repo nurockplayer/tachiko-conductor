@@ -360,6 +360,80 @@ function reviewAdmission(
   return { kind: 'admitted', activeValidation: active };
 }
 
+/**
+ * Sample the exact durable Run and the already-established host authority at
+ * each review execution/verdict boundary. These assertions do not reserve a
+ * whole-review-duration lock. Review admission must not strengthen missing
+ * ownership evidence: governed callers need both existing boundary callbacks.
+ */
+function assertReviewExecutionAdmission(run: Run, store: RunStore, deps: ReviewLoopDependencies): void {
+  let matched: boolean;
+  try {
+    const compareAndSwap = store.updateIfUnchanged;
+    if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable.');
+    matched = compareAndSwap.call(store, run, run);
+  } catch (cause) {
+    throw new ExecutionAdmissionRefusal('Review admission could not confirm the exact Run handoff.', false, {
+      cause, authorityUnknown: true,
+    });
+  }
+  if (!matched) throw new ExecutionAdmissionRefusal('The exact Run handoff changed before the review boundary.', true);
+
+  if (deps.governedPublicationRequired !== true) return;
+  if (deps.assertCurrentMutation === undefined || deps.assertCanPublish === undefined) {
+    throw new ExecutionAdmissionRefusal('Governed review is missing a required host admission callback.', false, {
+      cause: new Error('Current-mutation and publication admission callbacks are both required for governed review.'),
+    });
+  }
+  try {
+    deps.assertCurrentMutation();
+    deps.assertCanPublish();
+  } catch (cause) {
+    if (isExecutionAdmissionRefusal(cause)) throw cause;
+    throw new ExecutionAdmissionRefusal('Review admission could not confirm current mission and publication authority.', false, { cause });
+  }
+}
+
+/** Reconcile a known review-admission refusal without overwriting a Run winner. */
+function reviewAdmissionRefusalOutcome(
+  run: Run,
+  error: ExecutionAdmissionRefusal,
+  store: RunStore,
+  now: () => string,
+): ReviewLoopResult {
+  if (error.authorityUnknown) throw error;
+  try {
+    const compareAndSwap = store.updateIfUnchanged;
+    if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable during review-admission refusal reconciliation.');
+    if (!compareAndSwap.call(store, run, run) || error.runSuperseded) return staleReviewOutcome(run.id, run, store);
+    const reason = `Review admission was refused by its host authority boundary: ${error.message}`;
+    const parked = applyTransition(run, {
+      type: 'escalate', reason,
+      interrupt: { evidence: reason, choices: ['Restore current mission admission and retry review', CANCEL_RUN_DECISION] },
+    }, now());
+    if (!compareAndSwap.call(store, run, parked)) return staleReviewOutcome(run.id, run, store);
+    return { outcome: 'needs_human', run: parked, reason };
+  } catch {
+    // Never let a secondary CAS/read failure mask the original tagged refusal.
+    throw error;
+  }
+}
+
+function checkReviewExecutionAdmission(
+  run: Run,
+  store: RunStore,
+  deps: ReviewLoopDependencies,
+  now: () => string,
+): ReviewLoopResult | null {
+  try {
+    assertReviewExecutionAdmission(run, store, deps);
+    return null;
+  } catch (error) {
+    if (!isExecutionAdmissionRefusal(error)) throw error;
+    return reviewAdmissionRefusalOutcome(run, error, store, now);
+  }
+}
+
 function persistRevalidation(run: Run, reason: string, store: RunStore, now: () => string): ReviewLoopResult {
   const revalidating = applyTransition(run, { type: 'revalidate', reason }, now());
   if (!updateReviewRun(store, run, revalidating)) return staleReviewOutcome(run.id, run, store);
@@ -1155,7 +1229,8 @@ export async function runReviewLoop(
 
     const reviewHeadSha = run.headSha;
     if (reviewHeadSha === undefined) return parkBootstrap(run, new Error('Reviewer admission requires an exact candidate HEAD.'), store, now);
-    if (!updateReviewRun(store, run, run)) return staleReviewOutcome(run.id, run, store);
+    const beforeReviewExecution = checkReviewExecutionAdmission(run, store, deps, now);
+    if (beforeReviewExecution !== null) return beforeReviewExecution;
     const reviewerSpawnsForHead = (run.telemetry?.events ?? []).filter(
       (event) => event.kind === 'spawn' && event.role === 'reviewer' && event.headSha === reviewHeadSha,
     ).length;
@@ -1170,9 +1245,16 @@ export async function runReviewLoop(
     run = reviewerSpawn.run;
     const reviewerRun = run;
     let reviewResult: ReviewResult;
+    let invokingExecutionStartCallback = false;
+    let reconcilingPostStartBoundary = false;
     try {
+      invokingExecutionStartCallback = true;
       options.onExecutionStart?.();
-      if (!updateReviewRun(store, reviewerRun, reviewerRun)) return staleReviewOutcome(run.id, reviewerRun, store);
+      invokingExecutionStartCallback = false;
+      reconcilingPostStartBoundary = true;
+      const beforeReviewerInvocation = checkReviewExecutionAdmission(reviewerRun, store, deps, now);
+      if (beforeReviewerInvocation !== null) return beforeReviewerInvocation;
+      reconcilingPostStartBoundary = false;
       reviewResult = await reviewer.review({
         target,
         headSha: reviewHeadSha,
@@ -1181,6 +1263,21 @@ export async function runReviewLoop(
         ),
       });
     } catch (error) {
+      if (isExecutionAdmissionRefusal(error)) {
+        // A refusal thrown while reconciling the post-start fence already
+        // retained its primary tag after secondary CAS failure. Do not retry
+        // reconciliation from this enclosing invocation catch.
+        if (reconcilingPostStartBoundary) throw error;
+        return reviewAdmissionRefusalOutcome(reviewerRun, error, store, now);
+      }
+      if (invokingExecutionStartCallback) {
+        // Host callbacks may perform their own renewal/admission checks and
+        // throw before control reaches the explicit post-callback fence. First
+        // classify the captured Run and current host authority; only retain
+        // ordinary callback-failure semantics if both are still valid.
+        const afterCallbackFailure = checkReviewExecutionAdmission(reviewerRun, store, deps, now);
+        if (afterCallbackFailure !== null) return afterCallbackFailure;
+      }
       const reason = renderFailure('Reviewer failed', error);
       const failedTelemetry = recordCompletionTelemetry(reviewerRun, createCompletionInputFromResult({
         exitStatus: 'failure',
@@ -1207,6 +1304,8 @@ export async function runReviewLoop(
         ? { outcome: 'needs_human', run, reason }
         : { outcome: 'failed', run, reason };
     }
+    const afterReviewerCompletion = checkReviewExecutionAdmission(reviewerRun, store, deps, now);
+    if (afterReviewerCompletion !== null) return afterReviewerCompletion;
     const completedReview = recordCompletionTelemetry(reviewerRun, createCompletionInputFromResult({
       exitStatus: 'success',
       ...(reviewResult.telemetry === undefined ? {} : { telemetry: reviewResult.telemetry }),
@@ -1217,7 +1316,6 @@ export async function runReviewLoop(
     let postReviewSnapshot: GitHubLiveSnapshot;
     try {
       postReviewSnapshot = await github.readLiveSnapshot(target);
-      if (!updateReviewRun(store, run, run)) return staleReviewOutcome(run.id, run, store);
     } catch (error) {
       const reason = renderFailure('GitHub live-state validation failed after reviewer completion', error);
       return parkAdmission(run, reason, store, now);
@@ -1244,6 +1342,11 @@ export async function runReviewLoop(
       run = escalated;
       return { outcome: 'needs_human', run, reason };
     }
+
+    // The post-review snapshot is asynchronous. Sample the exact Run and both
+    // governed host authorities after it, with no await before verdict CAS.
+    const beforeVerdictAdmission = checkReviewExecutionAdmission(run, store, deps, now);
+    if (beforeVerdictAdmission !== null) return beforeVerdictAdmission;
 
     if (reviewResult.verdict === 'approve') {
       const approved = applyTransition(run, { type: 'review_approved', reviewResult }, now(), afterReview.activeValidation);

@@ -255,6 +255,41 @@ function approve(headSha: string): ReviewResult {
 }
 
 describe('runReviewLoop', () => {
+  it('refuses governed review when either existing host authority callback is missing', async (t) => {
+    for (const missing of ['current-mutation', 'publication'] as const) {
+      await t.test(missing, async () => {
+        const directory = mkdtempSync(path.join(os.tmpdir(), `tachiko-governed-review-missing-${missing}-`));
+        try {
+          const id = `governed-review-missing-${missing}`;
+          const store = new JsonFileStore({ dir: path.join(directory, 'runs') });
+          store.create(reviewingRun(HEAD, id));
+          const workspace = path.join(directory, 'workspace');
+          const registry = new MissionAdmissionRegistry({ filePath: path.join(directory, 'registry.json'),
+            config: { schemaVersion: 1, revision: `governed-review-missing-${missing}-v1`, limits: { maxCaptains: 1, maxWriters: 1, maxHighAutonomy: 1 } } });
+          const admitted = registry.admit({ laneId: `run:${id}`, role: 'production_captain', evidence: {
+            repository: `${TARGET.owner}/${TARGET.repo}`, issue: TARGET.issueNumber, run: id, workspace,
+          } });
+          assert.equal(admitted.outcome, 'admitted');
+          if (admitted.outcome !== 'admitted') return;
+          const before = registry.snapshot();
+          const reviewer = new FakeReviewer([approve(HEAD)]);
+          const result = await runReviewLoop({
+            store, github: githubAdapter([HEAD, HEAD]), implementation: new FakeImplementation([]), reviewer,
+            resolveValidationAuthority: reviewAuthority,
+            governedPublicationRequired: true,
+            ...(missing === 'publication' ? { assertCurrentMutation: () => registry.assertCanMutate(admitted.token) } : {}),
+            ...(missing === 'current-mutation' ? { assertCanPublish: () => registry.assertCanPublish(admitted.token, admitted.missionId) } : {}),
+          }, id, { maxAttempts: 1, now: () => T0 });
+          assert.equal(result.outcome, 'needs_human');
+          assert.match(result.reason, /missing a required host admission callback/);
+          assert.equal(reviewer.requests.length, 0);
+          assert.deepEqual(registry.snapshot(), before, 'callback omission cannot trigger evidence strengthening or registry mutation');
+          assert.equal(store.read(id)?.history.some((event) => event.type === 'review_approved' || event.type === 'changes_requested'), false);
+        } finally { rmSync(directory, { recursive: true, force: true }); }
+      });
+    }
+  });
+
   it('persists an approved review at FINAL_GATE for the final-gate workflow', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());
