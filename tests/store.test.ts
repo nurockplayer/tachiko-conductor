@@ -1363,6 +1363,113 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(raw.createdAt, undefined, 'the writer does not introduce a full Run validation gate');
   });
 
+  it('retains entry refusal declarations when CAS fingerprint serializers mutate aliased or separate next Runs', () => {
+    for (const kind of [undefined, 'process_family_settlement'] as const) {
+      for (const sharing of ['same-run', 'nested-alias', 'separate-expected'] as const) {
+        const { store, dir } = tempStore();
+        const initial = settlementValidationRun(kind);
+        store.create(initial);
+        const next = store.read(initial.id)!;
+        const expected = sharing === 'same-run' ? next : sharing === 'nested-alias' ? { ...next } : structuredClone(next);
+        const matching = structuredClone(expected);
+        const runPath = path.join(dir, `${initial.id}.json`), projectionPath = operationalProjectionPath(dir, initial.id);
+        const raw = readFileSync(runPath), projection = readFileSync(projectionPath);
+        let calls = 0;
+        Object.defineProperty(expected, 'toJSON', { configurable: true, value() {
+          calls += 1;
+          delete (expected as { toJSON?: unknown }).toJSON;
+          Object.assign(next.validationResult!.local.commands[0]!, { evidenceKind: 'command' });
+          return matching;
+        } });
+        assert.throws(() => store.updateIfUnchanged(expected, next), /invalid bounded validation output payload/);
+        assert.equal(calls, 1, sharing);
+        assert.deepEqual(readFileSync(runPath), raw);
+        assert.deepEqual(readFileSync(projectionPath), projection);
+        assert.equal(localValidationHasUnsettledProcessFamily(new JsonFileStore({ dir }).read(initial.id)?.validationResult?.local), true);
+        assert.equal(readdirSync(dir).some(name => name.endsWith('.tmp')), false);
+      }
+    }
+  });
+
+  it('captures refusal declarations before id and raw-result getters or append-only serialization on each write path', () => {
+    for (const kind of [undefined, 'process_family_settlement'] as const) {
+      for (const api of ['create', 'update', 'CAS'] as const) {
+        for (const seam of ['id', 'raw-result', 'history', 'repair-admissions'] as const) {
+          if (api === 'create' && (seam === 'history' || seam === 'repair-admissions')) continue;
+          const { store, dir } = tempStore();
+          const initial = settlementValidationRun(kind);
+          if (api !== 'create') store.create(initial);
+          const next = structuredClone(initial), expected = structuredClone(initial);
+          const runPath = path.join(dir, `${initial.id}.json`), projectionPath = operationalProjectionPath(dir, initial.id);
+          const raw = existsSync(runPath) ? readFileSync(runPath) : null;
+          const projection = existsSync(projectionPath) ? readFileSync(projectionPath) : null;
+          let calls = 0;
+          const mutate = () => { calls += 1; Object.assign(next.validationResult!.local.commands[0]!, { evidenceKind: 'command' }); };
+          if (seam === 'id') {
+            Object.defineProperty(api === 'CAS' ? expected : next, 'id', { enumerable: true, get() { mutate(); return initial.id; } });
+          } else if (seam === 'raw-result') {
+            const result = next.agentResult;
+            Object.defineProperty(next, 'agentResult', { enumerable: true, get() { mutate(); return result; } });
+          } else if (seam === 'history') {
+            const event = next.history[0]!, matching = structuredClone(event);
+            Object.defineProperty(event, 'toJSON', { configurable: true, value() {
+              mutate(); delete (event as { toJSON?: unknown }).toJSON; return matching;
+            } });
+          } else Object.defineProperty(next, 'repairAdmissions', { enumerable: true, get() { mutate(); return undefined; } });
+          assert.throws(() => api === 'create' ? store.create(next) : api === 'update' ? store.update(next)
+            : store.updateIfUnchanged(expected, next), /invalid bounded validation output payload/, `${api}/${seam}`);
+          assert.ok(calls > 0, `${api}/${seam} reached the intervening caller-controlled seam`);
+          assert.deepEqual(existsSync(runPath) ? readFileSync(runPath) : null, raw);
+          assert.deepEqual(existsSync(projectionPath) ? readFileSync(projectionPath) : null, projection);
+          assert.equal(readdirSync(dir).some(name => name.endsWith('.tmp')), false);
+        }
+      }
+    }
+  });
+
+  it('retains refusal declarations across conditional hooks while preserving stale CAS and marker-free legacy serialization', () => {
+    for (const kind of [undefined, 'process_family_settlement'] as const) {
+      const { store, dir } = tempStore();
+      const initial = settlementValidationRun(kind);
+      store.create(initial);
+      const expected = store.read(initial.id)!, next = structuredClone(expected);
+      const runPath = path.join(dir, `${initial.id}.json`), projectionPath = operationalProjectionPath(dir, initial.id);
+      const raw = readFileSync(runPath), projection = readFileSync(projectionPath);
+      let hookCalls = 0;
+      const guarded = new JsonFileStore({ dir, beforeConditionalWrite() {
+        hookCalls += 1; Object.assign(next.validationResult!.local.commands[0]!, { evidenceKind: 'command' });
+      } });
+      assert.throws(() => guarded.updateIfUnchanged(expected, next), /invalid bounded validation output payload/);
+      assert.equal(hookCalls, 1);
+      assert.deepEqual(readFileSync(runPath), raw);
+      assert.deepEqual(readFileSync(projectionPath), projection);
+      assert.equal(readdirSync(dir).some(name => name.endsWith('.tmp')), false);
+      const winner = { ...expected, updatedAt: '2026-08-14T00:01:00.000Z' };
+      store.update(winner);
+      const winnerRaw = readFileSync(runPath), winnerProjection = readFileSync(projectionPath);
+      const staleNext = structuredClone(expected), matching = structuredClone(expected);
+      Object.defineProperty(expected, 'toJSON', { value() {
+        Object.assign(staleNext.validationResult!.local.commands[0]!, { evidenceKind: 'command' }); return matching;
+      } });
+      assert.equal(guarded.updateIfUnchanged(expected, staleNext), false);
+      assert.equal(hookCalls, 1, 'a stale CAS never enters the publication hook');
+      assert.deepEqual(readFileSync(runPath), winnerRaw);
+      assert.deepEqual(readFileSync(projectionPath), winnerProjection);
+      assert.equal(localValidationHasUnsettledProcessFamily(store.read(initial.id)?.validationResult?.local), true);
+    }
+    const { store, dir } = tempStore();
+    const legacy = newRun('marker-free-serializer');
+    store.create(legacy);
+    const next = store.read(legacy.id)!, matching = structuredClone(next);
+    Object.defineProperty(next, 'toJSON', { configurable: true, value() {
+      delete (next as { toJSON?: unknown }).toJSON;
+      Object.assign(next, { futureUnknown: { retained: 'ordinary legacy metadata' } }); return matching;
+    } });
+    assert.equal(store.updateIfUnchanged(next, next), true);
+    const persisted = JSON.parse(readFileSync(path.join(dir, `${legacy.id}.json`), 'utf8'));
+    assert.deepEqual(persisted.futureUnknown, { retained: 'ordinary legacy metadata' });
+  });
+
   it('roundtrips explicit command kinds and conservative legacy refusal evidence without changing their authority', () => {
     for (const kind of [undefined, 'process_family_settlement', 'command'] as const) {
       const value = settlementValidationRun(kind);

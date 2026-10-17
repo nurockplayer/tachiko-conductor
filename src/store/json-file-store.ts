@@ -348,15 +348,20 @@ function assertNoInvalidBoundedValidationPayload(run: Run, declarations?: Bounde
   }
 }
 
+/** Capture safety declarations before caller-controlled reads, serializers or hooks can mutate the next Run. */
+function snapshotRunValidationDeclarations(run: Run): BoundedValidationDeclarations {
+  assertNoInvalidBoundedValidationPayload(run);
+  const validation = Object.getOwnPropertyDescriptor(run, 'validationResult');
+  return snapshotBoundedValidationDeclarations(validation !== undefined && 'value' in validation ? validation.value : undefined);
+}
+
 /** Write atomically and durably: sync the private temp before rename and its parent after rename. */
 function serializedJson(value: unknown): string {
   return `${JSON.stringify(value, null, 2)}\n`;
 }
 
-function writeJsonAtomic(filePath: string, value: unknown, syncForDurability: (fd: number, target: 'file' | 'directory') => void, validatePath: () => void): string {
+function writeJsonAtomic(filePath: string, value: unknown, syncForDurability: (fd: number, target: 'file' | 'directory') => void, validatePath: () => void, declarations: BoundedValidationDeclarations): string {
   validatePath();
-  const validation = typeof value === 'object' && value !== null ? Object.getOwnPropertyDescriptor(value, 'validationResult') : undefined;
-  const declarations = snapshotBoundedValidationDeclarations(validation !== undefined && 'value' in validation ? validation.value : undefined);
   const serialized = serializedJson(value);
   // Ancestor serializers can replace a previously checked nested payload.
   // Check exactly the bytes being published, without invoking the caller again.
@@ -580,6 +585,7 @@ export class JsonFileStore implements RunStore {
   }
 
   create(run: Run): void {
+    const declarations = snapshotRunValidationDeclarations(run);
     this.withMutationLock(run.id, () => {
       assertNoRawProviderOutput(run);
       assertNoInvalidBoundedValidationPayload(run);
@@ -588,7 +594,7 @@ export class JsonFileStore implements RunStore {
       if (existsSync(filePath)) {
         throw new Error(`A run with id "${run.id}" already exists at ${filePath}; refusing to overwrite.`);
       }
-      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability, () => this.assertSafeRunFile(filePath));
+      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability, () => this.assertSafeRunFile(filePath), declarations);
       writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
@@ -601,6 +607,7 @@ export class JsonFileStore implements RunStore {
   }
 
   update(run: Run): void {
+    const declarations = snapshotRunValidationDeclarations(run);
     this.withMutationLock(run.id, () => {
       assertNoRawProviderOutput(run);
       assertNoInvalidBoundedValidationPayload(run);
@@ -609,12 +616,13 @@ export class JsonFileStore implements RunStore {
       const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
       assertRepairAdmissionsAppendOnly(current, run);
       assertHistoryAppendOnly(current, run);
-      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability, () => this.assertSafeRunFile(filePath));
+      const serialized = writeJsonAtomic(filePath, run, this.syncForDurability, () => this.assertSafeRunFile(filePath), declarations);
       writeOperationalProjectionBestEffort(this.dir, run, serialized);
     });
   }
 
   updateIfUnchanged(expected: Run, next: Run): boolean {
+    const declarations = snapshotRunValidationDeclarations(next);
     if (expected.id !== next.id) throw new Error('updateIfUnchanged requires expected and next to name the same Run id.');
     return this.withMutationLock(expected.id, () => {
       assertNoRawProviderOutput(next);
@@ -627,7 +635,7 @@ export class JsonFileStore implements RunStore {
       assertHistoryAppendOnly(current, next);
       this.beforeConditionalWrite?.();
       this.assertSafeRunFile(filePath);
-      const serialized = writeJsonAtomic(filePath, next, this.syncForDurability, () => this.assertSafeRunFile(filePath));
+      const serialized = writeJsonAtomic(filePath, next, this.syncForDurability, () => this.assertSafeRunFile(filePath), declarations);
       writeOperationalProjectionBestEffort(this.dir, next, serialized);
       return true;
     });
