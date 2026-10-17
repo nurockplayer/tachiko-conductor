@@ -85,7 +85,7 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          Q_BROWSER_CANDIDATE="$GITHUB_WORKSPACE/candidate" node --import "$GITHUB_WORKSPACE/infrastructure/.github/scripts/issue104-browser-host-observer.mjs" node_modules/tsx/dist/cli.mjs --test --test-concurrency=2 --test-name-pattern='keeps the bootstrap browser context alive across transient client disconnects' tests/browser-runtime-integration.test.ts > "$QUAL_ROOT/browser-test.log" 2>&1
+          Q_BROWSER_CANDIDATE="$GITHUB_WORKSPACE/candidate" node node_modules/tsx/dist/cli.mjs --import "$GITHUB_WORKSPACE/infrastructure/.github/scripts/issue104-browser-host-observer.mjs" --test --test-concurrency=2 --test-name-pattern='keeps the bootstrap browser context alive across transient client disconnects' tests/browser-runtime-integration.test.ts > "$QUAL_ROOT/browser-test.log" 2>&1
           focus_code=$?
           set -e
           export BROWSER_FOCUS_EXIT="$focus_code"
