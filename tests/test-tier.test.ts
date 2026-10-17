@@ -30,12 +30,14 @@ describe('test tier runner', () => {
       'claude-code-smoke.test.ts',
       'codex-cli-smoke.test.ts',
       'browser-agent-smoke.test.ts',
+      'browser-bootstrap-client.test.ts',
       'browser-runtime.test.ts',
       'control-tower-browser.test.ts',
       'local-command-sandbox.test.ts',
       'workflow.test.ts',
     ];
     assert.deepEqual(selectTests('unit', files), [
+      'browser-bootstrap-client.test.ts',
       'browser-runtime.test.ts',
       'control-tower-browser.test.ts',
       'local-command-sandbox.test.ts',
@@ -47,6 +49,7 @@ describe('test tier runner', () => {
 
   it('uses the explicit host-only exclusion list for the isolated tier', () => {
     assert.deepEqual(isolatedExcludedTests, [
+      'browser-bootstrap-client.test.ts',
       'browser-runtime.test.ts',
       'control-tower-browser.test.ts',
       'local-command-sandbox.test.ts',
@@ -55,6 +58,7 @@ describe('test tier runner', () => {
     const files = [
       'browser-runtime-integration.test.ts',
       'claude-code-smoke.test.ts',
+      'browser-bootstrap-client.test.ts',
       'browser-runtime.test.ts',
       'control-tower-browser.test.ts',
       'local-command-sandbox.test.ts',

@@ -3,6 +3,7 @@ import path from 'node:path';
 export const integrationTest = 'browser-runtime-integration.test.ts';
 // These tests require genuine TCP listeners or host sandbox context unavailable in production.
 export const isolatedExcludedTests = Object.freeze([
+  'browser-bootstrap-client.test.ts',
   'browser-runtime.test.ts',
   'control-tower-browser.test.ts',
   'local-command-sandbox.test.ts',

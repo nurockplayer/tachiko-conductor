@@ -514,12 +514,13 @@ lockfile-mismatched artifact makes validation unknown. `scripts/issue-104-deploy
 maintenance hold, preflights, and then restarts launchd; leave the hold in
 place until an operator explicitly verifies and releases it.
 
-The production `test:isolated` tier excludes exactly `browser-runtime.test.ts`,
-`control-tower-browser.test.ts`, and `local-command-sandbox.test.ts` from the
-ordinary unit tier. The browser tests start TCP servers, while the sandbox
-install-boundary test requires host Darwin sandbox context. `pnpm test` retains
-all three files and remains required for captain validation before merge. The
-sandbox test must run through pinned pnpm and fails if its real toolchain cannot
+The production `test:isolated` tier excludes exactly `browser-bootstrap-client.test.ts`,
+`browser-runtime.test.ts`, `control-tower-browser.test.ts`, and
+`local-command-sandbox.test.ts` from the ordinary unit tier. The three browser
+test files start TCP servers, while the sandbox install-boundary test requires
+host Darwin sandbox context. `pnpm test` retains all four files, including both
+bootstrap MCP stream readiness cases, and remains required for captain validation
+before merge. The sandbox test must run through pinned pnpm and fails if its real toolchain cannot
 start; it verifies private IPC plus denial of host files, host sockets, signals,
 and IP networking. The isolated tier never treats a denied network operation as
 a reason to skip additional tests; all other validator and timeout tests remain
