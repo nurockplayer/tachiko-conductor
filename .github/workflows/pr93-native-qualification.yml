@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   qualify:
-    runs-on: macos-26-intel
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - name: Checkout qualification infrastructure
@@ -28,7 +28,7 @@ jobs:
       - name: Checkout immutable product candidate
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: c9e8a06e660d285746e4da4db252971939073e2d
+          ref: 7170acf998115fe3e910c03be79cfbf0bce4abb5
           fetch-depth: 0
           persist-credentials: false
           path: candidate
@@ -37,13 +37,14 @@ jobs:
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
         with:
           node-version: 24.19.0
+          architecture: arm64
 
-      - name: Observe one original exec-failure method and encrypt private evidence
+      - name: Run full native qualification and encrypt private evidence
         shell: bash
         run: |
           set -eu
           umask 077
-          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py --diagnostics-only
+          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py
 
       - name: Preserve ciphertext and sanitized summary
         if: always()

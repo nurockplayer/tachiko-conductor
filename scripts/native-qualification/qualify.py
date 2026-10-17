@@ -28,14 +28,16 @@ import time
 import traceback
 
 
-CANDIDATE = 'c9e8a06e660d285746e4da4db252971939073e2d'
-TREE = '00490a7f39b99632fdb31819e753b5b1185cfd41'
+CANDIDATE = '7170acf998115fe3e910c03be79cfbf0bce4abb5'
+TREE = '815662e1ee8ec94463d4cbfdf289dc980538389e'
 BASE = 'c8c7f0c094f0f51319b1b2890e96bcdf93a0ded8'
-PREVIOUS_CANDIDATE = 'e3cfc972f10cfbe4dca44a1f74d0d28d7943df76'
+PREVIOUS_CANDIDATE = 'c9e8a06e660d285746e4da4db252971939073e2d'
 PYTHON_SKIP = 'test_process_group_scan_miss_after_fork_remains_unknown'
 PYTHON_SKIP_REASON = 'the synchronized /proc race regression requires Linux'
 SEATBELT = 'runs configured absolute Node and repository-pinned absolute pnpm under the macOS seatbelt'
-NODE_TESTS = 65
+ROOT_CONFINEMENT = 'opens the root directory with the real macOS toolchain while denying an outside sentinel'
+NATIVE_TIMEZONE = 'keeps a live native macOS owner fenced when only the caller timezone changes'
+NODE_TESTS = 66
 RAW_LIMIT = 32 * 1024 * 1024
 PUBLIC_LIMIT = 8 * 1024 * 1024
 SUMMARY_LIMIT = 16 * 1024
@@ -158,13 +160,16 @@ def parse_node(text):
             numbers[name] = None
         else:
             numbers[name] = int(values[0])
-    seatbelt = re.findall(r'^\s*ok \d+ - ' + re.escape(SEATBELT) + r'\s*$', text, re.M)
+    native = {}
+    for key, name in [('seatbelt_executed', SEATBELT), ('root_confinement_executed', ROOT_CONFINEMENT),
+                      ('native_timezone_executed', NATIVE_TIMEZONE)]:
+        outcomes = re.findall(r'^[ \t]*(ok|not ok) \d+ - ' + re.escape(name) + r'([ \t]*(?:#.*)?)$', text, re.M)
+        native[key] = len(outcomes) == 1 and outcomes[0][0] == 'ok' and not outcomes[0][1].strip()
     skip_names = re.findall(r'^\s*(?:ok|not ok) \d+ - (.*?)(?:\s+# SKIP(?:\s+.*)?)$', text, re.M)
-    numbers.update({'counts_complete': complete, 'seatbelt_executed': len(seatbelt) == 1,
-                    'skips': skip_names})
+    numbers.update({'counts_complete': complete, **native, 'skips': skip_names})
     numbers['accepted'] = complete and numbers['tests'] == NODE_TESTS and numbers['pass'] == NODE_TESTS \
         and all(numbers[name] == 0 for name in ['fail', 'cancelled', 'skipped', 'todo']) \
-        and len(seatbelt) == 1 and not skip_names
+        and all(native.values()) and not skip_names
     return numbers
 
 
@@ -506,7 +511,7 @@ class Qualification:
         if (head, tree) != (CANDIDATE, TREE):
             raise RuntimeError('candidate_identity_mismatch')
         parents = self.git_text(label + '-parents', 'show', '-s', '--format=%P', 'HEAD').split()
-        if parents != [PREVIOUS_CANDIDATE, BASE]:
+        if parents != [PREVIOUS_CANDIDATE]:
             raise RuntimeError('candidate_parents_mismatch')
         self.run(label + '-base-ancestry', [self.git, '-C', self.candidate, 'merge-base', '--is-ancestor', BASE, CANDIDATE])
         _receipt, output = self.run(label + '-tracked', [self.git, '-C', self.candidate, 'ls-files', '--stage', '-z'])
@@ -563,7 +568,8 @@ class Qualification:
         return value
 
     def providers(self):
-        if platform.system() != 'Darwin' or platform.machine() != 'x86_64':
+        self.versions['python_architecture'] = platform.machine()
+        if platform.system() != 'Darwin' or self.versions['python_architecture'] != 'arm64':
             raise RuntimeError('supported_native_platform_required')
         if sys.version_info < (3, 9):
             raise RuntimeError('python39_required_for_child_umask')
@@ -600,7 +606,8 @@ class Qualification:
         version_commands = {'python': ['/usr/bin/python3', '--version'], 'node': [self.node, '--version'],
                             'corepack': [self.node.parent / 'corepack', '--version'],
                             'git': [self.git, '--version'], 'openssl': [self.openssl, 'version'],
-                            'macos': ['/usr/bin/sw_vers', '-productVersion']}
+                            'macos': ['/usr/bin/sw_vers', '-productVersion'],
+                            'node_architecture': [self.node, '-p', 'process.arch']}
         for name, command in version_commands.items():
             value = self.text(name + '-version', command)
             if not re.fullmatch(r'[A-Za-z0-9 ._()+:-]{1,120}', value):
@@ -610,6 +617,8 @@ class Qualification:
         # Python fixture independently verifies its committed Corepack0.34.6 provider.
         if self.versions['node'] != 'v24.19.0' or self.versions['corepack'] != '0.35.0':
             raise RuntimeError('pinned_toolchain_mismatch')
+        if self.versions['node_architecture'] != 'arm64':
+            raise RuntimeError('native_arm64_node_required')
         resources = {'disk': dict(zip(['total', 'used', 'free'], shutil.disk_usage(self.private))),
                      'memory_bytes': self.text('memory', ['/usr/sbin/sysctl', '-n', 'hw.memsize']),
                      'cpu_count': self.text('cpus', ['/usr/sbin/sysctl', '-n', 'hw.ncpu']),
@@ -1040,8 +1049,7 @@ class Qualification:
         self.providers()
         self.crypto_probe()
         self.before = self.source_manifest('before')
-        if self.preflight_only or self.diagnostics_only:
-            self.git_capability_probe()
+        self.git_capability_probe()
         if self.preflight_only:
             return
         if self.diagnostics_only:
@@ -1097,8 +1105,10 @@ class Qualification:
             (self.private / 'source-postflight-error.txt').write_text(source_error)
         complete = bool(self.records) and all(record['observed_family_complete'] and record['original_group_absent']
                        and record['raw_capture_complete'] and not record['timed_out'] for record in self.records)
-        native_passed = self.python is not None \
-            and self.node_result is not None and self.python['accepted'] and self.node_result['accepted']
+        native_passed = self.git_capability is not None and self.git_capability['accepted'] \
+            and self.python is not None and self.node_result is not None \
+            and all(item['accepted'] and item['exit_code'] == 0 and item['owned_completion']
+                    for item in [self.python, self.node_result])
         capability_passed = self.git_capability is not None and self.git_capability['accepted'] \
             and self.python is None and self.node_result is None
         diagnostic_complete = capability_passed and self.diagnostics is not None and self.diagnostics['complete']
@@ -1119,7 +1129,7 @@ class Qualification:
             public_python['unexpected_skip_count'] = sum(item != allowed for item in self.python['skips'])
         public_node = None if self.node_result is None else dict(self.node_result)
         if public_node is not None:
-            allowed = {SEATBELT, 'keeps a live native macOS owner fenced when only the caller timezone changes'}
+            allowed = {SEATBELT, ROOT_CONFINEMENT, NATIVE_TIMEZONE}
             public_node['skips'] = sorted(allowed.intersection(self.node_result['skips']))
             public_node['unexpected_skip_count'] = sum(name not in allowed for name in self.node_result['skips'])
         summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
