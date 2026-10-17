@@ -11,7 +11,7 @@ import { assertExecutionSupportedByProvider, type ResolvedExecutionConfiguration
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { canonicalReviewTarget } from '../reviewers/risk-policy.js';
 import type { NativeOracleEvidence, NativeSourceManifest, OracleReceiptStore } from './types.js';
-import { validNativeEvidence } from './native-reviewer.js';
+import { validNativeEvidence, unresolvedNativeReview } from './native-reviewer.js';
 import { oracleDigest, validNativeSourceManifest } from './source-evidence.js';
 import { acceptedScopeFromHandoff } from '../agents/implementation-packet.js';
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -289,6 +289,8 @@ const validUrl = (s: string) => {
 export const activeNativeLead = (run: Run) => run.nativeLead?.requests.find(r => r.identity.requestId === run.nativeLead?.activeRequestId);
 export const acceptedNativeLead = (run: Run) => run.nativeLead?.acceptances.find(a => a.requestId === run.nativeLead?.activeRequestId);
 export const unresolvedNativeLead = (run: Run) => run.nativeLead?.requests.some(r => r.submissionPossible && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'lead')) === true;
+/** Every issued current or inactive request retains its uncertainty fence. */
+export const unresolvedNativeRepairHistory = (run: Run): boolean => unresolvedNativeReview(run) || unresolvedNativeLead(run);
 export const nativeLeadStopped = (run: Run) => acceptedNativeLead(run)?.disposition.outcome === 'stop' || run.history.some(h => h.nativeLeadStop !== undefined);
 export function leadOwnerProved(run: Run, identity: NativeLeadIdentity, owner: NativeReviewContext['owner']): boolean {
   if (!owner || owner.missionId !== identity.missionId || owner.laneId !== identity.laneId)
@@ -391,7 +393,7 @@ function leadAcceptanceMatches(request: NativeLeadRequest, acceptance: NativeLea
 export function leadConsumptionValid(run: Run, reference: LeadRepairReference | undefined): boolean {
   const a = acceptedNativeLead(run);
   const r = reference;
-  return !!r && !!activeNativeLead(run) && hasAuthenticatedCompletion(activeNativeLead(run)!.identity, activeNativeLead(run)!.terminalDigest, activeNativeLead(run)!.completionProof, 'lead') && validLeadRepairReference(r) && run.implementationAuthority !== undefined && r.implementationAuthoritySha256 === oracleDigest(run.implementationAuthority) && !!a && leadAcceptanceMatches(activeNativeLead(run)!, a) && same(a, stripConsumption(r)) && activeNativeLead(run)?.status === 'qualified_complete' && run.reviewResult?.verdict === 'request_changes' && run.nativeReview?.accepted?.digest === r.identity.origin.digest && run.headSha === r.identity.headSha && run.pullRequest?.number === r.identity.pullRequestNumber && r.identity.repairOrdinal === run.history.filter(h => h.type === 'start_fix').length + 1 && r.identity.repairOrdinal <= r.identity.repairLimit && same(r.identity.blockingFindingIds, run.reviewResult.findings.flatMap((f, i) => f.severity === 'blocking' ? [`${r.identity.origin.digest}:${i}`] : [])) && !(run.repairAdmissions ?? []).some(p => p.leadDisposition?.identity.incarnation === r.identity.incarnation) && leadOwnerProved(run, r.identity, { missionId: r.identity.missionId, laneId: r.identity.laneId, generation: r.consumptionGeneration });
+  return !unresolvedNativeRepairHistory(run) && !!r && !!activeNativeLead(run) && hasAuthenticatedCompletion(activeNativeLead(run)!.identity, activeNativeLead(run)!.terminalDigest, activeNativeLead(run)!.completionProof, 'lead') && validLeadRepairReference(r) && run.implementationAuthority !== undefined && r.implementationAuthoritySha256 === oracleDigest(run.implementationAuthority) && !!a && leadAcceptanceMatches(activeNativeLead(run)!, a) && same(a, stripConsumption(r)) && activeNativeLead(run)?.status === 'qualified_complete' && run.reviewResult?.verdict === 'request_changes' && run.nativeReview?.accepted?.digest === r.identity.origin.digest && run.headSha === r.identity.headSha && run.pullRequest?.number === r.identity.pullRequestNumber && r.identity.repairOrdinal === run.history.filter(h => h.type === 'start_fix').length + 1 && r.identity.repairOrdinal <= r.identity.repairLimit && same(r.identity.blockingFindingIds, run.reviewResult.findings.flatMap((f, i) => f.severity === 'blocking' ? [`${r.identity.origin.digest}:${i}`] : [])) && !(run.repairAdmissions ?? []).some(p => p.leadDisposition?.identity.incarnation === r.identity.incarnation) && leadOwnerProved(run, r.identity, { missionId: r.identity.missionId, laneId: r.identity.laneId, generation: r.consumptionGeneration });
 }
 export function leadAuthority(run: Run, snapshot: GitHubLiveSnapshot, execution: ResolvedExecutionConfiguration, maxAttempts: number): NativeLeadAuthority {
   if (!originalImplementationMatches(run, snapshot)) throw new Error('Original admitted implementation authority is missing or changed.');
@@ -454,7 +456,7 @@ const frozen = <T>(v: T): T => {
 export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
   const validate = (c: NativeLeadContext): LeadRepairReference | null => {
     try {
-      if (!usable(host) || c.observationOnly || !nativeLeadCoherent(c.run))
+      if (!usable(host) || c.observationOnly || !nativeLeadCoherent(c.run) || unresolvedNativeRepairHistory(c.run))
         return null;
       c.assertCurrent();
       const a = acceptedNativeLead(c.run);
@@ -770,6 +772,9 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
 export function assertNativeLeadTransition(previous: Run, next: Run): void {
   const oldLength = previous.repairAdmissions?.length ?? 0;
   const added = (next.repairAdmissions ?? []).slice(oldLength);
+  const startsRepair = next.history.slice(previous.history.length).some(h => h.type === 'start_fix');
+  if ((added.length > 0 || startsRepair) && (unresolvedNativeRepairHistory(previous) || unresolvedNativeRepairHistory(next)))
+    throw new Error('Unresolved native history cannot authorize a new repair admission/start_fix.');
   for (const a of added) {
     if (previous.nativeReview?.repairLimit !== undefined && (a.budgetLimit !== previous.nativeReview.repairLimit || previous.history.filter(h => h.type === 'start_fix').length >= previous.nativeReview.repairLimit))
       throw new Error('Native durable shared repair budget changed or exhausted.');

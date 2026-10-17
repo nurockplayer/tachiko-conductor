@@ -4,15 +4,17 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import os from 'node:os';
 import path from 'node:path';
 import { it } from 'node:test';
-import { newRun, T0, TEST_VALIDATION_AUTHORITY, validationPassed } from './helpers.js';
+import { newRun, T0, TEST_VALIDATION_AUTHORITY, validationPassed, validationFailed } from './helpers.js';
 import type { Run } from '../src/domain/types.js';
 import { CANCEL_RUN_DECISION } from '../src/domain/decisions.js';
+import { buildImplementationPacket } from '../src/agents/implementation-packet.js';
+import { createRepairAdmissionSnapshot, createRepairAttemptBinding, activeRepairAdmission } from '../src/domain/repair-admission.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { hasAuthenticatedCompletion, type NativeCompletionHosts } from '../src/oracle/completion-proof.js';
 import { nativeReviewCoherent, unresolvedNativeReview, resolveNativeReviewer } from '../src/oracle/native-reviewer.js';
-import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead } from '../src/oracle/native-lead.js';
+import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid } from '../src/oracle/native-lead.js';
 import { canonicalReviewTarget } from '../src/reviewers/risk-policy.js';
 import { oracleDigest, textDigest } from '../src/oracle/source-evidence.js';
 import { recoverRunAdmission, resumeCommand, isDispatchRunOwnerRetiredCommand } from '../src/cli.js';
@@ -48,6 +50,14 @@ function fixture(role: 'review' | 'lead') {
     run.nativeReview.accepted = { requestId: reviewIdentity.requestId, receiptId: origin.id, digest: oracleDigest(origin), identity: reviewIdentity };
     const execution: any = { profile: 'routine', revision: 'test-execution-v1', executor: 'luna-isolated', model: 'gpt-5.6-luna', reasoningEffort: 'high', timeoutMs: 30000, sandboxMode: 'workspace-write', approvalPolicy: 'never' };
     const authority: any = { implementationAuthoritySha256: 'c'.repeat(64), target: run.target, pullRequest: run.pullRequest, bootstrap: { bootstrapKind: 'standalone-isolated', owner: 'acme', repo: 'widgets', issueNumber: 42, baseSha, workspacePath: path.join(root, 'workspace'), branch: 'candidate' }, taskShape: { revision: 'original-contract', shape: 'bounded' }, originalExecution: execution, execution, validation: validationPassed(headSha), reviewIdentity, scope: { sourceId: 'original-scope', sourceScope: 'issue', sourceUpdatedAt: T0, freshness: 'current', text: 'Create implementation.txt only.' }, issue: { id: 'I_42', number: 42, title: 'Bounded fixture', body: 'Original scope', state: 'open', url: '', createdAt: T0, updatedAt: T0 }, maxAttempts: 1 };
+    run.bootstrap = { ...authority.bootstrap, baseBranch: 'main' };
+    authority.bootstrap = run.bootstrap;
+    run.execution = execution; run.repairTaskShapeAuthority = authority.taskShape;
+    const input: any = { kind: 'initial', identity: { runId: run.id, target: run.target, workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, baseSha, execution }, authority: { repository: { owner: 'acme', repo: 'widgets' }, issue: { id: authority.issue.id, number: 42, updatedAt: T0, title: authority.issue.title, body: authority.issue.body }, acceptedScope: authority.scope }, repair: null };
+    const originalPacket = buildImplementationPacket(input); assert.equal(originalPacket.kind, 'packet');
+    if (originalPacket.kind !== 'packet') throw new Error('Controlled original packet invalid');
+    run.implementationAuthority = { input, taskShape: authority.taskShape, packetSha256: oracleDigest(originalPacket.packet) };
+    authority.implementationAuthoritySha256 = oracleDigest(run.implementationAuthority);
     const blockingFindingIds = [`${oracleDigest(origin)}:0`];
     const packet = { origin, manifest, authority, blockingFindingIds, remainingRepairs: 1 };
     const identity: any = { requestId: 'lead-request', correlationId: 'lead-request', incarnation: 'd'.repeat(64), runId: run.id, claimId: run.dispatchClaimId, missionId: reviewIdentity.missionId, laneId: reviewIdentity.laneId, ownerGeneration: 1, phase: 'lead-disposition', role: 'bounded-lead', repository: 'acme/widgets', targetKey: reviewIdentity.targetKey, pullRequestNumber: 7, baseSha, headSha, origin: { requestId: origin.identity.requestId, receiptId: origin.id, digest: oracleDigest(origin) }, authoritySha256: oracleDigest(authority), sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256, packetSha256: oracleDigest(packet), blockingFindingIds, repairOrdinal: 1, repairLimit: 1, bindingId: 'controlled-sol', policyRevision: 'bounded-lead-v1', requestedModel: 'controlled-sol', requestedEffort: 'High' };
@@ -288,4 +298,144 @@ for (const role of ['review', 'lead'] as const) {
       } finally { f.cleanup(); }
     });
   }
+}
+
+// Direct admission callers use controlled valid source/authority/packet fixtures.
+// No worker, actual mission token, Git operation or service is invoked here.
+function repairCase(finding: 'review_blocking' | 'validation_failed', uncertainty: 'none' | 'proofless-oracle' | 'inactive-oracle' | 'inactive-lead') {
+  const f = fixture('lead');
+  const completed: any = f.complete(), lead = completed.nativeLead.requests[0];
+  const acceptance = { requestId: lead.identity.requestId, receiptId: f.terminal.id, digest: lead.terminalDigest, identity: lead.identity, disposition: f.terminal.disposition };
+  completed.nativeLead.acceptances = [acceptance]; completed.nativeReview.repairLimit = 1;
+  const origin: any = f.receipts.readNative(`${completed.nativeReview.activeRequestId}.terminal`)!;
+  const previous: any = { ...completed, state: 'CHANGES_REQUESTED', validationResult: finding === 'validation_failed' ? validationFailed(completed.headSha) : validationPassed(completed.headSha), ...(finding === 'review_blocking' ? { reviewResult: origin.result } : {}) };
+  f.store().update(previous);
+  if (uncertainty === 'proofless-oracle') delete previous.nativeReview.requests[0].completionProof;
+  if (uncertainty === 'inactive-oracle') {
+    const old = structuredClone(previous.nativeReview.requests[0]);
+    old.identity.requestId = 'inactive-oracle'; old.identity.correlationId = old.identity.requestId; old.identity.headSha = 'e'.repeat(40);
+    old.status = 'retired'; delete old.terminalDigest; delete old.completionProof;
+    previous.nativeReview.requests.push(old);
+  }
+  if (uncertainty === 'inactive-lead') {
+    const old = structuredClone(previous.nativeLead.requests[0]);
+    old.identity.requestId = 'inactive-lead'; old.identity.correlationId = old.identity.requestId; old.identity.incarnation = 'e'.repeat(64);
+    old.status = 'retired'; delete old.terminalDigest; delete old.completionProof;
+    previous.nativeLead.requests.push(old);
+  }
+  // Reproduce persisted historical uncertainty without erasing or promoting it.
+  if (uncertainty !== 'none') writeFileSync(path.join(f.root, 'runs', `${previous.id}.json`), JSON.stringify(previous));
+  const current = f.store().read(previous.id)!;
+  const currentLead = current.nativeLead!.requests[0]!;
+  const reference = { ...acceptance, implementationAuthoritySha256: oracleDigest(current.implementationAuthority), originEvidence: origin, consumptionGeneration: 1, instructionsSha256: oracleDigest(acceptance.disposition) };
+  const packetInput: any = { ...current.implementationAuthority!.input, identity: { ...current.implementationAuthority!.input.identity, baseSha: current.headSha! }, kind: finding === 'review_blocking' ? 'review-repair' : 'validation-repair', repair: { headSha: current.headSha!, pullRequestNumber: 7, evidenceRef: `run:${current.id}:review:${current.headSha}`, evidence: finding === 'validation_failed' ? JSON.stringify(current.validationResult) : JSON.stringify({ verdict: current.reviewResult?.verdict, headSha: current.headSha, pullRequestNumber: 7 }), evidenceKind: finding === 'review_blocking' ? 'review' : 'validation', evidenceHeadSha: current.headSha!, evidencePullRequestNumber: 7, evidenceStatus: finding === 'review_blocking' ? 'request_changes' : 'failed', blockingFindings: finding === 'review_blocking' ? origin.result.findings.map((v: any) => `[blocking] ${v.summary}`) : [], ...(finding === 'review_blocking' ? { leadDisposition: reference } : {}) } };
+  const packet = buildImplementationPacket(packetInput); assert.equal(packet.kind, 'packet');
+  if (packet.kind !== 'packet') throw new Error('Controlled repair packet invalid');
+  const admission = { ...createRepairAdmissionSnapshot(current.repairTaskShapeAuthority!, finding, current.headSha!, 7, current.execution!, T0), budgetLimit: 1, attemptBinding: createRepairAttemptBinding(current, current.execution!), ...(finding === 'review_blocking' ? { leadDisposition: reference, packetSha256: oracleDigest(packet.packet) } : {}) };
+  const next: Run = { ...current, state: 'IMPLEMENTING', repairAdmissions: [admission], history: [...current.history, { type: 'start_fix', from: 'CHANGES_REQUESTED', to: 'IMPLEMENTING', at: T0, repairAdmissionIndex: 0 }] };
+  assert.equal(hasAuthenticatedCompletion(currentLead.identity, currentLead.terminalDigest, currentLead.completionProof, 'lead'), true, 'current lead proof is genuinely configured/authenticated');
+  assert.equal(nativeReviewCoherent(current), true); assert.equal(nativeLeadCoherent(current), true);
+  return { ...f, current, next, reference, admission };
+}
+
+for (const finding of ['review_blocking', 'validation_failed'] as const) {
+  for (const uncertainty of ['proofless-oracle', 'inactive-oracle', 'inactive-lead'] as const) {
+    for (const operation of ['update', 'CAS'] as const) {
+      it(`R1 raw admission ${finding}/${uncertainty}/${operation} rejects unresolved history`, () => {
+        const f = repairCase(finding, uncertainty);
+        try {
+          assert.equal(unresolvedNativeReview(f.current) || unresolvedNativeLead(f.current), true);
+          assert.throws(() => applyTransition(f.current, { type: 'start_fix', repairAdmission: f.admission }, T0), /Unresolved native history/);
+          const helper = leadConsumptionValid(f.current, f.reference);
+          let rawError: unknown, rawResult: unknown;
+          try { rawResult = operation === 'update' ? f.store().update(f.next) : f.store().updateIfUnchanged(f.current, f.next); } catch (error) { rawError = error; }
+          const after = f.store().read(f.current.id)!;
+          console.log(JSON.stringify({ finding, uncertainty, operation, helper, rawResult, rawError: rawError === undefined ? null : String(rawError), beforeUnresolved: unresolvedNativeReview(f.current) || unresolvedNativeLead(f.current), afterState: after.state, afterAdmissionCount: after.repairAdmissions?.length ?? 0, afterStartFixCount: after.history.filter(h => h.type === 'start_fix').length, fixtureWorkerOrServiceInvocations: 0 }));
+          assert.match(String(rawError), /unresolved native history/i, 'actual raw store must reject unresolved admission');
+          if (finding === 'review_blocking') assert.equal(helper, false, 'same shared helper must fence genuine lead proof when history is unresolved');
+          assert.deepEqual(after, f.current);
+        } finally { f.cleanup(); }
+      });
+    }
+  }
+  it(`R1 all-terminal ${finding} admits once and retains exact unfinished recovery`, () => {
+    const f = repairCase(finding, 'none');
+    try {
+      assert.equal(unresolvedNativeReview(f.current) || unresolvedNativeLead(f.current), false);
+      if (finding === 'review_blocking') assert.equal(leadConsumptionValid(f.current, f.reference), true);
+      const reduced = applyTransition(f.current, { type: 'start_fix', repairAdmission: f.admission }, T0);
+      assert.deepEqual(reduced.repairAdmissions, f.next.repairAdmissions);
+      assert.equal(f.store().updateIfUnchanged(f.current, f.next), true);
+      const recovered = f.store().read(f.current.id)!;
+      assert.ok(activeRepairAdmission(recovered));
+      assert.equal(f.store().updateIfUnchanged(recovered, recovered), true, 'exact unfinished persistence recovery adds no admission/debit');
+      assert.equal(f.store().read(f.current.id)!.repairAdmissions!.length, 1);
+      assert.equal(f.store().read(f.current.id)!.history.filter(h => h.type === 'start_fix').length, 1);
+      assert.equal(f.store().updateIfUnchanged(f.current, f.next), false, 'consumed stale predecessor cannot readmit');
+    } finally { f.cleanup(); }
+  });
+}
+
+for (const finding of ['review_blocking', 'validation_failed'] as const) {
+  for (const unknown of ['oracle', 'lead'] as const) {
+    for (const operation of ['update', 'CAS'] as const) {
+      it(`R1 next-candidate ${finding}/${unknown}/${operation} cannot introduce uncertainty with admission`, () => {
+        const f = repairCase(finding, 'none');
+        try {
+          const next: any = structuredClone(f.next), key = unknown === 'oracle' ? 'nativeReview' : 'nativeLead';
+          const historical = structuredClone(next[key].requests[0]);
+          historical.identity.requestId = 'next-unknown'; historical.identity.correlationId = historical.identity.requestId;
+          if (unknown === 'oracle') historical.identity.headSha = 'e'.repeat(40); else historical.identity.incarnation = 'e'.repeat(64);
+          historical.status = 'retired'; delete historical.terminalDigest; delete historical.completionProof;
+          next[key].requests.push(historical);
+          assert.equal(unresolvedNativeReview(f.current) || unresolvedNativeLead(f.current), false);
+          if (operation === 'update') assert.throws(() => f.store().update(next), /unresolved native history/i);
+          else assert.throws(() => f.store().updateIfUnchanged(f.current, next), /unresolved native history/i);
+          assert.deepEqual(f.store().read(f.current.id), f.current);
+        } finally { f.cleanup(); }
+      });
+    }
+  }
+}
+for (const operation of ['update', 'CAS'] as const) {
+  it(`R1 bare start_fix/${operation} cannot bypass unresolved-history fence`, () => {
+    const f = repairCase('validation_failed', 'inactive-lead');
+    try {
+      const next = { ...f.next, repairAdmissions: undefined };
+      if (operation === 'update') assert.throws(() => f.store().update(next), /unresolved native history/i);
+      else assert.throws(() => f.store().updateIfUnchanged(f.current, next), /unresolved native history/i);
+      assert.deepEqual(f.store().read(f.current.id), f.current);
+    } finally { f.cleanup(); }
+  });
+}
+
+for (const uncertainty of ['proofless-oracle', 'inactive-oracle', 'inactive-lead'] as const) {
+  it(`R1 qualified unfinished recovery preserves one attempt and fences ${uncertainty}`, () => {
+    const f = repairCase('review_blocking', 'none');
+    try {
+      assert.equal(f.store().updateIfUnchanged(f.current, f.next), true);
+      const run = f.store().read(f.current.id)!;
+      const q = f.request.identity, authority = f.request.packet.authority;
+      const host: any = { ...f.hosts.lead, binding: { bindingId: q.bindingId, policyRevision: q.policyRevision, model: q.requestedModel, effort: 'High', readOnly: true, qualified: true, allowTransportReplacement: false }, source: () => f.request.packet.manifest, async submit() { throw new Error('Recovery qualification must not submit'); } };
+      const snapshot: any = { repository: { owner: 'acme', repo: 'widgets' }, issue: authority.issue, headSha: run.headSha, pullRequest: { ...run.pullRequest, baseSha: q.baseSha }, handoff: { sourceId: authority.scope.sourceId, sourceScope: authority.scope.sourceScope, sourceUpdatedAt: authority.scope.sourceUpdatedAt, freshness: 'current', sections: { scope: authority.scope.text } }, problems: [] };
+      const context = (current: Run): any => ({ run: current, consumed: f.reference, snapshot, owner: { missionId: q.missionId, laneId: q.laneId, generation: 1 }, execution: current.execution, maxAttempts: 1, store: f.store(), now: () => T0, assertCurrent() {}, onSubmission: (r: Run) => r });
+      const boundary = resolveNativeLead(host);
+      assert.deepEqual(boundary.validate(context(run)), f.reference, 'genuine current qualification recovers the exact already-admitted attempt at the budget limit');
+      const uncertain: any = structuredClone(run);
+      if (uncertainty === 'proofless-oracle') delete uncertain.nativeReview.requests[0].completionProof;
+      else {
+        const key = uncertainty === 'inactive-oracle' ? 'nativeReview' : 'nativeLead';
+        const old = structuredClone(uncertain[key].requests[0]);
+        old.identity.requestId = 'unfinished-unknown'; old.identity.correlationId = old.identity.requestId;
+        if (key === 'nativeReview') old.identity.headSha = 'e'.repeat(40); else old.identity.incarnation = 'e'.repeat(64);
+        old.status = 'retired'; delete old.terminalDigest; delete old.completionProof;
+        uncertain[key].requests.push(old);
+      }
+      writeFileSync(path.join(f.root, 'runs', `${run.id}.json`), JSON.stringify(uncertain));
+      const restarted = f.store().read(run.id)!;
+      assert.equal(boundary.validate(context(restarted)), null, 'uncertainty cannot reuse a consumed reference as current execution permission');
+      assert.equal(restarted.repairAdmissions!.length, 1);
+      assert.equal(restarted.history.filter(h => h.type === 'start_fix').length, 1);
+    } finally { f.cleanup(); }
+  });
 }
