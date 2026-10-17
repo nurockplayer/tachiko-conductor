@@ -524,13 +524,17 @@ before merge. The sandbox test must run through pinned pnpm and fails if its rea
 start; it verifies private IPC plus denial of host files, host sockets, signals,
 and IP networking. The isolated tier never treats a denied network operation as
 a reason to skip additional tests; all other validator and timeout tests remain
-isolated. The isolated test runner reuses the existing test-only account-home
-preload for its workers and Node children through a fixed `NODE_OPTIONS` import,
-replacing inherited Node options. It captures each process's initial fixture
-`HOME` while delegating UID and lookup errors to the original OS account query;
-per-case account mocks still override and restore it. Full host, integration,
-and smoke tiers retain their existing account behavior. Production account-home
-resolution and credential-free command environments remain unchanged.
+isolated. The isolated test runner selects the existing test-only account-home
+preload's explicit kernel-ID mode through one fixed `NODE_OPTIONS` import query,
+replacing inherited Node options. This mode captures each process's absolute
+private fixture `HOME` and actual kernel UID/GID, requiring matching real and
+effective IDs; missing or inconsistent identity fails closed. Name and shell
+labels are non-authoritative test data. This mode never consults passwd or
+converts lookup errors into success; it supports default/`utf8` options and
+rejects unsupported options. Per-case account mocks still override and restore
+it. Default preload imports retain original account lookup, arguments and error
+delegation. Full host, integration and smoke tiers retain their account behavior;
+production account-home resolution and credential-free environments are unchanged.
 
 Without explicit configuration, local validation is unknown and the run cannot
 advance to review. The configured runner refuses an ambient directory: it
