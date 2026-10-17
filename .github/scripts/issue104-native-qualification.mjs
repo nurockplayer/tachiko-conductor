@@ -25,6 +25,18 @@ function command(program, args, cwd) {
 }
 function gitAt(directory, args) { return command(git, ['-C', directory, ...args]); }
 function sha(data) { return createHash('sha256').update(data).digest('hex'); }
+// Public receipts bind complete private manifests without oversized log lines.
+function manifestSummary(manifest) {
+  if (!Array.isArray(manifest)) return null;
+  const rootCounts = { dist: 0, node_modules: 0, 'apps/control-tower/node_modules': 0, other: 0, malformed: 0 };
+  for (const entry of manifest) {
+    const match = typeof entry === 'string' ? /^(?:file|link|directory) (.+) [0-7]+ [a-f0-9]{64}$/i.exec(entry) : null;
+    if (match === null) { rootCounts.malformed += 1; continue; }
+    const root = ['dist', 'node_modules', 'apps/control-tower/node_modules'].find((name) => match[1] === name || match[1].startsWith(name + '/'));
+    rootCounts[root ?? 'other'] += 1;
+  }
+  return { entryCount: manifest.length, sha256: sha(JSON.stringify(manifest)), rootCounts };
+}
 function fingerprint(directory) {
   let entries = 0; let bytes = 0;
   function walk(current) {
@@ -105,7 +117,14 @@ for (const mode of ['owned-request', 'configured-preexisting-pr']) {
     evidence, cleanups, artifactBefore, artifactAfter: fingerprint(artifact) };
   reports.push(report);
   fs.writeFileSync(path.join(root, mode + '.json'), JSON.stringify(report, null, 2));
-  console.log('ADAPTER_RECEIPT ' + JSON.stringify(report));
+  const publicReport = { ...report,
+    initialIgnoredManifest: manifestSummary(before), finalEntryIgnoredManifest: manifestSummary(after),
+    cleanups: cleanups.map((entry) => ({ ...entry,
+      snapshots: entry.snapshots.map((snapshot) => ({ ...snapshot, manifest: manifestSummary(snapshot.manifest) })) })),
+  };
+  const publicLine = 'ADAPTER_RECEIPT ' + JSON.stringify(publicReport) + '\n';
+  assert.ok(Buffer.byteLength(publicLine, 'utf8') <= 16 * 1024, 'bounded complete public receipt');
+  await new Promise((resolve, reject) => process.stdout.write(publicLine, (error) => error ? reject(error) : resolve()));
   assert.equal(evidence.status, 'passed', mode);
   assert.equal(evidence.commands.length, 4);
   assert.ok(evidence.commands.every((entry, index) => entry.commandIndex === index && entry.outcome === 'passed' && entry.exitCode === 0));
