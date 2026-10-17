@@ -366,7 +366,7 @@ async function execute(
   outputPolicy?: LocalValidationConfiguration['outputPolicy'],
   beforeSpawn?: () => void,
   captureRequested = command.captureOutput === true,
-): Promise<LocalValidationCommandEvidence & { readonly pendingCapture?: ToolOutputCaptureSummary }> {
+): Promise<LocalValidationCommandEvidence & { readonly pendingCapture?: ToolOutputCaptureSummary; readonly settlementIncomplete?: true }> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
   const policy = outputPolicy ?? DEFAULT_TOOL_OUTPUT_POLICY;
@@ -386,7 +386,7 @@ async function execute(
     let captureForcedIncomplete = false;
     let directExitBeforeDeadline = false;
     let directExitCode: number | null = null;
-    const finish = (outcome: LocalValidationCommandEvidence['outcome'], exitCode: number | null): void => {
+    const finish = (outcome: LocalValidationCommandEvidence['outcome'], exitCode: number | null, settlementIncomplete = false): void => {
       if (settled) return;
       settled = true;
       if (timer !== undefined) clearTimeout(timer);
@@ -401,6 +401,7 @@ async function execute(
       const pendingCapture: ToolOutputCaptureSummary | undefined = captureResult?.capture;
       const captureStatus: LocalValidationCommandEvidence['captureStatus'] = captureResult?.status;
       const evidence = { commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt,
+        ...(settlementIncomplete ? { settlementIncomplete: true as const } : {}),
         ...(captureStatus === undefined ? {} : { captureStatus }),
         ...(captureResult === undefined || captureStatus === 'complete' ? {} : { capturePreview: {
           stdout: captureResult.stdout, stderr: captureResult.stderr, diagnostics: captureResult.diagnostics,
@@ -424,8 +425,8 @@ async function execute(
       try { writer?.abort?.(); } catch { /* settlement truth is independent of capture cleanup */ }
       if (process.platform === 'win32') {
         const settledTree = await terminateWindowsProcessTree(child.pid);
-        finish(!settledTree ? 'unavailable' : directExitBeforeDeadline
-          ? (directExitCode === 0 ? 'passed' : 'failed') : 'timed_out', directExitBeforeDeadline ? directExitCode : null);
+        finish(directExitBeforeDeadline ? (directExitCode === 0 ? 'passed' : 'failed')
+          : !settledTree ? 'unavailable' : 'timed_out', directExitBeforeDeadline ? directExitCode : null, !settledTree);
         return;
       }
       terminateProcessGroup(child.pid, 'SIGKILL');
@@ -433,8 +434,8 @@ async function execute(
       // detached validation command, prove the owned group has no surviving
       // descendants before recording a timeout; otherwise fail closed.
       const groupSettled = await waitForProcessGroupSettlement(child.pid);
-      finish(!groupSettled ? 'unavailable' : directExitBeforeDeadline
-        ? (directExitCode === 0 ? 'passed' : 'failed') : 'timed_out', directExitBeforeDeadline ? directExitCode : null);
+      finish(directExitBeforeDeadline ? (directExitCode === 0 ? 'passed' : 'failed')
+        : !groupSettled ? 'unavailable' : 'timed_out', directExitBeforeDeadline ? directExitCode : null, !groupSettled);
     };
     let child: ReturnType<typeof spawn>;
     // Capture setup has completed; invoke the synchronous host fence directly
@@ -735,8 +736,15 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile,
           outputOperation, captureStore(), this.configuration.outputPolicy, request.beforeSpawn, command.captureOutput === true);
         if (result.pendingCapture !== undefined) pending.set(index, result.pendingCapture);
-        const { pendingCapture: _pendingCapture, ...commandEvidence } = result;
+        const { pendingCapture: _pendingCapture, settlementIncomplete, ...commandEvidence } = result;
         evidence.push(commandEvidence);
+        // Direct-child truth is evidence, not permission to continue while
+        // process-family settlement remains unproven. Keep this signal private.
+        if (settlementIncomplete === true) {
+          evidence.push({ commandIndex: evidence.length, executable: 'process-family-settlement',
+            outcome: 'unavailable', exitCode: null, durationMs: 0 });
+          return finishValidation('unknown');
+        }
         if (result.outcome === 'failed' || result.outcome === 'timed_out') {
           return finishValidation('failed');
         }

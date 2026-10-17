@@ -7,12 +7,14 @@ import * as childProcess from 'node:child_process';
 import { syncBuiltinESMExports } from 'node:module';
 import { createRequire } from 'node:module';
 import { createHash } from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { afterEach, describe, it } from 'node:test';
 
 import { ConfiguredLocalValidationAdapter, hasPinnedPnpmAuthority } from '../src/validation/local-command.js';
 import type { LocalValidationConfiguration } from '../src/adapters/validation.js';
 import { FileToolOutputStore, InMemoryToolOutputStore, readToolOutput } from '../src/evidence/tool-output.js';
-import { TARGET } from './helpers.js';
+import { isValidationResultCoherent } from '../src/domain/validation.js';
+import { TARGET, validationPassed } from './helpers.js';
 
 const dirs: string[] = [];
 
@@ -346,6 +348,149 @@ describe('ConfiguredLocalValidationAdapter', () => {
     const reusable = missing.beginOperation({ kind: 'after-empty-validation-operation' });
     reusable.abort();
   });
+
+  for (const settlementBranch of ['Windows tree', 'POSIX group'] as const) {
+    it(`retains observed direct exits and holds the plan when ${settlementBranch} settlement is unproven`, async () => {
+      for (const code of [0, 7]) {
+        const owned = request();
+        const evidenceRoot = mkdtempSync(path.join(os.tmpdir(), 'tachiko-validation-unproven-settlement-'));
+        dirs.push(evidenceRoot);
+        const store = new FileToolOutputStore(evidenceRoot, { capacity: 1 });
+        const laterMarker = path.join(evidenceRoot, 'later-command');
+        const marker = `OBSERVED-DIRECT-EXIT-${code}`;
+        const script = `const { spawn } = require('node:child_process'); spawn(process.execPath, ['-e', 'setTimeout(() => {}, 2500)'], { stdio: 'inherit' }); process.stdout.write(${JSON.stringify(marker)}); setImmediate(() => process.exit(${code}));`;
+        const childApi = createRequire(import.meta.url)('node:child_process') as { spawn: typeof childProcess.spawn };
+        const originalSpawn = childApi.spawn;
+        const originalSetTimeout = globalThis.setTimeout;
+        const originalClearTimeout = globalThis.clearTimeout;
+        const originalKill = process.kill;
+        const originalPlatform = process.platform;
+        let commandChild: ReturnType<typeof childProcess.spawn> | undefined;
+        let closed: Promise<void> | undefined;
+        let selectedDeadline: (() => void) | undefined;
+        let selectedTimer: ReturnType<typeof setTimeout> | undefined;
+        let watchdog: ReturnType<typeof setTimeout> | undefined;
+        let observedMarker = '';
+        let observedExit: number | null | undefined;
+        let deliveryQueued = false;
+        let ready = false;
+        let watchdogFired = false;
+        let refusalObserved = false;
+        let commandSpawns = 0;
+        const deliverWhenReady = (): void => {
+          if (ready || deliveryQueued || observedExit === undefined || !observedMarker.includes(marker) || selectedDeadline === undefined) return;
+          deliveryQueued = true;
+          setImmediate(() => {
+            ready = true;
+            if (selectedTimer !== undefined) originalClearTimeout(selectedTimer);
+            selectedDeadline?.();
+          });
+        };
+        // Branch controls model refusal only. The direct child, exit event,
+        // marker, inherited pipes and evidence store remain real on this host.
+        childApi.spawn = ((...args: Parameters<typeof childProcess.spawn>) => {
+          if (args[0] === 'taskkill') {
+            refusalObserved = true;
+            const refused = new EventEmitter();
+            setImmediate(() => refused.emit('close', 1));
+            return refused as unknown as ReturnType<typeof childProcess.spawn>;
+          }
+          commandSpawns += 1;
+          const child = originalSpawn(...args);
+          commandChild = child;
+          closed = new Promise<void>((resolve) => child.once('close', () => resolve()));
+          child.stdout?.on('data', (chunk: Buffer) => {
+            observedMarker += chunk.toString('utf8').slice(0, Math.max(0, marker.length - observedMarker.length));
+            deliverWhenReady();
+          });
+          child.once('exit', (exitCode) => { observedExit = exitCode; deliverWhenReady(); });
+          return child;
+        }) as typeof childProcess.spawn;
+        syncBuiltinESMExports();
+        Object.defineProperty(process, 'platform', { configurable: true, value: settlementBranch === 'Windows tree' ? 'win32' : 'linux' });
+        if (settlementBranch === 'POSIX group') {
+          process.kill = ((pid, signal) => {
+            if (commandChild?.pid !== undefined && pid === -commandChild.pid && signal === 0) {
+              refusalObserved = true;
+              throw Object.assign(new Error('controlled group inspection refusal'), { code: 'EPERM' });
+            }
+            return originalKill(pid, signal);
+          }) as typeof process.kill;
+        }
+        globalThis.setTimeout = ((callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+          if (delay === 250) {
+            selectedDeadline = () => callback(...args);
+            selectedTimer = originalSetTimeout(() => undefined, 60_000);
+            watchdog = originalSetTimeout(() => { watchdogFired = true; selectedDeadline?.(); }, 5_000);
+            return selectedTimer;
+          }
+          return originalSetTimeout(callback, delay, ...args);
+        }) as typeof globalThis.setTimeout;
+        let result;
+        try {
+          result = await new ConfiguredLocalValidationAdapter({
+            revision: 'settlement-refusal-v1', outputStore: store,
+            commands: [
+              { argv: [process.execPath, '-e', script], timeoutMs: 250, captureOutput: true },
+              { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(laterMarker)}, 'ran')`], timeoutMs: 1_000 },
+            ],
+          }).validate(owned);
+        } finally {
+          globalThis.setTimeout = originalSetTimeout;
+          globalThis.clearTimeout = originalClearTimeout;
+          process.kill = originalKill;
+          Object.defineProperty(process, 'platform', { configurable: true, value: originalPlatform });
+          childApi.spawn = originalSpawn;
+          syncBuiltinESMExports();
+          if (watchdog !== undefined) originalClearTimeout(watchdog);
+          if (selectedTimer !== undefined) originalClearTimeout(selectedTimer);
+          if (!ready && commandChild?.pid !== undefined) {
+            if (settlementBranch === 'POSIX group') {
+              try { originalKill(-commandChild.pid, 'SIGKILL'); } catch { /* owned fixture already exited */ }
+            } else commandChild.kill('SIGKILL');
+          }
+          // A refused Windows tree cleanup leaves a finite fixture holding
+          // pipes. Await its actual EOF before releasing test-owned storage.
+          if (closed !== undefined) {
+            let closeDeadline: ReturnType<typeof setTimeout> | undefined;
+            try {
+              await Promise.race([closed, new Promise<never>((_resolve, reject) => {
+                closeDeadline = originalSetTimeout(() => {
+                  if (commandChild?.pid !== undefined && settlementBranch === 'POSIX group') {
+                    try { originalKill(-commandChild.pid, 'SIGKILL'); } catch { /* owned fixture already exited */ }
+                  } else commandChild?.kill('SIGKILL');
+                  reject(new Error('owned fixture pipes did not close within the cleanup deadline'));
+                }, 5_000);
+              })]);
+            } finally { if (closeDeadline !== undefined) originalClearTimeout(closeDeadline); }
+          }
+        }
+        assert.equal(watchdogFired, false, 'the fail-only watchdog cannot supply readiness');
+        assert.equal(ready, true, 'actual exit and marker must precede the delivered deadline');
+        assert.equal(observedExit, code);
+        assert.equal(refusalObserved, true);
+        assert.equal(result!.status, 'unknown', 'unproven settlement must hold even after direct exit zero');
+        assert.equal(result!.commands[0]?.outcome, code === 0 ? 'passed' : 'failed');
+        assert.equal(result!.commands[0]?.exitCode, code);
+        assert.ok(result!.commands[0]?.captureStatus === 'partial' || result!.commands[0]?.captureStatus === 'unavailable',
+          'forced-incomplete capture cannot become a complete artifact, including an unsupported private store');
+        assert.equal(result!.commands[0]?.output, undefined);
+        assert.ok(result!.commands[0]?.capturePreview?.stdout.preview.includes(marker));
+        assert.deepEqual(result!.commands[1], { commandIndex: 1, executable: 'process-family-settlement',
+          outcome: 'unavailable', exitCode: null, durationMs: 0 }, 'the second record is a settlement sentinel, not another executed command');
+        assert.equal(result!.commands.length, 2);
+        assert.equal(commandSpawns, 1);
+        assert.equal(existsSync(laterMarker), false, 'the later plan command never runs');
+        assert.ok(result!.commands.every((command) => !Object.hasOwn(command, 'settlementIncomplete') && !Object.hasOwn(command, 'pendingCapture')));
+        assert.deepEqual(readdirSync(evidenceRoot).filter((name) => name.endsWith('.stdout') || name.endsWith('.stderr')), []);
+        const ledger = { ...validationPassed(owned.headSha), status: 'unknown', local: result! };
+        assert.equal(isValidationResultCoherent(ledger), true, 'the existing schema accepts the HOLD ledger');
+        assert.equal(isValidationResultCoherent({ ...ledger, status: 'passed' }), false, 'the same evidence cannot establish passed validation');
+        const reusable = store.beginOperation({ kind: 'after-unproven-settlement' });
+        reusable.abort();
+      }
+    });
+  }
 
   it('cleans the public runner capture after its injected store clock fails', async () => {
     const owned = request();
