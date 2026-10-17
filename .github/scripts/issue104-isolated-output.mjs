@@ -11,6 +11,7 @@ if (!pnpm || !path.isAbsolute(pnpm) || realpathSync(pnpm) !== pnpm) {
 }
 const originalSpawn = childProcess.spawn;
 const cap = 64 * 1024;
+const focusCodeSha256 = 'c8559fbab334e29863495df90779beefdc5c1355f155846c1f07202289d82e07';
 const chunkBytes = 4 * 1024;
 let sequence = 0;
 function capture(stream) {
@@ -24,8 +25,10 @@ function capture(stream) {
 }
 childProcess.spawn = function (file, args, options) {
   const selected = file === '/usr/bin/sandbox-exec' && Array.isArray(args)
-    && args.length === 4 && args[0] === '-p' && typeof args[1] === 'string'
-    && args[2] === pnpm && args[3] === 'test:isolated'
+    && args.length === 8 && args[0] === '-p' && typeof args[1] === 'string'
+    && args[2] === pnpm && args[3] === 'exec' && args[4] === 'node'
+    && args[5] === '--input-type=module' && args[6] === '-e' && typeof args[7] === 'string'
+    && createHash('sha256').update(args[7]).digest('hex') === focusCodeSha256
     && options?.stdio === 'ignore' && options.shell === false
     && options.detached === true && options.env?.NODE_OPTIONS === undefined;
   if (!selected) return originalSpawn.apply(this, arguments);
@@ -35,16 +38,16 @@ childProcess.spawn = function (file, args, options) {
   child.once('close', (code, signal) => {
     for (const [name, state] of Object.entries(streams)) {
       const totalChunks = Math.ceil(state.tail.length / chunkBytes);
-      process.stdout.write('ISOLATED_DIAGNOSTIC ' + JSON.stringify({
+      process.stdout.write('FIXTURE_FOCUS_DIAGNOSTIC ' + JSON.stringify({
         diagnosticOnly: true, sequence: current, stream: name, code, signal,
         totalBytes: state.totalBytes, retainedBytes: state.tail.length,
         truncated: state.totalBytes > cap, streamError: state.streamError,
         tailSha256: createHash('sha256').update(state.tail).digest('hex'),
-        totalChunks: code === 0 ? 0 : totalChunks,
+        totalChunks,
       }) + '\n');
-      if (code !== 0) {
+      if (state.tail.length > 0) {
         for (let index = 0; index < totalChunks; index += 1) {
-          process.stdout.write('ISOLATED_DIAGNOSTIC_CHUNK ' + JSON.stringify({
+          process.stdout.write('FIXTURE_FOCUS_DIAGNOSTIC_CHUNK ' + JSON.stringify({
             diagnosticOnly: true, sequence: current, stream: name, index, totalChunks,
             base64: state.tail.subarray(index * chunkBytes, (index + 1) * chunkBytes).toString('base64'),
           }) + '\n');

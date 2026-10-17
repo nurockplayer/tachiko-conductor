@@ -65,7 +65,9 @@ const binding = JSON.parse(fs.readFileSync(path.join(artifact, 'candidate.json')
 assert.deepEqual(binding, { head: expectedHead, tree: expectedTree, lockSha256: lockSha });
 const artifactBefore = fingerprint(artifact);
 const reports = [];
-for (const mode of ['owned-request', 'configured-preexisting-pr']) {
+// One diagnostic-only fixture prerequisite, never the full four-command gate.
+const focusCode = "import { spawnSync } from 'node:child_process'; import { environmentForTier, tsxInvocation } from './scripts/test-tier.mjs'; const tsx = tsxInvocation(process.cwd()); const result = spawnSync(tsx.command, [...tsx.arguments, '--test', '--test-concurrency=2', 'tests/account-home.test.ts', 'tests/mission-admission.test.ts', 'tests/store.test.ts'], { cwd: process.cwd(), env: environmentForTier('isolated'), stdio: 'inherit' }); if (result.error !== undefined) throw result.error; process.exitCode = result.status ?? 1;";
+for (const mode of ['owned-request']) {
   const workspace = path.join(root, mode);
   command(git, ['clone', '--no-local', '--no-checkout', candidate, workspace]);
   gitAt(workspace, ['checkout', '--detach', expectedHead]);
@@ -101,17 +103,20 @@ for (const mode of ['owned-request', 'configured-preexisting-pr']) {
     cleanups.push(receipt);
     return receipt.cleaned;
   }
-  const commands = policy.PRODUCTION_LOCAL_VALIDATION_CONFIG.commands.map((entry) => ({ ...entry, argv: [pnpm, ...entry.argv.slice(1)] }));
+  const commands = [
+    { ...policy.PRODUCTION_LOCAL_VALIDATION_CONFIG.commands[0], argv: [pnpm, ...policy.PRODUCTION_LOCAL_VALIDATION_CONFIG.commands[0].argv.slice(1)] },
+    { argv: [pnpm, 'exec', 'node', '--input-type=module', '-e', focusCode], timeoutMs: 300_000 },
+  ];
   const configuration = { revision: policy.PRODUCTION_POLICY_REVISION, commands, nodeProgram: node, pnpmProgram: pnpm, gitProgram: git,
     dependencyArtifactPath: artifact, playwrightBrowsersPath: path.join(root, 'browsers'),
     hydratedDependencyRoots: policy.PRODUCTION_LOCAL_VALIDATION_CONFIG.hydratedDependencyRoots,
-    terminalGeneratedIgnoredRoots: policy.PRODUCTION_LOCAL_VALIDATION_CONFIG.terminalGeneratedIgnoredRoots,
+    terminalGeneratedIgnoredRoots: [],
     ...(mode === 'configured-preexisting-pr' ? { workspacePath: workspace } : {}) };
   const request = { target: { kind: 'issue', owner: 'nurockplayer', repo: 'tachiko-conductor', issueNumber: 104 }, headSha: expectedHead,
     ...(mode === 'owned-request' ? { workspacePath: workspace } : {}) };
   const evidence = await new validation.ConfiguredLocalValidationAdapter(configuration, undefined, observeCleanup).validate(request);
   const after = await validation.ignoredManifest(authority, git, { nodeProgram: node });
-  const report = { mode, head: expectedHead, tree: expectedTree, lockSha256: lockSha, environmentKeys: Object.keys(process.env).sort(),
+  const report = { diagnosticOnly: true, mode, head: expectedHead, tree: expectedTree, lockSha256: lockSha, environmentKeys: Object.keys(process.env).sort(),
     configuredPrograms: { node, pnpm, git }, commands, admittedDependencyRoots: configuration.hydratedDependencyRoots,
     terminalGeneratedIgnoredRoots: configuration.terminalGeneratedIgnoredRoots, initialIgnoredManifest: before, finalEntryIgnoredManifest: after,
     evidence, cleanups, artifactBefore, artifactAfter: fingerprint(artifact) };
@@ -122,11 +127,11 @@ for (const mode of ['owned-request', 'configured-preexisting-pr']) {
     cleanups: cleanups.map((entry) => ({ ...entry,
       snapshots: entry.snapshots.map((snapshot) => ({ ...snapshot, manifest: manifestSummary(snapshot.manifest) })) })),
   };
-  const publicLine = 'ADAPTER_RECEIPT ' + JSON.stringify(publicReport) + '\n';
+  const publicLine = 'FIXTURE_FOCUS_RECEIPT ' + JSON.stringify(publicReport) + '\n';
   assert.ok(Buffer.byteLength(publicLine, 'utf8') <= 16 * 1024, 'bounded complete public receipt');
   await new Promise((resolve, reject) => process.stdout.write(publicLine, (error) => error ? reject(error) : resolve()));
   assert.equal(evidence.status, 'passed', mode);
-  assert.equal(evidence.commands.length, 4);
+  assert.equal(evidence.commands.length, 2);
   assert.ok(evidence.commands.every((entry, index) => entry.commandIndex === index && entry.outcome === 'passed' && entry.exitCode === 0));
   assert.deepEqual(after, []);
   assert.equal(gitAt(workspace, ['rev-parse', 'HEAD']), expectedHead);
@@ -142,8 +147,8 @@ for (const mode of ['owned-request', 'configured-preexisting-pr']) {
   const manifest = snapshots[0].manifest;
   assert.ok(Array.isArray(manifest) && manifest.length > 0);
   const roots = new Set(manifest.map((entry) => entry.replace(/^(file|link|directory) /, '').replace(/ [0-7]+ [a-f0-9]{64}$/i, '')));
-  assert.ok([...roots].some((entry) => entry === 'dist' || entry.startsWith('dist/')), 'final generated dist captured before production cleanup');
+  assert.ok(![...roots].some((entry) => entry === 'dist' || entry.startsWith('dist/')), 'focus never runs build');
   assert.ok([...roots].every((entry) => ['dist', 'node_modules', 'apps/control-tower/node_modules'].some((admitted) => entry === admitted || entry.startsWith(admitted + '/'))));
   assert.deepEqual(report.artifactAfter, artifactBefore, 'trusted private artifact unchanged');
 }
-console.log('QUALIFICATION_COMPLETE ' + JSON.stringify({ head: expectedHead, tree: expectedTree, adapterModes: reports.map((entry) => entry.mode), artifact: artifactBefore, compiledValidatorSha256: sha(fs.readFileSync(path.join(candidate, 'dist/validation/local-command.js'))) }));
+console.log('FIXTURE_FOCUS_COMPLETE ' + JSON.stringify({ diagnosticOnly: true, head: expectedHead, tree: expectedTree, adapterModes: reports.map((entry) => entry.mode), artifact: artifactBefore, compiledValidatorSha256: sha(fs.readFileSync(path.join(candidate, 'dist/validation/local-command.js'))) }));
