@@ -1345,6 +1345,29 @@ export async function runWorkflow(
           if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation failure was being recorded; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
         }
+        // A fresh settlement refusal is durable safety evidence. Retain it
+        // before any later authority read or external await can lose it.
+        if (localValidationHasUnsettledProcessFamily(validationResult.local)) {
+          const reason = 'Local validation process-family settlement remains unproven; further execution is held.';
+          const held = applyTransition(validationExpected, {
+            type: 'escalate', reason, validationResult,
+            pullRequest: { number: snapshot.pullRequest.number, headSha: validationHeadSha! },
+            interrupt: { evidence: reason, choices: [CANCEL_RUN_DECISION] },
+          }, now());
+          let retained: boolean;
+          try {
+            const compareAndSwap = store.updateIfUnchanged;
+            if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable while retaining settlement refusal.');
+            retained = compareAndSwap.call(store, validationExpected, held);
+          } catch (cause) {
+            throw new ExecutionAdmissionRefusal('The fresh settlement refusal could not be retained; execution is held.', false,
+              { cause, authorityUnknown: true });
+          }
+          if (!retained) {
+            throw new ExecutionAdmissionRefusal('The Run changed before its fresh settlement refusal could be retained; execution is held.', true);
+          }
+          return { outcome: 'needs_human', run: held, reason };
+        }
         const currentValidation = activeValidationConfiguration(deps);
         const currentInvalidAuthority = invalidValidationAuthority(currentValidation);
         if (currentInvalidAuthority !== null || !sameValidationAuthority(activeValidation, currentValidation)) {

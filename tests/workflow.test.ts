@@ -602,6 +602,148 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(result.run.validationResult?.local.status, 'unknown');
   });
 
+  it('retains fresh settlement refusal before later GitHub or policy observation and keeps resume fenced', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-fresh-settlement-retention-'));
+    try {
+      for (const mode of ['github-unavailable', 'policy-drift'] as const) {
+        const store = new JsonFileStore({ dir });
+        let run = createRun(TARGET, T0, `fresh-settlement-${mode}`);
+        run = applyTransition(run, { type: 'start' }, T0);
+        run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+        store.create(run);
+        const code = mode === 'github-unavailable' ? 0 : 7;
+        const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+          { commandIndex: 0, executable: 'node', outcome: code === 0 ? 'passed' : 'failed', exitCode: code, durationMs: 1 },
+          { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+        ] };
+        let validationEntries = 0, githubReads = 0, latePolicyReads = 0;
+        const validation: ValidationAdapter = {
+          kind: 'validation',
+          get configRevision() {
+            if (validationEntries > 0 && mode === 'policy-drift') { latePolicyReads += 1; return 'changed-policy-v2'; }
+            return 'test-config-v1';
+          },
+          async validate() { validationEntries += 1; return local; },
+        };
+        const github = githubAdapter([]);
+        github.readLiveSnapshot = async () => {
+          githubReads += 1;
+          if (githubReads > 1) throw new Error('post-validation GitHub unavailable');
+          return snapshot(HEAD);
+        };
+        const implementation = new FakeImplementation([]);
+        const reviewer = new FakeReviewer([]);
+        const deps = { store, github, implementation, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY };
+        const first = await runWorkflow(deps, run.id, { maxReviewAttempts: 3, now: () => T0 });
+        assert.equal(first.outcome, 'needs_human');
+        const persisted = new JsonFileStore({ dir }).read(run.id)!;
+        assert.equal(persisted.state, 'NEEDS_HUMAN');
+        assert.equal(persisted.validationResult?.status, 'unknown');
+        assert.deepEqual(persisted.validationResult?.local, local);
+        assert.equal(githubReads, 1, 'the refusal is retained before the later external await');
+        assert.equal(latePolicyReads, 0, 'the refusal is retained before later active-policy reads');
+        const oldRetry = 'Retry after restoring GitHub access';
+        assert.equal(persisted.interrupt?.choices?.includes(oldRetry), false);
+        // The generic transition accepts the legacy retry reason. Its retained
+        // marker must still fence execution after a same-HEAD resolution.
+        const resolved = applyTransition(persisted, { type: 'human_resolved', reason: oldRetry }, T0);
+        assert.deepEqual(resolved.validationResult, persisted.validationResult);
+        store.update(resolved);
+        const resumed = await runWorkflow({ ...deps, store: new JsonFileStore({ dir }) }, run.id,
+          { maxReviewAttempts: 3, now: () => T0 });
+        assert.equal(resumed.outcome, 'needs_human');
+        assert.deepEqual(resumed.run.validationResult, persisted.validationResult);
+        assert.equal(validationEntries, 1, 'attempted retry must not enter local validation a second time');
+        assert.equal(githubReads, 1);
+        assert.equal(latePolicyReads, 0);
+        assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+        assert.equal(resumed.run.history.some((entry) => entry.type === 'start_fix' || entry.type === 'revalidate'), false);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses failed settlement-retention CAS without returning a marker-free retry or overwriting a newer Run', async () => {
+    for (const mode of ['newer-winner', 'missing-cas', 'throwing-cas'] as const) {
+      const backing = new MemoryStore();
+      let run = createRun(TARGET, T0, `settlement-retention-${mode}`);
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      backing.create(run);
+      const storageError = new Error('settlement retention storage failure');
+      let validationEntries = 0, githubReads = 0;
+      let expectedAfter: Run | undefined;
+      const store: RunStore = {
+        name: 'retention-cas', read: (id) => backing.read(id), create: (value) => backing.create(value),
+        update: (value) => backing.update(value), list: () => backing.list(), delete: (id) => backing.delete(id),
+        updateIfUnchanged(expected, next) {
+          if (validationEntries > 0 && mode === 'throwing-cas') throw storageError;
+          return backing.updateIfUnchanged(expected, next);
+        },
+      };
+      const validation: ValidationAdapter = {
+        kind: 'validation', configRevision: 'test-config-v1',
+        async validate() {
+          validationEntries += 1;
+          const before = backing.read(run.id)!;
+          expectedAfter = mode === 'newer-winner'
+            ? applyTransition(before, { type: 'escalate', reason: 'newer owner decision' }, T0)
+            : before;
+          if (mode === 'newer-winner') backing.update(expectedAfter);
+          if (mode === 'missing-cas') store.updateIfUnchanged = undefined;
+          return { status: 'unknown', configRevision: 'test-config-v1', commands: [
+            { commandIndex: 0, executable: 'node', outcome: 'passed', exitCode: 0, durationMs: 1 },
+            { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+          ] };
+        },
+      };
+      const github = githubAdapter([]);
+      github.readLiveSnapshot = async () => { githubReads += 1; return snapshot(HEAD); };
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      await assert.rejects(runWorkflow({ store, github, implementation, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY },
+        run.id, { maxReviewAttempts: 3, now: () => T0 }), (error) => {
+        assert.equal(isExecutionAdmissionRefusal(error), true);
+        if (!isExecutionAdmissionRefusal(error)) return false;
+        assert.equal(error.runSuperseded, mode === 'newer-winner');
+        assert.equal(error.authorityUnknown, mode !== 'newer-winner');
+        if (mode === 'throwing-cas') assert.equal(error.cause, storageError);
+        return true;
+      });
+      assert.deepEqual(backing.read(run.id), expectedAfter, 'the retention failure never overwrites current durable authority');
+      assert.equal(validationEntries, 1);
+      assert.equal(githubReads, 1);
+      assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+    }
+  });
+
+  it('preserves the existing GitHub-restoration retry when local validation has no settlement marker', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'ordinary-github-validation-retry');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const validation = new FakeValidation();
+    let githubReads = 0;
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => {
+      githubReads += 1;
+      if (githubReads % 2 === 0) throw new Error('ordinary post-validation GitHub unavailable');
+      return snapshot(HEAD);
+    };
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+    const deps = { store, github, implementation, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY };
+    const first = await runWorkflow(deps, run.id, { maxReviewAttempts: 3, now: () => T0 });
+    assert.equal(first.outcome, 'needs_human');
+    assert.equal(validation.requests.length, 1);
+    const retry = 'Retry after restoring GitHub access';
+    assert.equal(first.run.interrupt?.choices?.includes(retry), true);
+    store.update(applyTransition(first.run, { type: 'human_resolved', reason: retry }, T0));
+    await runWorkflow(deps, run.id, { maxReviewAttempts: 3, now: () => T0 });
+    assert.equal(validation.requests.length, 2, 'ordinary no-marker retry semantics remain unchanged');
+    assert.equal(implementation.requests.length + reviewer.requests.length, 0);
+  });
+
   it('parks fresh settlement uncertainty despite hosted failure and preserves ordinary unknown failure precedence', async () => {
     for (const scenario of [{ code: 0, settlement: true }, { code: 7, settlement: true }, { code: 7, settlement: false }]) {
       const store = new MemoryStore();
