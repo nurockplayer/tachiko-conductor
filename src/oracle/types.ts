@@ -97,6 +97,9 @@ export type OracleReceipt = {
 export interface OracleReceiptStore {
   record(receipt: OracleReceipt): void;
   list(): readonly OracleReceipt[];
+  /** Immutable evidence only. The Run CAS remains the lifecycle authority. */
+  recordNative?(evidence: NativeOracleEvidence): void;
+  readNative?(id: string): NativeOracleEvidence | null;
 }
 
 export interface OracleReviewTransport {
@@ -119,4 +122,99 @@ export function receiptFromReview(
     blockingFindingCount: result.findings.filter((finding) => finding.severity === 'blocking').length,
     nonBlockingFindingCount: result.findings.filter((finding) => finding.severity === 'non_blocking').length,
   };
+}
+
+/** Complete readable blobs and diff, obtained from host-owned immutable Git objects. */
+export interface NativeSourceManifest {
+  readonly baseSha: string;
+  readonly headSha: string;
+  readonly files: readonly {
+    readonly path: string;
+    readonly base: { readonly oid: string; readonly text: string; readonly sha256: string } | null;
+    readonly head: { readonly oid: string; readonly text: string; readonly sha256: string } | null;
+  }[];
+  readonly diff: string;
+  readonly sourceSha256: string;
+  readonly diffSha256: string;
+}
+
+export interface NativeReviewIdentity {
+  readonly requestId: string;
+  readonly correlationId: string;
+  readonly runId: string;
+  readonly claimId: string;
+  readonly missionId: string;
+  readonly laneId: string;
+  readonly ownerGeneration: number;
+  readonly phase: 'review';
+  readonly targetKey: string;
+  readonly repository: string;
+  readonly pullRequestNumber: number;
+  readonly baseSha: string;
+  readonly headSha: string;
+  readonly contractRevision: string;
+  readonly role: 'independent-reviewer';
+  readonly scope: string;
+  readonly policyRevision: string;
+  readonly bindingId: string;
+  readonly requestedModel: string;
+  readonly requestedEffort: OracleEffort;
+  readonly floor: ReviewRiskTier;
+  readonly sourceSha256: string;
+  readonly diffSha256: string;
+}
+
+export interface NativeReviewRequestState {
+  readonly identity: NativeReviewIdentity;
+  readonly status: 'pending' | 'qualified_complete' | 'incomplete' | 'terminal_unknown' | 'retired' | 'replaced';
+  readonly submissionPossible: boolean;
+  readonly observations: number;
+  readonly nextObservationAt: string;
+  /** Only a URL actually returned by the qualified boundary is retained. */
+  readonly conversationUrl?: string;
+  readonly failure?: 'transport_failure' | 'safety_refusal' | 'missing_evidence';
+  readonly replacedBy?: string;
+  readonly terminalDigest?: string;
+  readonly terminalStatus?: 'incomplete' | 'terminal_unknown';
+  readonly retirementReason?: 'irrecoverable_transport';
+}
+
+export interface NativeReviewAcceptance {
+  readonly requestId: string;
+  readonly receiptId: string;
+  readonly digest: string;
+  readonly identity: NativeReviewIdentity;
+}
+
+export type NativeOracleEvidence =
+  | { readonly id: string; readonly kind: 'request'; readonly identity: NativeReviewIdentity; readonly manifest: NativeSourceManifest }
+  | { readonly id: string; readonly kind: 'terminal'; readonly identity: NativeReviewIdentity; readonly result: ReviewResult;
+      readonly authentication: { readonly actorId: string; readonly model: string; readonly effort: OracleEffort; readonly transportReceipt: string } };
+
+export type NativeReviewObservation =
+  | { readonly outcome: 'pending'; readonly conversationUrl?: string }
+  | { readonly outcome: 'terminal_unknown'; readonly conversationUrl?: string }
+  | { readonly outcome: 'incomplete'; readonly reason: 'transport_failure' | 'safety_refusal' | 'missing_evidence'; readonly conversationUrl?: string }
+  | { readonly outcome: 'complete'; readonly evidence: Extract<NativeOracleEvidence, { kind: 'terminal' }>; readonly conversationUrl?: string };
+
+/** Host-injected accepted-release boundary. No production binding is supplied by default.
+ * authenticate verifies service evidence independently of model-authored output. */
+export interface NativeReviewerHost {
+  readonly binding: {
+    readonly bindingId: string;
+    readonly contractRevision: string;
+    readonly policyRevision: string;
+    readonly scope: string;
+    readonly model: string;
+    readonly supportedEfforts: readonly OracleEffort[];
+    readonly authorActorIds: readonly string[];
+    readonly allowTransportReplacement: boolean;
+  };
+  readonly receipts: OracleReceiptStore;
+  readonly source: (baseSha: string, headSha: string) => NativeSourceManifest;
+  readonly submit: (request: Extract<NativeOracleEvidence, { kind: 'request' }>) => Promise<NativeReviewObservation>;
+  readonly observe?: (identity: NativeReviewIdentity, conversationUrl?: string) => Promise<NativeReviewObservation>;
+  /** Explicit trusted disposition, never inferred from timeout, empty discovery, or safety refusal. */
+  readonly replacementDisposition?: (request: NativeReviewRequestState) => 'irrecoverable_transport' | 'unavailable';
+  readonly authenticate: (evidence: Extract<NativeOracleEvidence, { kind: 'terminal' }>) => boolean;
 }

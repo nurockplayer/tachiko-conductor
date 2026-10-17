@@ -1,4 +1,25 @@
 import type { ReviewResult, Target } from '../domain/types.js';
+import type { Run } from '../domain/types.js';
+import type { GitHubLiveSnapshot } from './github.js';
+import type { RunStore } from '../store/json-file-store.js';
+
+export interface NativeReviewContext {
+  readonly run: Run;
+  readonly snapshot: GitHubLiveSnapshot;
+  readonly owner?: { readonly missionId: string; readonly laneId: string; readonly generation: number };
+  readonly assertCurrent: () => void;
+  readonly assertLiveClaim?: () => Promise<void>;
+}
+
+export interface NativeReviewBoundary {
+  available(): boolean;
+  advance(context: NativeReviewContext & { readonly store: RunStore; readonly now: () => string; readonly onSubmission: (run: Run) => Run }): Promise<
+    | { readonly outcome: 'wait'; readonly run: Run; readonly reason: string }
+    | { readonly outcome: 'complete'; readonly run: Run; readonly result: ReviewResult }
+    | { readonly outcome: 'superseded'; readonly run: Run; readonly reason: string }>;
+  /** Reads and authenticates immutable evidence again, using current host authority. */
+  validate(context: NativeReviewContext): boolean;
+}
 
 export interface ReviewRequest {
   /** The work item: a single issue or a whole branch. */
@@ -16,5 +37,6 @@ export interface ReviewRequest {
  */
 export interface ReviewerAdapter {
   readonly kind: 'reviewer';
+  readonly native?: NativeReviewBoundary;
   review(request: ReviewRequest): Promise<ReviewResult>;
 }
