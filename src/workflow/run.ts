@@ -16,7 +16,7 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
 import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
-import { isValidationResultCoherent } from '../domain/validation.js';
+import { isValidationResultCoherent, localValidationHasUnsettledProcessFamily } from '../domain/validation.js';
 import type { AgentResult, ExecutorIdentity, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import {
   createCompletionInputFromResult,
@@ -460,7 +460,8 @@ function unavailableLocalValidation(): LocalValidationEvidence {
 }
 
 function combineValidation(headSha: string, local: LocalValidationEvidence, hosted: HostedValidationEvidence): ValidationResult {
-  const status = local.status === 'failed' || hosted.status === 'failed'
+  const status = localValidationHasUnsettledProcessFamily(local) ? 'unknown'
+    : local.status === 'failed' || hosted.status === 'failed'
     ? 'failed'
     : local.status === 'unknown' || hosted.status === 'unknown'
         ? 'unknown'
@@ -587,6 +588,11 @@ export async function runWorkflow(
   const target = run.target;
 
   for (;;) {
+    if (!isTerminal(run.state) && run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY' &&
+        localValidationHasUnsettledProcessFamily(run.validationResult?.local)) {
+      return park(run, 'Local validation process-family settlement remains unproven; further execution is held.',
+        store, now, [CANCEL_RUN_DECISION]);
+    }
     switch (run.state) {
       case 'READY':
         {

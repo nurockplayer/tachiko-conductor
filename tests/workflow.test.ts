@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -600,6 +600,98 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.equal(result.run.validationResult?.status, 'unknown');
     assert.equal(result.run.validationResult?.local.status, 'unknown');
+  });
+
+  it('parks fresh settlement uncertainty despite hosted failure and preserves ordinary unknown failure precedence', async () => {
+    for (const scenario of [{ code: 0, settlement: true }, { code: 7, settlement: true }, { code: 7, settlement: false }]) {
+      const store = new MemoryStore();
+      let run = createRun(TARGET, T0, `settlement-hosted-${scenario.code}-${scenario.settlement}`);
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      store.create(run);
+      const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+        { commandIndex: 0, executable: 'node', outcome: scenario.code === 0 ? 'passed' : 'failed', exitCode: scenario.code, durationMs: 1 },
+        { commandIndex: 1, executable: scenario.settlement ? 'process-family-settlement' : 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+      ] };
+      const validation = new FakeValidation([local]);
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      const github = githubAdapter([]);
+      github.readLiveSnapshot = async () => ({ ...snapshot(HEAD),
+        checks: { availability: 'available', overall: 'failing', checks: [{ id: 'ci', name: 'ci', state: 'failing', url: null, updatedAt: T0 }] } });
+      const result = await runWorkflow({ store, github, implementation, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY },
+        run.id, { maxReviewAttempts: scenario.settlement ? 2 : 1, now: () => T0 });
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.validationResult?.status, scenario.settlement ? 'unknown' : 'failed');
+      assert.equal(result.run.validationResult?.hosted.status, 'failed');
+      assert.deepEqual(result.run.validationResult?.local, local);
+      assert.equal(result.run.history.some((entry) => entry.type === 'validation_failed'), !scenario.settlement);
+      assert.equal(result.run.history.some((entry) => entry.type === 'start_fix' || entry.type === 'revalidate'), false);
+      assert.equal(validation.requests.length, 1);
+      assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+    }
+  });
+
+  it('parks disk-persisted settlement markers before every active workflow re-entry effect', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-hold-restart-'));
+    try {
+      for (const state of ['READY', 'CHANGES_REQUESTED', 'IMPLEMENTING', 'VALIDATING', 'REVIEWING', 'FINAL_GATE', 'MERGE_READY', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY'] as const) {
+        const seed = validationPassed(HEAD);
+        const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+          { commandIndex: 0, executable: 'node', outcome: 'passed', exitCode: 0, durationMs: 1 },
+          { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+        ] };
+        const run: Run = { ...createRun(TARGET, T0, `settlement-restart-${state}`), state, headSha: HEAD,
+          pullRequest: { number: 7, headSha: HEAD }, bootstrap: new FakeBootstrap().identity,
+          validationResult: { ...seed, status: 'unknown', local, hosted: { ...seed.hosted, status: 'failed', overall: 'failing' } },
+          ...(state !== 'NEEDS_HUMAN' && state !== 'WAITING_DEPENDENCY' ? {} : {
+            interruptedFrom: 'VALIDATING' as const, interrupt: { kind: state === 'NEEDS_HUMAN' ? 'needs_human' as const : 'waiting_dependency' as const,
+              reason: 'Local validation process-family settlement remains unproven.', createdAt: T0 },
+          }) };
+        new JsonFileStore({ dir }).create(run);
+        const store = new JsonFileStore({ dir });
+        assert.deepEqual(store.read(run.id)?.validationResult, run.validationResult);
+        let effects = 0;
+        const unexpected = (): never => { effects += 1; throw new Error('settlement hold admitted an effect'); };
+        const github = githubAdapter([]);
+        github.readLiveSnapshot = async () => unexpected();
+        const implementation = new FakeImplementation([]);
+        const reviewer = new FakeReviewer([]);
+        const validation = new FakeValidation();
+        const result = await runWorkflow({ store, github, implementation, reviewer, validation,
+          bootstrapForExecution: unexpected, hostedCheckPolicy: TEST_HOSTED_POLICY }, run.id,
+        { maxReviewAttempts: 3, now: () => T0, onExecutionStart: unexpected });
+        assert.equal(result.outcome, state === 'WAITING_DEPENDENCY' ? 'waiting_dependency' : 'needs_human');
+        assert.equal(result.run.state, state === 'WAITING_DEPENDENCY' ? 'WAITING_DEPENDENCY' : 'NEEDS_HUMAN');
+        assert.match(result.outcome === 'needs_human' || result.outcome === 'waiting_dependency' ? result.reason : '', /process-family settlement remains unproven/);
+        assert.deepEqual(result.run.validationResult, run.validationResult);
+        assert.equal(result.run.history.some((entry) => entry.type === 'start_fix' || entry.type === 'revalidate'), false);
+        assert.equal(effects + validation.requests.length + implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+        assert.equal(new JsonFileStore({ dir }).read(run.id)?.state, result.run.state);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('rejects legacy failed settlement ledgers at the disk reader without executing recovery', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-legacy-ledger-'));
+    try {
+      const seed = validationPassed(HEAD);
+      const run: Run = { ...createRun(TARGET, T0, 'settlement-legacy-failed'), state: 'CHANGES_REQUESTED', headSha: HEAD,
+        pullRequest: { number: 7, headSha: HEAD }, validationResult: { ...seed, status: 'failed',
+          local: { status: 'unknown', configRevision: 'test-config-v1', commands: [
+            { commandIndex: 0, executable: 'node', outcome: 'failed', exitCode: 7, durationMs: 1 },
+            { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+          ] }, hosted: { ...seed.hosted, status: 'failed', overall: 'failing' } } };
+      new JsonFileStore({ dir }).create(run);
+      const before = readFileSync(path.join(dir, `${run.id}.json`));
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      const validation = new FakeValidation();
+      await assert.rejects(runWorkflow({ store: new JsonFileStore({ dir }), github: githubAdapter([]), implementation,
+        reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY }, run.id, { maxReviewAttempts: 3, now: () => T0 }), /corrupt or incompatible/);
+      assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length + validation.requests.length, 0);
+      assert.deepEqual(readFileSync(path.join(dir, `${run.id}.json`)), before, 'incompatible evidence is not automatically rewritten or revalidated');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('F06 revalidates stale persisted failed evidence before any implementation repair', async () => {

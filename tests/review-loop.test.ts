@@ -255,6 +255,39 @@ function approve(headSha: string): ReviewResult {
 }
 
 describe('runReviewLoop', () => {
+  it('parks current and legacy settlement markers before repair admission or automatic revalidation', async () => {
+    for (const state of ['CHANGES_REQUESTED', 'REVIEWING'] as const) {
+      for (const status of ['failed', 'unknown'] as const) {
+        for (const code of [0, 7]) {
+          const seed = validationPassed(HEAD);
+          const run: Run = persistedJson({ ...reviewingRun(), state, validationResult: { ...seed, status,
+            local: { status: 'unknown', configRevision: 'test-config-v1', commands: [
+              { commandIndex: 0, executable: 'node', outcome: code === 0 ? 'passed' : 'failed', exitCode: code, durationMs: 1 },
+              { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+            ] }, hosted: { ...seed.hosted, status: 'failed', overall: 'failing' } } });
+          const store = new MemoryStore();
+          store.create(run);
+          let effects = 0;
+          const unexpected = (): never => { effects += 1; throw new Error('settlement hold admitted review/repair authority'); };
+          const github = githubAdapter([]);
+          github.readLiveSnapshot = async () => unexpected();
+          const implementation = new FakeImplementation([]);
+          const reviewer = new FakeReviewer([]);
+          const result = await runReviewLoop({ store, github, implementation, reviewer,
+            resolveValidationAuthority: unexpected, bootstrapForExecution: unexpected,
+            assertCanMutate: unexpected, assertCurrentMutation: unexpected }, run.id,
+          { maxAttempts: 3, now: () => T0, onExecutionStart: unexpected });
+          assert.equal(result.outcome, 'needs_human');
+          assert.equal(result.run.state, 'NEEDS_HUMAN');
+          assert.match(result.outcome === 'needs_human' ? result.reason : '', /process-family settlement remains unproven/);
+          assert.deepEqual(result.run.validationResult, run.validationResult);
+          assert.equal(result.run.history.some((entry) => entry.type === 'start_fix' || entry.type === 'revalidate'), false);
+          assert.equal(effects + implementation.requests.length + reviewer.requests.length, 0);
+        }
+      }
+    }
+  });
+
   it('persists an approved review at FINAL_GATE for the final-gate workflow', async () => {
     const store = new MemoryStore();
     store.create(reviewingRun());

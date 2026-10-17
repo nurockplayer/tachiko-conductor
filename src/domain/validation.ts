@@ -231,6 +231,18 @@ function isHostedEvidence(value: unknown): value is HostedValidationEvidence {
   return hosted.status === expected;
 }
 
+/** An explicit missing family-settlement proof blocks every later execution. */
+export function localValidationHasUnsettledProcessFamily(value: unknown): boolean {
+  const commands = ownDataValue(value, 'commands');
+  if (!Array.isArray(commands)) return false;
+  for (let index = 0; index < commands.length; index += 1) {
+    const command = ownDataValue(commands, String(index));
+    if (ownDataValue(command, 'executable') === 'process-family-settlement' &&
+        ownDataValue(command, 'outcome') === 'unavailable') return true;
+  }
+  return false;
+}
+
 /** True only for compact evidence whose source fields and aggregate agree. */
 export function isValidationResultCoherent(value: unknown): value is ValidationResult {
   if (typeof value !== 'object' || value === null) return false;
@@ -240,7 +252,8 @@ export function isValidationResultCoherent(value: unknown): value is ValidationR
       !isLocalEvidence(result.local) || !isHostedEvidence(result.hosted)) return false;
   const local = result.local;
   const hosted = result.hosted;
-  const expected: ValidationStatus = local.status === 'failed' || hosted.status === 'failed'
+  const expected: ValidationStatus = localValidationHasUnsettledProcessFamily(local) ? 'unknown'
+    : local.status === 'failed' || hosted.status === 'failed'
     ? 'failed'
     : local.status === 'unknown' || hosted.status === 'unknown'
       ? 'unknown'
