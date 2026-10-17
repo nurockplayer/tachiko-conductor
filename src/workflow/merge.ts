@@ -1,4 +1,5 @@
-import { unresolvedNativeLead } from '../oracle/native-lead.js';
+import { unresolvedNativeReview } from '../oracle/native-reviewer.js';
+import { unresolvedNativeLead, nativeLeadStopped } from '../oracle/native-lead.js';
 import { applyTransition } from '../domain/state-machine.js';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -157,7 +158,7 @@ export async function qualifiedMergeIntegration(run: Run, github: GitHubAdapter,
 }
 /** All native- or attempt-bearing manual, automatic and retry settlement passes this guard. */
 export function assertNativeMergeSettlement(run: Run): void {
-  if(unresolvedNativeLead(run))throw new Error('Native lead remote work remains unresolved; integration proof cannot release it.');
+  if(unresolvedNativeReview(run) || unresolvedNativeLead(run) || nativeLeadStopped(run))throw new Error('Native lead remote work remains unresolved; integration proof cannot release it.');
   if (run.nativeReview === undefined && run.nativeLead === undefined && run.mergeAttempt === undefined) return;
   const a = run.mergeAttempt;
   if (!a?.qualification || !nativeMergeCoherent(run) || a.identity.reviewDigest !== run.nativeReview?.accepted?.digest || a.identity.validationDigest !== oracleDigest(run.validationResult)) throw new Error('Native-bearing settlement requires qualified actual merge integration and its exact validated/reviewed attempt.');
@@ -208,7 +209,7 @@ export async function observeNativeMerge(context: MergeContext): Promise<Run> {
 }
 /** One expected-HEAD squash. BASE uses explicitly accepted last-observed semantics, not atomic enforcement. */
 export async function initiateNativeMerge(context: MergeContext, host: NativeMergeHost, snapshot: GitHubLiveSnapshot): Promise<Run> {
-  if (unresolvedNativeLead(context.run)) return context.run;
+  if (unresolvedNativeReview(context.run) || unresolvedNativeLead(context.run) || nativeLeadStopped(context.run)) return context.run;
   if (!context.withBoundary || !context.assertInitiation || !context.owner || !context.assertClaim || !hasMergeIssuanceCapabilities(context.github)) return context.run;
   return await context.withBoundary(async () => {
     let run = context.run;

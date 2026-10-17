@@ -1,3 +1,5 @@
+import { nativeReviewCoherent } from '../oracle/native-reviewer.js';
+import { nativeLeadCoherent } from '../oracle/native-lead.js';
 import { leadConsumptionValid, acceptedNativeLead } from '../oracle/native-lead.js';
 import {
   LIVE_HEAD_SYNC_DECISION,
@@ -13,6 +15,7 @@ import { activeRepairAdmission, isRepairAdmissionSnapshot, isRepairExecutorIdent
 
 /** Why a transition was rejected. */
 export type InvalidTransitionCode =
+  | 'invalid-native-evidence'
   | 'terminal-state'
   | 'unknown-transition'
   | 'missing-payload'
@@ -730,6 +733,7 @@ export function applyTransition(
   now: string = new Date().toISOString(),
   activeValidation?: ActiveValidationConfiguration,
 ): Run {
+  if (!nativeReviewCoherent(run) || !nativeLeadCoherent(run)) throw new InvalidTransitionError('invalid-native-evidence', run.state, input.type, 'Native ledger lacks coherent immutable authenticated completion proof.');
   const from = run.state;
   const target = TRANSITION_TABLE[from][input.type];
 

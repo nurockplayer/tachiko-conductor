@@ -270,6 +270,7 @@ export interface Run {
   readonly execution?: ResolvedExecutionConfiguration;
   /** Optional for legacy JSON; when present it is the only repair shape authority. */
   readonly repairTaskShapeAuthority?: RepairTaskShapeAuthority;
+  readonly implementationAuthority?: import('./implementation-authority.js').OriginalImplementationAuthority;
   /** Append-only, exact-HEAD/PR-bound repair authorizations. */
   readonly repairAdmissions?: readonly RepairAdmissionSnapshot[];
   /** While paused in WAITING_DEPENDENCY / NEEDS_HUMAN, the state to resume to. */

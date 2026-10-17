@@ -102,6 +102,8 @@ export interface OracleReceiptStore {
   readNative?(id: string): NativeOracleEvidence | null;
   recordLead?(evidence: import('./native-lead.js').NativeLeadEvidence): void;
   readLead?(id: string): import('./native-lead.js').NativeLeadEvidence | null;
+  /** Trusted host authentication must succeed before immutable completion publication. */
+  recordAuthenticatedCompletion?(namespace: 'review' | 'lead', evidence: import('./completion-proof.js').CompletionEvidence, authenticate: (evidence: import('./completion-proof.js').CompletionEvidence) => boolean): import('./completion-proof.js').NativeCompletionProof;
 }
 
 export interface OracleReviewTransport {
@@ -177,6 +179,7 @@ export interface NativeReviewRequestState {
   readonly failure?: 'transport_failure' | 'safety_refusal' | 'missing_evidence';
   readonly replacedBy?: string;
   readonly terminalDigest?: string;
+  readonly completionProof?: import('./completion-proof.js').NativeCompletionProof;
   readonly terminalStatus?: 'incomplete' | 'terminal_unknown';
   readonly retirementReason?: 'irrecoverable_transport';
 }

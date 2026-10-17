@@ -1,3 +1,4 @@
+import { originalImplementationMatches } from '../domain/implementation-authority.js';
 import { oracleDigest } from '../oracle/source-evidence.js';
 import { nativeLeadReentry, unresolvedNativeLead, type NativeLeadBoundary } from '../oracle/native-lead.js';
 import { initiateNativeMerge, observeNativeMerge, type NativeMergeHost, type MergeContext } from './merge.js';
@@ -141,6 +142,7 @@ export interface WorkflowDependencies {
 }
 
 export interface WorkflowOptions {
+  readonly admittedRun?: Run;
   /** Bounded review attempts before the loop escalates to NEEDS_HUMAN. */
   readonly maxReviewAttempts: number;
   readonly now?: () => string;
@@ -593,6 +595,7 @@ export async function runWorkflow(
 
   const loaded = store.read(runId);
   if (loaded === null) throw new Error(`No run with id "${runId}" found.`);
+  if (options.admittedRun && JSON.stringify(loaded) !== JSON.stringify(options.admittedRun)) throw new ExecutionAdmissionRefusal('Run changed after exact operation-owned admission.', false);
   let run: Run = loaded;
   run = withRunTelemetryThresholds(run, options.telemetryThresholds ?? {});
   if (!updateIfCurrent(store, loaded, run)) {
@@ -934,6 +937,13 @@ export async function runWorkflow(
             return park(run, packet.reason, store, now, [CANCEL_RUN_DECISION]);
           }
           implementationPacket = packet.packet;
+          if (reviewer.native && !pendingRepair && run.implementationAuthority === undefined) {
+            if (run.agentResult !== undefined || run.executor !== undefined) return park(run, 'Original admitted implementation provenance is missing; cannot manufacture it during recovery.', store, now);
+            const pinned: Run = { ...run, implementationAuthority: { input: packetInput, taskShape: run.repairTaskShapeAuthority!, packetSha256: oracleDigest(packet.packet) } };
+            if (!updateIfCurrent(store, run, pinned)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before original implementation authority admission.');
+            run = pinned;
+          }
+          if (run.implementationAuthority && !originalImplementationMatches(run, snapshot)) return park(run, 'Live scope/contract changed from the original admitted implementation.', store, now);
           if (activeRepairAdmission(run)?.snapshot.leadDisposition && oracleDigest(implementationPacket)!==activeRepairAdmission(run)!.snapshot.packetSha256) return park(run,'Native repair packet changed after admitted preflight.',store,now);
         }
         const governedPublication = options.admissionFence === undefined
@@ -1183,6 +1193,10 @@ export async function runWorkflow(
           }
           run = failed;
           return { outcome: 'failed', run, reason: `Implementation failed: ${result.summary}` };
+        }
+        if (run.implementationAuthority) {
+          const liveAuthority = await github.readLiveSnapshot(target);
+          if (!originalImplementationMatches(run, liveAuthority)) return park(run, 'Original implementation authority changed before host publication.', store, now);
         }
         if (bootstrap !== undefined) {
           if (result.headSha === undefined || bootstrapAdapter === undefined) return bootstrapFailureAfterWorker(run, run, new Error('Implementation did not report an exact durable HEAD.'), store, now);

@@ -772,6 +772,12 @@ admission/start_fix CAS. The exact instructions and findings enter the isolated
 worker packet. A repaired HEAD requires fresh validation and a new independent
 Oracle result before the existing final gate.
 
+The original implementation packet authority is pinned on the Run before its
+first isolated invocation; later live scope cannot replace that original
+contract. Remote completion requires exact immutable request/evidence plus a
+private completion receipt published only after trusted host authentication.
+A digest or terminal-looking status in a Run cannot clear remote uncertainty.
+
 `Run.nativeLead` owns request/acceptance/observation history; immutable evidence
 uses `native/lead/` under the existing Oracle receipt store. Submission is marked
 before issuance, original correlation/returned URL is retained, and restart uses

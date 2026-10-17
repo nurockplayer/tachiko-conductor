@@ -1,3 +1,5 @@
+import { hasAuthenticatedCompletion } from './completion-proof.js';
+import { originalImplementationMatches } from '../domain/implementation-authority.js';
 import { activeRepairAdmission } from '../domain/repair-admission.js';
 import { randomUUID } from 'node:crypto';
 import type { NativeReviewContext } from '../adapters/reviewer.js';
@@ -66,6 +68,7 @@ export type NativeLeadDisposition = {
   readonly evidence: string;
 };
 export interface NativeLeadAuthority {
+  readonly implementationAuthoritySha256: string;
   readonly target: Run['target'];
   readonly pullRequest: NonNullable<Run['pullRequest']>;
   readonly bootstrap: NonNullable<Run['bootstrap']>;
@@ -131,6 +134,7 @@ export interface NativeLeadRequest {
   readonly replacedBy?: string;
   readonly replacementReason?: 'irrecoverable_transport';
   readonly terminalDigest?: string;
+  readonly completionProof?: import('./completion-proof.js').NativeCompletionProof;
 }
 export interface NativeLeadAcceptance {
   readonly requestId: string;
@@ -176,6 +180,7 @@ export interface LeadRepairReference extends NativeLeadAcceptance {
     kind: 'terminal';
   }>;
   readonly consumptionGeneration: number;
+  readonly implementationAuthoritySha256: string;
   readonly instructionsSha256: string;
 }
 export type NativeLeadObservation = {
@@ -258,7 +263,7 @@ export function validLeadEvidence(e: NativeLeadEvidence): boolean {
 }
 function validLeadAuthority(a: NativeLeadAuthority, i: NativeLeadIdentity): boolean {
   try {
-    if (!a || !keys(a, 'target,pullRequest,bootstrap,taskShape,originalExecution,execution,validation,reviewIdentity,scope,issue,maxAttempts') || canonicalReviewTarget(a.target)?.key !== i.targetKey || a.target.kind !== 'issue' || a.target.owner.toLowerCase() + '/' + a.target.repo.toLowerCase() !== i.repository || a.pullRequest?.number !== i.pullRequestNumber || a.pullRequest.headSha !== i.headSha || !a.bootstrap || a.bootstrap.bootstrapKind !== 'standalone-isolated' || a.bootstrap.owner.toLowerCase() + '/' + a.bootstrap.repo.toLowerCase() !== i.repository || a.bootstrap.issueNumber !== a.target.issueNumber || a.bootstrap.baseSha !== i.baseSha || !text(a.bootstrap.workspacePath, 4096) || !text(a.bootstrap.branch, 1024) || !a.taskShape || !keys(a.taskShape, 'revision,shape') || a.taskShape.shape !== 'bounded' || !text(a.taskShape.revision) || !same(a.originalExecution, a.execution) || a.execution.executor !== 'luna-isolated' || a.execution.profile !== 'routine' || !isValidationResultCoherent(a.validation) || a.validation.status !== 'passed' || a.validation.headSha !== i.headSha || a.validation.hosted.pullRequestNumber !== i.pullRequestNumber || (!a.reviewIdentity || a.reviewIdentity.requestId !== i.origin.requestId || a.reviewIdentity.headSha !== i.headSha || a.reviewIdentity.baseSha !== i.baseSha) || a.maxAttempts !== i.repairLimit)
+    if (!a || !keys(a, 'implementationAuthoritySha256,target,pullRequest,bootstrap,taskShape,originalExecution,execution,validation,reviewIdentity,scope,issue,maxAttempts') || !DIGEST.test(a.implementationAuthoritySha256) || canonicalReviewTarget(a.target)?.key !== i.targetKey || a.target.kind !== 'issue' || a.target.owner.toLowerCase() + '/' + a.target.repo.toLowerCase() !== i.repository || a.pullRequest?.number !== i.pullRequestNumber || a.pullRequest.headSha !== i.headSha || !a.bootstrap || a.bootstrap.bootstrapKind !== 'standalone-isolated' || a.bootstrap.owner.toLowerCase() + '/' + a.bootstrap.repo.toLowerCase() !== i.repository || a.bootstrap.issueNumber !== a.target.issueNumber || a.bootstrap.baseSha !== i.baseSha || !text(a.bootstrap.workspacePath, 4096) || !text(a.bootstrap.branch, 1024) || !a.taskShape || !keys(a.taskShape, 'revision,shape') || a.taskShape.shape !== 'bounded' || !text(a.taskShape.revision) || !same(a.originalExecution, a.execution) || a.execution.executor !== 'luna-isolated' || a.execution.profile !== 'routine' || !isValidationResultCoherent(a.validation) || a.validation.status !== 'passed' || a.validation.headSha !== i.headSha || a.validation.hosted.pullRequestNumber !== i.pullRequestNumber || (!a.reviewIdentity || a.reviewIdentity.requestId !== i.origin.requestId || a.reviewIdentity.headSha !== i.headSha || a.reviewIdentity.baseSha !== i.baseSha) || a.maxAttempts !== i.repairLimit)
       return false;
     assertExecutionSupportedByProvider(a.execution);
     const scope = a.scope, issue = a.issue;
@@ -282,7 +287,8 @@ const validUrl = (s: string) => {
 };
 export const activeNativeLead = (run: Run) => run.nativeLead?.requests.find(r => r.identity.requestId === run.nativeLead?.activeRequestId);
 export const acceptedNativeLead = (run: Run) => run.nativeLead?.acceptances.find(a => a.requestId === run.nativeLead?.activeRequestId);
-export const unresolvedNativeLead = (run: Run) => run.nativeLead?.requests.some(r => r.submissionPossible && r.terminalDigest === undefined) === true;
+export const unresolvedNativeLead = (run: Run) => run.nativeLead?.requests.some(r => r.submissionPossible && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'lead')) === true;
+export const nativeLeadStopped = (run: Run) => acceptedNativeLead(run)?.disposition.outcome === 'stop' || run.history.some(h => h.nativeLeadStop !== undefined);
 export function leadOwnerProved(run: Run, identity: NativeLeadIdentity, owner: NativeReviewContext['owner']): boolean {
   if (!owner || owner.missionId !== identity.missionId || owner.laneId !== identity.laneId)
     return false;
@@ -327,7 +333,7 @@ export function nativeLeadCoherent(run: Run): boolean {
       if (!keys(s, 'missionId,laneId,claimId,workspace,fromGeneration,toGeneration,predecessorSha256,status,predecessorGeneration,predecessorPhase,predecessorStatus') || ![s.missionId, s.claimId, s.workspace].every(v => text(v, 4096)) || s.laneId !== `run:${run.id}` || s.claimId !== run.dispatchClaimId || !Number.isSafeInteger(s.fromGeneration) || s.fromGeneration < 1 || !Number.isSafeInteger(s.toGeneration) || s.toGeneration <= s.fromGeneration || !['prepared', 'confirmed'].includes(s.status) || !['parked', 'released'].includes(s.predecessorStatus) || !['parked', 'park_transition', 'released'].includes(s.predecessorPhase) || !Number.isSafeInteger(s.predecessorGeneration) || s.toGeneration !== s.predecessorGeneration + 1 || (s.predecessorStatus === 'parked' ? s.fromGeneration !== s.predecessorGeneration - 1 : !(l.stoppedRecoveries ?? []).some(p => p.fromGeneration === s.fromGeneration && p.releasedGeneration === s.predecessorGeneration && p.missionId === s.missionId && p.workspace === s.workspace)) || !DIGEST.test(s.predecessorSha256))
         return false;
     for (const r of l.requests) {
-      if (!run.nativeReview?.requests.some(n => n.identity.requestId === r.identity.origin.requestId && n.terminalDigest === r.identity.origin.digest && n.identity.headSha === r.identity.headSha && n.identity.baseSha === r.identity.baseSha) || !keys(r, ['identity', 'status', 'submissionPossible', 'observations', 'nextObservationAt', ...(r.conversationUrl === undefined ? [] : ['conversationUrl']), ...(r.failure === undefined ? [] : ['failure']), ...(r.replacedBy === undefined ? [] : ['replacedBy']), ...(r.replacementReason === undefined ? [] : ['replacementReason']), ...(r.terminalDigest === undefined ? [] : ['terminalDigest'])].join(',')) || !validLeadIdentity(r.identity) || r.identity.runId !== run.id || r.identity.claimId !== run.dispatchClaimId || r.identity.repository !== `${run.target.owner}/${run.target.repo}`.toLowerCase() || !['pending', 'qualified_complete', 'incomplete', 'terminal_unknown', 'retired', 'replaced'].includes(r.status) || typeof r.submissionPossible !== 'boolean' || !Number.isSafeInteger(r.observations) || r.observations < 0 || r.observations > LEAD_OBSERVATIONS || !Number.isFinite(Date.parse(r.nextObservationAt)) || r.conversationUrl !== undefined && !validUrl(r.conversationUrl) || r.terminalDigest !== undefined && !DIGEST.test(r.terminalDigest) || r.status === 'qualified_complete' && (!r.submissionPossible || !r.terminalDigest) || r.failure !== undefined && !['transport_failure', 'safety_refusal', 'missing_evidence'].includes(r.failure))
+      if (!run.nativeReview?.requests.some(n => n.identity.requestId === r.identity.origin.requestId && n.terminalDigest === r.identity.origin.digest && n.identity.headSha === r.identity.headSha && n.identity.baseSha === r.identity.baseSha) || !keys(r, ['identity', 'status', 'submissionPossible', 'observations', 'nextObservationAt', ...(r.conversationUrl === undefined ? [] : ['conversationUrl']), ...(r.failure === undefined ? [] : ['failure']), ...(r.replacedBy === undefined ? [] : ['replacedBy']), ...(r.replacementReason === undefined ? [] : ['replacementReason']), ...(r.terminalDigest === undefined ? [] : ['terminalDigest']), ...(Object.hasOwn(r, 'completionProof') ? ['completionProof'] : [])].join(',')) || !validLeadIdentity(r.identity) || r.identity.runId !== run.id || r.identity.claimId !== run.dispatchClaimId || r.identity.repository !== `${run.target.owner}/${run.target.repo}`.toLowerCase() || !['pending', 'qualified_complete', 'incomplete', 'terminal_unknown', 'retired', 'replaced'].includes(r.status) || typeof r.submissionPossible !== 'boolean' || !Number.isSafeInteger(r.observations) || r.observations < 0 || r.observations > LEAD_OBSERVATIONS || !Number.isFinite(Date.parse(r.nextObservationAt)) || r.conversationUrl !== undefined && !validUrl(r.conversationUrl) || r.terminalDigest !== undefined && (!DIGEST.test(r.terminalDigest) || !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'lead')) || r.completionProof !== undefined && r.terminalDigest === undefined || r.status === 'qualified_complete' && (!r.submissionPossible || !r.terminalDigest) || r.failure !== undefined && !['transport_failure', 'safety_refusal', 'missing_evidence'].includes(r.failure))
         return false;
       const group = l.requests.filter(n => n.identity.incarnation === r.identity.incarnation);
       if (group.length > 2 || group.length === 2 && (group[0]!.status !== 'replaced' || group[0]!.replacementReason !== 'irrecoverable_transport' || group[0]!.replacedBy !== group[1]!.identity.requestId))
@@ -361,8 +367,8 @@ export function nativeLeadCoherent(run: Run): boolean {
     return false;
   }
 }
-function stripConsumption(r: LeadRepairReference): NativeLeadAcceptance { const { consumptionGeneration: _g, instructionsSha256: _h, originEvidence: _origin, ...a } = r; return a; }
-export function validLeadRepairReference(r: LeadRepairReference): boolean { return !!r && r.originEvidence?.kind === 'terminal' && validNativeEvidence(r.originEvidence) && r.originEvidence.result.verdict === 'request_changes' && oracleDigest(r.originEvidence) === r.identity.origin.digest && same(blockingFindingIds(r.originEvidence), r.identity.blockingFindingIds) && keys(r, 'requestId,receiptId,digest,identity,disposition,consumptionGeneration,instructionsSha256,originEvidence') && validLeadIdentity(r.identity) && DIGEST.test(r.digest) && r.receiptId === `${r.requestId}.terminal` && r.requestId === r.identity.requestId && validLeadDisposition(r.disposition) && r.disposition.outcome === 'repair' && same(r.disposition.origin, r.identity.origin) && r.disposition.authoritySha256 === r.identity.authoritySha256 && same([...r.disposition.acceptedFindingIds].sort(), [...r.identity.blockingFindingIds].sort()) && Number.isSafeInteger(r.consumptionGeneration) && r.consumptionGeneration >= r.identity.ownerGeneration && r.instructionsSha256 === oracleDigest(r.disposition); }
+function stripConsumption(r: LeadRepairReference): NativeLeadAcceptance { const { consumptionGeneration: _g, instructionsSha256: _h, originEvidence: _origin, implementationAuthoritySha256: _authority, ...a } = r; return a; }
+export function validLeadRepairReference(r: LeadRepairReference): boolean { return !!r && r.originEvidence?.kind === 'terminal' && validNativeEvidence(r.originEvidence) && r.originEvidence.result.verdict === 'request_changes' && oracleDigest(r.originEvidence) === r.identity.origin.digest && same(blockingFindingIds(r.originEvidence), r.identity.blockingFindingIds) && keys(r, 'requestId,receiptId,digest,identity,disposition,consumptionGeneration,instructionsSha256,originEvidence,implementationAuthoritySha256') && DIGEST.test(r.implementationAuthoritySha256) && validLeadIdentity(r.identity) && DIGEST.test(r.digest) && r.receiptId === `${r.requestId}.terminal` && r.requestId === r.identity.requestId && validLeadDisposition(r.disposition) && r.disposition.outcome === 'repair' && same(r.disposition.origin, r.identity.origin) && r.disposition.authoritySha256 === r.identity.authoritySha256 && same([...r.disposition.acceptedFindingIds].sort(), [...r.identity.blockingFindingIds].sort()) && Number.isSafeInteger(r.consumptionGeneration) && r.consumptionGeneration >= r.identity.ownerGeneration && r.instructionsSha256 === oracleDigest(r.disposition); }
 export function nativeLeadProgresses(before: Run, after: Run): boolean {
   const old = before.nativeLead;
   if (!old)
@@ -372,22 +378,23 @@ export function nativeLeadProgresses(before: Run, after: Run): boolean {
     return false;
   return old.acceptances.every((a, i) => same(a, n.acceptances[i])) && old.ownerSuccessions.every((a, i) => { const b = n.ownerSuccessions[i]!; return same({ ...a, status: undefined }, { ...b, status: undefined }) && (a.status === b.status || a.status === 'prepared' && b.status === 'confirmed'); }) && (old.stoppedRecoveries ?? []).every((a, i) => same(a, n.stoppedRecoveries?.[i])) && old.requests.every((r, i) => {
     const a = n.requests[i]!;
-    return same(r.identity, a.identity) && (!r.submissionPossible || a.submissionPossible) && a.observations >= r.observations && ['conversationUrl', 'terminalDigest', 'failure', 'replacedBy', 'replacementReason'].every(k => r[k as keyof NativeLeadRequest] === undefined || r[k as keyof NativeLeadRequest] === a[k as keyof NativeLeadRequest]) && (r.status === a.status || r.status === 'qualified_complete' && a.status === 'retired' || ['pending', 'terminal_unknown'].includes(r.status) || ['retired', 'replaced'].includes(r.status) && a.status === r.status || r.status === 'incomplete' && r.failure === 'transport_failure' && a.status === 'replaced');
+    return same(r.identity, a.identity) && (!r.submissionPossible || a.submissionPossible) && a.observations >= r.observations && ['conversationUrl', 'terminalDigest', 'completionProof', 'failure', 'replacedBy', 'replacementReason'].every(k => r[k as keyof NativeLeadRequest] === undefined || same(r[k as keyof NativeLeadRequest], a[k as keyof NativeLeadRequest]) || k === 'failure' && a.failure === 'safety_refusal') && (r.status === a.status || r.status === 'qualified_complete' && a.status === 'retired' || r.status === 'incomplete' && a.status === 'qualified_complete' && a.completionProof !== undefined || ['pending', 'terminal_unknown'].includes(r.status) || ['retired', 'replaced'].includes(r.status) && a.status === r.status || r.status === 'incomplete' && r.failure === 'transport_failure' && a.status === 'replaced');
   });
 }
 export function leadConsumptionValid(run: Run, reference: LeadRepairReference | undefined): boolean {
   const a = acceptedNativeLead(run);
   const r = reference;
-  return !!r && validLeadRepairReference(r) && !!a && same(a, stripConsumption(r)) && activeNativeLead(run)?.status === 'qualified_complete' && run.reviewResult?.verdict === 'request_changes' && run.nativeReview?.accepted?.digest === r.identity.origin.digest && run.headSha === r.identity.headSha && run.pullRequest?.number === r.identity.pullRequestNumber && r.identity.repairOrdinal === run.history.filter(h => h.type === 'start_fix').length + 1 && r.identity.repairOrdinal <= r.identity.repairLimit && same(r.identity.blockingFindingIds, run.reviewResult.findings.flatMap((f, i) => f.severity === 'blocking' ? [`${r.identity.origin.digest}:${i}`] : [])) && !(run.repairAdmissions ?? []).some(p => p.leadDisposition?.identity.incarnation === r.identity.incarnation) && leadOwnerProved(run, r.identity, { missionId: r.identity.missionId, laneId: r.identity.laneId, generation: r.consumptionGeneration });
+  return !!r && validLeadRepairReference(r) && run.implementationAuthority !== undefined && r.implementationAuthoritySha256 === oracleDigest(run.implementationAuthority) && !!a && same(a, stripConsumption(r)) && activeNativeLead(run)?.status === 'qualified_complete' && run.reviewResult?.verdict === 'request_changes' && run.nativeReview?.accepted?.digest === r.identity.origin.digest && run.headSha === r.identity.headSha && run.pullRequest?.number === r.identity.pullRequestNumber && r.identity.repairOrdinal === run.history.filter(h => h.type === 'start_fix').length + 1 && r.identity.repairOrdinal <= r.identity.repairLimit && same(r.identity.blockingFindingIds, run.reviewResult.findings.flatMap((f, i) => f.severity === 'blocking' ? [`${r.identity.origin.digest}:${i}`] : [])) && !(run.repairAdmissions ?? []).some(p => p.leadDisposition?.identity.incarnation === r.identity.incarnation) && leadOwnerProved(run, r.identity, { missionId: r.identity.missionId, laneId: r.identity.laneId, generation: r.consumptionGeneration });
 }
 export function leadAuthority(run: Run, snapshot: GitHubLiveSnapshot, execution: ResolvedExecutionConfiguration, maxAttempts: number): NativeLeadAuthority {
-  return { target: run.target, pullRequest: run.pullRequest!, bootstrap: run.bootstrap!, taskShape: run.repairTaskShapeAuthority!, originalExecution: run.execution!, execution, validation: run.validationResult!,
+  if (!originalImplementationMatches(run, snapshot)) throw new Error('Original admitted implementation authority is missing or changed.');
+  return { implementationAuthoritySha256: oracleDigest(run.implementationAuthority), target: run.target, pullRequest: run.pullRequest!, bootstrap: run.bootstrap!, taskShape: run.repairTaskShapeAuthority!, originalExecution: run.execution!, execution, validation: run.validationResult!,
     reviewIdentity: run.nativeReview!.accepted!.identity, scope: acceptedScopeFromHandoff(snapshot.handoff, snapshot.problems)!, issue: snapshot.issue, maxAttempts };
 }
 function usable(host: NativeLeadHost | undefined): host is NativeLeadHost {
   try {
     const b = host?.binding;
-    return !!host && keys(host, ['binding', 'receipts', 'source', 'submit', 'authenticate', ...(host.observe === undefined ? [] : ['observe']), ...(host.replacementDisposition === undefined ? [] : ['replacementDisposition'])].join(',')) && !!b && keys(b, 'bindingId,policyRevision,model,effort,readOnly,qualified,allowTransportReplacement') && [b.bindingId, b.policyRevision, b.model].every(v => text(v)) && b.effort === 'High' && b.readOnly === true && b.qualified === true && typeof b.allowTransportReplacement === 'boolean' && typeof host.source === 'function' && typeof host.submit === 'function' && typeof host.authenticate === 'function' && typeof host.receipts.recordLead === 'function' && typeof host.receipts.readLead === 'function' && typeof host.receipts.readNative === 'function' && (host.observe === undefined || typeof host.observe === 'function') && (host.replacementDisposition === undefined || typeof host.replacementDisposition === 'function');
+    return !!host && keys(host, ['binding', 'receipts', 'source', 'submit', 'authenticate', ...(host.observe === undefined ? [] : ['observe']), ...(host.replacementDisposition === undefined ? [] : ['replacementDisposition'])].join(',')) && !!b && keys(b, 'bindingId,policyRevision,model,effort,readOnly,qualified,allowTransportReplacement') && [b.bindingId, b.policyRevision, b.model].every(v => text(v)) && b.effort === 'High' && b.readOnly === true && b.qualified === true && typeof b.allowTransportReplacement === 'boolean' && typeof host.source === 'function' && typeof host.submit === 'function' && typeof host.authenticate === 'function' && typeof host.receipts.recordAuthenticatedCompletion === 'function' && typeof host.receipts.recordLead === 'function' && typeof host.receipts.readLead === 'function' && typeof host.receipts.readNative === 'function' && (host.observe === undefined || typeof host.observe === 'function') && (host.replacementDisposition === undefined || typeof host.replacementDisposition === 'function');
   }
   catch {
     return false;
@@ -454,7 +461,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       const m = host.source(a.identity.baseSha, a.identity.headSha);
       if (!validNativeSourceManifest(m) || m.sourceSha256 !== a.identity.sourceSha256 || m.diffSha256 !== a.identity.diffSha256)
         return null;
-      const reference = { ...a, originEvidence: q.packet.origin, consumptionGeneration: c.consumed?.consumptionGeneration ?? owner.generation, instructionsSha256: oracleDigest(a.disposition) };
+      const reference = { ...a, implementationAuthoritySha256: q.packet.authority.implementationAuthoritySha256, originEvidence: q.packet.origin, consumptionGeneration: c.consumed?.consumptionGeneration ?? owner.generation, instructionsSha256: oracleDigest(a.disposition) };
       if (c.consumed)
         return same(reference, c.consumed) && same(activeRepairAdmission(c.run)?.snapshot.leadDisposition, c.consumed) ? c.consumed : null;
       return leadConsumptionValid(c.run, reference) ? reference : null;
@@ -489,11 +496,11 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       if (validLeadEvidence(e)) {
         host.receipts.recordLead!(e);
         const acceptance: NativeLeadAcceptance = { requestId: request.identity.requestId, receiptId: e.id, digest: oracleDigest(e), identity: request.identity, disposition: e.disposition };
-        const active = run.nativeLead!.activeRequestId === request.identity.requestId;
+        const active = run.nativeLead!.activeRequestId === request.identity.requestId && request.failure !== 'safety_refusal';
         const existing = run.nativeLead!.acceptances.find(a => a.requestId === acceptance.requestId);
         if (existing && !same(existing, acceptance))
           return wait('Conflicting terminal rejected.');
-        const next = { ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? { ...r, terminalDigest: acceptance.digest, ...(active ? { status: 'qualified_complete' as const } : {}) } : r), acceptances: existing ? run.nativeLead!.acceptances : [...run.nativeLead!.acceptances, acceptance] } };
+        const next = { ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? { ...r, terminalDigest: acceptance.digest, completionProof: host.receipts.recordAuthenticatedCompletion!('lead', e, x => host.authenticate(x as Exclude<NativeLeadEvidence,{kind:'request'}>)), ...(active ? { status: 'qualified_complete' as const } : {}) } : r), acceptances: existing ? run.nativeLead!.acceptances : [...run.nativeLead!.acceptances, acceptance] } };
         if (!save(next))
           return wait('Lead terminal evidence retained after lost Run CAS.');
         return wait('Authenticated lead terminal retained as evidence only; no repair initiated.');
@@ -504,7 +511,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       if (!host.authenticate(frozen(completion)))
         return wait('External completion proof cannot be authenticated independently after restart.');
       host.receipts.recordLead!(completion);
-      if (!save({ ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? { ...r, terminalDigest: oracleDigest(completion), ...(r.status === 'retired' || r.status === 'replaced' ? {} : { status: 'incomplete' as const, failure: 'missing_evidence' as const }) } : r) } }))
+      if (!save({ ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? { ...r, terminalDigest: oracleDigest(completion), completionProof: host.receipts.recordAuthenticatedCompletion!('lead', completion, x => host.authenticate(x as Exclude<NativeLeadEvidence,{kind:'request'}>)), ...(r.status === 'retired' || r.status === 'replaced' ? {} : { status: 'incomplete' as const, failure: 'missing_evidence' as const }) } : r) } }))
         return wait('Completion proof retained after lost Run CAS.');
       return wait('Authenticated external completion retained; rejected semantic disposition cannot authorize repair.');
     };
@@ -513,7 +520,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       return complete(persisted);
     const rejected = host.receipts.readLead!(`${request.identity.requestId}.completion`);
     if (rejected?.kind === 'completion' && same(rejected.identity, request.identity) && host.authenticate(frozen(rejected))) {
-      save({ ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? { ...r, terminalDigest: oracleDigest(rejected), ...(r.status === 'retired' || r.status === 'replaced' ? {} : { status: 'incomplete' as const, failure: 'missing_evidence' as const }) } : r) } });
+      save({ ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? { ...r, terminalDigest: oracleDigest(rejected), completionProof: host.receipts.recordAuthenticatedCompletion!('lead', rejected, x => host.authenticate(x as Exclude<NativeLeadEvidence,{kind:'request'}>)), ...(r.status === 'retired' || r.status === 'replaced' ? {} : { status: 'incomplete' as const, failure: 'missing_evidence' as const }) } : r) } });
       return wait('Immutable rejected-terminal completion reconciled without a service read.');
     }
     if (!host.observe || request.observations >= LEAD_OBSERVATIONS || Date.parse(request.nextObservationAt) > Date.parse(c.now()))
@@ -539,6 +546,13 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
     }
     if (response.outcome === 'complete')
       return complete(response.evidence);
+    // HOLD observations retain lifecycle evidence without gaining issuance authority.
+    const inactive = ['retired', 'replaced'].includes(request.status);
+    const status = request.status === 'incomplete' ? 'incomplete' as const : response.outcome === 'incomplete' ? 'incomplete' as const : response.outcome;
+    const failure = request.failure === 'safety_refusal' ? request.failure : response.outcome === 'incomplete' ? response.reason : request.failure;
+    const updated = { ...request, ...(inactive ? {} : { status }), ...(failure === undefined ? {} : { failure }) };
+    if (!save({ ...run, nativeLead: { ...run.nativeLead!, requests: run.nativeLead!.requests.map(r => r.identity.requestId === request.identity.requestId ? updated : r) } }))
+      return wait('Lead observation status CAS lost.');
     return wait('Original lead request observed; uncertainty/finite budget retained.');
   };
   return { available: () => usable(host), validate, observe, async advance(c) {
@@ -563,7 +577,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
         return wait('Native lead origin is not the exact qualified changes-required receipt.');
       const base = c.snapshot.pullRequest?.baseSha;
       const scope = acceptedScopeFromHandoff(c.snapshot.handoff, c.snapshot.problems);
-      if (!base || c.snapshot.headSha !== run.headSha || base !== origin.identity.baseSha || run.headSha !== origin.identity.headSha || !scope || run.repairTaskShapeAuthority?.shape !== 'bounded' || c.execution.executor !== 'luna-isolated' || c.execution.profile !== 'routine' || !same(c.execution, run.execution) || run.history.filter(h => h.type === 'start_fix').length >= c.maxAttempts)
+      if (!originalImplementationMatches(run, c.snapshot) || !base || c.snapshot.headSha !== run.headSha || base !== origin.identity.baseSha || run.headSha !== origin.identity.headSha || !scope || run.repairTaskShapeAuthority?.shape !== 'bounded' || c.execution.executor !== 'luna-isolated' || c.execution.profile !== 'routine' || !same(c.execution, run.execution) || run.history.filter(h => h.type === 'start_fix').length >= c.maxAttempts)
         return wait('Native lead cannot authorize changed authority, non-bounded work, unavailable isolated execution or exhausted repair budget.');
       let manifest: NativeSourceManifest;
       try {
@@ -601,8 +615,8 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
         const existing = run.nativeLead!.acceptances.find(a => a.requestId === acceptance.requestId);
         if (existing && !same(existing, acceptance))
           return wait('Native lead conflicting terminal rejected.');
-        const isActive = request.identity.requestId === run.nativeLead!.activeRequestId;
-        const completed = { ...request, terminalDigest: digest, ...(isActive ? { status: 'qualified_complete' as const } : {}) };
+        const isActive = request.identity.requestId === run.nativeLead!.activeRequestId && request.failure !== 'safety_refusal';
+        const completed = { ...request, terminalDigest: digest, completionProof: host.receipts.recordAuthenticatedCompletion!('lead', e, x => host.authenticate(x as Exclude<NativeLeadEvidence,{kind:'request'}>)), ...(isActive ? { status: 'qualified_complete' as const } : {}) };
         const next = update(completed);
         if (!save({ ...next, nativeLead: { ...next.nativeLead, acceptances: existing ? next.nativeLead.acceptances : [...next.nativeLead.acceptances, acceptance] } }))
           return stale();
@@ -733,7 +747,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
           if (!host.authenticate(frozen(completion)))
             return wait('External completion proof cannot be authenticated independently after restart.');
           host.receipts.recordLead!(completion);
-          if (!save(update({ ...active, status: 'incomplete', failure: 'missing_evidence', terminalDigest: oracleDigest(completion) })))
+          if (!save(update({ ...active, status: 'incomplete', failure: 'missing_evidence', terminalDigest: oracleDigest(completion), completionProof: host.receipts.recordAuthenticatedCompletion!('lead', completion, x => host.authenticate(x as Exclude<NativeLeadEvidence,{kind:'request'}>)) })))
             return stale();
           return wait('Authenticated external completion retained; invalid disposition rejected.');
         }

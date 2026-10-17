@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { ExecutionAdmissionRefusal } from './adapters/agent.js';
 import { oracleDigest } from './oracle/source-evidence.js';
-import { resolveNativeLead, unresolvedNativeLead, issuedLeadRecoveryConfiguration, emptyLeadLedger, type NativeLeadHost, type LeadOwnerSuccession } from './oracle/native-lead.js';
+import { resolveNativeLead, unresolvedNativeLead, nativeLeadStopped, issuedLeadRecoveryConfiguration, emptyLeadLedger, type NativeLeadHost, type LeadOwnerSuccession } from './oracle/native-lead.js';
 import { assertNativeMergeSettlement, issuedMergeRecoveryConfiguration, qualifiedMergeIntegration, resolveNativeMergeHost, unresolvedNativeMerge, type NativeMergeHost } from './workflow/merge.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
@@ -1204,7 +1204,7 @@ function assertIssuedMergeReadmissionReceipt(receiptPath: string, run: Run, lane
   if (receipt.settlementReason !== undefined || !(exactParked || completedParkPublication || interruptedReadmission || exactStoppedRelease)) throw new Error('Issued merge receipt phase/token/generation does not match its exact current predecessor lane.');
 }
 
-function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, receiptPath?: string, workspace?: string, store?: RunStore): AdmissionToken {
+function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, receiptPath?: string, workspace?: string, store?: RunStore): { readonly token: AdmissionToken; readonly run: Run } {
   let succession: LeadOwnerSuccession | undefined;
   const leadRecovery = run.nativeLead !== undefined && run.nativeLead.requests.length > 0;
   const persist = (next: Run) => { if (!store || store.updateIfUnchanged?.(run,next) !== true) throw new Error('Lead owner succession Run CAS lost; no owner capability may be issued.'); run=next; };
@@ -1279,14 +1279,14 @@ function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, recei
     if (!receipt || receipt.phase!=='pre_execution' || receipt.token?.token!==result.token.token || receipt.generation!==result.token.generation || receipt.missionId!==succession.missionId || receipt.workspace!==succession.workspace) throw new Error('Lead successor publication lacks exact current owner receipt.');
     persist({...run,nativeLead:{...run.nativeLead!,ownerSuccessions:run.nativeLead!.ownerSuccessions.map(s=>s.toGeneration===succession!.toGeneration?{...s,status:'confirmed' as const}:s)}});
   }
-  return result.token;
+  return { token: result.token, run };
 }
 
 function settleRunAdmission(registry: MissionAdmissionRegistry, token: AdmissionToken, run: Run, receiptPath?: string, workDisposition?: 'cancelled'): void {
   // A local terminal outcome does not prove that a submitted native request
   // completed or was cancelled. Preserve its overlap reservation on returned
   // failures as well as on thrown exceptions.
-  const unresolvedReview = unresolvedNativeWork(run) || run.nativeLead !== undefined && workDisposition === undefined || run.state === 'MERGED' && (run.nativeReview !== undefined || run.nativeLead !== undefined || run.mergeAttempt !== undefined);
+  const unresolvedReview = unresolvedNativeWork(run) || nativeLeadStopped(run) && workDisposition === undefined || run.state === 'MERGED' && (run.nativeReview !== undefined || run.nativeLead !== undefined || run.mergeAttempt !== undefined);
   if ((run.state === 'FAILED' || run.state === 'MERGED') && !unresolvedReview) {
     registry.release(token, true, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'release_transition')),
       receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1, workDisposition));
@@ -1314,9 +1314,10 @@ export function recoverRunAdmission(
 ): 'released' {
   if (recoveryOptions?.retireWork === true && !operatorStopped) throw new Error('--retire-work requires explicit --stopped attestation.');
   if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw new Error('Run admission recovery requires --generation <positive integer>.');
-  const run = store.read(runId);
-  if (run === null) throw new Error(`No run with id "${runId}" found.`);
-  if (recoveryOptions?.retireWork === true && (unresolvedNativeWork(run) || run.mergeAttempt?.submissionPossible === true)) throw new Error('Native review remote submission is unresolved; stopped local execution cannot retire its external work.');
+  const initialRun = store.read(runId);
+  if (initialRun === null) throw new Error(`No run with id "${runId}" found.`);
+  let run: Run = initialRun;
+  if (recoveryOptions?.retireWork === true && (nativeLeadStopped(run) || unresolvedNativeWork(run) || run.mergeAttempt?.submissionPossible === true)) throw new Error('Native review remote submission is unresolved; stopped local execution cannot retire its external work.');
   const laneId = `run:${run.id}`;
   const repo = `${run.target.owner}/${run.target.repo}`.toLowerCase();
   const canonicalReceiptPath = receiptPath ?? resolveRunOwnerReceiptPath(repo, run.id, evidenceForRun(run));
@@ -1343,7 +1344,10 @@ export function recoverRunAdmission(
     const proof={fromGeneration:locked.status==='parked'?locked.generation-1:locked.generation,releasedGeneration:locked.generation+1,missionId:locked.missionId,workspace:locked.evidence.workspace,receiptSha256:oracleDigest(nonsecret)};
     const existing=current.nativeLead.stoppedRecoveries?.find(s=>s.releasedGeneration===proof.releasedGeneration);
     if (existing) return;
-    if (store.updateIfUnchanged?.(current,{...current,nativeLead:{...current.nativeLead,ownerSuccessions:current.nativeLead.ownerSuccessions.map(s=>s.status==='prepared'&&s.toGeneration===proof.fromGeneration?{...s,status:'confirmed' as const}:s),stoppedRecoveries:[...(current.nativeLead.stoppedRecoveries ?? []),proof]}})!==true) throw new Error('Lead stopped-recovery provenance CAS changed.');
+    if (JSON.stringify(current) !== JSON.stringify(run)) throw new Error('Run changed before stopped-recovery provenance CAS.');
+    const next = {...current,nativeLead:{...current.nativeLead,ownerSuccessions:current.nativeLead.ownerSuccessions.map(s=>s.status==='prepared'&&s.toGeneration===proof.fromGeneration?{...s,status:'confirmed' as const}:s),stoppedRecoveries:[...(current.nativeLead.stoppedRecoveries ?? []),proof]}};
+    if (store.updateIfUnchanged?.(current,next)!==true) throw new Error('Lead stopped-recovery provenance CAS changed.');
+    run = next;
   };
   const recordRetirement = () => {
     if (recoveryOptions?.retireWork !== true) return;
@@ -1589,8 +1593,9 @@ export async function runIssueCommand(
   // callers; capacity denial and a crash can retry this immutable Run id.
   const precreatedRun = isNewRun && (options.dispatchClaimId !== undefined || options.admission !== undefined);
   if (precreatedRun) deps.store.create(run);
-  const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace, deps.store);
-  run = deps.store.read(run.id) ?? run;
+  const admitted = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace, deps.store);
+  const admissionToken = admitted?.token;
+  run = admitted?.run ?? run;
   let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeWork(run) && run.mergeAttempt?.submissionPossible !== true;
   try {
     if (admissionToken !== undefined && runOwnerReceiptPath !== undefined && unresolvedNativeWork(run)) {
@@ -1602,6 +1607,7 @@ export async function runIssueCommand(
     }
     options.releaseDispatchAdmissionLock?.();
     const outcome = await runWorkflow(deps, run.id, {
+      admittedRun: admitted?.run.nativeLead === undefined ? undefined : admitted.run,
       assertReviewClaim: options.assertReviewClaim,
       assertLeadInitiation: options.assertLeadInitiation, leadObservationOnly:options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration, withNativeEffectBoundary:options.withNativeEffectBoundary ?? withNativeEffectBoundary,
       assertMergeInitiation: options.assertMergeInitiation,
@@ -1684,8 +1690,9 @@ export async function resumeCommand(
   const targetOwner = findRunByTarget(deps.store, run.target);
   if (targetOwner !== null && targetOwner.id !== id) throw new Error(`Run "${id}" is not the unique active durable Run for its target.`);
   const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
-  const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace, deps.store);
-  run = deps.store.read(run.id) ?? run;
+  const admitted = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace, deps.store);
+  const admissionToken = admitted?.token;
+  run = admitted?.run ?? run;
   let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeWork(run) && run.mergeAttempt?.submissionPossible !== true;
   try {
   const now = options.now ?? (() => new Date().toISOString());
@@ -1776,6 +1783,7 @@ export async function resumeCommand(
   }
   options.releaseDispatchAdmissionLock?.();
   const outcome = await runWorkflow(deps, id, {
+    admittedRun: admissionToken === undefined || resumed.nativeLead === undefined ? undefined : resumed,
     assertReviewClaim: options.assertReviewClaim,
     assertLeadInitiation: options.assertLeadInitiation, leadObservationOnly:options.leadObservationOnly, leadRecoveryConfiguration:options.leadRecoveryConfiguration, withNativeEffectBoundary:options.withNativeEffectBoundary ?? withNativeEffectBoundary,
     assertMergeInitiation: options.assertMergeInitiation,
@@ -2155,7 +2163,7 @@ function casMergedRun(store: RunStore, current: Run): Run {
 
 /** Work retirement needs explicit disposition and exact owner proof; release alone is not disposition. */
 export function isDispatchRunOwnerRetiredCommand(store: RunStore, run: Run, admission: MissionAdmissionRegistry): boolean {
-  if(unresolvedNativeWork(run) || run.state!=='MERGED' && run.mergeAttempt?.submissionPossible)return false;
+  if(nativeLeadStopped(run) || unresolvedNativeWork(run) || run.state!=='MERGED' && run.mergeAttempt?.submissionPossible)return false;
   if (run.dispatchClaimId === undefined || run.execution === undefined || run.repairTaskShapeAuthority === undefined) return false;
   const lane = admission.readLane(`run:${run.id}`);
   if (lane === null || lane.status !== 'released') return false;
@@ -2242,11 +2250,13 @@ export async function runMergedTransitionCommand(
       const workspace = assertMergeLaneIdentity(initial, lane);
       const receiptPath = resolveRunOwnerReceiptPath(`${initial.target.owner}/${initial.target.repo}`.toLowerCase(), id, evidenceForRun(initial));
       readMergeReceipt(receiptPath, initial, lane.missionId, workspace);
-      const token = acquireRunAdmission(admission, initial, receiptPath, workspace, store);
-      const resumed = initial.state === 'WAITING_DEPENDENCY' ? applyTransition(initial, { type: 'dependency_satisfied' }) : initial;
-      const next: Run = { ...resumed, mergeAttempt: { ...initial.mergeAttempt!, observedMerged: initial.mergeAttempt!.observedMerged ?? { mergeCommitSha: qualification.mergeCommitSha, observedAt: qualification.observedAt }, qualification: initial.mergeAttempt!.qualification ?? qualification } };
-      if (store.updateIfUnchanged?.(initial, next) !== true) throw new Error('Run changed before qualified merge recovery CAS.');
-      settleRunAdmission(admission, token, next, receiptPath);
+      const admitted = acquireRunAdmission(admission, initial, receiptPath, workspace, store);
+      const owned = admitted.run;
+      admission.assertCurrentOwner(admitted.token);
+      const resumed = owned.state === 'WAITING_DEPENDENCY' ? applyTransition(owned, { type: 'dependency_satisfied' }) : owned;
+      const next: Run = { ...resumed, mergeAttempt: { ...owned.mergeAttempt!, observedMerged: owned.mergeAttempt!.observedMerged ?? { mergeCommitSha: qualification.mergeCommitSha, observedAt: qualification.observedAt }, qualification: owned.mergeAttempt!.qualification ?? qualification } };
+      if (store.updateIfUnchanged?.(owned, next) !== true) throw new Error('Run changed before qualified merge recovery CAS.');
+      settleRunAdmission(admission, admitted.token, next, receiptPath);
       return await runMergedTransitionCommand(store, id, github, admission, async (operation) => await operation());
     });
   }

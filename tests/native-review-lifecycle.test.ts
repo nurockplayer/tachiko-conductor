@@ -426,10 +426,15 @@ describe('native review through the real factory / durable dispatcher', () => {
           // from receipt authentication or its accepted digest.
           writeFileSync(path.join(f.directory, 'oracle', 'native', `${terminal.id}.json`), JSON.stringify({ ...terminal, result: { ...terminal.result, telemetry: { ...terminal.result.telemetry, turns: 2 } } }));
         }
-        const rejected = await cached();
-        assert.equal(rejected.outcome, 'waiting_dependency', tamper);
-        assert.equal(rejected.run.nativeReview!.wait!.kind, 'qualification');
-        assert.equal(rejected.run.nativeReview!.accepted!.digest, ready.nativeReview!.accepted!.digest);
+        if (tamper === 'semantic-review') {
+          const rejected = await cached();
+          assert.equal(rejected.outcome, 'waiting_dependency', tamper);
+          assert.equal(rejected.run.nativeReview!.wait!.kind, 'qualification');
+          assert.equal(rejected.run.nativeReview!.accepted!.digest, ready.nativeReview!.accepted!.digest);
+        } else {
+          await assert.rejects(cached, /corrupt|incompatible/, 'changed immutable completion bytes are rejected at store load');
+          assert.throws(() => f.store().read(ready.id), /corrupt|incompatible/);
+        }
         assert.equal(f.counts().submissions, 1); assert.equal(f.counts().observations, 0); assert.equal(f.counts().modelCalls, 0);
       } finally { f.cleanup(); }
     }
@@ -1043,9 +1048,16 @@ describe('native merge crash and authority fences', () => {
         if (bad === 'policy') (f.host.binding as { policyRevision: string }).policyRevision = 'changed';
         if (bad === 'negative') f.setNegativeReview();
         if (bad === 'receipt') { const accepted = f.store().read('run-native')!.nativeReview!.accepted!; writeFileSync(path.join(f.directory, 'oracle', 'native', `${accepted.receiptId}.json`), '{"invalid":true}'); }
-        await f.poll();
-        assert.equal(f.mergeCounts().squashes, 0, bad); assert.equal(f.store().read('run-native')!.mergeAttempt, undefined, bad);
-        assert.equal(f.counts().modelCalls, 0, bad); assert.equal(f.store().list().length, 1);
+        if (bad === 'receipt') {
+          await assert.rejects(f.poll, /corrupt|incompatible/);
+          assert.throws(() => f.store().read('run-native'), /corrupt|incompatible/);
+        } else {
+          await f.poll();
+          assert.equal(f.store().read('run-native')!.mergeAttempt, undefined, bad);
+          assert.equal(f.store().list().length, 1);
+        }
+        assert.equal(f.mergeCounts().squashes, 0, bad);
+        assert.equal(f.counts().modelCalls, 0, bad);
       } finally { f.cleanup(); }
     }
   });

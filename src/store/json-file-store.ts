@@ -1,3 +1,4 @@
+import { implementationAuthorityCoherent, assertImplementationAuthorityProgresses } from '../domain/implementation-authority.js';
 import { nativeLeadCoherent, nativeLeadProgresses, assertNativeLeadTransition } from '../oracle/native-lead.js';
 import { nativeMergeCoherent, nativeMergeProgresses } from '../workflow/merge.js';
 import { closeSync, existsSync, fchmodSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
@@ -326,7 +327,7 @@ function isRun(value: unknown): value is Run {
     (v.validationResult === undefined || isValidationResultCoherent(v.validationResult)) &&
     (v.telemetry === undefined || isRunTelemetry(v.telemetry)) &&
     nativeMergeCoherent(v as unknown as Run) &&
-    nativeReviewCoherent(v as unknown as Run) && nativeLeadCoherent(v as unknown as Run) &&
+    implementationAuthorityCoherent(v as unknown as Run) && nativeReviewCoherent(v as unknown as Run) && nativeLeadCoherent(v as unknown as Run) &&
     isRepairHistoryCoherent(v) &&
     (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
@@ -556,6 +557,7 @@ export class JsonFileStore implements RunStore {
   }
 
   create(run: Run): void {
+    assertImplementationAuthorityProgresses(null, run);
     if (!nativeMergeCoherent(run)) throw new Error('Invalid native merge Run attempt.');
     if (!nativeLeadCoherent(run)) throw new Error('Invalid native lead Run ledger.');
     if (!nativeReviewCoherent(run)) throw new Error('Invalid native review Run ledger.');
@@ -585,6 +587,7 @@ export class JsonFileStore implements RunStore {
       if (!nativeMergeCoherent(run) || current !== null && !nativeMergeProgresses(current, run)) throw new Error('Native merge attempt must remain coherent and monotonic.');
       if (!nativeLeadCoherent(run) || current !== null && !nativeLeadProgresses(current, run)) throw new Error('Native lead ledger must remain coherent and monotonic.');
       if (!nativeReviewCoherent(run) || current !== null && !nativeReviewProgresses(current, run)) throw new Error('Native review ledger must remain coherent and monotonic.');
+      assertImplementationAuthorityProgresses(current, run);
       if (current) assertNativeLeadTransition(current,run);
       assertRepairAdmissionsAppendOnly(current, run);
       assertHistoryAppendOnly(current, run);
@@ -603,6 +606,7 @@ export class JsonFileStore implements RunStore {
       if (!nativeMergeCoherent(next) || !nativeMergeProgresses(current, next)) throw new Error('Native merge attempt must remain coherent and monotonic.');
       if (!nativeLeadCoherent(next) || !nativeLeadProgresses(current, next)) throw new Error('Native lead ledger must remain coherent and monotonic.');
       if (!nativeReviewCoherent(next) || !nativeReviewProgresses(current, next)) throw new Error('Native review ledger must remain coherent and monotonic.');
+      assertImplementationAuthorityProgresses(current, next);
       assertNativeLeadTransition(current,next);
       assertRepairAdmissionsAppendOnly(current, next);
       assertHistoryAppendOnly(current, next);

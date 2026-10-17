@@ -1,3 +1,4 @@
+import { originalImplementationMatches } from '../domain/implementation-authority.js';
 import { resolveNativeLead, activeNativeLead, acceptedNativeLead, emptyLeadLedger, leadConsumptionValid, type NativeLeadBoundary, type NativeLeadContext, type LeadRepairReference } from '../oracle/native-lead.js';
 import { oracleDigest } from '../oracle/source-evidence.js';
 import {
@@ -347,6 +348,7 @@ function reviewAdmission(
   snapshot: GitHubLiveSnapshot,
   resolveValidationAuthority: () => ActiveValidationConfiguration,
 ): ReviewAdmission {
+  if (run.implementationAuthority && !originalImplementationMatches(run, snapshot)) return { kind: 'needs_human', reason: 'Original admitted implementation scope/contract changed.' };
   const target = run.target;
   if (target.kind !== 'issue' ||
     snapshot.repository.owner.toLowerCase() !== target.owner.toLowerCase() ||
