@@ -111,7 +111,7 @@ for (const mode of ['owned-request', 'configured-preexisting-pr']) {
     ...(mode === 'owned-request' ? { workspacePath: workspace } : {}) };
   const evidence = await new validation.ConfiguredLocalValidationAdapter(configuration, undefined, observeCleanup).validate(request);
   const after = await validation.ignoredManifest(authority, git, { nodeProgram: node });
-  const report = { diagnosticOnly: true, mode, head: expectedHead, tree: expectedTree, lockSha256: lockSha, environmentKeys: Object.keys(process.env).sort(),
+  const report = { mode, head: expectedHead, tree: expectedTree, lockSha256: lockSha, environmentKeys: Object.keys(process.env).sort(),
     configuredPrograms: { node, pnpm, git }, commands, admittedDependencyRoots: configuration.hydratedDependencyRoots,
     terminalGeneratedIgnoredRoots: configuration.terminalGeneratedIgnoredRoots, initialIgnoredManifest: before, finalEntryIgnoredManifest: after,
     evidence, cleanups, artifactBefore, artifactAfter: fingerprint(artifact) };
@@ -122,7 +122,7 @@ for (const mode of ['owned-request', 'configured-preexisting-pr']) {
     cleanups: cleanups.map((entry) => ({ ...entry,
       snapshots: entry.snapshots.map((snapshot) => ({ ...snapshot, manifest: manifestSummary(snapshot.manifest) })) })),
   };
-  const publicLine = 'ISOLATED_DIAGNOSTIC_RECEIPT ' + JSON.stringify(publicReport) + '\n';
+  const publicLine = 'ADAPTER_RECEIPT ' + JSON.stringify(publicReport) + '\n';
   assert.ok(Buffer.byteLength(publicLine, 'utf8') <= 16 * 1024, 'bounded complete public receipt');
   await new Promise((resolve, reject) => process.stdout.write(publicLine, (error) => error ? reject(error) : resolve()));
   assert.equal(evidence.status, 'passed', mode);
@@ -146,4 +146,4 @@ for (const mode of ['owned-request', 'configured-preexisting-pr']) {
   assert.ok([...roots].every((entry) => ['dist', 'node_modules', 'apps/control-tower/node_modules'].some((admitted) => entry === admitted || entry.startsWith(admitted + '/'))));
   assert.deepEqual(report.artifactAfter, artifactBefore, 'trusted private artifact unchanged');
 }
-console.log('ISOLATED_DIAGNOSTIC_COMPLETE ' + JSON.stringify({ diagnosticOnly: true, head: expectedHead, tree: expectedTree, adapterModes: reports.map((entry) => entry.mode), artifact: artifactBefore, compiledValidatorSha256: sha(fs.readFileSync(path.join(candidate, 'dist/validation/local-command.js'))) }));
+console.log('QUALIFICATION_COMPLETE ' + JSON.stringify({ head: expectedHead, tree: expectedTree, adapterModes: reports.map((entry) => entry.mode), artifact: artifactBefore, compiledValidatorSha256: sha(fs.readFileSync(path.join(candidate, 'dist/validation/local-command.js'))) }));
