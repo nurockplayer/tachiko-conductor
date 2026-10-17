@@ -1,3 +1,6 @@
+import { originalImplementationMatches } from '../domain/implementation-authority.js';
+import { resolveNativeLead, activeNativeLead, acceptedNativeLead, emptyLeadLedger, unresolvedNativeRepairHistory, leadConsumptionValid, type NativeLeadBoundary, type NativeLeadContext, type LeadRepairReference } from '../oracle/native-lead.js';
+import { oracleDigest } from '../oracle/source-evidence.js';
 import {
   GOVERNED_PUBLICATION_REENTRY_ACTION,
   hasGovernedPublicationConfinement,
@@ -10,7 +13,7 @@ import {
   type WorkspaceGuard,
 } from '../adapters/agent.js';
 import type { ImplementationBootstrapAdapter } from '../adapters/bootstrap.js';
-import { createCompletionInputFromResult, recordCompletionTelemetry, recordSpawnTelemetry } from '../domain/telemetry.js';
+import { appendRunTelemetryEvents, createCompletionInputFromResult, recordCompletionTelemetry, recordSpawnTelemetry } from '../domain/telemetry.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
@@ -33,7 +36,7 @@ import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUE
 import { createBootstrapFailureRun } from '../workflow/bootstrap-failure.js';
 import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 import { acceptedScopeFromHandoff, buildImplementationPacket, preflightImplementationPacket, type ImplementationPacket, type ImplementationPacketInput } from '../agents/implementation-packet.js';
-import { parkNativeReview, unresolvedNativeReview } from '../oracle/native-reviewer.js';
+import { parkNativeReview, unresolvedNativeReview, nativeReviewWaitKind } from '../oracle/native-reviewer.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
@@ -42,6 +45,12 @@ export interface ReviewLoopDependencies {
   readonly bootstrap?: ImplementationBootstrapAdapter;
   readonly bootstrapForExecution?: (execution: ResolvedExecutionConfiguration | undefined) => ImplementationBootstrapAdapter | undefined;
   readonly reviewer: ReviewerAdapter;
+  readonly nativeLead?: NativeLeadBoundary;
+  readonly withLeadBoundary?: <T>(operation: () => Promise<T>) => Promise<T>;
+  readonly assertLeadInitiation?: () => Promise<void>;
+  readonly leadObservationOnly?: boolean;
+  readonly withNativeEffectBoundary?: <T>(operation:()=>T)=>T;
+  readonly leadRecoveryConfiguration?: import('../dispatch/config.js').DispatchConfiguration;
   readonly reviewOwner?: { readonly missionId: string; readonly laneId: string; readonly generation: number };
   readonly assertReviewClaim?: (run: Run) => Promise<void>;
   /**
@@ -103,6 +112,7 @@ function lunaRepairPacketInput(
   execution: ResolvedExecutionConfiguration | undefined,
   validationFailure: boolean,
   pendingReview: ReviewResult | undefined,
+  leadReference?: LeadRepairReference,
 ): ImplementationPacketInput {
   const validValidation = isValidationResultCoherent(run.validationResult) &&
     run.validationResult.status === 'failed' && run.validationResult.headSha === run.headSha &&
@@ -164,6 +174,7 @@ function lunaRepairPacketInput(
       evidenceStatus: validationRepair
         ? validValidation?.status === 'failed' ? 'failed' : 'request_changes'
         : validReview?.verdict === 'request_changes' ? 'request_changes' : 'failed',
+      ...((leadReference ?? activeRepairAdmission(run)?.snapshot.leadDisposition) === undefined ? {} : {leadDisposition: leadReference ?? activeRepairAdmission(run)!.snapshot.leadDisposition}),
       blockingFindings: validationRepair
         ? []
         : (validReview?.findings ?? []).filter((finding) => finding.severity === 'blocking')
@@ -293,6 +304,13 @@ function repairBootstrapAdmissionRefusalOutcome(run: Run, error: ExecutionAdmiss
   }
 }
 
+function assertNativeRepairExecution(run:Run,deps:ReviewLoopDependencies,snapshot?:GitHubLiveSnapshot):void {
+  const receipt=activeRepairAdmission(run)?.snapshot;
+  if(receipt?.leadDisposition) {
+    if(oracleDigest(deps.resolveRepairExecutionProfile?.(receipt.executionProfile))!==oracleDigest(receipt.execution) || !isValidationFresh(run,deps.resolveValidationAuthority()) || !snapshot || !deps.reviewer.native?.validate({run,snapshot,owner:deps.reviewOwner,assertCurrent:()=>deps.assertCurrentMutation?.()}) || !deps.nativeLead?.validate({run,snapshot,owner:deps.reviewOwner,assertCurrent:()=>deps.assertCurrentMutation?.(),store:deps.store,now:()=>new Date().toISOString(),execution:receipt.execution,maxAttempts:receipt.leadDisposition.identity.repairLimit,onSubmission:r=>r,consumed:receipt.leadDisposition})) throw new ExecutionAdmissionRefusal('Native repair current execution/review/lead/validation authority changed before worker/publication.',false);
+  }
+}
+
 function assertFinalRepairPublicationAdmission(run: Run, store: RunStore, deps: ReviewLoopDependencies): void {
   assertFinalRepairAdmission(run, store, deps.assertCurrentMutation,
     deps.governedPublicationRequired === true);
@@ -330,6 +348,7 @@ function reviewAdmission(
   snapshot: GitHubLiveSnapshot,
   resolveValidationAuthority: () => ActiveValidationConfiguration,
 ): ReviewAdmission {
+  if (run.implementationAuthority && !originalImplementationMatches(run, snapshot)) return { kind: 'needs_human', reason: 'Original admitted implementation scope/contract changed.' };
   const target = run.target;
   if (target.kind !== 'issue' ||
     snapshot.repository.owner.toLowerCase() !== target.owner.toLowerCase() ||
@@ -438,6 +457,8 @@ export async function runReviewLoop(
   const loaded = store.read(runId);
   if (loaded === null) throw new Error(`No run with id "${runId}" found.`);
   let run: Run = loaded;
+  const maxAttempts=run.nativeReview?.repairLimit ?? options.maxAttempts;
+  if(run.nativeReview!==undefined && !reviewer.native){const reason='Native reviewer binding removed; native-bearing repair cannot use legacy execution.';const parked=parkNativeReview(run,'binding',reason,now());if(!updateReviewRun(store,run,parked))return staleReviewOutcome(run.id,run,store);return{outcome:'waiting_dependency',run:parked,reason};}
   if (run.state !== 'REVIEWING' && run.state !== 'CHANGES_REQUESTED') {
     throw new Error(`runReviewLoop requires the run in REVIEWING or CHANGES_REQUESTED; it is in ${run.state}.`);
   }
@@ -448,12 +469,16 @@ export async function runReviewLoop(
 
   for (;;) {
     if (run.state === 'CHANGES_REQUESTED') {
-      if (reviewer.native !== undefined && run.reviewResult?.verdict === 'request_changes') {
+      const nativeRepair = (run.nativeReview !== undefined || run.nativeLead !== undefined || reviewer.native !== undefined) && run.reviewResult?.verdict === 'request_changes';
+      let leadReference: LeadRepairReference | undefined;
+      const lead = deps.nativeLead ?? resolveNativeLead();
+      if (nativeRepair && !lead.available()) {
         const reason = 'Native review findings retained; qualified lead disposition is unavailable, so repair is parked.';
         const parked = parkNativeReview(run, 'lead', reason, now());
         if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
         return { outcome: 'waiting_dependency', run: parked, reason };
       }
+      if(run.nativeReview?.repairLimit!==undefined && run.nativeReview.repairLimit!==options.maxAttempts) return parkRepairAuthority(run,'Native shared repair budget policy changed; no new admission is authorized.',store,now);
       const validationFailure = run.validationResult?.status === 'failed';
       if (validationFailure) {
         let activeValidation: ActiveValidationConfiguration;
@@ -479,7 +504,7 @@ export async function runReviewLoop(
           );
         }
       }
-      if (durableRepairAttempts(run) >= options.maxAttempts) {
+      if ((run.nativeReview !== undefined || run.nativeLead !== undefined || reviewer.native !== undefined ? run.history.filter(h => h.type === 'start_fix').length : durableRepairAttempts(run)) >= maxAttempts) {
         const reason = `Review did not converge after ${options.maxAttempts} attempt(s); the shared post-implementation repair budget was exhausted.`;
         const escalated = applyTransition(
           run,
@@ -564,6 +589,7 @@ export async function runReviewLoop(
       // such field and intentionally follows the pre-existing generic path.
       let repairExecution = run.execution;
       let repairStartsWithFreshExecutor = false;
+      let repairPacketSha256: string | undefined;
       let repairAttempt = activeRepairAdmission(run);
       const authority = run.repairTaskShapeAuthority;
       let physicalPredecessor;
@@ -616,20 +642,74 @@ export async function runReviewLoop(
         const finding: RepairFindingKind = validationFailure && (pendingReview === undefined || pendingReview.verdict !== 'request_changes')
           ? 'validation_failed'
           : 'review_blocking';
+        if (nativeRepair) {
+          if(!isValidationFresh(run,resolveValidationAuthority())) return parkRepairAuthority(run,'Native repair current validation-policy authority drifted; original lead evidence cannot authorize execution.',store,now);
+          if(!deps.assertLeadInitiation || !deps.withLeadBoundary || !deps.withNativeEffectBoundary) return parkRepairAuthority(run,'Native repair requires current serialized claim/owner/HOLD issue and process boundaries.',store,now);
+          const leadContext = (): NativeLeadContext => ({ run, snapshot: repairSnapshot!, owner: deps.reviewOwner, execution: repairExecution!, maxAttempts, store, now,
+            assertCurrent: () => deps.assertCurrentMutation?.(), assertLiveClaim: deps.assertReviewClaim === undefined ? undefined : () => deps.assertReviewClaim!(run),
+            withIssueBoundary: deps.withLeadBoundary, assertInitiation: deps.assertLeadInitiation, observationOnly: deps.leadObservationOnly, recoveryConfiguration: deps.leadRecoveryConfiguration,
+            onSubmission: (current) => {
+              options.onExecutionStart?.();const identity=activeNativeLead(current)!.identity;
+              const invocationId=`spawn:lead:${identity.requestId}`;
+              return appendRunTelemetryEvents(current,[{id:invocationId,invocationId,kind:'spawn',at:now(),role:'lead',attemptKind:'lead',attempt:(current.telemetry?.events.filter(e=>e.kind==='spawn'&&e.role==='lead').length ?? 0)+1,headSha:identity.headSha,provider:'native-lead',model:identity.requestedModel,reasoningEffort:identity.requestedEffort,profile:null,contextMode:'bounded',contextJustification:'live-target-bounded'}]);
+            } });
+          if (!reviewer.native?.validate(leadContext())) return parkRepairAuthority(run, 'Native repair origin no longer passes current independent-review qualification.', store, now);
+          const decision = await lead.advance(leadContext());
+          run = decision.run;
+          if (decision.outcome === 'superseded') return staleReviewOutcome(run.id, run, store);
+          if (decision.outcome === 'wait' || deps.leadObservationOnly) {
+            const reason = decision.outcome === 'wait' ? decision.reason : 'HOLD retained lead terminal as evidence only.';
+            const parked = parkNativeReview(run, 'lead', reason, now());
+            const observationWait = acceptedNativeLead(run)?.disposition.outcome === 'repair' && (unresolvedNativeRepairHistory(run) || reason.includes('evidence only'));
+            const kind = !observationWait && decision.outcome === 'wait' && (decision.reason.includes('unsupported') || decision.reason.includes('observation budget exhausted') || acceptedNativeLead(run) !== undefined || run.nativeLead?.requests.some(r => r.status === 'incomplete' && r.failure !== 'transport_failure')) ? 'qualification' as const : 'request' as const;
+            const next = { ...parked, nativeLead: { ...(run.nativeLead ?? emptyLeadLedger()), wait: {kind, nextAttemptAt: new Date(Date.parse(now()) + 30_000).toISOString()} } };
+            if (!updateReviewRun(store, run, next)) return staleReviewOutcome(run.id, run, store);
+            return {outcome:'waiting_dependency',run:next,reason};
+          }
+          if (decision.outcome !== 'complete') return staleReviewOutcome(run.id,run,store);
+          if (decision.acceptance.disposition.outcome === 'stop') {
+            const reason = `Qualified bounded lead stop ${decision.acceptance.receiptId} sha256=${decision.acceptance.digest}: ${decision.acceptance.disposition.reason}: ${decision.acceptance.disposition.evidence}`;
+            const a=decision.acceptance;
+            const stopped=applyTransition(run,{type:'escalate',reason,...(run.history.some(h=>h.nativeLeadStop?.requestId===a.requestId)?{}:{nativeLeadStop:{requestId:a.requestId,receiptId:a.receiptId,digest:a.digest}}),interrupt:{evidence:reason,choices:[CANCEL_RUN_DECISION]}},now());
+            const next={...stopped,nativeLead:{...run.nativeLead!,wait:{kind:'stop' as const,nextAttemptAt:now()}}};
+            if (!updateReviewRun(store,run,next)) return staleReviewOutcome(run.id,run,store);
+            return {outcome:'needs_human',run:next,reason};
+          }
+          if (unresolvedNativeRepairHistory(run)) {
+            const reason = 'Qualified active lead disposition retained; waiting for exact original/inactive remote completion before repair.';
+            const parked = parkNativeReview(run, 'lead', reason, now());
+            const next = { ...parked, nativeLead: { ...run.nativeLead!, wait: { kind: 'request' as const, nextAttemptAt: new Date(Date.parse(now()) + 30_000).toISOString() } } };
+            if (!updateReviewRun(store, run, next)) return staleReviewOutcome(run.id, run, store);
+            return { outcome: 'waiting_dependency', run: next, reason };
+          }
+          await deps.assertReviewClaim?.(run);
+          deps.assertCurrentMutation?.();
+          await deps.assertLeadInitiation?.();
+          const currentExecution=deps.resolveRepairExecutionProfile?.('routine');
+          if(!currentExecution || oracleDigest(currentExecution)!==oracleDigest(repairExecution))return parkRepairAuthority(run,'Current qualified repair execution authority changed before lead consumption.',store,now);
+          const currentSnapshot = await github.readLiveSnapshot(target);
+          if (!updateReviewRun(store,run,run)) return staleReviewOutcome(run.id,run,store);
+          repairSnapshot = currentSnapshot;
+          if (!reviewer.native?.validate(leadContext())) return parkRepairAuthority(run, 'Native origin or live candidate authority changed before repair consumption.',store,now);
+          leadReference = lead.validate(leadContext()) ?? undefined;
+          if (!leadReference) return parkRepairAuthority(run, 'Qualified lead evidence lacks fresh exact owner/authority/execution consumption admission.',store,now);
+        }
         if (repairExecution?.executor === 'luna-isolated' && repairSnapshot !== undefined) {
-          const preflightPacket = preflightImplementationPacket(lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview));
+          const preflightPacket = preflightImplementationPacket(lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview, leadReference));
+          if (preflightPacket.kind === 'packet') repairPacketSha256=oracleDigest(preflightPacket.packet);
           if (preflightPacket.kind === 'refusal') {
             return parkRepairAuthority(run, preflightPacket.reason, store, now, [CANCEL_RUN_DECISION]);
           }
         }
         const admission = { ...createRepairAdmissionSnapshot(
-          authority, finding, run.headSha, run.pullRequest.number, repairExecution, now(),
-        ), attemptBinding };
+          authority, finding, run.headSha!, run.pullRequest!.number, repairExecution, now(),
+        ), attemptBinding, ...(run.nativeReview?.repairLimit===undefined?{}:{budgetLimit:run.nativeReview.repairLimit}), ...(leadReference === undefined ? {} : {packetSha256:repairPacketSha256}), ...(leadReference === undefined ? {} : {leadDisposition:leadReference}) };
         const startedFix = applyTransition(run, { type: 'start_fix', repairAdmission: admission }, now());
         // An authority snapshot is useful only if it was appended against the
         // exact durable Run that was preflighted. Never invoke a worker after a
         // stale CAS, because another writer may have replaced its HEAD or PR.
-        if (!updateReviewRun(store, run, startedFix)) {
+        const commit = async () => { if (nativeRepair) { const current=deps.resolveRepairExecutionProfile?.('routine'); if(!current || oracleDigest(current)!==oracleDigest(repairExecution)) throw new ExecutionAdmissionRefusal('Native repair execution authority changed at consumption CAS.',false); await deps.assertLeadInitiation?.(); await deps.assertReviewClaim?.(run); deps.assertCurrentMutation?.(); } return updateReviewRun(store,run,startedFix); };
+        if (!await (deps.withLeadBoundary ? deps.withLeadBoundary(commit) : commit())) {
           return supersededRepairAdmission(run.id, run, store);
         }
         run = startedFix;
@@ -645,7 +725,8 @@ export async function runReviewLoop(
       }
       if (authority === undefined) {
         if (repairExecution?.executor === 'luna-isolated' && repairSnapshot !== undefined) {
-          const preflightPacket = preflightImplementationPacket(lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview));
+          const preflightPacket = preflightImplementationPacket(lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview, leadReference));
+          if (preflightPacket.kind === 'packet') repairPacketSha256=oracleDigest(preflightPacket.packet);
           if (preflightPacket.kind === 'refusal') {
             return parkRepairAuthority(run, preflightPacket.reason, store, now, [CANCEL_RUN_DECISION]);
           }
@@ -738,7 +819,7 @@ export async function runReviewLoop(
       if (isolatedLuna) {
         const packetInput = repairSnapshot === undefined
           ? null
-          : lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview);
+          : lunaRepairPacketInput(run, target, repairSnapshot, repairExecution, validationFailure, pendingReview, leadReference);
         const packet = packetInput === null
           ? { kind: 'refusal' as const, reason: 'Isolated Luna repair lost its fresh bounded Issue packet.', code: 'PACKET_AUTHORITY_MISSING' as const }
           : buildImplementationPacket({
@@ -754,6 +835,7 @@ export async function runReviewLoop(
           return parkRepairAuthority(run, packet.reason, store, now, [CANCEL_RUN_DECISION]);
         }
         implementationPacket = packet.packet;
+        if (repairAttempt?.snapshot.leadDisposition && oracleDigest(implementationPacket)!==repairAttempt.snapshot.packetSha256) return parkRepairAuthority(run,'Native repair packet changed after admission preflight.',store,now);
       }
       let governedRepairAgent: ImplementationAgent | undefined;
       if (deps.governedPublicationRequired === true) {
@@ -887,7 +969,9 @@ export async function runReviewLoop(
           ...(isolatedLuna ? {} : { supplementalInstructions: blockingFindings }),
           ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath, branch: run.bootstrap.branch, workspaceGuard }),
           ...(capabilities === undefined ? {} : { capabilities }),
+          ...(repairAttempt?.snapshot.leadDisposition===undefined?{}:{withExecutionBoundary:deps.withNativeEffectBoundary}),
           beforeExecution: () => {
+            assertNativeRepairExecution(workerHandoff,deps,repairSnapshot);
             assertFinalRepairAdmission(workerHandoff, store, () => {
               if (deps.governedPublicationRequired === true && deps.assertCurrentMutation === undefined) {
                 throw new Error('Governed review repair has no current admission-generation check.');
@@ -1003,13 +1087,24 @@ export async function runReviewLoop(
         if (repairBootstrap === undefined || progressBaseSha === undefined) {
           return parkBootstrap(run, new Error('Durable review-fix verification is unavailable.'), store, now, run);
         }
+        if(repairAttempt?.snapshot.leadDisposition) {
+          const current=await checkOwnedFix();if(current!==null)return current;
+          const packet=buildImplementationPacket(lunaRepairPacketInput(run,target,repairSnapshot!,repairExecution,validationFailure,pendingReview));
+          if(packet.kind!=='packet' || oracleDigest(packet.packet)!==repairAttempt.snapshot.packetSha256)return parkRepairAuthority(run,'Native repair live packet authority changed before host publication.',store,now);
+        }
         const publicationRun = run;
         try {
           await repairBootstrap.verifyDurable({
             identity: run.bootstrap, expectedHeadSha: fixResult.headSha, progressBaseSha, workspaceGuard,
             beforeMutation: () => assertFinalRepairAdmission(publicationRun, store, deps.assertCurrentMutation,
               deps.governedPublicationRequired === true),
-            beforePublish: () => assertFinalRepairPublicationAdmission(publicationRun, store, deps),
+            beforePublish: () => {assertNativeRepairExecution(publicationRun,deps,repairSnapshot);assertFinalRepairPublicationAdmission(publicationRun, store, deps);},
+            ...(repairAttempt?.snapshot.leadDisposition===undefined?{}:{withPublicationBoundary:deps.withNativeEffectBoundary,recheckPublication:async()=>{
+              const live=await github.readLiveSnapshot(target);await deps.assertReviewClaim?.(publicationRun);
+              const packet=buildImplementationPacket(lunaRepairPacketInput(publicationRun,target,live,repairExecution,validationFailure,pendingReview));
+              if(pullRequestIdentityConflict(publicationRun,live,{allowHeadAdvance:true})!==null || live.headSha!==publicationRun.headSha || packet.kind!=='packet' || oracleDigest(packet.packet)!==repairAttempt!.snapshot.packetSha256)throw new ExecutionAdmissionRefusal('Native repair live authority changed at final publication read.',false);
+              repairSnapshot=live;assertNativeRepairExecution(publicationRun,deps,live);
+            }}),
           });
         } catch (error) {
           if (isExecutionAdmissionRefusal(error)) return repairBootstrapAdmissionRefusalOutcome(publicationRun, error, store, now);
@@ -1085,7 +1180,7 @@ export async function runReviewLoop(
       };
     }
 
-    if (durableRepairAttempts(run) >= options.maxAttempts) {
+    if (run.nativeReview === undefined && run.nativeLead === undefined && reviewer.native === undefined && durableRepairAttempts(run) >= maxAttempts) {
       const reason = `Post-implementation repair budget of ${options.maxAttempts} attempt(s) was already reached.`;
       const escalated = applyTransition(
         run,
@@ -1174,9 +1269,10 @@ export async function runReviewLoop(
     let reviewResult: ReviewResult;
     if (reviewer.native !== undefined) {
       const advanced = await reviewer.native.advance({
-        run, snapshot: liveSnapshot, store, now, owner: deps.reviewOwner,
+        run, snapshot: liveSnapshot, store, now, owner: deps.reviewOwner, recoveryConfiguration: deps.leadRecoveryConfiguration,
         ...(deps.assertReviewClaim === undefined ? {} : { assertLiveClaim: async () => await deps.assertReviewClaim!(store.read(run.id) ?? run) }),
         assertCurrent: () => deps.assertCurrentMutation?.(),
+        withIssueBoundary:deps.withLeadBoundary, assertInitiation:deps.assertLeadInitiation,
         onSubmission: (markedRun) => {
           deps.assertCurrentMutation?.();
           options.onExecutionStart?.();
@@ -1186,9 +1282,15 @@ export async function runReviewLoop(
       run = advanced.run;
       if (advanced.outcome === 'superseded') return { outcome: 'superseded', run, reason: advanced.reason };
       if (advanced.outcome === 'wait') {
-        const parked = parkNativeReview(run, run.nativeReview?.activeRequestId === undefined ? 'binding' : 'request', advanced.reason, now());
+        const parked = parkNativeReview(run, run.nativeReview?.activeRequestId === undefined ? 'binding' : advanced.reason.includes('replacement allowance') ? 'qualification' : nativeReviewWaitKind(run), advanced.reason, now());
         if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
         return { outcome: 'waiting_dependency', run: parked, reason: advanced.reason };
+      }
+      if (unresolvedNativeReview(run)) {
+        const reason='Qualified active Oracle result retained; waiting for exact inactive remote completion before verdict adoption.';
+        const parked=parkNativeReview(run,nativeReviewWaitKind(run),reason,now());
+        if(!updateReviewRun(store,run,parked))return staleReviewOutcome(run.id,run,store);
+        return {outcome:'waiting_dependency',run:parked,reason};
       }
       reviewResult = advanced.result;
     } else {

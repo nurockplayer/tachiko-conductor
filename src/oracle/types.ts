@@ -100,6 +100,11 @@ export interface OracleReceiptStore {
   /** Immutable evidence only. The Run CAS remains the lifecycle authority. */
   recordNative?(evidence: NativeOracleEvidence): void;
   readNative?(id: string): NativeOracleEvidence | null;
+  recordLead?(evidence: import('./native-lead.js').NativeLeadEvidence): void;
+  readLead?(id: string): import('./native-lead.js').NativeLeadEvidence | null;
+  /** Trusted host authentication must succeed before immutable completion publication. */
+  verifyAuthenticatedCompletion?(namespace: 'review' | 'lead', identity: NativeReviewIdentity | import('./native-lead.js').NativeLeadIdentity, terminalDigest: string | undefined, proof: import('./completion-proof.js').NativeCompletionProof, authenticate: (evidence: import('./completion-proof.js').CompletionEvidence) => boolean): boolean;
+  recordAuthenticatedCompletion?(namespace: 'review' | 'lead', evidence: import('./completion-proof.js').CompletionEvidence, authenticate: (evidence: import('./completion-proof.js').CompletionEvidence) => boolean): import('./completion-proof.js').NativeCompletionProof;
 }
 
 export interface OracleReviewTransport {
@@ -175,6 +180,7 @@ export interface NativeReviewRequestState {
   readonly failure?: 'transport_failure' | 'safety_refusal' | 'missing_evidence';
   readonly replacedBy?: string;
   readonly terminalDigest?: string;
+  readonly completionProof?: import('./completion-proof.js').NativeCompletionProof;
   readonly terminalStatus?: 'incomplete' | 'terminal_unknown';
   readonly retirementReason?: 'irrecoverable_transport';
 }

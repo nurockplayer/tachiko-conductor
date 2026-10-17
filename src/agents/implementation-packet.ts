@@ -1,3 +1,4 @@
+import { validLeadRepairReference, type LeadRepairReference } from '../oracle/native-lead.js';
 import { createHash } from 'node:crypto';
 
 import type { Target } from '../domain/types.js';
@@ -89,6 +90,7 @@ export interface ImplementationPacketInput {
     readonly evidencePullRequestNumber: number;
     readonly evidenceStatus: 'failed' | 'request_changes';
     readonly blockingFindings: readonly string[];
+    readonly leadDisposition?: LeadRepairReference;
   };
 }
 
@@ -141,7 +143,7 @@ function digest(value: string): string {
 }
 
 function repairEvidenceMaterial(repair: NonNullable<ImplementationPacketInput['repair']>): string {
-  return [repair.evidence, ...repair.blockingFindings].join('\n');
+  return [repair.evidence, ...repair.blockingFindings, ...(repair.leadDisposition === undefined ? [] : [JSON.stringify(repair.leadDisposition)])].join('\n');
 }
 
 function repairEvidenceMatches(kind: ImplementationPacketKind, repair: NonNullable<ImplementationPacketInput['repair']>): boolean {
@@ -215,6 +217,11 @@ export function buildImplementationPacket(input: ImplementationPacketInput): Imp
         (input.kind === 'review-repair' && (repair.evidenceKind !== 'review' || repair.evidenceStatus !== 'request_changes'))) {
       return refusal('PACKET_REPAIR_EVIDENCE_MISSING', 'Repair requires exact HEAD, accepted pull request, and source-bound evidence.');
     }
+    if (repair.leadDisposition !== undefined && (!validLeadRepairReference(repair.leadDisposition) || repair.leadDisposition.identity.headSha !== repair.headSha || repair.leadDisposition.identity.pullRequestNumber !== repair.pullRequestNumber || repair.leadDisposition.disposition.outcome !== 'repair' || repair.leadDisposition.disposition.acceptedFindingIds.length !== repair.blockingFindings.length)) return refusal('PACKET_REPAIR_EVIDENCE_MISSING', 'Native lead disposition does not bind the exact complete repair packet.');
+    if (repair.leadDisposition) {
+      const original=repair.leadDisposition.originEvidence.result.findings.filter(f=>f.severity==='blocking').map(f=>`[blocking] ${f.summary}${f.detail===undefined?'':` — ${f.detail}`}`);
+      if(JSON.stringify(original)!==JSON.stringify(repair.blockingFindings)) return refusal('PACKET_REPAIR_EVIDENCE_MISSING','Native repair blocking finding contents differ from the immutable original receipt.');
+    }
     const aggregateRepairBytes = utf8Bytes(repairEvidenceMaterial(repair));
     if (aggregateRepairBytes > IMPLEMENTATION_PACKET_LIMITS.repairEvidenceBytes) {
       return refusal('PACKET_REPAIR_EVIDENCE_OVERSIZE', `Repair evidence and blocking findings exceed ${IMPLEMENTATION_PACKET_LIMITS.repairEvidenceBytes} UTF-8 bytes.`);
@@ -263,6 +270,7 @@ export function buildImplementationPacket(input: ImplementationPacketInput): Imp
     lines.push(
       `Repair identity: PR #${repair.pullRequestNumber} at exact HEAD ${repair.headSha}`,
       `Repair evidence source: ${repair.evidenceRef} sha256=${provenance.repairEvidenceSha256}`,
+      ...(repair.leadDisposition === undefined ? [] : ['Qualified bounded lead disposition (read-only; original scope remains authoritative):', JSON.stringify(repair.leadDisposition)]),
       'Repair evidence:',
       repair.evidence,
       ...(repair.blockingFindings.length === 0 ? [] : ['Blocking findings:', ...repair.blockingFindings.map((item, index) => `${index + 1}. ${item}`)]),

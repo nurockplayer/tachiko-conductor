@@ -1,3 +1,5 @@
+import { nativeReviewCoherent, unresolvedNativeReview } from '../oracle/native-reviewer.js';
+import { unresolvedNativeLead, nativeLeadStopped } from '../oracle/native-lead.js';
 import { applyTransition } from '../domain/state-machine.js';
 import { randomUUID } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -116,7 +118,7 @@ export function nativeMergeCoherent(run: Run): boolean {
   } catch { return false; }
 }
 export function nativeMergeProgresses(previous: Run, next: Run): boolean {
-  if (next.state === 'MERGED' && previous.state !== 'MERGED' && (next.nativeReview !== undefined || next.mergeAttempt !== undefined)) {
+  if (next.state === 'MERGED' && previous.state !== 'MERGED' && (next.nativeReview !== undefined || next.nativeLead !== undefined || next.mergeAttempt !== undefined)) {
     try { assertNativeMergeSettlement(next); } catch { return false; }
   }
   const a = previous.mergeAttempt; const b = next.mergeAttempt;
@@ -156,7 +158,9 @@ export async function qualifiedMergeIntegration(run: Run, github: GitHubAdapter,
 }
 /** All native- or attempt-bearing manual, automatic and retry settlement passes this guard. */
 export function assertNativeMergeSettlement(run: Run): void {
-  if (run.nativeReview === undefined && run.mergeAttempt === undefined) return;
+  if(!nativeReviewCoherent(run))throw new Error('Native review history is not coherent current qualification for settlement.');
+  if(unresolvedNativeReview(run) || unresolvedNativeLead(run) || nativeLeadStopped(run))throw new Error('Native lead remote work remains unresolved; integration proof cannot release it.');
+  if (run.nativeReview === undefined && run.nativeLead === undefined && run.mergeAttempt === undefined) return;
   const a = run.mergeAttempt;
   if (!a?.qualification || !nativeMergeCoherent(run) || a.identity.reviewDigest !== run.nativeReview?.accepted?.digest || a.identity.validationDigest !== oracleDigest(run.validationResult)) throw new Error('Native-bearing settlement requires qualified actual merge integration and its exact validated/reviewed attempt.');
 }
@@ -206,6 +210,7 @@ export async function observeNativeMerge(context: MergeContext): Promise<Run> {
 }
 /** One expected-HEAD squash. BASE uses explicitly accepted last-observed semantics, not atomic enforcement. */
 export async function initiateNativeMerge(context: MergeContext, host: NativeMergeHost, snapshot: GitHubLiveSnapshot): Promise<Run> {
+  if (unresolvedNativeReview(context.run) || unresolvedNativeLead(context.run) || nativeLeadStopped(context.run)) return context.run;
   if (!context.withBoundary || !context.assertInitiation || !context.owner || !context.assertClaim || !hasMergeIssuanceCapabilities(context.github)) return context.run;
   return await context.withBoundary(async () => {
     let run = context.run;
@@ -215,7 +220,7 @@ export async function initiateNativeMerge(context: MergeContext, host: NativeMer
     await context.assertInitiation!(run); await context.assertClaim!(run); context.assertCurrent();
     if (!hasMergeIssuanceCapabilities(context.github)) return run;
     const owner = context.owner!;
-    if (run.state !== 'MERGE_READY' || !run.nativeReview?.accepted || !run.bootstrap || !run.headSha || snapshot.headSha !== run.headSha || snapshotPr?.state !== 'open' || snapshotPr.number !== run.pullRequest?.number ||
+    if (run.state !== 'MERGE_READY' || !nativeReviewCoherent(run) || !run.nativeReview?.accepted || !run.bootstrap || !run.headSha || snapshot.headSha !== run.headSha || snapshotPr?.state !== 'open' || snapshotPr.number !== run.pullRequest?.number ||
       snapshotPr.baseRef !== p.baseBranch || snapshotPr.baseRepository?.owner.toLowerCase() !== p.owner.toLowerCase() || snapshotPr.baseRepository.repo.toLowerCase() !== p.repo.toLowerCase() ||
       snapshotPr.headRepository?.owner.toLowerCase() !== p.owner.toLowerCase() || snapshotPr.headRepository.repo.toLowerCase() !== p.repo.toLowerCase() || snapshotPr.headRef !== (run.bootstrap.publicationBranch ?? run.bootstrap.branch) ||
       run.nativeReview.accepted.identity.policyRevision !== p.reviewPolicyRevision || run.validationResult?.local.configRevision !== p.localValidationRevision || run.validationResult.hosted.policyRevision !== p.hostedValidationRevision) return run;

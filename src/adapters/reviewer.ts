@@ -9,11 +9,21 @@ export interface NativeReviewContext {
   readonly owner?: { readonly missionId: string; readonly laneId: string; readonly generation: number };
   readonly assertCurrent: () => void;
   readonly assertLiveClaim?: () => Promise<void>;
+  /** Explicit attention recovery may reconcile existing receipts only. */
+  readonly cachedOnly?: boolean;
+  readonly withIssueBoundary?: <T>(operation: () => Promise<T>) => Promise<T>;
+  readonly assertInitiation?: () => Promise<void>;
 }
 
 export interface NativeReviewBoundary {
   available(): boolean;
-  advance(context: NativeReviewContext & { readonly store: RunStore; readonly now: () => string; readonly onSubmission: (run: Run) => Run }): Promise<
+  /** Configured-host scheduling only; performs no receipt/service observation. */
+  canObserve?(run: Run, now: string): boolean;
+  /** Scheduling for one qualified replacement decision, never a permit or read. */
+  canRecover?(run: Run, now: string): boolean;
+  /** Bounded evidence-only recovery; cannot issue, accept a verdict, or run a worker. */
+  observe?(context: NativeReviewContext & { readonly store: RunStore; readonly now: () => string }): Promise<{ readonly run: Run; readonly reason: string }>;
+  advance(context: NativeReviewContext & { readonly store: RunStore; readonly now: () => string; readonly onSubmission: (run: Run) => Run; readonly recoveryConfiguration?: import('../dispatch/config.js').DispatchConfiguration }): Promise<
     | { readonly outcome: 'wait'; readonly run: Run; readonly reason: string }
     | { readonly outcome: 'complete'; readonly run: Run; readonly result: ReviewResult }
     | { readonly outcome: 'superseded'; readonly run: Run; readonly reason: string }>;

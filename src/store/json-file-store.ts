@@ -1,3 +1,7 @@
+import { JsonFileOracleReceiptStore } from '../oracle/receipt-store.js';
+import { authenticateNativeRun, type NativeCompletionHosts } from '../oracle/completion-proof.js';
+import { implementationAuthorityCoherent, assertImplementationAuthorityProgresses } from '../domain/implementation-authority.js';
+import { nativeLeadCoherent, nativeLeadProgresses, assertNativeLeadTransition } from '../oracle/native-lead.js';
 import { nativeMergeCoherent, nativeMergeProgresses } from '../workflow/merge.js';
 import { closeSync, existsSync, fchmodSync, fsyncSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -22,6 +26,7 @@ import { nativeReviewCoherent, nativeReviewProgresses } from '../oracle/native-r
  */
 export interface RunStore {
   readonly name: string;
+  configureNativeCompletionHosts?(hosts: NativeCompletionHosts): void;
   create(run: Run): void;
   read(id: string): Run | null;
   update(run: Run): void;
@@ -37,6 +42,8 @@ export interface RunStore {
 }
 
 export interface JsonFileStoreOptions {
+  /** Trusted factory dependencies; never inferred from persisted Run fields. */
+  readonly nativeCompletionHosts?: NativeCompletionHosts | readonly NativeCompletionHosts[];
   /** Directory that will hold one `<id>.json` file per run. */
   readonly dir: string;
   /** Bound for waiting on another same-host Run writer. */
@@ -325,7 +332,7 @@ function isRun(value: unknown): value is Run {
     (v.validationResult === undefined || isValidationResultCoherent(v.validationResult)) &&
     (v.telemetry === undefined || isRunTelemetry(v.telemetry)) &&
     nativeMergeCoherent(v as unknown as Run) &&
-    nativeReviewCoherent(v as unknown as Run) &&
+    implementationAuthorityCoherent(v as unknown as Run) && nativeReviewCoherent(v as unknown as Run, true) && nativeLeadCoherent(v as unknown as Run, true) &&
     isRepairHistoryCoherent(v) &&
     (v.validationResult === undefined || v.headSha === undefined || (v.validationResult as { headSha: unknown }).headSha === v.headSha) &&
     isValidInterruptContext(v.state, v.interruptedFrom)
@@ -377,7 +384,7 @@ function writeOperationalProjectionBestEffort(runsDir: string, run: Run, committ
   }
 }
 
-function readRun(filePath: string, id: string): Run {
+function readRun(filePath: string, id: string, hosts: readonly NativeCompletionHosts[]): Run {
   let raw: string;
   try {
     raw = readFileSync(filePath, 'utf8');
@@ -401,6 +408,9 @@ function readRun(filePath: string, id: string): Run {
     );
   }
   const run = parsed as Run;
+  try { authenticateNativeRun(run, hosts); } catch (error) {
+    throw new Error(`Run file ${filePath} is corrupt or incompatible: ${(error as Error).message}`);
+  }
   // All historical bootstrap records predate explicit boundary kinds and were
   // linked worktrees. Normalize once at the durable read boundary; never infer
   // from a caller-controlled path.
@@ -481,6 +491,21 @@ function sleepSync(milliseconds: number): void {
 
 export class JsonFileStore implements RunStore {
   readonly name = 'json-file';
+  private readonly nativeCompletionHosts: NativeCompletionHosts[] = [];
+  private readonly completionHostIdentities: { role: 'review' | 'lead'; receipts: object; authenticate: Function }[] = [];
+  /** Register trusted historical verification independently from current role
+   * availability. Opt-out/model-free factory construction cannot erase it. */
+  configureNativeCompletionHosts(hosts: NativeCompletionHosts): void {
+    for (const role of ['review', 'lead'] as const) {
+      const host = hosts[role];
+      if (!(host?.receipts instanceof JsonFileOracleReceiptStore) || typeof host.authenticate !== 'function') continue;
+      const { receipts, authenticate } = host;
+      if (this.completionHostIdentities.some(prior => prior.role === role && prior.receipts === receipts && prior.authenticate === authenticate)) continue;
+      this.completionHostIdentities.push({ role, receipts, authenticate });
+      const verifier = Object.freeze({ receipts, authenticate: authenticate.bind(host) });
+      this.nativeCompletionHosts.push(Object.freeze({ [role]: verifier }));
+    }
+  }
   private readonly dir: string;
   private readonly mutationLockTimeoutMs: number;
   private readonly mutationLockRetryMs: number;
@@ -488,6 +513,7 @@ export class JsonFileStore implements RunStore {
   private readonly syncForDurability: (fd: number, target: 'file' | 'directory') => void;
 
   constructor(options: JsonFileStoreOptions) {
+    for (const context of Array.isArray(options.nativeCompletionHosts) ? options.nativeCompletionHosts : [options.nativeCompletionHosts ?? {}]) this.configureNativeCompletionHosts(context);
     this.mutationLockTimeoutMs = options.mutationLockTimeoutMs ?? DEFAULT_RUN_MUTATION_LOCK_TIMEOUT_MS;
     this.mutationLockRetryMs = options.mutationLockRetryMs ?? DEFAULT_RUN_MUTATION_LOCK_RETRY_MS;
     this.beforeConditionalWrite = options.beforeConditionalWrite;
@@ -555,7 +581,10 @@ export class JsonFileStore implements RunStore {
   }
 
   create(run: Run): void {
+    authenticateNativeRun(run, this.nativeCompletionHosts, true);
+    assertImplementationAuthorityProgresses(null, run);
     if (!nativeMergeCoherent(run)) throw new Error('Invalid native merge Run attempt.');
+    if (!nativeLeadCoherent(run)) throw new Error('Invalid native lead Run ledger.');
     if (!nativeReviewCoherent(run)) throw new Error('Invalid native review Run ledger.');
     this.withMutationLock(run.id, () => {
       const filePath = this.filePathFor(run.id);
@@ -572,16 +601,20 @@ export class JsonFileStore implements RunStore {
     const filePath = this.filePathFor(id);
     this.assertSafeRunFile(filePath);
     if (!existsSync(filePath)) return null;
-    return readRun(filePath, id);
+    return readRun(filePath, id, this.nativeCompletionHosts);
   }
 
   update(run: Run): void {
     this.withMutationLock(run.id, () => {
       const filePath = this.filePathFor(run.id);
       this.assertSafeRunFile(filePath);
-      const current = existsSync(filePath) ? readRun(filePath, run.id) : null;
+      const current = existsSync(filePath) ? readRun(filePath, run.id, this.nativeCompletionHosts) : null;
+      authenticateNativeRun(run, this.nativeCompletionHosts, true);
       if (!nativeMergeCoherent(run) || current !== null && !nativeMergeProgresses(current, run)) throw new Error('Native merge attempt must remain coherent and monotonic.');
+      if (!nativeLeadCoherent(run) || current !== null && !nativeLeadProgresses(current, run)) throw new Error('Native lead ledger must remain coherent and monotonic.');
       if (!nativeReviewCoherent(run) || current !== null && !nativeReviewProgresses(current, run)) throw new Error('Native review ledger must remain coherent and monotonic.');
+      assertImplementationAuthorityProgresses(current, run);
+      if (current) assertNativeLeadTransition(current,run);
       assertRepairAdmissionsAppendOnly(current, run);
       assertHistoryAppendOnly(current, run);
       const serialized = writeJsonAtomic(filePath, run, this.syncForDurability, () => this.assertSafeRunFile(filePath));
@@ -594,10 +627,14 @@ export class JsonFileStore implements RunStore {
     return this.withMutationLock(expected.id, () => {
       const filePath = this.filePathFor(expected.id);
       this.assertSafeRunFile(filePath);
-      const current = readRun(filePath, expected.id);
+      const current = readRun(filePath, expected.id, this.nativeCompletionHosts);
       if (runFingerprint(current) !== runFingerprint(expected)) return false;
+      authenticateNativeRun(next, this.nativeCompletionHosts, true);
       if (!nativeMergeCoherent(next) || !nativeMergeProgresses(current, next)) throw new Error('Native merge attempt must remain coherent and monotonic.');
+      if (!nativeLeadCoherent(next) || !nativeLeadProgresses(current, next)) throw new Error('Native lead ledger must remain coherent and monotonic.');
       if (!nativeReviewCoherent(next) || !nativeReviewProgresses(current, next)) throw new Error('Native review ledger must remain coherent and monotonic.');
+      assertImplementationAuthorityProgresses(current, next);
+      assertNativeLeadTransition(current,next);
       assertRepairAdmissionsAppendOnly(current, next);
       assertHistoryAppendOnly(current, next);
       this.beforeConditionalWrite?.();
@@ -616,7 +653,7 @@ export class JsonFileStore implements RunStore {
       .map((name) => {
         const filePath = path.join(this.dir, name);
         this.assertSafeRunFile(filePath);
-        return readRun(filePath, name.slice(0, -'.json'.length));
+        return readRun(filePath, name.slice(0, -'.json'.length), this.nativeCompletionHosts);
       });
   }
 

@@ -70,7 +70,7 @@ function fixture(mergeComposition = false) {
   let submit: (r: RequestEvidence) => Promise<NativeReviewObservation> = async () => ({ outcome: 'pending', conversationUrl: 'https://review.example.invalid/exact?conversation=returned' });
   let observe: NonNullable<NativeReviewerHost['observe']> = async () => ({ outcome: 'pending' });
   const now = () => new Date(clock).toISOString();
-  const store = () => new JsonFileStore({ dir: path.join(directory, 'runs') });
+  const store = () => new JsonFileStore({ dir: path.join(directory, 'runs'), nativeCompletionHosts: { review: host } });
   let onRegistryPublish = () => {};
   const registry = () => new MissionAdmissionRegistry({ beforePublish: () => onRegistryPublish(), filePath: path.join(directory, 'host', 'admission.json'), config: admissionConfig, now });
   const receipts = () => new JsonFileOracleReceiptStore(path.join(directory, 'oracle'));
@@ -426,10 +426,15 @@ describe('native review through the real factory / durable dispatcher', () => {
           // from receipt authentication or its accepted digest.
           writeFileSync(path.join(f.directory, 'oracle', 'native', `${terminal.id}.json`), JSON.stringify({ ...terminal, result: { ...terminal.result, telemetry: { ...terminal.result.telemetry, turns: 2 } } }));
         }
-        const rejected = await cached();
-        assert.equal(rejected.outcome, 'waiting_dependency', tamper);
-        assert.equal(rejected.run.nativeReview!.wait!.kind, 'qualification');
-        assert.equal(rejected.run.nativeReview!.accepted!.digest, ready.nativeReview!.accepted!.digest);
+        if (tamper === 'semantic-review') {
+          const rejected = await cached();
+          assert.equal(rejected.outcome, 'waiting_dependency', tamper);
+          assert.equal(rejected.run.nativeReview!.wait!.kind, 'qualification');
+          assert.equal(rejected.run.nativeReview!.accepted!.digest, ready.nativeReview!.accepted!.digest);
+        } else {
+          await assert.rejects(cached, /corrupt|incompatible/, 'changed immutable completion bytes are rejected at store load');
+          assert.throws(() => f.store().read(ready.id), /corrupt|incompatible/);
+        }
         assert.equal(f.counts().submissions, 1); assert.equal(f.counts().observations, 0); assert.equal(f.counts().modelCalls, 0);
       } finally { f.cleanup(); }
     }
@@ -570,14 +575,21 @@ describe('native review through the real factory / durable dispatcher', () => {
     } finally { f.cleanup(); }
   });
 
-  it('records unknown unsupported recovery and uses only an explicit qualified irrecoverable-transport disposition for one replacement', async () => {
+  it('retains unsupported pending recovery and uses a genuine lost acknowledgement for one explicitly qualified replacement', async () => {
     const f = fixture();
     try {
-      f.seed(); await f.poll(); const original = f.request();
+      f.seed(); await f.poll();
       const { observe: _observe, ...unsupported } = f.host;
       f.tick(); await f.poll(unsupported);
-      assert.equal(activeNativeReview(f.store().read('run-native')!)!.status, 'terminal_unknown');
+      assert.equal(activeNativeReview(f.store().read('run-native')!)!.status, 'pending');
       assert.equal(f.counts().submissions, 1);
+      assert.equal(activeNativeReview(f.store().read('run-native')!)!.failure, undefined);
+    } finally { f.cleanup(); }
+    const f2=fixture();
+    try {
+      const f=f2; f.seed(); f.setSubmit(async()=>{throw new Error('actual controlled lost acknowledgement');}); await f.poll(); const original=f.request();
+      const {observe:_observe,...unsupported}=f.host;
+      assert.equal(activeNativeReview(f.store().read('run-native')!)!.status,'terminal_unknown');
       f.tick();
       await f.poll({ ...unsupported, replacementDisposition: () => 'irrecoverable_transport' });
       const replaced = f.store().read('run-native')!;
@@ -586,11 +598,12 @@ describe('native review through the real factory / durable dispatcher', () => {
       assert.equal(replaced.nativeReview!.requests[0]!.retirementReason, 'irrecoverable_transport');
       assert.equal(replaced.nativeReview!.requests[0]!.failure, undefined, 'unknown is not fabricated transport failure/cancellation');
       f.receipts().recordNative(f.terminal(original));
-      f.tick(); await f.poll(unsupported);
+      await runIssueCommand(f.workflow(unsupported),'acme/widgets#42',{execution,dispatchClaimId:'claim-native',repairTaskShapeAuthority:authority,admission:f.registry(),runOwnerReceiptPath:f.receiptPath,admissionWorkspace:f.repository,now:f.now,leadObservationOnly:true,nativeCachedOnly:true,async assertReviewClaim(){},withDispatchAdmissionLock:async op=>op()});
+      assert.ok(f.store().read('run-native')!.nativeReview!.requests[0]!.completionProof,'explicit exact cached original terminal is reconciled');
       f.tick(); await f.poll({ ...unsupported, replacementDisposition: () => 'irrecoverable_transport' });
       assert.equal(f.store().read('run-native')!.nativeReview!.accepted, undefined);
       assert.equal(f.counts().submissions, 2);
-    } finally { f.cleanup(); }
+    } finally { f2.cleanup(); }
   });
 
   it('retains original correlation without inventing a URL after remote acceptance and lost acknowledgement', async () => {
@@ -794,7 +807,7 @@ describe('native review through the real factory / durable dispatcher', () => {
       assert.deepEqual(f.registry().readLane('run:run-native'), owner);
       // Historical terminal records are read-compatible; no new transition or native credit.
       const historical: Run = { ...ready, state: 'MERGED' };
-      const historyStore = new JsonFileStore({ dir: path.join(f.directory, 'historical') }); historyStore.create(historical);
+      const historyStore = new JsonFileStore({ dir: path.join(f.directory, 'historical'), nativeCompletionHosts: { review: f.host } }); historyStore.create(historical);
       const beforeRetry = historyStore.read(historical.id);
       await assert.rejects(runMergedTransitionCommand(historyStore, historical.id, f.github, f.registry(), async (op) => op()), /Historical terminal Run remains readable and unchanged/);
       assert.deepEqual(historyStore.read(historical.id), beforeRetry);
@@ -1043,9 +1056,16 @@ describe('native merge crash and authority fences', () => {
         if (bad === 'policy') (f.host.binding as { policyRevision: string }).policyRevision = 'changed';
         if (bad === 'negative') f.setNegativeReview();
         if (bad === 'receipt') { const accepted = f.store().read('run-native')!.nativeReview!.accepted!; writeFileSync(path.join(f.directory, 'oracle', 'native', `${accepted.receiptId}.json`), '{"invalid":true}'); }
-        await f.poll();
-        assert.equal(f.mergeCounts().squashes, 0, bad); assert.equal(f.store().read('run-native')!.mergeAttempt, undefined, bad);
-        assert.equal(f.counts().modelCalls, 0, bad); assert.equal(f.store().list().length, 1);
+        if (bad === 'receipt') {
+          await assert.rejects(f.poll, /corrupt|incompatible/);
+          assert.throws(() => f.store().read('run-native'), /corrupt|incompatible/);
+        } else {
+          await f.poll();
+          assert.equal(f.store().read('run-native')!.mergeAttempt, undefined, bad);
+          assert.equal(f.store().list().length, 1);
+        }
+        assert.equal(f.mergeCounts().squashes, 0, bad);
+        assert.equal(f.counts().modelCalls, 0, bad);
       } finally { f.cleanup(); }
     }
   });
@@ -1080,7 +1100,7 @@ describe('native merge crash and authority fences', () => {
       assert.throws(() => f.store().update({ ...run, mergeAttempt: { ...attempt, submissionPossible: false } }), /monotonic/);
       assert.throws(() => f.store().update({ ...run, mergeAttempt: { ...attempt, observations: 0 } }), /monotonic/);
       assert.throws(() => f.store().update({ ...run, state: 'MERGED' }), /monotonic/);
-      const history = new JsonFileStore({ dir: path.join(f.directory, 'historical-merge') });
+      const history = new JsonFileStore({ dir: path.join(f.directory, 'historical-merge'), nativeCompletionHosts: { review: f.host } });
       history.create({ ...run, state: 'MERGED' });
       f.setMergeState('merged'); f.setMain(f.squash); f.setCommit({ sha: f.squash, treeSha: 'f'.repeat(40), parents: [f.base] });
       await assert.rejects(runMergedTransitionCommand(history, run.id, f.github, new MissionAdmissionRegistry({ filePath: path.join(f.directory, 'absent-registry.json'), config: admissionConfig }), async (op) => op()), /parent|tree|quali/i);
