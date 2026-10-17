@@ -11,7 +11,7 @@ if (!pnpm || !path.isAbsolute(pnpm) || realpathSync(pnpm) !== pnpm) {
 }
 const originalSpawn = childProcess.spawn;
 const cap = 64 * 1024;
-const focusCodeSha256 = 'db9f9541a3f3ed44a1cd61ea711b5d39c32d8e38bde5833f14793ce406b02f54';
+const focusCodeSha256 = 'c8559fbab334e29863495df90779beefdc5c1355f155846c1f07202289d82e07';
 const chunkBytes = 4 * 1024;
 let sequence = 0;
 function capture(stream) {
@@ -25,11 +25,10 @@ function capture(stream) {
 }
 childProcess.spawn = function (file, args, options) {
   const selected = file === '/usr/bin/sandbox-exec' && Array.isArray(args)
-    && args.length === 10 && args[0] === '-p' && typeof args[1] === 'string'
+    && args.length === 8 && args[0] === '-p' && typeof args[1] === 'string'
     && args[2] === pnpm && args[3] === 'exec' && args[4] === 'node'
-    && args[5] === '--import' && args[6] === 'tsx'
-    && args[7] === '--input-type=module' && args[8] === '-e' && typeof args[9] === 'string'
-    && createHash('sha256').update(args[9]).digest('hex') === focusCodeSha256
+    && args[5] === '--input-type=module' && args[6] === '-e' && typeof args[7] === 'string'
+    && createHash('sha256').update(args[7]).digest('hex') === focusCodeSha256
     && options?.stdio === 'ignore' && options.shell === false
     && options.detached === true && options.env?.NODE_OPTIONS === undefined;
   if (!selected) return originalSpawn.apply(this, arguments);

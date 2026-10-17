@@ -1,4 +1,4 @@
-name: Issue 104 account operation stage diagnosis
+name: Issue 104 isolated account fixture prerequisite
 on:
   push:
     branches: [qualification/issue104-stage6-native]
@@ -12,8 +12,8 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 45
     env:
-      CANDIDATE_SHA: 82d684e2067ed42704073710668767f21af6385e
-      CANDIDATE_TREE: 69ca2eb4fc9cb7ba75d7d559bde988f57bac4b47
+      CANDIDATE_SHA: 3bca1876879ea7c91c7007dfd3457a0400973f27
+      CANDIDATE_TREE: 491d68871ec44a414f684aedde9bcdcd3327c852
     steps:
       - uses: actions/checkout@v7
         with:
@@ -21,7 +21,7 @@ jobs:
           persist-credentials: false
       - uses: actions/checkout@v7
         with:
-          ref: 82d684e2067ed42704073710668767f21af6385e
+          ref: 3bca1876879ea7c91c7007dfd3457a0400973f27
           path: candidate
           persist-credentials: false
       - uses: actions/setup-node@v7
@@ -88,7 +88,7 @@ jobs:
         working-directory: candidate
         timeout-minutes: 3
         run: pnpm build
-      - name: Diagnostic-only fixed private account operation stages
+      - name: Diagnostic-only complete account store and admission fixture files
         timeout-minutes: 30
         shell: bash
         run: |
