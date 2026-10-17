@@ -56,6 +56,7 @@ import {
   canSynchronizeInterruptedHead,
 } from './domain/decisions.js';
 import { applyTransition, transitionRequiresResult } from './domain/state-machine.js';
+import { localValidationHasUnsettledProcessFamily } from './domain/validation.js';
 import { projectRunEfficiency, type RunEfficiencyProjection } from './domain/telemetry.js';
 import {
   TRANSITION_TYPES,
@@ -1270,7 +1271,10 @@ export function recoverRunAdmission(
         fresh.run.history.at(-1)?.type !== 'fail' || fresh.run.history.at(-1)?.reason !== CANCEL_RUN_DECISION)) {
         throw new Error(`Run "${run.id}" cancellation disposition conflicts with durable history.`);
       }
-      if (fresh.receipt.workDisposition === undefined) writeRunOwnerReceipt(canonicalReceiptPath, { ...fresh.receipt, workDisposition: 'retired' });
+      if (fresh.receipt.workDisposition === undefined ||
+        (fresh.receipt.workDisposition === 'cancelled' && localValidationHasUnsettledProcessFamily(fresh.run.validationResult?.local))) {
+        writeRunOwnerReceipt(canonicalReceiptPath, { ...fresh.receipt, workDisposition: 'retired' });
+      }
     });
   };
   if (lane.status === 'released' && lane.generation === expectedGeneration + 1) {
@@ -1536,6 +1540,9 @@ export async function resumeCommand(
   const choices = run.interrupt?.choices ?? [];
   if (choices.length > 0 && !choices.includes(decision)) {
     throw new Error(`Invalid decision "${decision}". Choose exactly one of: ${choices.join(' | ')}.`);
+  }
+  if (decision.trim() === CANCEL_RUN_DECISION && localValidationHasUnsettledProcessFamily(run.validationResult?.local)) {
+    throw new Error('Process-family settlement remains unproven; cancellation cannot attest stopped execution. Preserve the owner and use exact-generation --stopped recovery before --retire-work.');
   }
   const targetOwner = findRunByTarget(deps.store, run.target);
   if (targetOwner !== null && targetOwner.id !== id) throw new Error(`Run "${id}" is not the unique active durable Run for its target.`);
@@ -2021,7 +2028,8 @@ export function isDispatchRunOwnerRetiredCommand(store: RunStore, run: Run, admi
         run.history.at(-1)?.type !== 'fail' || run.history.at(-1)?.reason !== CANCEL_RUN_DECISION)) {
         throw new Error(`Run "${run.id}" cancellation disposition conflicts with durable history.`);
       }
-      retired = receipt.workDisposition === 'retired' || receipt.workDisposition === 'cancelled';
+      retired = receipt.workDisposition === 'retired' ||
+        (receipt.workDisposition === 'cancelled' && !localValidationHasUnsettledProcessFamily(run.validationResult?.local));
     }
   });
   return retired;

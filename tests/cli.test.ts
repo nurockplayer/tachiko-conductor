@@ -1278,6 +1278,102 @@ describe('workflow run and resume commands', () => {
     });
   }
 
+  it('refuses ordinary settlement-marker cancellation without changing the owner and requires attested recovery', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-cancel-held-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      await f.reconcileMergedRun(f.run);
+      const h = f.addHistoricalOwner('NEEDS_HUMAN');
+      const held: Run = { ...h.run, validationResult: { ...validationPassed(h.run.headSha!), status: 'unknown',
+        local: { status: 'unknown', configRevision: 'test-config-v1', commands: [
+          { commandIndex: 0, executable: 'node', outcome: 'passed', exitCode: 0, durationMs: 1 },
+          { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+        ] } } };
+      f.store.update(held);
+      const next = { laneId: 'next-same-workspace', role: 'production_captain' as const, highAutonomy: true,
+        evidence: { repository: 'acme/widgets', issue: 43, run: 'next-run', workspace: held.bootstrap!.workspacePath } };
+      assert.equal(f.setup.registry.admit(next).outcome, 'duplicate');
+      const beforeLane = f.setup.registry.readLane(`run:${held.id}`);
+      const beforeReceipt = readFileSync(h.receiptPath);
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      let externalReads = 0, releaseCalls = 0;
+      const github = githubAdapter([]);
+      github.readLiveSnapshot = async () => { externalReads += 1; throw new Error('unexpected GitHub read'); };
+      const originalRelease = f.setup.registry.release.bind(f.setup.registry);
+      f.setup.registry.release = (...args: Parameters<typeof originalRelease>) => { releaseCalls += 1; return originalRelease(...args); };
+      await assert.rejects(resumeCommand(deps(f.store, github, implementation, reviewer), held.id, CANCEL_RUN_DECISION, {
+        dispatchClaimId: held.dispatchClaimId, admission: f.setup.registry,
+        admissionWorkspace: held.bootstrap!.workspacePath, now: () => T0,
+      }), /settlement remains unproven.*--stopped/);
+      assert.deepEqual(f.store.read(held.id), held);
+      assert.deepEqual(f.setup.registry.readLane(`run:${held.id}`), beforeLane);
+      assert.deepEqual(readFileSync(h.receiptPath), beforeReceipt);
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.phase, 'parked');
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.workDisposition, undefined);
+      assert.equal(f.setup.registry.admit(next).outcome, 'duplicate');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, held, f.setup.registry), false);
+      assert.equal(externalReads + releaseCalls + implementation.calls + reviewer.calls + f.starts, 0);
+      assert.throws(() => recoverRunAdmission(f.store, f.setup.registry, held.id, h.generation, false, h.receiptPath,
+        { retireWork: true }), /explicit --stopped/);
+      assert.throws(() => recoverRunAdmission(f.store, f.setup.registry, held.id, h.generation + 7, true, h.receiptPath,
+        { retireWork: true }), /generation/);
+      assert.equal(f.setup.registry.admit(next).outcome, 'duplicate');
+      assert.equal(recoverRunAdmission(f.store, f.setup.registry, held.id, h.generation, true, h.receiptPath), 'released');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, held, f.setup.registry), false, 'stopped release alone is not work retirement');
+      assert.equal(recoverRunAdmission(f.store, f.setup.registry, held.id, h.generation, true, h.receiptPath,
+        { retireWork: true }), 'released');
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.workDisposition, 'retired');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, held, f.setup.registry), true);
+      assert.deepEqual(f.store.read(held.id), held, 'operator attestation does not erase the settlement marker');
+      assert.equal(f.setup.registry.admit(next).outcome, 'admitted');
+      assert.equal(externalReads + implementation.calls + reviewer.calls + f.starts, 0);
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('holds persisted cancelled settlement-marker proof until exact stopped work retirement', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-cancel-history-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      await f.reconcileMergedRun(f.run);
+      const h = f.addHistoricalOwner('NEEDS_HUMAN');
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      const cancelled = await resumeCommand(deps(f.store, f.github, implementation, reviewer), h.run.id, CANCEL_RUN_DECISION, {
+        dispatchClaimId: h.run.dispatchClaimId, admission: f.setup.registry, now: () => T0,
+      });
+      assert.equal(cancelled.run.state, 'FAILED');
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.workDisposition, 'cancelled');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, cancelled.run, f.setup.registry), true, 'ordinary no-marker cancellation remains retired');
+      const historical: Run = { ...f.store.read(cancelled.run.id)!, validationResult: { ...validationPassed(cancelled.run.headSha!), status: 'unknown',
+        local: { status: 'unknown', configRevision: 'test-config-v1', commands: [
+          { commandIndex: 0, executable: 'node', outcome: 'failed', exitCode: 7, durationMs: 1 },
+          { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+        ] } } };
+      f.store.update(historical);
+      const receiptBytes = readFileSync(h.receiptPath);
+      f.restart();
+      assert.deepEqual(f.store.read(historical.id), historical);
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, historical, f.setup.registry), false);
+      const comments = JSON.stringify(f.comments);
+      assert.equal((await f.poll()).outcome, 'owner_reconciliation_hold');
+      assert.equal(JSON.stringify(f.comments), comments);
+      assert.deepEqual(readFileSync(h.receiptPath), receiptBytes, 'retirement predicate does not rewrite historical proof');
+      assert.equal(implementation.calls + reviewer.calls + f.starts, 0);
+      const releasedGeneration = readRunOwnerReceipt(h.receiptPath)!.generation;
+      assert.throws(() => recoverRunAdmission(f.store, f.setup.registry, historical.id, releasedGeneration - 1, false,
+        h.receiptPath, { retireWork: true }), /explicit --stopped/);
+      assert.equal(recoverRunAdmission(f.store, f.setup.registry, historical.id, releasedGeneration - 1, true,
+        h.receiptPath, { retireWork: true }), 'released');
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.workDisposition, 'retired');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, historical, f.setup.registry), true);
+      assert.deepEqual(f.store.read(historical.id), historical);
+      assert.equal(implementation.calls + reviewer.calls + f.starts, 0);
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('records cancellation only through the actual cancel decision and then permits later work', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-cancel-disposition-'));
     const restore = isolateMergeReceiptRoot(dir);
