@@ -2,6 +2,7 @@ import { existsSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 
 import { GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, GOVERNED_PUBLICATION_REENTRY_ACTION, governedExecutionBoundaryRefusal, type GovernedInvocationPreparation, type ImplementationAgent, type ImplementationRequest } from '../adapters/agent.js';
+import { assertExecutionSupportedByProvider } from '../execution-profiles.js';
 import type { AgentResult } from '../domain/types.js';
 import { CodexCliAdapter, hasOriginalCodexCliRun } from './codex-cli.js';
 import { hasPreparedStandaloneLunaInvocation } from '../workspace/standalone-git-bootstrap.js';
@@ -74,8 +75,8 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
         `Governed isolated Luna requires the exact current standalone preparation proof. No model turn or worker process was started. ${GOVERNED_PUBLICATION_REENTRY_ACTION}`,
         request);
     }
-    if (request.execution?.executor !== LUNA_ISOLATED_PROVIDER || request.execution.model !== LUNA_ISOLATED_MODEL) {
-      return failure(LUNA_ISOLATED_ERROR_CODE.TRANSPORT_MISMATCH, 'Isolated Luna requires the exact luna-isolated / gpt-5.6-luna execution snapshot.');
+    if (!hasSupportedLunaExecution(request.execution)) {
+      return failure(LUNA_ISOLATED_ERROR_CODE.TRANSPORT_MISMATCH, LUNA_EXECUTION_MISMATCH);
     }
     if (request.authority !== 'embedded' || request.instructions === undefined || request.instructions.trim() === '') {
       return failure(LUNA_ISOLATED_ERROR_CODE.RUNTIME_UNQUALIFIED, 'Isolated Luna requires a non-empty host-supplied bounded task packet.');
@@ -110,7 +111,22 @@ export class IsolatedLunaAdapter implements ImplementationAgent {
     if (!hasPreparedStandaloneLunaInvocation(request)) {
       return { status: 'held', reason: `Isolated Luna has no exact current standalone preparation proof. ${GOVERNED_PUBLICATION_REENTRY_ACTION}` };
     }
+    if (!hasSupportedLunaExecution(request.execution)) {
+      return { status: 'held', reason: `${LUNA_ISOLATED_ERROR_CODE.TRANSPORT_MISMATCH}: ${LUNA_EXECUTION_MISMATCH}` };
+    }
     return { status: 'qualified', agent: this };
+  }
+}
+
+const LUNA_EXECUTION_MISMATCH = 'Isolated Luna requires the exact routine / luna-isolated / gpt-5.6-luna / workspace-write / never execution snapshot.';
+
+function hasSupportedLunaExecution(execution: ImplementationRequest['execution']): execution is NonNullable<ImplementationRequest['execution']> {
+  if (execution?.executor !== LUNA_ISOLATED_PROVIDER || execution.model !== LUNA_ISOLATED_MODEL) return false;
+  try {
+    assertExecutionSupportedByProvider(execution);
+    return true;
+  } catch {
+    return false;
   }
 }
 

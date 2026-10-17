@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, readFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
+import type { ImplementationRequest } from '../src/adapters/agent.js';
 import { hasGovernedPublicationConfinement } from '../src/adapters/agent.js';
 import { CodexCliAdapter } from '../src/agents/codex-cli.js';
 import { IsolatedLunaAdapter, LUNA_ISOLATED_MODEL, LUNA_ISOLATED_PROVIDER, isolatedLunaEnvironment, parseTrustedLunaConfig } from '../src/agents/luna-isolated.js';
@@ -33,7 +34,7 @@ describe('qualified Luna runtime configuration', () => {
       const head = fixture.baseSha;
       const codex = path.join(bin, 'codex');
       const spawnMarker = path.join(root, 'codex-spawned');
-      writeFileSync(codex, `#!/bin/sh\nprintf x > '${spawnMarker}'\nprintf '%s\\n' '${JSON.stringify({ type: 'thread.started', thread_id: 'luna-thread' })}' '${JSON.stringify({ type: 'turn.started' })}' '${JSON.stringify({ type: 'item.completed', item: { id: 'message', type: 'agent_message', text: 'bounded result' } })}' '${JSON.stringify({ type: 'turn.completed' })}'\n`);
+      writeFileSync(codex, `#!/bin/sh\nprintf x >> '${spawnMarker}'\nprintf '%s\\n' '${JSON.stringify({ type: 'thread.started', thread_id: 'luna-thread' })}' '${JSON.stringify({ type: 'turn.started' })}' '${JSON.stringify({ type: 'item.completed', item: { id: 'message', type: 'agent_message', text: 'bounded result' } })}' '${JSON.stringify({ type: 'turn.completed' })}'\n`);
       chmodSync(codex, 0o755);
       const git = path.join(bin, 'git');
       writeFileSync(git, `#!/bin/sh\n[ "$1" = rev-parse ] && [ "$2" = HEAD ] || exit 91\nprintf '%s\\n' '${head}'\n`);
@@ -42,22 +43,54 @@ describe('qualified Luna runtime configuration', () => {
       const adapter = new IsolatedLunaAdapter({ codexHome: home, timeoutMs: 10_000, path: bin });
       assert.equal(hasGovernedPublicationConfinement(adapter), true);
       let executionEntries = 0;
-      const result = await adapter.run({
+      const request: ImplementationRequest = {
         target,
         baseSha: fixture.baseSha, workspacePath, branch: identity.branch, workspaceGuard: bootstrap.guard(identity), authority: 'embedded',
         instructions: 'Implement the bounded task.',
-        execution: { profile: 'standard', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL, reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' },
+        execution: { profile: 'routine', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL, reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' },
         runtimeOwnership: { runId: 'run-luna', generation: 'luna-generation' },
         governedPublication: { required: true, continuation: false },
         beforeExecution: () => { executionEntries += 1; },
-      });
+      };
+      assert.equal(adapter.prepareGovernedInvocation(request).status, 'qualified');
+      const result = await adapter.run(request);
 
       assert.equal(result.exitStatus, 'success', result.summary);
       assert.equal(result.headSha, head);
       assert.equal(result.executor?.provider, 'codex-cli', 'the confined Luna wrapper reports its actual inner CLI transport');
       assert.equal(result.executor?.sessionId, 'luna-thread');
-      assert.equal(existsSync(spawnMarker), true);
+      assert.equal(readFileSync(spawnMarker, 'utf8'), 'x', 'exactly one model process started');
       assert.equal(executionEntries, 1, 'the callback reached the nested Codex process boundary');
+      rmSync(spawnMarker);
+      const validExecution = request.execution!;
+      const invalidExecutions: readonly [string, ImplementationRequest['execution']][] = [
+        ['standard', { ...validExecution, profile: 'standard' }],
+        ['complex', { ...validExecution, profile: 'complex' }],
+        ['critical', { ...validExecution, profile: 'critical' }],
+        ['missing execution', undefined],
+        ['wrong executor', { ...validExecution, executor: 'codex-cli' }],
+        ['wrong model', { ...validExecution, model: 'gpt-5.6' }],
+        ['missing sandbox', { ...validExecution, sandboxMode: undefined }],
+        ['read-only sandbox', { ...validExecution, sandboxMode: 'read-only' }],
+        ['danger-full-access sandbox', { ...validExecution, sandboxMode: 'danger-full-access' }],
+        ['missing approval', { ...validExecution, approvalPolicy: undefined }],
+        ['on-request approval', { ...validExecution, approvalPolicy: 'on-request' }],
+        ['untrusted approval', { ...validExecution, approvalPolicy: 'untrusted' }],
+      ];
+      for (const [label, execution] of invalidExecutions) {
+        const invalidRequest = { ...request, execution };
+        const before = { ...invalidRequest, execution: execution === undefined ? undefined : { ...execution } };
+        const preparation = adapter.prepareGovernedInvocation(invalidRequest);
+        assert.equal(preparation.status, 'held', label);
+        if (preparation.status === 'held') assert.match(preparation.reason, /LUNA_TRANSPORT_MISMATCH/, label);
+        const rejected = await adapter.run(invalidRequest);
+        assert.equal(rejected.exitStatus, 'failure', label);
+        assert.match(rejected.diagnostics?.join(' ') ?? '', /LUNA_TRANSPORT_MISMATCH/, label);
+        assert.equal(existsSync(spawnMarker), false, label);
+        assert.equal(executionEntries, 1, `${label}: no additional execution callback`);
+        assert.deepEqual(invalidRequest, before, `${label}: request unchanged`);
+      }
+
     } finally {
       rmSync(root, { recursive: true, force: true });
       for (const fixture of fixtures.splice(0)) fixture.cleanup();
@@ -77,7 +110,7 @@ describe('qualified Luna runtime configuration', () => {
       const request = {
         target: { kind: 'issue' as const, owner: 'acme', repo: 'widgets', issueNumber: 42 }, baseSha: fixture.baseSha,
         workspacePath: workspace, branch: 'tachiko/fake', authority: 'embedded' as const, instructions: 'task',
-        execution: { profile: 'standard', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL, reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' } as const,
+        execution: { profile: 'routine', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL, reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' } as const,
         runtimeOwnership: { runId: 'run-luna', generation: 'generation' }, governedPublication: { required: true as const, continuation: false }, beforeExecution: () => {},
       };
       const missing = await adapter.run(request);
@@ -140,7 +173,7 @@ describe('qualified Luna runtime configuration', () => {
       const result = await adapter.run({
         target, baseSha: fixture.baseSha, workspacePath: identity.workspacePath, branch: identity.branch,
         workspaceGuard: bootstrap.guard(identity), authority: 'embedded', instructions: 'bounded task',
-        execution: { profile: 'standard', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL,
+        execution: { profile: 'routine', revision: 'profiles-v1', executor: LUNA_ISOLATED_PROVIDER, model: LUNA_ISOLATED_MODEL,
           reasoningEffort: 'high', timeoutMs: 10_000, sandboxMode: 'workspace-write', approvalPolicy: 'never' },
         runtimeOwnership: { runId: plan.runId, generation: 'luna-generation' },
         governedPublication: { required: true, continuation: false },
