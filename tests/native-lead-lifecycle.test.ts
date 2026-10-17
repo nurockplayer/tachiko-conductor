@@ -789,13 +789,16 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
     const f = fixture();
     try {
       let held = false;
-      f.setIssueHook(() => { if (!held) {
+      f.setIssueHook(() => { if (!held && activeNativeLead(f.run())!==undefined) {
         held = true;
         f.setHold(true);
       } });
       await assert.rejects(() => f.poll(), /HOLD/);
+      assert.equal(held,true,'fault must reach the reserved lead issue boundary after Oracle issuance');
+      assert.equal(f.counts().reviewCalls,1);
       assert.equal(f.counts().leadCalls, 0);
-      assert.equal(activeNativeLead(f.run())?.submissionPossible, false);
+      const reserved=activeNativeLead(f.run());assert.ok(reserved,'lead reservation must exist at the intended cut');
+      assert.equal(reserved.submissionPossible, false);
       assert.equal(f.run().repairAdmissions, undefined);
       const run = f.run(), lane = f.registry().readLane(`run:${run.id}`)!;
       assert.equal(lane.status, 'active');
@@ -812,6 +815,20 @@ describe('bounded native lead through real persistence / dispatch / isolated rep
     finally {
       f.cleanup();
     }
+  });
+  it('enforces the earlier Oracle serialized HOLD cut without fabricating a lead reservation, then recovers the owned workflow', async () => {
+    const f=fixture();try {
+      let held=false;f.setIssueHook(()=>{if(!held){held=true;f.setHold(true);}});
+      await assert.rejects(()=>f.poll(),/HOLD/);
+      assert.equal(held,true);assert.equal(f.counts().reviewCalls,0);assert.equal(f.counts().leadCalls,0);assert.equal(activeNativeLead(f.run()),undefined);
+      const run=f.run(),request=run.nativeReview!.requests[0]!;assert.ok(request,'Oracle must be reserved at this earlier cut');assert.equal(request.submissionPossible,false);
+      assert.equal(run.repairAdmissions,undefined);assert.equal(f.counts().boundaries,0);
+      const lane=f.registry().readLane(`run:${run.id}`)!;assert.equal(lane.status,'active');
+      recoverRunAdmission(f.store(),f.registry(),run.id,lane.generation,true,f.receiptPath);
+      f.tick();await f.poll();assert.equal(f.counts().reviewCalls,0);assert.equal(f.counts().leadCalls,0);assert.equal(f.run().repairAdmissions,undefined);
+      f.setHold(false);f.tick();await f.poll();
+      assert.equal(f.counts().leadCalls,1);assert.equal(f.run().repairAdmissions?.length,1);assert.equal(f.run().state,'MERGE_READY');assert.equal(f.counts().reviewCalls,2);
+    }finally{f.cleanup();}
   });
   it('enforces HOLD at actual isolated process creation after admission without starting a second logical repair', async () => {
     const f = fixture();

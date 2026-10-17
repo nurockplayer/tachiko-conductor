@@ -10,10 +10,11 @@ import { CANCEL_RUN_DECISION } from '../src/domain/decisions.js';
 import { buildImplementationPacket } from '../src/agents/implementation-packet.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding, activeRepairAdmission } from '../src/domain/repair-admission.js';
 import { applyTransition } from '../src/domain/state-machine.js';
+import { recordSpawnTelemetry } from '../src/domain/telemetry.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { hasAuthenticatedCompletion, type NativeCompletionHosts } from '../src/oracle/completion-proof.js';
-import { nativeReviewCoherent, unresolvedNativeReview, resolveNativeReviewer, issuedReviewRecoveryConfiguration, nativeReviewReentry } from '../src/oracle/native-reviewer.js';
+import { nativeReviewCoherent, nativeReviewProgresses, authenticatedReviewMatches, unresolvedNativeReview, resolveNativeReviewer, issuedReviewRecoveryConfiguration, nativeReviewReentry } from '../src/oracle/native-reviewer.js';
 import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid, nativeLeadReentry, leadPayloadDigest } from '../src/oracle/native-lead.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { canonicalReviewTarget } from '../src/reviewers/risk-policy.js';
@@ -1360,3 +1361,119 @@ for(const role of ['lead','review'] as const)
   it(`N2 direct ${role} runner admits one configured replacement despite spent read budget`,()=>qualifiedRecoveryCaller(role,['dispatch','once'],false,3,'runner'));
 
 for(const role of ['lead','review'] as const)it(`N2 ${role} configured disposition denial becomes finite attention without submission or automatic decision polling`,()=>qualifiedRecoveryCaller(role,['dispatch','once'],false,3,'main',true));
+
+for(const marker of ['qualification','request'] as const)it(`Q1 actual Oracle refusal retains exact cached evidence-only recovery from ${marker} wait`,async()=>{
+ const f:any=inactiveOracleFixture(),originalUserInfo=os.userInfo,log=console.log;
+ const env={data:process.env.TACHIKO_DATA_DIR,config:process.env.TACHIKO_DISPATCH_CONFIG};
+ const originals={list:GitHubDispatchRuntime.prototype.listRuntimeComments,update:GitHubDispatchRuntime.prototype.updateRuntimeComment,queue:GitHubDispatchRuntime.prototype.readQueueComment,create:GitHubDispatchRuntime.prototype.createRuntimeComment,snapshot:LiveGitHubAdapter.prototype.readLiveSnapshot,processRun:NodeProcessRunner.prototype.run};
+ let children=0,queueReads=0;
+ try{
+  os.userInfo=(()=>({...originalUserInfo(),homedir:f.root})) as typeof os.userInfo;process.env.TACHIKO_DATA_DIR=path.join(f.root,f.directory);process.env.TACHIKO_DISPATCH_CONFIG=JSON.stringify(f.config);console.log=()=>{};
+  f.host.submit=async()=>({outcome:'pending'});
+  await f.boundary.advance(f.context());
+  f.tick();f.setObserve(async()=>({outcome:'incomplete',reason:'safety_refusal'}));
+  await f.boundary.observe(f.context());
+  const observed=f.store().read(f.run.id);assert.equal(observed.nativeReview.requests[0].failure,'safety_refusal');
+  f.store().update({...observed,state:'WAITING_DEPENDENCY',interruptedFrom:'REVIEWING',nativeReview:{...observed.nativeReview,wait:{kind:marker,nextAttemptAt:f.now()}}});
+  f.registry=()=>createHostAdmissionRegistry();const w=oracleWorkflow(f),r=f.store().read(f.run.id),old=r.nativeReview.requests[0];
+  const evidence={repository:'acme/widgets',run:r.id,issue:42,pullRequest:7,claim:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+  const receipt=resolveRunOwnerReceiptPath('acme/widgets',r.id,evidence),base:any={schemaVersion:1,laneId:`run:${r.id}`,missionId:f.context().owner.missionId,repository:'acme/widgets',runId:r.id,issue:42,claimId:r.dispatchClaimId,workspace:r.bootstrap.workspacePath};
+  w.registry.park(w.token,'workflow_wait',()=>writeRunOwnerReceipt(receipt,{...base,phase:'park_transition',generation:1,token:w.token}),()=>writeRunOwnerReceipt(receipt,{...base,phase:'parked',generation:2}));
+  publishAdmissionRuntimeProjection(process.env.TACHIKO_DATA_DIR,w.registry,f.store(),{stage:'idle',supervisor:'parked',maintenanceHold:{active:false}});
+  let comments=[{id:'retained-oracle-attention',body:renderDispatchRuntime({issue:42,claimId:r.dispatchClaimId,runId:r.id,profile:'routine',repairTaskShapeAuthority:r.repairTaskShapeAuthority,state:'running',claimedAt:T0,heartbeatAt:T0,leaseUntil:'2099-01-01T00:00:00.000Z'})}];
+  GitHubDispatchRuntime.prototype.listRuntimeComments=async()=>structuredClone(comments);
+  GitHubDispatchRuntime.prototype.updateRuntimeComment=async(_id,body)=>{comments=[{id:'retained-oracle-attention',body}];return comments[0]!;};
+  GitHubDispatchRuntime.prototype.readQueueComment=async()=>{queueReads++;throw new Error('No new queue read');};
+  GitHubDispatchRuntime.prototype.createRuntimeComment=async()=>{throw new Error('No new claim');};
+  LiveGitHubAdapter.prototype.readLiveSnapshot=async()=>f.snapshot;
+  NodeProcessRunner.prototype.run=async()=>{children++;throw new Error('No child in attention scheduling control');};
+  f.receipts.recordNative(f.terminal(old.identity,'request_changes'));
+  const native={historicalCompletionHosts:f.hosts,nativeReviewerHost:f.host};
+  const before=w.registry.readLane(`run:${r.id}`)!.generation;
+  const explicitExit=await main(['run','resume',r.id,'--decision','Reconcile genuine cached Oracle refusal evidence only'],native);
+  const final=f.store().read(r.id),q=final.nativeReview.requests[0];
+  log(JSON.stringify({control:'oracle-refusal-cached-public-resume',explicitExit,unresolved:unresolvedNativeReview(final),completionProof:!!q.completionProof,status:q.status,failure:q.failure,wait:final.nativeReview.wait?.kind,reads:f.reads().length,generationBefore:before,generationAfter:w.registry.readLane(`run:${r.id}`)!.generation,accepted:!!final.nativeReview.accepted,workers:w.workers(),children,queueReads}));
+  assert.equal(explicitExit,0);assert.equal(children,0);assert.equal(f.reads().length,1);assert.equal(final.nativeReview.accepted,undefined);
+  assert.equal(!!q.completionProof,true,'genuine cached terminal must settle uncertainty without adopting the refused verdict');
+  assert.equal(unresolvedNativeReview(final),false);assert.equal(q.status,'incomplete');assert.equal(q.failure,'safety_refusal');assert.equal(q.observations,1);assert.equal(final.repairAdmissions,undefined);assert.equal(w.workers(),0);assert.equal(queueReads,0);
+  assert.equal(final.nativeReview.wait.kind,'qualification');const generation=w.registry.readLane(`run:${r.id}`)!.generation;assert.equal(await main(['dispatch','once'],native),0);assert.equal(w.registry.readLane(`run:${r.id}`)!.generation,generation);assert.equal(f.reads().length,1);assert.equal(queueReads,0);
+ }finally{
+  GitHubDispatchRuntime.prototype.listRuntimeComments=originals.list;GitHubDispatchRuntime.prototype.updateRuntimeComment=originals.update;GitHubDispatchRuntime.prototype.readQueueComment=originals.queue;GitHubDispatchRuntime.prototype.createRuntimeComment=originals.create;LiveGitHubAdapter.prototype.readLiveSnapshot=originals.snapshot;NodeProcessRunner.prototype.run=originals.processRun;os.userInfo=originalUserInfo;console.log=log;
+  for(const [key,value] of [['TACHIKO_DATA_DIR',env.data],['TACHIKO_DISPATCH_CONFIG',env.config]] as const){if(value===undefined)delete process.env[key];else process.env[key]=value;}f.cleanup();
+ }
+});
+
+// Real producer/observer, configured receipts and file CAS. The refused status
+// remains evidence only even when the remote terminal itself is authentic.
+async function refusedOracle(failure:'safety_refusal'|'missing_evidence'='safety_refusal') {
+  const f=inactiveOracleFixture();f.host.submit=async()=>({outcome:'pending'});
+  await f.boundary.advance(f.context());f.tick();f.setObserve(async()=>({outcome:'incomplete',reason:failure}));
+  await f.boundary.observe!(f.context());return f;
+}
+for(const failure of ['safety_refusal','missing_evidence'] as const) {
+  it(`Q1 ${failure} completion survives configured read/import/CAS/reducer clones without verdict authority`,async()=>{
+    const f=await refusedOracle(failure);try {
+      const before=f.store().read(f.run.id)!,q=before.nativeReview!.requests[0]!;f.receipts.recordNative(f.terminal(q.identity));
+      f.host.binding.model='revoked-current-model';
+      const settled=(await f.boundary.observe!({...f.context(),cachedOnly:true})).run;
+      const completed=settled.nativeReview!.requests[0]!;assert.equal(completed.status,'incomplete');assert.equal(completed.failure,failure);assert.ok(completed.completionProof);
+      assert.equal(nativeReviewCoherent(settled),true);assert.equal(nativeReviewProgresses(before,settled),true);assert.equal(unresolvedNativeReview(settled),false);
+      assert.equal(settled.nativeReview!.accepted,undefined);assert.equal(f.reads().length,1);assert.equal(completed.observations,1);assert.equal(f.boundary.canObserve!(settled,f.now()),false);assert.equal(f.boundary.canRecover!(settled,f.now()),false);
+      const clone=structuredClone(settled);assert.equal(unresolvedNativeReview(clone),true,'JSON/structured cloning cannot mint a trusted context');
+      const imported=new JsonFileStore({dir:path.join(f.root,'refusal-import'),nativeCompletionHosts:f.hosts});imported.create(clone);
+      let current=imported.read(clone.id)!;assert.equal(unresolvedNativeReview(current),false);assert.equal(imported.list().length,1);
+      assert.equal(imported.updateIfUnchanged(current,structuredClone(current)),true);current=imported.read(clone.id)!;imported.update(structuredClone(current));
+      const reducer=applyTransition(current,{type:'wait_dependency',reason:'Evidence-only refused completion'},f.now());imported.update(structuredClone(reducer));
+      const historical=new JsonFileStore({dir:path.join(f.root,'refusal-import'),nativeCompletionHosts:f.hosts}).read(clone.id)!;assert.equal(unresolvedNativeReview(historical),false);
+      const untrusted=new JsonFileStore({dir:path.join(f.root,'refusal-import')}).read(clone.id)!;assert.equal(unresolvedNativeReview(untrusted),true,'default readable history cannot clear uncertainty without trusted context');
+      assert.equal(f.boundary.validate({...f.context(),run:historical}),false);
+      assert.equal((await f.boundary.advance({...f.context(),run:historical})).outcome,'wait');assert.equal(f.reads().length,1);
+      const promoted:any={...historical,state:'REVIEWING',nativeReview:{...historical.nativeReview!,requests:historical.nativeReview!.requests.map(r=>({...r,status:'qualified_complete'})),accepted:{requestId:q.identity.requestId,receiptId:`${q.identity.requestId}.terminal`,digest:completed.terminalDigest,identity:q.identity}}};
+      assert.equal(nativeReviewCoherent(promoted),false);assert.equal(nativeReviewProgresses(historical,promoted),false);assert.equal(authenticatedReviewMatches({...historical,nativeReview:{...historical.nativeReview!,accepted:promoted.nativeReview.accepted}},f.terminal(q.identity).result),false);
+      assert.throws(()=>imported.update(promoted),/coherent|monotonic/);assert.throws(()=>imported.updateIfUnchanged(historical,promoted),/coherent|monotonic/);
+      assert.throws(()=>new JsonFileStore({dir:path.join(f.root,'promoted-import'),nativeCompletionHosts:f.hosts}).create(promoted),/native review/);
+      // Prior-schema accepted history stays readable, while a refused status
+      // cannot regain current verdict eligibility merely through old projection.
+      const legacyDir=path.join(f.root,'legacy-refusal');mkdirSync(legacyDir);writeFileSync(path.join(legacyDir,`${promoted.id}.json`),JSON.stringify({...promoted,state:historical.state}));
+      const legacy=new JsonFileStore({dir:legacyDir,nativeCompletionHosts:f.hosts}).read(promoted.id)!;
+      assert.equal(legacy.nativeReview!.requests[0]!.failure,failure);assert.equal(f.boundary.validate({...f.context(),run:legacy}),false);assert.equal(nativeReviewCoherent(legacy),false);
+      assert.equal(nativeReviewReentry({...legacy,state:'WAITING_DEPENDENCY',interruptedFrom:'FINAL_GATE',nativeReview:{...legacy.nativeReview!,wait:{kind:'request',nextAttemptAt:T0}}},f.now()),false);
+
+      assert.throws(()=>applyTransition({...historical,state:'REVIEWING'},{type:'review_approved',reviewResult:f.terminal(q.identity).result},f.now(),TEST_VALIDATION_AUTHORITY),/authenticated|review payload/i);
+      assert.equal((await f.boundary.advance({...f.context(),run:promoted})).outcome,'wait');assert.equal(f.boundary.validate({...f.context(),run:promoted}),false);
+      assert.equal(imported.read(clone.id)!.repairAdmissions,undefined);
+    }finally{f.cleanup();}
+  });
+}
+for(const kind of ['absent','foreign-authentication','raw-digest','foreign-proof','malformed-proof'] as const) {
+  it(`Q1 ${kind} refusal evidence cannot clear uncertainty or acquire acceptance`,async()=>{
+    const f=await refusedOracle();try {
+      const before=f.store().read(f.run.id)!,q=before.nativeReview!.requests[0]!;
+      if(kind==='foreign-authentication'){f.receipts.recordNative(f.terminal(q.identity));f.host.authenticate=()=>false;}
+      if(kind==='raw-digest'||kind==='foreign-proof'||kind==='malformed-proof') {
+        const forged:any=structuredClone(before);forged.nativeReview.requests[0].terminalDigest='a'.repeat(64);
+        if(kind==='foreign-proof')forged.nativeReview.requests[0].completionProof=f.receipts.recordAuthenticatedCompletion('review',f.request.packet.origin,e=>f.hosts.review!.authenticate(e as any));
+        if(kind==='malformed-proof')forged.nativeReview.requests[0].completionProof={file:'/untrusted/receipt',digest:'a'.repeat(64),unknown:true};
+        assert.throws(()=>f.store().update(forged),/coherent|proof|authenticated/);
+        assert.throws(()=>f.store().updateIfUnchanged(before,forged),/coherent|proof|authenticated/);
+      }
+      const observed=(await f.boundary.observe!({...f.context(),cachedOnly:true})).run;
+      assert.equal(unresolvedNativeReview(observed),true);assert.equal(observed.nativeReview!.accepted,undefined);assert.equal(observed.nativeReview!.requests[0]!.completionProof,undefined);assert.equal(f.reads().length,1);
+      await f.boundary.observe!(f.context());assert.equal(f.reads().length,1,'known refusal cannot acquire another service read even through direct observer');
+    }finally{f.cleanup();}
+  });
+}
+for(const boundary of ['submission','observation'] as const) {
+  it(`Q2 actual Oracle ${boundary} claim loss fences bookkeeping and terminal adoption`,async()=>{
+    const f=inactiveOracleFixture();try {
+      let current=true,submits=0,bookkeeping=0;f.host.submit=async()=>{submits++;return{outcome:'pending'};};
+      const durable=f.store(),cas=durable.updateIfUnchanged.bind(durable);
+      durable.updateIfUnchanged=(expected,next)=>{const matched=cas(expected,next);if(boundary==='submission'&&matched&&expected.nativeReview?.requests[0]?.submissionPossible===false&&next.nativeReview?.requests[0]?.submissionPossible===true)current=false;return matched;};
+      const context=()=>f.context({store:durable,async assertLiveClaim(){await Promise.resolve();if(!current)throw new Error('Controlled retained claim replaced');},onSubmission:(r:Run)=>{bookkeeping++;return recordSpawnTelemetry(r,{role:'reviewer',attemptKind:'review',headSha:r.headSha,contextMode:'bounded',contextJustification:'live-target-bounded'},f.now()).run;},withIssueBoundary:async(op:()=>Promise<unknown>)=>op(),async assertInitiation(){}});
+      if(boundary==='submission')await assert.rejects(()=>f.boundary.advance(context()),/claim replaced/);
+      else {await f.boundary.advance(context());f.setObserve(async identity=>{current=false;return{outcome:'complete',evidence:f.terminal(identity)};});f.tick();await assert.rejects(()=>f.boundary.advance(context()),/claim replaced/);}
+      const r=durable.read(f.run.id)!;assert.equal(r.nativeReview!.requests[0]!.submissionPossible,true);assert.equal(r.nativeReview!.accepted,undefined);assert.equal(r.nativeReview!.requests[0]!.completionProof,undefined);
+      assert.equal(submits,boundary==='submission'?0:1);assert.equal(bookkeeping,boundary==='submission'?0:1);assert.equal(r.telemetry?.events.filter(e=>e.kind==='spawn').length??0,boundary==='submission'?0:1);
+    }finally{f.cleanup();}
+  });
+}

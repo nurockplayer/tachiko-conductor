@@ -57,6 +57,10 @@ export function validNativeEvidence(e: NativeOracleEvidence): boolean {
   } catch { return false; }
 }
 
+function verdictEligible(request: NativeReviewRequestState | undefined): boolean {
+  return request?.status==='qualified_complete' && (request.failure===undefined || request.failure==='transport_failure');
+}
+
 /** Read compatibility never supplies missing native qualification. */
 export function nativeReviewCoherent(run: Run, inspectOnly = false): boolean {
   try {
@@ -71,7 +75,7 @@ export function nativeReviewCoherent(run: Run, inspectOnly = false): boolean {
       if (!Object.keys(r).every(k => ['identity','status','submissionPossible','observations','nextObservationAt','conversationUrl','failure','replacedBy','terminalDigest','completionProof','terminalStatus','retirementReason'].includes(k)) || !validNativeIdentity(r.identity) || r.identity.runId !== run.id || r.identity.claimId !== run.dispatchClaimId || r.identity.targetKey !== canonicalReviewTarget(run.target)?.key || r.identity.repository !== `${run.target.owner}/${run.target.repo}`.toLowerCase() ||
         !['pending', 'qualified_complete', 'incomplete', 'terminal_unknown', 'retired', 'replaced'].includes(r.status) || typeof r.submissionPossible !== 'boolean' || !Number.isSafeInteger(r.observations) || r.observations < 0 || r.observations > NATIVE_REVIEW_OBSERVATIONS || !Number.isFinite(Date.parse(r.nextObservationAt)) ||
         (r.conversationUrl !== undefined && !validUrl(r.conversationUrl)) || (r.failure !== undefined && !['transport_failure', 'safety_refusal', 'missing_evidence'].includes(r.failure)) ||
-        (r.terminalDigest !== undefined && (!DIGEST.test(r.terminalDigest) || !['qualified_complete','retired','replaced'].includes(r.status) || r.completionProof !== undefined && (!validCompletionProof(r.completionProof) || !inspectOnly && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'review')))) || (r.completionProof !== undefined && r.terminalDigest === undefined) || (r.status === 'qualified_complete' && (!r.submissionPossible || r.terminalDigest === undefined)) ||
+        (r.terminalDigest !== undefined && (!DIGEST.test(r.terminalDigest) || !(['qualified_complete','retired','replaced'].includes(r.status) || r.status==='incomplete' && r.submissionPossible && r.failure!==undefined && r.failure!=='transport_failure' && r.completionProof!==undefined) || r.completionProof !== undefined && (!validCompletionProof(r.completionProof) || !inspectOnly && !hasAuthenticatedCompletion(r.identity, r.terminalDigest, r.completionProof, 'review')))) || (r.completionProof !== undefined && r.terminalDigest === undefined) || (r.status === 'qualified_complete' && (!r.submissionPossible || r.terminalDigest === undefined || !inspectOnly && r.failure!==undefined && r.failure!=='transport_failure')) ||
         (r.terminalStatus !== undefined && !['incomplete', 'terminal_unknown'].includes(r.terminalStatus)) || (r.retirementReason !== undefined && r.retirementReason !== 'irrecoverable_transport') ||
         (r.status === 'replaced' && (r.failure !== 'transport_failure' && !(r.terminalStatus === 'terminal_unknown' && r.retirementReason === 'irrecoverable_transport') || !ledger.requests.some((n) => n.identity.requestId === r.replacedBy && sameCandidate(r.identity, n.identity))))) return false;
       if (ledger.requests.filter((n) => sameCandidate(r.identity, n.identity)).length > 2) return false;
@@ -90,7 +94,7 @@ export function nativeReviewCoherent(run: Run, inspectOnly = false): boolean {
  * including telemetry. Cached validation separately uses the durable projection. */
 export function authenticatedReviewMatches(run: Run, result: ReviewResult | undefined): boolean {
   const active = activeNativeReview(run), accepted = run.nativeReview?.accepted;
-  if (!active || !accepted || active.identity.requestId !== accepted.requestId) return false;
+  if (!active || !accepted || !verdictEligible(active) || active.identity.requestId !== accepted.requestId) return false;
   const evidence = authenticatedCompletionEvidence(active.identity, active.terminalDigest, active.completionProof, 'review');
   return !!evidence && evidence.kind === 'terminal' && 'result' in evidence && evidence.id === accepted.receiptId && oracleDigest(evidence) === accepted.digest && validNativeEvidence({ ...evidence, result } as NativeOracleEvidence) && same(evidence.result, result);
 }
@@ -104,7 +108,7 @@ export function nativeReviewProgresses(previous: Run, next: Run): boolean {
   if (ledger === undefined || old.repairLimit!==undefined && ledger.repairLimit!==old.repairLimit || ledger.requests.length < old.requests.length || old.recoveryConfiguration === undefined && ledger.recoveryConfiguration !== undefined && old.requests.some(r => r.submissionPossible) || old.recoveryConfiguration !== undefined && !same(old.recoveryConfiguration, ledger.recoveryConfiguration)) return false;
   return old.requests.every((r, i) => {
     const n = ledger.requests[i];
-    if (!n || r.terminalDigest===undefined && n.terminalDigest!==undefined && (n.status!=='qualified_complete' && n.status!==r.status || !hasAuthenticatedCompletion(n.identity,n.terminalDigest,n.completionProof,'review')) || !same(r.identity, n.identity) || r.submissionPossible && !n.submissionPossible || n.observations < r.observations ||
+    if (!n || r.failure!==undefined && r.failure!=='transport_failure' && n.status==='qualified_complete' || r.terminalDigest===undefined && n.terminalDigest!==undefined && (n.status!=='qualified_complete' && n.status!==r.status || !hasAuthenticatedCompletion(n.identity,n.terminalDigest,n.completionProof,'review')) || !same(r.identity, n.identity) || r.submissionPossible && !n.submissionPossible || n.observations < r.observations ||
       r.conversationUrl !== undefined && n.conversationUrl !== r.conversationUrl || r.failure !== undefined && n.failure !== r.failure || r.terminalDigest !== undefined && (n.terminalDigest !== r.terminalDigest || r.completionProof !== undefined && !same(r.completionProof, n.completionProof) || r.completionProof === undefined && n.completionProof !== undefined && !hasAuthenticatedCompletion(n.identity, n.terminalDigest, n.completionProof, 'review')) ||
       r.replacedBy !== undefined && n.replacedBy !== r.replacedBy || r.terminalStatus !== undefined && n.terminalStatus !== r.terminalStatus || r.retirementReason !== undefined && n.retirementReason !== r.retirementReason) return false;
     return r.status === n.status || r.status === 'pending' || r.status === 'terminal_unknown' && ['pending', 'qualified_complete', 'incomplete'].includes(n.status) || r.status === 'incomplete' && r.failure === 'transport_failure' && (n.status === 'replaced' || n.status === 'qualified_complete' && hasAuthenticatedCompletion(n.identity,n.terminalDigest,n.completionProof,'review')) ||
@@ -129,7 +133,7 @@ export function unresolvedNativeReview(run: Run): boolean {
 export function settledHistoricalReviewGate(run: Run): boolean {
   const phase = run.state === 'WAITING_DEPENDENCY' ? run.interruptedFrom : run.state;
   return (phase === 'FINAL_GATE' || phase === 'MERGE_READY') && (run.nativeReview?.wait?.kind === 'request' || run.nativeReview?.wait?.kind === 'qualification') &&
-    activeNativeReview(run)?.status === 'qualified_complete' && !unresolvedNativeReview(run) && !nativeLeadStopped(run);
+    verdictEligible(activeNativeReview(run)) && !unresolvedNativeReview(run) && !nativeLeadStopped(run);
 }
 /** Automatic recovery never polls intentional attention, exhausted or future work. */
 export function nativeReviewObservationDue(run: Run, now: string, binding?: {readonly bindingId: string; readonly model: string}): boolean {
@@ -151,7 +155,7 @@ export function nativeReviewReentry(run: Run, now = new Date().toISOString()): b
   // the caller must revalidate before using the retained current result.
   if (run.state === 'WAITING_DEPENDENCY' && settledHistoricalReviewGate(run)) return true;
   return run.state === 'WAITING_DEPENDENCY' && run.interruptedFrom === 'REVIEWING' && active !== undefined &&
-    (['pending', 'terminal_unknown'].includes(active.status) && active.observations < NATIVE_REVIEW_OBSERVATIONS || active.status === 'qualified_complete' || active.status === 'incomplete' && active.failure === 'transport_failure') &&
+    (['pending', 'terminal_unknown'].includes(active.status) && active.observations < NATIVE_REVIEW_OBSERVATIONS || verdictEligible(active) || active.status === 'incomplete' && active.failure === 'transport_failure') &&
     Date.parse(active.nextObservationAt) <= Date.parse(now);
 }
 
@@ -199,15 +203,17 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
     if (!usableHost(host) || !context.owner || !context.assertLiveClaim) return result('Native review observation unavailable: qualified host/current owner/claim missing.');
     await context.assertLiveClaim(); context.assertCurrent();
     const owner=context.owner;
-    const eligible = () => (run.nativeReview?.requests ?? []).filter(r => r.submissionPossible && !hasAuthenticatedCompletion(r.identity,r.terminalDigest,r.completionProof,'review') && r.identity.runId === run.id && r.identity.claimId === run.dispatchClaimId && r.identity.missionId === owner.missionId && r.identity.laneId === owner.laneId && owner.generation >= r.identity.ownerGeneration && !(r.identity.requestId === run.nativeReview?.activeRequestId && r.status === 'incomplete' && r.failure !== 'transport_failure'));
+    const eligible = () => (run.nativeReview?.requests ?? []).filter(r => r.submissionPossible && !hasAuthenticatedCompletion(r.identity,r.terminalDigest,r.completionProof,'review') && r.identity.runId === run.id && r.identity.claimId === run.dispatchClaimId && r.identity.missionId === owner.missionId && r.identity.laneId === owner.laneId && owner.generation >= r.identity.ownerGeneration);
     const save = (next: Run) => { context.assertCurrent(); if(context.store.updateIfUnchanged?.(run,next)!==true)return false;run=next;return true; };
     const complete = async (request: NativeReviewRequestState, e: Extract<NativeOracleEvidence,{kind:'terminal'}>) => {
       if (!validNativeEvidence(e) || !same(e.identity,request.identity) || host.binding.authorActorIds.includes(e.authentication.actorId) || !host.authenticate(frozen(e))) return false;
       await context.assertLiveClaim!(); context.assertCurrent();
       host.receipts.recordNative!(e);
       const completionProof=host.receipts.recordAuthenticatedCompletion!('review',e,x=>x.kind==='terminal'&&host.authenticate(x as Extract<NativeOracleEvidence,{kind:'terminal'}>)&&!host.binding.authorActorIds.includes(x.authentication.actorId));
-      const inactive=['retired','replaced'].includes(request.status);
-      return save({...run,nativeReview:{...run.nativeReview!,requests:run.nativeReview!.requests.map(r=>r.identity.requestId===request.identity.requestId?{...r,terminalDigest:oracleDigest(e),completionProof,...(inactive?{}:{status:'qualified_complete' as const})}:r)}});
+      const refused=request.status==='incomplete' && request.failure!=='transport_failure';
+      const inactive=['retired','replaced'].includes(request.status) || refused;
+      const attention=request.identity.requestId===run.nativeReview?.activeRequestId && refused ? {wait:{kind:'qualification' as const,nextAttemptAt:new Date(Date.parse(context.now())+NATIVE_REVIEW_BACKOFF_MS).toISOString()}} : {};
+      return save({...run,nativeReview:{...run.nativeReview!,...attention,requests:run.nativeReview!.requests.map(r=>r.identity.requestId===request.identity.requestId?{...r,terminalDigest:oracleDigest(e),completionProof,...(inactive?{}:{status:'qualified_complete' as const})}:r)}});
     };
     let reconciled=false;
     for(const request of eligible()) {
@@ -216,7 +222,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
     }
     if(reconciled)return result('Exact cached Oracle terminals reconciled as evidence only; no verdict adopted or service read.');
     if(context.cachedOnly)return result('Explicit Oracle attention recovery found no exact cached completion; no service read permitted.');
-    const request=eligible().filter(r=>r.identity.bindingId===host.binding.bindingId&&r.identity.requestedModel===host.binding.model&&r.observations<NATIVE_REVIEW_OBSERVATIONS&&Date.parse(r.nextObservationAt)<=Date.parse(context.now())).sort((a,b)=>a.observations-b.observations||Date.parse(a.nextObservationAt)-Date.parse(b.nextObservationAt))[0];
+    const request=eligible().filter(r=>r.failure!=='safety_refusal' && (r.status!=='incomplete' || r.failure==='transport_failure') && r.identity.bindingId===host.binding.bindingId&&r.identity.requestedModel===host.binding.model&&r.observations<NATIVE_REVIEW_OBSERVATIONS&&Date.parse(r.nextObservationAt)<=Date.parse(context.now())).sort((a,b)=>a.observations-b.observations||Date.parse(a.nextObservationAt)-Date.parse(b.nextObservationAt))[0];
     if(!request||!host.observe)return result('Native review finite observation unavailable or not due; uncertainty retained.');
     let observing={...request,observations:request.observations+1,nextObservationAt:new Date(Date.parse(context.now())+NATIVE_REVIEW_BACKOFF_MS).toISOString()};
     if(!save({...run,nativeReview:{...run.nativeReview!,requests:run.nativeReview!.requests.map(r=>r.identity.requestId===request.identity.requestId?observing:r)}}))return result('Native review observation CAS lost.');
@@ -267,6 +273,8 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
       if (run.nativeReview?.requests.some(r=>r.identity.requestId!==run.nativeReview?.activeRequestId&&r.submissionPossible&&!hasAuthenticatedCompletion(r.identity,r.terminalDigest,r.completionProof,'review'))) {
         const observed=await observe({...context,run});run=observed.run;return wait(observed.reason);
       }
+      const refused=activeNativeReview(run);
+      if(refused?.failure!==undefined && refused.failure!=='transport_failure')return wait('Native review refusal/incomplete evidence is not current verdict or replacement authority.');
       const snapshot = context.snapshot;
       if (!owner || !run.dispatchClaimId || !run.repairTaskShapeAuthority || !run.headSha || snapshot.headSha !== run.headSha || snapshot.pullRequest?.state !== 'open' || snapshot.pullRequest.number !== run.pullRequest?.number ||
         snapshot.pullRequest.headSha !== run.headSha || !SHA.test(snapshot.pullRequest.baseSha ?? '') || snapshot.repository.owner.toLowerCase() !== run.target.owner.toLowerCase() || snapshot.repository.repo.toLowerCase() !== run.target.repo.toLowerCase()) return wait('Native review unavailable: exact Run/claim/mission/contract/PR candidate authority is missing.');
@@ -342,6 +350,9 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
           const marked = { ...active!, submissionPossible: true };
           if (!save({ ...run, nativeReview: { ...run.nativeReview!, requests: run.nativeReview!.requests.map((r) => r.identity.requestId === active!.identity.requestId ? marked : r) } })) return null;
           active = marked;
+          await context.assertInitiation?.();
+          await context.assertLiveClaim!();
+          context.assertCurrent();
           if (!save(context.onSubmission(run))) return null;
           await context.assertInitiation?.();
           await context.assertLiveClaim!();
@@ -394,7 +405,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
         const accepted = run.nativeReview?.accepted;
         const active = activeNativeReview(run);
         const owner = context.owner;
-        if (!accepted || !active || !hasAuthenticatedCompletion(active.identity, active.terminalDigest, active.completionProof, 'review') || !owner || active.status !== 'qualified_complete' || active.identity.requestId !== accepted.requestId || active.identity.claimId !== run.dispatchClaimId || active.identity.missionId !== owner.missionId || active.identity.laneId !== owner.laneId || owner.generation < active.identity.ownerGeneration ||
+        if (!accepted || !active || !hasAuthenticatedCompletion(active.identity, active.terminalDigest, active.completionProof, 'review') || !owner || !verdictEligible(active) || active.identity.requestId !== accepted.requestId || active.identity.claimId !== run.dispatchClaimId || active.identity.missionId !== owner.missionId || active.identity.laneId !== owner.laneId || owner.generation < active.identity.ownerGeneration ||
           active.identity.headSha !== run.headSha || active.identity.headSha !== context.snapshot.headSha || active.identity.baseSha !== context.snapshot.pullRequest?.baseSha || active.identity.pullRequestNumber !== context.snapshot.pullRequest?.number ||
           active.identity.contractRevision !== JSON.stringify([run.repairTaskShapeAuthority?.revision, host.binding.contractRevision]) || active.identity.policyRevision !== host.binding.policyRevision || active.identity.scope !== host.binding.scope || active.identity.bindingId !== host.binding.bindingId || active.identity.requestedModel !== host.binding.model || !host.binding.supportedEfforts.includes(active.identity.requestedEffort)) return false;
         const request = host.receipts.readNative!(`${accepted.requestId}.request`);

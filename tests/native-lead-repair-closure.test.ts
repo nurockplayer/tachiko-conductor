@@ -230,6 +230,8 @@ it('never downgrades held incomplete/refusal evidence when a later observation i
 it('completes actual lead/new-HEAD/fresh gates/native squash/settlement/reconciliation before queue delivery', async () => {
   const f = fixture(); try {
     await ready(f); const m = mergeFixture(f); await m.issue(); const r = f.run(); assertNativeMergeSettlement(r);
+    const refusedReview:Run={...r,nativeReview:{...r.nativeReview!,requests:r.nativeReview!.requests.map(q=>q.identity.requestId===r.nativeReview!.activeRequestId?{...q,failure:'safety_refusal'}:q)}};
+    assert.throws(()=>assertNativeMergeSettlement(refusedReview),/review.*qualification/i,'a genuine merge attempt cannot reuse a refused Oracle projection as current settlement authority');
     assert.equal(m.writes(), 1); assert.equal(f.registry().readLane(`run:${r.id}`)!.parkedReason, 'workflow_settled');
     assert.equal(isDispatchRunOwnerRetiredCommand(f.store(), r, f.registry()), false);
     assert.equal(selectDispatchRuntime(await f.runtime.listRuntimeComments())!.claim.issue, 42);

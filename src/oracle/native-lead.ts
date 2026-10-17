@@ -11,7 +11,7 @@ import { assertExecutionSupportedByProvider, type ResolvedExecutionConfiguration
 import { isValidationResultCoherent } from '../domain/validation.js';
 import { canonicalReviewTarget } from '../reviewers/risk-policy.js';
 import type { NativeOracleEvidence, NativeSourceManifest, OracleReceiptStore } from './types.js';
-import { validNativeEvidence, unresolvedNativeReview } from './native-reviewer.js';
+import { validNativeEvidence, nativeReviewCoherent, unresolvedNativeReview } from './native-reviewer.js';
 import { oracleDigest, validNativeSourceManifest } from './source-evidence.js';
 import { acceptedScopeFromHandoff } from '../agents/implementation-packet.js';
 const DIGEST = /^[0-9a-f]{64}$/;
@@ -403,7 +403,7 @@ function leadAcceptanceMatches(request: NativeLeadRequest, acceptance: NativeLea
 export function leadConsumptionValid(run: Run, reference: LeadRepairReference | undefined): boolean {
   const a = acceptedNativeLead(run);
   const r = reference;
-  return !unresolvedNativeRepairHistory(run) && !!r && !!activeNativeLead(run) && hasAuthenticatedCompletion(activeNativeLead(run)!.identity, activeNativeLead(run)!.terminalDigest, activeNativeLead(run)!.completionProof, 'lead') && validLeadRepairReference(r) && run.implementationAuthority !== undefined && r.implementationAuthoritySha256 === oracleDigest(run.implementationAuthority) && !!a && leadAcceptanceMatches(activeNativeLead(run)!, a) && same(a, stripConsumption(r)) && activeNativeLead(run)?.status === 'qualified_complete' && run.reviewResult?.verdict === 'request_changes' && run.nativeReview?.accepted?.digest === r.identity.origin.digest && run.headSha === r.identity.headSha && run.pullRequest?.number === r.identity.pullRequestNumber && r.identity.repairOrdinal === run.history.filter(h => h.type === 'start_fix').length + 1 && r.identity.repairOrdinal <= r.identity.repairLimit && same(r.identity.blockingFindingIds, run.reviewResult.findings.flatMap((f, i) => f.severity === 'blocking' ? [`${r.identity.origin.digest}:${i}`] : [])) && !(run.repairAdmissions ?? []).some(p => p.leadDisposition?.identity.incarnation === r.identity.incarnation) && leadOwnerProved(run, r.identity, { missionId: r.identity.missionId, laneId: r.identity.laneId, generation: r.consumptionGeneration });
+  return nativeReviewCoherent(run) && !unresolvedNativeRepairHistory(run) && !!r && !!activeNativeLead(run) && hasAuthenticatedCompletion(activeNativeLead(run)!.identity, activeNativeLead(run)!.terminalDigest, activeNativeLead(run)!.completionProof, 'lead') && validLeadRepairReference(r) && run.implementationAuthority !== undefined && r.implementationAuthoritySha256 === oracleDigest(run.implementationAuthority) && !!a && leadAcceptanceMatches(activeNativeLead(run)!, a) && same(a, stripConsumption(r)) && activeNativeLead(run)?.status === 'qualified_complete' && run.reviewResult?.verdict === 'request_changes' && run.nativeReview?.accepted?.digest === r.identity.origin.digest && run.headSha === r.identity.headSha && run.pullRequest?.number === r.identity.pullRequestNumber && r.identity.repairOrdinal === run.history.filter(h => h.type === 'start_fix').length + 1 && r.identity.repairOrdinal <= r.identity.repairLimit && same(r.identity.blockingFindingIds, run.reviewResult.findings.flatMap((f, i) => f.severity === 'blocking' ? [`${r.identity.origin.digest}:${i}`] : [])) && !(run.repairAdmissions ?? []).some(p => p.leadDisposition?.identity.incarnation === r.identity.incarnation) && leadOwnerProved(run, r.identity, { missionId: r.identity.missionId, laneId: r.identity.laneId, generation: r.consumptionGeneration });
 }
 export function leadAuthority(run: Run, snapshot: GitHubLiveSnapshot, execution: ResolvedExecutionConfiguration, maxAttempts: number): NativeLeadAuthority {
   if (!originalImplementationMatches(run, snapshot)) throw new Error('Original admitted implementation authority is missing or changed.');
@@ -624,7 +624,7 @@ export function resolveNativeLead(host?: NativeLeadHost): NativeLeadBoundary {
       };
       if (!usable(host))
         return wait('Native lead unavailable: no accepted qualified read-only host binding.');
-      if (!c.owner || !c.assertLiveClaim || !run.dispatchClaimId || !run.nativeReview?.accepted)
+      if (!c.owner || !c.assertLiveClaim || !run.dispatchClaimId || !run.nativeReview?.accepted || !nativeReviewCoherent(run))
         return wait('Native lead unavailable: current owner/claim/origin proof missing.');
       await c.assertLiveClaim();
       c.assertCurrent();
