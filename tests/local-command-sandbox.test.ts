@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import os from 'node:os';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { afterEach, describe, it } from 'node:test';
 
-import { ConfiguredLocalValidationAdapter, hasSupportedProductionGitRuntime } from '../src/validation/local-command.js';
+import { ConfiguredLocalValidationAdapter, copyDependencyStore, disposePrivateTrees, hasSupportedProductionGitRuntime } from '../src/validation/local-command.js';
 import { TARGET } from './helpers.js';
 
 const dirs: string[] = [];
@@ -44,6 +45,104 @@ describe('ConfiguredLocalValidationAdapter sandbox boundary', () => {
     }).validate(owned);
     assert.equal(result.status, 'unknown');
     assert.deepEqual(result.commands, [{ commandIndex: 0, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 }]);
+  });
+
+  it('settles a normal-exit descendant under the real configured pnpm seatbelt before cleanup or later commands', { skip: process.platform !== 'darwin' }, async (t) => {
+    const pnpm = process.env.npm_execpath;
+    assert.ok(pnpm !== undefined && path.isAbsolute(pnpm), 'run the Darwin regression through pinned pnpm');
+    for (const mode of ['owned request', 'pre-existing PR workspace'] as const) {
+      await t.test(mode, async () => {
+        const owned = request();
+        const artifact = mkdtempSync(path.join(os.tmpdir(), 'tachiko-sandbox-group-artifact-'));
+        dirs.push(artifact);
+        const lockfile = 'lockfileVersion: 9.0\n';
+        writeFileSync(path.join(owned.workspacePath, 'pnpm-lock.yaml'), lockfile);
+        writeFileSync(path.join(owned.workspacePath, 'package.json'), JSON.stringify({
+          packageManager: 'pnpm@10.34.5', scripts: { leak: 'node leak.cjs', later: 'node later.cjs' },
+        }));
+        writeFileSync(path.join(owned.workspacePath, 'leak.cjs'), `
+const fs = require('node:fs');
+const path = require('node:path');
+const ready = path.join(process.env.TMPDIR, 'descendant-ready');
+const childSource = "process.on('SIGTERM',()=>{});require('node:fs').writeFileSync(" + JSON.stringify(ready) + ",'ready');setInterval(()=>{},1000)";
+const child = require('node:child_process').spawn(process.execPath, ['-e', childSource], { stdio: 'ignore' });
+child.unref();
+fs.writeFileSync(path.join(process.env.TMPDIR, 'normal-exit-descendant.json'), JSON.stringify({ pid: child.pid, workspace: process.cwd() }));
+let checks = 0;
+const waiting = setInterval(() => {
+  if (fs.existsSync(ready)) { clearInterval(waiting); process.exit(0); }
+  if (++checks > 200) process.exit(18);
+}, 25);
+`);
+        writeFileSync(path.join(owned.workspacePath, 'later.cjs'), "require('node:fs').writeFileSync(require('node:path').join(process.env.TMPDIR,'later-command'),'ran');\n");
+        assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'add', '.']).status, 0);
+        assert.equal(spawnSync('git', ['-C', owned.workspacePath, 'commit', '-m', 'normal-exit descendant fixture']).status, 0);
+        owned.headSha = spawnSync('git', ['-C', owned.workspacePath, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).stdout.trim();
+        // A real private store copy exposes only this owned runtime path to the
+        // host fixture; the descendant writes no host file or network socket.
+        mkdirSync(path.join(artifact, 'store'));
+        writeFileSync(path.join(artifact, 'pnpm-lock.yaml.sha256'), createHash('sha256').update(lockfile).digest('hex'));
+        let runtime: string | undefined;
+        let descendantPid: number | undefined;
+        let cleanupCalls = 0;
+        const rememberDescendant = () => {
+          if (runtime === undefined) return;
+          const receipt = path.join(runtime, 'tmp', 'normal-exit-descendant.json');
+          if (existsSync(receipt)) {
+            const recorded = JSON.parse(readFileSync(receipt, 'utf8')) as { pid: number; workspace: string };
+            descendantPid = recorded.pid;
+            assert.equal(path.basename(recorded.workspace), 'workspace');
+            const snapshot = path.dirname(recorded.workspace);
+            assert.ok(path.basename(snapshot).startsWith('tachiko-validation-snapshot-'));
+            dirs.push(snapshot);
+          }
+        };
+        try {
+          const result = await new ConfiguredLocalValidationAdapter({
+            revision: 'darwin-normal-exit-group-v1', nodeProgram: process.execPath, pnpmProgram: pnpm, gitProgram: '/usr/bin/git',
+            dependencyArtifactPath: artifact,
+            ...(mode === 'pre-existing PR workspace' ? { workspacePath: owned.workspacePath } : {}),
+            commands: [
+              { argv: [pnpm, 'run', 'leak'], timeoutMs: 30_000 },
+              { argv: [pnpm, 'run', 'later'], timeoutMs: 30_000 },
+            ],
+          }, async (source, destination) => {
+            runtime = path.dirname(destination);
+            dirs.push(runtime);
+            return copyDependencyStore(source, destination);
+          }, async (paths) => {
+            cleanupCalls += 1;
+            dirs.push(...paths);
+            rememberDescendant();
+            assert.ok(descendantPid !== undefined && Number.isSafeInteger(descendantPid) && descendantPid > 1);
+            assert.throws(() => process.kill(descendantPid!, 0), { code: 'ESRCH' }, 'cleanup must follow real owned descendant settlement');
+            assert.equal(existsSync(path.join(runtime!, 'tmp', 'later-command')), false);
+            return disposePrivateTrees(paths);
+          }).validate(mode === 'owned request' ? owned : { target: TARGET, headSha: owned.headSha });
+          assert.equal(result.status, 'unknown', JSON.stringify(result));
+          assert.equal(result.commands.length, 1, JSON.stringify(result));
+          assert.equal(result.commands[0]?.outcome, 'unavailable', JSON.stringify(result));
+          assert.equal(result.commands[0]?.exitCode, null);
+          assert.equal(cleanupCalls, 1);
+          assert.ok(runtime !== undefined);
+          assert.equal(existsSync(runtime), false);
+        } finally {
+          rememberDescendant();
+          if (descendantPid !== undefined) {
+            assert.ok(Number.isSafeInteger(descendantPid) && descendantPid > 1 && descendantPid !== process.pid);
+            try { process.kill(descendantPid, 'SIGKILL'); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+            const deadline = Date.now() + 2_000;
+            while (Date.now() < deadline) {
+              try { process.kill(descendantPid, 0); }
+              catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') break; throw error; }
+              await new Promise<void>((resolve) => setTimeout(resolve, 25));
+            }
+            assert.throws(() => process.kill(descendantPid!, 0), { code: 'ESRCH' });
+          }
+        }
+      });
+    }
   });
 
   it('runs pinned tools with private IPC while denying host files, sockets and IP networking under the macOS seatbelt', { skip: process.platform !== 'darwin' }, async (t) => {

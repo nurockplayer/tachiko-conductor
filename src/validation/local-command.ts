@@ -12,6 +12,11 @@ function malformed(commandIndex: number, executable = ''): LocalValidationComman
 }
 
 const TERMINATION_GRACE_MS = 1_000;
+// Invocation-local host state, never serialized as validation authority. If
+// absence of an owned POSIX group is unproved, retain every private tree that
+// a command or infrastructure helper could still be using.
+interface ExecutionSettlement { unproven: boolean }
+
 // Snapshot materialization is part of the validation authority boundary, not
 // the validation command itself. Keep it independently bounded so a valid
 // short command budget cannot make ordinary repository reconstruction
@@ -186,6 +191,16 @@ export async function ignoredManifest(
   gitProgram = 'git',
   options: IgnoredManifestLimits = {},
 ): Promise<string[] | null> {
+  return ignoredManifestWithSettlement(authority, gitProgram, options, { unproven: false });
+}
+
+async function ignoredManifestWithSettlement(
+  authority: GitAuthority,
+  gitProgram: string,
+  options: IgnoredManifestLimits,
+  settlement: ExecutionSettlement,
+): Promise<string[] | null> {
+  if (settlement.unproven) return null;
   const limits = {
     timeoutMs: options.timeoutMs ?? IGNORED_MANIFEST_TIMEOUT_MS,
     maxEntries: options.maxEntries ?? IGNORED_MANIFEST_MAX_ENTRIES,
@@ -202,7 +217,7 @@ export async function ignoredManifest(
   const result = path.join(temporary, 'result.json');
   let manifest: string[] | null = null;
   try {
-    const execution = await execute(-1, { argv: [nodeProgram, '-e', IGNORED_MANIFEST_PROGRAM, gitProgram, authority.gitDir, authority.path, result, JSON.stringify(limits)], timeoutMs: limits.timeoutMs }, temporary, validatorGitEnvironment(), undefined);
+    const execution = await execute(-1, { argv: [nodeProgram, '-e', IGNORED_MANIFEST_PROGRAM, gitProgram, authority.gitDir, authority.path, result, JSON.stringify(limits)], timeoutMs: limits.timeoutMs }, temporary, validatorGitEnvironment(), undefined, settlement);
     if (execution.outcome !== 'passed') return null;
     if (statSync(result).size > limits.maxOutputBytes) return null;
     const raw = readFileSync(result, 'utf8');
@@ -210,7 +225,7 @@ export async function ignoredManifest(
     if (typeof parsed === 'object' && parsed !== null && (parsed as { ok?: unknown }).ok === true && Array.isArray((parsed as { manifest?: unknown }).manifest) &&
       (parsed as { manifest: unknown[] }).manifest.every((entry) => typeof entry === 'string')) manifest = (parsed as { manifest: string[] }).manifest;
   } catch { manifest = null; }
-  finally { if (!(await disposePrivateTrees([temporary]))) manifest = null; }
+  finally { if (!(await cleanPrivateTreesWithSettlement([temporary], settlement))) manifest = null; }
   return manifest;
 }
 
@@ -230,7 +245,10 @@ async function workspaceMatches(
   trustedIgnoredBaselinePath?: string,
   gitProgram = 'git',
   environment = validatorGitEnvironment(),
+  settlement: ExecutionSettlement = { unproven: false },
 ): Promise<string[] | null> {
+  if (settlement.unproven) return null;
+  const cleanPrivateTrees: PrivateTreeCleaner = (paths) => cleanPrivateTreesWithSettlement(paths, settlement);
   const authority = directGitAuthority(workspacePath);
   if (authority === null) return null;
   // This verification reads candidate Git metadata.  A candidate-controlled
@@ -242,13 +260,14 @@ async function workspaceMatches(
   const head = invoke(['rev-parse', 'HEAD']);
   // Do not content-compare through worker metadata/config: use a no-local
   // private bare clone and private index below as the settlement authority.
-  const comparison = await baselineWorkspace(workspacePath, disposePrivateTrees, request.headSha, gitProgram, environment);
+  const comparison = await baselineWorkspace(workspacePath, cleanPrivateTrees, request.headSha, gitProgram, environment);
   if (comparison === null) return null;
   const comparisonInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(comparison, args), { encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment }) as SpawnSyncReturns<string>;
   const tracked = comparisonInvoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
-  const manifest = await ignoredManifest(comparison, gitProgram);
+  const manifest = await ignoredManifestWithSettlement(comparison, gitProgram, {}, settlement);
+  if (settlement.unproven) return null;
   const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
-  if (head.status !== 0 || head.stdout.trim() !== request.headSha || tracked.status !== 0 || manifest === null || hiddenIndexFlags !== false) { await disposePrivateTrees([comparison.privateRoot]); return null; }
+  if (head.status !== 0 || head.stdout.trim() !== request.headSha || tracked.status !== 0 || manifest === null || hiddenIndexFlags !== false) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
   if (trustedIgnoredBaselinePath !== undefined) {
     // A configured baseline becomes the command cwd, even when both ignored
     // manifests are empty.  Prove it is a separate, clean checkout of this
@@ -258,28 +277,29 @@ async function workspaceMatches(
     try {
       baselinePath = realpathSync(trustedIgnoredBaselinePath);
       workerPath = realpathSync(workspacePath);
-    } catch { await disposePrivateTrees([comparison.privateRoot]); return null; }
-    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) { await disposePrivateTrees([comparison.privateRoot]); return null; }
-    const baselineAuthority = await baselineWorkspace(baselinePath, disposePrivateTrees, request.headSha, gitProgram, environment);
-    if (baselineAuthority === null) { await disposePrivateTrees([comparison.privateRoot]); return null; }
+    } catch { await cleanPrivateTrees([comparison.privateRoot]); return null; }
+    if (baselinePath === workerPath || baselinePath.startsWith(`${workerPath}${path.sep}`) || workerPath.startsWith(`${baselinePath}${path.sep}`)) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
+    const baselineAuthority = await baselineWorkspace(baselinePath, cleanPrivateTrees, request.headSha, gitProgram, environment);
+    if (baselineAuthority === null) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
     const baselineInvoke: GitInvoke = (args, timeoutMs = TERMINATION_GRACE_MS) => spawnSync(gitProgram, gitArguments(baselineAuthority, args), {
       encoding: 'utf8', shell: false, timeout: timeoutMs, maxBuffer: GIT_STATUS_MAX_BUFFER, env: environment,
     }) as SpawnSyncReturns<string>;
     const baselineHead = baselineInvoke(['rev-parse', 'HEAD']);
     const baselineTracked = baselineInvoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
-    const baselineManifest = await ignoredManifest(baselineAuthority, gitProgram);
+    const baselineManifest = await ignoredManifestWithSettlement(baselineAuthority, gitProgram, {}, settlement);
+    if (settlement.unproven) return null;
     const baselineHiddenIndexFlags = hasHiddenIndexFlags(baselineInvoke);
     const baselineValid = baselineHead.status === 0 && baselineHead.stdout.trim() === request.headSha && baselineTracked.status === 0 && baselineManifest !== null && baselineManifest.join('\n') === manifest.join('\n') && baselineHiddenIndexFlags === false;
-    const baselineCleaned = await disposePrivateTrees([baselineAuthority.privateRoot]);
-    if (!baselineCleaned) { await disposePrivateTrees([comparison.privateRoot]); return null; }
-    if (!baselineValid) { await disposePrivateTrees([comparison.privateRoot]); return null; }
+    const baselineCleaned = await cleanPrivateTrees([baselineAuthority.privateRoot]);
+    if (!baselineCleaned) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
+    if (!baselineValid) { await cleanPrivateTrees([comparison.privateRoot]); return null; }
   } else if (manifest.length > 0) {
     // Never globally ignore ignored paths. They are admissible only when a
     // separate host-owned clean checkout at this exact HEAD proves identical
     // bytes existed before the worker could have written its workspace.
-    await disposePrivateTrees([comparison.privateRoot]); return null;
+    await cleanPrivateTrees([comparison.privateRoot]); return null;
   }
-  if (!(await disposePrivateTrees([comparison.privateRoot]))) return null;
+  if (!(await cleanPrivateTrees([comparison.privateRoot]))) return null;
   if (!requireRepositoryIdentity) return manifest;
   const remote = invoke(['remote', 'get-url', 'origin']);
   return remote.status === 0 && remoteMatchesTarget(remote.stdout, request) ? manifest : null;
@@ -287,7 +307,8 @@ async function workspaceMatches(
 
 /** The reconstructed checkout has no remote by design.  Bind command evidence
  * to its immutable exact commit and reject any tracked/index mutation. */
-async function commandWorkspaceManifest(authority: GitAuthority, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment()): Promise<string[] | null> {
+async function commandWorkspaceManifest(authority: GitAuthority, headSha: string, gitProgram = 'git', environment = validatorGitEnvironment(), settlement: ExecutionSettlement = { unproven: false }): Promise<string[] | null> {
+  if (settlement.unproven) return null;
   // The reconstructed checkout contains candidate history.  Every trusted
   // host-side probe pins fsmonitor off so a copied or otherwise planted local
   // config cannot execute while evidence is being verified.
@@ -298,11 +319,11 @@ async function commandWorkspaceManifest(authority: GitAuthority, headSha: string
   const tracked = invoke(['diff', '--no-ext-diff', '--no-textconv', '--no-renames', '--quiet', '--exit-code', 'HEAD', '--']);
   const hiddenIndexFlags = hasHiddenIndexFlags(invoke);
   if (head.status !== 0 || head.stdout.trim() !== headSha || tracked.status !== 0 || hiddenIndexFlags !== false) return null;
-  return ignoredManifest(authority, gitProgram);
+  return ignoredManifestWithSettlement(authority, gitProgram, {}, settlement);
 }
 
-async function commandWorkspaceMatches(authority: GitAuthority, headSha: string, expectedIgnored: readonly string[] = [], gitProgram = 'git', environment = validatorGitEnvironment()): Promise<boolean> {
-  const manifest = await commandWorkspaceManifest(authority, headSha, gitProgram, environment);
+async function commandWorkspaceMatches(authority: GitAuthority, headSha: string, expectedIgnored: readonly string[] = [], gitProgram = 'git', environment = validatorGitEnvironment(), settlement: ExecutionSettlement = { unproven: false }): Promise<boolean> {
+  const manifest = await commandWorkspaceManifest(authority, headSha, gitProgram, environment, settlement);
   return manifest !== null && manifest.join('\n') === expectedIgnored.join('\n');
 }
 
@@ -600,35 +621,67 @@ async function execute(
   workspacePath: string,
   environment: NodeJS.ProcessEnv,
   sandboxProfile?: string,
+  settlement?: ExecutionSettlement,
 ): Promise<LocalValidationCommandEvidence> {
   const executable = command.argv[0]!;
   const startedAt = Date.now();
+  if (settlement?.unproven) return { commandIndex, executable, outcome: 'unavailable', exitCode: null, durationMs: 0 };
   return new Promise((resolve) => {
     let settled = false;
     let timedOut = false;
     let timer: NodeJS.Timeout | undefined;
     let forceTimer: NodeJS.Timeout | undefined;
     let settling = false;
+    const clearTimers = (): void => {
+      if (timer !== undefined) clearTimeout(timer);
+      if (forceTimer !== undefined) clearTimeout(forceTimer);
+    };
     const finish = (outcome: LocalValidationCommandEvidence['outcome'], exitCode: number | null): void => {
       if (settled) return;
       settled = true;
-      if (timer !== undefined) clearTimeout(timer);
-      if (forceTimer !== undefined) clearTimeout(forceTimer);
+      clearTimers();
       resolve({ commandIndex, executable, outcome, exitCode, durationMs: Date.now() - startedAt });
     };
-    const settleTimedOutProcess = async (child: ReturnType<typeof spawn>): Promise<void> => {
+    const settleProcess = async (
+      child: ReturnType<typeof spawn>,
+      outcome: LocalValidationCommandEvidence['outcome'],
+      exitCode: number | null,
+      allowNaturalSettlement = false,
+    ): Promise<void> => {
+      // close/error/deadline can race; exactly one owner may settle the group
+      // and no later event may publish evidence or start another command early.
       if (settling || settled) return;
       settling = true;
+      clearTimers();
       if (process.platform === 'win32') {
-        finish((await terminateWindowsProcessTree(child.pid)) ? 'timed_out' : 'unavailable', null);
+        // Retain existing normal-close semantics on Windows; this POSIX-group
+        // repair does not qualify Windows descendants or escaped sessions.
+        if (timedOut) finish((await terminateWindowsProcessTree(child.pid)) ? 'timed_out' : 'unavailable', null);
+        else finish(outcome, exitCode);
         return;
       }
-      terminateProcessGroup(child.pid, 'SIGKILL');
-      // A child `close` event only proves the direct process exited.  For a
-      // detached validation command, prove the owned group has no surviving
-      // descendants before recording a timeout; otherwise fail closed.
-      const groupSettled = await waitForProcessGroupSettlement(child.pid);
-      finish(groupSettled ? 'timed_out' : 'unavailable', null);
+      // A spawn failure without a pid created no owned process group.
+      if (child.pid === undefined) { finish('unavailable', null); return; }
+      let groupSettled = processGroupHasSettled(child.pid);
+      if (!groupSettled && allowNaturalSettlement) {
+        // A direct close can precede ordinary descendant teardown. Give it
+        // the existing bounded grace before requiring termination.
+        groupSettled = await waitForProcessGroupSettlement(child.pid);
+      }
+      const requiredIntervention = !groupSettled;
+      if (!groupSettled) {
+        terminateProcessGroup(child.pid, 'SIGKILL');
+        groupSettled = await waitForProcessGroupSettlement(child.pid);
+      }
+      if (!groupSettled) {
+        if (settlement !== undefined) settlement.unproven = true;
+        finish('unavailable', null);
+        return;
+      }
+      // A parent exit0 cannot turn a leaked group into PASS merely because we
+      // killed it. unavailable/null preserves the compact evidence contract.
+      if (requiredIntervention && outcome === 'passed') finish('unavailable', null);
+      else finish(outcome, exitCode);
     };
     let child: ReturnType<typeof spawn>;
     try {
@@ -644,23 +697,20 @@ async function execute(
       return;
     }
     timer = setTimeout(() => {
+      if (settling || settled) return;
       timedOut = true;
       if (process.platform === 'win32') {
-        void settleTimedOutProcess(child);
+        void settleProcess(child, 'timed_out', null);
         return;
       }
       if (!terminateProcessGroup(child.pid, 'SIGTERM')) child.kill('SIGTERM');
       forceTimer = setTimeout(() => {
-        void settleTimedOutProcess(child);
+        void settleProcess(child, 'timed_out', null);
       }, TERMINATION_GRACE_MS);
     }, command.timeoutMs);
-    child.once('error', () => finish('unavailable', null));
+    child.once('error', () => { void settleProcess(child, timedOut ? 'timed_out' : 'unavailable', null); });
     child.once('close', (code) => {
-      if (timedOut) {
-        void settleTimedOutProcess(child);
-        return;
-      }
-      finish(code === 0 ? 'passed' : 'failed', code);
+      void settleProcess(child, timedOut ? 'timed_out' : code === 0 ? 'passed' : 'failed', timedOut ? null : code, !timedOut);
     });
   });
 }
@@ -682,13 +732,23 @@ export async function copyDependencyStore(
   destination: string,
   options: { readonly timeoutMs?: number; readonly nodeProgram?: string } = {},
 ): Promise<boolean> {
+  return copyDependencyStoreWithSettlement(source, destination, options, { unproven: false });
+}
+
+async function copyDependencyStoreWithSettlement(
+  source: string,
+  destination: string,
+  options: { readonly timeoutMs?: number; readonly nodeProgram?: string },
+  settlement: ExecutionSettlement,
+): Promise<boolean> {
+  if (settlement.unproven) return false;
   const timeoutMs = options.timeoutMs ?? DEPENDENCY_STORE_COPY_TIMEOUT_MS;
   const nodeProgram = options.nodeProgram ?? process.execPath;
   if (!path.isAbsolute(source) || !path.isAbsolute(destination) || !path.isAbsolute(nodeProgram) ||
     !Number.isSafeInteger(timeoutMs) || timeoutMs < MIN_LOCAL_VALIDATION_TIMEOUT_MS || timeoutMs > MAX_LOCAL_VALIDATION_TIMEOUT_MS) return false;
   const result = await execute(-1, {
     argv: [nodeProgram, '-e', DEPENDENCY_STORE_COPY_PROGRAM, source, destination], timeoutMs,
-  }, path.dirname(destination), {}, undefined);
+  }, path.dirname(destination), {}, undefined, settlement);
   return result.outcome === 'passed';
 }
 
@@ -701,6 +761,26 @@ export async function disposePrivateTrees(
   paths: readonly string[],
   options: { readonly timeoutMs?: number; readonly nodeProgram?: string } = {},
 ): Promise<boolean> {
+  return disposePrivateTreesWithSettlement(paths, options, { unproven: false });
+}
+
+async function cleanPrivateTreesWithSettlement(
+  paths: readonly string[],
+  settlement: ExecutionSettlement,
+  cleaner: PrivateTreeCleaner = disposePrivateTrees,
+): Promise<boolean> {
+  if (settlement.unproven) return false;
+  return cleaner === disposePrivateTrees
+    ? disposePrivateTreesWithSettlement(paths, {}, settlement)
+    : cleaner(paths);
+}
+
+async function disposePrivateTreesWithSettlement(
+  paths: readonly string[],
+  options: { readonly timeoutMs?: number; readonly nodeProgram?: string },
+  settlement: ExecutionSettlement,
+): Promise<boolean> {
+  if (settlement.unproven) return false;
   if (paths.length === 0 || !paths.every(isOwnedPrivateTreePath)) return false;
   const timeoutMs = options.timeoutMs ?? PRIVATE_TREE_CLEANUP_TIMEOUT_MS;
   const nodeProgram = options.nodeProgram ?? process.execPath;
@@ -708,7 +788,7 @@ export async function disposePrivateTrees(
     timeoutMs < MIN_LOCAL_VALIDATION_TIMEOUT_MS || timeoutMs > MAX_LOCAL_VALIDATION_TIMEOUT_MS) return false;
   const result = await execute(-1, {
     argv: [nodeProgram, '-e', PRIVATE_TREE_CLEANUP_PROGRAM, ...paths], timeoutMs,
-  }, path.parse(path.resolve(paths[0]!)).root, {}, undefined);
+  }, path.parse(path.resolve(paths[0]!)).root, {}, undefined, settlement);
   return result.outcome === 'passed';
 }
 
@@ -944,8 +1024,10 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     if (workspacePath === undefined) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
+    const settlement: ExecutionSettlement = { unproven: false };
+    const cleanPrivateTrees: PrivateTreeCleaner = (paths) => cleanPrivateTreesWithSettlement(paths, settlement, this.cleanPrivateTrees);
     const gitEnvironment = validatorGitEnvironment();
-    const admittedIgnoredManifest = await workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment);
+    const admittedIgnoredManifest = await workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment, settlement);
     if (admittedIgnoredManifest === null) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     // A configured baseline is host-owned and already proved byte-identical
     // for every ignored dependency.  It is therefore the only place those
@@ -953,8 +1035,8 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
     // input so worker-controlled .git bytes have no validation authority.
     const baseline = this.configuration.trustedIgnoredBaselinePath;
     const commandWorkspace = baseline === undefined
-      ? await reconstructedWorkspace(workspacePath, request.headSha, this.cleanPrivateTrees, this.configuration.gitProgram, gitEnvironment)
-      : await baselineWorkspace(baseline, this.cleanPrivateTrees, request.headSha, this.configuration.gitProgram, gitEnvironment);
+      ? await reconstructedWorkspace(workspacePath, request.headSha, cleanPrivateTrees, this.configuration.gitProgram, gitEnvironment)
+      : await baselineWorkspace(baseline, cleanPrivateTrees, request.headSha, this.configuration.gitProgram, gitEnvironment);
     if (commandWorkspace === null) {
       return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
     }
@@ -982,7 +1064,9 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // command sequence a private copy, preserving the host artifact's bytes.
       const privateStore = dependencyStore === null ? undefined : path.join(runtimeRoot, 'store');
       if (dependencyStore !== null && privateStore !== undefined) {
-        if (!(await this.copyStore(dependencyStore, privateStore))) {
+        if (!(await (this.copyStore === copyDependencyStore
+          ? copyDependencyStoreWithSettlement(dependencyStore, privateStore, {}, settlement)
+          : this.copyStore(dependencyStore, privateStore)))) {
           return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
         }
       }
@@ -1007,7 +1091,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
       // itself never grants this authority, and later checks pin this same
       // manifest (or the separately captured cold-hydration manifest).
       const initialIgnoredManifest = baseline === undefined ? [] : admittedIgnoredManifest;
-      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, initialIgnoredManifest, this.configuration.gitProgram, gitEnvironment))) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
+      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, initialIgnoredManifest, this.configuration.gitProgram, gitEnvironment, settlement))) return { status: 'unknown', configRevision: revision, commands: [workspaceUnavailable(0)] };
       let hydratedManifest: readonly string[] = initialIgnoredManifest;
       let settledManifest: readonly string[] = initialIgnoredManifest;
       for (let index = 0; index < configured.length; index += 1) {
@@ -1016,13 +1100,13 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
           evidence.push(malformed(index, Array.isArray((command as { argv?: unknown })?.argv) ? String((command as { argv: unknown[] }).argv[0] ?? '') : ''));
           return { status: 'unknown', configRevision: revision, commands: evidence };
         }
-        const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile);
+        const result = await execute(index, command, commandWorkspace.path, environment, sandboxProfile, settlement);
         evidence.push(result);
         if (result.outcome === 'failed' || result.outcome === 'timed_out') {
           return { status: 'failed', configRevision: revision, commands: evidence };
         }
         if (result.outcome !== 'passed') return { status: 'unknown', configRevision: revision, commands: evidence };
-        const manifest = await commandWorkspaceManifest(commandWorkspace, request.headSha, this.configuration.gitProgram, gitEnvironment);
+        const manifest = await commandWorkspaceManifest(commandWorkspace, request.headSha, this.configuration.gitProgram, gitEnvironment, settlement);
         const isHydration = index === 0 && this.configuration.dependencyArtifactPath !== undefined;
         const isFinal = index === configured.length - 1;
         const manifestAdmitted = manifest !== null && (
@@ -1039,11 +1123,11 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         if (isHydration) hydratedManifest = manifest;
         settledManifest = manifest;
       }
-      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, settledManifest, this.configuration.gitProgram, gitEnvironment))) {
+      if (!(await commandWorkspaceMatches(commandWorkspace, request.headSha, settledManifest, this.configuration.gitProgram, gitEnvironment, settlement))) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
-      if ((await workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment)) === null) {
+      if ((await workspaceMatches(request, workspacePath, requiresRepositoryIdentity, this.configuration.trustedIgnoredBaselinePath, this.configuration.gitProgram, gitEnvironment, settlement)) === null) {
         evidence.push(workspaceUnavailable(evidence.length));
         return { status: 'unknown', configRevision: revision, commands: evidence };
       }
@@ -1054,7 +1138,7 @@ export class ConfiguredLocalValidationAdapter implements ValidationAdapter {
         commandWorkspace.privateRoot,
       ];
       let cleaned = privateTrees.length === 0;
-      try { cleaned = cleaned || await this.cleanPrivateTrees(privateTrees); } catch { cleaned = false; }
+      try { cleaned = cleaned || await cleanPrivateTrees(privateTrees); } catch { cleaned = false; }
       if (!cleaned) {
         return { status: 'unknown', configRevision: revision, commands: [...evidence, workspaceUnavailable(evidence.length)] };
       }

@@ -55,6 +55,53 @@ function configuration(argv: readonly string[], timeoutMs = 5_000): LocalValidat
   return { revision: 'test-v1', commands: [{ argv, timeoutMs }] };
 }
 
+function fixtureGroupIsGone(pgid: number): boolean {
+  assert.ok(Number.isSafeInteger(pgid) && pgid > 1 && pgid !== process.pid);
+  try { process.kill(-pgid, 0); return false; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return true;
+    throw error;
+  }
+}
+
+async function cleanFixtureGroup(receiptPath: string): Promise<void> {
+  if (!existsSync(receiptPath)) return;
+  const { pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pgid: number };
+  if (fixtureGroupIsGone(pgid)) return;
+  try { process.kill(-pgid, 'SIGKILL'); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+  const deadline = Date.now() + 2_000;
+  while (!fixtureGroupIsGone(pgid) && Date.now() < deadline) {
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+  }
+  assert.equal(fixtureGroupIsGone(pgid), true, 'owned fixture group must be reaped before cleanup');
+}
+
+function fixturePrivateTrees(receiptPath: string): string[] {
+  const receipt = JSON.parse(readFileSync(receiptPath, 'utf8')) as { workspace: string; temporary: string };
+  const snapshot = path.dirname(receipt.workspace);
+  const runtime = path.dirname(receipt.temporary);
+  assert.equal(path.basename(receipt.workspace), 'workspace');
+  assert.ok(path.basename(snapshot).startsWith('tachiko-validation-snapshot-'));
+  assert.ok(path.basename(runtime).startsWith('tcv-'));
+  return [snapshot, runtime];
+}
+
+function manifestFixturePrivateTrees(receiptPath: string): string[] {
+  const [, temporary, metadata] = readFileSync(receiptPath, 'utf8').trim().split('\n');
+  assert.ok(temporary && metadata);
+  assert.ok(path.basename(temporary).startsWith('tcv-manifest-'));
+  assert.equal(path.basename(metadata), 'git');
+  assert.ok(path.basename(path.dirname(metadata)).startsWith('tachiko-validation-baseline-'));
+  return [temporary, path.dirname(metadata)];
+}
+
+function normalExitWithDescendant(receiptPath: string, exitCode: number, resistant: boolean, naturalExitMs?: number): string {
+  const ready = `${receiptPath}.ready`;
+  const descendant = `${resistant ? "process.on('SIGTERM',()=>{});" : ''}require('node:fs').writeFileSync(${JSON.stringify(ready)},'ready');${naturalExitMs === undefined ? 'setInterval(()=>{},1000);' : `setTimeout(()=>process.exit(0),${naturalExitMs});`}`;
+  return `const fs=require('node:fs');const child=require('node:child_process').spawn(process.execPath,['-e',${JSON.stringify(descendant)}],{stdio:'ignore'});child.unref();fs.writeFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pid:child.pid,pgid:process.pid,workspace:process.cwd(),temporary:process.env.TMPDIR}));let checks=0;const readiness=setInterval(()=>{if(fs.existsSync(${JSON.stringify(ready)})){clearInterval(readiness);process.exit(${exitCode});}if(++checks>200)process.exit(18);},10);`;
+}
+
 function pinnedPnpm(workspacePath: string, version: string, exitCode = 0): string {
   const tools = mkdtempSync(path.join(os.tmpdir(), 'tachiko-pnpm-version-'));
   dirs.push(tools);
@@ -1059,6 +1106,188 @@ exec ${JSON.stringify(actualGit)} "$@"
     );
   });
 
+  it('allows a normally exiting group to settle naturally within the bounded grace', { skip: process.platform === 'win32' }, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-natural-exit-group-'));
+    dirs.push(proof);
+    const receiptPath = path.join(proof, 'owned.json');
+    try {
+      const result = await new ConfiguredLocalValidationAdapter(configuration([
+        process.execPath, '-e', normalExitWithDescendant(receiptPath, 0, false, 150),
+      ])).validate(owned);
+      assert.equal(result.status, 'passed', JSON.stringify(result));
+      assert.equal(result.commands[0]?.outcome, 'passed');
+      const { pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pgid: number };
+      assert.equal(fixtureGroupIsGone(pgid), true);
+    } finally {
+      await cleanFixtureGroup(receiptPath);
+      if (existsSync(receiptPath)) {
+        dirs.push(...fixturePrivateTrees(receiptPath));
+      }
+    }
+  });
+
+  it('waits through transient group probes after close without requiring termination', { skip: process.platform === 'win32' }, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-transient-group-probes-'));
+    dirs.push(proof);
+    const receiptPath = path.join(proof, 'owned.json');
+    const actualKill = process.kill;
+    let pendingProbes = 3;
+    let interventions = 0;
+    process.kill = (pid, signal) => {
+      if (existsSync(receiptPath) && pid === -Number(JSON.parse(readFileSync(receiptPath, 'utf8')).pgid)) {
+        if (signal === 0 && pendingProbes-- > 0) return true;
+        if (signal !== 0) interventions += 1;
+      }
+      return actualKill(pid, signal);
+    };
+    try {
+      const result = await new ConfiguredLocalValidationAdapter(configuration([
+        process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pgid:process.pid}))`,
+      ])).validate(owned);
+      assert.equal(result.status, 'passed', JSON.stringify(result));
+      assert.ok(pendingProbes < 0, 'natural settlement polls through the transient group');
+      assert.equal(interventions, 0, 'natural settlement must not terminate the group');
+    } finally { process.kill = actualKill; await cleanFixtureGroup(receiptPath); }
+  });
+
+  it('retains private command trees and blocks later commands when group absence cannot be proved', { skip: process.platform === 'win32' }, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-unproven-exit-group-'));
+    dirs.push(proof);
+    const receiptPath = path.join(proof, 'owned.json');
+    const laterCommand = path.join(proof, 'later-command');
+    const actualKill = process.kill;
+    let cleanupCalls = 0;
+    let refusedProbes = 0;
+    process.kill = (pid, signal) => {
+      if (existsSync(receiptPath)) {
+        const { pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pgid: number };
+        if (pid === -pgid) {
+          refusedProbes += 1;
+          throw Object.assign(new Error('owned fixture group probe is unavailable'), { code: 'EPERM' });
+        }
+      }
+      return actualKill(pid, signal);
+    };
+    try {
+      const result = await new ConfiguredLocalValidationAdapter({
+        revision: 'unproven-exit-group-v1', commands: [
+          { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(receiptPath)},JSON.stringify({pgid:process.pid,workspace:process.cwd(),temporary:process.env.TMPDIR}))`], timeoutMs: 5_000 },
+          { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(laterCommand)},'ran')`], timeoutMs: 5_000 },
+        ],
+      }, undefined, async (paths) => { cleanupCalls += 1; return disposePrivateTrees(paths); }).validate(owned);
+      const retainedTrees = fixturePrivateTrees(receiptPath);
+      dirs.push(...retainedTrees);
+      assert.equal(result.status, 'unknown', JSON.stringify(result));
+      assert.equal(result.commands[0]?.outcome, 'unavailable');
+      assert.equal(result.commands[0]?.exitCode, null);
+      assert.equal(existsSync(laterCommand), false);
+      assert.equal(cleanupCalls, 0, 'uncertainty cannot initiate destructive cleanup');
+      assert.ok(refusedProbes > 1);
+      for (const tree of retainedTrees) assert.equal(existsSync(tree), true);
+    } finally {
+      process.kill = actualKill;
+      await cleanFixtureGroup(receiptPath);
+      if (existsSync(receiptPath)) {
+        dirs.push(...fixturePrivateTrees(receiptPath));
+      }
+    }
+  });
+
+  it('propagates unproved manifest-group settlement through admission without deleting its private trees', { skip: process.platform === 'win32' }, async () => {
+    const owned = request();
+    const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-unproven-manifest-group-'));
+    dirs.push(proof);
+    const receiptPath = path.join(proof, 'owned.txt');
+    const git = path.join(proof, 'git');
+    const realGit = spawnSync('which', ['git'], { encoding: 'utf8' }).stdout.trim();
+    assert.ok(path.isAbsolute(realGit));
+    writeFileSync(git, `#!/bin/sh
+metadata=
+for argument in "$@"; do
+  case "$argument" in --git-dir=*) metadata=\${argument#--git-dir=} ;; esac
+done
+case " $* " in *" status "*) printf '%s\\n%s\\n%s\\n' "$PPID" "$PWD" "$metadata" > ${JSON.stringify(receiptPath)} ;; esac
+exec ${JSON.stringify(realGit)} "$@"
+`);
+    chmodSync(git, 0o755);
+    const actualKill = process.kill;
+    let refusedProbes = 0;
+    process.kill = (pid, signal) => {
+      if (existsSync(receiptPath) && pid === -Number(readFileSync(receiptPath, 'utf8').split('\n')[0])) {
+        refusedProbes += 1;
+        throw Object.assign(new Error('owned manifest group probe is unavailable'), { code: 'EPERM' });
+      }
+      return actualKill(pid, signal);
+    };
+    try {
+      const result = await new ConfiguredLocalValidationAdapter({
+        ...configuration([process.execPath, '-e', 'process.exit(0)']), gitProgram: git,
+      }).validate(owned);
+      const [, temporary, metadata] = readFileSync(receiptPath, 'utf8').trim().split('\n');
+      assert.ok(temporary && metadata);
+      dirs.push(...manifestFixturePrivateTrees(receiptPath));
+      assert.equal(result.status, 'unknown', JSON.stringify(result));
+      assert.equal(result.commands[0]?.outcome, 'unavailable');
+      assert.ok(refusedProbes > 1);
+      assert.equal(existsSync(path.join(temporary, 'result.json')), true);
+      assert.equal(existsSync(metadata), true, 'admission cannot delete metadata used by an unproved helper group');
+    } finally {
+      process.kill = actualKill;
+      if (existsSync(receiptPath)) {
+        const [pgid] = readFileSync(receiptPath, 'utf8').trim().split('\n');
+        assert.equal(fixtureGroupIsGone(Number(pgid)), true);
+        dirs.push(...manifestFixturePrivateTrees(receiptPath));
+      }
+    }
+  });
+
+  for (const [exitCode, resistant] of [[0, false], [0, true], [7, true]] as const) {
+    it(`settles a ${resistant ? 'signal-resistant' : 'persistent'} owned descendant after normal exit ${exitCode} before cleanup`, { skip: process.platform === 'win32' }, async () => {
+      const owned = request();
+      const proof = mkdtempSync(path.join(os.tmpdir(), 'tachiko-normal-exit-group-'));
+      dirs.push(proof);
+      const receiptPath = path.join(proof, 'owned.json');
+      const laterCommand = path.join(proof, 'later-command');
+      const cleanedTrees: string[] = [];
+      let cleanupSawSettledGroup = false;
+      try {
+        const result = await new ConfiguredLocalValidationAdapter({
+          revision: 'normal-exit-group-v1',
+          commands: [
+            { argv: [process.execPath, '-e', normalExitWithDescendant(receiptPath, exitCode, resistant)], timeoutMs: 5_000 },
+            { argv: [process.execPath, '-e', `require('node:fs').writeFileSync(${JSON.stringify(laterCommand)},'ran')`], timeoutMs: 5_000 },
+          ],
+        }, undefined, async (paths) => {
+          cleanedTrees.push(...paths);
+          dirs.push(...paths);
+          const { pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pgid: number };
+          cleanupSawSettledGroup = fixtureGroupIsGone(pgid);
+          return disposePrivateTrees(paths);
+        }).validate(owned);
+        assert.equal(result.status, exitCode === 0 ? 'unknown' : 'failed', JSON.stringify(result));
+        assert.equal(result.commands.length, 1, JSON.stringify(result));
+        assert.equal(result.commands[0]?.outcome, exitCode === 0 ? 'unavailable' : 'failed');
+        assert.equal(result.commands[0]?.exitCode, exitCode === 0 ? null : 7);
+        assert.equal(existsSync(laterCommand), false);
+        assert.equal(cleanupSawSettledGroup, true);
+        assert.equal(cleanedTrees.length, 2);
+        for (const tree of cleanedTrees) assert.equal(existsSync(tree), false);
+        const { pid, pgid } = JSON.parse(readFileSync(receiptPath, 'utf8')) as { pid: number; pgid: number };
+        assert.ok(Number.isSafeInteger(pid) && pid > 1);
+        assert.equal(fixtureGroupIsGone(pgid), true);
+        assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+      } finally {
+        await cleanFixtureGroup(receiptPath);
+        if (existsSync(receiptPath)) {
+          dirs.push(...fixturePrivateTrees(receiptPath));
+        }
+      }
+    });
+  }
+
   it('forces a signal-resistant command to settle after the bounded grace period', async () => {
     const startedAt = Date.now();
     const result = await new ConfiguredLocalValidationAdapter(
@@ -1118,6 +1347,9 @@ exec ${JSON.stringify(actualGit)} "$@"
     ).validate(request());
 
     assert.equal((await malformed).status, 'unknown');
-    assert.equal((await unavailable).status, 'unknown');
+    const missingExecutable = await unavailable;
+    assert.equal(missingExecutable.status, 'unknown');
+    assert.equal(missingExecutable.commands[0]?.outcome, 'unavailable');
+    assert.equal(missingExecutable.commands[0]?.exitCode, null);
   });
 });
