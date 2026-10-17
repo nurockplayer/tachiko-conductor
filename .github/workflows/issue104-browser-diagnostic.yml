@@ -1,4 +1,4 @@
-name: Issue 104 bounded browser continuity diagnostic
+name: Issue 104 uninstrumented ordinary browser verification
 on:
   push:
     branches: [qualification/issue104-stage6-browser]
@@ -50,18 +50,12 @@ jobs:
           test "$(pnpm --version)" = 10.34.5
           test "$(git -C candidate rev-parse HEAD)" = "$CANDIDATE_SHA"
           test "$(git -C candidate rev-parse 'HEAD^{tree}')" = "$CANDIDATE_TREE"
-          node <<'NODE'
-          const fs=require('node:fs'),crypto=require('node:crypto');
-          for (const [name,expected] of [['host-observer.mjs','2b640984e1bbf55afec7a0fcde37998147e26eaa2229e86454b9d904343a47da'],['server-observer.cjs','920d4c94605c1daff07915994b5d74b8f9b245021eb02f06d45bb195274803f3']]) {
-            if(crypto.createHash('sha256').update(fs.readFileSync('infrastructure/.github/scripts/issue104-browser-'+name)).digest('hex')!==expected) throw new Error('Observer script identity mismatch');
-          }
-          NODE
-          git -C candidate switch --create ci-browser-diagnostic
+          git -C candidate switch --create ci-browser-verification
           qual_root=$(mktemp -d /private/tmp/bd-XXXXXX)
           chmod 700 "$qual_root"
           mkdir -m 700 "$qual_root/store" "$qual_root/browsers"
           printf 'QUAL_ROOT=%s\nPLAYWRIGHT_BROWSERS_PATH=%s/browsers\n' "$qual_root" "$qual_root" >> "$GITHUB_ENV"
-          printf 'owner=/root/v1_stage_six_lead timeout=20m standard-macos-26 diagnostic-only zero-qualification\n'
+          printf 'owner=/root/v1_stage_six_lead timeout=20m standard-macos-26 ordinary-uninstrumented-browser-verification original-failure-preserved\n'
       - name: Frozen private dependency and browser preparation
         working-directory: candidate
         timeout-minutes: 10
@@ -74,63 +68,36 @@ jobs:
           const fs = require('node:fs'), crypto = require('node:crypto');
           const hash = (p) => crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
           const core = 'node_modules/.pnpm/playwright-core@1.63.0-alpha-2026-08-05/node_modules/playwright-core/lib/';
-          if (hash('pnpm-lock.yaml') !== '04ec614394a2815e3a85ebc0bb9441192c8dee368b97fe1161fc6a95c9b91474' || hash(core+'coreBundle.js') !== 'adf9246486a03bee08b2895db057ba470c62377911d291693fe783d91d6fec52' || hash(core+'utilsBundle.js') !== '580f571bf063e2256b51b3946a035bc452fc0e22808d5547b198baea39923a32') throw new Error('Pinned diagnostic dependency mismatch');
+          if (hash('pnpm-lock.yaml') !== '04ec614394a2815e3a85ebc0bb9441192c8dee368b97fe1161fc6a95c9b91474' || hash(core+'coreBundle.js') !== 'adf9246486a03bee08b2895db057ba470c62377911d291693fe783d91d6fec52' || hash(core+'utilsBundle.js') !== '580f571bf063e2256b51b3946a035bc452fc0e22808d5547b198baea39923a32') throw new Error('Pinned verification dependency mismatch');
           fs.writeFileSync(process.env.QUAL_ROOT+'/dependency-before.json', JSON.stringify([hash('pnpm-lock.yaml'),hash(core+'coreBundle.js'),hash(core+'utilsBundle.js')]));
           NODE
           test -z "$(git status --porcelain --untracked-files=normal)"
-      - name: Observe only the unchanged failing browser leaf
+      - name: Ordinary uninstrumented two-case browser integration
         working-directory: candidate
         timeout-minutes: 4
         shell: bash
         run: |
           set -euo pipefail
-          set +e
-          Q_BROWSER_CANDIDATE="$GITHUB_WORKSPACE/candidate" node node_modules/tsx/dist/cli.mjs --import "$GITHUB_WORKSPACE/infrastructure/.github/scripts/issue104-browser-host-observer.mjs" --test --test-concurrency=2 --test-name-pattern='keeps the bootstrap browser context alive across transient client disconnects' tests/browser-runtime-integration.test.ts > "$QUAL_ROOT/browser-test.log" 2>&1
-          focus_code=$?
-          set -e
-          export BROWSER_FOCUS_EXIT="$focus_code"
+          test -z "${NODE_OPTIONS:-}"
+          test -z "${Q_BROWSER_CANDIDATE:-}"
+          test ! -e "$GITHUB_WORKSPACE/infrastructure/.github/scripts/issue104-browser-host-observer.mjs"
+          test ! -e "$GITHUB_WORKSPACE/infrastructure/.github/scripts/issue104-browser-server-observer.cjs"
+          pnpm test:integration
+      - name: Prove guarded dependencies unchanged after verification
+        if: always()
+        working-directory: candidate
+        shell: bash
+        run: |
+          set -euo pipefail
           node <<'NODE'
-          const fs = require('node:fs'), crypto = require('node:crypto');
-          const hash = (b) => crypto.createHash('sha256').update(b).digest('hex');
-          const raw = fs.readFileSync(process.env.QUAL_ROOT+'/browser-test.log');
-          const overflow = raw.length > 2*1024*1024;
-          const text = overflow ? '' : raw.toString('utf8');
-          const records = [], ends = [], counters = [];
-          let invalid = false;
-          const numeric = new Set(['v','child','index','ms','server','backend','context','browser','page','sequence','pending','pendingAgeMs','initialized','disposed','observedActive','pageCount']);
-          const events = new Set(['ready','guard_failed','server_seen','ping_start','ping_settle','server_close_entry','backend_initialize_entry','backend_initialize_settle','backend_dispose_entry','tool_entry','tool_settle','context_seen','browser_seen','page_seen','selected_page','context_page','context_close','browser_disconnect','page_close','page_crash','page_main_frame_navigation']);
-          const enums = {event:events,kind:new Set(['bootstrap','transient','health','other']),outcome:new Set(['fulfilled','rejected','threw']),phase:new Set(['before','after']),category:new Set(['guard','shape'])};
-          const boolean = new Set(['first','present']);
-          for (const line of text.split('\n')) {
-            const rm = line.indexOf('BROWSER_DIAGNOSTIC_RECORD '), em = line.indexOf('BROWSER_DIAGNOSTIC_END ');
-            try {
-              if (rm >= 0) {
-                const payload = line.slice(rm+26), r = JSON.parse(payload);
-                if (!r || r.v !== 1 || r.child !== 1 || r.index !== records.length+1 || records.length >= 512 || !events.has(r.event) || !Object.entries(r).every(([k,v]) => numeric.has(k) ? Number.isSafeInteger(v) && v >= (k==='observedActive' ? -512 : 0) && v<=1e9 : Object.hasOwn(enums,k) ? enums[k].has(v) : boolean.has(k) && typeof v==='boolean') || JSON.stringify(r)!==payload) invalid=true;
-                else records.push(r);
-              } else if (em >= 0) {
-                const e=JSON.parse(line.slice(em+23));
-                if (e.child===0 && e.selected===0) continue;
-                const numbers=['v','child','selected','records','rawBytes','invalid','discarded','lineOverflow','streamErrors','dropped','observerErrors','missingShapes'];
-                const bools=['byteOverflow','partialLine','closed','streamEnded','childEndSeen','missingReady','listenersRemoved','digestMatches','complete'];
-                const keys=[...numbers,...bools,'sha256','exit'];
-                if (!e || Object.keys(e).length!==keys.length || !keys.every(k=>Object.hasOwn(e,k)) || !numbers.every(k=>Number.isSafeInteger(e[k])&&e[k]>=0&&e[k]<=1e9) || !bools.every(k=>typeof e[k]==='boolean') || !/^[0-9a-f]{64}$/.test(e.sha256) || !['zero','nonzero','signal','unknown'].includes(e.exit)) invalid=true;
-                else ends.push(e);
-              } else if (/^[ℹ# ]*(tests|suites|pass|fail|cancelled|skipped|todo|duration_ms) [0-9.]+$/.test(line.trim())) counters.push(line.trim());
-            } catch { invalid=true; }
-          }
-          const digest=hash(records.map(r=>JSON.stringify(r)+'\n').join(''));
-          const complete=!overflow&&!invalid&&ends.length===1&&ends[0].v===1&&ends[0].child===1&&ends[0].selected===1&&ends[0].records===records.length&&ends[0].sha256===digest&&ends[0].complete;
-          for (const r of records) console.log('BROWSER_DIAGNOSTIC_RECORD '+JSON.stringify(r));
-          for (const e of ends) console.log('BROWSER_DIAGNOSTIC_END '+JSON.stringify(e));
-          for (const c of counters) console.log('BROWSER_TEST_COUNTER '+c);
+          const fs=require('node:fs'),crypto=require('node:crypto');
+          const hash=(p)=>crypto.createHash('sha256').update(fs.readFileSync(p)).digest('hex');
           const core='node_modules/.pnpm/playwright-core@1.63.0-alpha-2026-08-05/node_modules/playwright-core/lib/';
-          const dependencyAfter=[hash(fs.readFileSync('pnpm-lock.yaml')),hash(fs.readFileSync(core+'coreBundle.js')),hash(fs.readFileSync(core+'utilsBundle.js'))];
-          const dependenciesUnchanged=JSON.stringify(dependencyAfter)===fs.readFileSync(process.env.QUAL_ROOT+'/dependency-before.json','utf8');
-          console.log('BROWSER_DIAGNOSTIC_RECEIPT '+JSON.stringify({v:1,head:process.env.CANDIDATE_SHA,tree:process.env.CANDIDATE_TREE,focusExitCode:Number(process.env.BROWSER_FOCUS_EXIT),privateLogBytes:raw.length,privateLogSha256:hash(raw),privateLogOverflow:overflow,records:records.length,sha256:digest,invalid,complete,dependenciesUnchanged,knownSentinelAssertion:text.includes('still-open')&&text.includes('AssertionError'),undefinedMentioned:text.includes('undefined'),aboutBlankMentioned:text.includes('about:blank'),qualificationCredit:0}));
-          if (!complete || !dependenciesUnchanged || process.env.BROWSER_FOCUS_EXIT!=='0') process.exitCode=1;
+          const after=[hash('pnpm-lock.yaml'),hash(core+'coreBundle.js'),hash(core+'utilsBundle.js')];
+          if(JSON.stringify(after)!==fs.readFileSync(process.env.QUAL_ROOT+'/dependency-before.json','utf8')) throw new Error('Guarded dependencies changed');
+          console.log('guarded-lock-and-bundles-unchanged=true');
           NODE
-      - name: Prove source unchanged after observation, including failure
+      - name: Prove source unchanged after verification, including failure
         if: always()
         working-directory: candidate
         shell: bash
@@ -140,7 +107,7 @@ jobs:
           test "$(git rev-parse 'HEAD^{tree}')" = "$CANDIDATE_TREE"
           test -z "$(git status --porcelain --untracked-files=normal)"
           printf 'source-head-tree-status-unchanged=true\n'
-      - name: Dispose owned private preparation and trace
+      - name: Dispose owned private preparation
         if: always()
         timeout-minutes: 2
         shell: bash
@@ -151,4 +118,4 @@ jobs:
             test ! -e "$QUAL_ROOT"
             printf 'owned-private-root-removed=%s\n' "$QUAL_ROOT"
           fi
-          printf 'No private trace, browser or dependency artifact uploaded; GitHub owns ephemeral runner disposal.\n'
+          printf 'No private browser or dependency artifact uploaded; GitHub owns ephemeral runner disposal.\n'
