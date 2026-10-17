@@ -38,7 +38,7 @@ jobs:
         with:
           node-version: 24.19.0
 
-      - name: Capture bound dyld image only and encrypt private evidence
+      - name: Observe one original exec-failure method and encrypt private evidence
         shell: bash
         run: |
           set -eu

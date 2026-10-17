@@ -124,7 +124,7 @@ def write_summary(path, value):
         mode = value.get('mode', 'native_qualification')
         value = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                  'mode': mode, 'native_gates': 'UNKNOWN' if mode == 'native_qualification' else 'NOT_RUN',
-                 'selection': 'dyld_image_only' if mode == 'diagnostics_only' else None,
+                 'selection': 'exec_failure_timing_only' if mode == 'diagnostics_only' else None,
                  'status': {'provider_preflight_only': 'PREFLIGHT_FAIL',
                             'diagnostics_only': 'DIAGNOSTIC_FAIL'}.get(mode, 'FAIL'),
                  'reason': 'summary_oversize', 'evidence_encrypted': False,
@@ -177,7 +177,7 @@ class Qualification:
         self.failure_status = 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL'
         self.success_status = 'DIAGNOSTIC_COMPLETE' if diagnostics_only else 'PREFLIGHT_PASS' if preflight_only else 'PASS'
         self.git_capability = None
-        self.diagnostics = {'selection': 'dyld_image_only', 'image': None, 'complete': False} if diagnostics_only else None
+        self.diagnostics = {'selection': 'exec_failure_timing_only', 'test': None, 'timing': None, 'complete': False} if diagnostics_only else None
         self.diagnostic_files = []
         self.started = time.monotonic()
         self.runner_temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
@@ -189,7 +189,7 @@ class Qualification:
         self.public.mkdir(mode=0o700, exist_ok=False)
         write_summary(self.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE,
                       'base': BASE, 'mode': self.mode, 'native_gates': 'NOT_RUN',
-                      'selection': 'dyld_image_only' if diagnostics_only else None,
+                      'selection': 'exec_failure_timing_only' if diagnostics_only else None,
                       'status': self.failure_status, 'reason': 'collector_initializing',
                       'evidence_encrypted': False, 'production_qualification': False})
         self.logs = self.private / 'logs'
@@ -595,6 +595,7 @@ class Qualification:
         self.provenance['recipient_sha256'] = digest(self.infra / 'recipient.pem')
         if self.diagnostics_only:
             self.provenance['diagnostic_module_sha256'] = digest(self.infra / 'adapter-diagnostic.mjs')
+            self.provenance['timing_launcher_sha256'] = digest(self.infra / 'timing-observation.py')
         write_json(self.private / 'workflow-provenance.json', self.provenance)
         version_commands = {'python': ['/usr/bin/python3', '--version'], 'node': [self.node, '--version'],
                             'corepack': [self.node.parent / 'corepack', '--version'],
@@ -725,6 +726,80 @@ class Qualification:
         # Nothing is retained as an image/proof until UUID/signature/stable bytes bind.
         (self.private / 'dyld-image.bin').write_bytes(raw)
         write_json(self.private / 'dyld-image.json', proof)
+        self.diagnostics['complete'] = True
+        write_json(self.private / 'diagnostics.json', self.diagnostics)
+
+    def observe_exec_failure(self):
+        record, output = self.run('python-exec-failure-timing',
+            ['/usr/bin/python3', self.infra / 'timing-observation.py',
+             self.candidate / 'scripts/bootstrap-heartbeat/runner.py', self.private], timeout=60, required=False)
+        if record['timed_out'] or not record['raw_capture_complete'] or not record['observed_root'] \
+                or not record['observed_family_complete'] or not record['original_group_absent']:
+            raise RuntimeError('timing_owned_collection_incomplete')
+        def bounded_json(path, limit, lines=False):
+            info = path.stat()
+            def identity(value):
+                return (value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+                        value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= limit:
+                raise RuntimeError('timing_evidence_size_unsupported')
+            with path.open('rb') as stream:
+                raw = stream.read(info.st_size)
+                if len(raw) != info.st_size or identity(os.fstat(stream.fileno())) != identity(info):
+                    raise RuntimeError('timing_evidence_changed')
+            if lines and any(len(line) + 1 > 256 for line in raw.splitlines()):
+                raise RuntimeError('timing_event_record_oversize')
+            return [json.loads(line) for line in raw.splitlines()] if lines else json.loads(raw)
+        receipt = bounded_json(self.private / 'timing-observation.json', 16 * 1024)
+        events = bounded_json(self.private / 'timing-events.jsonl', 64 * 1024, lines=True)
+        # Python3.9 unittest may pass a boolean to SystemExit; retain that value.
+        if receipt.get('interceptions') != 1 or type(receipt.get('unittest_exit_code')) not in (int, bool) \
+                or receipt['unittest_exit_code'] not in (0, 1) or receipt['unittest_exit_code'] != record['exit_code'] \
+                or not isinstance(receipt.get('invocation'), dict) \
+                or type(receipt['invocation'].get('elapsed_ns')) is not int or receipt['invocation']['elapsed_ns'] < 0 \
+                or not 1 <= len(events) <= 256:
+            raise RuntimeError('timing_original_method_or_interception_incomplete')
+        stderr = output[1].read_text()
+        if re.search(r'^Ran 1 test in [0-9.]+s$', stderr, re.M) is None \
+                or len(re.findall(r'^test_exec_failure_releases_guard_and_leaves_change_retryable \(', stderr, re.M)) != 1:
+            raise RuntimeError('timing_original_unittest_completion_unknown')
+        groups = {}
+        for event in events:
+            if set(event) - {'phase', 'pid', 'ppid', 'role', 'monotonic_ns', 'exception'} \
+                    or event.get('role') not in ('runner', 'guard') \
+                    or re.fullmatch(r'[a-z_]{1,64}', event.get('phase', '')) is None \
+                    or any(type(event.get(key)) is not int or event[key] < 1 for key in ('pid', 'ppid', 'monotonic_ns')) \
+                    or ('exception' in event and (event['phase'] != 'popen_exception' \
+                        or re.fullmatch(r'[A-Za-z_][A-Za-z_0-9]{0,63}', event['exception']) is None)) \
+                    or event['phase'] in ('trace_limit', 'trace_incomplete'):
+                raise RuntimeError('timing_trace_invalid_or_incomplete')
+            group = groups.setdefault(event['pid'], [])
+            if len(group) >= 128 or (group and (event['monotonic_ns'] < group[-1]['monotonic_ns'] or event['role'] != group[0]['role'])):
+                raise RuntimeError('timing_per_pid_trace_incomplete')
+            group.append(event)
+        roots = [group for group in groups.values() if group[0]['role'] == 'runner']
+        guards = [group for group in groups.values() if group[0]['role'] == 'guard']
+        if len(roots) != 1 or len(guards) > 1 or roots[0][0]['phase'] != 'hook_ready' \
+                or roots[0][-1]['phase'] != 'hook_return' or roots[0][0]['ppid'] != record['root_pid'] \
+                or (guards and (guards[0][0]['phase'] != 'guard_fork_return' or guards[0][0]['ppid'] != roots[0][0]['pid'])):
+            raise RuntimeError('timing_runner_guard_binding_incomplete')
+        phases = {event['role'] + ':' + event['phase'] for event in events}
+        expected = {'runner:' + name + '_call' for name in
+                    ('main', 'heartbeat', 'acquire_lock', 'load_config', 'github_fingerprint',
+                     'verify_wake_target', 'reserve_heartbeat', 'run_wake', 'spawn_lock_guard', 'admission_call')}
+        expected.update({'runner:popen_exception', 'runner:popen_failure_branch',
+                         'runner:parent_settled_ack_received', 'runner:parent_guard_reaped',
+                         'guard:guard_empty_group_branch', 'guard:guard_settlement_call',
+                         'guard:guard_settled_write_attempt'})
+        spans = {str(pid): group[-1]['monotonic_ns'] - group[0]['monotonic_ns'] for pid, group in groups.items()}
+        runner_span = roots[0][-1]['monotonic_ns'] - roots[0][0]['monotonic_ns']
+        analysis = {'per_pid_spans_ns': spans, 'cross_pid_timestamps_comparable': False,
+                    'unattributed_startup_shutdown_residual_ns': receipt['invocation']['elapsed_ns'] - runner_span,
+                    'missing_phases': sorted(expected - phases), 'source_receipt': 'timing-observation.json',
+                    'supplemental_only': True, 'original_test_exit_code': record['exit_code']}
+        write_json(self.private / 'timing-analysis.json', analysis)
+        self.diagnostics['test'] = {'exit_code': record['exit_code'], 'outcome': 'PASS' if record['exit_code'] == 0 else 'FAIL'}
+        self.diagnostics['timing'] = {'status': 'OBSERVED' if expected <= phases else 'UNKNOWN', 'event_count': len(events)}
         self.diagnostics['complete'] = True
         write_json(self.private / 'diagnostics.json', self.diagnostics)
 
@@ -970,7 +1045,8 @@ class Qualification:
         if self.preflight_only:
             return
         if self.diagnostics_only:
-            self.capture_dyld_image()
+            self.hydrate()
+            self.observe_exec_failure()
             return
         self.hydrate()
         # Expected discovery count is source-derived; no test selection or source rewriting.
@@ -1049,7 +1125,7 @@ class Qualification:
         summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                    'provenance': self.provenance,
                    'mode': self.mode, 'native_gates': native_gates,
-                   'selection': 'dyld_image_only' if self.diagnostics_only else None,
+                   'selection': 'exec_failure_timing_only' if self.diagnostics_only else None,
                    'diagnostics': self.diagnostics,
                    'status': self.success_status if passed else self.failure_status, 'source_unchanged': unchanged,
                    'python': public_python, 'node': public_node, 'versions': self.versions,
@@ -1065,7 +1141,8 @@ class Qualification:
                        'pnpm-tool.json', 'workflow-provenance.json', 'developer-tools-inventory.json', 'git-capability.json',
                        'result.json', 'cms-probe.txt', 'cms-probe.der', 'diagnostics.json', 'diagnostic-archive-error.txt',
                        'qualification-error.txt', 'source-postflight-error.txt', 'collector-error.txt',
-                       'dyld-image.bin', 'dyld-image.json']
+                       'dyld-image.bin', 'dyld-image.json', 'timing-events.jsonl',
+                       'timing-observation.json', 'timing-analysis.json']
             for name in allowed:
                 path = self.private / name
                 if path.exists():
@@ -1120,7 +1197,7 @@ def main():
                        'tree': TREE, 'base': BASE,
                        'mode': 'diagnostics_only' if diagnostics_only else 'provider_preflight_only' if preflight_only else 'native_qualification',
                        'native_gates': 'NOT_RUN' if preflight_only or diagnostics_only else 'UNKNOWN',
-                       'selection': 'dyld_image_only' if diagnostics_only else None,
+                       'selection': 'exec_failure_timing_only' if diagnostics_only else None,
                        'status': 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL', 'reason': 'collector_failed',
                        'evidence_encrypted': False, 'production_qualification': False})
         print('Diagnostic collector failed; native gates NOT_RUN.' if diagnostics_only else
