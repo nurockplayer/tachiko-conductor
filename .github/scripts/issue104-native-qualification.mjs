@@ -10,8 +10,12 @@ const { Q_ROOT: root, Q_CANDIDATE: candidate, Q_NODE: node, Q_PNPM: pnpm, Q_GIT:
 for (const value of [root, candidate, node, pnpm, git]) assert.ok(path.isAbsolute(value));
 assert.equal(process.platform, 'darwin');
 assert.equal(process.version, 'v24.21.0');
+// Discard only the observed Darwin startup metadata, never admit it as input.
+const removedDarwinTextEncoding = Object.hasOwn(process.env, '__CF_USER_TEXT_ENCODING');
+delete process.env.__CF_USER_TEXT_ENCODING;
 const allowed = new Set(['PATH', 'HOME', 'TMPDIR', 'Q_ROOT', 'Q_CANDIDATE', 'Q_NODE', 'Q_PNPM', 'Q_GIT', 'Q_EXPECTED_SHA', 'Q_EXPECTED_TREE']);
 assert.deepEqual(Object.keys(process.env).filter((key) => !allowed.has(key)), []);
+console.log('VALIDATION_STARTUP ' + JSON.stringify({ removedDarwinTextEncoding, environmentKeys: Object.keys(process.env).sort() }));
 const gitEnv = { PATH: path.dirname(node) + ':/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0', GIT_NO_REPLACE_OBJECTS: '1' };
 function command(program, args, cwd) {
   const result = spawnSync(program, args, { cwd, env: gitEnv, encoding: 'utf8', timeout: 30_000, maxBuffer: 8 * 1024 * 1024 });
