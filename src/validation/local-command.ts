@@ -535,7 +535,8 @@ function macosValidationSandboxProfile(
   const clauses = reads.map((entry) => `(allow file-read* (subpath ${sandboxLiteral(entry)}))`).join('\n');
   // Permit the loader's read-only root-directory open. This also permits root
   // listing; keep it literal so it grants no reads of root's descendants.
-  return `(version 1)\n(deny default)\n(deny network*)\n(allow process*)\n(allow file-read-data (literal "/"))\n${clauses}\n(allow file-write* (subpath ${sandboxLiteral(workspace)}))\n(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))`;
+  // Runtime startup may query page size; allow only the exact static metadata key.
+  return `(version 1)\n(deny default)\n(deny network*)\n(allow process*)\n(allow sysctl-read (sysctl-name "hw.pagesize"))\n(allow file-read-data (literal "/"))\n${clauses}\n(allow file-write* (subpath ${sandboxLiteral(workspace)}))\n(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))`;
 }
 
 /**
