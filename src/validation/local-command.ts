@@ -533,7 +533,9 @@ function macosValidationSandboxProfile(
     try { reads.push(realpathSync(dependencyArtifactPath)); } catch { return null; }
   }
   const clauses = reads.map((entry) => `(allow file-read* (subpath ${sandboxLiteral(entry)}))`).join('\n');
-  return `(version 1)\n(deny default)\n(deny network*)\n(allow process*)\n${clauses}\n(allow file-write* (subpath ${sandboxLiteral(workspace)}))\n(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))`;
+  // Permit the loader's read-only root-directory open. This also permits root
+  // listing; keep it literal so it grants no reads of root's descendants.
+  return `(version 1)\n(deny default)\n(deny network*)\n(allow process*)\n(allow file-read-data (literal "/"))\n${clauses}\n(allow file-write* (subpath ${sandboxLiteral(workspace)}))\n(allow file-write* (subpath ${sandboxLiteral(runtimeRoot)}))`;
 }
 
 /**

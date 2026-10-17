@@ -66,6 +66,50 @@ describe('ConfiguredLocalValidationAdapter', () => {
     assert.equal(result.status, 'passed');
   });
 
+  it('opens the root directory with the real macOS toolchain while denying an outside sentinel', { skip: process.platform !== 'darwin' || !existsSync(path.resolve('node_modules/.bin/pnpm')) }, async () => {
+    const owned = request('pnpm@10.34.5');
+    const pnpm = path.resolve('node_modules/.bin/pnpm');
+    const node = realpathSync(process.execPath);
+    const resolvedPnpm = realpathSync(pnpm);
+    // This owned sibling of the fresh snapshot/runtime directories is outside
+    // their subtrees. It contains known fixture bytes, never host secrets.
+    const outside = mkdtempSync(path.join(os.tmpdir(), 'tachiko-seatbelt-outside-'));
+    dirs.push(outside);
+    const sentinel = path.join(realpathSync(outside), 'sentinel.txt');
+    const bytes = 'owned outside-seatbelt fixture\n';
+    writeFileSync(sentinel, bytes);
+    assert.equal(readFileSync(sentinel, 'utf8'), bytes);
+    // Reject a fixture accidentally covered by any configured toolchain or
+    // fixed OS read subtree; no browser/dependency artifacts are configured.
+    for (const subtree of [
+      owned.workspacePath, node, resolvedPnpm, pnpm,
+      path.dirname(node), path.dirname(path.dirname(node)),
+      path.dirname(resolvedPnpm), path.dirname(path.dirname(resolvedPnpm)),
+      '/usr/bin/env', '/bin/sh', '/usr/lib', '/System/Library', '/usr/share',
+      '/dev/null', '/dev/urandom', '/var/db/timezone', '/private/var/db/timezone',
+    ]) {
+      const admitted = existsSync(subtree) ? realpathSync(subtree) : path.resolve(subtree);
+      assert.ok(admitted !== path.parse(sentinel).root && sentinel !== admitted && !sentinel.startsWith(`${admitted}${path.sep}`), `sentinel must be outside ${admitted}`);
+    }
+    const script = `
+      const assert = require('node:assert/strict');
+      const fs = require('node:fs');
+      const root = fs.openSync('/', fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
+      fs.closeSync(root);
+      assert.throws(() => fs.readFileSync(${JSON.stringify(sentinel)}),
+        (error) => error.code === 'EACCES' || error.code === 'EPERM');
+    `;
+    const result = await new ConfiguredLocalValidationAdapter({
+      revision: 'darwin-literal-root-confinement-v1', nodeProgram: process.execPath, pnpmProgram: pnpm,
+      commands: [{ argv: [pnpm, 'exec', process.execPath, '-e', script], timeoutMs: 30_000 }],
+    }).validate(owned);
+    assert.equal(result.status, 'passed');
+    assert.equal(result.commands.length, 1);
+    assert.equal(result.commands[0]?.outcome, 'passed');
+    assert.equal(result.commands[0]?.exitCode, 0);
+    assert.equal(readFileSync(sentinel, 'utf8'), bytes);
+  });
+
   it('binds pnpm validation authority to the exact repository packageManager pin', () => {
     const owned = request();
     const matching = pinnedPnpm(owned.workspacePath, '10.34.5');
