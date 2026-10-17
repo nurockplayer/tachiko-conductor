@@ -871,6 +871,7 @@ function macosValidationSandboxProfile(
 (allow process*)
 (allow signal (target same-sandbox))
 (allow file-read* file-test-existence (literal "/"))
+(allow file-read-data (require-all (vnode-type DIRECTORY) (require-any (literal "/private") (literal "/private/tmp"))))
 (allow file-read-metadata (literal "/tmp") (literal "/var"))
 (allow sysctl-read ${sysctls})
 ${clauses}

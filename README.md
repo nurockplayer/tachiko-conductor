@@ -514,6 +514,12 @@ lockfile-mismatched artifact makes validation unknown. `scripts/issue-104-deploy
 maintenance hold, preflights, and then restarts launchd; leave the hold in
 place until an operator explicitly verifies and releases it.
 
+The sandbox's fixed ancestor directory reads cover the canonical `/private/tmp`
+qualification route: read-only opens and entry names at `/private` and
+`/private/tmp`, without granting file contents below those nodes. Private roots
+still follow `os.tmpdir()`. Arbitrary or personal temporary layouts, including
+`/private/var/folders`, remain unqualified and fail closed when inaccessible.
+
 The production `test:isolated` tier excludes exactly `browser-bootstrap-client.test.ts`,
 `browser-runtime.test.ts`, `control-tower-browser.test.ts`, and
 `local-command-sandbox.test.ts` from the ordinary unit tier. The three browser
