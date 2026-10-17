@@ -895,6 +895,7 @@ export async function runWorkflow(
             assertCapturedRunAtBoundary(store, plannedFrom);
             assertPlannedBootstrapIdentity(bootstrap, bootstrapAdapter, target, authoritativeBaseBranch, authoritativeBaseSha, publicationBranch);
             const plannedRun = applyTransition(plannedFrom, { type: 'bootstrap_prepared', bootstrap }, now());
+            assertFinalExecutionAdmission(store, plannedFrom, options);
             persistPlannedBootstrap(store, plannedFrom, plannedRun);
             run = plannedRun;
             refusalRun = plannedRun;

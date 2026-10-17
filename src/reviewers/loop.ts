@@ -710,7 +710,7 @@ export async function runReviewLoop(
         // An authority snapshot is useful only if it was appended against the
         // exact durable Run that was preflighted. Never invoke a worker after a
         // stale CAS, because another writer may have replaced its HEAD or PR.
-        const commit = async () => { if (nativeRepair) { const current=deps.resolveRepairExecutionProfile?.('routine'); if(!current || oracleDigest(current)!==oracleDigest(repairExecution)) throw new ExecutionAdmissionRefusal('Native repair execution authority changed at consumption CAS.',false); await deps.assertLeadInitiation?.(); await deps.assertReviewClaim?.(run); deps.assertCurrentMutation?.(); } return updateReviewRun(store,run,startedFix); };
+        const commit = async () => { if (nativeRepair) { const current=deps.resolveRepairExecutionProfile?.('routine'); if(!current || oracleDigest(current)!==oracleDigest(repairExecution)) throw new ExecutionAdmissionRefusal('Native repair execution authority changed at consumption CAS.',false); await deps.assertLeadInitiation?.(); await deps.assertReviewClaim?.(run); deps.assertCurrentMutation?.(); deps.assertNormalInitiation?.(run); } return updateReviewRun(store,run,startedFix); };
         if (!await (deps.withLeadBoundary ? deps.withLeadBoundary(commit) : commit())) {
           return supersededRepairAdmission(run.id, run, store);
         }
@@ -775,12 +775,15 @@ export async function runReviewLoop(
           establishRepairPlanningAdmission(expected, store, deps);
           const bootstrap = await repairBootstrap.plan({
             runId: run.id, target, baseBranch, baseSha, publicationBranch,
-            beforeMutation: () => assertFinalRepairAdmission(expected, store, deps.assertCurrentMutation,
-              deps.governedPublicationRequired === true),
+            beforeMutation: () => { assertFinalRepairAdmission(expected, store, deps.assertCurrentMutation,
+              deps.governedPublicationRequired === true); deps.assertNormalInitiation?.(expected); },
           });
           assertFinalRepairAdmission(expected, store);
           assertRepairPlanIdentity(bootstrap, repairBootstrap, target, baseBranch, baseSha, publicationBranch);
           const prepared = applyTransition(run, { type: 'bootstrap_prepared', bootstrap }, now());
+          assertFinalRepairAdmission(expected, store, deps.assertCurrentMutation,
+            deps.governedPublicationRequired === true);
+          deps.assertNormalInitiation?.(expected);
           persistRepairBootstrap(store, expected, prepared);
           run = prepared;
           deps.assertCanMutate?.(bootstrap.workspacePath);
@@ -807,8 +810,8 @@ export async function runReviewLoop(
           await repairBootstrap.prepare({
             runId: repairRun.id, target, baseBranch: repairIdentity.baseBranch, baseSha: repairIdentity.baseSha,
             existing: repairIdentity, recoveryAuthority: { expectedHeadSha: progressBaseSha },
-            beforeMutation: () => assertFinalRepairAdmission(repairRun, store, deps.assertCurrentMutation,
-              deps.governedPublicationRequired === true),
+            beforeMutation: () => { assertFinalRepairAdmission(repairRun, store, deps.assertCurrentMutation,
+              deps.governedPublicationRequired === true); deps.assertNormalInitiation?.(repairRun); },
           });
           workspaceGuard = repairBootstrap.guard(repairIdentity);
         } catch (error) {

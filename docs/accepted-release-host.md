@@ -196,3 +196,9 @@ not inherit this initiation gate. Explicit `run transition <id> merged` authenti
 retained terminal review/lead/inactive proof records again before admission/owner writes,
 using original configured verifiers. Legacy structural readability and separately guarded
 stopped-owner attestation do not become authenticated completion or merge authority.
+
+The routine worker has two explicit process routes: the accepted Codex entry for model execution, and the accepted Git executable for the exact `rev-parse HEAD` completion read. The HEAD route rejects every other executable/argument sequence. Both selected transports participate in the existing source-owned Luna qualification identity; controlled injected transports prove selection and completion only, and confer no governed runtime qualification. Shared Git observation remains installation-scoped so revoked current initiation does not disable issued observation or cleanup.
+
+Accepted Codex and pnpm runtime directories must be physically disjoint in both containment directions from the selected object repository and GitHub namespace, including nonstandard directory names. Repair plan/prepare mutation callbacks, post-plan bootstrap persistence in both promoted and resumed workflow paths, and the final native repair consumption CAS check the captured normal Run fence after their last awaited authority read. These checks do not apply to historical issued-only settlement.
+
+Tests provision only their newly created private account tree with private directory/file permissions before accepting either transpiled or TypeScript-compiled artifacts. They never change shared runner/tool/source permissions. Successful controlled JSONL plus exact accepted Git HEAD output is a process-selection proof without a real model; actual compiled-child entry, real Git lifecycle and normal CI are separate checks. No personal Mac executor is connected or qualified in this session; the user's machine existence is unknown.

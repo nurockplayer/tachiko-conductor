@@ -56,6 +56,8 @@ export interface ProductionHostSnapshot {
   readonly transport?: GhCliTransport;
   readonly gitRunner?: ProcessRunner;
   readonly codexExecutable?: string;
+  readonly gitExecutable?: string;
+  readonly workerHeadReadRunner?: ProcessRunner;
   readonly workerRunner?: ProcessRunner;
   readonly workerTransportSourceOwned?: boolean;
   readonly historicalCompletionHosts: readonly NativeCompletionHosts[];
@@ -191,6 +193,15 @@ function validateRelease(home: string, root: string, entry: string, raw: string)
   for(const location of [r.repository.objectRoot,...['releases','repositories','workspaces','runs','dispatch','mission-admission','tools'].map(name=>path.join(home,'.tachiko-conductor',name))]) { if(inside(location,r.github.configDirectory)||inside(r.github.configDirectory,location))throw new Error('Accepted GitHub namespace overlaps a candidate, immutable release or authority surface.'); }
   if (!r.environment || typeof r.environment !== 'object' || Array.isArray(r.environment) || Object.entries(r.environment).some(([k, v]) => !ENV_KEYS.has(k) || typeof v !== 'string' || v.includes('\0'))) throw new Error('Unsupported accepted environment field.');
   if (r.environment.TACHIKO_NODE_PROGRAM !== r.node.path || r.environment.TACHIKO_GIT_PROGRAM !== r.git.path || r.environment.TACHIKO_PNPM_PROGRAM !== r.pnpm.path) throw new Error('Accepted runtime policy programs disagree.');
+  // Reject selected physical overlap before reading any executable or tool
+  // manifest: an invalid tool tree must not cause GitHub namespace contents to
+  // be read merely to decide whether that tree is acceptable.
+  for(const tool of [r.codex,r.pnpm]) {
+    protectedPath(home,tool.runtimeDirectory,'directory');
+    for(const location of [r.repository.objectRoot,r.github.configDirectory]) {
+      if(inside(location,tool.runtimeDirectory)||inside(tool.runtimeDirectory,location))throw new Error('Accepted tool runtime overlaps the selected object root or GitHub namespace.');
+    }
+  }
   for (const p of [r.node, r.git, r.gh]) program(home, p);
   for(const tool of [r.codex,r.pnpm]) validateTool(home,tool,r.node);
   assertRuntime(r,entry);
@@ -255,8 +266,15 @@ export function resolveProductionHost(entryUrl: string, runner: ProcessRunner = 
     const gitRunner: ProcessRunner = Object.freeze({ run: async (_file: string, args: readonly string[], options: ProcessRunOptions) => { assertInstallation(); return runner.run(r.git.path, ['-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-c','core.attributesFile=/dev/null','-c','core.useReplaceRefs=false',...args], { ...options, env:hostEnv, beforeSpawn: () => { assertInstallation(); options.beforeSpawn?.(); } }); } });
     const sourceOwnedRunner=Object.getPrototypeOf(runner)===NodeProcessRunner.prototype&&!Object.hasOwn(runner,'run')&&NodeProcessRunner.prototype.run===originalNodeRun;
     const workerRunner:ProcessRunner=Object.freeze({run:async(file:string,args:readonly string[],options:ProcessRunOptions)=>{assertInitiation();if(sourceOwnedRunner&&(Object.getPrototypeOf(runner)!==NodeProcessRunner.prototype||Object.hasOwn(runner,'run')||NodeProcessRunner.prototype.run!==originalNodeRun))throw new Error('Accepted worker process transport changed.');if(file!==r.codex.path)throw new Error('Worker executable differs from accepted Codex.');return runner.run(file,args,{...options,beforeSpawn:()=>{assertInitiation();options.beforeSpawn?.();}});}});
+    // This is deliberately narrower than the observation-safe shared Git runner.
+    const workerHeadReadRunner:ProcessRunner=Object.freeze({run:async(file:string,args:readonly string[],options:ProcessRunOptions)=>{
+      assertInitiation();
+      if(sourceOwnedRunner&&(Object.getPrototypeOf(runner)!==NodeProcessRunner.prototype||Object.hasOwn(runner,'run')||NodeProcessRunner.prototype.run!==originalNodeRun))throw new Error('Accepted worker HEAD-read transport changed.');
+      if(file!==r.git.path||args.length!==2||args[0]!=='rev-parse'||args[1]!=='HEAD')throw new Error('Worker HEAD read differs from the accepted exact Git command.');
+      return gitRunner.run(file,args,{...options,beforeSpawn:()=>{assertInitiation();options.beforeSpawn?.();}});
+    }});
     const transport = new GhCliTransport({ runner, executable:r.gh.path, hostname:'github.com', acceptedActorId:r.github.actorId, cwd:r.repository.objectRoot, env:hostEnv, beforeSpawn:assertInstallation, beforeMerge:assertInitiation, repository:{owner:r.repository.owner,repo:r.repository.repo} });
-    const snapshot: ProductionHostSnapshot = Object.freeze({ installation:'accepted', reason, artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, releaseId:r.releaseId, manifestDigest:r.manifestDigest, repositoryRoot:r.repository.objectRoot, codexExecutable:r.codex.path, workerRunner, workerTransportSourceOwned:sourceOwnedRunner, runsDirectory, initiationPolicy, environment, nativeMergeHost, transport, gitRunner, historicalCompletionHosts, historicalVerification,
+    const snapshot: ProductionHostSnapshot = Object.freeze({ installation:'accepted', reason, artifactVerification:'initial-sha256/current-stat-inventory-v1' as const, releaseId:r.releaseId, manifestDigest:r.manifestDigest, repositoryRoot:r.repository.objectRoot, codexExecutable:r.codex.path, gitExecutable:r.git.path, workerHeadReadRunner, workerRunner, workerTransportSourceOwned:sourceOwnedRunner, runsDirectory, initiationPolicy, environment, nativeMergeHost, transport, gitRunner, historicalCompletionHosts, historicalVerification,
       reviewer:Object.freeze({available:false as const,reason:'Oracle service contract unavailable.'}), lead:Object.freeze({available:false as const,reason:'Sol service contract unavailable.'}), assertInstallation, assertInitiation, assertRunInitiation,
       assertRecoveryScope: (owner: string, repo: string) => { assertInstallation(); if (owner !== r.repository.owner || repo !== r.repository.repo) throw new Error('Issued recovery scope differs from the compatible accepted installation.'); },
     }); snapshots.add(snapshot); return snapshot;

@@ -3565,3 +3565,30 @@ describe('captured production normal effect fence',()=>{
     const f=await installedFixture();try{const captured=f.resolve();const store=new MemoryStore();let run=createRun(TARGET,T0,`production-final-${cut}`);if(cut==='resumed-worker')run=applyTransition(run,{type:'start'},T0);if(cut==='validation'){run=applyTransition(run,{type:'start'},T0);run=applyTransition(run,{type:'agent_succeeded',agentResult:successResult(HEAD),headSha:HEAD,pullRequest:{number:7,headSha:HEAD}},T0);}store.create(run);let effects=0;const revoke=async()=>{await Promise.resolve();f.enable(false);};const implementation:ImplementationAgent={kind:'implementation-agent',async run(request){if(cut==='initial-worker'||cut==='resumed-worker'){await revoke();request.beforeExecution?.();effects++;}return successResult(HEAD);}};const bootstrap=new class extends FakeBootstrap{override async verifyDurable(request:VerifyDurableRequest){if(cut==='publication'){await revoke();request.beforePublish?.();effects++;}return{headSha:request.expectedHeadSha,branch:this.identity.branch};}}();const validation:ValidationAdapter={kind:'validation',configRevision:'test-config-v1',async validate(request){await revoke();request.beforeExecution?.();effects++;return validationPassed(request.headSha).local;}};const outcome=await runWorkflow({store,github:githubAdapter(cut==='publication'?[null,null,HEAD]:[HEAD]),implementation,reviewer:new FakeReviewer([]),...(cut==='publication'?{bootstrap}:{}),...(cut==='validation'?{validation,hostedCheckPolicy:TEST_HOSTED_POLICY}:{}),assertNormalInitiation:()=>captured.assertInitiation()},run.id,{maxReviewAttempts:1,now:()=>T0});assert.equal(effects,0);assert.equal(outcome.outcome,'needs_human');assert.throws(captured.assertInitiation,/latched/);}finally{f.cleanup();}
   });
 });
+
+
+describe('captured production repair bootstrap fence',()=>{
+  for(const route of ['promotion','resume'] as const)for(const cut of ['plan-mutation','post-plan-persistence','prepare-mutation'] as const)it(`removes initiation at actual repair ${route} ${cut} after awaited authority`,async()=>{
+    const f=await installedFixture();
+    try {
+      const captured=f.resolve();const store=new MemoryStore();
+      const execution:ResolvedExecutionConfiguration={profile:'routine',revision:'luna-v1',executor:'luna-isolated',model:'gpt-5.6-luna',timeoutMs:60000};
+      let run=reviewingRun(store,`repair-final-${cut}`,HEAD);
+      run=applyTransition(run,{type:'changes_requested',reviewResult:requestChanges(HEAD)},T0,TEST_VALIDATION_AUTHORITY);
+      run={...run,repairTaskShapeAuthority:{revision:'task-shape-v1',shape:'bounded'},repairAdmissions:[{authorityRevision:'task-shape-v1',taskShape:'bounded',taxonomyRevision:'repair-finding-taxonomy-v1',finding:'review_blocking',headSha:HEAD,pullRequestNumber:7,executionProfile:'routine',executionRevision:execution.revision,execution,admittedAt:T0}],state:'IMPLEMENTING',history:[...run.history,{type:'start_fix',from:'CHANGES_REQUESTED',to:'IMPLEMENTING',at:T0}]};
+      if(route==='promotion')run={...run,state:'CHANGES_REQUESTED',repairAdmissions:[],history:run.history.filter(h=>h.type!=='start_fix')};
+      store.update(run);
+      const identity={bootstrapKind:'standalone-isolated' as const,owner:'acme',repo:'widgets',issueNumber:42,baseBranch:'main',baseSha:'base',branch:`tachiko/${run.id}`,publicationBranch:'existing-pr',workspacePath:`/tmp/${run.id}`};
+      let planCalls=0;let prepareCalls=0;let mutations=0;let workers=0;
+      const bootstrap:ImplementationBootstrapAdapter={kind:'implementation-bootstrap',bootstrapKind:'standalone-isolated',
+        async plan(request){planCalls++;await Promise.resolve();if(cut==='plan-mutation'||cut==='post-plan-persistence')f.enable(false);if(cut==='plan-mutation'){request.beforeMutation?.();mutations++;}return identity;},
+        async prepare(request){prepareCalls++;await Promise.resolve();f.enable(false);request.beforeMutation?.();mutations++;return identity;},
+        guard(){return{assertValid(){}};},async verifyDurable(request){return{headSha:request.expectedHeadSha,branch:identity.branch};}};
+      const github=githubAdapter([HEAD]);const read=github.readLiveSnapshot.bind(github);github.readLiveSnapshot=async target=>{const live=await read(target);return{...live,pullRequest:{...live.pullRequest!,headRef:'existing-pr',baseRef:'main',headRepository:{owner:'acme',repo:'widgets'}}};};
+      const result=await runWorkflow({store,github,implementation:{kind:'implementation-agent',async run(){workers++;return successResult(HEAD2);}},reviewer:new FakeReviewer([]),validation:new FakeValidation(),hostedCheckPolicy:TEST_HOSTED_POLICY,bootstrapForExecution:()=>bootstrap,resolveRepairExecutionProfile:()=>execution,assertNormalInitiation:()=>captured.assertInitiation()},run.id,{maxReviewAttempts:2,now:()=>T0});
+      assert.equal(result.outcome,'needs_human');assert.equal(planCalls,1);assert.equal(prepareCalls,cut==='prepare-mutation'?1:0);assert.equal(mutations,0);assert.equal(workers,0);
+      assert.equal(store.read(run.id)!.history.filter(h=>h.type==='bootstrap_prepared').length,cut==='prepare-mutation'?1:0);
+      assert.equal(store.read(run.id)!.history.filter(h=>h.type==='start_fix').length,1,'Existing repair ordinal is preserved');assert.throws(captured.assertInitiation,/latched/);
+    }finally{f.cleanup();}
+  });
+});

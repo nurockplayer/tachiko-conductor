@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
-import { chmodSync, cpSync, linkSync, mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs';
+import { chmodSync, cpSync, linkSync, mkdirSync, lstatSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { describe, it } from 'node:test';
 import { resolveProductionHost } from '../src/production-host.js';
-import Module from 'node:module';
+import Module, { syncBuiltinESMExports } from 'node:module';
 import { PRODUCTION_EXECUTION_PROFILE_CONFIG, PRODUCTION_LOCAL_VALIDATION_CONFIG } from '../src/production-policy.js';
 import { distributionManifestDigest } from '../src/production-host.js';
 import { manifest, installedFixture } from './production-host-fixture.js';
@@ -58,14 +59,57 @@ describe('accepted production tool closure and placement',()=>{
   it('selects the accepted Codex through the real routine Luna provider without invoking a real model',async()=>{
     const f=await installedFixture(true,false,{}, {lunaHome:true});try{const calls:{file:string;args:readonly string[];env:NodeJS.ProcessEnv|undefined}[]=[];const s=f.resolve({async run(file,args,options){options.beforeSpawn?.();calls.push({file,args,env:options.env});return{exitCode:1,stdout:'',stderr:'controlled no-model stop'};}});assert.equal(s.workerTransportSourceOwned,false,'Controlled transport confers no source-owned governed-runtime qualification');const luna=await import(new URL('./agents/luna-isolated.js',f.entryUrl).href) as typeof import('../src/agents/luna-isolated.js');const unqualified=new luna.IsolatedLunaAdapter({production:s,codexHome:s.environment.TACHIKO_LUNA_CODEX_HOME!,timeoutMs:900000});assert.equal(luna.hasGovernedPublicationConfinement(unqualified),false);const genuine=f.resolve();assert.equal(genuine.workerTransportSourceOwned,true);const qualified=new luna.IsolatedLunaAdapter({production:genuine,codexHome:genuine.environment.TACHIKO_LUNA_CODEX_HOME!,timeoutMs:900000});assert.equal(luna.hasGovernedPublicationConfinement(qualified),true);Object.defineProperty(qualified,'runner',{value:{run(){throw new Error('forged runner');}}});assert.equal(luna.hasGovernedPublicationConfinement(qualified),false);const installedBuild=(await import(new URL('./cli.js',f.entryUrl).href)).buildWorkflowDeps as typeof buildWorkflowDeps;const deps=installedBuild({configureNativeCompletionHosts(){}} as never,undefined,s.environment,s.transport,undefined,s.nativeMergeHost,undefined,s);const execution={profile:'routine' as const,revision:'issue-104-production-v7',...PRODUCTION_EXECUTION_PROFILE_CONFIG.profiles.routine};const result=await deps.implementation.run({target:{kind:'issue',owner:'acme',repo:'widgets',issueNumber:42},baseSha:'a'.repeat(40),authority:'embedded',instructions:'Controlled bounded process-selection proof; do not execute a model.',workspacePath:f.objectRoot,branch:'candidate',execution});assert.equal(result.exitStatus,'failure');assert.equal(calls.length,1);assert.equal(calls[0]!.file,f.record.codex.path);assert.ok(calls[0]!.args.includes('gpt-5.6-luna'));assert.ok(calls[0]!.args.includes('workspace-write'));assert.equal(calls[0]!.env!.CODEX_HOME,s.environment.TACHIKO_LUNA_CODEX_HOME);assert.ok(calls[0]!.env!.PATH!.startsWith(path.dirname(f.record.node.path)));const before=calls.length;writeFileSync(path.join(f.record.codex.runtimeDirectory,'runtime.cjs'),'changed loaded code');await deps.implementation.run({target:{kind:'issue',owner:'acme',repo:'widgets',issueNumber:42},baseSha:'a'.repeat(40),authority:'embedded',instructions:'Bounded no-model stop.',workspacePath:f.objectRoot,branch:'candidate',execution});assert.equal(calls.length,before);}finally{f.cleanup();}
   });
+  it('completes controlled Codex JSONL through the real Luna provider and the exact accepted Git HEAD transport',async()=>{
+    const f=await installedFixture(true,false,{}, {lunaHome:true});
+    try {
+      const calls:{file:string;args:readonly string[];env:NodeJS.ProcessEnv|undefined}[]=[];
+      const head='d'.repeat(40);
+      const jsonl=[{type:'thread.started',thread_id:'controlled-success'},{type:'turn.started'},{type:'item.completed',item:{id:'message',type:'agent_message',text:'Controlled successful completion'}},{type:'turn.completed'}].map(v=>JSON.stringify(v)).join('\n');
+      const s=f.resolve({async run(file,args,options){options.beforeSpawn?.();calls.push({file,args,env:options.env});return{exitCode:0,stdout:file===f.record.codex.path?jsonl:head+'\n',stderr:''};}});
+      const installedBuild=(await import(new URL('./cli.js',f.entryUrl).href)).buildWorkflowDeps as typeof buildWorkflowDeps;
+      const deps=installedBuild({configureNativeCompletionHosts(){}} as never,undefined,s.environment,s.transport,undefined,s.nativeMergeHost,undefined,s);
+      const execution={profile:'routine' as const,revision:'issue-104-production-v7',...PRODUCTION_EXECUTION_PROFILE_CONFIG.profiles.routine};
+      const result=await deps.implementation.run({target:{kind:'issue',owner:'acme',repo:'widgets',issueNumber:42},baseSha:'a'.repeat(40),authority:'embedded',instructions:'Controlled successful transport proof without a model.',workspacePath:f.objectRoot,branch:'candidate',execution});
+      assert.equal(result.exitStatus,'success',JSON.stringify(result));assert.equal(result.headSha,head);
+      assert.equal(calls.length,2);assert.equal(calls[0]!.file,f.record.codex.path);assert.equal(calls[1]!.file,f.record.git.path);
+      assert.deepEqual(calls[1]!.args.slice(-2),['rev-parse','HEAD']);assert.equal(calls[1]!.env!.GIT_CONFIG_GLOBAL,'/dev/null');
+      await assert.rejects(s.workerHeadReadRunner!.run(f.record.git.path,['push'],{cwd:f.objectRoot,timeoutMs:1000}),/exact Git command/);
+      await assert.rejects(s.workerHeadReadRunner!.run('git',['rev-parse','HEAD'],{cwd:f.objectRoot,timeoutMs:1000}),/exact Git command/);assert.equal(calls.length,2);
+      const luna=await import(new URL('./agents/luna-isolated.js',f.entryUrl).href) as typeof import('../src/agents/luna-isolated.js');
+      for(const field of ['headReadRunner','gitExecutable'] as const){const genuine=f.resolve();const qualified=new luna.IsolatedLunaAdapter({production:genuine,codexHome:genuine.environment.TACHIKO_LUNA_CODEX_HOME!,timeoutMs:900000});assert.equal(luna.hasGovernedPublicationConfinement(qualified),true);Object.defineProperty(qualified,field,{value:field==='gitExecutable'?'git':{run(){throw new Error('forged HEAD reader');}}});assert.equal(luna.hasGovernedPublicationConfinement(qualified),false,field);}
+      f.enable(false);await assert.rejects(s.workerHeadReadRunner!.run(f.record.git.path,['rev-parse','HEAD'],{cwd:f.objectRoot,timeoutMs:1000}),/changed/);assert.equal(calls.length,2);
+      await s.gitRunner!.run(f.record.git.path,['rev-parse','HEAD'],{cwd:f.objectRoot,timeoutMs:1000});assert.equal(calls.length,3,'Observation-safe Git remains independent of current initiation');
+    }finally{f.cleanup();}
+  });
   it('binds pnpm entry and loaded runtime bytes and refuses changed tools at the validation request fence',async()=>{
     for(const slot of ['pnpm','codex'] as const)for(const part of ['entry','loaded'] as const){const f=await installedFixture();try{const s=f.resolve();assert.equal(s.installation,'accepted',s.reason);const file=part==='entry'?f.record[slot].path:path.join(f.record[slot].runtimeDirectory,'runtime.cjs');const bytes=readFileSync(file);writeFileSync(file,Buffer.from(bytes).fill(88));assert.throws(s.assertInstallation,/changed/);const installedBuild=(await import(new URL('./cli.js',f.entryUrl).href)).buildWorkflowDeps as typeof buildWorkflowDeps;const deps=installedBuild({configureNativeCompletionHosts(){}} as never,undefined,s.environment,s.transport,undefined,s.nativeMergeHost,undefined,s);await assert.rejects(deps.validation!.validate({target:{kind:'issue',owner:'acme',repo:'widgets',issueNumber:42},headSha:'a'.repeat(40),workspacePath:f.objectRoot,beforeExecution:()=>s.assertRunInitiation({execution:{profile:'routine' as const,revision:'issue-104-production-v7',...PRODUCTION_EXECUTION_PROFILE_CONFIG.profiles.routine}})}),/changed/);assert.match(f.resolve().reason,/program bytes changed|runtime\/dependency closure changed/);}finally{f.cleanup();}}
   });
   it('rejects tool wrapper interpreter and ancestor fallback independently of accepted artifact identity',async()=>{
-    const f=await installedFixture();try{const before=f.resolve();assert.equal(before.installation,'accepted',before.reason);const outside=path.join(path.dirname(f.record.pnpm.runtimeDirectory),'node_modules');mkdirSync(outside);assert.throws(before.assertInstallation,/ancestor dependency fallback/);assert.match(f.resolve().reason,/ancestor dependency fallback/);rmSync(outside,{recursive:true});const file=f.record.pnpm.path;writeFileSync(file,'#!/usr/bin/env node\nrequire("./runtime.cjs");\n');assert.match(f.resolve().reason,/program bytes changed/);}finally{f.cleanup();}
+    const f=await installedFixture();try{const before=f.resolve();assert.equal(before.installation,'accepted',before.reason);const outside=path.join(path.dirname(f.record.pnpm.runtimeDirectory),'node_modules');mkdirSync(outside);assert.throws(before.assertInstallation,/ancestor dependency fallback/);assert.match(f.resolve().reason,/ancestor dependency fallback/);rmSync(outside,{recursive:true});}finally{f.cleanup();}
+    const invalid=await installedFixture(false,false,{}, {toolInterpreter:'ambient-node',expectedRejection:/exact pinned Node\/no-global-search-paths interpreter/});invalid.cleanup();
   });
   it('accepts the separate GitHub namespace and refuses valid-identity overlapping placements',async()=>{
     const accepted=await installedFixture();try{assert.equal(accepted.resolve().installation,'accepted');}finally{accepted.cleanup();}
     for(const githubNamespace of ['workspaces/candidate/github','repositories/objects/github','releases','runs/github','mission-admission/github','tools/github','']){const f=await installedFixture(false,false,{}, {githubNamespace,expectedRejection:/GitHub namespace overlaps/});f.cleanup();}
   });
+  it('rejects both containment directions of actual selected tool and object/GitHub roots with valid content identities',async()=>{
+    const baseline=await installedFixture(false,false,{}, {toolNamespaces:{codex:'private-runtime/codex',pnpm:'private-runtime/pnpm'}});try{assert.equal(baseline.resolve().installation,'accepted');}finally{baseline.cleanup();}
+    for(const slot of ['codex','pnpm'] as const)for(const surface of ['objectNamespace','githubNamespace'] as const)for(const location of [`private-runtime/${slot}`, 'private-runtime',`private-runtime/${slot}/nested`]){
+      const f=await installedFixture(false,false,{}, {toolNamespaces:{[slot]:`private-runtime/${slot}`},[surface]:location,expectedRejection:/tool runtime overlaps the selected object root or GitHub namespace/});f.cleanup();
+    }
+  });
+  it('refuses selected tool overlap before reading any conflicting GitHub namespace content',async()=>{
+    const baseline=await installedFixture();try{assert.equal(baseline.resolve().installation,'accepted');}finally{baseline.cleanup();}
+    for(const slot of ['codex','pnpm'] as const){const f=await installedFixture(false,false,{}, {toolNamespaces:{[slot]:`private-runtime/${slot}`},githubNamespace:`private-runtime/${slot}/github`,githubFixtureFile:true,expectedRejection:/tool runtime overlaps the selected object root or GitHub namespace/});
+      const originalRead=fs.readFileSync;let namespaceReads=0;
+      try {
+        Object.defineProperty(fs,'readFileSync',{value:(...args:unknown[])=>{const file=args[0];if(typeof file==='string'&&(file===f.record.github.configDirectory||file.startsWith(f.record.github.configDirectory+path.sep))){namespaceReads++;throw new Error('Forbidden controlled namespace content read');}return Reflect.apply(originalRead,fs,args);}});syncBuiltinESMExports();
+        const refused=f.resolve();assert.equal(refused.installation,'unavailable');assert.match(refused.reason,/tool runtime overlaps the selected object root or GitHub namespace/);assert.equal(namespaceReads,0,'Production must refuse placement before reading the synthetic namespace file');
+      }finally{Object.defineProperty(fs,'readFileSync',{value:originalRead});syncBuiltinESMExports();f.cleanup();}
+    }
+  });
+  it('provisions accepted private copied and emitted permissions for transpile and actual compiled modes',async()=>{
+    for(const compiled of [false,true]){const f=await installedFixture(false,compiled);try{assert.equal(f.resolve().installation,'accepted');const assertPrivate=(directory:string)=>{assert.equal(lstatSync(directory).mode&0o077,0,directory);for(const name of readdirSync(directory)){const file=path.join(directory,name);const stat=lstatSync(file);assert.equal(stat.isSymbolicLink(),false,file);assert.equal(stat.mode&0o077,0,file);if(stat.isDirectory())assertPrivate(file);}};assertPrivate(f.home);assert.ok(lstatSync(path.join(f.release,'dist/mission-admission')).isDirectory());assert.ok(lstatSync(path.join(f.release,'dist/oracle/receipt-store.js')).isFile());}finally{f.cleanup();}}
+  });
+
 });
