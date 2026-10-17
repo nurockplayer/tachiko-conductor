@@ -1229,11 +1229,15 @@ function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, recei
 }
 
 function settleRunAdmission(registry: MissionAdmissionRegistry, token: AdmissionToken, run: Run, receiptPath?: string, workDisposition?: 'cancelled'): void {
-  if (run.state === 'FAILED' || run.state === 'MERGED') {
+  // A local terminal outcome does not prove that a submitted native request
+  // completed or was cancelled. Preserve its overlap reservation on returned
+  // failures as well as on thrown exceptions.
+  const unresolvedReview = unresolvedNativeReview(run);
+  if ((run.state === 'FAILED' || run.state === 'MERGED') && !unresolvedReview) {
     registry.release(token, true, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'release_transition')),
       receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1, workDisposition));
   } else {
-    const reason = run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
+    const reason = unresolvedReview || run.state === 'NEEDS_HUMAN' || run.state === 'WAITING_DEPENDENCY' ? 'workflow_wait' : 'workflow_settled';
     registry.park(token, reason, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'park_transition')),
       receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'parked', token.generation + 1));
   }

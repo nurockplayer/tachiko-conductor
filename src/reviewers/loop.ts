@@ -33,7 +33,7 @@ import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUE
 import { createBootstrapFailureRun } from '../workflow/bootstrap-failure.js';
 import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 import { acceptedScopeFromHandoff, buildImplementationPacket, preflightImplementationPacket, type ImplementationPacket, type ImplementationPacketInput } from '../agents/implementation-packet.js';
-import { parkNativeReview } from '../oracle/native-reviewer.js';
+import { parkNativeReview, unresolvedNativeReview } from '../oracle/native-reviewer.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
@@ -1112,6 +1112,11 @@ export async function runReviewLoop(
       liveHead = liveSnapshot.headSha;
     } catch (error) {
       const reason = renderFailure('GitHub live-state validation failed', error);
+      if (unresolvedNativeReview(run)) {
+        const parked = parkNativeReview(run, 'request', reason, now());
+        if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
+        return { outcome: 'waiting_dependency', run: parked, reason };
+      }
       const type = isRetryable(error) ? 'escalate' : 'fail';
       const failure = applyTransition(
         run,

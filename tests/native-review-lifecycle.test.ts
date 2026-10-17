@@ -18,7 +18,7 @@ import { readRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.
 import { activeNativeReview, nativeReviewCoherent, nativeReviewReentry, resolveNativeReviewer } from '../src/oracle/native-reviewer.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { oracleDigest, readNativeSourceManifest, validNativeSourceManifest } from '../src/oracle/source-evidence.js';
-import type { NativeOracleEvidence, NativeReviewObservation, NativeReviewerHost } from '../src/oracle/types.js';
+import type { NativeOracleEvidence, NativeReviewObservation, NativeReviewerHost, OracleReceipt } from '../src/oracle/types.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import type { WorkflowDependencies } from '../src/workflow/run.js';
 import { runWorkflow } from '../src/workflow/run.js';
@@ -199,6 +199,170 @@ describe('native review through the real factory / durable dispatcher', () => {
     } finally { f.cleanup(); }
   });
 
+  it('rejects malformed present optional host capabilities through claim-composed READY and REVIEWING entry before any execution', async () => {
+    for (const state of ['READY', 'REVIEWING'] as const) {
+      for (const field of ['observe', 'replacementDisposition'] as const) {
+        for (const value of ['malformed-not-callable', null]) {
+          const f = fixture();
+          try {
+            const binding = { ...f.host, [field]: value } as unknown as NativeReviewerHost;
+            assert.equal(resolveNativeReviewer(binding).native!.available(), false, `${state}:${field}:${value}`);
+            f.seed(state);
+            assert.equal((await f.poll(binding)).outcome, 'dispatched');
+            const run = f.store().read('run-native')!;
+            assert.equal(run.state, 'WAITING_DEPENDENCY');
+            assert.match(run.interrupt!.reason, /Native review unavailable/);
+            assert.equal(run.nativeReview!.requests.length, 0);
+            assert.equal(run.telemetry!.events.filter((e) => e.kind === 'spawn').length, 0);
+            assert.equal(f.counts().modelCalls, 0);
+            assert.equal(f.counts().submissions, 0);
+            assert.equal(f.counts().observations, 0);
+            assert.equal(f.registry().readLane('run:run-native')!.status, 'parked');
+          } finally { f.cleanup(); }
+        }
+      }
+    }
+  });
+
+  it('parks pending native review on returned GitHub infrastructure failure, preserves overlap ownership and resumes the original request', async () => {
+    for (const retryable of [false, true]) {
+      const f = fixture();
+      try {
+        f.seed(); await f.poll();
+        const pending = f.store().read('run-native')!;
+        const request = f.request();
+        const owner = f.registry().readLane('run:run-native')!;
+        const readSnapshot = f.github.readLiveSnapshot;
+        f.github.readLiveSnapshot = async () => { throw Object.assign(new Error('controlled GitHub read infrastructure failure'), { retryable }); };
+        f.tick();
+        const failure = await f.poll();
+        assert.equal(failure.outcome, 'dispatched');
+        if (failure.outcome !== 'dispatched') throw new Error('Expected returned workflow wait.');
+        assert.equal(failure.execution.state, 'WAITING_DEPENDENCY');
+        const waiting = f.store().read('run-native')!;
+        assert.equal(waiting.interruptedFrom, 'REVIEWING');
+        assert.equal(waiting.nativeReview!.wait!.kind, 'request');
+        assert.match(waiting.interrupt!.reason, /controlled GitHub read infrastructure failure/);
+        assert.deepEqual(activeNativeReview(waiting), activeNativeReview(pending));
+        assert.equal(waiting.history.some((event) => event.type === 'fail'), false);
+        const retainedOwner = f.registry().readLane('run:run-native')!;
+        assert.equal(retainedOwner.status, 'parked');
+        assert.equal(retainedOwner.parkedReason, 'workflow_wait');
+        assert.equal(retainedOwner.missionId, owner.missionId);
+        assert.ok(retainedOwner.generation > owner.generation);
+        const receipt = readRunOwnerReceipt(f.receiptPath)!;
+        assert.equal(receipt.phase, 'parked');
+        assert.equal(receipt.workDisposition, undefined);
+        assert.equal(receipt.claimId, request.identity.claimId);
+        const overlap = f.registry().admit({ laneId: 'competing-owner', role: 'production_captain', evidence: { repository: 'acme/widgets', issue: 42 } });
+        assert.notEqual(overlap.outcome, 'admitted', 'remote pending work retains its mission overlap reservation');
+        assert.equal(f.store().list().length, 1);
+        assert.equal(f.counts().submissions, 1); assert.equal(f.counts().observations, 0); assert.equal(f.counts().modelCalls, 0);
+        assert.equal(waiting.telemetry!.events.filter((e) => e.kind === 'spawn').length, 1);
+        assert.equal((await f.poll()).outcome, 'existing_claim', 'infrastructure failure respects durable wait backoff');
+        f.github.readLiveSnapshot = readSnapshot;
+        f.setObserve(async (identity, url) => {
+          assert.deepEqual(identity, request.identity);
+          assert.equal(url, activeNativeReview(pending)!.conversationUrl);
+          return { outcome: 'complete', evidence: f.terminal(request) };
+        });
+        f.tick(); await f.poll();
+        const ready = f.store().read('run-native')!;
+        assert.equal(ready.state, 'MERGE_READY');
+        assert.equal(ready.nativeReview!.requests.length, 1);
+        assert.equal(ready.nativeReview!.accepted!.requestId, request.identity.requestId);
+        assert.equal(f.counts().submissions, 1); assert.equal(f.counts().observations, 1); assert.equal(f.counts().modelCalls, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('centrally parks an unresolved native owner even if workflow returns FAILED, while preserving ordinary failure release', async () => {
+    for (const pendingReview of [true, false]) {
+      const f = fixture();
+      try {
+        f.seed(); if (pendingReview) await f.poll();
+        const before = f.store().read('run-native')!;
+        const workflow = f.workflow();
+        let faultApplied = false;
+        const outcome = await runIssueCommand(workflow, 'acme/widgets#42', {
+          execution, dispatchClaimId: before.dispatchClaimId, repairTaskShapeAuthority: authority,
+          admission: f.registry(), runOwnerReceiptPath: f.receiptPath, admissionWorkspace: f.repository, now: f.now,
+          // A completed local failure between owner admission and workflow
+          // entry exercises returned-outcome settlement independently of the
+          // review loop's infrastructure-error handling and exception catch.
+          releaseDispatchAdmissionLock: () => {
+            if (faultApplied) return;
+            faultApplied = true;
+            const current = workflow.store.read(before.id)!;
+            const failed = applyTransition(current, { type: 'fail', reason: 'controlled local terminal outcome' }, f.now());
+            assert.equal(workflow.store.updateIfUnchanged!(current, failed), true);
+          },
+        });
+        assert.equal(faultApplied, true);
+        assert.equal(outcome.outcome, 'failed');
+        assert.equal(outcome.run.state, 'FAILED');
+        const owner = f.registry().readLane('run:run-native')!;
+        const receipt = readRunOwnerReceipt(f.receiptPath)!;
+        assert.equal(owner.status, pendingReview ? 'parked' : 'released');
+        assert.equal(receipt.phase, pendingReview ? 'parked' : 'released');
+        assert.equal(receipt.workDisposition, undefined);
+        if (pendingReview) {
+          assert.equal(owner.parkedReason, 'workflow_wait');
+          assert.deepEqual(activeNativeReview(outcome.run), activeNativeReview(before));
+          assert.equal(activeNativeReview(outcome.run)!.submissionPossible, true);
+        }
+        assert.equal(f.counts().modelCalls, 0); assert.equal(f.counts().observations, 0);
+        assert.equal(f.counts().submissions, pendingReview ? 1 : 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
+  it('accepts authenticated telemetry-bearing approval at final and reconstructed cached gates while retaining full receipt authentication and digest', async () => {
+    for (const tamper of ['semantic-review', 'receipt-telemetry'] as const) {
+      const f = fixture();
+      try {
+        f.seed();
+        let terminal: TerminalEvidence | undefined;
+        f.setSubmit(async (request) => {
+          const evidence = f.terminal(request);
+          const result = { ...evidence.result, telemetry: { provider: 'qualified-controlled-transport', model: request.identity.requestedModel, reasoningEffort: request.identity.requestedEffort, turns: 1, usage: { inputTokens: 12, outputTokens: 7 } } };
+          terminal = { ...evidence, result, authentication: { ...evidence.authentication, transportReceipt: oracleDigest({ identity: request.identity, result, actor: evidence.authentication.actorId }) } };
+          return { outcome: 'complete', evidence: terminal };
+        });
+        await f.poll();
+        const ready = f.store().read('run-native')!;
+        assert.equal(ready.state, 'MERGE_READY');
+        assert.ok(terminal);
+        assert.equal(ready.reviewResult!.telemetry, undefined, 'state machine retains its semantic review projection');
+        assert.equal(ready.nativeReview!.accepted!.digest, oracleDigest(terminal));
+        assert.deepEqual(f.receipts().readNative(terminal.id), terminal, 'full authenticated usage/provenance evidence is retained');
+        const cached = () => runIssueCommand(f.workflow(), 'acme/widgets#42', {
+          execution, dispatchClaimId: ready.dispatchClaimId, repairTaskShapeAuthority: authority,
+          admission: f.registry(), runOwnerReceiptPath: f.receiptPath, admissionWorkspace: f.repository, now: f.now,
+          assertReviewClaim: async (run) => {
+            const live = selectDispatchRuntime(await f.runtime.listRuntimeComments())!.claim;
+            assert.equal(live.claimId, run.dispatchClaimId); assert.equal(live.runId, run.id); assert.equal(live.issue, TARGET.issueNumber);
+          },
+        });
+        assert.equal((await cached()).outcome, 'merge_ready', 'a fresh factory/store/admission rechecks cached qualification');
+        if (tamper === 'semantic-review') {
+          const current = f.store().read(ready.id)!;
+          assert.equal(f.store().updateIfUnchanged(current, { ...current, reviewResult: { ...current.reviewResult!, findings: [{ severity: 'non_blocking', summary: 'foreign semantic review' }] } }), true);
+        } else {
+          // Deliberately corrupt the immutable file outside its no-replace
+          // writer: ignoring telemetry for semantic equality must not omit it
+          // from receipt authentication or its accepted digest.
+          writeFileSync(path.join(f.directory, 'oracle', 'native', `${terminal.id}.json`), JSON.stringify({ ...terminal, result: { ...terminal.result, telemetry: { ...terminal.result.telemetry, turns: 2 } } }));
+        }
+        const rejected = await cached();
+        assert.equal(rejected.outcome, 'waiting_dependency', tamper);
+        assert.equal(rejected.run.nativeReview!.wait!.kind, 'qualification');
+        assert.equal(rejected.run.nativeReview!.accepted!.digest, ready.nativeReview!.accepted!.digest);
+        assert.equal(f.counts().submissions, 1); assert.equal(f.counts().observations, 0); assert.equal(f.counts().modelCalls, 0);
+      } finally { f.cleanup(); }
+    }
+  });
+
   it('retains qualified changes-required findings and parks without lead transport or repair', async () => {
     const f = fixture();
     try {
@@ -209,6 +373,53 @@ describe('native review through the real factory / durable dispatcher', () => {
       assert.equal(run.reviewResult!.findings[0]!.summary, 'Preserve this finding');
       assert.equal(run.nativeReview!.wait!.kind, 'lead');
       assert.equal(f.counts().modelCalls, 0); assert.equal(run.repairAdmissions, undefined);
+    } finally { f.cleanup(); }
+  });
+
+  it('keeps every valid legacy suffix readable in a disjoint namespace and prevents legacy writes from replacing native evidence', async () => {
+    const f = fixture();
+    try {
+      const legacy = (id: string): OracleReceipt => ({ id, target: TARGET, requestedHeadSha: f.head, observedHeadSha: f.head, outcome: 'approved', reviewedAt: T0, blockingFindingCount: 0, nonBlockingFindingCount: 0 });
+      f.receipts().record(legacy('legacy.native'));
+      assert.deepEqual(f.receipts().list(), [{ ...legacy('legacy.native'), policyQualified: false }]);
+      f.seed();
+      f.setSubmit(async (request) => {
+        const terminal = f.terminal(request);
+        // These were actual shared filenames before namespace isolation.
+        // Include a legacy write after request publication and before terminal
+        // publication so isolation works in both directions and on restart.
+        f.receipts().record(legacy(`${request.id}.native`));
+        f.receipts().record(legacy(`${terminal.id}.native`));
+        return { outcome: 'complete', evidence: terminal };
+      });
+      await f.poll();
+      const ready = f.store().read('run-native')!;
+      assert.equal(ready.state, 'MERGE_READY');
+      const request = f.request(); const terminal = f.terminal(request);
+      const requestFile = path.join(f.directory, 'oracle', 'native', `${request.id}.json`);
+      const terminalFile = path.join(f.directory, 'oracle', 'native', `${terminal.id}.json`);
+      const beforeRequest = readFileSync(requestFile, 'utf8');
+      const beforeTerminal = readFileSync(terminalFile, 'utf8');
+      const legacyIds = ['legacy.native', `${request.id}.native`, `${terminal.id}.native`];
+      for (const id of legacyIds) f.receipts().record(legacy(id));
+      assert.deepEqual(f.receipts().list().map((r) => r.id).sort(), legacyIds.sort());
+      assert.ok(f.receipts().list().every((r) => r.policyQualified === false));
+      assert.equal(readFileSync(requestFile, 'utf8'), beforeRequest);
+      assert.equal(readFileSync(terminalFile, 'utf8'), beforeTerminal);
+      assert.deepEqual(f.receipts().readNative(request.id), request);
+      assert.deepEqual(f.receipts().readNative(terminal.id), terminal);
+      assert.equal(ready.nativeReview!.accepted!.digest, oracleDigest(terminal));
+      f.receipts().recordNative(terminal);
+      assert.throws(() => f.receipts().recordNative({ ...terminal, result: { ...terminal.result, findings: [{ severity: 'non_blocking', summary: 'conflicting immutable finding' }] } }), /Conflicting immutable/);
+      assert.equal(readFileSync(terminalFile, 'utf8'), beforeTerminal);
+
+      const oldRoot = path.join(f.directory, 'unqualified-flat-format');
+      const oldStore = new JsonFileOracleReceiptStore(oldRoot);
+      const oldFile = path.join(oldRoot, `${terminal.id}.native.json`);
+      writeFileSync(oldFile, JSON.stringify(terminal));
+      assert.equal(oldStore.readNative(terminal.id), null, 'flat ambiguous files never acquire native qualification');
+      assert.throws(() => oldStore.list(), /Invalid Oracle receipt/, 'non-legacy flat schema fails closed instead of being hidden or promoted');
+      assert.deepEqual(JSON.parse(readFileSync(oldFile, 'utf8')), terminal, 'ambiguous old evidence is retained unchanged');
     } finally { f.cleanup(); }
   });
 

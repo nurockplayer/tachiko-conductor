@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import type { NativeReviewBoundary, NativeReviewContext, ReviewerAdapter } from '../adapters/reviewer.js';
-import type { Run } from '../domain/types.js';
+import type { ReviewResult, Run } from '../domain/types.js';
 import { applyTransition } from '../domain/state-machine.js';
 import { isProviderExecutionTelemetry } from '../domain/telemetry.js';
 import { classifyReviewRisk, canonicalReviewTarget } from '../reviewers/risk-policy.js';
@@ -14,6 +14,14 @@ const DIGEST = /^[0-9a-f]{64}$/;
 const ID = /^[A-Za-z0-9._:-]{1,300}$/;
 const text = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0 && v.length <= 500;
 const same = (a: unknown, b: unknown) => oracleDigest(a) === oracleDigest(b);
+
+/** Match the state machine's durable review projection. Authentication and
+ * receipt digests still cover the full terminal result, including telemetry. */
+function durableReview(result: ReviewResult | undefined): Omit<ReviewResult, 'telemetry'> | undefined {
+  if (result === undefined) return undefined;
+  const { telemetry: _telemetry, ...review } = result;
+  return review;
+}
 
 function frozen<T>(value: T): T {
   const copy = structuredClone(value);
@@ -121,6 +129,7 @@ function usableHost(host: NativeReviewerHost | undefined): host is NativeReviewe
       [b.bindingId, b.contractRevision, b.policyRevision, b.scope, b.model].every(text) && Array.isArray(b.supportedEfforts) && b.supportedEfforts.length > 0 && b.supportedEfforts.length <= 3 && new Set(b.supportedEfforts).size === b.supportedEfforts.length && b.supportedEfforts.every((e) => ['Medium', 'High', 'Extra High'].includes(e)) &&
       b.supportedEfforts.includes('Extra High') &&
       Array.isArray(b.authorActorIds) && b.authorActorIds.length > 0 && b.authorActorIds.every(text) && typeof b.allowTransportReplacement === 'boolean' &&
+      (host.observe === undefined || typeof host.observe === 'function') && (host.replacementDisposition === undefined || typeof host.replacementDisposition === 'function') &&
       typeof host.receipts?.recordNative === 'function' && typeof host.receipts.readNative === 'function' && typeof host.source === 'function' && typeof host.submit === 'function' && typeof host.authenticate === 'function';
   } catch { return false; }
 }
@@ -262,7 +271,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
         const request = host.receipts.readNative!(`${accepted.requestId}.request`);
         const terminal = host.receipts.readNative!(accepted.receiptId);
         if (!request || request.kind !== 'request' || !validNativeEvidence(request) || !same(request.identity, active.identity) || !terminal || terminal.kind !== 'terminal' || !validNativeEvidence(terminal) ||
-          oracleDigest(terminal) !== accepted.digest || !same(terminal.identity, active.identity) || !same(run.reviewResult, terminal.result) || host.binding.authorActorIds.includes(terminal.authentication.actorId) || !host.authenticate(frozen(terminal))) return false;
+          oracleDigest(terminal) !== accepted.digest || !same(terminal.identity, active.identity) || !same(durableReview(run.reviewResult), durableReview(terminal.result)) || host.binding.authorActorIds.includes(terminal.authentication.actorId) || !host.authenticate(frozen(terminal))) return false;
         const current = host.source(active.identity.baseSha, active.identity.headSha);
         context.assertCurrent();
         return validNativeSourceManifest(current) && current.sourceSha256 === active.identity.sourceSha256 && current.diffSha256 === active.identity.diffSha256;

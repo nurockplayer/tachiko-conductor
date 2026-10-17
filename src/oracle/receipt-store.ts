@@ -49,7 +49,13 @@ function valid(value: unknown): value is OracleReceipt {
 
 export class JsonFileOracleReceiptStore implements OracleReceiptStore {
   private readonly dir: string;
-  constructor(dir: string) { this.dir = ensureDurableDirectory(path.resolve(dir), { mode: 0o700 }); }
+  private readonly nativeDir: string;
+  constructor(dir: string) {
+    this.dir = ensureDurableDirectory(path.resolve(dir), { mode: 0o700 });
+    // Every legacy id can contain dots, so no filename suffix is a disjoint
+    // namespace. Native evidence lives below this same store's root instead.
+    this.nativeDir = path.join(this.dir, 'native');
+  }
   record(receipt: OracleReceipt): void {
     if (!valid(receipt)) throw new Error('Invalid Oracle receipt.');
     const file = path.join(this.dir, `${receipt.id}.json`);
@@ -58,7 +64,7 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
     renameSync(temp, file);
   }
   list(): readonly OracleReceipt[] {
-    return readdirSync(this.dir).filter((name) => name.endsWith('.json') && !name.endsWith('.native.json')).sort().map((name) => {
+    return readdirSync(this.dir).filter((name) => name.endsWith('.json')).sort().map((name) => {
       const value: unknown = JSON.parse(readFileSync(path.join(this.dir, name), 'utf8'));
       if (!valid(value)) throw new Error(`Invalid Oracle receipt in ${name}.`);
       return value.policy === undefined ? { ...value, policyQualified: false } : value;
@@ -66,7 +72,8 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
   }
   recordNative(evidence: NativeOracleEvidence): void {
     if (!validNativeEvidence(evidence)) throw new Error('Invalid immutable native Oracle evidence.');
-    const file = path.join(this.dir, `${evidence.id}.native.json`);
+    ensureDurableDirectory(this.nativeDir, { mode: 0o700 });
+    const file = path.join(this.nativeDir, `${evidence.id}.json`);
     const existing = this.readNative(evidence.id);
     if (existing !== null) {
       if (oracleDigest(existing) !== oracleDigest(evidence)) throw new Error('Conflicting immutable native Oracle evidence.');
@@ -82,13 +89,15 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
         const winner = this.readNative(evidence.id);
         if (winner === null || oracleDigest(winner) !== oracleDigest(evidence)) throw new Error('Conflicting immutable native Oracle evidence.');
       }
-      const directory = openSync(this.dir, 'r');
+      const directory = openSync(this.nativeDir, 'r');
       try { fsyncSync(directory); } finally { closeSync(directory); }
     } finally { unlinkSync(temporary); }
   }
   readNative(id: string): NativeOracleEvidence | null {
     if (!/^[A-Za-z0-9._-]{1,300}$/.test(id)) throw new Error('Invalid native Oracle evidence id.');
-    const file = path.join(this.dir, `${id}.native.json`);
+    // Do not adopt an ambiguous flat *.native.json file from an earlier
+    // unqualified format; it may be a valid legacy receipt with that suffix.
+    const file = path.join(this.nativeDir, `${id}.json`);
     if (!existsSync(file)) return null;
     const value = JSON.parse(readFileSync(file, 'utf8')) as NativeOracleEvidence;
     if (!validNativeEvidence(value) || value.id !== id) throw new Error('Invalid immutable native Oracle evidence.');
