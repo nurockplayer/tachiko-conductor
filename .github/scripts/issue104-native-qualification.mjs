@@ -65,8 +65,8 @@ const binding = JSON.parse(fs.readFileSync(path.join(artifact, 'candidate.json')
 assert.deepEqual(binding, { head: expectedHead, tree: expectedTree, lockSha256: lockSha });
 const artifactBefore = fingerprint(artifact);
 const reports = [];
-// One diagnostic-only fixture prerequisite, never the full four-command gate.
-const focusCode = "import { spawnSync } from 'node:child_process'; import { environmentForTier, tsxInvocation } from './scripts/test-tier.mjs'; const tsx = tsxInvocation(process.cwd()); const result = spawnSync(tsx.command, [...tsx.arguments, '--test', '--test-concurrency=2', 'tests/account-home.test.ts', 'tests/mission-admission.test.ts', 'tests/store.test.ts'], { cwd: process.cwd(), env: environmentForTier('isolated'), stdio: 'inherit' }); if (result.error !== undefined) throw result.error; process.exitCode = result.status ?? 1;";
+// One diagnostic-only fixed lock-identity prerequisite, never the full four-command gate.
+const focusCode = "import { spawnSync } from 'node:child_process';\nconst records = [];\nfunction errorScalars(error) {\n  if (!error || typeof error !== 'object') return {};\n  const result = {};\n  if (typeof error.code === 'string' && /^(?:E[A-Z0-9_]{1,40}|ERR_[A-Z0-9_]{1,60})$/.test(error.code)) result.code = error.code;\n  if (Number.isSafeInteger(error.errno)) result.errno = error.errno;\n  if (error.syscall === 'spawnSync' || (typeof error.syscall === 'string' && error.syscall.startsWith('spawnSync /'))) result.syscall = 'spawnSync';\n  return result;\n}\nfunction observe(stage, program, args, uuidParser = false) {\n  try {\n    const result = spawnSync(program, args, {\n      encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'],\n      timeout: 2_000, maxBuffer: 64 * 1024,\n      env: { ...process.env, LC_ALL: 'C', LANG: 'C', TZ: 'UTC0' },\n    });\n    const stdoutString = typeof result.stdout === 'string';\n    const outputPresent = stdoutString && result.stdout.trim().length > 0;\n    const parserMatch = uuidParser ? Boolean(stdoutString && result.stdout.trim().match(/\"IOPlatformUUID\"\\s*=\\s*\"([^\"]+)\"/)?.[1]) : undefined;\n    const passed = result.error === undefined && result.status === 0 && outputPresent && (!uuidParser || parserMatch);\n    records.push({ stage, passed, status: Number.isInteger(result.status) ? result.status : null,\n      signal: typeof result.signal === 'string' && /^SIG[A-Z0-9]{1,20}$/.test(result.signal) ? result.signal : null,\n      errorPresent: result.error !== undefined, ...errorScalars(result.error), stdoutString, outputPresent,\n      ...(uuidParser ? { parserMatch } : {}) });\n  } catch (error) {\n    records.push({ stage, passed: false, thrown: true, ...errorScalars(error) });\n  }\n}\nobserve('ioreg-host-identity', '/usr/sbin/ioreg', ['-rd1', '-c', 'IOPlatformExpertDevice'], true);\nobserve('sysctl-boot-identity', '/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid']);\nobserve('ps-own-start-identity', '/bin/ps', ['-o', 'lstart=', '-p', String(process.pid)]);\nfor (const record of records) console.log('LOCK_QUERY_STAGE ' + JSON.stringify(record));\nconst failed = records.filter((record) => !record.passed).length;\nconsole.log('LOCK_QUERY_SUMMARY ' + JSON.stringify({ diagnosticOnly: true, stages: records.length, failed }));\nprocess.exitCode = records.length === 3 && failed === 0 ? 0 : 1;\n";
 for (const mode of ['owned-request']) {
   const workspace = path.join(root, mode);
   command(git, ['clone', '--no-local', '--no-checkout', candidate, workspace]);
@@ -127,7 +127,7 @@ for (const mode of ['owned-request']) {
     cleanups: cleanups.map((entry) => ({ ...entry,
       snapshots: entry.snapshots.map((snapshot) => ({ ...snapshot, manifest: manifestSummary(snapshot.manifest) })) })),
   };
-  const publicLine = 'FIXTURE_FOCUS_RECEIPT ' + JSON.stringify(publicReport) + '\n';
+  const publicLine = 'LOCK_QUERY_RECEIPT ' + JSON.stringify(publicReport) + '\n';
   assert.ok(Buffer.byteLength(publicLine, 'utf8') <= 16 * 1024, 'bounded complete public receipt');
   await new Promise((resolve, reject) => process.stdout.write(publicLine, (error) => error ? reject(error) : resolve()));
   assert.equal(evidence.status, 'passed', mode);
@@ -147,8 +147,8 @@ for (const mode of ['owned-request']) {
   const manifest = snapshots[0].manifest;
   assert.ok(Array.isArray(manifest) && manifest.length > 0);
   const roots = new Set(manifest.map((entry) => entry.replace(/^(file|link|directory) /, '').replace(/ [0-7]+ [a-f0-9]{64}$/i, '')));
-  assert.ok(![...roots].some((entry) => entry === 'dist' || entry.startsWith('dist/')), 'focus never runs build');
+  assert.ok(![...roots].some((entry) => entry === 'dist' || entry.startsWith('dist/')), 'diagnostic never runs build');
   assert.ok([...roots].every((entry) => ['dist', 'node_modules', 'apps/control-tower/node_modules'].some((admitted) => entry === admitted || entry.startsWith(admitted + '/'))));
   assert.deepEqual(report.artifactAfter, artifactBefore, 'trusted private artifact unchanged');
 }
-console.log('FIXTURE_FOCUS_COMPLETE ' + JSON.stringify({ diagnosticOnly: true, head: expectedHead, tree: expectedTree, adapterModes: reports.map((entry) => entry.mode), artifact: artifactBefore, compiledValidatorSha256: sha(fs.readFileSync(path.join(candidate, 'dist/validation/local-command.js'))) }));
+console.log('LOCK_QUERY_COMPLETE ' + JSON.stringify({ diagnosticOnly: true, head: expectedHead, tree: expectedTree, adapterModes: reports.map((entry) => entry.mode), artifact: artifactBefore, compiledValidatorSha256: sha(fs.readFileSync(path.join(candidate, 'dist/validation/local-command.js'))) }));

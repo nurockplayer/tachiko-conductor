@@ -1,4 +1,4 @@
-name: Issue 104 isolated account fixture prerequisite
+name: Issue 104 isolated lock identity prerequisite
 on:
   push:
     branches: [qualification/issue104-stage6-native]
@@ -88,7 +88,7 @@ jobs:
         working-directory: candidate
         timeout-minutes: 3
         run: pnpm build
-      - name: Diagnostic-only complete account store and admission fixture files
+      - name: Diagnostic-only three fixed lock identity queries
         timeout-minutes: 30
         shell: bash
         run: |
