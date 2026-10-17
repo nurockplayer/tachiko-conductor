@@ -38,12 +38,12 @@ jobs:
         with:
           node-version: 24.19.0
 
-      - name: Run provider preflight only and encrypt private evidence
+      - name: Run bounded supplemental diagnostics and encrypt private evidence
         shell: bash
         run: |
           set -eu
           umask 077
-          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py --preflight-only
+          /usr/bin/python3 qualification-infra/scripts/native-qualification/qualify.py --diagnostics-only
 
       - name: Preserve ciphertext and sanitized summary
         if: always()

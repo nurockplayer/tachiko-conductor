@@ -39,6 +39,11 @@ PUBLIC_LIMIT = 8 * 1024 * 1024
 SUMMARY_LIMIT = 16 * 1024
 CLT_ROOT = pathlib.Path('/Library/Developer/CommandLineTools')
 CLT_GIT = CLT_ROOT / 'usr/bin/git'
+DIAGNOSTIC_TESTS = (
+    'test_direct_exit_does_not_wait_for_descendant_output_eof',
+    'test_exec_failure_releases_guard_and_leaves_change_retryable',
+    'test_stalled_wake_times_out_without_consuming_change',
+)
 
 
 def utc():
@@ -60,11 +65,11 @@ def write_json(path, value):
 def write_summary(path, value):
     encoded = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
     if len(encoded) > SUMMARY_LIMIT:
-        preflight_only = value.get('mode') == 'provider_preflight_only'
+        mode = value.get('mode', 'native_qualification')
         value = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
-                 'mode': 'provider_preflight_only' if preflight_only else 'native_qualification',
-                 'native_gates': 'NOT_RUN' if preflight_only else 'UNKNOWN',
-                 'status': 'PREFLIGHT_FAIL' if preflight_only else 'FAIL',
+                 'mode': mode, 'native_gates': 'UNKNOWN' if mode == 'native_qualification' else 'NOT_RUN',
+                 'status': {'provider_preflight_only': 'PREFLIGHT_FAIL',
+                            'diagnostics_only': 'DIAGNOSTIC_FAIL'}.get(mode, 'FAIL'),
                  'reason': 'summary_oversize', 'evidence_encrypted': False,
                  'production_qualification': False}
         encoded = (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
@@ -107,13 +112,16 @@ def parse_node(text):
 
 
 class Qualification:
-    def __init__(self, preflight_only=False):
+    def __init__(self, preflight_only=False, diagnostics_only=False):
         os.umask(0o077)
         self.preflight_only = preflight_only
-        self.mode = 'provider_preflight_only' if preflight_only else 'native_qualification'
-        self.failure_status = 'PREFLIGHT_FAIL' if preflight_only else 'FAIL'
-        self.success_status = 'PREFLIGHT_PASS' if preflight_only else 'PASS'
+        self.diagnostics_only = diagnostics_only
+        self.mode = 'diagnostics_only' if diagnostics_only else 'provider_preflight_only' if preflight_only else 'native_qualification'
+        self.failure_status = 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL'
+        self.success_status = 'DIAGNOSTIC_COMPLETE' if diagnostics_only else 'PREFLIGHT_PASS' if preflight_only else 'PASS'
         self.git_capability = None
+        self.diagnostics = {'python': [], 'node': None, 'complete': False} if diagnostics_only else None
+        self.diagnostic_files = []
         self.started = time.monotonic()
         self.runner_temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
         self.workspace = pathlib.Path(os.environ['GITHUB_WORKSPACE']).resolve(strict=True)
@@ -527,6 +535,8 @@ class Qualification:
             raise RuntimeError('infrastructure_commit_mismatch')
         self.provenance['harness_sha256'] = digest(self.infra / 'qualify.py')
         self.provenance['recipient_sha256'] = digest(self.infra / 'recipient.pem')
+        if self.diagnostics_only:
+            self.provenance['diagnostic_module_sha256'] = digest(self.infra / 'adapter-diagnostic.mjs')
         write_json(self.private / 'workflow-provenance.json', self.provenance)
         version_commands = {'python': ['/usr/bin/python3', '--version'], 'node': [self.node, '--version'],
                             'corepack': [self.node.parent / 'corepack', '--version'],
@@ -594,25 +604,113 @@ class Qualification:
                    'lock_sha256': digest(tool_root / 'pnpm-lock.yaml'), 'launcher': str(launcher),
                    'launcher_target': str(executable), 'corepack_shim': False})
 
+    def git_capability_probe(self):
+        argv = [self.git, '--no-replace-objects', '--no-lazy-fetch', '-c', 'core.fsmonitor=false',
+                '-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=',
+                '-C', self.candidate, 'cat-file', '-e', 'HEAD^{commit}']
+        record, _output = self.run('git-required-syntax-local-object', argv, required=False)
+        accepted = record['exit_code'] == 0 and not record['timed_out'] and record['raw_capture_complete'] \
+            and record['observed_family_complete'] and record['original_group_absent']
+        self.git_capability = {'argv': [str(arg) for arg in argv], 'exit_code': record['exit_code'],
+                               'version': self.versions['git'], 'sha256': digest(self.git), 'accepted': accepted}
+        write_json(self.private / 'git-capability.json', self.git_capability)
+        if not accepted:
+            raise RuntimeError('git_required_syntax_local_object_failed')
+
+    def diagnose(self):
+        # Selection is supplemental only: original script/main and unchanged assertions.
+        deadline = time.monotonic() + 240
+        for index, name in enumerate(DIAGNOSTIC_TESTS):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('python_diagnostic_total_bound')
+            record, output = self.run('python-diagnostic-' + str(index + 1),
+                ['/usr/bin/python3', 'scripts/bootstrap-heartbeat/test_runner.py', 'HeartbeatTest.' + name],
+                timeout=min(60, remaining), required=False)
+            text = output[0].read_text() + '\n' + output[1].read_text()
+            parsed = parse_python(text)
+            outcomes = re.findall(r'^' + re.escape(name) + r' \([^\n]+\) \.\.\. (ok|FAIL|ERROR)$', text, re.M)
+            finding = {'test_id': 'HeartbeatTest.' + name, 'exit_code': record['exit_code'],
+                       'outcome': outcomes[0] if len(outcomes) == 1 else 'INCOMPLETE',
+                       'elapsed_seconds': record['elapsed_seconds'],
+                       'counts': {key: parsed[key] for key in ['tests', 'pass', 'fail', 'skip', 'counts_complete']}}
+            self.diagnostics['python'].append(finding)
+            write_json(self.private / 'diagnostics.json', self.diagnostics)
+            if not record['observed_root'] or not record['observed_family_complete'] \
+                    or not record['original_group_absent'] or not record['raw_capture_complete'] \
+                    or record['timed_out'] or record['elapsed_seconds'] > 60 or time.monotonic() > deadline \
+                    or not parsed['counts_complete'] or parsed['tests'] != 1 or len(outcomes) != 1 \
+                    or record['exit_code'] != (0 if outcomes[0] == 'ok' else 1):
+                raise RuntimeError('python_diagnostic_infrastructure_incomplete')
+        deadline = time.monotonic() + 180
+        for mode in ['control', 'captured']:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError('node_diagnostic_total_bound')
+            record, _output = self.run('node-adapter-diagnostic-' + mode,
+                [self.node, '--import', 'tsx', self.infra / 'adapter-diagnostic.mjs', self.candidate,
+                 self.private / 'node-diagnostic', self.fixture, self.git, mode], timeout=remaining, required=False)
+            if record['exit_code'] != 0 or not record['observed_root'] or not record['observed_family_complete'] \
+                    or not record['original_group_absent'] or not record['raw_capture_complete'] \
+                    or record['timed_out'] or time.monotonic() > deadline:
+                raise RuntimeError('node_diagnostic_infrastructure_incomplete')
+        self.diagnostics['node'] = json.loads((self.private / 'node-diagnostic/comparison.json').read_text())
+        if self.diagnostics['node'].get('complete') is not True:
+            raise RuntimeError('node_diagnostic_comparison_incomplete')
+        self.diagnostics['complete'] = True
+        write_json(self.private / 'diagnostics.json', self.diagnostics)
+
+    def diagnostic_archive_files(self):
+        # Evidence only: never traverse fixtures, dependencies, child homes or caches.
+        root = self.private / 'node-diagnostic'
+        patterns = [r'(?:fixture|control|captured|comparison|error|store-manifest)\.json',
+                    r'store/[0-9a-f-]{36}\.(?:stdout|stderr)',
+                    r'store/operations/(?:[0-9a-f-]{36}\.json|slot-[0-9]{4}\.json|index\.json)']
+        files = []
+        self.diagnostic_files = files
+        total = 0
+        invalid = False
+        if not root.exists():
+            return files
+        for directory in [root, root / 'store', root / 'store/operations']:
+            if not directory.exists():
+                continue
+            if directory.is_symlink() or not directory.is_dir():
+                raise RuntimeError('diagnostic_evidence_directory_unsafe')
+            with os.scandir(directory) as entries:
+                for index, entry in enumerate(entries):
+                    if index >= 32:
+                        raise RuntimeError('diagnostic_evidence_file_count_bound')
+                    path = pathlib.Path(entry.path)
+                    if path.is_dir() and not path.is_symlink():
+                        if path not in [root / 'store', root / 'store/operations']:
+                            invalid = True
+                        continue
+                    relative = str(path.relative_to(root))
+                    if not any(re.fullmatch(pattern, relative) for pattern in patterns) \
+                            or not stat.S_ISREG(path.lstat().st_mode) or path.is_symlink():
+                        invalid = True
+                        continue
+                    total += path.stat().st_size
+                    if total > RAW_LIMIT or len(files) >= 32:
+                        raise RuntimeError('diagnostic_evidence_byte_or_count_bound')
+                    files.append(path)
+        if invalid:
+            raise RuntimeError('diagnostic_evidence_unexpected_entries')
+        return sorted(files)
+
     def qualify(self):
         self.providers()
         self.crypto_probe()
         self.before = self.source_manifest('before')
+        if self.preflight_only or self.diagnostics_only:
+            self.git_capability_probe()
         if self.preflight_only:
-            argv = [self.git, '--no-replace-objects', '--no-lazy-fetch', '-c', 'core.fsmonitor=false',
-                    '-c', 'core.hooksPath=/dev/null', '-c', 'credential.helper=',
-                    '-C', self.candidate, 'cat-file', '-e', 'HEAD^{commit}']
-            record, _output = self.run('git-required-syntax-local-object', argv, required=False)
-            accepted = record['exit_code'] == 0 and not record['timed_out'] and record['raw_capture_complete'] \
-                and record['observed_family_complete'] and record['original_group_absent']
-            self.git_capability = {'argv': [str(arg) for arg in argv], 'exit_code': record['exit_code'],
-                                   'version': self.versions['git'], 'sha256': digest(self.git),
-                                   'accepted': accepted}
-            write_json(self.private / 'git-capability.json', self.git_capability)
-            if not accepted:
-                raise RuntimeError('git_required_syntax_local_object_failed')
             return
         self.hydrate()
+        if self.diagnostics_only:
+            self.diagnose()
+            return
         # Expected discovery count is source-derived; no test selection or source rewriting.
         python_source = ast.parse((self.candidate / 'scripts/bootstrap-heartbeat/test_runner.py').read_text())
         methods = [node.name for node in ast.walk(python_source) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -638,6 +736,12 @@ class Qualification:
 
     def finish(self):
         self.finalizing = True
+        if self.diagnostics_only:
+            try:
+                self.diagnostic_files = self.diagnostic_archive_files()
+            except BaseException:
+                self.failure = self.failure or traceback.format_exc()
+                (self.private / 'diagnostic-archive-error.txt').write_text(traceback.format_exc())
         source_error = None
         if self.before is not None:
             try:
@@ -659,11 +763,13 @@ class Qualification:
             and self.node_result is not None and self.python['accepted'] and self.node_result['accepted']
         capability_passed = self.git_capability is not None and self.git_capability['accepted'] \
             and self.python is None and self.node_result is None
+        diagnostic_complete = capability_passed and self.diagnostics is not None and self.diagnostics['complete']
         passed = self.failure is None and unchanged and complete \
-            and (capability_passed if self.preflight_only else native_passed)
-        native_gates = 'NOT_RUN' if self.python is None and self.node_result is None else 'PASS' if native_passed else 'FAIL'
+            and (diagnostic_complete if self.diagnostics_only else capability_passed if self.preflight_only else native_passed)
+        native_gates = 'NOT_RUN' if self.diagnostics_only or (self.python is None and self.node_result is None) else 'PASS' if native_passed else 'FAIL'
         private_result = {'candidate': CANDIDATE, 'tree': TREE, 'base': BASE, 'provenance': self.provenance,
                           'mode': self.mode, 'native_gates': native_gates, 'git_capability': self.git_capability,
+                          'diagnostics': self.diagnostics,
                           'failure': self.failure, 'source_unchanged': unchanged,
                           'python': self.python, 'node': self.node_result, 'commands': self.records,
                           'environment_keys': sorted(self.env), 'versions': self.versions, 'passed': passed}
@@ -681,6 +787,7 @@ class Qualification:
         summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                    'provenance': self.provenance,
                    'mode': self.mode, 'native_gates': native_gates,
+                   'diagnostics': self.diagnostics,
                    'status': self.success_status if passed else self.failure_status, 'source_unchanged': unchanged,
                    'python': public_python, 'node': public_node, 'versions': self.versions,
                    'observed_owned_completion': complete, 'global_quiescence_claimed': False,
@@ -693,12 +800,14 @@ class Qualification:
             # Never archive caches, executable hydration, child homes or fixture trees.
             allowed = ['logs', 'before-source.json', 'after-source.json', 'providers.json', 'resources.json',
                        'pnpm-tool.json', 'workflow-provenance.json', 'developer-tools-inventory.json', 'git-capability.json',
-                       'result.json', 'cms-probe.txt', 'cms-probe.der',
+                       'result.json', 'cms-probe.txt', 'cms-probe.der', 'diagnostics.json', 'diagnostic-archive-error.txt',
                        'qualification-error.txt', 'source-postflight-error.txt', 'collector-error.txt']
             for name in allowed:
                 path = self.private / name
                 if path.exists():
                     tar.add(path, arcname='evidence/' + name, recursive=True)
+            for path in self.diagnostic_files:
+                tar.add(path, arcname='evidence/' + str(path.relative_to(self.private)), recursive=False)
         summary['plaintext_sha256'] = digest(archive)
         ciphertext = self.public / 'evidence.cms'
         # Final encryption logs stay private and are not streamed to Actions.
@@ -725,13 +834,14 @@ class Qualification:
 
 
 def main():
-    if sys.argv[1:] not in ([], ['--preflight-only']):
-        print('Qualification requires no arguments or exactly --preflight-only.')
+    if sys.argv[1:] not in ([], ['--preflight-only'], ['--diagnostics-only']):
+        print('Qualification requires no arguments, --preflight-only or --diagnostics-only.')
         return 1
     preflight_only = sys.argv[1:] == ['--preflight-only']
+    diagnostics_only = sys.argv[1:] == ['--diagnostics-only']
     qualification = Qualification.__new__(Qualification)
     try:
-        qualification.__init__(preflight_only=preflight_only)
+        qualification.__init__(preflight_only=preflight_only, diagnostics_only=diagnostics_only)
         try:
             qualification.qualify()
         except BaseException:
@@ -744,11 +854,12 @@ def main():
             (qualification.private / 'collector-error.txt').write_text(traceback.format_exc())
             write_summary(qualification.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE,
                        'tree': TREE, 'base': BASE,
-                       'mode': 'provider_preflight_only' if preflight_only else 'native_qualification',
-                       'native_gates': 'NOT_RUN' if preflight_only else 'UNKNOWN',
-                       'status': 'PREFLIGHT_FAIL' if preflight_only else 'FAIL', 'reason': 'collector_failed',
+                       'mode': 'diagnostics_only' if diagnostics_only else 'provider_preflight_only' if preflight_only else 'native_qualification',
+                       'native_gates': 'NOT_RUN' if preflight_only or diagnostics_only else 'UNKNOWN',
+                       'status': 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL', 'reason': 'collector_failed',
                        'evidence_encrypted': False, 'production_qualification': False})
-        print('Provider preflight collector failed; native gates NOT_RUN.' if preflight_only
+        print('Diagnostic collector failed; native gates NOT_RUN.' if diagnostics_only else
+              'Provider preflight collector failed; native gates NOT_RUN.' if preflight_only
               else 'Native qualification collector failed; gate remains FAIL.')
         return 1
 
