@@ -25,6 +25,7 @@ export * from './reviewers/deepseek.js';
 export * from './reviewers/loop.js';
 export * from './reviewers/risk-policy.js';
 export * from './workflow/run.js';
+export * from './workflow/merge.js';
 export * from './workflow/wait-observation.js';
 export * from './workflow/wait-ledger-store.js';
 export * from './workflow/wait-command.js';

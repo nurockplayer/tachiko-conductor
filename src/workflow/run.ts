@@ -1,3 +1,4 @@
+import { initiateNativeMerge, observeNativeMerge, type NativeMergeHost, type MergeContext } from './merge.js';
 import {
   GOVERNED_PUBLICATION_REENTRY_ACTION,
   hasGovernedPublicationConfinement,
@@ -118,6 +119,7 @@ function lunaPacketInput(
 }
 
 export interface WorkflowDependencies {
+  readonly nativeMergeHost?: NativeMergeHost;
   readonly store: RunStore;
   readonly github: GitHubAdapter;
   readonly implementation: ImplementationAgent;
@@ -143,6 +145,9 @@ export interface WorkflowOptions {
   /** Called immediately before a model, reviewer, or other delegated execution boundary. */
   readonly onExecutionStart?: () => void;
   readonly assertReviewClaim?: (run: Run) => Promise<void>;
+  readonly assertMergeInitiation?: (run: Run) => Promise<void>;
+  readonly withMergeBoundary?: <T>(operation: () => Promise<T>) => Promise<T>;
+  readonly onMergeSubmission?: () => void;
   /** Host admission capability enforced at mutation and publication boundaries. */
   readonly admissionFence?: { readonly registry: MissionAdmissionRegistry; readonly token: AdmissionToken; readonly productionMissionId: string; readonly executionWorkspace?: string };
 }
@@ -582,6 +587,15 @@ export async function runWorkflow(
   }
   const target = run.target;
 
+  const mergeContext = (current: Run): MergeContext => ({ run: current, store, github, now,
+    ...(options.admissionFence === undefined ? {} : { owner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
+    assertCurrent: () => assertPublicationAdmission(options), assertClaim: options.assertReviewClaim, assertInitiation: options.assertMergeInitiation,
+    withBoundary: options.withMergeBoundary, onSubmission: () => options.onMergeSubmission?.(),
+  });
+  // Issued attempts recover independently of reviewer/config availability and
+  // never re-enter implementation, review, validation or merge submission.
+  if (run.mergeAttempt?.submissionPossible) return { outcome: 'merge_ready', run: await observeNativeMerge(mergeContext(run)) };
+  let recheckCachedReadiness = run.state === 'MERGE_READY';
   for (;;) {
     if (reviewer.native !== undefined && (!reviewer.native.available() || options.assertReviewClaim === undefined) && ['READY', 'IMPLEMENTING', 'CHANGES_REQUESTED'].includes(run.state)) {
       const reason = 'Native review unavailable: no accepted trusted host reviewer binding; implementation and repair are waiting.';
@@ -1561,15 +1575,6 @@ export async function runWorkflow(
           return githubFailureOutcome(run, error, store, now);
         }
         if (!updateIfCurrent(store, finalGateExpected, finalGateExpected)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
-        if (reviewer.native !== undefined) await options.assertReviewClaim?.(run);
-        if ((reviewer.native !== undefined || run.nativeReview !== undefined) && (options.assertReviewClaim === undefined || !reviewer.native?.validate({ run, snapshot,
-          ...(options.admissionFence === undefined ? {} : { owner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
-          assertCurrent: () => assertCurrentMutationAdmission(options) }))) {
-          const reason = 'Final gate requires authenticated immutable native review evidence under current host authority.';
-          const parked = parkNativeReview(run, 'qualification', reason, now());
-          if (!updateIfCurrent(store, run, parked)) return staleWorkflowOutcome(run.id, run, store, reason);
-          return { outcome: 'waiting_dependency', run: parked, reason };
-        }
         const conflict = pullRequestIdentityConflict(run, snapshot, { allowHeadAdvance: true });
         if (conflict !== null) return park(run, conflict, store, now);
         if (snapshot.headSha !== run.headSha) {
@@ -1588,6 +1593,15 @@ export async function runWorkflow(
           );
           if (!updateIfCurrent(store, finalGateExpected, run)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed during the final-gate live read; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
+        }
+        if (reviewer.native !== undefined) await options.assertReviewClaim?.(run);
+        if ((reviewer.native !== undefined || run.nativeReview !== undefined) && (options.assertReviewClaim === undefined || !reviewer.native?.validate({ run, snapshot,
+          ...(options.admissionFence === undefined ? {} : { owner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
+          assertCurrent: () => assertCurrentMutationAdmission(options) }))) {
+          const reason = 'Final gate requires authenticated immutable native review evidence under current host authority.';
+          const parked = parkNativeReview(run, 'qualification', reason, now());
+          if (!updateIfCurrent(store, run, parked)) return staleWorkflowOutcome(run.id, run, store, reason);
+          return { outcome: 'waiting_dependency', run: parked, reason };
         }
         if (snapshot.pullRequest !== null) strengthenAdmissionEvidence(options, run, { pullRequest: snapshot.pullRequest.number });
 
@@ -1680,22 +1694,17 @@ export async function runWorkflow(
         assertPublicationAdmission(options);
         run = completeLiveFinalGate(finalGateExpected, now(), activeValidationConfiguration(deps));
         if (!updateIfCurrent(store, finalGateExpected, run)) return staleWorkflowOutcome(run.id, finalGateExpected, store, 'Run changed before final-gate readiness publication; preserving the newer Run.');
+        if (deps.nativeMergeHost !== undefined) run = await initiateNativeMerge(mergeContext(run), deps.nativeMergeHost, snapshot);
         break;
       }
 
       case 'MERGE_READY':
-        if (reviewer.native !== undefined || run.nativeReview !== undefined) {
-          const snapshot = await github.readLiveSnapshot(target);
-          await options.assertReviewClaim?.(run);
-          if (!updateIfCurrent(store, run, run)) return staleWorkflowOutcome(run.id, run, store, 'Run changed while cached native readiness was being checked.');
-          if (options.assertReviewClaim === undefined || !reviewer.native?.validate({ run, snapshot,
-            ...(options.admissionFence === undefined ? {} : { owner: { missionId: options.admissionFence.productionMissionId, laneId: options.admissionFence.token.laneId, generation: options.admissionFence.token.generation } }),
-            assertCurrent: () => assertCurrentMutationAdmission(options) })) {
-            const reason = 'Cached readiness lacks current authenticated native review qualification.';
-            const parked = parkNativeReview(run, 'qualification', reason, now());
-            if (!updateIfCurrent(store, run, parked)) return staleWorkflowOutcome(run.id, run, store, reason);
-            return { outcome: 'waiting_dependency', run: parked, reason };
-          }
+        if (recheckCachedReadiness && (reviewer.native !== undefined || run.nativeReview !== undefined)) {
+          recheckCachedReadiness = false;
+          const next = applyTransition(run, { type: 'recheck_readiness', reason: 'Re-establish cached native readiness through the complete live final gate.' }, now());
+          if (!updateIfCurrent(store, run, next)) return staleWorkflowOutcome(run.id, run, store, 'Run changed before cached readiness revalidation.');
+          run = next;
+          break;
         }
         if (hasUnreestablishedLegacyGate(run)) {
           const reason = 'Historical gate_passed readiness is read-compatible only; current validation, review, and live GitHub authority must be re-established.';

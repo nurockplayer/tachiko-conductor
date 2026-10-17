@@ -25,7 +25,7 @@ export interface DispatchContinuousResult {
 export const DEFAULT_DISPATCH_IDLE_POLL_MS = 30_000;
 
 function isTerminalDispatch(result: DispatchOnceResult): boolean {
-  return result.outcome === 'dispatched' && [
+  return result.outcome === 'dispatched' && result.execution.waitForPoll !== true && [
     'MERGED', 'MERGE_READY', 'NEEDS_HUMAN', 'FAILED',
   ].includes(result.execution.state);
 }

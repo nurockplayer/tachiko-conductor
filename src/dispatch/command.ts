@@ -1,3 +1,4 @@
+import { oracleDigest } from '../oracle/source-evidence.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { Run } from '../domain/types.js';
 import type { RepairTaskShapeAuthority } from '../domain/repair-admission.js';
@@ -15,9 +16,9 @@ export interface DispatchCommandDependencies {
   readonly workflow: WorkflowDependencies;
   readonly runtime: DispatchCommandRuntime;
   readonly resolveExecutionProfile: (profile: string) => ResolvedExecutionConfiguration;
-  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string, repairTaskShapeAuthority: RepairTaskShapeAuthority, admission?: MissionAdmissionRegistry, releaseAdmissionLock?: () => void, withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>, assertReviewClaim?: (run: Run) => Promise<void>) => Promise<WorkflowOutcome>;
+  readonly runIssue: (ref: string, execution: ResolvedExecutionConfiguration | undefined, dispatchClaimId: string, repairTaskShapeAuthority: RepairTaskShapeAuthority, admission?: MissionAdmissionRegistry, releaseAdmissionLock?: () => void, withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>, assertReviewClaim?: (run: Run) => Promise<void>, assertMergeInitiation?: (run: Run) => Promise<void>) => Promise<WorkflowOutcome>;
   /** Resume the Run bound by the retained runtime claim, never a target lookup. */
-  readonly resumeClaimedRun: (run: Run, dispatchClaimId: string, admission?: MissionAdmissionRegistry, releaseAdmissionLock?: () => void, withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>, assertReviewClaim?: (run: Run) => Promise<void>) => Promise<WorkflowOutcome>;
+  readonly resumeClaimedRun: (run: Run, dispatchClaimId: string, admission?: MissionAdmissionRegistry, releaseAdmissionLock?: () => void, withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>, assertReviewClaim?: (run: Run) => Promise<void>, assertMergeInitiation?: (run: Run) => Promise<void>) => Promise<WorkflowOutcome>;
   /** Executable CLI always supplies the host-global admission registry. */
   readonly admission?: MissionAdmissionRegistry;
   /** Lock held around prepare; execution releases it immediately before model-capable workflow entry. */
@@ -29,6 +30,8 @@ export interface DispatchCommandDependencies {
   /** Exact released lane/receipt proof; retirement does not establish delivery. */
   readonly isRunOwnerRetired?: (run: Run) => boolean;
   readonly now?: () => string;
+  readonly maintenanceHold?: boolean;
+  readonly issuedMergeRecoveryOnly?: boolean;
 }
 
 function outcomeState(outcome: WorkflowOutcome): WorkflowOutcome['run']['state'] {
@@ -42,7 +45,9 @@ export async function dispatchOnceCommand(
 ): Promise<DispatchOnceResult> {
   const now = deps.now ?? (() => new Date().toISOString());
   return await dispatchOnce({
-    queueBody: await deps.runtime.readQueueComment(),
+    queueBody: deps.maintenanceHold || deps.issuedMergeRecoveryOnly ? '' : await deps.runtime.readQueueComment(),
+    maintenanceHold: deps.maintenanceHold,
+    issuedMergeRecoveryOnly: deps.issuedMergeRecoveryOnly,
     owner: config.owner,
     repo: config.repo,
     github: deps.workflow.github,
@@ -62,6 +67,11 @@ export async function dispatchOnceCommand(
           !['running', 'claimed'].includes(live.claim.state) || JSON.stringify(live.claim.repairTaskShapeAuthority) !== JSON.stringify(claim.repairTaskShapeAuthority) ||
           claimedRun(deps.workflow.store, live.claim, entry, config)?.id !== run.id) throw new Error('Native review retained dispatch claim is missing, replaced, or differently bound.');
       };
+      const assertMergeInitiation = async (run: Run) => {
+        if (deps.maintenanceHold || !config.merge || !deps.workflow.nativeMergeHost || oracleDigest(config.merge) !== oracleDigest(deps.workflow.nativeMergeHost.policy) ||
+          config.merge.dispatchRevision !== config.revision || config.merge.owner !== config.owner || config.merge.repo !== config.repo || config.merge.controlIssue !== config.controlIssue || config.merge.queueCommentId !== config.queueCommentId) throw new Error('Native merge lacks identical accepted-release and current dispatch scope authority.');
+        await assertReviewClaim(run);
+      };
       if (existing !== null) {
         if (existing.execution === undefined) {
           throw new Error(`Durable run ${existing.id} does not retain the queue-selected immutable execution profile.`);
@@ -74,8 +84,8 @@ export async function dispatchOnceCommand(
             existing.repairTaskShapeAuthority.shape !== claim.repairTaskShapeAuthority.shape)) {
           throw new Error(`Durable run ${existing.id} task-shape authority does not match the retained dispatch claim.`);
         }
-        const outcome = await deps.resumeClaimedRun(existing, claim.claimId, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim);
-        return { runId: outcome.run.id, state: outcomeState(outcome) };
+        const outcome = await deps.resumeClaimedRun(existing, claim.claimId, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim, assertMergeInitiation);
+        return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.state === 'MERGE_READY' && outcome.run.nativeReview !== undefined ? { waitForPoll: true } : {}) };
       }
       if (!hasValidDispatchAuthority(entry)) {
         throw new Error(`Queue issue #${entry.issue} lacks explicit revisioned task-shape authority.`);
@@ -86,8 +96,8 @@ export async function dispatchOnceCommand(
         throw new Error(`Dispatch claim ${claim.claimId} does not retain the queue-selected task-shape authority.`);
       }
       const selected = deps.resolveExecutionProfile(entry.profile);
-      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim);
-      return { runId: outcome.run.id, state: outcomeState(outcome) };
+      const outcome = await deps.runIssue(`${config.owner}/${config.repo}#${entry.issue}`, selected, claim.claimId, entry.repairTaskShapeAuthority, deps.admission, deps.releaseAdmissionLock, deps.withAdmissionLock, assertReviewClaim, assertMergeInitiation);
+      return { runId: outcome.run.id, state: outcomeState(outcome), ...(outcome.run.state === 'MERGE_READY' && outcome.run.nativeReview !== undefined ? { waitForPoll: true } : {}) };
     },
   });
 }

@@ -1,3 +1,4 @@
+import { nativeMergeReentry } from '../workflow/merge.js';
 import { randomUUID } from 'node:crypto';
 
 import type { GitHubAdapter } from '../adapters/github.js';
@@ -27,6 +28,7 @@ export interface DispatchRuntimeApi extends DispatchClaimApi {
 export interface DispatchExecution {
   readonly runId: string;
   readonly state: WorkflowState;
+  readonly waitForPoll?: boolean;
 }
 
 /** Bounded control-plane evidence; contains no generation token or filesystem path. */
@@ -62,6 +64,8 @@ export class DispatchAdmissionWaitError extends Error {
 
 export interface DispatchOnceOptions {
   readonly queueBody: string;
+  readonly maintenanceHold?: boolean;
+  readonly issuedMergeRecoveryOnly?: boolean;
   readonly owner: string;
   readonly repo: string;
   readonly github: GitHubAdapter;
@@ -446,7 +450,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       profile: existing.claim.profile,
       ...(existing.claim.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: existing.claim.repairTaskShapeAuthority }),
     };
-    const queue = parseDispatchQueue(options.queueBody);
+    const queue = options.maintenanceHold || options.issuedMergeRecoveryOnly ? [] : parseDispatchQueue(options.queueBody);
     let run = claimedRun(options.store, existing.claim, entry, options);
     if (run === null && (existing.claim.state === 'retired' || !hasValidDispatchAuthority(entry))) {
       return {
@@ -455,10 +459,12 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       };
     }
     if (run !== null) assertClaimAuthorityMatchesRun(existing.claim, run);
+    if (options.issuedMergeRecoveryOnly && !run?.mergeAttempt?.submissionPossible) return { outcome: 'existing_claim', claim: existing.claim };
+    if (options.maintenanceHold && !run?.mergeAttempt?.submissionPossible) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD permits only observation/settlement of an already-issued merge.' };
     const historicalHold = historicalOwnerHold(options, run?.id);
     if (historicalHold !== null) return { outcome: 'owner_reconciliation_hold', entry, claim: existing.claim, reason: historicalHold };
     const ownerRetired = run !== null && run.state !== 'MERGED' && options.isRunOwnerRetired?.(run) === true;
-    if (!ownerRetired && (run === null || !isSettledRun(run) || nativeReviewReentry(run, options.now()))) {
+    if (!ownerRetired && (run === null || !isSettledRun(run) || nativeReviewReentry(run, options.now()) || run.state === 'MERGE_READY' && run.nativeReview !== undefined && run.mergeAttempt?.submissionPossible !== true || nativeMergeReentry(run, options.now()))) {
       if (run !== null && options.admission?.readLane(`run:${run.id}`)?.status === 'active') {
         return {
           outcome: 'admission_wait', waitKind: 'owner', entry, runId: run.id, claim: existing.claim,
@@ -475,7 +481,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     // dependency holds remain ownership fences even when a queue row vanishes.
     const reissued = queue.some((queued) => queued.issue === entry.issue && queued.route === 'codex' && hasValidDispatchAuthority(queued) &&
       entry.repairTaskShapeAuthority !== undefined && queued.repairTaskShapeAuthority.revision !== entry.repairTaskShapeAuthority.revision);
-    const complete = (run.state === 'MERGE_READY' || run.state === 'MERGED') && await delivered(run, entry, options, reissued);
+    const complete = (run.state === 'MERGE_READY' || run.state === 'MERGED') && (run.mergeAttempt === undefined || run.mergeAttempt.qualification !== undefined) && await delivered(run, entry, options, reissued);
     run = options.store.read(run.id) ?? run;
     const reconciled = existing.claim.state === 'retired' && (run.state === 'MERGED' || ownerRetired)
       ? existing.claim
@@ -485,6 +491,8 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       })
       : existing.claim;
     if (!complete && !ownerRetired) return { outcome: 'existing_claim', claim: reconciled };
+    if (options.maintenanceHold) return { outcome: 'maintenance_hold', reason: 'Issued merge observation/settlement completed; maintenance HOLD retains the queue fence.' };
+    if (options.issuedMergeRecoveryOnly) return { outcome: 'existing_claim', claim: reconciled };
     const reasons: string[] = [];
     for (const queued of queue) {
       if (queued.route !== 'codex') {
@@ -510,9 +518,11 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     if (reconciled.state !== 'retired') await retireTerminalClaim(options.runtime, existing.id, reconciled, options.now());
     return { outcome: 'no_eligible_work', reasons };
   }
+  if (options.issuedMergeRecoveryOnly) return { outcome: 'no_eligible_work', reasons: ['Issued merge recovery has no exact retained runtime claim.'] };
   const historicalHold = historicalOwnerHold(options);
   if (historicalHold !== null) return { outcome: 'no_eligible_work', reasons: [historicalHold] };
-  const queue = parseDispatchQueue(options.queueBody);
+  const queue = options.maintenanceHold || options.issuedMergeRecoveryOnly ? [] : parseDispatchQueue(options.queueBody);
+  if (options.maintenanceHold) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD prevents new dispatch admission.' };
   const reasons: string[] = [];
   for (const entry of queue) {
     if (entry.route !== 'codex') {

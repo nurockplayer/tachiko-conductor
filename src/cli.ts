@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { assertNativeMergeSettlement, issuedMergeRecoveryConfiguration, qualifiedMergeIntegration, resolveNativeMergeHost, unresolvedNativeMerge, type NativeMergeHost } from './workflow/merge.js';
 import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -1232,7 +1233,7 @@ function settleRunAdmission(registry: MissionAdmissionRegistry, token: Admission
   // A local terminal outcome does not prove that a submitted native request
   // completed or was cancelled. Preserve its overlap reservation on returned
   // failures as well as on thrown exceptions.
-  const unresolvedReview = unresolvedNativeReview(run);
+  const unresolvedReview = unresolvedNativeWork(run) || run.state === 'MERGED' && (run.nativeReview !== undefined || run.mergeAttempt !== undefined);
   if ((run.state === 'FAILED' || run.state === 'MERGED') && !unresolvedReview) {
     registry.release(token, true, receiptPath === undefined ? undefined : () => writeRunOwnerReceipt(receiptPath, receiptForCurrentToken(receiptPath, token, 'release_transition')),
       receiptPath === undefined ? undefined : () => finalizeRunOwnerReceipt(receiptPath, token, 'released', token.generation + 1, workDisposition));
@@ -1262,7 +1263,7 @@ export function recoverRunAdmission(
   if (!Number.isSafeInteger(expectedGeneration) || expectedGeneration < 1) throw new Error('Run admission recovery requires --generation <positive integer>.');
   const run = store.read(runId);
   if (run === null) throw new Error(`No run with id "${runId}" found.`);
-  if (recoveryOptions?.retireWork === true && unresolvedNativeReview(run)) throw new Error('Native review remote submission is unresolved; stopped local execution cannot retire its external work.');
+  if (recoveryOptions?.retireWork === true && (unresolvedNativeWork(run) || run.mergeAttempt?.submissionPossible === true)) throw new Error('Native review remote submission is unresolved; stopped local execution cannot retire its external work.');
   const laneId = `run:${run.id}`;
   const repo = `${run.target.owner}/${run.target.repo}`.toLowerCase();
   const canonicalReceiptPath = receiptPath ?? resolveRunOwnerReceiptPath(repo, run.id, evidenceForRun(run));
@@ -1431,6 +1432,7 @@ export function parseGitHubRepositoryRemote(remote: string): string {
 
 export interface WorkflowCommandOptions {
   readonly assertReviewClaim?: (run: Run) => Promise<void>;
+  readonly assertMergeInitiation?: (run: Run) => Promise<void>;
   readonly maxReviewAttempts?: number;
   readonly now?: () => string;
   /** Required for a newly-created production issue run; persisted runs retain their own snapshot. */
@@ -1501,9 +1503,9 @@ export async function runIssueCommand(
   const precreatedRun = isNewRun && (options.dispatchClaimId !== undefined || options.admission !== undefined);
   if (precreatedRun) deps.store.create(run);
   const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
-  let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeReview(run);
+  let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeWork(run) && run.mergeAttempt?.submissionPossible !== true;
   try {
-    if (admissionToken !== undefined && runOwnerReceiptPath !== undefined && unresolvedNativeReview(run)) {
+    if (admissionToken !== undefined && runOwnerReceiptPath !== undefined && unresolvedNativeWork(run)) {
       options.admission!.renew(admissionToken, () => writeRunOwnerReceipt(runOwnerReceiptPath, receiptForCurrentToken(runOwnerReceiptPath, admissionToken, 'execution_possible')));
     }
     if (isNewRun && !precreatedRun) deps.store.create(run);
@@ -1513,6 +1515,12 @@ export async function runIssueCommand(
     options.releaseDispatchAdmissionLock?.();
     const outcome = await runWorkflow(deps, run.id, {
       assertReviewClaim: options.assertReviewClaim,
+      assertMergeInitiation: options.assertMergeInitiation,
+      withMergeBoundary: options.withDispatchAdmissionLock,
+      onMergeSubmission: () => {
+        mayReleaseAsPreExecution = false;
+        if (admissionToken !== undefined && runOwnerReceiptPath !== undefined) options.admission!.renew(admissionToken, () => writeRunOwnerReceipt(runOwnerReceiptPath, receiptForCurrentToken(runOwnerReceiptPath, admissionToken, 'execution_possible')));
+      },
       maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
       now: options.now,
       ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
@@ -1533,7 +1541,7 @@ export async function runIssueCommand(
   } catch (error) {
     // A marker CAS may have become durable even if a subsequent owner fence,
     // accounting hook, or file/directory sync failed before it returned.
-    try { if (unresolvedNativeReview(deps.store.read(run.id) ?? run)) mayReleaseAsPreExecution = false; }
+    try { if (unresolvedNativeWork(deps.store.read(run.id) ?? run) || (deps.store.read(run.id) ?? run).mergeAttempt?.submissionPossible) mayReleaseAsPreExecution = false; }
     catch { mayReleaseAsPreExecution = false; }
     if (admissionToken !== undefined && mayReleaseAsPreExecution) {
       options.releaseDispatchAdmissionLock?.();
@@ -1568,7 +1576,7 @@ export async function resumeCommand(
     throw new Error(`Run "${id}" is not parked for a decision (state ${run.state}); nothing to resume.`);
   }
   if (decision.trim() === '') throw new Error('A non-empty --decision is required to resume a parked run.');
-  if (decision.trim() === CANCEL_RUN_DECISION && unresolvedNativeReview(run)) throw new Error('Native review submission remains uncertain; local cancellation cannot prove remote cancellation or release its owner.');
+  if (decision.trim() === CANCEL_RUN_DECISION && (unresolvedNativeWork(run) || run.mergeAttempt?.submissionPossible === true)) throw new Error('Native review submission remains uncertain; local cancellation cannot prove remote cancellation or release its owner.');
   const choices = run.interrupt?.choices ?? [];
   if (choices.length > 0 && !choices.includes(decision)) {
     throw new Error(`Invalid decision "${decision}". Choose exactly one of: ${choices.join(' | ')}.`);
@@ -1577,7 +1585,7 @@ export async function resumeCommand(
   if (targetOwner !== null && targetOwner.id !== id) throw new Error(`Run "${id}" is not the unique active durable Run for its target.`);
   const runOwnerReceiptPath = options.runOwnerReceiptPath ?? (options.admission === undefined ? undefined : resolveRunOwnerReceiptPath(`${run.target.owner}/${run.target.repo}`.toLowerCase(), run.id, evidenceForRun(run, options.admissionWorkspace === undefined ? {} : { workspace: options.admissionWorkspace })));
   const admissionToken = options.admission === undefined ? undefined : acquireRunAdmission(options.admission, run, runOwnerReceiptPath, options.admissionWorkspace);
-  let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeReview(run);
+  let mayReleaseAsPreExecution = admissionToken !== undefined && !unresolvedNativeWork(run) && run.mergeAttempt?.submissionPossible !== true;
   try {
   const now = options.now ?? (() => new Date().toISOString());
   if (
@@ -1668,6 +1676,12 @@ export async function resumeCommand(
   options.releaseDispatchAdmissionLock?.();
   const outcome = await runWorkflow(deps, id, {
     assertReviewClaim: options.assertReviewClaim,
+    assertMergeInitiation: options.assertMergeInitiation,
+    withMergeBoundary: options.withDispatchAdmissionLock,
+    onMergeSubmission: () => {
+      mayReleaseAsPreExecution = false;
+      if (admissionToken !== undefined && runOwnerReceiptPath !== undefined) options.admission!.renew(admissionToken, () => writeRunOwnerReceipt(runOwnerReceiptPath, receiptForCurrentToken(runOwnerReceiptPath, admissionToken, 'execution_possible')));
+    },
     maxReviewAttempts: options.maxReviewAttempts ?? DEFAULT_MAX_REVIEW_ATTEMPTS,
     now: options.now,
     ...(options.telemetryThresholds === undefined ? {} : { telemetryThresholds: options.telemetryThresholds }),
@@ -1686,7 +1700,7 @@ export async function resumeCommand(
   });
   return outcome;
   } catch (error) {
-    try { if (unresolvedNativeReview(deps.store.read(run.id) ?? run)) mayReleaseAsPreExecution = false; }
+    try { if (unresolvedNativeWork(deps.store.read(run.id) ?? run) || (deps.store.read(run.id) ?? run).mergeAttempt?.submissionPossible) mayReleaseAsPreExecution = false; }
     catch { mayReleaseAsPreExecution = false; }
     if (admissionToken !== undefined && mayReleaseAsPreExecution) {
       options.releaseDispatchAdmissionLock?.();
@@ -1748,6 +1762,7 @@ export function buildWorkflowDeps(
   env: NodeJS.ProcessEnv = process.env,
   transport: GhCliTransport = new GhCliTransport(),
   nativeReviewerHost?: NativeReviewerHost,
+  nativeMergeHost?: NativeMergeHost,
 ): WorkflowDependencies {
   const github = new LiveGitHubAdapter({ transport });
   const localValidation = resolveLocalValidationConfiguration(env);
@@ -1846,6 +1861,7 @@ export function buildWorkflowDeps(
       },
     }),
     reviewer: resolveNativeReviewer(nativeReviewerHost),
+    nativeMergeHost: resolveNativeMergeHost(nativeMergeHost),
     bootstrap: lazyBootstrap,
     bootstrapForExecution: (execution) => {
       if (execution?.executor !== LUNA_ISOLATED_PROVIDER) return lazyBootstrap;
@@ -1870,6 +1886,8 @@ export function buildWorkflowDeps(
     },
   };
 }
+
+function unresolvedNativeWork(run: Run): boolean { return unresolvedNativeReview(run) || unresolvedNativeMerge(run); }
 
 // --- commands (exported so tests can exercise them without spawning a process) ---
 
@@ -1960,6 +1978,8 @@ function assertExactMergedPullRequest(run: Run, pullRequest: GitHubLivePullReque
 
 function assertMergeLaneIdentity(run: Run, lane: AdmissionLaneView): string | undefined {
   const repository = `${run.target.owner}/${run.target.repo}`.toLowerCase();
+  const attempt = run.mergeAttempt;
+  if (attempt && (lane.missionId !== attempt.identity.missionId || lane.laneId !== attempt.identity.laneId || lane.generation < (attempt.issuanceGeneration ?? attempt.identity.generation))) throw new Error('Merge lane does not match the issued attempt mission/generation.');
   if (lane.laneId !== `run:${run.id}` || lane.evidence.run !== run.id || lane.evidence.repository !== repository ||
     lane.evidence.issue !== (run.target.kind === 'issue' ? run.target.issueNumber : undefined) ||
     lane.evidence.claim !== run.dispatchClaimId || lane.evidence.pullRequest !== run.pullRequest?.number) {
@@ -2018,7 +2038,7 @@ function finalizeMergeReleaseReceipt(receiptPath: string, run: Run, missionId: s
 }
 
 function casMergedRun(store: RunStore, current: Run): Run {
-  if (current.nativeReview !== undefined) throw new Error('Native review-bearing Run requires qualified merge settlement authority; the automatic merge bridge is unavailable.');
+  assertNativeMergeSettlement(current);
   if (current.state === 'MERGED') return current;
   if (current.state !== 'MERGE_READY') throw new Error(`Run "${current.id}" is ${current.state}; only MERGE_READY can be merged.`);
   if (store.updateIfUnchanged === undefined) throw new Error(`Run store cannot compare-and-swap merged Run "${current.id}"; refusing an unfenced transition.`);
@@ -2032,6 +2052,8 @@ export function isDispatchRunOwnerRetiredCommand(store: RunStore, run: Run, admi
   if (run.dispatchClaimId === undefined || run.execution === undefined || run.repairTaskShapeAuthority === undefined) return false;
   const lane = admission.readLane(`run:${run.id}`);
   if (lane === null || lane.status !== 'released') return false;
+  if (run.mergeAttempt !== undefined) assertMergeLaneIdentity(run, lane);
+  if (run.state === 'MERGED') assertNativeMergeSettlement(run);
   let retired = run.state === 'MERGED';
   admission.withExactReleasedLane(lane.laneId, lane.generation, (released) => {
     const current = store.read(run.id);
@@ -2086,21 +2108,54 @@ export async function runMergedTransitionCommand(
 ): Promise<Run> {
   const initial = store.read(id);
   if (initial === null) throw new Error(`No run with id "${id}" found.`);
-  if (initial.state !== 'MERGE_READY' && initial.state !== 'MERGED') {
+  if (initial.state !== 'MERGE_READY' && initial.state !== 'MERGED' && !(initial.mergeAttempt?.submissionPossible && initial.state === 'WAITING_DEPENDENCY' && initial.interruptedFrom === 'MERGE_READY')) {
     throw new Error(`Run "${id}" is ${initial.state}; only MERGE_READY or an exact merged retry may be reconciled.`);
   }
   if (initial.pullRequest === undefined) throw new Error(`Run "${id}" has no persisted pull request identity; refusing an operator-claimed merge.`);
   if (github.readPullRequest === undefined) throw new Error('GitHub adapter cannot directly read the persisted pull request; refusing an operator-claimed merge.');
   const proof = await github.readPullRequest(initial.target.owner, initial.target.repo, initial.pullRequest.number);
   assertExactMergedPullRequest(initial, proof);
-  if (initial.nativeReview !== undefined) {
-    // This slice can qualify review readiness, but cannot qualify merge
-    // integration/settlement. Retain the external fact without releasing work.
+  if (initial.mergeAttempt?.submissionPossible && (initial.mergeAttempt.qualification === undefined || admission.readLane(`run:${id}`)?.parkedReason === 'workflow_wait')) {
+    // Explicit exact-proof recovery can settle an exhausted observation budget;
+    // it cannot issue another request or convert an active local invocation.
+    let qualification;
+    try { qualification = await qualifiedMergeIntegration(initial, github, new Date().toISOString()); }
+    catch (error) {
+      if (!initial.mergeAttempt.observedMerged && /^[0-9a-f]{40}$/.test(proof.mergeCommitSha ?? '')) await withDispatchAdmissionLock(() => {
+        const observed: Run = { ...initial, mergeAttempt: { ...initial.mergeAttempt!, observedMerged: { mergeCommitSha: proof.mergeCommitSha!, observedAt: new Date().toISOString() }, reason: 'Merged PR observed; actual integration remains unqualified.' } };
+        if (store.updateIfUnchanged?.(initial, observed) !== true) throw new Error('Run changed while retaining actual merged proof.');
+      });
+      throw error;
+    }
+    return await withDispatchAdmissionLock(async () => {
+      const current = store.read(id);
+      if (JSON.stringify(current) !== JSON.stringify(initial)) throw new Error('Run changed before exact native merge recovery.');
+      const lane = admission.readLane(`run:${id}`);
+      if (lane?.status !== 'parked') throw new Error('Native merge recovery requires its exact quiescent parked owner.');
+      const workspace = assertMergeLaneIdentity(initial, lane);
+      const receiptPath = resolveRunOwnerReceiptPath(`${initial.target.owner}/${initial.target.repo}`.toLowerCase(), id, evidenceForRun(initial));
+      readMergeReceipt(receiptPath, initial, lane.missionId, workspace);
+      const token = acquireRunAdmission(admission, initial, receiptPath, workspace);
+      const resumed = initial.state === 'WAITING_DEPENDENCY' ? applyTransition(initial, { type: 'dependency_satisfied' }) : initial;
+      const next: Run = { ...resumed, mergeAttempt: { ...initial.mergeAttempt!, observedMerged: initial.mergeAttempt!.observedMerged ?? { mergeCommitSha: qualification.mergeCommitSha, observedAt: qualification.observedAt }, qualification: initial.mergeAttempt!.qualification ?? qualification } };
+      if (store.updateIfUnchanged?.(initial, next) !== true) throw new Error('Run changed before qualified merge recovery CAS.');
+      settleRunAdmission(admission, token, next, receiptPath);
+      return await runMergedTransitionCommand(store, id, github, admission, async (operation) => await operation());
+    });
+  }
+  if ((initial.nativeReview !== undefined || initial.mergeAttempt !== undefined) && initial.mergeAttempt?.qualification === undefined) {
+    // A review receipt without an issued merge attempt is not integration
+    // authority. Retain the external fact without releasing work.
     const reason = 'Merged PR observed; native settlement remains unqualified because the accepted-release merge bridge is unavailable.';
     if (initial.state === 'MERGED') throw new Error(`${reason} Historical terminal Run remains readable and unchanged; observed proof: ${JSON.stringify(proof)}`);
     const observed = applyTransition(initial, { type: 'wait_dependency', reason, interrupt: { evidence: JSON.stringify(proof) } });
     if (store.updateIfUnchanged?.(initial, observed) !== true) throw new Error('Run changed while retaining observed merged-but-unsettled evidence.');
     throw new Error(`${reason} The exact observed proof is retained; Run and owner remain fenced.`);
+  }
+
+  if (initial.nativeReview !== undefined || initial.mergeAttempt !== undefined) {
+    assertNativeMergeSettlement(initial);
+    await qualifiedMergeIntegration(initial, github, new Date().toISOString());
   }
 
   const reconcile = (): Run => {
@@ -2120,6 +2175,7 @@ export async function runMergedTransitionCommand(
     if (current.state !== 'MERGE_READY' && current.state !== 'MERGED') throw new Error(`Run "${id}" changed to ${current.state} during merge reconciliation.`);
 
     if (lane === null) {
+      if (current.nativeReview !== undefined || current.mergeAttempt !== undefined) throw new Error('Native-bearing settlement requires its exact retained admission lane and owner receipt.');
       if (phase !== 'unadmitted') throw new Error('Admission lane disappeared during merge reconciliation.');
       if (readRunOwnerReceipt(resolveRunOwnerReceiptPath(`${current.target.owner}/${current.target.repo}`.toLowerCase(), current.id, evidenceForRun(current))) !== null) {
         throw new Error(`Run owner receipt exists without its admission lane for Run "${id}"; refusing merge reconciliation.`);
@@ -2131,7 +2187,7 @@ export async function runMergedTransitionCommand(
     const repository = `${current.target.owner}/${current.target.repo}`.toLowerCase();
     const receiptPath = resolveRunOwnerReceiptPath(repository, current.id, evidenceForRun(current, laneWorkspace === undefined ? {} : { workspace: laneWorkspace }));
     const storedReceipt = readRunOwnerReceipt(receiptPath);
-    if (storedReceipt === null && current.state === 'MERGED' && phase === 'already_released') return current;
+    if (storedReceipt === null && current.state === 'MERGED' && phase === 'already_released' && current.nativeReview === undefined && current.mergeAttempt === undefined) return current;
     const receipt = readMergeReceipt(receiptPath, current, lane.missionId, laneWorkspace);
     if (phase === 'before_publish') {
       parkedGeneration = writeMergeReleaseTransition(receiptPath, current, lane.missionId, lane);
@@ -2711,24 +2767,36 @@ export async function main(argv: string[]): Promise<number> {
       });
       const idlePollMs = values['idle-poll-ms'] === undefined ? DEFAULT_DISPATCH_IDLE_POLL_MS : Number(values['idle-poll-ms']);
       const nextPollAt = () => subcommand === 'serve' ? new Date(Date.now() + idlePollMs).toISOString() : undefined;
+      let processConfig: ReturnType<typeof resolveDispatchConfiguration> | undefined;
+      let processWorkflow: WorkflowDependencies | undefined;
       const reconcile = async () => await withDispatchAdmissionLock(async (releaseAdmissionLock) => {
         // This durable typed fence precedes queue reads, configuration, GitHub,
         // workflow construction, and every model-capable boundary. The same
         // admission lock serializes an operator hold/release with this entire
         // interval, so a transition cannot be overwritten mid-reconcile.
-        if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) {
+        const maintenanceHold = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
+        const issued = store.list().filter((run) => {
+          if (!run.mergeAttempt?.submissionPossible) return false;
+          if (run.state !== 'MERGED') return true;
+          try { return !isDispatchRunOwnerRetiredCommand(store, run, admission); } catch { return true; }
+        });
+        if (issued.length > 1) throw new Error('Multiple issued merge owners require explicit reconciliation; refusing ambiguous recovery.');
+        const recovering = issued[0];
+        if (maintenanceHold && recovering === undefined) {
           publishRuntime('maintenance_hold', 'parked', nextPollAt());
           return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
         }
         publishRuntime('scanning', 'running', nextPollAt());
-        const config = resolveDispatchConfiguration();
+        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : issuedMergeRecoveryConfiguration(recovering);
         const transport = new GhCliTransport();
         const runtime = new GitHubDispatchRuntime(transport, config);
-        const workflow = buildWorkflowDeps(store, undefined, process.env, transport);
+        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport) : buildWorkflowDeps(store, undefined, {}, transport);
         return await dispatchOnceCommand(config, {
           workflow,
           runtime,
           admission,
+          maintenanceHold,
+          issuedMergeRecoveryOnly: recovering !== undefined,
           releaseAdmissionLock,
           // The outer prepare boundary still owns the canonical lock here.
           // Reacquiring that same lock inside settlement would deadlock.
@@ -2736,15 +2804,20 @@ export async function main(argv: string[]): Promise<number> {
           reconcileMergedRun: async (run) => await reconcileDispatchMergedRunCommand(store, run, workflow.github, admission, async (operation) => await operation()),
           withAdmissionLock: async <T>(operation: () => Promise<T> | T) => await withDispatchAdmissionLock(operation),
           resolveExecutionProfile: (profile) => resolveSelectedExecutionProfile(profile),
-          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock, assertReviewClaim) => {
+          runIssue: async (ref, execution, dispatchClaimId, repairTaskShapeAuthority, missionAdmission, release, withLock, assertReviewClaim, assertMergeInitiation) => {
             return await runIssueCommand(workflow, ref, {
               ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
               assertReviewClaim,
+              assertMergeInitiation: async (run) => {
+                if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
+                if (!assertMergeInitiation) throw new Error('Merge dispatch authority unavailable.');
+                await assertMergeInitiation(run);
+              },
             });
           },
-          resumeClaimedRun: async (run, dispatchClaimId, missionAdmission, release, withLock, assertReviewClaim) => {
+          resumeClaimedRun: async (run, dispatchClaimId, missionAdmission, release, withLock, assertReviewClaim, assertMergeInitiation) => {
             if (run.target.kind !== 'issue') throw new Error(`Dispatch claimed Run ${run.id} is not an issue Run.`);
             const workspace = persistedRunWorkspace(run);
             return await runIssueCommand(workflow, `${run.target.owner}/${run.target.repo}#${run.target.issueNumber}`, {
@@ -2756,6 +2829,11 @@ export async function main(argv: string[]): Promise<number> {
               ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
               assertReviewClaim,
+              assertMergeInitiation: async (run) => {
+                if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
+                if (!assertMergeInitiation) throw new Error('Merge dispatch authority unavailable.');
+                await assertMergeInitiation(run);
+              },
             });
           },
         });

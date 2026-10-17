@@ -123,6 +123,7 @@ export const TRANSITION_TABLE: Readonly<
     fail: 'FAILED',
   },
   MERGE_READY: {
+    recheck_readiness: 'FINAL_GATE',
     merged: 'MERGED',
     wait_dependency: 'WAITING_DEPENDENCY',
     escalate: 'NEEDS_HUMAN',
