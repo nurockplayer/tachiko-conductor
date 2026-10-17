@@ -204,6 +204,7 @@ export interface Interrupt {
 
 /** One applied step in a run's history. */
 export interface TransitionRecord {
+  readonly nativeLeadStop?: NativeLeadStopReference;
   /**
    * The workflow-owned final authority records final_gate_verified after live
    * reconciliation. gate_passed is retained only so old JSON history remains
@@ -221,7 +222,10 @@ export interface TransitionRecord {
 }
 
 /** Payload for a single transition application. */
+export interface NativeLeadStopReference {readonly requestId:string;readonly receiptId:string;readonly digest:string;}
+
 export interface TransitionInput {
+  readonly nativeLeadStop?: NativeLeadStopReference;
   readonly type: TransitionType;
   readonly reason?: string;
   /** Carried into the run; required for `agent_succeeded`. */
@@ -282,11 +286,14 @@ export interface Run {
   readonly reviewResult?: ReviewResult;
   /** Native review lifecycle is owned exclusively by this Run's CAS. */
   readonly nativeReview?: {
+    readonly repairLimit?: number;
     readonly requests: readonly import('../oracle/types.js').NativeReviewRequestState[];
     readonly activeRequestId?: string;
     readonly accepted?: import('../oracle/types.js').NativeReviewAcceptance;
     readonly wait?: { readonly kind: 'binding' | 'request' | 'lead' | 'qualification'; readonly nextAttemptAt: string };
   };
+  /** Bounded read-only lead lifecycle; same Run CAS is its only authority. */
+  readonly nativeLead?: import('../oracle/native-lead.js').NativeLeadLedger;
   /** Single durable native merge attempt; existing Run CAS is its only lifecycle authority. */
   readonly mergeAttempt?: import('../workflow/merge.js').NativeMergeAttempt;
   /** Latest validation result, bound to an exact HEAD SHA. */

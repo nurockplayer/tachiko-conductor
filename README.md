@@ -757,6 +757,31 @@ transport qualification remain separate work. The selected Medium/High/Extra
 High effort is an observed configuration; account quota economics are not
 established here.
 
+## Disabled native lead repair bridge
+
+The host factory accepts a separate explicit qualified read-only lead binding.
+There is no default service, environment enablement, candidate configuration or
+provider fallback. Real role/transport/personal-host qualification remains open;
+controlled tests and engineering merges are not native deliveries.
+
+A qualified changes-required Oracle receipt can request one bounded `repair` or
+closed `stop` disposition. Repair accepts every original blocking finding using
+the original terminal digest and finding index, preserves the accepted scope and
+execution authority, and is consumed once by the existing atomic repair
+admission/start_fix CAS. The exact instructions and findings enter the isolated
+worker packet. A repaired HEAD requires fresh validation and a new independent
+Oracle result before the existing final gate.
+
+`Run.nativeLead` owns request/acceptance/observation history; immutable evidence
+uses `native/lead/` under the existing Oracle receipt store. Submission is marked
+before issuance, original correlation/returned URL is retained, and restart uses
+at most three persisted observations with 30-second backoff. One qualified
+irrecoverable replacement may share the same repair incarnation; retirement
+never proves remote completion. Exact receipt-backed owner succession and the
+current owner token are required to consume a recovered disposition. HOLD
+recovery can observe and persist evidence only. Stop, uncertainty and exhausted
+budgets retain the work reservation and cannot advance the queue.
+
 ## Layout
 
 ```

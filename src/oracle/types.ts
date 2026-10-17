@@ -100,6 +100,8 @@ export interface OracleReceiptStore {
   /** Immutable evidence only. The Run CAS remains the lifecycle authority. */
   recordNative?(evidence: NativeOracleEvidence): void;
   readNative?(id: string): NativeOracleEvidence | null;
+  recordLead?(evidence: import('./native-lead.js').NativeLeadEvidence): void;
+  readLead?(id: string): import('./native-lead.js').NativeLeadEvidence | null;
 }
 
 export interface OracleReviewTransport {

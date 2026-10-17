@@ -1,3 +1,4 @@
+import { nativeLeadReentry, unresolvedNativeLead } from '../oracle/native-lead.js';
 import { nativeMergeReentry } from '../workflow/merge.js';
 import { randomUUID } from 'node:crypto';
 
@@ -66,6 +67,7 @@ export interface DispatchOnceOptions {
   readonly queueBody: string;
   readonly maintenanceHold?: boolean;
   readonly issuedMergeRecoveryOnly?: boolean;
+  readonly issuedLeadRecoveryOnly?: boolean;
   readonly owner: string;
   readonly repo: string;
   readonly github: GitHubAdapter;
@@ -111,10 +113,10 @@ async function retiredForProgression(run: Run, options: DispatchOnceOptions): Pr
   // retirement/cancellation disposition, not delivery. Preserve that authority
   // without requiring retired unissued work to merge or reopening its wait.
   if (run.state !== 'MERGED') {
-    if (unresolvedNativeReview(run) || run.mergeAttempt?.submissionPossible === true) throw new DispatchProtocolError('Non-delivery retirement conflicts with unresolved or possibly issued external work.');
+    if (unresolvedNativeReview(run) || unresolvedNativeLead(run) || run.mergeAttempt?.submissionPossible === true) throw new DispatchProtocolError('Non-delivery retirement conflicts with unresolved or possibly issued external work.');
     return true;
   }
-  return run.nativeReview === undefined && run.mergeAttempt === undefined ||
+  return run.nativeReview === undefined && run.nativeLead === undefined && run.mergeAttempt === undefined ||
     options.qualifyNativeProgression !== undefined && await options.qualifyNativeProgression(run);
 }
 
@@ -466,7 +468,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
       profile: existing.claim.profile,
       ...(existing.claim.repairTaskShapeAuthority === undefined ? {} : { repairTaskShapeAuthority: existing.claim.repairTaskShapeAuthority }),
     };
-    const queue = options.maintenanceHold || options.issuedMergeRecoveryOnly ? [] : parseDispatchQueue(options.queueBody);
+    const queue = options.maintenanceHold || options.issuedMergeRecoveryOnly || options.issuedLeadRecoveryOnly ? [] : parseDispatchQueue(options.queueBody);
     let run = claimedRun(options.store, existing.claim, entry, options);
     if (run === null && (existing.claim.state === 'retired' || !hasValidDispatchAuthority(entry))) {
       return {
@@ -476,11 +478,12 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     }
     if (run !== null) assertClaimAuthorityMatchesRun(existing.claim, run);
     if (options.issuedMergeRecoveryOnly && !run?.mergeAttempt?.submissionPossible) return { outcome: 'existing_claim', claim: existing.claim };
-    if (options.maintenanceHold && !run?.mergeAttempt?.submissionPossible) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD permits only observation/settlement of an already-issued merge.' };
+    if (options.issuedLeadRecoveryOnly && (!run || !unresolvedNativeLead(run))) return {outcome:'existing_claim',claim:existing.claim};
+    if (options.maintenanceHold && !run?.mergeAttempt?.submissionPossible && (!run || !unresolvedNativeLead(run))) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD permits only observation/settlement of an already-issued merge.' };
     const historicalHold = await historicalOwnerHold(options, run?.id);
     if (historicalHold !== null) return { outcome: 'owner_reconciliation_hold', entry, claim: existing.claim, reason: historicalHold };
     const ownerRetired = run !== null && run.state !== 'MERGED' && await retiredForProgression(run, options);
-    if (!ownerRetired && (run === null || !isSettledRun(run) || nativeReviewReentry(run, options.now()) || run.state === 'MERGE_READY' && run.nativeReview !== undefined && run.mergeAttempt?.submissionPossible !== true || nativeMergeReentry(run, options.now()))) {
+    if (!ownerRetired && (run === null || !isSettledRun(run) || options.issuedLeadRecoveryOnly || nativeReviewReentry(run, options.now()) || nativeLeadReentry(run,options.now()) || run.state === 'MERGE_READY' && (run.nativeReview !== undefined || run.nativeLead !== undefined) && run.mergeAttempt?.submissionPossible !== true || nativeMergeReentry(run, options.now()))) {
       if (run !== null && options.admission?.readLane(`run:${run.id}`)?.status === 'active') {
         return {
           outcome: 'admission_wait', waitKind: 'owner', entry, runId: run.id, claim: existing.claim,
@@ -537,7 +540,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
   if (options.issuedMergeRecoveryOnly) return { outcome: 'no_eligible_work', reasons: ['Issued merge recovery has no exact retained runtime claim.'] };
   const historicalHold = await historicalOwnerHold(options);
   if (historicalHold !== null) return { outcome: 'no_eligible_work', reasons: [historicalHold] };
-  const queue = options.maintenanceHold || options.issuedMergeRecoveryOnly ? [] : parseDispatchQueue(options.queueBody);
+  const queue = options.maintenanceHold || options.issuedMergeRecoveryOnly || options.issuedLeadRecoveryOnly ? [] : parseDispatchQueue(options.queueBody);
   if (options.maintenanceHold) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD prevents new dispatch admission.' };
   const reasons: string[] = [];
   for (const entry of queue) {

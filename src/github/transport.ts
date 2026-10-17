@@ -36,6 +36,8 @@ export interface ProcessRunOptions {
    * directly before delegating to the real child-process boundary.
    */
   readonly beforeSpawn?: () => void;
+  /** Short host-owned serialized child-creation boundary; never held while awaiting the child. */
+  readonly withSpawnBoundary?: <T>(operation: () => T) => T;
 }
 
 export interface ProcessRunner {
@@ -59,8 +61,9 @@ export class NodeProcessRunner implements ProcessRunner {
       };
       // Keep this callback in the child-creation turn: a rejected host check
       // must reject this promise without creating a process.
+      const createChild = () => {
       options.beforeSpawn?.();
-      const child = execFile(
+      return execFile(
         file,
         [...args],
         {
@@ -96,6 +99,8 @@ export class NodeProcessRunner implements ProcessRunner {
           finish(() => reject(error));
         },
       );
+      };
+      const child = options.withSpawnBoundary ? options.withSpawnBoundary(createChild) : createChild();
       // A child may close its read end before stdin is ended (for example,
       // EPIPE). Always consume the stream error so it cannot escape as an
       // unhandled process-level error.

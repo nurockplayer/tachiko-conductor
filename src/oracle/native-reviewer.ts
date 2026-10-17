@@ -58,13 +58,14 @@ export function nativeReviewCoherent(run: Run): boolean {
   try {
     const ledger = run.nativeReview;
     if (ledger === undefined) return true;
+    if (ledger.repairLimit !== undefined && (!Number.isSafeInteger(ledger.repairLimit) || ledger.repairLimit<1)) return false;
     if (!Array.isArray(ledger.requests) || ledger.requests.length > 20 || new Set(ledger.requests.map((r) => r.identity.requestId)).size !== ledger.requests.length) return false;
     if (ledger.wait !== undefined && (!['binding', 'request', 'lead', 'qualification'].includes(ledger.wait.kind) || !Number.isFinite(Date.parse(ledger.wait.nextAttemptAt)))) return false;
     for (const r of ledger.requests) {
       if (!validNativeIdentity(r.identity) || r.identity.runId !== run.id || r.identity.claimId !== run.dispatchClaimId || r.identity.targetKey !== canonicalReviewTarget(run.target)?.key || r.identity.repository !== `${run.target.owner}/${run.target.repo}`.toLowerCase() ||
         !['pending', 'qualified_complete', 'incomplete', 'terminal_unknown', 'retired', 'replaced'].includes(r.status) || typeof r.submissionPossible !== 'boolean' || !Number.isSafeInteger(r.observations) || r.observations < 0 || r.observations > NATIVE_REVIEW_OBSERVATIONS || !Number.isFinite(Date.parse(r.nextObservationAt)) ||
         (r.conversationUrl !== undefined && !validUrl(r.conversationUrl)) || (r.failure !== undefined && !['transport_failure', 'safety_refusal', 'missing_evidence'].includes(r.failure)) ||
-        (r.terminalDigest !== undefined && !DIGEST.test(r.terminalDigest)) || (r.status === 'qualified_complete' && (!r.submissionPossible || r.terminalDigest === undefined)) ||
+        (r.terminalDigest !== undefined && (!DIGEST.test(r.terminalDigest) || !['qualified_complete','retired'].includes(r.status))) || (r.status === 'qualified_complete' && (!r.submissionPossible || r.terminalDigest === undefined)) ||
         (r.terminalStatus !== undefined && !['incomplete', 'terminal_unknown'].includes(r.terminalStatus)) || (r.retirementReason !== undefined && r.retirementReason !== 'irrecoverable_transport') ||
         (r.status === 'replaced' && (r.failure !== 'transport_failure' && !(r.terminalStatus === 'terminal_unknown' && r.retirementReason === 'irrecoverable_transport') || !ledger.requests.some((n) => n.identity.requestId === r.replacedBy && sameCandidate(r.identity, n.identity))))) return false;
       if (ledger.requests.filter((n) => sameCandidate(r.identity, n.identity)).length > 2) return false;
@@ -84,10 +85,10 @@ export function nativeReviewProgresses(previous: Run, next: Run): boolean {
   const old = previous.nativeReview;
   if (old === undefined) return true;
   const ledger = next.nativeReview;
-  if (ledger === undefined || ledger.requests.length < old.requests.length) return false;
+  if (ledger === undefined || old.repairLimit!==undefined && ledger.repairLimit!==old.repairLimit || ledger.requests.length < old.requests.length) return false;
   return old.requests.every((r, i) => {
     const n = ledger.requests[i];
-    if (!n || !same(r.identity, n.identity) || r.submissionPossible && !n.submissionPossible || n.observations < r.observations ||
+    if (!n || r.terminalDigest===undefined && n.terminalDigest!==undefined && n.status!=='qualified_complete' || !same(r.identity, n.identity) || r.submissionPossible && !n.submissionPossible || n.observations < r.observations ||
       r.conversationUrl !== undefined && n.conversationUrl !== r.conversationUrl || r.failure !== undefined && n.failure !== r.failure || r.terminalDigest !== undefined && n.terminalDigest !== r.terminalDigest ||
       r.replacedBy !== undefined && n.replacedBy !== r.replacedBy || r.terminalStatus !== undefined && n.terminalStatus !== r.terminalStatus || r.retirementReason !== undefined && n.retirementReason !== r.retirementReason) return false;
     return r.status === n.status || r.status === 'pending' || r.status === 'terminal_unknown' && ['pending', 'qualified_complete', 'incomplete'].includes(n.status) || r.status === 'incomplete' && r.failure === 'transport_failure' && n.status === 'replaced' ||
@@ -106,7 +107,7 @@ export function activeNativeReview(run: Run): NativeReviewRequestState | undefin
   return run.nativeReview?.requests.find((r) => r.identity.requestId === run.nativeReview?.activeRequestId);
 }
 export function unresolvedNativeReview(run: Run): boolean {
-  return run.nativeReview?.requests.some((r) => r.submissionPossible && r.status !== 'qualified_complete') === true;
+  return run.nativeReview?.requests.some((r) => r.submissionPossible && r.terminalDigest === undefined) === true;
 }
 export function nativeReviewReentry(run: Run, now = new Date().toISOString()): boolean {
   if (run.state === 'WAITING_DEPENDENCY' && run.nativeReview?.wait?.kind === 'binding') return Date.parse(run.nativeReview.wait.nextAttemptAt) <= Date.parse(now);
@@ -177,7 +178,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
         const candidateMoved = active.identity.headSha !== run.headSha || active.identity.baseSha !== baseSha || active.identity.sourceSha256 !== manifest.sourceSha256 || active.identity.diffSha256 !== manifest.diffSha256;
         if (candidateMoved) {
           const retired = { ...active, status: 'retired' as const, ...(['incomplete', 'terminal_unknown'].includes(active.status) ? { terminalStatus: active.status as 'incomplete' | 'terminal_unknown' } : {}) };
-          if (!save({ ...run, nativeReview: { requests: run.nativeReview!.requests.map((r) => r.identity.requestId === active!.identity.requestId ? retired : r) } })) return stale();
+          if (!save({ ...run, nativeReview: { ...(run.nativeReview?.repairLimit===undefined?{}:{repairLimit:run.nativeReview.repairLimit}), requests: run.nativeReview!.requests.map((r) => r.identity.requestId === active!.identity.requestId ? retired : r) } })) return stale();
           return wait('Native review original retired from active review after candidate movement; remote cancellation is unknown and its evidence remains retained.');
         }
         return wait('Native review unavailable: active request authority changed; original identity remains fenced.');
@@ -197,7 +198,7 @@ export function resolveNativeReviewer(host?: NativeReviewerHost): ReviewerAdapte
           requestedModel: host.binding.model, requestedEffort: effort, floor, sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256 };
         const reserved: NativeReviewRequestState = { identity, status: 'pending', submissionPossible: false, observations: 0, nextObservationAt: context.now() };
         const requests = (run.nativeReview?.requests ?? []).map((r) => replacement && r.identity.requestId === active!.identity.requestId ? { ...r, status: 'replaced' as const, terminalStatus: r.status as 'incomplete' | 'terminal_unknown', ...(irrecoverable ? { retirementReason: 'irrecoverable_transport' as const } : {}), replacedBy: requestId } : r);
-        if (!save({ ...run, nativeReview: { requests: [...requests, reserved], activeRequestId: requestId } })) return stale();
+        if (!save({ ...run, nativeReview: { ...(run.nativeReview?.repairLimit===undefined?{}:{repairLimit:run.nativeReview.repairLimit}), requests: [...requests, reserved], activeRequestId: requestId } })) return stale();
         active = reserved;
       }
       const requestEvidence: Extract<NativeOracleEvidence, { kind: 'request' }> = frozen({ id: `${active.identity.requestId}.request`, kind: 'request', identity: active.identity, manifest });

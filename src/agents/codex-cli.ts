@@ -154,7 +154,7 @@ export class CodexCliAdapter implements ImplementationAgent {
       result = await this.runner.run(
         'codex',
         this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort),
-        this.processOptions(request.signal, cwd, request.beforeExecution),
+        {...this.processOptions(request.signal, cwd, request.beforeExecution), ...(request.withExecutionBoundary===undefined?{}:{withSpawnBoundary:request.withExecutionBoundary})},
       );
     } catch (error) {
       if (isExecutionAdmissionRefusal(error)) throw error;

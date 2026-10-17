@@ -1,3 +1,4 @@
+import { validLeadEvidence, type NativeLeadEvidence } from './native-lead.js';
 import { closeSync, existsSync, fsyncSync, linkSync, openSync, readdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import path from 'node:path';
@@ -70,11 +71,23 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
       return value.policy === undefined ? { ...value, policyQualified: false } : value;
     });
   }
-  recordNative(evidence: NativeOracleEvidence): void {
-    if (!validNativeEvidence(evidence)) throw new Error('Invalid immutable native Oracle evidence.');
-    ensureDurableDirectory(this.nativeDir, { mode: 0o700 });
-    const file = path.join(this.nativeDir, `${evidence.id}.json`);
-    const existing = this.readNative(evidence.id);
+  recordNative(evidence: NativeOracleEvidence): void { this.recordImmutable(evidence, false); }
+  recordLead(evidence: NativeLeadEvidence): void { this.recordImmutable(evidence, true); }
+  readLead(id: string): NativeLeadEvidence | null {
+    if (!/^[A-Za-z0-9._-]{1,300}$/.test(id)) throw new Error('Invalid native lead evidence id.');
+    const file = path.join(this.nativeDir, 'lead', `${id}.json`);
+    if (!existsSync(file)) return null;
+    const value = JSON.parse(readFileSync(file, 'utf8')) as NativeLeadEvidence;
+    if (!validLeadEvidence(value) || value.id !== id) throw new Error('Invalid immutable native lead evidence.');
+    return value;
+  }
+  private recordImmutable(evidence: NativeOracleEvidence | NativeLeadEvidence, lead: boolean): void {
+    const directoryPath = lead ? path.join(this.nativeDir, 'lead') : this.nativeDir;
+    const read = (id: string) => lead ? this.readLead(id) : this.readNative(id);
+    if (!(lead ? validLeadEvidence(evidence as NativeLeadEvidence) : validNativeEvidence(evidence as NativeOracleEvidence))) throw new Error('Invalid immutable native Oracle evidence.');
+    ensureDurableDirectory(directoryPath, { mode: 0o700 });
+    const file = path.join(directoryPath, `${evidence.id}.json`);
+    const existing = read(evidence.id);
     if (existing !== null) {
       if (oracleDigest(existing) !== oracleDigest(evidence)) throw new Error('Conflicting immutable native Oracle evidence.');
       return;
@@ -86,10 +99,10 @@ export class JsonFileOracleReceiptStore implements OracleReceiptStore {
       // Atomic no-replace publication; a concurrent different result cannot win silently.
       try { linkSync(temporary, file); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        const winner = this.readNative(evidence.id);
+        const winner = read(evidence.id);
         if (winner === null || oracleDigest(winner) !== oracleDigest(evidence)) throw new Error('Conflicting immutable native Oracle evidence.');
       }
-      const directory = openSync(this.nativeDir, 'r');
+      const directory = openSync(directoryPath, 'r');
       try { fsyncSync(directory); } finally { closeSync(directory); }
     } finally { unlinkSync(temporary); }
   }
