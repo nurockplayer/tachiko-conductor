@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it } from 'node:test';
@@ -20,7 +20,7 @@ import { projectRunEfficiency } from '../src/domain/telemetry.js';
 import type { AgentResult, LocalValidationEvidence, ReviewResult, Run } from '../src/domain/types.js';
 import { JsonFileStore, type RunStore } from '../src/store/json-file-store.js';
 import { EXECUTION_CONFIGURATION_ERROR_CODE, type ResolvedExecutionConfiguration } from '../src/execution-profiles.js';
-import { runWorkflow } from '../src/workflow/run.js';
+import { runWorkflow, type WorkflowDependencies } from '../src/workflow/run.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
 import { ImplementationAgentRegistry } from '../src/agents/implementation-router.js';
@@ -33,6 +33,8 @@ import { createBootstrapGitFixture } from './bootstrap-fixture.js';
 import { createGenuineLunaFixture } from './support/genuine-luna.js';
 import { StandaloneGitBootstrap } from '../src/workspace/standalone-git-bootstrap.js';
 import { GitWorktreeBootstrap } from '../src/workspace/git-worktree-bootstrap.js';
+import { InMemoryToolOutputStore, TOOL_OUTPUT_POLICY_MAXIMA, boundToolOutput } from '../src/evidence/tool-output.js';
+import { DEFAULT_EFFICIENCY_THRESHOLDS, RUN_TELEMETRY_REVISION } from '../src/domain/telemetry.js';
 
 const T0 = '2026-08-14T00:00:00.000Z';
 const HEAD = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
@@ -398,36 +400,171 @@ describe('runWorkflow', { concurrency: false }, () => {
   });
 
   it('F06 persists incoherent local validation evidence as a durable fail-closed interrupt', async () => {
-    const store = new MemoryStore();
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-f06-preview-'));
+    const store = new JsonFileStore({ dir: directory });
     let run = createRun(TARGET, T0, 'validation-incoherent-adapter');
     run = applyTransition(run, { type: 'start' }, T0);
     run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = { ...run, telemetry: {
+      revision: RUN_TELEMETRY_REVISION, coverage: 'partial', thresholds: DEFAULT_EFFICIENCY_THRESHOLDS,
+      events: [{ id: 'f06-existing-wait', at: T0, kind: 'wait_status_wakeup', state: 'VALIDATING', headSha: HEAD }],
+    } };
     store.create(run);
+    const oversizedSentinel = 'OVERSIZED-FALLBACK-PREVIEW-MUST-NOT-PERSIST';
+    const oversizedPreview = oversizedSentinel + 'x'.repeat(1_048_576 - oversizedSentinel.length);
     const incoherentValidation: ValidationAdapter = {
       kind: 'validation', configRevision: 'test-config-v1',
       async validate() {
-        return { status: 'passed', configRevision: 'test-config-v1', commands: [] } as unknown as LocalValidationEvidence;
+        return {
+          status: 'passed', configRevision: 'test-config-v1',
+          commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+            captureStatus: 'unavailable', capturePreview: {
+              stdout: { bytes: Buffer.byteLength(oversizedPreview), preview: oversizedPreview,
+                previewBytes: Buffer.byteLength(oversizedPreview), truncated: false },
+              stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+              diagnostics: [], diagnosticsTruncated: false,
+            } }],
+        };
       },
     };
 
-    const result = await runWorkflow(
-      {
+    try {
+      const result = await runWorkflow(
+        {
+          store,
+          github: githubAdapter([HEAD]),
+          implementation: new FakeImplementation([]),
+          reviewer: new FakeReviewer([]),
+          validation: incoherentValidation,
+          hostedCheckPolicy: TEST_HOSTED_POLICY,
+        },
+        run.id,
+        { maxReviewAttempts: 1, now: () => T0 },
+      );
+
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.state, 'NEEDS_HUMAN');
+      assert.equal(result.run.validationResult?.status, 'unknown');
+      assert.equal(result.run.validationResult?.local.status, 'unknown');
+      assert.deepEqual(result.run.validationResult?.local.commands, [], 'the oversized adapter preview is replaced by unavailable local evidence');
+      assert.equal(result.run.history.at(-1)?.type, 'escalate');
+      const jsonHistory = (history: Run['history']): Run['history'] => JSON.parse(JSON.stringify(history)) as Run['history'];
+      assert.deepEqual(jsonHistory(result.run.history.slice(0, run.history.length)), jsonHistory(run.history),
+        'pre-validation history is preserved');
+      assert.deepEqual(result.run.telemetry, run.telemetry, 'existing telemetry is preserved without preview content');
+
+      const persisted = new JsonFileStore({ dir: directory }).read(run.id);
+      assert.equal(persisted?.state, 'NEEDS_HUMAN');
+      assert.deepEqual(persisted?.history, jsonHistory(result.run.history),
+        'durable history retains the refusal transition');
+      assert.deepEqual(persisted?.telemetry, run.telemetry, 'durable telemetry event and thresholds are preserved');
+      assert.deepEqual(persisted?.validationResult?.local.commands, []);
+      assert.equal(JSON.stringify(persisted?.validationResult).includes(oversizedSentinel), false,
+        'durable refusal contains no oversized fallback preview');
+      assert.ok(JSON.stringify(persisted?.validationResult).length < TOOL_OUTPUT_POLICY_MAXIMA.previewBytes,
+        'only compact unavailable evidence reaches durable validation state');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('refuses malformed retention authority in complete evidence before persisting it', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-retention-authority-'));
+    const store = new JsonFileStore({ dir: directory });
+    let run = createRun(TARGET, T0, 'validation-malformed-retention-authority');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = { ...run, telemetry: {
+      revision: RUN_TELEMETRY_REVISION, coverage: 'partial', thresholds: DEFAULT_EFFICIENCY_THRESHOLDS,
+      events: [{ id: 'retention-existing-wait', at: T0, kind: 'wait_status_wakeup', state: 'VALIDATING', headSha: HEAD }],
+    } };
+    store.create(run);
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
+      store: new InMemoryToolOutputStore(), policy: { previewBytes: 8, diagnosticBytes: 8, maxDiagnostics: 1, readBytes: 8 } });
+    const malformedOutput = { ...output, artifact: { ...output.artifact,
+      operationId: 'not-an-operation-id', retainedUntil: '2000-01-01T00:00:00.000Z' } };
+    const malformedValidation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate() {
+        return { status: 'passed', configRevision: 'test-config-v1', commands: [{
+          commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+          captureStatus: 'complete', output: malformedOutput,
+        }] };
+      },
+    };
+
+    try {
+      const result = await runWorkflow({
+        store, github: githubAdapter([HEAD]), implementation: new FakeImplementation([]),
+        reviewer: new FakeReviewer([approve(HEAD)]), validation: malformedValidation, hostedCheckPolicy: TEST_HOSTED_POLICY,
+      }, run.id, { maxReviewAttempts: 1, now: () => T0 });
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.state, 'NEEDS_HUMAN');
+      assert.deepEqual(result.run.validationResult?.local.commands, [], 'malformed complete evidence is replaced with compact unavailable evidence');
+      const jsonHistory = (history: Run['history']): Run['history'] => JSON.parse(JSON.stringify(history)) as Run['history'];
+      assert.deepEqual(jsonHistory(result.run.history.slice(0, run.history.length)), jsonHistory(run.history),
+        'pre-validation history is preserved');
+      assert.deepEqual(result.run.telemetry, run.telemetry, 'prior telemetry is preserved');
+      const persisted = new JsonFileStore({ dir: directory }).read(run.id);
+      assert.equal(persisted?.state, 'NEEDS_HUMAN');
+      assert.deepEqual(persisted?.validationResult?.local.commands, []);
+      assert.equal(JSON.stringify(persisted?.validationResult).includes('not-an-operation-id'), false,
+        'invalid retention authority never reaches durable validation state');
+      assert.deepEqual(persisted?.telemetry, run.telemetry);
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('fails closed when fallback raw stream bytes exceed the preview policy without a truncation claim', async () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-workflow-f06-truncated-flag-'));
+    const store = new JsonFileStore({ dir: directory });
+    let run = createRun(TARGET, T0, 'validation-false-truncation-claim');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    run = { ...run, telemetry: {
+      revision: RUN_TELEMETRY_REVISION, coverage: 'partial', thresholds: DEFAULT_EFFICIENCY_THRESHOLDS,
+      events: [{ id: 'f1-existing-wait', at: T0, kind: 'wait_status_wakeup', state: 'VALIDATING', headSha: HEAD }],
+    } };
+    store.create(run);
+    const retainedSentinel = 'OVER-LIMIT-COMPLETE-RETAINED-PREVIEW-MUST-NOT-PERSIST';
+    const incoherentValidation: ValidationAdapter = {
+      kind: 'validation', configRevision: 'test-config-v1',
+      async validate() {
+        return {
+          status: 'passed', configRevision: 'test-config-v1',
+          commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+            captureStatus: 'unavailable', capturePreview: {
+              stdout: { bytes: TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, preview: retainedSentinel,
+                previewBytes: Buffer.byteLength(retainedSentinel), truncated: false },
+              stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+              diagnostics: [], diagnosticsTruncated: false,
+            } }],
+        };
+      },
+    };
+
+    try {
+      const result = await runWorkflow({
         store,
         github: githubAdapter([HEAD]),
         implementation: new FakeImplementation([]),
         reviewer: new FakeReviewer([]),
         validation: incoherentValidation,
         hostedCheckPolicy: TEST_HOSTED_POLICY,
-      },
-      run.id,
-      { maxReviewAttempts: 1, now: () => T0 },
-    );
+      }, run.id, { maxReviewAttempts: 1, now: () => T0 });
 
-    assert.equal(result.outcome, 'needs_human');
-    assert.equal(result.run.state, 'NEEDS_HUMAN');
-    assert.equal(result.run.validationResult?.status, 'unknown');
-    assert.equal(result.run.validationResult?.local.status, 'unknown');
-    assert.equal(result.run.history.at(-1)?.type, 'escalate');
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.state, 'NEEDS_HUMAN');
+      assert.equal(result.run.validationResult?.local.status, 'unknown');
+      assert.deepEqual(result.run.validationResult?.local.commands, []);
+      const jsonHistory = (history: Run['history']): Run['history'] => JSON.parse(JSON.stringify(history)) as Run['history'];
+      assert.deepEqual(jsonHistory(result.run.history.slice(0, run.history.length)), jsonHistory(run.history),
+        'pre-validation history survives the fail-closed replacement');
+      assert.deepEqual(result.run.telemetry, run.telemetry, 'the existing wait event and thresholds survive the replacement');
+      const persisted = new JsonFileStore({ dir: directory }).read(run.id);
+      assert.equal(persisted?.state, 'NEEDS_HUMAN');
+      assert.deepEqual(jsonHistory(persisted?.history ?? []), jsonHistory(result.run.history));
+      assert.deepEqual(persisted?.telemetry, run.telemetry, 'durable telemetry preserves the prior event and thresholds');
+      assert.equal(JSON.stringify(persisted?.validationResult).includes(retainedSentinel), false,
+        'the compact retained preview is not persisted when its raw byte count lacks a truncation claim');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('F06 rejects failed local evidence that contradicts its zero exit code', async () => {
@@ -463,6 +600,279 @@ describe('runWorkflow', { concurrency: false }, () => {
     assert.equal(result.run.state, 'NEEDS_HUMAN');
     assert.equal(result.run.validationResult?.status, 'unknown');
     assert.equal(result.run.validationResult?.local.status, 'unknown');
+  });
+
+  it('keeps typed and legacy refusals held while a typed ordinary collision follows the normal retry path', async () => {
+    for (const kind of [undefined, 'process_family_settlement', 'command'] as const) {
+      const store = new MemoryStore();
+      let run = applyTransition(createRun(TARGET, T0, `kind-${kind ?? 'legacy'}`), { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      store.create(run);
+      const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+        { ...(kind === undefined ? {} : { evidenceKind: kind }), commandIndex: 0, executable: 'process-family-settlement',
+          outcome: 'unavailable', exitCode: null, durationMs: 0 },
+      ] };
+      const github = githubAdapter([]);
+      let reads = 0, validations = 0;
+      github.readLiveSnapshot = async () => { reads += 1; return snapshot(HEAD); };
+      const implementation = new FakeImplementation([]), reviewer = new FakeReviewer([]);
+      const dependencies: WorkflowDependencies = { store, github, implementation, reviewer,
+        validation: { kind: 'validation', configRevision: 'test-config-v1', async validate() { validations += 1; return local; } }, hostedCheckPolicy: TEST_HOSTED_POLICY };
+      const result = await runWorkflow(dependencies, run.id, { maxReviewAttempts: 3, now: () => T0 });
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.validationResult?.status, 'unknown');
+      assert.equal(validations, 1);
+      assert.equal(reads, kind === 'command' ? 2 : 1);
+      if (kind === 'command') assert.ok(result.run.interrupt?.choices?.some((choice) => /retry/i.test(choice)));
+      else {
+        assert.deepEqual(result.run.interrupt?.choices, ['Cancel the run']);
+        store.update(applyTransition(JSON.parse(JSON.stringify(result.run)), { type: 'human_resolved', reason: 'legacy retry' }, T0));
+        const reentry = await runWorkflow(dependencies, run.id, { maxReviewAttempts: 3, now: () => T0 });
+        assert.equal(reentry.outcome, 'needs_human');
+        assert.deepEqual(reentry.run.validationResult, result.run.validationResult);
+        assert.equal(validations, 1);
+        assert.equal(reads, 1);
+      }
+      assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+    }
+  });
+
+  it('retains fresh settlement refusal before later GitHub or policy observation and keeps resume fenced', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-fresh-settlement-retention-'));
+    try {
+      for (const mode of ['github-unavailable', 'policy-drift'] as const) {
+        const store = new JsonFileStore({ dir });
+        let run = createRun(TARGET, T0, `fresh-settlement-${mode}`);
+        run = applyTransition(run, { type: 'start' }, T0);
+        run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+        store.create(run);
+        const code = mode === 'github-unavailable' ? 0 : 7;
+        const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+          { commandIndex: 0, executable: 'node', outcome: code === 0 ? 'passed' : 'failed', exitCode: code, durationMs: 1 },
+          { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+        ] };
+        let validationEntries = 0, githubReads = 0, latePolicyReads = 0;
+        const validation: ValidationAdapter = {
+          kind: 'validation',
+          get configRevision() {
+            if (validationEntries > 0 && mode === 'policy-drift') { latePolicyReads += 1; return 'changed-policy-v2'; }
+            return 'test-config-v1';
+          },
+          async validate() { validationEntries += 1; return local; },
+        };
+        const github = githubAdapter([]);
+        github.readLiveSnapshot = async () => {
+          githubReads += 1;
+          if (githubReads > 1) throw new Error('post-validation GitHub unavailable');
+          return snapshot(HEAD);
+        };
+        const implementation = new FakeImplementation([]);
+        const reviewer = new FakeReviewer([]);
+        const deps = { store, github, implementation, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY };
+        const first = await runWorkflow(deps, run.id, { maxReviewAttempts: 3, now: () => T0 });
+        assert.equal(first.outcome, 'needs_human');
+        const persisted = new JsonFileStore({ dir }).read(run.id)!;
+        assert.equal(persisted.state, 'NEEDS_HUMAN');
+        assert.equal(persisted.validationResult?.status, 'unknown');
+        assert.deepEqual(persisted.validationResult?.local, local);
+        assert.equal(githubReads, 1, 'the refusal is retained before the later external await');
+        assert.equal(latePolicyReads, 0, 'the refusal is retained before later active-policy reads');
+        const oldRetry = 'Retry after restoring GitHub access';
+        assert.equal(persisted.interrupt?.choices?.includes(oldRetry), false);
+        // The generic transition accepts the legacy retry reason. Its retained
+        // marker must still fence execution after a same-HEAD resolution.
+        const resolved = applyTransition(persisted, { type: 'human_resolved', reason: oldRetry }, T0);
+        assert.deepEqual(resolved.validationResult, persisted.validationResult);
+        store.update(resolved);
+        const resumed = await runWorkflow({ ...deps, store: new JsonFileStore({ dir }) }, run.id,
+          { maxReviewAttempts: 3, now: () => T0 });
+        assert.equal(resumed.outcome, 'needs_human');
+        assert.deepEqual(resumed.run.validationResult, persisted.validationResult);
+        assert.equal(validationEntries, 1, 'attempted retry must not enter local validation a second time');
+        assert.equal(githubReads, 1);
+        assert.equal(latePolicyReads, 0);
+        assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+        assert.equal(resumed.run.history.some((entry) => entry.type === 'start_fix' || entry.type === 'revalidate'), false);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('refuses failed settlement-retention CAS without returning a marker-free retry or overwriting a newer Run', async () => {
+    for (const mode of ['newer-winner', 'missing-cas', 'throwing-cas'] as const) {
+      const backing = new MemoryStore();
+      let run = createRun(TARGET, T0, `settlement-retention-${mode}`);
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      backing.create(run);
+      const storageError = new Error('settlement retention storage failure');
+      let validationEntries = 0, githubReads = 0;
+      let expectedAfter: Run | undefined;
+      const store: RunStore = {
+        name: 'retention-cas', read: (id) => backing.read(id), create: (value) => backing.create(value),
+        update: (value) => backing.update(value), list: () => backing.list(), delete: (id) => backing.delete(id),
+        updateIfUnchanged(expected, next) {
+          if (validationEntries > 0 && mode === 'throwing-cas') throw storageError;
+          return backing.updateIfUnchanged(expected, next);
+        },
+      };
+      const validation: ValidationAdapter = {
+        kind: 'validation', configRevision: 'test-config-v1',
+        async validate() {
+          validationEntries += 1;
+          const before = backing.read(run.id)!;
+          expectedAfter = mode === 'newer-winner'
+            ? applyTransition(before, { type: 'escalate', reason: 'newer owner decision' }, T0)
+            : before;
+          if (mode === 'newer-winner') backing.update(expectedAfter);
+          if (mode === 'missing-cas') store.updateIfUnchanged = undefined;
+          return { status: 'unknown', configRevision: 'test-config-v1', commands: [
+            { commandIndex: 0, executable: 'node', outcome: 'passed', exitCode: 0, durationMs: 1 },
+            { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+          ] };
+        },
+      };
+      const github = githubAdapter([]);
+      github.readLiveSnapshot = async () => { githubReads += 1; return snapshot(HEAD); };
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      await assert.rejects(runWorkflow({ store, github, implementation, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY },
+        run.id, { maxReviewAttempts: 3, now: () => T0 }), (error) => {
+        assert.equal(isExecutionAdmissionRefusal(error), true);
+        if (!isExecutionAdmissionRefusal(error)) return false;
+        assert.equal(error.runSuperseded, mode === 'newer-winner');
+        assert.equal(error.authorityUnknown, mode !== 'newer-winner');
+        if (mode === 'throwing-cas') assert.equal(error.cause, storageError);
+        return true;
+      });
+      assert.deepEqual(backing.read(run.id), expectedAfter, 'the retention failure never overwrites current durable authority');
+      assert.equal(validationEntries, 1);
+      assert.equal(githubReads, 1);
+      assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+    }
+  });
+
+  it('preserves the existing GitHub-restoration retry when local validation has no settlement marker', async () => {
+    const store = new MemoryStore();
+    let run = createRun(TARGET, T0, 'ordinary-github-validation-retry');
+    run = applyTransition(run, { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    store.create(run);
+    const validation = new FakeValidation();
+    let githubReads = 0;
+    const github = githubAdapter([]);
+    github.readLiveSnapshot = async () => {
+      githubReads += 1;
+      if (githubReads % 2 === 0) throw new Error('ordinary post-validation GitHub unavailable');
+      return snapshot(HEAD);
+    };
+    const implementation = new FakeImplementation([]);
+    const reviewer = new FakeReviewer([]);
+    const deps = { store, github, implementation, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY };
+    const first = await runWorkflow(deps, run.id, { maxReviewAttempts: 3, now: () => T0 });
+    assert.equal(first.outcome, 'needs_human');
+    assert.equal(validation.requests.length, 1);
+    const retry = 'Retry after restoring GitHub access';
+    assert.equal(first.run.interrupt?.choices?.includes(retry), true);
+    store.update(applyTransition(first.run, { type: 'human_resolved', reason: retry }, T0));
+    await runWorkflow(deps, run.id, { maxReviewAttempts: 3, now: () => T0 });
+    assert.equal(validation.requests.length, 2, 'ordinary no-marker retry semantics remain unchanged');
+    assert.equal(implementation.requests.length + reviewer.requests.length, 0);
+  });
+
+  it('parks fresh settlement uncertainty despite hosted failure and preserves ordinary unknown failure precedence', async () => {
+    for (const scenario of [{ code: 0, settlement: true }, { code: 7, settlement: true }, { code: 7, settlement: false }]) {
+      const store = new MemoryStore();
+      let run = createRun(TARGET, T0, `settlement-hosted-${scenario.code}-${scenario.settlement}`);
+      run = applyTransition(run, { type: 'start' }, T0);
+      run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+      store.create(run);
+      const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+        { commandIndex: 0, executable: 'node', outcome: scenario.code === 0 ? 'passed' : 'failed', exitCode: scenario.code, durationMs: 1 },
+        { commandIndex: 1, executable: scenario.settlement ? 'process-family-settlement' : 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+      ] };
+      const validation = new FakeValidation([local]);
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      const github = githubAdapter([]);
+      github.readLiveSnapshot = async () => ({ ...snapshot(HEAD),
+        checks: { availability: 'available', overall: 'failing', checks: [{ id: 'ci', name: 'ci', state: 'failing', url: null, updatedAt: T0 }] } });
+      const result = await runWorkflow({ store, github, implementation, reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY },
+        run.id, { maxReviewAttempts: scenario.settlement ? 2 : 1, now: () => T0 });
+      assert.equal(result.outcome, 'needs_human');
+      assert.equal(result.run.validationResult?.status, scenario.settlement ? 'unknown' : 'failed');
+      assert.equal(result.run.validationResult?.hosted.status, 'failed');
+      assert.deepEqual(result.run.validationResult?.local, local);
+      assert.equal(result.run.history.some((entry) => entry.type === 'validation_failed'), !scenario.settlement);
+      assert.equal(result.run.history.some((entry) => entry.type === 'start_fix' || entry.type === 'revalidate'), false);
+      assert.equal(validation.requests.length, 1);
+      assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+    }
+  });
+
+  it('parks disk-persisted settlement markers before every active workflow re-entry effect', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-hold-restart-'));
+    try {
+      for (const state of ['READY', 'CHANGES_REQUESTED', 'IMPLEMENTING', 'VALIDATING', 'REVIEWING', 'FINAL_GATE', 'MERGE_READY', 'NEEDS_HUMAN', 'WAITING_DEPENDENCY'] as const) {
+        const seed = validationPassed(HEAD);
+        const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+          { commandIndex: 0, executable: 'node', outcome: 'passed', exitCode: 0, durationMs: 1 },
+          { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+        ] };
+        const run: Run = { ...createRun(TARGET, T0, `settlement-restart-${state}`), state, headSha: HEAD,
+          pullRequest: { number: 7, headSha: HEAD }, bootstrap: new FakeBootstrap().identity,
+          validationResult: { ...seed, status: 'unknown', local, hosted: { ...seed.hosted, status: 'failed', overall: 'failing' } },
+          ...(state !== 'NEEDS_HUMAN' && state !== 'WAITING_DEPENDENCY' ? {} : {
+            interruptedFrom: 'VALIDATING' as const, interrupt: { kind: state === 'NEEDS_HUMAN' ? 'needs_human' as const : 'waiting_dependency' as const,
+              reason: 'Local validation process-family settlement remains unproven.', createdAt: T0 },
+          }) };
+        new JsonFileStore({ dir }).create(run);
+        const store = new JsonFileStore({ dir });
+        assert.deepEqual(store.read(run.id)?.validationResult, run.validationResult);
+        let effects = 0;
+        const unexpected = (): never => { effects += 1; throw new Error('settlement hold admitted an effect'); };
+        const github = githubAdapter([]);
+        github.readLiveSnapshot = async () => unexpected();
+        const implementation = new FakeImplementation([]);
+        const reviewer = new FakeReviewer([]);
+        const validation = new FakeValidation();
+        const result = await runWorkflow({ store, github, implementation, reviewer, validation,
+          bootstrapForExecution: unexpected, hostedCheckPolicy: TEST_HOSTED_POLICY }, run.id,
+        { maxReviewAttempts: 3, now: () => T0, onExecutionStart: unexpected });
+        assert.equal(result.outcome, state === 'WAITING_DEPENDENCY' ? 'waiting_dependency' : 'needs_human');
+        assert.equal(result.run.state, state === 'WAITING_DEPENDENCY' ? 'WAITING_DEPENDENCY' : 'NEEDS_HUMAN');
+        assert.match(result.outcome === 'needs_human' || result.outcome === 'waiting_dependency' ? result.reason : '', /process-family settlement remains unproven/);
+        assert.deepEqual(result.run.validationResult, run.validationResult);
+        assert.equal(result.run.history.some((entry) => entry.type === 'start_fix' || entry.type === 'revalidate'), false);
+        assert.equal(effects + validation.requests.length + implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length, 0);
+        assert.equal(new JsonFileStore({ dir }).read(run.id)?.state, result.run.state);
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('rejects legacy failed settlement ledgers at the disk reader without executing recovery', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-legacy-ledger-'));
+    try {
+      const seed = validationPassed(HEAD);
+      const run: Run = { ...createRun(TARGET, T0, 'settlement-legacy-failed'), state: 'CHANGES_REQUESTED', headSha: HEAD,
+        pullRequest: { number: 7, headSha: HEAD }, validationResult: { ...seed, status: 'failed',
+          local: { status: 'unknown', configRevision: 'test-config-v1', commands: [
+            { commandIndex: 0, executable: 'node', outcome: 'failed', exitCode: 7, durationMs: 1 },
+            { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+          ] }, hosted: { ...seed.hosted, status: 'failed', overall: 'failing' } } };
+      assert.throws(() => new JsonFileStore({ dir }).create(run), /invalid bounded validation output payload/,
+        'new writes refuse an incoherent known-refusal ledger before publication');
+      // Reconstruct historical bytes directly; the current writer cannot
+      // manufacture this pre-existing incompatible ledger anymore.
+      writeFileSync(path.join(dir, `${run.id}.json`), JSON.stringify(run), { mode: 0o600 });
+      const before = readFileSync(path.join(dir, `${run.id}.json`));
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      const validation = new FakeValidation();
+      await assert.rejects(runWorkflow({ store: new JsonFileStore({ dir }), github: githubAdapter([]), implementation,
+        reviewer, validation, hostedCheckPolicy: TEST_HOSTED_POLICY }, run.id, { maxReviewAttempts: 3, now: () => T0 }), /corrupt or incompatible/);
+      assert.equal(implementation.requests.length + implementation.preflightRequests.length + reviewer.requests.length + validation.requests.length, 0);
+      assert.deepEqual(readFileSync(path.join(dir, `${run.id}.json`)), before, 'incompatible evidence is not automatically rewritten or revalidated');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
   it('F06 revalidates stale persisted failed evidence before any implementation repair', async () => {

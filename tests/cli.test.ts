@@ -26,6 +26,8 @@ import {
   resolveLocalValidationConfiguration,
   resolveImplementationProvider,
   resolveRunsDir,
+  resolveToolOutputRoot,
+  resolveToolOutputPolicy,
   runCreateCommand,
   runIssueCommand,
   runMergedTransitionCommand,
@@ -40,6 +42,7 @@ import type { ImplementationAgent } from '../src/adapters/agent.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import type { ReviewerAdapter, ReviewRequest } from '../src/adapters/reviewer.js';
 import { createRun } from '../src/domain/run.js';
+import { FileToolOutputStore } from '../src/evidence/tool-output.js';
 import { CANCEL_RUN_DECISION } from '../src/domain/decisions.js';
 import { applyTransition } from '../src/domain/state-machine.js';
 import type { AgentResult, ReviewResult, Run, TransitionType } from '../src/domain/types.js';
@@ -398,6 +401,77 @@ describe('CLI command layer', () => {
     assert.match(resolveRunsDir({}), /\.tachiko-conductor/);
   });
 
+  it('resolves a stable private evidence root and validates byte budgets', () => {
+    assert.equal(resolveToolOutputRoot({ TACHIKO_DATA_DIR: '/tmp/x' }), '/tmp/x/.evidence/v1');
+    const relativeDataRoot = resolveToolOutputRoot({ TACHIKO_DATA_DIR: 'relative-data-dir' });
+    assert.ok(path.isAbsolute(relativeDataRoot));
+    assert.doesNotThrow(() => new FileToolOutputStore(relativeDataRoot), 'the production store accepts its resolved default root');
+    assert.equal(resolveToolOutputRoot({ TACHIKO_EVIDENCE_DIR: '/private/evidence' }), '/private/evidence');
+    assert.deepEqual(resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: JSON.stringify({ previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 16 }) }),
+      { previewBytes: 8, diagnosticBytes: 32, maxDiagnostics: 2, readBytes: 16 });
+    assert.throws(() => resolveToolOutputRoot({ TACHIKO_EVIDENCE_DIR: 'relative' }), /absolute/);
+    assert.throws(() => resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: '{"previewBytes":0}' }), /previewBytes/);
+    assert.throws(() => resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: '{"previewBytes":65537,"diagnosticBytes":32,"maxDiagnostics":2,"readBytes":16}' }), /previewBytes.*maximum/);
+    assert.throws(() => resolveToolOutputPolicy({ TACHIKO_TOOL_OUTPUT_POLICY: '{"previewBytes":8,"diagnosticBytes":32,"maxDiagnostics":129,"readBytes":16}' }), /maxDiagnostics.*maximum/);
+  });
+
+  it('reopens the configured evidence root for CLI range drilldown', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-tool-output-cli-'));
+    const prior = process.env.TACHIKO_EVIDENCE_DIR;
+    const priorLog = console.log;
+    let printed = '';
+    try {
+      process.env.TACHIKO_EVIDENCE_DIR = root;
+      const reference = new FileToolOutputStore(root).save({ stdout: 'cli-evidence', stderr: '' });
+      console.log = (...values: unknown[]) => { printed = values.map(String).join(' '); };
+      assert.equal(await main(['tool-output', 'read', JSON.stringify(reference), '--channel', 'stdout', '--offset', '4', '--length', '8']), 0);
+      assert.equal(JSON.parse(printed).text, 'evidence');
+    } finally {
+      console.log = priorLog;
+      if (prior === undefined) delete process.env.TACHIKO_EVIDENCE_DIR;
+      else process.env.TACHIKO_EVIDENCE_DIR = prior;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('dispatches explicit evidence read and search before unrelated Run-store admission', async () => {
+    const root = mkdtempSync(path.join(os.tmpdir(), 'tachiko-tool-output-independent-cli-'));
+    const evidenceRoot = path.join(root, 'evidence');
+    const blocker = path.join(root, 'run-store-is-a-file');
+    const previous = { evidence: process.env.TACHIKO_EVIDENCE_DIR, data: process.env.TACHIKO_DATA_DIR };
+    const priorLog = console.log;
+    const priorError = console.error;
+    let printed = '';
+    let errors = '';
+    try {
+      const reference = new FileToolOutputStore(evidenceRoot).save({ stdout: 'independent-evidence-marker', stderr: '' });
+      writeFileSync(blocker, 'unrelated Run path sentinel');
+      process.env.TACHIKO_EVIDENCE_DIR = evidenceRoot;
+      process.env.TACHIKO_DATA_DIR = blocker;
+      console.log = (...values: unknown[]) => { printed = values.map(String).join(' '); };
+      console.error = (...values: unknown[]) => { errors = values.map(String).join(' '); };
+
+      assert.equal(await main(['tool-output', 'read', JSON.stringify(reference), '--channel', 'stdout']), 0);
+      assert.equal(JSON.parse(printed).text, 'independent-evidence-marker');
+      assert.equal(await main(['tool-output', 'search', JSON.stringify(reference), '--query', 'evidence-marker']), 0);
+      assert.equal(JSON.parse(printed)[0]?.text, 'independent-evidence-marker');
+      assert.equal(await main(['tool-output', 'read', JSON.stringify({ ...reference, id: 'missing' }), '--channel', 'stdout']), 1,
+        'invalid explicit evidence still refuses through the evidence store');
+      assert.match(errors, /not found|identity|reference|unavailable|expired/i);
+      assert.equal(readFileSync(blocker, 'utf8'), 'unrelated Run path sentinel');
+
+      await assert.rejects(main(['--help']), /not a directory/i, 'help retains its historical Run-store construction order');
+      await assert.rejects(main(['run', 'show', reference.id]), /not a directory/i, 'Run commands retain their historical admission failure');
+      assert.equal(readFileSync(blocker, 'utf8'), 'unrelated Run path sentinel');
+    } finally {
+      console.log = priorLog;
+      console.error = priorError;
+      if (previous.evidence === undefined) delete process.env.TACHIKO_EVIDENCE_DIR; else process.env.TACHIKO_EVIDENCE_DIR = previous.evidence;
+      if (previous.data === undefined) delete process.env.TACHIKO_DATA_DIR; else process.env.TACHIKO_DATA_DIR = previous.data;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it('resolves the implementation provider and explicit Codex execution config without choosing a model', () => {
     assert.equal(resolveImplementationProvider({}), 'worker-router');
     assert.equal(resolveImplementationProvider({ TACHIKO_IMPLEMENTATION_AGENT: 'codex-cli' }), 'codex-cli');
@@ -443,6 +517,15 @@ describe('CLI command layer', () => {
       }),
       { revision: 'repo-v1', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
     );
+    assert.deepEqual(resolveLocalValidationConfiguration({
+      TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [
+        { argv: ['tool', 'test'], timeoutMs: 5_000, captureOutput: true },
+        { argv: ['tool', 'lint'], timeoutMs: 5_000, captureOutput: false },
+      ] }),
+    })?.commands.map((command) => command.captureOutput), [true, false]);
+    assert.throws(() => resolveLocalValidationConfiguration({
+      TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({ revision: 'repo-v1', commands: [{ argv: ['tool'], timeoutMs: 5_000, captureOutput: 'yes' }] }),
+    }), /captureOutput must be a boolean/);
     assert.deepEqual(
       resolveLocalValidationConfiguration({
         TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
@@ -450,7 +533,10 @@ describe('CLI command layer', () => {
           commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }],
         }),
       }),
-      { revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr', commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }] },
+      {
+        revision: 'pre-existing-v1', workspacePath: '/tmp/tachiko-existing-pr',
+        commands: [{ argv: ['tool', 'test'], timeoutMs: 5_000 }],
+      },
     );
     assert.throws(
       () => resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: '{bad json' }),
@@ -1191,6 +1277,125 @@ describe('workflow run and resume commands', () => {
       } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
     });
   }
+
+  it('accepts ordinary cancellation for a newly typed configured executable-name collision', async () => {
+    const configuration = resolveLocalValidationConfiguration({ TACHIKO_LOCAL_VALIDATION_CONFIG: JSON.stringify({
+      revision: 'test-config-v1', commands: [{ argv: ['process-family-settlement'], timeoutMs: 1000 }],
+    }) });
+    assert.ok(configuration);
+    assert.equal(configuration.commands[0]?.argv[0], 'process-family-settlement');
+    const store = new MemoryStore();
+    let run = applyTransition(createRun(TARGET, T0, 'ordinary-settlement-name'), { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(HEAD), headSha: HEAD }, T0);
+    const base = validationPassed(HEAD);
+    run = applyTransition(run, { type: 'escalate', reason: 'ordinary unavailable configured command',
+      validationResult: { ...base, status: 'unknown', local: { status: 'unknown', configRevision: configuration.revision, commands: [
+        { evidenceKind: 'command', commandIndex: 0, executable: configuration.commands[0]!.argv[0]!, outcome: 'unavailable', exitCode: null, durationMs: 1 },
+      ] } }, pullRequest: { number: 7, headSha: HEAD }, interrupt: { evidence: 'ordinary spawn unavailable', choices: [CANCEL_RUN_DECISION] } }, T0);
+    store.create(run);
+    const implementation = new FakeImplementation([]), reviewer = new FakeReviewer([]);
+    const result = await resumeCommand(deps(store, githubAdapter([]), implementation, reviewer), run.id, CANCEL_RUN_DECISION, { now: () => T0 });
+    assert.equal(result.outcome, 'failed');
+    assert.equal(result.run.history.at(-1)?.reason, CANCEL_RUN_DECISION);
+    assert.deepEqual(result.run.validationResult, run.validationResult);
+    assert.equal(implementation.calls + reviewer.calls, 0);
+  });
+
+  it('refuses ordinary settlement-marker cancellation without changing the owner and requires attested recovery', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-cancel-held-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      await f.reconcileMergedRun(f.run);
+      const h = f.addHistoricalOwner('NEEDS_HUMAN');
+      const held: Run = { ...h.run, validationResult: { ...validationPassed(h.run.headSha!), status: 'unknown',
+        local: { status: 'unknown', configRevision: 'test-config-v1', commands: [
+          { commandIndex: 0, executable: 'node', outcome: 'passed', exitCode: 0, durationMs: 1 },
+          { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+        ] } } };
+      f.store.update(held);
+      const next = { laneId: 'next-same-workspace', role: 'production_captain' as const, highAutonomy: true,
+        evidence: { repository: 'acme/widgets', issue: 43, run: 'next-run', workspace: held.bootstrap!.workspacePath } };
+      assert.equal(f.setup.registry.admit(next).outcome, 'duplicate');
+      const beforeLane = f.setup.registry.readLane(`run:${held.id}`);
+      const beforeReceipt = readFileSync(h.receiptPath);
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      let externalReads = 0, releaseCalls = 0;
+      const github = githubAdapter([]);
+      github.readLiveSnapshot = async () => { externalReads += 1; throw new Error('unexpected GitHub read'); };
+      const originalRelease = f.setup.registry.release.bind(f.setup.registry);
+      f.setup.registry.release = (...args: Parameters<typeof originalRelease>) => { releaseCalls += 1; return originalRelease(...args); };
+      await assert.rejects(resumeCommand(deps(f.store, github, implementation, reviewer), held.id, CANCEL_RUN_DECISION, {
+        dispatchClaimId: held.dispatchClaimId, admission: f.setup.registry,
+        admissionWorkspace: held.bootstrap!.workspacePath, now: () => T0,
+      }), /settlement remains unproven.*--stopped/);
+      assert.deepEqual(f.store.read(held.id), held);
+      assert.deepEqual(f.setup.registry.readLane(`run:${held.id}`), beforeLane);
+      assert.deepEqual(readFileSync(h.receiptPath), beforeReceipt);
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.phase, 'parked');
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.workDisposition, undefined);
+      assert.equal(f.setup.registry.admit(next).outcome, 'duplicate');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, held, f.setup.registry), false);
+      assert.equal(externalReads + releaseCalls + implementation.calls + reviewer.calls + f.starts, 0);
+      assert.throws(() => recoverRunAdmission(f.store, f.setup.registry, held.id, h.generation, false, h.receiptPath,
+        { retireWork: true }), /explicit --stopped/);
+      assert.throws(() => recoverRunAdmission(f.store, f.setup.registry, held.id, h.generation + 7, true, h.receiptPath,
+        { retireWork: true }), /generation/);
+      assert.equal(f.setup.registry.admit(next).outcome, 'duplicate');
+      assert.equal(recoverRunAdmission(f.store, f.setup.registry, held.id, h.generation, true, h.receiptPath), 'released');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, held, f.setup.registry), false, 'stopped release alone is not work retirement');
+      assert.equal(recoverRunAdmission(f.store, f.setup.registry, held.id, h.generation, true, h.receiptPath,
+        { retireWork: true }), 'released');
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.workDisposition, 'retired');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, held, f.setup.registry), true);
+      assert.deepEqual(f.store.read(held.id), held, 'operator attestation does not erase the settlement marker');
+      assert.equal(f.setup.registry.admit(next).outcome, 'admitted');
+      assert.equal(externalReads + implementation.calls + reviewer.calls + f.starts, 0);
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('holds persisted cancelled settlement-marker proof until exact stopped work retirement', async () => {
+    const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-settlement-cancel-history-'));
+    const restore = isolateMergeReceiptRoot(dir);
+    try {
+      const f = dispatchDeliveryFixture(dir);
+      await f.reconcileMergedRun(f.run);
+      const h = f.addHistoricalOwner('NEEDS_HUMAN');
+      const implementation = new FakeImplementation([]);
+      const reviewer = new FakeReviewer([]);
+      const cancelled = await resumeCommand(deps(f.store, f.github, implementation, reviewer), h.run.id, CANCEL_RUN_DECISION, {
+        dispatchClaimId: h.run.dispatchClaimId, admission: f.setup.registry, now: () => T0,
+      });
+      assert.equal(cancelled.run.state, 'FAILED');
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.workDisposition, 'cancelled');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, cancelled.run, f.setup.registry), true, 'ordinary no-marker cancellation remains retired');
+      const historical: Run = { ...f.store.read(cancelled.run.id)!, validationResult: { ...validationPassed(cancelled.run.headSha!), status: 'unknown',
+        local: { status: 'unknown', configRevision: 'test-config-v1', commands: [
+          { commandIndex: 0, executable: 'node', outcome: 'failed', exitCode: 7, durationMs: 1 },
+          { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+        ] } } };
+      f.store.update(historical);
+      const receiptBytes = readFileSync(h.receiptPath);
+      f.restart();
+      assert.deepEqual(f.store.read(historical.id), historical);
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, historical, f.setup.registry), false);
+      const comments = JSON.stringify(f.comments);
+      assert.equal((await f.poll()).outcome, 'owner_reconciliation_hold');
+      assert.equal(JSON.stringify(f.comments), comments);
+      assert.deepEqual(readFileSync(h.receiptPath), receiptBytes, 'retirement predicate does not rewrite historical proof');
+      assert.equal(implementation.calls + reviewer.calls + f.starts, 0);
+      const releasedGeneration = readRunOwnerReceipt(h.receiptPath)!.generation;
+      assert.throws(() => recoverRunAdmission(f.store, f.setup.registry, historical.id, releasedGeneration - 1, false,
+        h.receiptPath, { retireWork: true }), /explicit --stopped/);
+      assert.equal(recoverRunAdmission(f.store, f.setup.registry, historical.id, releasedGeneration - 1, true,
+        h.receiptPath, { retireWork: true }), 'released');
+      assert.equal(readRunOwnerReceipt(h.receiptPath)?.workDisposition, 'retired');
+      assert.equal(isDispatchRunOwnerRetiredCommand(f.store, historical, f.setup.registry), true);
+      assert.deepEqual(f.store.read(historical.id), historical);
+      assert.equal(implementation.calls + reviewer.calls + f.starts, 0);
+    } finally { restore(); rmSync(dir, { recursive: true, force: true }); }
+  });
 
   it('records cancellation only through the actual cancel decision and then permits later work', async () => {
     const dir = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-cancel-disposition-'));

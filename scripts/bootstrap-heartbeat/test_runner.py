@@ -339,7 +339,11 @@ class ProviderBuildTest(unittest.TestCase):
             old_mode = stat.S_IMODE(self.module.ROOT.stat().st_mode)
             try:
                 self.module.ROOT.chmod(old_mode | 0o077)
-                with self.assertRaisesRegex(RuntimeError, "snapshot root"):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    r"(?:unsafe ownership or permissions for heartbeat private path:|"
+                    r"private provider snapshot root ownership or permissions changed)",
+                ):
                     self.module.run_verified_corepack(node, digest, self.manifest, files, ["--version"])
             finally:
                 self.module.ROOT.chmod(old_mode)
@@ -776,6 +780,18 @@ class HeartbeatTest(unittest.TestCase):
             "            os.close(1); os.close(2)\n"
             "        time.sleep(background); os._exit(0)\n"
             "    pathlib.Path(os.environ['MOCK_WAKE_BACKGROUND_PID']).write_text(str(pid))\n"
+            "if os.environ.get('MOCK_WAKE_READY'):\n"
+            "    release = pathlib.Path(os.environ['MOCK_WAKE_RELEASE'])\n"
+            "    deadline = time.monotonic() + 60\n"
+            "    ready = pathlib.Path(os.environ['MOCK_WAKE_READY'])\n"
+            "    ready_pending = ready.with_name(ready.name + '.pending')\n"
+            "    ready_pending.write_text('ready\\n')\n"
+            "    ready_pending.replace(ready)\n"
+            "    while not release.exists():\n"
+            "        if time.monotonic() >= deadline:\n"
+            "            pathlib.Path(os.environ['MOCK_WAKE_READY']).write_text('timed_out\\n')\n"
+            "            print('mock wake release gate timed out', file=sys.stderr); sys.exit(87)\n"
+            "        time.sleep(0.02)\n"
             "time.sleep(float(os.environ.get('MOCK_WAKE_SLEEP', '0')))\n"
             "if os.environ.get('MOCK_WAKE_SETTLED', '1') == '1':\n"
             "    print('TACHIKO_HEARTBEAT_SETTLED_V1')\n"
@@ -3604,33 +3620,61 @@ class HeartbeatTest(unittest.TestCase):
         self.assertIn("canonical per-user host path", inherited.stderr)
 
     def test_reinstall_cannot_race_an_active_wake_snapshot(self) -> None:
-        self.invoke("run", "--prime")
-        self.write_payload("B")
-        sleeping = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001", MOCK_WAKE_SLEEP="2")
-        active = subprocess.Popen(
-            [sys.executable, str(RUNNER), "run"], env=sleeping,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        )
-        deadline = time.time() + 5
-        while len(self.records()) < 1 and time.time() < deadline:
-            time.sleep(0.02)
-        self.assertEqual(len(self.records()), 1)
-        config_before = (self.state_root / "config.json").read_bytes()
-        snapshot = self.state_root / "verified-wake-executable"
-        snapshot_before = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+        self.selected_source_fixture()
         alternate = self.root / "alternate-wake"
         alternate.write_text("#!/bin/sh\nprintf 'TACHIKO_HEARTBEAT_SETTLED_V1\\n'\n", encoding="utf-8")
         alternate.chmod(0o700)
         command = json.dumps([str(alternate)])
-        result = self.invoke(
-            "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
-            "--acknowledge-relocatable-wake-target", "--no-load", check=False,
+        self.invoke("run", "--prime")
+        self.write_payload("B")
+        ready = self.root / "wake-ready"
+        release = self.root / "wake-release"
+        gated = dict(self.env, SCD_HEARTBEAT_TEST_NOW="1001",
+                     MOCK_WAKE_READY=str(ready), MOCK_WAKE_RELEASE=str(release))
+        active = subprocess.Popen(
+            [sys.executable, str(RUNNER), "run"], env=gated,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("heartbeat poll or wake is active", result.stderr)
-        self.assertEqual((self.state_root / "config.json").read_bytes(), config_before)
-        self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), snapshot_before)
-        active.communicate(timeout=5)
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists() and active.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(ready.is_file(), f"wake did not reach release gate; exit={active.poll()}")
+            self.assertEqual(len(self.records()), 1)
+            self.assertEqual((ready.read_text(), release.exists()), ("ready\n", False))
+            self.assertIsNone(active.poll(), "gated wake must remain active before install")
+            config_before = (self.state_root / "config.json").read_bytes()
+            snapshot = self.state_root / "verified-wake-executable"
+            snapshot_before = hashlib.sha256(snapshot.read_bytes()).hexdigest()
+            result = self.invoke(
+                "install", "--repo", str(Path.cwd()), "--wake-command-json", command,
+                "--acknowledge-relocatable-wake-target", "--no-load", check=False,
+            )
+            diagnostic = (f"ready={ready.read_text()!r} release={release.exists()} exit={active.poll()}\n"
+                          + result.stdout + result.stderr)
+            self.assertEqual((ready.read_text(), release.exists()), ("ready\n", False), diagnostic)
+            self.assertIsNone(active.poll(), diagnostic)
+            self.assertEqual(result.returncode, 1, diagnostic)
+            self.assertIn("heartbeat poll or wake is active", result.stderr)
+            self.assertEqual((self.state_root / "config.json").read_bytes(), config_before)
+            self.assertEqual(hashlib.sha256(snapshot.read_bytes()).hexdigest(), snapshot_before)
+            self.assertEqual((ready.read_text(), release.exists()), ("ready\n", False), diagnostic)
+            self.assertIsNone(active.poll(), "gated wake must remain active through artifact checks")
+        finally:
+            try:
+                release.touch()
+            finally:
+                try:
+                    stdout, stderr = active.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    active.terminate()
+                    try:
+                        stdout, stderr = active.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        active.kill()
+                        stdout, stderr = active.communicate(timeout=5)
+                    self.fail("gated wake did not finish after release:\n" + stdout + stderr)
+        self.assertEqual(active.returncode, 0, stdout + stderr)
 
     def test_install_pins_github_cli_bytes_across_source_replacement(self) -> None:
         replaceable_parent = self.root / "replaceable-gh-parent"

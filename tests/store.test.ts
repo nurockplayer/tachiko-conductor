@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, fstatSync, fsyncSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import path from 'node:path';
@@ -7,6 +7,8 @@ import { pathToFileURL } from 'node:url';
 import { afterEach, describe, it } from 'node:test';
 
 import { applyTransition } from '../src/domain/state-machine.js';
+import { isKnownBoundedValidationPayloadCoherent, isValidationResultCoherent, localValidationHasUnsettledProcessFamily } from '../src/domain/validation.js';
+import { InMemoryToolOutputStore, TOOL_OUTPUT_POLICY_MAXIMA, boundToolOutput, isToolOutputEnvelope } from '../src/evidence/tool-output.js';
 import type { Run } from '../src/domain/types.js';
 import { createRepairAdmissionSnapshot, createRepairAttemptBinding } from '../src/domain/repair-admission.js';
 import { isCurrentAccountPathApplicable } from '../src/account-home.js';
@@ -61,6 +63,50 @@ function casFixture(id: string): Run {
     writable: true,
   });
   return run as Run;
+}
+
+function boundedValidationRun(id: string): Run {
+  const headSha = `${id}-head`;
+  const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'ok', stderr: '',
+    store: new InMemoryToolOutputStore() });
+  const base = validationPassed(headSha);
+  const validation = { ...base, local: { ...base.local, commands: [{ ...base.local.commands[0]!,
+    captureStatus: 'complete' as const, output }] } };
+  const started = applyTransition(newRun(id), { type: 'start' }, T0);
+  const validating = applyTransition(started, {
+    type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+  }, T0);
+  return applyTransition(validating, { type: 'validation_passed', validationResult: validation,
+    pullRequest: { number: 7, headSha } }, T0);
+}
+
+function settlementValidationRun(kind?: 'command' | 'process_family_settlement'): Run {
+  const base = boundedValidationRun('settlement-identity');
+  return { ...base, validationResult: { ...base.validationResult!, status: 'unknown', local: {
+    status: 'unknown', configRevision: 'test-config-v1', commands: [{ ...(kind === undefined ? {} : { evidenceKind: kind }),
+      commandIndex: 0, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 }],
+  } } };
+}
+
+function assertBoundedRunWriteRefused(validRun: Run, candidate: Run | (() => Run), expected: RegExp): void {
+  for (const api of ['create', 'update', 'CAS'] as const) {
+    const attempt = typeof candidate === 'function' ? candidate() : candidate;
+    const { store, dir } = tempStore();
+    if (api !== 'create') store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const projectionPath = operationalProjectionPath(dir, validRun.id);
+    const beforeRun = existsSync(runPath) ? readFileSync(runPath, 'utf8') : null;
+    const beforeProjection = existsSync(projectionPath) ? readFileSync(projectionPath, 'utf8') : null;
+    assert.throws(() => {
+      if (api === 'create') store.create(attempt);
+      else if (api === 'update') store.update(attempt);
+      else store.updateIfUnchanged(validRun, attempt);
+    }, expected, `${api} rejects the candidate`);
+    assert.equal(existsSync(runPath) ? readFileSync(runPath, 'utf8') : null, beforeRun, `${api} preserves Run bytes`);
+    assert.equal(existsSync(projectionPath) ? readFileSync(projectionPath, 'utf8') : null, beforeProjection,
+      `${api} preserves projection bytes`);
+    assert.equal(readdirSync(dir).some((name) => name.endsWith('.tmp')), false);
+  }
 }
 
 afterEach(() => {
@@ -203,7 +249,7 @@ describe('JsonFileStore — persistence round-trips', () => {
     }
   });
 
-  it('publishes canonical Run JSON with a safe mode under umask 002', () => {
+  it('publishes canonical Run JSON with a private mode under umask 002', () => {
     const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-account-umask-'));
     tmpDirs.push(home);
     const conductor = path.join(home, '.tachiko-conductor');
@@ -218,14 +264,96 @@ describe('JsonFileStore — persistence round-trips', () => {
       const initial = newRun('canonical-umask-run');
       store.create(initial);
       const filePath = path.join(runs, `${initial.id}.json`);
-      assert.equal(statSync(filePath).mode & 0o777, 0o644);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
       store.update(applyTransition(initial, { type: 'start' }, T0));
-      assert.equal(statSync(filePath).mode & 0o777, 0o644);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
       store.read(initial.id);
     } finally {
       process.umask(originalUmask);
       os.userInfo = originalUserInfo;
     }
+  });
+
+  it('keeps Run temp descriptors and final snapshots private across create, update and CAS under permissive umask', () => {
+    const home = mkdtempSync(path.join(os.tmpdir(), 'tachiko-store-private-run-'));
+    tmpDirs.push(home);
+    const conductor = path.join(home, '.tachiko-conductor');
+    const runs = path.join(conductor, 'runs');
+    mkdirSync(runs, { recursive: true, mode: 0o755 });
+    chmodSync(home, 0o755);
+    chmodSync(conductor, 0o755);
+    chmodSync(runs, 0o755);
+    const originalUserInfo = os.userInfo;
+    const originalUmask = process.umask(0);
+    const observedTempModes: number[] = [];
+    try {
+      os.userInfo = (() => ({ ...originalUserInfo(), homedir: home })) as typeof os.userInfo;
+      const store = new JsonFileStore({ dir: runs, syncForDurability: (fd, target) => {
+        if (target !== 'file') { fsyncSync(fd); return; }
+        const descriptorMode = fstatSync(fd).mode & 0o777;
+        observedTempModes.push(descriptorMode);
+        assert.equal(descriptorMode, 0o600, 'the descriptor remains private at the pre-rename file durability seam');
+        const tempName = readdirSync(runs).find((name) => name.startsWith('private-run-writes.json.') && name.endsWith('.tmp'));
+        assert.ok(tempName, 'file durability seam is observing the authoritative Run temporary');
+        const tempPath = path.join(runs, tempName);
+        assert.equal(statSync(tempPath).mode & 0o777, 0o600);
+        const prospectiveBytes = readFileSync(tempPath, 'utf8');
+        assert.ok(prospectiveBytes.includes('COMPLETE-PRIVATE-RUN-OUTPUT'));
+        assert.ok(prospectiveBytes.includes('FALLBACK-PRIVATE-RUN-PREVIEW'));
+        fsyncSync(fd);
+      } });
+      const completeOutput = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'COMPLETE-PRIVATE-RUN-OUTPUT', stderr: '', store: new InMemoryToolOutputStore() });
+      const fallbackText = 'FALLBACK-PRIVATE-RUN-PREVIEW';
+      const fallbackStream = { bytes: Buffer.byteLength(fallbackText), preview: fallbackText,
+        previewBytes: Buffer.byteLength(fallbackText), truncated: false };
+      const validation = validationPassed();
+      const initial = {
+        ...newRun('private-run-writes'),
+        validationResult: {
+          ...validation,
+          local: { ...validation.local, commands: [
+            { commandIndex: 0, executable: 'test', outcome: 'passed' as const, exitCode: 0, durationMs: 1,
+              captureStatus: 'complete' as const, output: completeOutput },
+            { commandIndex: 1, executable: 'test', outcome: 'passed' as const, exitCode: 0, durationMs: 1,
+              captureStatus: 'partial' as const, capturePreview: {
+                stdout: fallbackStream, stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+                diagnostics: [fallbackText], diagnosticsTruncated: false,
+              } },
+          ] },
+        },
+      };
+      store.create(initial);
+      const filePath = path.join(runs, `${initial.id}.json`);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.ok(readFileSync(filePath, 'utf8').includes('COMPLETE-PRIVATE-RUN-OUTPUT'));
+      assert.ok(readFileSync(filePath, 'utf8').includes('FALLBACK-PRIVATE-RUN-PREVIEW'));
+      const updated = applyTransition(initial, { type: 'start' }, T0);
+      store.update(updated);
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.equal(store.updateIfUnchanged(updated, updated), true, 'successful CAS still writes through the shared private helper');
+      assert.equal(statSync(filePath).mode & 0o777, 0o600);
+      assert.deepEqual(observedTempModes, [0o600, 0o600, 0o600]);
+    } finally {
+      process.umask(originalUmask);
+      os.userInfo = originalUserInfo;
+    }
+  });
+
+  it('reads legacy 0644 Runs without mutation, leaves failed CAS untouched, and hardens an ordinary update', () => {
+    const { store, dir } = tempStore();
+    const legacy = newRun('legacy-run-permissions');
+    const filePath = path.join(dir, `${legacy.id}.json`);
+    writeFileSync(filePath, `${JSON.stringify(legacy, null, 2)}\n`, { mode: 0o644 });
+    chmodSync(filePath, 0o644);
+    const legacyBytes = readFileSync(filePath, 'utf8');
+    assert.deepEqual(store.read(legacy.id), legacy);
+    assert.equal(statSync(filePath).mode & 0o777, 0o644, 'read preserves legacy mode');
+    const stale = { ...legacy, updatedAt: '2030-01-01T00:00:00.000Z' };
+    assert.equal(store.updateIfUnchanged(stale, { ...stale, updatedAt: '2030-01-01T00:00:01.000Z' }), false);
+    assert.equal(readFileSync(filePath, 'utf8'), legacyBytes, 'failed CAS preserves legacy bytes');
+    assert.equal(statSync(filePath).mode & 0o777, 0o644, 'failed CAS preserves legacy permissions');
+    store.update({ ...legacy, updatedAt: '2026-10-08T00:00:00.000Z' });
+    assert.equal(statSync(filePath).mode & 0o777, 0o600, 'ordinary authorized rewrite atomically hardens only this Run');
   });
 
   it('rejects a cached canonical Run store after its conductor root is retargeted', () => {
@@ -415,12 +543,40 @@ describe('JsonFileStore — persistence round-trips', () => {
       agentResult: { ...successResult('head-sha'), executor: { provider: 'codex-cli', sessionId: 'secret-session' } },
       pullRequest: { number: 7, headSha: 'head-sha' },
     }, T0);
+    const completeSentinel = 'COMPLETE-RAW-OUTPUT-SENTINEL';
+    const fallbackSentinel = 'FALLBACK-RAW-PREVIEW-SENTINEL';
+    const completeOutput = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: completeSentinel, stderr: '', store: new InMemoryToolOutputStore() });
+    const fallbackStream = { bytes: Buffer.byteLength(fallbackSentinel), preview: fallbackSentinel,
+      previewBytes: Buffer.byteLength(fallbackSentinel), truncated: false };
+    const validation = validationPassed('head-sha');
+    run = {
+      ...run,
+      validationResult: {
+        ...validation,
+        local: {
+          ...validation.local,
+          commands: [
+            { commandIndex: 0, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+              captureStatus: 'complete' as const, output: completeOutput },
+            { commandIndex: 1, executable: 'test', outcome: 'passed', exitCode: 0, durationMs: 1,
+              captureStatus: 'partial' as const, capturePreview: {
+                stdout: fallbackStream, stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+                diagnostics: [fallbackSentinel], diagnosticsTruncated: false,
+              } },
+          ],
+        },
+      },
+    };
     store.create(run);
 
     const raw = readFileSync(path.join(dir, 'projected.json'), 'utf8');
     const projection = JSON.parse(readFileSync(operationalProjectionPath(dir, 'projected'), 'utf8')) as Record<string, unknown>;
     assert.equal(projection.schemaVersion, OPERATIONAL_RUN_PROJECTION_VERSION);
     assert.equal(projection.sourceDigest, sha256(raw));
+    assert.equal(raw.includes(completeSentinel), true);
+    assert.equal(raw.includes(fallbackSentinel), true);
+    assert.equal(JSON.stringify(projection).includes(completeSentinel), false, 'derived metadata omits complete raw-output bytes');
+    assert.equal(JSON.stringify(projection).includes(fallbackSentinel), false, 'derived metadata omits fallback raw-preview bytes');
     assert.equal(projection.workflowState, 'VALIDATING');
     assert.deepEqual(projection.target, { owner: 'acme', repo: 'widgets', issueNumber: 42 });
     assert.deepEqual(projection.bootstrap, { workspacePath: '/tmp/projected', branch: 'codex/projected', baseBranch: 'main', baseSha: 'base-sha' });
@@ -1018,6 +1174,1120 @@ describe('JsonFileStore — persistence round-trips', () => {
     assert.equal(loaded?.agentResult?.sessionId, 'legacy-session-1');
     assert.deepEqual(loaded?.executor, { provider: 'codex-cli', sessionId: 'thread-1' });
     assert.equal(loaded?.agentResult?.durationMs, 125);
+  });
+
+  it('rejects raw provider output before create, update, or CAS can persist it', () => {
+    const evidence = boundToolOutput({
+      outcome: 'failed',
+      exitCode: 7,
+      stdout: 'stdout '.repeat(100),
+      stderr: 'ERROR: test failed\n',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
+    });
+    const withRawOutput = (run: Run): Run => ({
+      ...run,
+      agentResult: { exitStatus: 'failure', summary: 'failed', output: evidence } as never,
+    });
+
+    const createStore = tempStore();
+    const createRun = withRawOutput(newRun('raw-output-create'));
+    assert.throws(() => createStore.store.create(createRun), /raw provider output artifacts/);
+    assert.equal(existsSync(path.join(createStore.dir, `${createRun.id}.json`)), false);
+
+    const updateStore = tempStore();
+    const updateRun = newRun('raw-output-update');
+    updateStore.store.create(updateRun);
+    const updateRunPath = path.join(updateStore.dir, `${updateRun.id}.json`);
+    const updateBytes = readFileSync(updateRunPath, 'utf8');
+    assert.throws(() => updateStore.store.update(withRawOutput(updateRun)), /raw provider output artifacts/);
+    assert.equal(readFileSync(updateRunPath, 'utf8'), updateBytes);
+
+    const casStore = tempStore();
+    const casRun = newRun('raw-output-cas');
+    casStore.store.create(casRun);
+    const casRunPath = path.join(casStore.dir, `${casRun.id}.json`);
+    const casBytes = readFileSync(casRunPath, 'utf8');
+    assert.throws(() => casStore.store.updateIfUnchanged(casRun, withRawOutput(casRun)), /raw provider output artifacts/);
+    assert.equal(readFileSync(casRunPath, 'utf8'), casBytes);
+  });
+
+  it('round trips an exact joined diagnostic boundary inside local Run validation evidence', () => {
+    const line = `ERROR: ${'x'.repeat(32_761)}`;
+    const output = boundToolOutput({ outcome: 'failed', exitCode: 1, stderr: line, stdout: line,
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 8, diagnosticBytes: 65_536, maxDiagnostics: 2, readBytes: 8 } });
+    assert.equal(Buffer.byteLength(output.diagnostics.join('\n')), 65_536);
+    const validation = validationFailed('diagnostic-roundtrip');
+    let run: Run = applyTransition(newRun('diagnostic-run-roundtrip'), { type: 'start' }, T0);
+    run = applyTransition(run, { type: 'agent_succeeded', agentResult: successResult('diagnostic-roundtrip'), headSha: 'diagnostic-roundtrip' }, T0);
+    run = applyTransition(run, { type: 'validation_failed', validationResult: validation,
+      pullRequest: { number: 7, headSha: 'diagnostic-roundtrip' } }, T0);
+    run = { ...run, validationResult: { ...validation, local: { ...validation.local, commands: [{ commandIndex: 0,
+      executable: 'test', outcome: 'failed', exitCode: 1, durationMs: 1, captureStatus: 'complete', output }] } } };
+    const { store, dir } = tempStore();
+    store.create(run);
+    const loaded = store.read(run.id);
+    const persisted = loaded?.validationResult?.local.commands[0]?.output;
+    assert.deepEqual(persisted?.diagnostics, output.diagnostics);
+    assert.equal(Buffer.byteLength((persisted?.diagnostics ?? []).join('\n')), 65_536);
+  });
+
+  it('refuses unbounded file identity scalars before persistence and on stored Run reads', () => {
+    const validRun = boundedValidationRun('file-identity-bounds');
+    const output = validRun.validationResult!.local.commands[0]!.output!;
+    (output.artifact as { fileIdentity: unknown }).fileIdentity = {
+      stdout: { dev: '0'.repeat(256), ino: '001' }, stderr: { dev: '02', ino: '0'.repeat(256) },
+    };
+    assert.equal(isToolOutputEnvelope(output), true, '256 digits and leading zeros remain supported');
+    const control = tempStore();
+    control.store.create(validRun);
+    assert.deepEqual(control.store.read(validRun.id)?.validationResult?.local.commands[0]?.output?.artifact.fileIdentity,
+      output.artifact.fileIdentity);
+    for (const channel of ['stdout', 'stderr'] as const) {
+      for (const key of ['dev', 'ino'] as const) {
+        const candidate = structuredClone(validRun);
+        const part = candidate.validationResult!.local.commands[0]!.output!.artifact.fileIdentity![channel] as { dev: string; ino: string };
+        part[key] = '1'.repeat(257);
+        assert.equal(isToolOutputEnvelope(candidate.validationResult!.local.commands[0]!.output), false);
+        assert.equal(isValidationResultCoherent(candidate.validationResult), false);
+        assertBoundedRunWriteRefused(validRun, candidate, /invalid bounded validation output payload/);
+        const { store, dir } = tempStore();
+        const runPath = path.join(dir, `${validRun.id}.json`);
+        const raw = JSON.stringify(candidate);
+        writeFileSync(runPath, raw);
+        assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+        assert.throws(() => store.updateIfUnchanged(validRun, validRun), /corrupt or incompatible/);
+        assert.equal(readFileSync(runPath, 'utf8'), raw);
+      }
+    }
+  });
+
+  it('refuses inherited data and nonenumerable fixed bounded payload fields before persistence', () => {
+    for (const boundary of ['envelope', 'stream', 'artifact', 'identity', 'identity-part', 'overflow', 'partial-preview', 'partial-stream'] as const) {
+      for (const shape of ['inherited-data', 'nonenumerable'] as const) {
+        const validRun = boundedValidationRun('fixed-record-serialization');
+        const candidate = structuredClone(validRun);
+        const command = candidate.validationResult!.local.commands[0]!;
+        (command.output!.artifact as { fileIdentity: unknown }).fileIdentity = {
+          stdout: { dev: '1', ino: '2' }, stderr: { dev: '3', ino: '4' },
+        };
+        const preview = { stdout: { bytes: 2, preview: 'ok', previewBytes: 2, truncated: false },
+          stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false }, diagnostics: [] as string[], diagnosticsTruncated: false };
+        let record: object;
+        let key: string;
+        switch (boundary) {
+          case 'envelope': record = command.output!; key = 'version'; break;
+          case 'stream': record = command.output!.stdout; key = 'preview'; break;
+          case 'artifact': record = command.output!.artifact; key = 'id'; break;
+          case 'identity': record = command.output!.artifact.fileIdentity!; key = 'stdout'; break;
+          case 'identity-part': record = command.output!.artifact.fileIdentity!.stderr; key = 'ino'; break;
+          case 'overflow': record = command.output!.overflow; key = 'stdout'; break;
+          default:
+            delete (command as { output?: unknown }).output;
+            (command as { captureStatus: string }).captureStatus = 'partial';
+            Object.assign(command, { capturePreview: preview });
+            record = boundary === 'partial-preview' ? preview : preview.stdout;
+            key = boundary === 'partial-preview' ? 'diagnosticsTruncated' : 'preview';
+        }
+        const value = (record as Record<string, unknown>)[key];
+        if (shape === 'nonenumerable') Object.defineProperty(record, key, { value, enumerable: false });
+        else {
+          delete (record as Record<string, unknown>)[key];
+          Object.setPrototypeOf(record, Object.defineProperty({}, key, { value, enumerable: true }));
+        }
+        assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), false, `${boundary}: ${shape}`);
+        assert.equal(isValidationResultCoherent(candidate.validationResult), false, `${boundary}: ${shape}`);
+        assertBoundedRunWriteRefused(validRun, candidate, /invalid bounded validation output payload/);
+      }
+    }
+  });
+
+  it('checks the exact serialized Run snapshot when ancestor serializers inject bounded payload violations', () => {
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    for (const ancestor of ['command', 'local', 'validation', 'Run'] as const) {
+      const validRun = boundedValidationRun('serialized-bounded-snapshot');
+      const candidate = structuredClone(validRun);
+      const serialized = structuredClone(validRun);
+      Object.assign(serialized.validationResult!.local.commands[0]!.output!, { rawTranscript });
+      const target = ancestor === 'Run' ? candidate : ancestor === 'validation' ? candidate.validationResult!
+        : ancestor === 'local' ? candidate.validationResult!.local : candidate.validationResult!.local.commands[0]!;
+      const replacement = ancestor === 'Run' ? serialized : ancestor === 'validation' ? serialized.validationResult!
+        : ancestor === 'local' ? serialized.validationResult!.local : serialized.validationResult!.local.commands[0]!;
+      Object.defineProperty(target, 'toJSON', { value() { return replacement; } });
+      assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), true, 'the caller shape alone is bounded');
+      assertBoundedRunWriteRefused(validRun, candidate, /invalid bounded validation output payload/);
+    }
+    for (const ancestor of ['agentResult', 'Run'] as const) {
+      const validRun = boundedValidationRun('serialized-provider-snapshot');
+      const candidate = structuredClone(validRun);
+      const serialized = structuredClone(validRun);
+      Object.assign(serialized.agentResult!, { output: validRun.validationResult!.local.commands[0]!.output });
+      Object.defineProperty(ancestor === 'Run' ? candidate : candidate.agentResult!, 'toJSON', {
+        value() { return ancestor === 'Run' ? serialized : serialized.agentResult; },
+      });
+      assertBoundedRunWriteRefused(validRun, candidate, /raw provider output artifacts/);
+    }
+  });
+
+  it('persists one checked benign serializer snapshot and preserves future unknown and legacy fields', () => {
+    for (const api of ['create', 'update', 'CAS'] as const) {
+      const validRun = boundedValidationRun('benign-serialized-snapshot');
+      const candidate = structuredClone(validRun);
+      let calls = 0;
+      Object.defineProperty(candidate, 'toJSON', { value() {
+        calls += 1;
+        const snapshot = structuredClone(validRun);
+        return { ...snapshot, futureUnknown: { retained: true },
+          validationResult: { ...snapshot.validationResult!, local: { ...snapshot.validationResult!.local,
+            commands: [{ ...snapshot.validationResult!.local.commands[0]!, output: {
+              ...snapshot.validationResult!.local.commands[0]!.output!, summary: `bounded-snapshot-${calls}`,
+            } }] } } };
+      } });
+      const { store, dir } = tempStore();
+      if (api !== 'create') store.create(validRun);
+      if (api === 'create') store.create(candidate);
+      else if (api === 'update') store.update(candidate);
+      else assert.equal(store.updateIfUnchanged(validRun, candidate), true);
+      assert.equal(calls, 1, 'the checked snapshot is written without serializing the caller again');
+      const raw = JSON.parse(readFileSync(path.join(dir, `${validRun.id}.json`), 'utf8'));
+      assert.deepEqual(raw.futureUnknown, { retained: true });
+      assert.equal(store.read(validRun.id)?.validationResult?.local.commands[0]?.output?.summary, 'bounded-snapshot-1');
+    }
+    const { store, dir } = tempStore();
+    const legacy = casFixture('legacy-known-bounds-only');
+    delete (legacy as { createdAt?: string }).createdAt;
+    store.create(legacy);
+    const raw = JSON.parse(readFileSync(path.join(dir, `${legacy.id}.json`), 'utf8'));
+    assert.deepEqual(raw.futureUnknown, { metadata: { second: 2, first: 1 }, ordered: ['first', 'second'] });
+    assert.equal(raw.createdAt, undefined, 'the writer does not introduce a full Run validation gate');
+  });
+
+  it('retains entry refusal declarations when CAS fingerprint serializers mutate aliased or separate next Runs', () => {
+    for (const kind of [undefined, 'process_family_settlement'] as const) {
+      for (const sharing of ['same-run', 'nested-alias', 'separate-expected'] as const) {
+        const { store, dir } = tempStore();
+        const initial = settlementValidationRun(kind);
+        store.create(initial);
+        const next = store.read(initial.id)!;
+        const expected = sharing === 'same-run' ? next : sharing === 'nested-alias' ? { ...next } : structuredClone(next);
+        const matching = structuredClone(expected);
+        const runPath = path.join(dir, `${initial.id}.json`), projectionPath = operationalProjectionPath(dir, initial.id);
+        const raw = readFileSync(runPath), projection = readFileSync(projectionPath);
+        let calls = 0;
+        Object.defineProperty(expected, 'toJSON', { configurable: true, value() {
+          calls += 1;
+          delete (expected as { toJSON?: unknown }).toJSON;
+          Object.assign(next.validationResult!.local.commands[0]!, { evidenceKind: 'command' });
+          return matching;
+        } });
+        assert.throws(() => store.updateIfUnchanged(expected, next), /invalid bounded validation output payload/);
+        assert.equal(calls, 1, sharing);
+        assert.deepEqual(readFileSync(runPath), raw);
+        assert.deepEqual(readFileSync(projectionPath), projection);
+        assert.equal(localValidationHasUnsettledProcessFamily(new JsonFileStore({ dir }).read(initial.id)?.validationResult?.local), true);
+        assert.equal(readdirSync(dir).some(name => name.endsWith('.tmp')), false);
+      }
+    }
+  });
+
+  it('captures refusal declarations before id and raw-result getters or append-only serialization on each write path', () => {
+    for (const kind of [undefined, 'process_family_settlement'] as const) {
+      for (const api of ['create', 'update', 'CAS'] as const) {
+        for (const seam of ['id', 'raw-result', 'history', 'repair-admissions'] as const) {
+          if (api === 'create' && (seam === 'history' || seam === 'repair-admissions')) continue;
+          const { store, dir } = tempStore();
+          const initial = settlementValidationRun(kind);
+          if (api !== 'create') store.create(initial);
+          const next = structuredClone(initial), expected = structuredClone(initial);
+          const runPath = path.join(dir, `${initial.id}.json`), projectionPath = operationalProjectionPath(dir, initial.id);
+          const raw = existsSync(runPath) ? readFileSync(runPath) : null;
+          const projection = existsSync(projectionPath) ? readFileSync(projectionPath) : null;
+          let calls = 0;
+          const mutate = () => { calls += 1; Object.assign(next.validationResult!.local.commands[0]!, { evidenceKind: 'command' }); };
+          if (seam === 'id') {
+            Object.defineProperty(api === 'CAS' ? expected : next, 'id', { enumerable: true, get() { mutate(); return initial.id; } });
+          } else if (seam === 'raw-result') {
+            const result = next.agentResult;
+            Object.defineProperty(next, 'agentResult', { enumerable: true, get() { mutate(); return result; } });
+          } else if (seam === 'history') {
+            const event = next.history[0]!, matching = structuredClone(event);
+            Object.defineProperty(event, 'toJSON', { configurable: true, value() {
+              mutate(); delete (event as { toJSON?: unknown }).toJSON; return matching;
+            } });
+          } else Object.defineProperty(next, 'repairAdmissions', { enumerable: true, get() { mutate(); return undefined; } });
+          assert.throws(() => api === 'create' ? store.create(next) : api === 'update' ? store.update(next)
+            : store.updateIfUnchanged(expected, next), /invalid bounded validation output payload/, `${api}/${seam}`);
+          assert.ok(calls > 0, `${api}/${seam} reached the intervening caller-controlled seam`);
+          assert.deepEqual(existsSync(runPath) ? readFileSync(runPath) : null, raw);
+          assert.deepEqual(existsSync(projectionPath) ? readFileSync(projectionPath) : null, projection);
+          assert.equal(readdirSync(dir).some(name => name.endsWith('.tmp')), false);
+        }
+      }
+    }
+  });
+
+  it('retains refusal declarations across conditional hooks while preserving stale CAS and marker-free legacy serialization', () => {
+    for (const kind of [undefined, 'process_family_settlement'] as const) {
+      const { store, dir } = tempStore();
+      const initial = settlementValidationRun(kind);
+      store.create(initial);
+      const expected = store.read(initial.id)!, next = structuredClone(expected);
+      const runPath = path.join(dir, `${initial.id}.json`), projectionPath = operationalProjectionPath(dir, initial.id);
+      const raw = readFileSync(runPath), projection = readFileSync(projectionPath);
+      let hookCalls = 0;
+      const guarded = new JsonFileStore({ dir, beforeConditionalWrite() {
+        hookCalls += 1; Object.assign(next.validationResult!.local.commands[0]!, { evidenceKind: 'command' });
+      } });
+      assert.throws(() => guarded.updateIfUnchanged(expected, next), /invalid bounded validation output payload/);
+      assert.equal(hookCalls, 1);
+      assert.deepEqual(readFileSync(runPath), raw);
+      assert.deepEqual(readFileSync(projectionPath), projection);
+      assert.equal(readdirSync(dir).some(name => name.endsWith('.tmp')), false);
+      const winner = { ...expected, updatedAt: '2026-08-14T00:01:00.000Z' };
+      store.update(winner);
+      const winnerRaw = readFileSync(runPath), winnerProjection = readFileSync(projectionPath);
+      const staleNext = structuredClone(expected), matching = structuredClone(expected);
+      Object.defineProperty(expected, 'toJSON', { value() {
+        Object.assign(staleNext.validationResult!.local.commands[0]!, { evidenceKind: 'command' }); return matching;
+      } });
+      assert.equal(guarded.updateIfUnchanged(expected, staleNext), false);
+      assert.equal(hookCalls, 1, 'a stale CAS never enters the publication hook');
+      assert.deepEqual(readFileSync(runPath), winnerRaw);
+      assert.deepEqual(readFileSync(projectionPath), winnerProjection);
+      assert.equal(localValidationHasUnsettledProcessFamily(store.read(initial.id)?.validationResult?.local), true);
+    }
+    const { store, dir } = tempStore();
+    const legacy = newRun('marker-free-serializer');
+    store.create(legacy);
+    const next = store.read(legacy.id)!, matching = structuredClone(next);
+    Object.defineProperty(next, 'toJSON', { configurable: true, value() {
+      delete (next as { toJSON?: unknown }).toJSON;
+      Object.assign(next, { futureUnknown: { retained: 'ordinary legacy metadata' } }); return matching;
+    } });
+    assert.equal(store.updateIfUnchanged(next, next), true);
+    const persisted = JSON.parse(readFileSync(path.join(dir, `${legacy.id}.json`), 'utf8'));
+    assert.deepEqual(persisted.futureUnknown, { retained: 'ordinary legacy metadata' });
+  });
+
+  it('roundtrips explicit command kinds and conservative legacy refusal evidence without changing their authority', () => {
+    for (const kind of [undefined, 'process_family_settlement', 'command'] as const) {
+      const value = settlementValidationRun(kind);
+      const { store } = tempStore();
+      store.create(value);
+      const loaded = store.read(value.id)!;
+      assert.deepEqual(loaded.validationResult, JSON.parse(JSON.stringify(value.validationResult)));
+      assert.equal(isValidationResultCoherent(loaded.validationResult), true);
+      assert.equal(localValidationHasUnsettledProcessFamily(loaded.validationResult?.local), kind !== 'command');
+      store.update(loaded);
+      assert.equal(store.updateIfUnchanged(loaded, loaded), true);
+    }
+  });
+
+  it('pins typed and legacy refusal identity across ancestor serializers and rejects relevant accessors before publication', () => {
+    for (const kind of [undefined, 'process_family_settlement'] as const) {
+      const valid = settlementValidationRun(kind);
+      for (const attack of ['flip-kind', 'drop-tag', 'replace', 'move', 'mutate-original', 'flip-status'] as const) {
+        assertBoundedRunWriteRefused(valid, () => {
+          const candidate = structuredClone(valid);
+          const serialized = structuredClone(valid);
+          const command = serialized.validationResult!.local.commands[0]!;
+          if (attack === 'flip-kind' || attack === 'mutate-original') Object.assign(command, { evidenceKind: 'command' });
+          else if (attack === 'drop-tag') {
+            // Untyped legacy evidence cannot be removed; typed evidence cannot lose its tag.
+            if (kind === undefined) (serialized.validationResult!.local as { commands: unknown }).commands = [];
+            else delete (command as { evidenceKind?: unknown }).evidenceKind;
+          } else if (attack === 'replace') Object.assign(command, { executable: 'git' });
+          else if (attack === 'move') (serialized.validationResult!.local as { commands: unknown }).commands = [
+            { evidenceKind: 'command', commandIndex: 0, executable: 'node', outcome: 'passed', exitCode: 0, durationMs: 1 },
+            { ...command, commandIndex: 1 },
+          ];
+          else Object.assign(serialized.validationResult!, { status: 'passed' });
+          const ancestor = attack === 'drop-tag' ? candidate.validationResult!.local.commands
+            : attack === 'replace' ? candidate.validationResult
+              : attack === 'flip-kind' ? candidate.validationResult!.local.commands[0]
+                : attack === 'move' ? candidate.validationResult!.local : candidate;
+          const replacement = attack === 'drop-tag' ? serialized.validationResult!.local.commands
+            : attack === 'replace' ? serialized.validationResult
+              : attack === 'flip-kind' ? command
+                : attack === 'move' ? serialized.validationResult!.local : serialized;
+          Object.defineProperty(ancestor!, 'toJSON', { value() {
+            if (attack === 'mutate-original') Object.assign(candidate.validationResult!.local.commands[0]!, { evidenceKind: 'command' });
+            return replacement;
+          } });
+          return candidate;
+        }, /invalid bounded validation output payload/);
+      }
+    }
+    for (const field of ['validationResult', 'local', 'commands', 'index', 'evidenceKind', 'executable', 'outcome'] as const) {
+      let calls = 0;
+      const valid = settlementValidationRun('process_family_settlement');
+      assertBoundedRunWriteRefused(valid, () => {
+        const candidate = structuredClone(valid);
+        const target = field === 'validationResult' ? candidate : field === 'local' ? candidate.validationResult!
+          : field === 'commands' ? candidate.validationResult!.local
+            : field === 'index' ? candidate.validationResult!.local.commands : candidate.validationResult!.local.commands[0]!;
+        const key = field === 'index' ? '0' : field;
+        const value = Object.getOwnPropertyDescriptor(target, key)?.value;
+        Object.defineProperty(target, key, { enumerable: true, configurable: true, get() { calls += 1; return value; } });
+        return candidate;
+      }, /invalid bounded validation output payload/);
+      assert.equal(calls, 0, `${field} accessor was never evaluated`);
+    }
+  });
+
+  it('refuses incoherent capture markers in the exact serialized snapshot before any Run publication', () => {
+    for (const ancestor of ['command', 'local', 'validation', 'Run'] as const) {
+      const validRun = boundedValidationRun('serialized-complete-output-required');
+      const candidate = structuredClone(validRun);
+      const serialized = structuredClone(validRun);
+      delete (serialized.validationResult!.local.commands[0]! as { output?: unknown }).output;
+      const target = ancestor === 'Run' ? candidate : ancestor === 'validation' ? candidate.validationResult!
+        : ancestor === 'local' ? candidate.validationResult!.local : candidate.validationResult!.local.commands[0]!;
+      const replacement = ancestor === 'Run' ? serialized : ancestor === 'validation' ? serialized.validationResult!
+        : ancestor === 'local' ? serialized.validationResult!.local : serialized.validationResult!.local.commands[0]!;
+      Object.defineProperty(target, 'toJSON', { value() { return replacement; } });
+      assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), true);
+      assertBoundedRunWriteRefused(validRun, candidate, /invalid bounded validation output payload/);
+    }
+  });
+
+  it('preserves immutable declared capture fields across ancestor serialization and original-object mutation', () => {
+    for (const variant of ['command', 'local', 'validation', 'Run', 'remove-command', 'remove-validation',
+      'null-command', 'mutate-command', 'mutate-Run', 'drop-status', 'drop-preview'] as const) {
+      const validRun = boundedValidationRun('serialized-declaration-preservation');
+      const makeCandidate = (): Run => {
+        const candidate = structuredClone(validRun);
+        const command = candidate.validationResult!.local.commands[0]!;
+        if (variant === 'drop-preview') {
+          delete (command as { output?: unknown }).output;
+          Object.assign(command, { captureStatus: 'partial', capturePreview: {
+            stdout: { bytes: 2, preview: 'ok', previewBytes: 2, truncated: false },
+            stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false }, diagnostics: [], diagnosticsTruncated: false,
+          } });
+        }
+        const serialized = structuredClone(candidate);
+        const serializedCommand = serialized.validationResult!.local.commands[0]!;
+        if (variant === 'drop-status') delete (serializedCommand as { captureStatus?: unknown }).captureStatus;
+        else if (variant === 'drop-preview') delete (serializedCommand as { capturePreview?: unknown }).capturePreview;
+        else {
+          delete (serializedCommand as { output?: unknown }).output;
+          delete (serializedCommand as { capturePreview?: unknown }).capturePreview;
+          delete (serializedCommand as { captureStatus?: unknown }).captureStatus;
+        }
+        const ancestor = variant === 'command' || variant === 'mutate-command' || variant === 'null-command' ? 'command'
+          : variant === 'local' || variant === 'remove-command' ? 'local'
+            : variant === 'validation' ? 'validation' : 'Run';
+        const target = ancestor === 'Run' ? candidate : ancestor === 'validation' ? candidate.validationResult!
+          : ancestor === 'local' ? candidate.validationResult!.local : command;
+        const replacement = ancestor === 'Run' ? serialized : ancestor === 'validation' ? serialized.validationResult!
+          : ancestor === 'local' ? serialized.validationResult!.local : serializedCommand;
+        if (variant === 'remove-command') (serialized.validationResult!.local as { commands: unknown }).commands = [];
+        if (variant === 'remove-validation') delete (serialized as { validationResult?: unknown }).validationResult;
+        Object.defineProperty(target, 'toJSON', { value() {
+          if (variant === 'mutate-command') {
+            delete (command as { output?: unknown }).output;
+            delete (command as { captureStatus?: unknown }).captureStatus;
+          }
+          if (variant === 'mutate-Run') delete (candidate as { validationResult?: unknown }).validationResult;
+          return variant === 'null-command' ? null : replacement;
+        } });
+        return candidate;
+      };
+      assertBoundedRunWriteRefused(validRun, makeCandidate, /invalid bounded validation output payload/);
+    }
+  });
+
+  it('preserves valid serialized capture markers and marker-free legacy command shapes', () => {
+    for (const shape of ['complete', 'output-only', 'partial-preview', 'partial', 'unavailable', 'no-markers', 'undefined-markers',
+      'null-slot', 'sparse-slot', 'null-commands', 'missing-commands'] as const) {
+      for (const api of ['create', 'update', 'CAS'] as const) {
+        const validRun = boundedValidationRun('serialized-capture-control');
+        const serialized = structuredClone(validRun);
+        const command = serialized.validationResult!.local.commands[0]!;
+        if (shape === 'output-only') delete (command as { captureStatus?: unknown }).captureStatus;
+        if (shape !== 'complete' && shape !== 'output-only') {
+          delete (command as { output?: unknown }).output;
+          delete (command as { captureStatus?: unknown }).captureStatus;
+        }
+        if (shape === 'partial' || shape === 'unavailable' || shape === 'partial-preview') {
+          (command as { captureStatus: string }).captureStatus = shape === 'unavailable' ? 'unavailable' : 'partial';
+        }
+        if (shape === 'partial-preview') (command as { capturePreview: unknown }).capturePreview = {
+          stdout: { bytes: 2, preview: 'ok', previewBytes: 2, truncated: false },
+          stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false }, diagnostics: [], diagnosticsTruncated: false,
+        };
+        if (shape === 'null-slot') (serialized.validationResult!.local as { commands: unknown }).commands = [null];
+        if (shape === 'sparse-slot') (serialized.validationResult!.local as { commands: unknown }).commands = new Array(1);
+        if (shape === 'null-commands') (serialized.validationResult!.local as { commands: unknown }).commands = null;
+        if (shape === 'missing-commands') delete (serialized.validationResult!.local as { commands?: unknown }).commands;
+        if (shape === 'undefined-markers') Object.assign(command, { output: undefined, capturePreview: undefined, captureStatus: undefined });
+        const candidate = structuredClone(serialized);
+        Object.defineProperty(candidate, 'toJSON', { value() { return serialized; } });
+        const { store, dir } = tempStore();
+        if (api !== 'create') store.create(validRun);
+        if (api === 'create') store.create(candidate);
+        else if (api === 'update') store.update(candidate);
+        else assert.equal(store.updateIfUnchanged(validRun, candidate), true);
+        const raw = JSON.parse(readFileSync(path.join(dir, `${validRun.id}.json`), 'utf8'));
+        assert.deepEqual(raw.validationResult.local.commands, JSON.parse(JSON.stringify(serialized.validationResult!.local)).commands,
+          `${shape}: ${api} preserves the admitted serialized shape`);
+      }
+    }
+  });
+
+  for (const boundary of ['envelope', 'envelope-stream', 'partial-preview', 'partial-stream'] as const) {
+    for (const api of ['guard', 'create', 'update', 'CAS'] as const) {
+      it(`refuses inherited ${boundary} accessors before ${api} evaluates or persists them`, () => {
+        const headSha = 'inherited-accessor-head';
+        const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'x', stderr: '',
+          store: new InMemoryToolOutputStore() });
+        const capturePreview = {
+          stdout: { bytes: 1, preview: 'x', previewBytes: 1, truncated: false },
+          stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+          diagnostics: [] as string[], diagnosticsTruncated: false,
+        };
+        const base = validationPassed(headSha);
+        const validation = { ...base, local: { ...base.local, commands: [{ ...base.local.commands[0]!,
+          ...(boundary.startsWith('envelope') ? { captureStatus: 'complete' as const, output }
+            : { captureStatus: 'partial' as const, capturePreview }),
+        }] } };
+        const implementing = applyTransition(newRun('inherited-accessor'), { type: 'start' }, T0);
+        const validating = applyTransition(implementing, {
+          type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+        }, T0);
+        const validRun = applyTransition(validating, { type: 'validation_passed', validationResult: validation,
+          pullRequest: { number: 7, headSha } }, T0);
+        const { store, dir } = tempStore();
+        if (api === 'update' || api === 'CAS') store.create(validRun);
+        const runPath = path.join(dir, `${validRun.id}.json`);
+        const projectionPath = operationalProjectionPath(dir, validRun.id);
+        const priorRun = existsSync(runPath) ? readFileSync(runPath, 'utf8') : null;
+        const priorProjection = existsSync(projectionPath) ? readFileSync(projectionPath, 'utf8') : null;
+
+        // A fresh candidate for each API: preceding validation must not consume
+        // the getter or append the unknown field before the API under test.
+        const candidate = structuredClone(validRun);
+        const command = candidate.validationResult!.local.commands[0]!;
+        const record = (boundary === 'envelope' ? command.output
+          : boundary === 'envelope-stream' ? command.output!.stdout
+            : boundary === 'partial-preview' ? command.capturePreview
+              : command.capturePreview!.stdout) as unknown as Record<string, unknown>;
+        const key = boundary === 'envelope' ? 'summary'
+          : boundary === 'partial-preview' ? 'diagnosticsTruncated' : 'preview';
+        const retained = record[key];
+        delete record[key];
+        let calls = 0;
+        const prototype = Object.defineProperty({}, key, { get() {
+          calls += 1;
+          record.rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+          return retained;
+        } });
+        Object.setPrototypeOf(record, Object.create(prototype));
+
+        if (api === 'guard') {
+          assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), false);
+          assert.equal(isValidationResultCoherent(candidate.validationResult), false);
+        } else {
+          assert.throws(() => {
+            if (api === 'create') store.create(candidate);
+            else if (api === 'update') store.update(candidate);
+            else store.updateIfUnchanged(validRun, candidate);
+          }, /invalid bounded validation output payload/);
+        }
+        assert.equal(calls, 0, 'inherited getter never executes');
+        assert.equal(Object.hasOwn(record, 'rawTranscript'), false);
+        assert.equal(existsSync(runPath) ? readFileSync(runPath, 'utf8') : null, priorRun);
+        assert.equal(existsSync(projectionPath) ? readFileSync(projectionPath, 'utf8') : null, priorProjection);
+      });
+    }
+  }
+
+  it('preserves bounded own data with null prototypes or shadowed inherited accessors', () => {
+    for (const prototypeKind of ['null', 'shadowed'] as const) {
+      let calls = 0;
+      const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'x', stderr: '',
+        store: new InMemoryToolOutputStore() });
+      const capturePreview = {
+        stdout: { bytes: 1, preview: 'x', previewBytes: 1, truncated: false },
+        stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        diagnostics: [] as string[], diagnosticsTruncated: false,
+      };
+      for (const [record, key] of [[output, 'summary'], [output.stdout, 'preview'],
+        [capturePreview, 'diagnosticsTruncated'], [capturePreview.stdout, 'preview']] as const) {
+        Object.setPrototypeOf(record, prototypeKind === 'null' ? null
+          : Object.defineProperty({}, key, { get() { calls += 1; throw new Error('shadowed getter'); } }));
+      }
+      const base = validationPassed('inherited-control-head');
+      for (const commandOutput of [{ captureStatus: 'complete' as const, output },
+        { captureStatus: 'partial' as const, capturePreview }]) {
+        const validation = { ...base, local: { ...base.local,
+          commands: [{ ...base.local.commands[0]!, ...commandOutput }] } };
+        assert.equal(isKnownBoundedValidationPayloadCoherent(validation), true);
+        assert.equal(isValidationResultCoherent(validation), true);
+        assert.equal(isValidationResultCoherent(JSON.parse(JSON.stringify(validation))), true);
+      }
+      assert.equal(calls, 0);
+    }
+  });
+
+  it('rejects oversized opaque artifact IDs before persistence and on stored Run reads', () => {
+    const headSha = 'artifact-id-bound-head';
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'x', stderr: '',
+      store: new InMemoryToolOutputStore() });
+    const base = validationPassed(headSha);
+    const validation = { ...base, local: { ...base.local, commands: [{ ...base.local.commands[0]!,
+      captureStatus: 'complete' as const, output }] } };
+    const implementing = applyTransition(newRun('artifact-id-bound'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    const validRun = applyTransition(validating, { type: 'validation_passed', validationResult: validation,
+      pullRequest: { number: 7, headSha } }, T0);
+    const withId = (id: string): Run => {
+      const candidate = structuredClone(validRun);
+      (candidate.validationResult!.local.commands[0]!.output!.artifact as { id: string }).id = id;
+      return candidate;
+    };
+    for (const id of ['a'.repeat(257), '界'.repeat(86), 'RAW-' + 'x'.repeat(262_144)]) {
+      const candidate = withId(id);
+      assert.equal(isKnownBoundedValidationPayloadCoherent(candidate.validationResult), false);
+      assert.equal(isValidationResultCoherent(candidate.validationResult), false);
+      const { store, dir } = tempStore();
+      const runPath = path.join(dir, `${validRun.id}.json`);
+      const projectionPath = operationalProjectionPath(dir, validRun.id);
+      assert.throws(() => store.create(candidate), /invalid bounded validation output payload/);
+      assert.equal(existsSync(runPath), false);
+      assert.equal(existsSync(projectionPath), false);
+      store.create(validRun);
+      const priorRun = readFileSync(runPath, 'utf8');
+      const priorProjection = readFileSync(projectionPath, 'utf8');
+      assert.throws(() => store.update(candidate), /invalid bounded validation output payload/);
+      assert.throws(() => store.updateIfUnchanged(validRun, candidate), /invalid bounded validation output payload/);
+      assert.equal(readFileSync(runPath, 'utf8'), priorRun);
+      assert.equal(readFileSync(projectionPath, 'utf8'), priorProjection);
+      const invalidBytes = JSON.stringify(candidate);
+      writeFileSync(runPath, invalidBytes);
+      assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+      assert.throws(() => store.list(), /corrupt or incompatible/);
+      assert.throws(() => store.updateIfUnchanged(validRun, validRun), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), invalidBytes);
+      assert.equal(readFileSync(projectionPath, 'utf8'), priorProjection);
+    }
+    for (const id of ['custom-store:one', ' x ', 'é'.repeat(128)]) {
+      const candidate = withId(id);
+      const { store } = tempStore();
+      store.create(candidate);
+      assert.equal(store.read(candidate.id)?.validationResult?.local.commands[0]?.output?.artifact.id, id);
+    }
+  });
+
+  it('rejects incoherent tool-output payloads before validation admission and on persisted Run read/CAS', () => {
+    const headSha = 'envelope-limits-validation-head';
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: 'xy', stderr: '',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 1, diagnosticBytes: 2, maxDiagnostics: 1, readBytes: 1 } });
+    const invalidOutput = structuredClone(output) as any;
+    invalidOutput.stdout.preview = 'xy';
+    invalidOutput.stdout.previewBytes = Buffer.byteLength(invalidOutput.stdout.preview);
+    invalidOutput.overflow.retainedBytes = invalidOutput.stdout.previewBytes + invalidOutput.stderr.previewBytes;
+    invalidOutput.overflow.omittedBytes = Math.max(0, invalidOutput.overflow.totalBytes - invalidOutput.overflow.retainedBytes);
+    const validation = validationPassed(headSha);
+    const validValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus: 'complete' as const, output }] },
+    };
+    const invalidValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: invalidOutput }] },
+    };
+    assert.equal(isValidationResultCoherent(validValidation), true);
+    assert.equal(isValidationResultCoherent(invalidValidation), false);
+
+    const implementing = applyTransition(newRun('envelope-limits-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: invalidValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const projectionPath = operationalProjectionPath(dir, validRun.id);
+    const originalRunBytes = readFileSync(runPath, 'utf8');
+    const originalProjectionBytes = readFileSync(projectionPath, 'utf8');
+    assert.equal(isToolOutputEnvelope(store.read(validRun.id)?.validationResult?.local.commands[0]?.output), true,
+      'a legitimate bounded envelope survives Run creation and readback');
+
+    const invalidRun = {
+      ...validRun,
+      validationResult: invalidValidation,
+    };
+    const invalidBytes = JSON.stringify(invalidRun);
+    writeFileSync(runPath, invalidBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected persisted read leaves the original raw bytes untouched');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects a corrupt existing Run before comparing or writing');
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS leaves the original raw bytes untouched');
+
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    class InheritedEnvelopeSerializer {
+      constructor(value: typeof output) { Object.assign(this, value); }
+      toJSON() { return { ...this, rawTranscript }; }
+    }
+    const diagnosticsWithSerializer = [...output.diagnostics];
+    Object.defineProperty(diagnosticsWithSerializer, 'toJSON', { value: () => [...diagnosticsWithSerializer, rawTranscript] });
+    const serializerCases: ReadonlyArray<{ readonly label: string; readonly output: typeof output }> = [
+      { label: 'unknown own envelope field', output: { ...output, rawTranscript } as unknown as typeof output },
+      { label: 'inherited envelope serializer', output: new InheritedEnvelopeSerializer(output) as unknown as typeof output },
+      { label: 'own nonenumerable diagnostics serializer', output: { ...output, diagnostics: diagnosticsWithSerializer } },
+    ];
+    for (const candidate of serializerCases) {
+      const candidateValidation = {
+        ...validation,
+        local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: candidate.output }] },
+      };
+      assert.equal(isToolOutputEnvelope(candidate.output), false, `${candidate.label} is rejected by the envelope guard`);
+      assert.equal(isValidationResultCoherent(candidateValidation), false,
+        `${candidate.label} is rejected as validation evidence`);
+      assert.throws(() => applyTransition(validating, {
+        type: 'validation_passed', validationResult: candidateValidation,
+        pullRequest: { number: 7, headSha },
+      }, T0), /coherent|conflicts/, `transition refuses ${candidate.label}`);
+      const candidateRun = { ...validRun, validationResult: candidateValidation };
+      const candidateBytes = JSON.stringify(candidateRun);
+      assert.ok(candidateBytes.includes(rawTranscript), `${candidate.label} would serialize the unbounded transcript`);
+
+      const { store: rejectedCreateStore, dir: rejectedCreateDir } = tempStore();
+      assert.throws(() => rejectedCreateStore.create(candidateRun), /invalid bounded validation output payload/,
+        `create refuses ${candidate.label} before persistence`);
+      assert.equal(existsSync(path.join(rejectedCreateDir, `${validRun.id}.json`)), false,
+        `${candidate.label} create leaves no authoritative Run`);
+      assert.equal(existsSync(operationalProjectionPath(rejectedCreateDir, validRun.id)), false,
+        `${candidate.label} create leaves no operational projection`);
+
+      writeFileSync(runPath, originalRunBytes, 'utf8');
+      assert.throws(() => store.update(candidateRun), /invalid bounded validation output payload/,
+        `update refuses ${candidate.label} before mutation`);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidate.label} update preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} update preserves projection bytes`);
+      assert.throws(() => store.updateIfUnchanged!(validRun, candidateRun), /invalid bounded validation output payload/,
+        `CAS refuses ${candidate.label} before mutation`);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidate.label} CAS preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} CAS preserves projection bytes`);
+
+      writeFileSync(runPath, candidateBytes, 'utf8');
+      assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), candidateBytes, `${candidate.label} rejected read preserves raw bytes`);
+      assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), candidateBytes, `${candidate.label} rejected CAS preserves raw bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidate.label} corrupt read/CAS leaves operational projection unchanged`);
+    }
+
+    const accessorCases: Array<{ readonly label: string; readonly make: (calls: { count: number }) => typeof output }> = [
+      { label: 'envelope summary accessor', make: (calls) => {
+        const candidate = { ...output } as any;
+        Object.defineProperty(candidate, 'summary', { enumerable: true, get() { calls.count += 1; return 'ok'; } });
+        return candidate;
+      } },
+      { label: 'nested stream accessor', make: (calls) => {
+        const stdout = { ...output.stdout } as any;
+        Object.defineProperty(stdout, 'preview', { enumerable: true, get() { calls.count += 1; return 'x'; } });
+        return { ...output, stdout };
+      } },
+      { label: 'diagnostic array item accessor', make: (calls) => {
+        const diagnostics = ['ok'];
+        Object.defineProperty(diagnostics, '0', { enumerable: true, configurable: true,
+          get() { calls.count += 1; return 'ok'; } });
+        return { ...output, diagnostics };
+      } },
+    ];
+    for (const candidateCase of accessorCases) {
+      const calls = { count: 0 };
+      const candidateOutput = candidateCase.make(calls);
+      const candidateValidation = {
+        ...validation,
+        local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: candidateOutput }] },
+      };
+      const candidateRun = { ...validRun, validationResult: candidateValidation };
+      assert.equal(isToolOutputEnvelope(candidateOutput), false, `${candidateCase.label} is rejected without evaluating it`);
+      assert.equal(isValidationResultCoherent(candidateValidation), false, `${candidateCase.label} is rejected as evidence`);
+      assert.equal(calls.count, 0, `${candidateCase.label} remains unevaluated by validation guards`);
+
+      const { store: rejectedCreateStore, dir: rejectedCreateDir } = tempStore();
+      assert.throws(() => rejectedCreateStore.create(candidateRun), /invalid bounded validation output payload/);
+      assert.equal(existsSync(path.join(rejectedCreateDir, `${validRun.id}.json`)), false,
+        `${candidateCase.label} create publishes no Run`);
+      assert.equal(existsSync(operationalProjectionPath(rejectedCreateDir, validRun.id)), false,
+        `${candidateCase.label} create publishes no projection`);
+      assert.equal(calls.count, 0);
+
+      writeFileSync(runPath, originalRunBytes, 'utf8');
+      assert.throws(() => store.update(candidateRun), /invalid bounded validation output payload/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidateCase.label} update preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidateCase.label} update preserves projection bytes`);
+      assert.throws(() => store.updateIfUnchanged!(validRun, candidateRun), /invalid bounded validation output payload/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, `${candidateCase.label} CAS preserves Run bytes`);
+      assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+        `${candidateCase.label} CAS preserves projection bytes`);
+      assert.equal(calls.count, 0, `${candidateCase.label} stays unevaluated across store writes`);
+    }
+
+    const falseTruncatedOutput = structuredClone(output) as any;
+    falseTruncatedOutput.stdout.truncated = false;
+    falseTruncatedOutput.overflow.stdout = false;
+    falseTruncatedOutput.overflow.truncated = falseTruncatedOutput.overflow.capture || falseTruncatedOutput.overflow.summary ||
+      falseTruncatedOutput.overflow.diagnostics || falseTruncatedOutput.overflow.stdout || falseTruncatedOutput.overflow.stderr;
+    const falseTruncatedValidation = {
+      ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: falseTruncatedOutput }] },
+    };
+    assert.equal(isToolOutputEnvelope(falseTruncatedOutput), false,
+      'a complete envelope cannot report over-limit stream bytes without truncation');
+    assert.equal(isValidationResultCoherent({ ...validation,
+      local: { ...validation.local, commands: [{ ...validValidation.local.commands[0]!, output: falseTruncatedOutput }] } }), false);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: falseTruncatedValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const falseTruncatedRun = { ...validRun, validationResult: falseTruncatedValidation };
+    const falseTruncatedBytes = JSON.stringify(falseTruncatedRun);
+    writeFileSync(runPath, falseTruncatedBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), falseTruncatedBytes,
+      'rejected complete-envelope read preserves original raw bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), falseTruncatedBytes,
+      'rejected complete-envelope CAS preserves original raw bytes');
+  });
+
+  it('roundtrips canonical retention metadata and refuses malformed metadata on Run read and CAS', () => {
+    const headSha = 'retention-metadata-validation-head';
+    const output = boundToolOutput({ outcome: 'passed', exitCode: 0, stdout: '', stderr: '',
+      store: new InMemoryToolOutputStore(), policy: { previewBytes: 8, diagnosticBytes: 8, maxDiagnostics: 1, readBytes: 8 } });
+    const operationId = '00000000-0000-4000-8000-000000000000';
+    const retainedUntil = '2000-01-01T00:00:00.000Z';
+    const retainedOutput = { ...output, artifact: { ...output.artifact, operationId, retainedUntil } };
+    assert.equal(isToolOutputEnvelope(retainedOutput), true, 'canonical past deadline is structurally coherent');
+    const validation = {
+      ...validationPassed(headSha),
+      local: { ...validationPassed(headSha).local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus: 'complete' as const, output: retainedOutput }] },
+    };
+    const implementing = applyTransition(newRun('retention-metadata-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const persistedOutput = store.read(validRun.id)?.validationResult?.local.commands[0]?.output;
+    assert.equal(isToolOutputEnvelope(persistedOutput), true, 'valid paired authority survives store roundtrip');
+
+    const malformedOutputs = [
+      { ...retainedOutput, artifact: { ...retainedOutput.artifact, operationId: 'not-an-operation-id' } },
+      { ...retainedOutput, artifact: { ...retainedOutput.artifact, retainedUntil: '2000-1-1T00:00:00.000Z' } },
+      { ...output, artifact: { ...output.artifact, operationId } },
+    ];
+    for (const malformedOutput of malformedOutputs) {
+      const malformedValidation = {
+        ...validation,
+        local: { ...validation.local, commands: [{ ...validation.local.commands[0]!, output: malformedOutput }] },
+      };
+      const corruptRun = { ...validRun, validationResult: malformedValidation };
+      const originalBytes = JSON.stringify(corruptRun);
+      writeFileSync(runPath, originalBytes, 'utf8');
+      assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalBytes, 'rejected read preserves raw bytes');
+      assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), originalBytes, 'rejected CAS preserves raw bytes');
+    }
+  });
+
+  it('bounds partial and unavailable fallback diagnostics before validation and persisted Run admission', () => {
+    const headSha = 'fallback-diagnostics-validation-head';
+    const base = validationPassed(headSha);
+    const command = { commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+      exitCode: 0, durationMs: 1, captureStatus: 'partial' as const, capturePreview: {
+        stdout: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        diagnostics: [] as string[], diagnosticsTruncated: false,
+      } };
+    const withDiagnostics = (status: 'partial' | 'unavailable', diagnostics: string[]) => ({
+      ...base,
+      local: { ...base.local, commands: [{ ...command, captureStatus: status, capturePreview: {
+        ...command.capturePreview, diagnostics,
+      } }] },
+    });
+    const rejected: Array<{ name: string; diagnostics: string[] }> = [
+      { name: 'line count', diagnostics: Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics + 1 }, () => 'x') },
+      { name: 'single byte total', diagnostics: ['x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes + 1)] },
+      { name: 'LF joined total', diagnostics: Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics }, () => 'x'.repeat(512)) },
+      { name: 'UTF-8 total', diagnostics: ['界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes / 3)) + '界'.repeat(2)] },
+    ];
+    for (const status of ['partial', 'unavailable'] as const) {
+      for (const candidate of rejected) {
+        assert.equal(isValidationResultCoherent(withDiagnostics(status, candidate.diagnostics)), false,
+          `${status} capture rejects ${candidate.name} above policy`);
+      }
+    }
+
+    const exactJoined = Array.from({ length: TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics }, (_, index) =>
+      index === TOOL_OUTPUT_POLICY_MAXIMA.maxDiagnostics - 1 ? 'x'.repeat(385) : 'x'.repeat(512));
+    assert.equal(exactJoined.reduce((bytes, line) => bytes + Buffer.byteLength(line) + 1, -1), TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes,
+      'positive joined-byte fixture includes each LF separator');
+    const exactUtf8 = '😀'.repeat(16_383) + 'abcd';
+    assert.equal(Buffer.byteLength(exactUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.diagnosticBytes);
+    for (const status of ['partial', 'unavailable'] as const) {
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, exactJoined)), true,
+        `${status} capture accepts exact line-count and joined-byte boundaries`);
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, [exactUtf8])), true,
+        `${status} capture counts UTF-8 bytes at the exact boundary`);
+      assert.equal(isValidationResultCoherent(withDiagnostics(status, [])), true,
+        `${status} capture accepts an empty diagnostic list`);
+    }
+
+    const invalidValidation = withDiagnostics('partial', rejected[2]!.diagnostics);
+    const implementing = applyTransition(newRun('fallback-diagnostics-validation'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: invalidValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/);
+
+    const validValidation = withDiagnostics('partial', exactJoined);
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    assert.equal(isValidationResultCoherent(store.read(validRun.id)?.validationResult), true,
+      'legitimate exact-boundary fallback evidence survives create/read');
+
+    const invalidRun = { ...validRun, validationResult: invalidValidation };
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const invalidBytes = JSON.stringify(invalidRun);
+    writeFileSync(runPath, invalidBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected persisted read preserves the malformed raw bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects malformed persisted fallback evidence before writing');
+    assert.equal(readFileSync(runPath, 'utf8'), invalidBytes, 'rejected CAS preserves the malformed raw bytes');
+  });
+
+  it('rejects unbounded own fields in partial fallback previews before persisted Run read or CAS', () => {
+    const headSha = 'fallback-preview-unknown-payload-head';
+    const base = validationPassed(headSha);
+    const preview = {
+      stdout: { bytes: 1, preview: 'x', previewBytes: 1, truncated: false },
+      stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+      diagnostics: [] as string[], diagnosticsTruncated: false,
+    };
+    const withPreview = (captureStatus: 'partial' | 'unavailable', capturePreview = preview) => ({
+      ...base,
+      local: { ...base.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+        exitCode: 0, durationMs: 1, captureStatus, capturePreview }] },
+    });
+    for (const status of ['partial', 'unavailable'] as const) {
+      assert.equal(isValidationResultCoherent(withPreview(status)), true,
+        `${status} capture keeps valid bounded preview fields`);
+      assert.equal(isValidationResultCoherent({ ...base,
+        local: { ...base.local, commands: [{ commandIndex: 0, executable: 'test', outcome: 'passed' as const,
+          exitCode: 0, durationMs: 1, captureStatus: status }] } }), true,
+      `${status} capture still permits legacy evidence without an optional preview`);
+    }
+    const rawTranscript = 'RAW-' + 'x'.repeat(262_144);
+    const diagnosticsWithSerializer = [...preview.diagnostics];
+    Object.defineProperty(diagnosticsWithSerializer, 'toJSON', { value: () => [...diagnosticsWithSerializer, rawTranscript] });
+    const invalidPreviews = [
+      { ...preview, rawTranscript },
+      { ...preview, stdout: { ...preview.stdout, rawTranscript } },
+      { ...preview, stderr: { ...preview.stderr, rawTranscript } },
+      { ...preview, diagnostics: diagnosticsWithSerializer },
+    ];
+    for (const invalidPreview of invalidPreviews) {
+      assert.equal(isValidationResultCoherent(withPreview('partial', invalidPreview)), false,
+        'partial preview rejects unknown raw payload at the preview and nested stream levels');
+    }
+
+    const validValidation = withPreview('partial');
+    const implementing = applyTransition(newRun('fallback-preview-unknown-payload'), { type: 'start' }, T0);
+    const validating = applyTransition(implementing, {
+      type: 'agent_succeeded', agentResult: successResult(headSha), headSha,
+    }, T0);
+    const unknownPayloadValidation = withPreview('partial', invalidPreviews[3]!);
+    assert.throws(() => applyTransition(validating, {
+      type: 'validation_passed', validationResult: unknownPayloadValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0), /coherent|conflicts/, 'transition refuses unbounded partial-preview payload');
+    const validRun = applyTransition(validating, {
+      type: 'validation_passed', validationResult: validValidation,
+      pullRequest: { number: 7, headSha },
+    }, T0);
+    const { store, dir } = tempStore();
+    store.create(validRun);
+    const runPath = path.join(dir, `${validRun.id}.json`);
+    const projectionPath = operationalProjectionPath(dir, validRun.id);
+    const originalRunBytes = readFileSync(runPath, 'utf8');
+    const originalProjectionBytes = readFileSync(projectionPath, 'utf8');
+    const malformedRun = { ...validRun, validationResult: unknownPayloadValidation };
+    const malformedBytes = JSON.stringify(malformedRun);
+    const { store: rejectedCreateStore, dir: rejectedCreateDir } = tempStore();
+    assert.throws(() => rejectedCreateStore.create(malformedRun), /invalid bounded validation output payload/);
+    assert.equal(existsSync(path.join(rejectedCreateDir, `${validRun.id}.json`)), false,
+      'invalid partial preview creates no authoritative Run');
+    assert.equal(existsSync(operationalProjectionPath(rejectedCreateDir, validRun.id)), false,
+      'invalid partial preview creates no operational projection');
+    assert.throws(() => store.update(malformedRun), /invalid bounded validation output payload/);
+    assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, 'invalid preview update preserves Run bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes, 'invalid preview update preserves projection bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, malformedRun), /invalid bounded validation output payload/);
+    assert.equal(readFileSync(runPath, 'utf8'), originalRunBytes, 'invalid preview CAS preserves Run bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes, 'invalid preview CAS preserves projection bytes');
+    writeFileSync(runPath, malformedBytes, 'utf8');
+    assert.throws(() => store.read(validRun.id), /corrupt or incompatible/);
+    assert.equal(readFileSync(runPath, 'utf8'), malformedBytes, 'rejected read preserves original bytes');
+    assert.throws(() => store.updateIfUnchanged!(validRun, validRun), /corrupt or incompatible/,
+      'CAS rejects malformed persisted preview before writing');
+    assert.equal(readFileSync(runPath, 'utf8'), malformedBytes, 'rejected CAS preserves original bytes');
+    assert.equal(readFileSync(projectionPath, 'utf8'), originalProjectionBytes,
+      'rejected malformed preview read/CAS leaves projection unchanged');
+  });
+
+  it('bounds partial and unavailable fallback stream previews to the shared policy before Run admission', () => {
+    const headSha = 'fallback-stream-preview-validation-head';
+    const base = validationPassed(headSha);
+    const exactAscii = 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes);
+    const exactUtf8 = '界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes / 3)) + 'a';
+    const oversizedUtf8 = '界'.repeat(Math.floor(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes / 3)) + 'ab';
+    assert.equal(Buffer.byteLength(exactUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes);
+    assert.equal(Buffer.byteLength(oversizedUtf8, 'utf8'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1);
+    const makeValidation = (
+      status: 'partial' | 'unavailable', channel: 'stdout' | 'stderr', preview: string,
+      declaredBytes = Buffer.byteLength(preview, 'utf8'), rawBytes = Buffer.byteLength(preview, 'utf8'), truncated = false,
+    ) => {
+      const stream = { bytes: rawBytes, preview, previewBytes: declaredBytes, truncated };
+      const capturePreview = {
+        stdout: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        stderr: { bytes: 0, preview: '', previewBytes: 0, truncated: false },
+        diagnostics: [] as string[], diagnosticsTruncated: false,
+      };
+      capturePreview[channel] = stream;
+      return {
+        ...base,
+        local: {
+          ...base.local,
+          commands: [{ ...base.local.commands[0]!, captureStatus: status, capturePreview }],
+        },
+      };
+    };
+    const validatingRun = (id: string) => {
+      let run = newRun(id);
+      run = applyTransition(run, { type: 'start' }, T0);
+      return applyTransition(run, { type: 'agent_succeeded', agentResult: successResult(headSha), headSha }, T0);
+    };
+    let storedRun: Run | undefined;
+
+    for (const status of ['partial', 'unavailable'] as const) {
+      for (const channel of ['stdout', 'stderr'] as const) {
+        for (const [label, preview] of [['empty', ''], ['exact ASCII', exactAscii], ['exact UTF-8', exactUtf8]] as const) {
+          const validation = makeValidation(status, channel, preview);
+          assert.equal(isValidationResultCoherent(validation), true, `${status}/${channel} accepts ${label}`);
+          const next = applyTransition(validatingRun(`fallback-preview-${status}-${channel}-${label.replaceAll(' ', '-')}`), {
+            type: 'validation_passed', validationResult: validation,
+            pullRequest: { number: 7, headSha },
+          }, T0);
+          assert.equal(next.state, 'REVIEWING', `${status}/${channel} admits ${label} through the state machine`);
+          if (label === 'exact ASCII' && status === 'partial' && channel === 'stdout') storedRun = next;
+        }
+        const truncatedPrefix = makeValidation(status, channel, 'retained-prefix', undefined, 128, true);
+        assert.equal(isValidationResultCoherent(truncatedPrefix), true,
+          `${status}/${channel} accepts an exact valid truncated prefix whose preview does not exceed observed bytes`);
+        const truncatedRun = applyTransition(validatingRun(`fallback-truncated-${status}-${channel}`), {
+          type: 'validation_passed', validationResult: truncatedPrefix,
+          pullRequest: { number: 7, headSha },
+        }, T0);
+        assert.equal(truncatedRun.state, 'REVIEWING', `${status}/${channel} admits a valid truncated prefix`);
+
+        const largeTruncatedPrefix = makeValidation(status, channel, 'retained-prefix', undefined,
+          TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, true);
+        assert.equal(isValidationResultCoherent(largeTruncatedPrefix), true,
+          `${status}/${channel} accepts a truthful truncated stream above the policy preview maximum`);
+        const largeTruncatedRun = applyTransition(validatingRun(`fallback-large-truncated-${status}-${channel}`), {
+          type: 'validation_passed', validationResult: largeTruncatedPrefix,
+          pullRequest: { number: 7, headSha },
+        }, T0);
+        assert.equal(largeTruncatedRun.state, 'REVIEWING',
+          `${status}/${channel} admits a truthful over-limit raw stream with a bounded retained preview`);
+
+        const rejected: Array<{ name: string; preview: string; declared?: number; raw?: number }> = [
+          { name: 'oversized ASCII', preview: 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1) },
+          { name: 'oversized UTF-8', preview: oversizedUtf8 },
+          { name: '1MiB', preview: 'm'.repeat(1_048_576) },
+          { name: 'negative declared count', preview: 'x', declared: -1 },
+          { name: 'fractional declared count', preview: 'x', declared: 1.5 },
+          { name: 'unsafe declared count', preview: 'x', declared: Number.MAX_SAFE_INTEGER + 1 },
+          { name: 'mismatched declared count', preview: 'xy', declared: 1 },
+          { name: 'preview count exceeds zero observed bytes', preview: 'x', raw: 0 },
+          { name: 'UTF-8 preview count exceeds one observed byte', preview: '😀', raw: 1 },
+          { name: 'over-policy bytes without truncation flag', preview: 'x', raw: TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1 },
+        ];
+        for (const candidate of rejected) {
+          const validation = makeValidation(status, channel, candidate.preview, candidate.declared, candidate.raw);
+          assert.equal(isValidationResultCoherent(validation), false,
+            `${status}/${channel} rejects ${candidate.name}`);
+          assert.throws(() => applyTransition(validatingRun(`invalid-preview-${status}-${channel}-${candidate.name.replaceAll(' ', '-')}`), {
+            type: 'validation_passed', validationResult: validation,
+            pullRequest: { number: 7, headSha },
+          }, T0), /coherent|conflicts/, `${status}/${channel} rejects ${candidate.name} at state-machine admission`);
+        }
+      }
+    }
+
+    assert.ok(storedRun, 'exact-boundary fallback validation reached Run state');
+    const { store, dir } = tempStore();
+    store.create(storedRun);
+    assert.deepEqual(store.read(storedRun.id)?.validationResult, storedRun.validationResult,
+      'legitimate exact-boundary fallback evidence survives JSON create/read');
+
+    const runPath = path.join(dir, `${storedRun.id}.json`);
+    const invalidValidations = [
+      makeValidation('unavailable', 'stderr', 'x'.repeat(TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1)),
+      makeValidation('unavailable', 'stderr', 'corrupt-retained-prefix',
+        Buffer.byteLength('corrupt-retained-prefix'), TOOL_OUTPUT_POLICY_MAXIMA.previewBytes + 1, false),
+    ];
+    for (const [index, invalidValidation] of invalidValidations.entries()) {
+      const invalidBytes: string = JSON.stringify({ ...storedRun, validationResult: invalidValidation });
+      writeFileSync(runPath, invalidBytes, 'utf8');
+      assert.throws(() => store.read(storedRun.id), /corrupt or incompatible/);
+      assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
+        `rejected persisted fallback read ${index} preserves original malformed preview bytes`);
+      assert.throws(() => store.updateIfUnchanged!(storedRun, storedRun), /corrupt or incompatible/,
+        `CAS rejects corrupt existing fallback evidence ${index} before writing`);
+      assert.equal(readFileSync(runPath, 'utf8'), invalidBytes,
+        `rejected fallback CAS ${index} preserves original malformed preview bytes`);
+    }
   });
 
   it('persists the selected profile and resolved non-secret execution snapshot across restart', () => {

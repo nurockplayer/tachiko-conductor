@@ -5,6 +5,7 @@ import type {
   ProviderFailureTelemetry,
   ProviderTokenUsage,
 } from '../domain/telemetry.js';
+import type { ToolOutputEnvelope } from '../evidence/tool-output.js';
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return typeof value === 'object' && value !== null && !Array.isArray(value)
@@ -167,4 +168,13 @@ export function providerTelemetry(input: {
 export function maximumBytes(current: number | undefined, candidate: number | undefined): number | undefined {
   if (candidate === undefined) return current;
   return current === undefined ? candidate : Math.max(current, candidate);
+}
+
+/** Add the observed bounded-output artifact size without retaining its content. */
+export function attachToolOutputTelemetry(
+  telemetry: ProviderExecutionTelemetry,
+  output: ToolOutputEnvelope | undefined,
+): ProviderExecutionTelemetry {
+  const largestToolResultBytes = maximumBytes(telemetry.largestToolResultBytes, output?.artifact.totalBytes);
+  return largestToolResultBytes === undefined ? telemetry : { ...telemetry, largestToolResultBytes };
 }

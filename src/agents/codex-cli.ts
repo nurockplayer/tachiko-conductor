@@ -148,12 +148,21 @@ export class CodexCliAdapter implements ImplementationAgent {
     const prompt = buildPrompt(request);
     await assertWorkspaceGuard(request.workspaceGuard);
     const cwd = request.workspacePath ?? this.cwd;
+    let args: string[];
+    try {
+      // Keep deterministic caller/configuration validation outside the child
+      // execution catch, whose exception text may contain provider output.
+      args = this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : 'Invalid Codex invocation configuration.';
+      return failureAgentResult(CODEX_ERROR_CODE.EXEC_FAILURE, detail, 0, executor);
+    }
     const startedAt = Date.now();
     let result: ProcessResult;
     try {
       result = await this.runner.run(
         'codex',
-        this.buildArgs(prompt, request.capabilities ?? [], executor, preflight.reasoningEffort),
+        args,
         this.processOptions(request.signal, cwd, request.beforeExecution),
       );
     } catch (error) {
@@ -179,7 +188,7 @@ export class CodexCliAdapter implements ImplementationAgent {
       }
       return failureAgentResult(
         CODEX_ERROR_CODE.EXEC_FAILURE,
-        `Failed to run Codex CLI: ${errorMessage(error)}`,
+        'Failed to run Codex CLI.',
         durationMs,
         executor,
       );
@@ -539,8 +548,4 @@ function elapsedMs(startedAt: number): number {
 
 function errorCode(error: unknown): unknown {
   return typeof error === 'object' && error !== null ? (error as { code?: unknown }).code : undefined;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

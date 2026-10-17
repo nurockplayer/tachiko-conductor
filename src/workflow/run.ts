@@ -16,7 +16,7 @@ import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import type { HostedCheckPolicyConfiguration, ValidationAdapter } from '../adapters/validation.js';
 import { activeHostedPolicyIdentity, activeLocalPolicyIdentity, applyTransition, isReviewFresh, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
-import { isValidationResultCoherent } from '../domain/validation.js';
+import { isValidationResultCoherent, localValidationHasUnsettledProcessFamily } from '../domain/validation.js';
 import type { AgentResult, ExecutorIdentity, HostedValidationEvidence, LocalValidationEvidence, Run, Target, ValidationResult } from '../domain/types.js';
 import {
   createCompletionInputFromResult,
@@ -460,7 +460,8 @@ function unavailableLocalValidation(): LocalValidationEvidence {
 }
 
 function combineValidation(headSha: string, local: LocalValidationEvidence, hosted: HostedValidationEvidence): ValidationResult {
-  const status = local.status === 'failed' || hosted.status === 'failed'
+  const status = localValidationHasUnsettledProcessFamily(local) ? 'unknown'
+    : local.status === 'failed' || hosted.status === 'failed'
     ? 'failed'
     : local.status === 'unknown' || hosted.status === 'unknown'
         ? 'unknown'
@@ -490,7 +491,13 @@ async function validateExactHead(
   if (local === undefined) {
     onExecutionStart?.();
     beforeValidation?.();
-    local = await validation!.validate({ target, headSha: run.headSha, ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }) });
+    local = await validation!.validate({
+      target,
+      headSha: run.headSha,
+      ...(run.bootstrap === undefined ? {} : { workspacePath: run.bootstrap.workspacePath }),
+      runId: run.id,
+      ...(beforeValidation === undefined ? {} : { beforeSpawn: beforeValidation }),
+    });
   }
   return combineValidation(run.headSha, local, hostedValidation(snapshot, hostedPolicy));
 }
@@ -581,6 +588,11 @@ export async function runWorkflow(
   const target = run.target;
 
   for (;;) {
+    if (!isTerminal(run.state) && run.state !== 'NEEDS_HUMAN' && run.state !== 'WAITING_DEPENDENCY' &&
+        localValidationHasUnsettledProcessFamily(run.validationResult?.local)) {
+      return park(run, 'Local validation process-family settlement remains unproven; further execution is held.',
+        store, now, [CANCEL_RUN_DECISION]);
+    }
     switch (run.state) {
       case 'READY':
         {
@@ -1332,6 +1344,29 @@ export async function runWorkflow(
           );
           if (!updateIfCurrent(store, validationExpected, run)) return staleWorkflowOutcome(run.id, validationExpected, store, 'Run changed while validation failure was being recorded; preserving the newer Run.');
           return { outcome: 'needs_human', run, reason };
+        }
+        // A fresh settlement refusal is durable safety evidence. Retain it
+        // before any later authority read or external await can lose it.
+        if (localValidationHasUnsettledProcessFamily(validationResult.local)) {
+          const reason = 'Local validation process-family settlement remains unproven; further execution is held.';
+          const held = applyTransition(validationExpected, {
+            type: 'escalate', reason, validationResult,
+            pullRequest: { number: snapshot.pullRequest.number, headSha: validationHeadSha! },
+            interrupt: { evidence: reason, choices: [CANCEL_RUN_DECISION] },
+          }, now());
+          let retained: boolean;
+          try {
+            const compareAndSwap = store.updateIfUnchanged;
+            if (compareAndSwap === undefined) throw new Error('Strict Run compare-and-swap is unavailable while retaining settlement refusal.');
+            retained = compareAndSwap.call(store, validationExpected, held);
+          } catch (cause) {
+            throw new ExecutionAdmissionRefusal('The fresh settlement refusal could not be retained; execution is held.', false,
+              { cause, authorityUnknown: true });
+          }
+          if (!retained) {
+            throw new ExecutionAdmissionRefusal('The Run changed before its fresh settlement refusal could be retained; execution is held.', true);
+          }
+          return { outcome: 'needs_human', run: held, reason };
         }
         const currentValidation = activeValidationConfiguration(deps);
         const currentInvalidAuthority = invalidValidationAuthority(currentValidation);

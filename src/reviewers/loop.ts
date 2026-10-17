@@ -14,7 +14,7 @@ import { createCompletionInputFromResult, recordCompletionTelemetry, recordSpawn
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../adapters/github.js';
 import type { ReviewerAdapter } from '../adapters/reviewer.js';
 import { applyTransition, isTerminal, isValidationFresh, validationEvidenceMatchesActive, type ActiveValidationConfiguration } from '../domain/state-machine.js';
-import { isValidationResultCoherent } from '../domain/validation.js';
+import { isValidationResultCoherent, localValidationHasUnsettledProcessFamily } from '../domain/validation.js';
 import type { AgentResult, ReviewResult, Run, Target } from '../domain/types.js';
 import {
   activeRepairAdmission,
@@ -443,6 +443,10 @@ export async function runReviewLoop(
   }
 
   for (;;) {
+    if (localValidationHasUnsettledProcessFamily(run.validationResult?.local)) {
+      return parkRepairAuthority(run, 'Local validation process-family settlement remains unproven; further execution is held.',
+        store, now, [CANCEL_RUN_DECISION]);
+    }
     if (run.state === 'CHANGES_REQUESTED') {
       const validationFailure = run.validationResult?.status === 'failed';
       if (validationFailure) {

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, realpathSync, renameSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
@@ -224,6 +224,41 @@ describe('dispatch scheduler boundary', () => {
     }
   });
 
+  it('hands a prepared publication anchor through rollback without discarding a linked owner', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-prepared-owner-'));
+    const lockPath = path.join(directory, 'prepared.lock');
+    const events: string[] = [];
+    let prelink = false;
+    let failPublicationBarrier = true;
+    try {
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath,
+        preparePublication: (publication) => {
+          assert.equal(publication.temporaryPath.startsWith(`${lockPath}.tmp-`), true);
+          assert.equal(typeof publication.generation.dev, 'bigint');
+          assert.equal(typeof publication.generation.ino, 'bigint');
+          events.push('prepared');
+          return {
+            discardUnpublished: () => { events.push('discard'); },
+            beforeRollbackUnlink: () => { events.push('guard'); },
+            afterRollbackUnlink: () => { events.push('unlinked'); },
+          };
+        },
+        beforeCanonicalLink: () => { prelink = true; events.push('prelink'); },
+        syncDirectory: (directoryPath) => {
+          if (prelink && failPublicationBarrier) {
+            failPublicationBarrier = false;
+            throw new Error('prepared publication barrier failure');
+          }
+          syncDirectory(directoryPath);
+        },
+      }), /prepared publication barrier failure/);
+      assert.deepEqual(events, ['prepared', 'prelink', 'guard', 'unlinked']);
+      assert.equal(existsSync(lockPath), false, 'the exact linked owner was rolled back only after its guard');
+      assert.deepEqual(readdirSync(directory), [], 'the temporary alias is retired after rollback');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
   it('reclaims versioned same-host locks only across reboot or process-start mismatch', () => {
     const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-incarnation-'));
     const lockPath = path.join(directory, 'once.lock');
@@ -349,6 +384,164 @@ describe('dispatch scheduler boundary', () => {
     } finally {
       rmSync(directory, { recursive: true, force: true });
     }
+  });
+
+  it('charges each bounded symlink claim and keeps the finite winning-claim lane', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-budgeted-claims-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const stale = { nonce: 'budgeted-crashed-root', pid: 41 };
+    const root = `${lockPath}.${createHash('sha256').update(JSON.stringify(stale)).digest('hex')}.stale-takeover`;
+    let chargedBytes = 0;
+    const policy = (limit: number) => ({
+      maxRecordBytes: 4096,
+      symlinkReadBytes: 4096,
+      accountRead: (bytes: number) => {
+        if (chargedBytes + bytes > limit) throw new Error('metadata-read budget exhausted');
+        chargedBytes += bytes;
+      },
+      reserveReadBytes: (bytes: number) => {
+        if (chargedBytes + bytes > limit) throw new Error('metadata-read budget exhausted');
+        chargedBytes += bytes;
+        let remaining = bytes;
+        let active = true;
+        return {
+          accountRead: (count: number) => {
+            if (!active || count > remaining) throw new Error('metadata-read budget exhausted');
+            remaining -= count;
+          },
+          releaseUnused: () => {
+            if (!active) return;
+            chargedBytes -= remaining;
+            active = false;
+          },
+        };
+      },
+    });
+    try {
+      writeFileSync(lockPath, JSON.stringify(stale));
+      let takeoverPath = root;
+      const claims: string[] = [];
+      for (let index = 0; index < 8; index += 1) {
+        const previousClaim = { nonce: `budgeted-dead-claim-${index}`, pid: 50 + index };
+        symlinkSync(JSON.stringify(previousClaim), takeoverPath);
+        claims.push(takeoverPath);
+        takeoverPath = `${root}.${createHash('sha256').update(JSON.stringify(previousClaim)).digest('hex')}.recovery`;
+      }
+      const recovered = acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'budgeted-live-winner', isProcessAlive: () => false, readPolicy: policy(1_000_000),
+      });
+      assert.ok(chargedBytes > 20 * 1024, 'every distinct historical symlink is charged at the qualified 4 KiB ceiling');
+      assert.ok(claims.every((claim) => readlinkSync(claim).length > 0), 'claim history remains immutable');
+      assert.equal((JSON.parse(readlinkSync(takeoverPath)) as { nonce: string }).nonce, 'budgeted-live-winner');
+      recovered.release();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('preserves a byte-identical canonical owner replacement after creating a bounded takeover claim', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-generation-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const pinnedOriginalPath = path.join(directory, 'original-owner.pin');
+    const staleBytes = JSON.stringify({ nonce: 'generation-crashed-owner', pid: 41 });
+    const takeoverPath = `${lockPath}.${createHash('sha256').update(staleBytes).digest('hex')}.stale-takeover`;
+    let chargedBytes = 0;
+    let replacementInstalled = false;
+    try {
+      writeFileSync(lockPath, staleBytes);
+      const originalGeneration = statSync(lockPath);
+      linkSync(lockPath, pinnedOriginalPath);
+      const installReplacement = () => {
+        if (replacementInstalled || !lstatSync(takeoverPath).isSymbolicLink()) return;
+        const replacementPath = path.join(directory, 'replacement-owner.tmp');
+        writeFileSync(replacementPath, staleBytes);
+        renameSync(replacementPath, lockPath);
+        replacementInstalled = true;
+      };
+      const readPolicy = {
+        maxRecordBytes: 4096,
+        symlinkReadBytes: 4096,
+        accountRead: (bytes: number) => {
+          if (chargedBytes + bytes > 100_000) throw new Error('metadata-read budget exhausted');
+          chargedBytes += bytes;
+        },
+        reserveReadBytes: (bytes: number) => {
+          if (chargedBytes + bytes > 100_000) throw new Error('metadata-read budget exhausted');
+          chargedBytes += bytes;
+          let remaining = bytes;
+          let active = true;
+          const accountReservedRead = (count: number) => {
+            if (!active || count > remaining) throw new Error('metadata-read budget exhausted');
+            remaining -= count;
+          };
+          return {
+            get accountRead() {
+              // The source reads this getter after creating the fresh claim,
+              // then passes the returned callback into boundedRecordFromDescriptor.
+              // Replace now, before that reader's first lstat, so its own
+              // descriptor/path generation checks see a stable replacement.
+              installReplacement();
+              return accountReservedRead;
+            },
+            releaseUnused: () => {
+              if (active) { chargedBytes -= remaining; active = false; }
+            },
+          };
+        },
+      };
+
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath,
+        nonce: () => 'generation-live-successor',
+        isProcessAlive: () => false,
+        readPolicy,
+      }), DispatchInvocationLockedError);
+
+      assert.equal(replacementInstalled, true, 'replacement is installed after the fresh claim exists');
+      assert.equal(readFileSync(lockPath, 'utf8'), staleBytes, 'byte-identical foreign replacement remains canonical');
+      const replacementGeneration = statSync(lockPath);
+      const pinnedGeneration = statSync(pinnedOriginalPath);
+      assert.equal(pinnedGeneration.dev, originalGeneration.dev);
+      assert.equal(pinnedGeneration.ino, originalGeneration.ino, 'hard link pins the original inode against reuse');
+      assert.notEqual(replacementGeneration.ino, originalGeneration.ino, 'canonical path names a different inode');
+      assert.equal((JSON.parse(readlinkSync(takeoverPath)) as { nonce: string }).nonce, 'generation-live-successor',
+        'fresh claim history remains intact when takeover refuses the new generation');
+      assert.ok(chargedBytes >= 2 * Buffer.byteLength(staleBytes), 'both admitted owner generations remain charged');
+    } finally { rmSync(directory, { recursive: true, force: true }); }
+  });
+
+  it('refuses a fresh live claim before creation when its bounded continuation cannot be reserved', () => {
+    const directory = mkdtempSync(path.join(os.tmpdir(), 'tachiko-dispatch-lock-reservation-'));
+    const lockPath = path.join(directory, 'once.lock');
+    const stale = { nonce: 'reservation-crashed-root', pid: 41 };
+    const root = `${lockPath}.${createHash('sha256').update(JSON.stringify(stale)).digest('hex')}.stale-takeover`;
+    const makePolicy = (limit: number) => {
+      let charged = 0;
+      return {
+        maxRecordBytes: 4096, symlinkReadBytes: 4096,
+        accountRead: (bytes: number) => { if (charged + bytes > limit) throw new Error('metadata-read budget exhausted'); charged += bytes; },
+        reserveReadBytes: (bytes: number) => {
+          if (charged + bytes > limit) throw new Error('metadata-read budget exhausted');
+          charged += bytes;
+          let remaining = bytes;
+          let active = true;
+          return {
+            accountRead: (count: number) => { if (!active || count > remaining) throw new Error('metadata-read budget exhausted'); remaining -= count; },
+            releaseUnused: () => { if (active) { charged -= remaining; active = false; } },
+          };
+        },
+      };
+    };
+    try {
+      writeFileSync(lockPath, JSON.stringify(stale));
+      assert.throws(() => acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'first-live-winner', isProcessAlive: () => false, readPolicy: makePolicy(4096),
+      }), /metadata-read budget exhausted/);
+      assert.equal(existsSync(root), false, 'no claim naming this still-live process is published without its full continuation reserve');
+      const recovered = acquireDispatchInvocationLock({
+        lockPath, nonce: () => 'later-live-winner', isProcessAlive: () => false, readPolicy: makePolicy(1_000_000),
+      });
+      assert.equal((JSON.parse(readlinkSync(root)) as { nonce: string }).nonce, 'later-live-winner');
+      recovered.release();
+    } finally { rmSync(directory, { recursive: true, force: true }); }
   });
 
   it('fails closed on a deep live claim and on a repeated recovery path', () => {

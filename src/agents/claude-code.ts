@@ -266,7 +266,7 @@ export class ClaudeCodeAdapter implements ImplementationAgent {
       }
       return failureAgentResult(
         CLAUDE_ERROR_CODE.EXEC_FAILURE,
-        `Failed to run Claude Code: ${message(error)}`,
+        'Failed to run Claude Code.',
         durationMs,
         resumeSessionId,
       );
@@ -417,10 +417,6 @@ function errorCode(error: unknown): unknown {
 
 function executorIdentity(sessionId: string | undefined): ExecutorIdentity | undefined {
   return sessionId === undefined ? undefined : { provider: CLAUDE_CODE_PROVIDER, sessionId };
-}
-
-function message(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }
 
 function formatTarget(target: Target): string {

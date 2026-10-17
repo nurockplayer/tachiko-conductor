@@ -1,11 +1,14 @@
 import type { LocalValidationEvidence } from '../domain/types.js';
 import type { IssueTarget } from '../domain/types.js';
 import type { HostedCheckPolicy } from '../validation/hosted-policy.js';
+import type { ToolOutputPolicy, ToolOutputStore } from '../evidence/tool-output.js';
 
 /** One explicitly configured executable and its bounded wall-clock limit. */
 export interface LocalValidationCommandConfiguration {
   readonly argv: readonly string[];
   readonly timeoutMs: number;
+  /** Explicit authorization to retain this command's raw output as evidence. */
+  readonly captureOutput?: boolean;
 }
 
 /** Repository/run-owned local validation configuration. */
@@ -32,6 +35,9 @@ export interface LocalValidationConfiguration {
    * must exactly match before local commands may consume those bytes.
    */
   readonly trustedIgnoredBaselinePath?: string;
+  /** Explicit host-owned store; absence keeps command output transient. */
+  readonly outputStore?: ToolOutputStore;
+  readonly outputPolicy?: ToolOutputPolicy;
 }
 
 /** Explicit repository/run policy used to interpret the live hosted check list. */
@@ -48,6 +54,10 @@ export interface ValidationRequest {
   readonly headSha: string;
   /** Owned worktree verified by the implementation bootstrap, when available. */
   readonly workspacePath?: string;
+  /** Attribution only; lifecycle is owned by this validate() operation. */
+  readonly runId?: string;
+  /** Synchronous admission fence invoked immediately before each child spawn. */
+  readonly beforeSpawn?: () => void;
 }
 
 /** Provider-neutral boundary for Conductor-observed local validation. */

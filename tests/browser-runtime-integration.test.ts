@@ -15,6 +15,7 @@ import {
   BrowserRuntimeError,
   ManagedPlaywrightMcpRuntime,
   type BrowserRuntimeHandle,
+  type BrowserRuntimeSnapshot,
 } from '../src/browser/playwright-mcp-runtime.js';
 import { openBrowserForBootstrap } from '../src/browser/mcp-client.js';
 
@@ -42,18 +43,78 @@ function reportIntegrationPhase(startedAt: number, phase: string, state: 'start'
 
 async function withClient<T>(endpoint: string, action: (client: Client) => Promise<T>, diagnostic?: { readonly startedAt: number; readonly label: string }): Promise<T> {
   const client = new Client({ name: 'tachiko-browser-integration-test', version: '0.1.0' });
+  const endpointUrl = new URL(endpoint);
+  const nativeFetch = globalThis.fetch;
+  let firstEndpointGetSeen = false;
+  let resolveReady!: () => void;
+  let rejectReady!: (error: unknown) => void;
+  const readiness = new Promise<void>((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+  const readinessOutcome = readiness.then(
+    () => ({ kind: 'ready' as const }),
+    (error: unknown) => ({ kind: 'error' as const, error }),
+  );
+  const readinessFetch: typeof fetch = (input, init) => {
+    let requestUrl: URL;
+    try {
+      requestUrl = new URL(input instanceof Request ? input.url : input.toString(), endpointUrl);
+    } catch {
+      return nativeFetch(input, init);
+    }
+    const method = (init?.method ?? (input instanceof Request ? input.method : 'GET')).toUpperCase();
+    if (requestUrl.href !== endpointUrl.href || method !== 'GET' || firstEndpointGetSeen) {
+      return nativeFetch(input, init);
+    }
+    firstEndpointGetSeen = true;
+
+    const requestHeaders = new Headers(input instanceof Request ? input.headers : undefined);
+    new Headers(init?.headers).forEach((value, name) => requestHeaders.set(name, value));
+    const requestSessionId = requestHeaders.get('mcp-session-id');
+    try {
+      return nativeFetch(input, init).then((response) => {
+        const mediaType = response.headers.get('content-type')?.split(';', 1)[0]?.trim().toLowerCase();
+        const responseSessionId = response.headers.get('mcp-session-id');
+        if (response.status === 200 && mediaType === 'text/event-stream' && response.body !== null &&
+          requestSessionId !== null && requestSessionId.length > 0 && responseSessionId === requestSessionId) {
+          resolveReady();
+        } else {
+          rejectReady(new Error('The integration MCP event stream was not established for the initialized session.'));
+        }
+        return response;
+      }, (error: unknown) => {
+        rejectReady(error instanceof Error ? error : new Error(String(error)));
+        throw error;
+      });
+    } catch (error) {
+      rejectReady(error instanceof Error ? error : new Error(String(error)));
+      throw error;
+    }
+  };
   const phase = (name: string, state: 'start' | 'done') => {
     if (diagnostic !== undefined) reportIntegrationPhase(diagnostic.startedAt, `${diagnostic.label}.${name}`, state);
   };
+  let readinessTimer: ReturnType<typeof setTimeout> | undefined;
   try {
     phase('connect', 'start');
-    await client.connect(new StreamableHTTPClientTransport(new URL(endpoint)));
+    await client.connect(new StreamableHTTPClientTransport(endpointUrl, { fetch: readinessFetch }));
     phase('connect', 'done');
+    phase('event-stream-ready', 'start');
+    const timedOut = new Promise<{ readonly kind: 'timeout' }>((resolve) => {
+      readinessTimer = setTimeout(() => resolve({ kind: 'timeout' }), 5_000);
+    });
+    const ready = await Promise.race([readinessOutcome, timedOut]);
+    if (readinessTimer !== undefined) {
+      clearTimeout(readinessTimer);
+      readinessTimer = undefined;
+    }
+    if (ready.kind === 'timeout') throw new Error('Timed out waiting for the integration MCP event stream.');
+    if (ready.kind === 'error') throw ready.error;
+    phase('event-stream-ready', 'done');
     phase('tool-action', 'start');
     const result = await action(client);
     phase('tool-action', 'done');
     return result;
   } finally {
+    if (readinessTimer !== undefined) clearTimeout(readinessTimer);
     phase('close', 'start');
     await client.close().catch(() => undefined);
     phase('close', 'done');
@@ -164,8 +225,46 @@ describe('managed Playwright MCP integration', () => {
     });
     let first: BrowserRuntimeHandle | undefined;
     let second: BrowserRuntimeHandle | undefined;
+    let firstSnapshot: BrowserRuntimeSnapshot | undefined;
+    let firstStopSnapshot: BrowserRuntimeSnapshot | undefined;
+    let firstStopElapsedMs: number | undefined;
+    let secondNavigationDiagnostic: { readonly isError: unknown; readonly text: string } | undefined;
+    let secondReadDiagnostic: { readonly isError: unknown; readonly text: string } | undefined;
+    const boundedToolResult = (value: unknown): { readonly isError: unknown; readonly text: string } => {
+      if (typeof value !== 'object' || value === null) return { isError: undefined, text: '' };
+      const toolResult = value as { readonly isError?: unknown; readonly content?: unknown };
+      const text = Array.isArray(toolResult.content)
+        ? toolResult.content.slice(0, 4).flatMap((item: unknown) => {
+          if (typeof item !== 'object' || item === null) return [];
+          const entry = item as { readonly type?: unknown; readonly text?: unknown };
+          return entry.type === 'text' && typeof entry.text === 'string' ? [entry.text.slice(0, 320)] : [];
+        }).join('\n').slice(0, 1_200)
+        : '';
+      return { isError: toolResult.isError, text };
+    };
+    const persistenceDiagnostic = (): string => JSON.stringify({
+      fixtureOrigin: new URL(fixtureUrl).origin,
+      profileRoot: path.join(root, 'profiles'),
+      firstRuntimeId: firstSnapshot?.runtimeId,
+      firstProfile: firstSnapshot?.profile,
+      firstStopElapsedMs,
+      firstStopSnapshot: firstStopSnapshot === undefined ? undefined : {
+        runtimeId: firstStopSnapshot.runtimeId,
+        profile: firstStopSnapshot.profile,
+        state: firstStopSnapshot.state,
+        health: firstStopSnapshot.health,
+        exitCode: firstStopSnapshot.exitCode,
+        exitSignal: firstStopSnapshot.exitSignal,
+        stoppedAt: firstStopSnapshot.stoppedAt,
+      },
+      secondRuntimeId: second?.snapshot.runtimeId,
+      secondProfile: second?.snapshot.profile,
+      secondNavigation: secondNavigationDiagnostic,
+      secondRead: secondReadDiagnostic,
+    });
     try {
       first = await runtime.start({ profile: 'persistent', port: await freePort(), headless: true });
+      firstSnapshot = first.snapshot;
       assert.equal(first.snapshot.host, '127.0.0.1');
       await assert.rejects(
         runtime.start({ profile: 'persistent', port: await freePort(), headless: true }),
@@ -195,19 +294,23 @@ describe('managed Playwright MCP integration', () => {
         assert.notEqual(written.isError, true);
         assert.match(contentText(written), /state-from-first-session/);
       });
-      await first.stop();
+      const firstStopStartedAt = Date.now();
+      firstStopSnapshot = await first.stop();
+      firstStopElapsedMs = Date.now() - firstStopStartedAt;
       first = undefined;
 
       second = await runtime.start({ profile: 'persistent', port: await freePort(), headless: true });
       await withClient(second.snapshot.endpoint, async (client) => {
         const navigation = await client.callTool({ name: 'browser_navigate', arguments: { url: fixtureUrl } });
-        assert.notEqual(navigation.isError, true);
+        secondNavigationDiagnostic = boundedToolResult(navigation);
+        assert.notEqual(navigation.isError, true, `second same-profile navigation failed; bounded runtime context=${persistenceDiagnostic()}`);
         const read = await client.callTool({
           name: 'browser_evaluate',
           arguments: { function: "() => localStorage.getItem('tachiko-persistent')" },
         });
-        assert.notEqual(read.isError, true);
-        assert.match(contentText(read), /state-from-first-session/);
+        secondReadDiagnostic = boundedToolResult(read);
+        assert.notEqual(read.isError, true, `second same-profile read failed; bounded runtime context=${persistenceDiagnostic()}`);
+        assert.match(contentText(read), /state-from-first-session/, `persisted value missing; bounded runtime context=${persistenceDiagnostic()}`);
       });
     } finally {
       await first?.stop().catch(() => undefined);

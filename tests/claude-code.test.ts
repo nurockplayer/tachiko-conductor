@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { ClaudeCodeAdapter, NodeClaudeProcessRunner } from '../src/agents/claude-code.js';
+import { InMemoryToolOutputStore, boundToolOutput } from '../src/evidence/tool-output.js';
 import type { ClaudeProcessRunner, ClaudeRunOptions } from '../src/agents/claude-code.js';
 import type { GitHubAdapter, GitHubLiveSnapshot } from '../src/adapters/github.js';
 import { ExecutionAdmissionRefusal, GOVERNED_PUBLICATION_CONFINEMENT_REQUIRED, WorkspaceGuardFailure } from '../src/adapters/agent.js';
@@ -93,7 +94,12 @@ describe('ClaudeCodeAdapter', () => {
   });
 
   it('runs claude with an argument array and converts a JSON result to a success AgentResult', async () => {
-    const runner = new FakeRunner([result(claudeJson('implemented')), result(HEAD)]);
+    const sentinel = 'PRIVATE_PROVIDER_TRANSCRIPT_SENTINEL';
+    const output = boundToolOutput({
+      outcome: 'passed', exitCode: 0, stdout: sentinel, stderr: '', store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
+    });
+    const runner = new FakeRunner([{ ...result(claudeJson('implemented')), output }, result(HEAD)]);
     const adapter = new ClaudeCodeAdapter({ runner, cwd: '/tmp/repo', timeoutMs: 9000 });
 
     const agentResult = await adapter.run({ target: TARGET, baseSha: 'base-1', instructions: 'Fix it.' });
@@ -102,6 +108,8 @@ describe('ClaudeCodeAdapter', () => {
     assert.equal(agentResult.summary, 'implemented');
     assert.equal(agentResult.headSha, HEAD);
     assert.equal(agentResult.sessionId, 'sess-1');
+    assert.equal(Object.hasOwn(agentResult, 'output'), false);
+    assert.doesNotMatch(JSON.stringify(agentResult), new RegExp(sentinel));
     assert.deepEqual(agentResult.executor, { provider: 'claude-code', sessionId: 'sess-1' });
     assert.equal(typeof agentResult.durationMs, 'number');
     assert.deepEqual(runner.calls[0]?.options, { timeoutMs: 9000, cwd: '/tmp/repo' });
@@ -154,13 +162,28 @@ describe('ClaudeCodeAdapter', () => {
     assert.equal(runner.calls.length, 1);
   });
 
+  it('does not attach injected provider output evidence on a non-zero exit', async () => {
+    const output = boundToolOutput({
+      outcome: 'failed', exitCode: 19, stdout: 'noise '.repeat(100), stderr: 'ERROR: claude crashed\n',
+      store: new InMemoryToolOutputStore(),
+      policy: { previewBytes: 32, diagnosticBytes: 128, maxDiagnostics: 4, readBytes: 128 },
+    });
+    const agentResult = await new ClaudeCodeAdapter({
+      runner: new FakeRunner([{ ...result('', 'ERROR: claude crashed\n', 19), output }]), cwd: '/tmp/repo',
+    }).run({ target: TARGET, baseSha: 'base-1' });
+
+    assert.equal(agentResult.exitStatus, 'failure');
+    assert.equal(Object.hasOwn(agentResult, 'output'), false);
+  });
+
   it('maps is_error results, timeouts, missing executables, and invalid structured output deterministically', async () => {
+    const sentinel = 'PRIVATE_PROVIDER_TRANSCRIPT_SENTINEL';
     const cases: Array<{ outcome: ProcessResult | Error; code: string }> = [
       { outcome: result(claudeJson('failed', { is_error: true })), code: 'CLAUDE_ERROR' },
-      { outcome: Object.assign(new Error('timed out'), { code: 'ETIMEDOUT' }), code: 'CLAUDE_TIMEOUT' },
-      { outcome: Object.assign(new Error('spawn claude ENOENT'), { code: 'ENOENT' }), code: 'CLAUDE_NOT_FOUND' },
-      { outcome: result('{bad json'), code: 'CLAUDE_INVALID_OUTPUT' },
-      { outcome: result('{}'), code: 'CLAUDE_INVALID_OUTPUT' },
+      { outcome: Object.assign(new Error(`timed out: ${sentinel}`), { code: 'ETIMEDOUT', processOutput: sentinel }), code: 'CLAUDE_TIMEOUT' },
+      { outcome: Object.assign(new Error(`spawn claude ENOENT: ${sentinel}`), { code: 'ENOENT', processOutput: sentinel }), code: 'CLAUDE_NOT_FOUND' },
+      { outcome: result(`{bad json ${sentinel}`, sentinel), code: 'CLAUDE_INVALID_OUTPUT' },
+      { outcome: result('{}', sentinel), code: 'CLAUDE_INVALID_OUTPUT' },
       { outcome: result(JSON.stringify({ type: 'result', result: 42, is_error: false })), code: 'CLAUDE_INVALID_OUTPUT' },
     ];
     for (const { outcome, code } of cases) {
@@ -170,6 +193,23 @@ describe('ClaudeCodeAdapter', () => {
       assert.equal(agentResult.exitStatus, 'failure', `expected failure for ${code}`);
       assert.match(agentResult.diagnostics?.join('\n') ?? '', new RegExp(code));
       assert.equal(typeof agentResult.durationMs, 'number');
+      assert.doesNotMatch(JSON.stringify(agentResult), new RegExp(sentinel));
+      assert.equal(Object.hasOwn(agentResult, 'output'), false);
+    }
+  });
+
+  it('keeps cancellation and generic spawn errors free of untrusted error text', async () => {
+    const sentinel = 'PRIVATE_PROVIDER_TRANSCRIPT_SENTINEL';
+    const cases = [
+      Object.assign(new Error(`cancelled: ${sentinel}`), { code: 'ABORT_ERR', processOutput: sentinel }),
+      Object.assign(new Error(`spawn failure: ${sentinel}`), { code: 'EIO', processOutput: sentinel }),
+    ];
+    for (const error of cases) {
+      const agentResult = await new ClaudeCodeAdapter({ runner: new FakeRunner([error]), cwd: '/tmp/repo' })
+        .run({ target: TARGET, baseSha: 'base-1' });
+      assert.equal(agentResult.exitStatus, 'failure');
+      assert.doesNotMatch(JSON.stringify(agentResult), new RegExp(sentinel));
+      assert.equal(Object.hasOwn(agentResult, 'output'), false);
     }
   });
 
@@ -441,6 +481,7 @@ describe('NodeClaudeProcessRunner', () => {
       { timeoutMs: 1_000, cwd: process.cwd() },
     );
 
-    assert.deepEqual(child, { stdout: 'closed', stderr: '', exitCode: 0 });
+    assert.deepEqual({ stdout: child.stdout, stderr: child.stderr, exitCode: child.exitCode }, { stdout: 'closed', stderr: '', exitCode: 0 });
+    assert.equal(child.output, undefined);
   });
 });

@@ -8,7 +8,8 @@ import {
   applyTransition,
   isValidationFresh,
 } from '../src/domain/state-machine.js';
-import type { Run, WorkflowState } from '../src/domain/types.js';
+import type { LocalValidationEvidence, Run, WorkflowState } from '../src/domain/types.js';
+import { isValidationResultCoherent, localValidationHasUnsettledProcessFamily } from '../src/domain/validation.js';
 import {
   T0,
   approval,
@@ -30,6 +31,53 @@ function runIn(state: WorkflowState, overrides: Partial<Run> = {}): Run {
 }
 
 describe('validation closure regressions', () => {
+  it('disambiguates typed command collisions while keeping typed and untyped refusal evidence conservative', () => {
+    const base = validationPassed(OLD_HEAD);
+    for (const kind of [undefined, 'process_family_settlement', 'command'] as const) {
+      const command = { ...(kind === undefined ? {} : { evidenceKind: kind }), commandIndex: 0,
+        executable: 'process-family-settlement', outcome: 'unavailable' as const, exitCode: null, durationMs: 0 };
+      const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [command] };
+      const result = { ...base, local, hosted: { ...base.hosted, status: 'failed' as const, overall: 'failing' as const },
+        status: kind === 'command' ? 'failed' : 'unknown' };
+      assert.equal(localValidationHasUnsettledProcessFamily(local), kind !== 'command');
+      assert.equal(isValidationResultCoherent(JSON.parse(JSON.stringify(result))), true);
+      assert.equal(isValidationResultCoherent({ ...result, status: kind === 'command' ? 'unknown' : 'failed' }), false);
+    }
+    const typed = { evidenceKind: 'process_family_settlement', commandIndex: 0, executable: 'process-family-settlement',
+      outcome: 'unavailable', exitCode: null, durationMs: 0 };
+    for (const change of [{ evidenceKind: 'invalid' }, { executable: 'node' }, { outcome: 'passed' }, { exitCode: 0 }, { durationMs: 1 }]) {
+      assert.equal(isValidationResultCoherent({ ...base, status: 'unknown', local: { ...base.local, status: 'unknown', commands: [{ ...typed, ...change }] } }), false);
+    }
+    assert.equal(isValidationResultCoherent({ ...base, status: 'unknown', local: { ...base.local, status: 'unknown', commands: [
+      typed, { commandIndex: 1, executable: 'git', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+    ] } }), false, 'typed refusal cannot precede a later command');
+  });
+
+  it('keeps explicit family-settlement uncertainty unknown ahead of hosted failure only', () => {
+    for (const code of [0, 7]) {
+      const local: LocalValidationEvidence = { status: 'unknown', configRevision: 'test-config-v1', commands: [
+        { commandIndex: 0, executable: 'node', outcome: code === 0 ? 'passed' : 'failed', exitCode: code, durationMs: 1 },
+        { commandIndex: 1, executable: 'process-family-settlement', outcome: 'unavailable', exitCode: null, durationMs: 0 },
+      ] };
+      const seed = validationPassed(OLD_HEAD);
+      const held = { ...seed, status: 'unknown', local, hosted: { ...seed.hosted, status: 'failed', overall: 'failing' } };
+      assert.equal(localValidationHasUnsettledProcessFamily(local), true);
+      assert.equal(isValidationResultCoherent(held), true);
+      assert.equal(isValidationResultCoherent({ ...held, status: 'failed' }), false);
+      assert.equal(isValidationResultCoherent({ ...held, status: 'passed' }), false);
+      const ordinary = { ...local, commands: [local.commands[0]!, { ...local.commands[1]!, executable: 'git' }] };
+      assert.equal(localValidationHasUnsettledProcessFamily(ordinary), false);
+      assert.equal(isValidationResultCoherent({ ...held, local: ordinary, status: 'failed' }), true,
+        'unrelated local unknown retains known hosted-failure precedence');
+      assert.equal(isValidationResultCoherent({ ...held, local: ordinary }), false);
+      assert.equal(localValidationHasUnsettledProcessFamily({ commands: [{ executable: 'process-family-settlement', outcome: 'passed' }] }), false);
+    }
+    let getterCalls = 0;
+    const command = { get executable() { getterCalls += 1; return 'process-family-settlement'; }, outcome: 'unavailable' };
+    assert.equal(localValidationHasUnsettledProcessFamily({ commands: [command] }), false);
+    assert.equal(getterCalls, 0, 'marker recognition must not invoke evidence accessors');
+  });
+
   it('treats removed or disabled active configuration identities as stale, not wildcards', () => {
     const run = runIn('FINAL_GATE', {
       headSha: OLD_HEAD,
