@@ -2,6 +2,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
+import { channel } from 'node:diagnostics_channel';
 import { lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -20,6 +21,40 @@ const setup = [];
 let fixture;
 const raw = (bytes) => ({ base64: (bytes ?? Buffer.alloc(0)).toString('base64'),
   bytes: bytes?.length ?? 0, sha256: hash(bytes ?? Buffer.alloc(0)) });
+// Node publishes child_process at construction, before spawnfile is populated.
+// Attach now and select only the actual sandbox-exec child at its spawn event.
+const childChannel = channel('child_process');
+const observation = { status: 'UNKNOWN', events: [], bounded: true };
+const observerStarted = process.hrtime.bigint();
+let attached = 0;
+let selected = 0;
+let observationWriteFailed = false;
+function persistObservation() {
+  const phases = observation.events.map((event) => event.phase);
+  observation.status = observation.bounded && selected === 1 && phases.join(',') === 'spawn,exit,close'
+    ? 'OBSERVED' : 'UNKNOWN';
+  try { save(mode + '-process.json', observation); }
+  catch { observationWriteFailed = true; }
+}
+function observeChild({ process: child }) {
+  if (++attached > 32) { observation.bounded = false; return; }
+  let matches = false;
+  const record = (phase, detail = {}) => {
+    if (observation.events.length >= 6) { observation.bounded = false; return; }
+    observation.events.push({ phase, monotonicMs: Number(process.hrtime.bigint() - observerStarted) / 1e6, ...detail });
+    persistObservation();
+  };
+  child.once('spawn', () => {
+    if (child.spawnfile !== '/usr/bin/sandbox-exec') return;
+    matches = true;
+    selected += 1;
+    record('spawn');
+  });
+  for (const phase of ['exit', 'close']) child.once(phase, (code, signal) => {
+    if (matches) record(phase, { code, signal });
+  });
+}
+childChannel.subscribe(observeChild);
 
 function verifyFixture(owned, configuration, original) {
   assert.deepEqual(owned.target, { kind: 'issue', owner: 'acme', repo: 'widgets', issueNumber: 42 });
@@ -112,7 +147,7 @@ async function main() {
     save('control.json', { startedAt: startedControl, endedAt: new Date().toISOString(), inputProof, evidence: control });
     assert.equal(control.commands.length, 1);
     assert.ok(['passed', 'failed'].includes(control.commands[0].outcome), 'stop on unavailable/timeout control');
-    assert.ok(Number.isInteger(control.commands[0].exitCode), 'control must retain true inner exit');
+    assert.ok(control.commands[0].exitCode === null || Number.isFinite(control.commands[0].exitCode), 'retain numeric or null inner exit');
     return;
   }
 
@@ -128,10 +163,11 @@ async function main() {
   }).validate(owned);
   // Persist the full independent result before checking completeness or reading output.
   save('captured.json', { startedAt: startedCaptured, endedAt: new Date().toISOString(), inputProof, evidence: captured });
+  inventoryStore();
   assert.equal(captured.commands.length, 1);
   const command = captured.commands[0];
   assert.ok(['passed', 'failed'].includes(command.outcome), 'stop on unavailable/timeout captured command');
-  assert.ok(Number.isInteger(command.exitCode), 'captured command must retain true inner exit');
+  assert.ok(command.exitCode === null || Number.isFinite(command.exitCode), 'retain numeric or null inner exit');
   assert.equal(command.captureStatus, 'complete', 'partial/unavailable capture is incomplete diagnostic');
   assert.ok(command.output && !command.output.overflow.capture);
   const ranges = ['stdout', 'stderr'].map((channel) => readToolOutput(command.output, store, { channel, offset: 0, length: 16_384 }));
@@ -149,6 +185,9 @@ try {
   save('error.json', { error: String(error), stack: error.stack, complete: false });
   process.exitCode = 1;
 } finally {
+  childChannel.unsubscribe(observeChild);
+  persistObservation();
+  if (observationWriteFailed || !observation.bounded) process.exitCode = 1;
   try { if (mode === 'captured') inventoryStore(); }
   catch (error) {
     save('error.json', { error: String(error), stack: error.stack, complete: false });

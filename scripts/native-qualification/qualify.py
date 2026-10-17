@@ -39,11 +39,6 @@ PUBLIC_LIMIT = 8 * 1024 * 1024
 SUMMARY_LIMIT = 16 * 1024
 CLT_ROOT = pathlib.Path('/Library/Developer/CommandLineTools')
 CLT_GIT = CLT_ROOT / 'usr/bin/git'
-DIAGNOSTIC_TESTS = (
-    'test_direct_exit_does_not_wait_for_descendant_output_eof',
-    'test_exec_failure_releases_guard_and_leaves_change_retryable',
-    'test_stalled_wake_times_out_without_consuming_change',
-)
 
 
 def utc():
@@ -68,6 +63,7 @@ def write_summary(path, value):
         mode = value.get('mode', 'native_qualification')
         value = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                  'mode': mode, 'native_gates': 'UNKNOWN' if mode == 'native_qualification' else 'NOT_RUN',
+                 'selection': 'adapter_pair_only' if mode == 'diagnostics_only' else None,
                  'status': {'provider_preflight_only': 'PREFLIGHT_FAIL',
                             'diagnostics_only': 'DIAGNOSTIC_FAIL'}.get(mode, 'FAIL'),
                  'reason': 'summary_oversize', 'evidence_encrypted': False,
@@ -120,7 +116,7 @@ class Qualification:
         self.failure_status = 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL'
         self.success_status = 'DIAGNOSTIC_COMPLETE' if diagnostics_only else 'PREFLIGHT_PASS' if preflight_only else 'PASS'
         self.git_capability = None
-        self.diagnostics = {'python': [], 'node': None, 'complete': False} if diagnostics_only else None
+        self.diagnostics = {'selection': 'adapter_pair_only', 'node': None, 'complete': False} if diagnostics_only else None
         self.diagnostic_files = []
         self.started = time.monotonic()
         self.runner_temp = pathlib.Path(os.environ['RUNNER_TEMP']).resolve(strict=True)
@@ -132,6 +128,7 @@ class Qualification:
         self.public.mkdir(mode=0o700, exist_ok=False)
         write_summary(self.public / 'summary.json', {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE,
                       'base': BASE, 'mode': self.mode, 'native_gates': 'NOT_RUN',
+                      'selection': 'adapter_pair_only' if diagnostics_only else None,
                       'status': self.failure_status, 'reason': 'collector_initializing',
                       'evidence_encrypted': False, 'production_qualification': False})
         self.logs = self.private / 'logs'
@@ -618,30 +615,8 @@ class Qualification:
             raise RuntimeError('git_required_syntax_local_object_failed')
 
     def diagnose(self):
-        # Selection is supplemental only: original script/main and unchanged assertions.
-        deadline = time.monotonic() + 240
-        for index, name in enumerate(DIAGNOSTIC_TESTS):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RuntimeError('python_diagnostic_total_bound')
-            record, output = self.run('python-diagnostic-' + str(index + 1),
-                ['/usr/bin/python3', 'scripts/bootstrap-heartbeat/test_runner.py', 'HeartbeatTest.' + name],
-                timeout=min(60, remaining), required=False)
-            text = output[0].read_text() + '\n' + output[1].read_text()
-            parsed = parse_python(text)
-            outcomes = re.findall(r'^' + re.escape(name) + r' \([^\n]+\) \.\.\. (ok|FAIL|ERROR)$', text, re.M)
-            finding = {'test_id': 'HeartbeatTest.' + name, 'exit_code': record['exit_code'],
-                       'outcome': outcomes[0] if len(outcomes) == 1 else 'INCOMPLETE',
-                       'elapsed_seconds': record['elapsed_seconds'],
-                       'counts': {key: parsed[key] for key in ['tests', 'pass', 'fail', 'skip', 'counts_complete']}}
-            self.diagnostics['python'].append(finding)
-            write_json(self.private / 'diagnostics.json', self.diagnostics)
-            if not record['observed_root'] or not record['observed_family_complete'] \
-                    or not record['original_group_absent'] or not record['raw_capture_complete'] \
-                    or record['timed_out'] or record['elapsed_seconds'] > 60 or time.monotonic() > deadline \
-                    or not parsed['counts_complete'] or parsed['tests'] != 1 or len(outcomes) != 1 \
-                    or record['exit_code'] != (0 if outcomes[0] == 'ok' else 1):
-                raise RuntimeError('python_diagnostic_infrastructure_incomplete')
+        # The completed Python selection remains historical; only this adapter pair runs.
+        write_json(self.private / 'diagnostics.json', self.diagnostics)
         deadline = time.monotonic() + 180
         for mode in ['control', 'captured']:
             remaining = deadline - time.monotonic()
@@ -663,7 +638,7 @@ class Qualification:
     def diagnostic_archive_files(self):
         # Evidence only: never traverse fixtures, dependencies, child homes or caches.
         root = self.private / 'node-diagnostic'
-        patterns = [r'(?:fixture|control|captured|comparison|error|store-manifest)\.json',
+        patterns = [r'(?:fixture|control|captured|comparison|error|store-manifest|control-process|captured-process)\.json',
                     r'store/[0-9a-f-]{36}\.(?:stdout|stderr)',
                     r'store/operations/(?:[0-9a-f-]{36}\.json|slot-[0-9]{4}\.json|index\.json)']
         files = []
@@ -787,6 +762,7 @@ class Qualification:
         summary = {'schema_version': 1, 'candidate': CANDIDATE, 'tree': TREE, 'base': BASE,
                    'provenance': self.provenance,
                    'mode': self.mode, 'native_gates': native_gates,
+                   'selection': 'adapter_pair_only' if self.diagnostics_only else None,
                    'diagnostics': self.diagnostics,
                    'status': self.success_status if passed else self.failure_status, 'source_unchanged': unchanged,
                    'python': public_python, 'node': public_node, 'versions': self.versions,
@@ -856,6 +832,7 @@ def main():
                        'tree': TREE, 'base': BASE,
                        'mode': 'diagnostics_only' if diagnostics_only else 'provider_preflight_only' if preflight_only else 'native_qualification',
                        'native_gates': 'NOT_RUN' if preflight_only or diagnostics_only else 'UNKNOWN',
+                       'selection': 'adapter_pair_only' if diagnostics_only else None,
                        'status': 'DIAGNOSTIC_FAIL' if diagnostics_only else 'PREFLIGHT_FAIL' if preflight_only else 'FAIL', 'reason': 'collector_failed',
                        'evidence_encrypted': False, 'production_qualification': False})
         print('Diagnostic collector failed; native gates NOT_RUN.' if diagnostics_only else
