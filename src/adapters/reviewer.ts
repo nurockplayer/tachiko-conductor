@@ -13,7 +13,9 @@ export interface NativeReviewContext {
 
 export interface NativeReviewBoundary {
   available(): boolean;
-  advance(context: NativeReviewContext & { readonly store: RunStore; readonly now: () => string; readonly onSubmission: (run: Run) => Run }): Promise<
+  /** Bounded evidence-only recovery; cannot issue, accept a verdict, or run a worker. */
+  observe?(context: NativeReviewContext & { readonly store: RunStore; readonly now: () => string }): Promise<{ readonly run: Run; readonly reason: string }>;
+  advance(context: NativeReviewContext & { readonly store: RunStore; readonly now: () => string; readonly onSubmission: (run: Run) => Run; readonly recoveryConfiguration?: import('../dispatch/config.js').DispatchConfiguration }): Promise<
     | { readonly outcome: 'wait'; readonly run: Run; readonly reason: string }
     | { readonly outcome: 'complete'; readonly run: Run; readonly result: ReviewResult }
     | { readonly outcome: 'superseded'; readonly run: Run; readonly reason: string }>;

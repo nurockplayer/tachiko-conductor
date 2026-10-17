@@ -31,7 +31,7 @@ import {
 } from '../domain/telemetry.js';
 import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, REESTABLISH_READINESS_DECISION } from '../domain/decisions.js';
 import { runReviewLoop } from '../reviewers/loop.js';
-import { nativeReviewReentry, parkNativeReview } from '../oracle/native-reviewer.js';
+import { nativeReviewReentry, parkNativeReview, unresolvedNativeReview, nativeReviewWaitKind } from '../oracle/native-reviewer.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import { activeRepairAdmission, generationlessAppServerPredecessor, resolveRepairPredecessor, unfinishedBoundRepairAttempt, type RepairAdmissionSnapshot } from '../domain/repair-admission.js';
 import type { RunStore } from '../store/json-file-store.js';
@@ -616,8 +616,23 @@ export async function runWorkflow(
   if (run.mergeAttempt?.submissionPossible) return { outcome: 'merge_ready', run: await observeNativeMerge(mergeContext(run)) };
   if (options.leadObservationOnly || unresolvedNativeLead(run) && !(run.state==='CHANGES_REQUESTED' || run.state==='WAITING_DEPENDENCY' && run.interruptedFrom==='CHANGES_REQUESTED')) {
     const snapshot=await github.readLiveSnapshot(run.target);
-    const observed=await deps.nativeLead?.observe({run,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(run),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
-    return {outcome:'waiting_dependency',run:observed?.run ?? run,reason:observed?.reason ?? 'HOLD permits no lead submission or repair; qualified observation unavailable.'};
+    const context=(current:Run)=>({run:current,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(current),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
+    const reasons:string[]=[];
+    if(unresolvedNativeReview(run)) {const observed=await reviewer.native?.observe?.(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified Oracle observation unavailable.');}
+    if(unresolvedNativeLead(run)) {const observed=await deps.nativeLead?.observe(context(run));run=observed?.run??run;reasons.push(observed?.reason??'Qualified lead observation unavailable.');}
+    if(unresolvedNativeReview(run) && nativeReviewWaitKind(run)==='qualification' && run.nativeReview?.wait?.kind!=='qualification') {
+      const next={...run,nativeReview:{...run.nativeReview!,wait:{kind:'qualification' as const,nextAttemptAt:new Date(Date.parse(now())+30_000).toISOString()}}};
+      if(!updateIfCurrent(store,run,next))return staleWorkflowOutcome(run.id,run,store,'Run changed before Oracle attention wait.');run=next;
+    }
+    return {outcome:'waiting_dependency',run,reason:reasons.join(' ')||'Issued recovery permits no submission or repair.'};
+  }
+  if (unresolvedNativeReview(run) && run.nativeReview?.requests.some(r=>r.identity.requestId!==run.nativeReview?.activeRequestId&&r.submissionPossible&&!r.terminalDigest) && run.state!=='REVIEWING' && !(run.state==='WAITING_DEPENDENCY'&&run.interruptedFrom==='REVIEWING') && run.nativeReview.wait?.kind!=='qualification') {
+    const snapshot=await github.readLiveSnapshot(run.target);
+    const observed=await reviewer.native?.observe?.({run,snapshot,store,now,assertCurrent:()=>assertPublicationAdmission(options),assertLiveClaim:options.assertReviewClaim===undefined?undefined:()=>options.assertReviewClaim!(run),...(options.admissionFence===undefined?{}:{owner:{missionId:options.admissionFence.productionMissionId,laneId:options.admissionFence.token.laneId,generation:options.admissionFence.token.generation}})});
+    run=observed?.run??run;const reason=observed?.reason??'Qualified historical Oracle observation unavailable.';
+    const parked=parkNativeReview(run,nativeReviewWaitKind(run),reason,now());
+    if(!updateIfCurrent(store,run,parked))return staleWorkflowOutcome(run.id,run,store,'Run changed during historical Oracle observation wait.');
+    return {outcome:'waiting_dependency',run:parked,reason};
   }
   if (reviewer.native && run.nativeReview?.repairLimit===undefined) {
     const next={...run,nativeReview:{...run.nativeReview,requests:run.nativeReview?.requests ?? [],repairLimit:options.maxReviewAttempts}};

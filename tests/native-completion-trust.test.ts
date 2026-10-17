@@ -13,20 +13,25 @@ import { applyTransition } from '../src/domain/state-machine.js';
 import { JsonFileStore } from '../src/store/json-file-store.js';
 import { JsonFileOracleReceiptStore } from '../src/oracle/receipt-store.js';
 import { hasAuthenticatedCompletion, type NativeCompletionHosts } from '../src/oracle/completion-proof.js';
-import { nativeReviewCoherent, unresolvedNativeReview, resolveNativeReviewer } from '../src/oracle/native-reviewer.js';
+import { nativeReviewCoherent, unresolvedNativeReview, resolveNativeReviewer, issuedReviewRecoveryConfiguration } from '../src/oracle/native-reviewer.js';
 import { nativeLeadCoherent, unresolvedNativeLead, validLeadEvidence, resolveNativeLead, leadConsumptionValid, nativeLeadReentry } from '../src/oracle/native-lead.js';
 import { runReviewLoop } from '../src/reviewers/loop.js';
 import { canonicalReviewTarget } from '../src/reviewers/risk-policy.js';
 import { oracleDigest, textDigest } from '../src/oracle/source-evidence.js';
-import { recoverRunAdmission, resumeCommand, isDispatchRunOwnerRetiredCommand, buildWorkflowDeps, main } from '../src/cli.js';
+import { recoverRunAdmission, resumeCommand, isDispatchRunOwnerRetiredCommand, buildWorkflowDeps, main, publishAdmissionRuntimeProjection } from '../src/cli.js';
 import { createHostAdmissionRegistry, resolveRunOwnerReceiptPath } from '../src/mission-admission/host-registry.js';
 import { readRunOwnerReceipt, writeRunOwnerReceipt } from '../src/mission-admission/run-owner-receipt.js';
-import { MissionAdmissionRegistry } from '../src/mission-admission/registry.js';
+import { GitHubDispatchRuntime } from '../src/dispatch/github-runtime.js';
+import { renderDispatchRuntime, selectDispatchRuntime } from '../src/dispatch/queue.js';
+import { LiveGitHubAdapter } from '../src/github/live-state.js';
+import { NodeProcessRunner } from '../src/github/transport.js';
+import { runWorkflow } from '../src/workflow/run.js';
+import { MissionAdmissionRegistry, deterministicMissionId } from '../src/mission-admission/registry.js';
 
 // No Git, service, worker, or subprocess fixture. Real file persistence, immutable
 // publication, HMAC authentication, store CAS and public command fences are used.
 // Controlled Run/request fixtures do not claim an actual implementation delivery.
-function fixture(role: 'review' | 'lead') {
+function fixture(role: 'review' | 'lead', canonicalOwner = false) {
   const root = mkdtempSync(path.join(os.tmpdir(), 'native-completion-trust-'));
   const receipts = new JsonFileOracleReceiptStore(path.join(root, 'host-receipts'));
   const sign = (e: any) => createHmac('sha256', 'controlled-test-authenticator-not-production').update(oracleDigest({ kind: e.kind, identity: e.identity, ...(e.kind === 'completion' ? { terminalSha256: e.terminalSha256 } : e.disposition ? { disposition: e.disposition } : { result: e.result }) })).digest('hex');
@@ -39,7 +44,7 @@ function fixture(role: 'review' | 'lead') {
   const diff = 'controlled original source manifest';
   const manifest = { baseSha, headSha, files, diff, sourceSha256: oracleDigest(files), diffSha256: textDigest(diff) };
   const run: any = { ...newRun(`trust-${role}`), dispatchClaimId: 'claim-trust', headSha, pullRequest: { number: 7, headSha } };
-  const reviewIdentity: any = { runId: run.id, claimId: run.dispatchClaimId, missionId: 'mission-trust', laneId: `run:${run.id}`, phase: 'review', role: 'independent-reviewer', targetKey: canonicalReviewTarget(run.target)!.key, repository: 'acme/widgets', pullRequestNumber: 7, baseSha, headSha, scope: 'complete-candidate', sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256, floor: 'R5', requestedEffort: 'Extra High', requestedModel: 'controlled-oracle', requestId: 'review-request', correlationId: 'review-request', ownerGeneration: 1, contractRevision: JSON.stringify([role === 'lead' ? 'original-contract' : undefined, 'original-contract']), policyRevision: 'independent-unpromoted-v1', bindingId: 'controlled-host' };
+  const reviewIdentity: any = { runId: run.id, claimId: run.dispatchClaimId, missionId: canonicalOwner ? deterministicMissionId({ repository: 'acme/widgets', issue: 42 }) : 'mission-trust', laneId: `run:${run.id}`, phase: 'review', role: 'independent-reviewer', targetKey: canonicalReviewTarget(run.target)!.key, repository: 'acme/widgets', pullRequestNumber: 7, baseSha, headSha, scope: 'complete-candidate', sourceSha256: manifest.sourceSha256, diffSha256: manifest.diffSha256, floor: 'R5', requestedEffort: 'Extra High', requestedModel: 'controlled-oracle', requestId: 'review-request', correlationId: 'review-request', ownerGeneration: 1, contractRevision: JSON.stringify([role === 'lead' ? 'original-contract' : undefined, 'original-contract']), policyRevision: 'independent-unpromoted-v1', bindingId: 'controlled-host' };
   const reviewRequest: any = { kind: 'request', id: 'review-request.request', identity: reviewIdentity, manifest };
   const origin: any = { kind: 'terminal', id: 'review-request.terminal', identity: reviewIdentity, result: { verdict: role === 'lead' ? 'request_changes' : 'approve', reviewerName: 'controlled-independent', headSha, findings: role === 'lead' ? [{ severity: 'blocking', summary: 'Bounded original finding' }] : [] }, authentication: { actorId: 'independent', model: reviewIdentity.requestedModel, effort: reviewIdentity.requestedEffort, transportReceipt: '' } };
   origin.authentication.transportReceipt = sign(origin);
@@ -414,6 +419,65 @@ for (const operation of ['update', 'CAS'] as const) {
   });
 }
 
+it('C2 an exact retired Oracle terminal attaches evidence without active identity or acceptance restoration', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.boundary.advance(f.context());
+    const r = f.store().read(f.run.id)!, q = r.nativeReview!.requests[0]!;
+    const retired: Run = { ...r, nativeReview: { ...r.nativeReview!, activeRequestId: undefined, requests: [{ ...q, status: 'retired', terminalStatus: 'incomplete', observations: 3, nextObservationAt: '2099-01-01T00:00:00.000Z' }] } };
+    assert.equal(f.store().updateIfUnchanged(r, retired), true);
+    f.receipts.recordNative(f.terminal(q.identity));
+    const observed = await f.boundary.observe!(f.context());
+    assert.equal(unresolvedNativeReview(observed.run), false); assert.equal(observed.run.nativeReview!.requests[0]!.status, 'retired');
+    assert.equal(observed.run.nativeReview!.requests[0]!.observations, 3); assert.equal(observed.run.nativeReview!.requests[0]!.failure, 'transport_failure');
+    assert.equal(observed.run.nativeReview!.activeRequestId, undefined); assert.equal(observed.run.nativeReview!.accepted, undefined);
+    assert.equal(f.reads().length, 0); assert.equal(f.submissions(), 1); assert.equal(f.boundary.validate(f.context()), false);
+  } finally { f.cleanup(); }
+});
+for (const failure of ['claim', 'CAS'] as const) {
+  it(`C2 inactive cache ${failure} loser preserves durable uncertainty and unrelated current history`, async () => {
+    const f = inactiveOracleFixture(); try {
+      await f.issue(); const before = f.store().read(f.run.id)!, q = before.nativeReview!.requests[0]!;
+      f.receipts.recordNative(f.terminal(q.identity));
+      let claims = 0, concurrent: Run | undefined;
+      const context = f.context({
+        async assertLiveClaim() { if (failure === 'claim' && ++claims > 1) throw new Error('Controlled lost retained claim'); },
+        ...(failure === 'CAS' ? { store: { read: (id: string) => f.store().read(id), updateIfUnchanged(expected: Run, next: Run) {
+          if (!concurrent) { const current = f.store().read(f.run.id)!; concurrent = applyTransition(current, { type: 'wait_dependency', reason: 'Unrelated concurrent owner observation' }, T0); f.store().update(concurrent); }
+          return f.store().updateIfUnchanged(expected, next);
+        } } } : {}),
+      });
+      if (failure === 'claim') await assert.rejects(f.boundary.observe!(context), /lost retained claim/); else await f.boundary.observe!(context);
+      const current = f.store().read(f.run.id)!; assert.equal(unresolvedNativeReview(current), true);
+      assert.equal(current.nativeReview!.requests[0]!.completionProof, undefined); assert.deepEqual(current.nativeReview!.accepted, before.nativeReview!.accepted);
+      if (concurrent) assert.deepEqual(current, concurrent);
+      assert.equal(f.reads().length, 0); assert.equal(f.submissions(), 2); assert.equal(current.repairAdmissions?.length ?? 0, 0);
+    } finally { f.cleanup(); }
+  });
+}
+it('C2 a false observer authenticator cannot promote an exact cached inactive Oracle terminal', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.issue(); const before = f.store().read(f.run.id)!;
+    f.receipts.recordNative(f.terminal(before.nativeReview!.requests[0]!.identity)); f.host.authenticate = () => false;
+    const observed = await f.boundary.observe!(f.context());
+    assert.equal(unresolvedNativeReview(observed.run), true); assert.equal(observed.run.nativeReview!.requests[0]!.completionProof, undefined);
+    assert.deepEqual(observed.run.nativeReview!.accepted, before.nativeReview!.accepted); assert.equal(f.submissions(), 2);
+    assert.throws(() => applyTransition(observed.run, { type: 'review_approved', reviewResult: f.terminal(before.nativeReview!.requests[1]!.identity).result }, T0, TEST_VALIDATION_AUTHORITY), /Unresolved native history/);
+  } finally { f.cleanup(); }
+});
+it('C2 HOLD observation preserves incomplete transport and actual returned URL without replacing or resetting its finite budget', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.boundary.advance(f.context()); const workflow = oracleWorkflow(f);
+    f.setObserve(async () => ({ outcome: 'pending', conversationUrl: 'https://fixture.invalid/original-oracle' }));
+    for (let i = 1; i <= 3; i++) {
+      f.tick(); const observed = await workflow.poll(true), q = observed.run.nativeReview!.requests[0]!;
+      assert.equal(q.status, 'incomplete'); assert.equal(q.failure, 'transport_failure'); assert.equal(q.observations, i);
+      assert.equal(q.conversationUrl, 'https://fixture.invalid/original-oracle'); assert.equal(observed.run.nativeReview!.requests.length, 1);
+    }
+    f.tick(); await workflow.poll(true); assert.equal(f.reads().length, 3); assert.equal(f.submissions(), 1);
+    assert.equal(f.store().read(f.run.id)!.nativeReview!.wait!.kind, 'qualification'); assert.equal(workflow.workers(), 0);
+  } finally { f.cleanup(); }
+});
+
 for (const uncertainty of ['proofless-oracle', 'inactive-oracle', 'inactive-lead'] as const) {
   it(`R1 qualified unfinished recovery preserves one attempt and fences ${uncertainty}`, () => {
     const f = repairCase('review_blocking', 'none');
@@ -506,13 +570,13 @@ for (const role of ['review', 'lead'] as const) {
   });
 }
 
-function observationFixture() {
-  const f = fixture('lead');
+function observationFixture(canonicalOwner = false) {
+  const f = fixture('lead', canonicalOwner);
   let reads: string[] = [], time = Date.parse(T0);
   let observe: (identity: any) => Promise<any> = async () => { throw new Error('Controlled service-read failure'); };
   const host: any = { ...f.hosts.lead, binding: { bindingId: 'controlled-sol', policyRevision: 'bounded-lead-v1', model: 'controlled-sol', effort: 'High', readOnly: true, qualified: true, allowTransportReplacement: true }, source: () => f.request.packet.manifest, async submit() { throw new Error('No observation control may submit'); }, async observe(identity: any) { reads.push(identity.requestId); return observe(identity); }, replacementDisposition: () => 'irrecoverable_transport' };
   const boundary = resolveNativeLead(host);
-  const context = (extra: any = {}) => ({ run: f.store().read(f.run.id)!, store: f.store(), now: () => new Date(time).toISOString(), owner: { missionId: 'mission-trust', laneId: `run:${f.run.id}`, generation: 1 }, assertCurrent() {}, async assertLiveClaim() {}, ...extra });
+  const context = (extra: any = {}) => ({ run: f.store().read(f.run.id)!, store: f.store(), now: () => new Date(time).toISOString(), owner: { missionId: f.request.identity.missionId, laneId: `run:${f.run.id}`, generation: 1 }, assertCurrent() {}, async assertLiveClaim() {}, ...extra });
   const replacement = (observations = 3) => {
     const run: any = f.store().read(f.run.id)!, original = run.nativeLead.requests[0];
     const identity = { ...original.identity, requestId: 'replacement-request', correlationId: 'replacement-request' };
@@ -653,6 +717,247 @@ for (const original of ['unknown', 'cached-stop'] as const) {
       assert.equal(f.unresolved(result.run), original === 'unknown');
       assert.equal(result.run.history.some(h => h.nativeLeadStop !== undefined), false);
       assert.equal(f.reads().length, 0, 'these polls use exact immutable cache or retain unknown evidence without service reads');
+    } finally { f.cleanup(); }
+  });
+}
+
+// These cases enter the real executable CLI, retained dispatcher, canonical
+// owner readmission and workflow. Only GitHub/host service reads are controlled;
+// every process and new queue/submission boundary is forbidden explicitly.
+for (const command of [['dispatch', 'once'], ['dispatch', 'serve', '--max-cycles', '1']]) {
+  for (const held of [true, false]) for (const cached of [true, false]) {
+    it(`C1 actual ${command.join(' ')} retained lead recovery held=${held}/cached=${cached} is observation-only`, async () => {
+      const f = observationFixture(true), originalUserInfo = os.userInfo, data = process.env.TACHIKO_DATA_DIR, log = console.log;
+      const list = GitHubDispatchRuntime.prototype.listRuntimeComments, update = GitHubDispatchRuntime.prototype.updateRuntimeComment, queue = GitHubDispatchRuntime.prototype.readQueueComment, create = GitHubDispatchRuntime.prototype.createRuntimeComment, snapshot = LiveGitHubAdapter.prototype.readLiveSnapshot, processRun = NodeProcessRunner.prototype.run;
+      let children = 0, submissions = 0, reads = 0;
+      try {
+        os.userInfo = (() => ({ ...originalUserInfo(), homedir: f.root })) as typeof os.userInfo;
+        process.env.TACHIKO_DATA_DIR = path.join(f.root, 'runs'); console.log = () => {};
+        const r: any = f.store().read(f.run.id)!;
+        r.state = 'WAITING_DEPENDENCY'; r.interruptedFrom = 'CHANGES_REQUESTED'; r.reviewResult = f.request.packet.origin.result; r.validationResult = f.request.packet.authority.validation;
+        r.nativeLead.recoveryConfiguration = { revision: 'original-dispatch', owner: 'acme', repo: 'widgets', controlIssue: 90, queueCommentId: 91, leaseDurationMs: 60000 }; f.store().update(r);
+        const registry = createHostAdmissionRegistry(), evidence = { repository: 'acme/widgets', run: r.id, issue: 42, pullRequest: 7, claim: r.dispatchClaimId, workspace: r.bootstrap.workspacePath };
+        const owner = registry.admit({ laneId: `run:${r.id}`, role: 'production_captain', evidence, highAutonomy: true });
+        assert.equal(owner.outcome, 'admitted'); if (owner.outcome !== 'admitted') throw new Error('Controlled canonical owner admission failed');
+        assert.equal(owner.missionId, f.request.identity.missionId);
+        const receipt = resolveRunOwnerReceiptPath('acme/widgets', r.id, evidence);
+        const base: any = { schemaVersion: 1, laneId: `run:${r.id}`, missionId: owner.missionId, repository: 'acme/widgets', runId: r.id, issue: 42, claimId: r.dispatchClaimId, workspace: r.bootstrap.workspacePath };
+        registry.park(owner.token, 'workflow_wait', () => writeRunOwnerReceipt(receipt, { ...base, phase: 'park_transition', generation: 1, token: owner.token }), () => writeRunOwnerReceipt(receipt, { ...base, phase: 'parked', generation: 2 }));
+        publishAdmissionRuntimeProjection(path.join(f.root, 'runs'), registry, f.store(), { stage: held ? 'maintenance_hold' : 'idle', supervisor: 'parked', maintenanceHold: { active: held } });
+        let comments = [{ id: 'retained-runtime', body: renderDispatchRuntime({ issue: 42, claimId: r.dispatchClaimId, runId: r.id, profile: 'routine', repairTaskShapeAuthority: r.repairTaskShapeAuthority, state: 'running', claimedAt: T0, heartbeatAt: T0, leaseUntil: '2099-01-01T00:00:00.000Z' }) }];
+        GitHubDispatchRuntime.prototype.listRuntimeComments = async () => structuredClone(comments);
+        GitHubDispatchRuntime.prototype.updateRuntimeComment = async (_id, body) => { comments = [{ id: 'retained-runtime', body }]; return comments[0]!; };
+        GitHubDispatchRuntime.prototype.readQueueComment = async () => { throw new Error('Issued recovery must not read a new queue'); };
+        GitHubDispatchRuntime.prototype.createRuntimeComment = async () => { throw new Error('Issued recovery must retain A'); };
+        LiveGitHubAdapter.prototype.readLiveSnapshot = async () => ({ headSha: r.headSha } as any);
+        NodeProcessRunner.prototype.run = async () => { children++; throw new Error('No recovery child is permitted'); };
+        f.host.submit = async () => { submissions++; throw new Error('No issued-recovery submission is permitted'); };
+        if (cached) f.terminal(f.request.identity);
+        f.setObserve(async () => { reads++; return { outcome: 'pending' }; });
+        assert.equal(await main(command, { historicalCompletionHosts: f.hosts, nativeLeadHost: f.host }), 0);
+        const current = f.store().read(r.id)!;
+        assert.equal(current.nativeLead!.ownerSuccessions.length, 1, 'actual readmission records exact generation1→3 succession');
+        assert.equal(current.nativeLead!.ownerSuccessions[0]!.status, 'confirmed');
+        assert.equal(current.nativeLead!.requests[0]!.observations, cached ? 0 : 1);
+        assert.equal(f.unresolved(current), !cached); assert.equal(reads, cached ? 0 : 1);
+        assert.equal(children, 0); assert.equal(submissions, 0); assert.equal(current.repairAdmissions?.length ?? 0, 0);
+        assert.equal(current.history.filter(h => h.type === 'start_fix').length, 0);
+        assert.equal(selectDispatchRuntime(comments)!.claim.issue, 42);
+        assert.equal(registry.readLane(`run:${r.id}`)!.status, 'parked');
+        assert.equal(readRunOwnerReceipt(receipt)!.workDisposition, undefined);
+      } finally {
+        GitHubDispatchRuntime.prototype.listRuntimeComments = list; GitHubDispatchRuntime.prototype.updateRuntimeComment = update; GitHubDispatchRuntime.prototype.readQueueComment = queue; GitHubDispatchRuntime.prototype.createRuntimeComment = create; LiveGitHubAdapter.prototype.readLiveSnapshot = snapshot; NodeProcessRunner.prototype.run = processRun;
+        os.userInfo = originalUserInfo; console.log = log; if (data === undefined) delete process.env.TACHIKO_DATA_DIR; else process.env.TACHIKO_DATA_DIR = data; f.cleanup();
+      }
+    });
+  }
+}
+
+function inactiveOracleFixture(verdict: 'approve' | 'request_changes' = 'approve') {
+  const f = fixture('lead', true), directory = 'oracle-runs', store = () => f.store(f.hosts, directory);
+  const r: any = structuredClone(f.run), a = f.request.packet.authority;
+  delete r.nativeLead; delete r.nativeReview; r.state = 'REVIEWING'; r.validationResult = a.validation; store().create(r);
+  let time = Date.parse(T0), submissions = 0, reads: string[] = [];
+  const terminal = (identity: any, chosen: 'approve' | 'request_changes' = verdict) => {
+    const e: any = { ...structuredClone(f.request.packet.origin), id: `${identity.requestId}.terminal`, identity, result: { ...f.request.packet.origin.result, verdict: chosen, findings: chosen === 'approve' ? [] : f.request.packet.origin.result.findings } };
+    e.authentication.transportReceipt = createHmac('sha256', 'controlled-test-authenticator-not-production').update(oracleDigest({ kind: e.kind, identity: e.identity, result: e.result })).digest('hex'); return e;
+  };
+  let observation: (identity: any) => Promise<any> = async () => ({ outcome: 'pending' });
+  const host: any = { ...f.hosts.review, binding: { bindingId: 'controlled-host', contractRevision: 'original-contract', policyRevision: 'independent-unpromoted-v1', scope: 'complete-candidate', model: 'controlled-oracle', supportedEfforts: ['Extra High'], authorActorIds: ['controlled-author'], allowTransportReplacement: true }, source: () => f.request.packet.manifest, async submit(q: any) { submissions++; return submissions === 1 ? { outcome: 'incomplete', reason: 'transport_failure' } : { outcome: 'complete', evidence: terminal(q.identity) }; }, async observe(identity: any) { reads.push(identity.requestId); return observation(identity); } };
+  const reviewer = resolveNativeReviewer(host), boundary = reviewer.native!;
+  const snapshot: any = { repository: { owner: 'acme', repo: 'widgets' }, issue: a.issue, headSha: r.headSha, pullRequest: { ...r.pullRequest, state: 'open', baseSha: f.request.identity.baseSha, headRef: r.bootstrap.branch, baseRef: 'main', headRepository: { owner: 'acme', repo: 'widgets' } }, handoff: { sourceId: a.scope.sourceId, sourceScope: a.scope.sourceScope, sourceUpdatedAt: a.scope.sourceUpdatedAt, freshness: 'current', sections: { scope: a.scope.text } }, problems: [] };
+  const now = () => new Date(time).toISOString();
+  const config = { revision: 'original-dispatch', owner: 'acme', repo: 'widgets', controlIssue: 90, queueCommentId: 91, leaseDurationMs: 60000 };
+  const context = (extra: any = {}) => ({ run: store().read(r.id)!, store: store(), snapshot, now, owner: { missionId: f.request.identity.missionId, laneId: `run:${r.id}`, generation: 1 }, assertCurrent() {}, async assertLiveClaim() {}, onSubmission: (run: Run) => run, recoveryConfiguration: config, ...extra });
+  const issue = async () => { assert.equal((await boundary.advance(context())).outcome, 'wait'); time += 30000; assert.equal((await boundary.advance(context())).outcome, 'complete'); assert.equal(submissions, 2); };
+  return { ...f, run: r as Run, store, directory, snapshot, config, context, host, reviewer, boundary, terminal, now, issue, tick: () => { time += 30000; }, reads: () => reads, submissions: () => submissions, setObserve: (fn: typeof observation) => { observation = fn; } };
+}
+function oracleWorkflow(f: ReturnType<typeof inactiveOracleFixture>) {
+  const registry = f.registry(), evidence = { repository: 'acme/widgets', run: f.run.id, issue: 42, pullRequest: 7, claim: f.run.dispatchClaimId!, workspace: f.run.bootstrap!.workspacePath };
+  const admitted = registry.admit({ laneId: `run:${f.run.id}`, role: 'production_captain', evidence, highAutonomy: true });
+  assert.equal(admitted.outcome, 'admitted'); if (admitted.outcome !== 'admitted') throw new Error('Controlled actual workflow owner admission failed');
+  assert.equal(admitted.missionId, f.context().owner.missionId);
+  let workers = 0, snapshots = 0;
+  const live = () => ({ ...f.snapshot, observedAt: f.now(), pullRequest: { ...f.snapshot.pullRequest, id: 'PR_7', title: 'Bounded fixture', url: '', isDraft: false, mergeable: true, mergeStateStatus: 'CLEAN' }, checks: { availability: 'available', overall: 'passing', checks: [{ id: 'test', name: 'test', state: 'passing', url: null, updatedAt: f.now() }] }, reviews: { decision: 'none', latestByAuthor: [], unresolvedThreads: 0 }, conversations: [] });
+  const deps: any = { store: f.store(), github: { async readLiveSnapshot() { snapshots++; return live(); } }, implementation: { kind: 'implementation', async implement() { workers++; throw new Error('No bounded Oracle control may create a repair worker'); } }, reviewer: f.reviewer, validation: { kind: 'validation', configRevision: 'test-config-v1', async validate() { throw new Error('Seeded fresh validation must not be rerun by this bounded control'); } }, hostedCheckPolicy: { revision: 'test-hosted-policy-v1', policy: { mode: 'required' } } };
+  const poll = (held = false) => runWorkflow(deps, f.run.id, { maxReviewAttempts: 1, now: f.now, assertReviewClaim: async r => { assert.equal(r.dispatchClaimId, f.run.dispatchClaimId); }, admissionFence: { registry, token: admitted.token, productionMissionId: admitted.missionId, executionWorkspace: f.run.bootstrap!.workspacePath }, leadObservationOnly: held, leadRecoveryConfiguration: f.config });
+  return { poll, deps, registry, workers: () => workers, snapshots: () => snapshots };
+}
+for (const verdict of ['approve', 'request_changes'] as const) for (const held of [true, false]) {
+  it(`C2 actual workflow retains ${verdict} replacement wait, reconciles old via ${held ? 'HOLD' : 'ordinary'} caller, then freshly qualifies current verdict`, async () => {
+    const f = inactiveOracleFixture(verdict); try {
+      const workflow = oracleWorkflow(f);
+      await workflow.poll(); f.tick(); const replaced = await workflow.poll();
+      assert.equal(replaced.outcome, 'waiting_dependency'); assert.equal(replaced.run.state, 'WAITING_DEPENDENCY');
+      assert.equal(replaced.run.nativeReview!.wait!.kind, 'request'); assert.equal(f.submissions(), 2);
+      assert.equal(replaced.run.history.some(h => h.type === 'review_approved' || h.type === 'changes_requested'), false);
+      assert.equal(workflow.workers(), 0); assert.equal(replaced.run.repairAdmissions?.length ?? 0, 0);
+      const original = replaced.run.nativeReview!.requests[0]!, replacement = replaced.run.nativeReview!.accepted!;
+      f.setObserve(async identity => { assert.equal(identity.requestId, original.identity.requestId); return { outcome: 'complete', evidence: f.terminal(identity, verdict === 'approve' ? 'request_changes' : 'approve') }; });
+      f.tick(); const settled = await workflow.poll(held);
+      assert.equal(settled.outcome, 'waiting_dependency'); assert.equal(unresolvedNativeReview(settled.run), false);
+      assert.equal(settled.run.nativeReview!.requests[0]!.status, 'replaced'); assert.deepEqual(settled.run.nativeReview!.accepted, replacement);
+      assert.equal(settled.run.history.some(h => h.type === 'review_approved' || h.type === 'changes_requested'), false);
+      assert.equal(f.submissions(), 2); assert.equal(workflow.workers(), 0);
+      f.tick(); await workflow.poll(); const adopted = f.store().read(f.run.id)!;
+      assert.ok(adopted.history.some(h => h.type === (verdict === 'approve' ? 'review_approved' : 'changes_requested')));
+      assert.equal(adopted.reviewResult!.verdict, verdict); assert.deepEqual(adopted.nativeReview!.accepted, replacement);
+      assert.equal(adopted.nativeReview!.requests.length, 2); assert.equal(f.submissions(), 2); assert.equal(workflow.workers(), 0);
+    } finally { f.cleanup(); }
+  });
+}
+it('C2 exhausted original enters attention; explicit cache observation settles only evidence without automatic reentry', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.issue(); const workflow = oracleWorkflow(f);
+    for (let i = 0; i < 3; i++) { f.tick(); await workflow.poll(); }
+    const attention = f.store().read(f.run.id)!;
+    assert.equal(attention.nativeReview!.wait!.kind, 'qualification');
+    assert.equal(attention.nativeReview!.requests[0]!.observations, 3); assert.equal(f.reads().length, 3);
+    f.tick(); await workflow.poll(); assert.equal(f.reads().length, 3);
+    const original = attention.nativeReview!.requests[0]!; f.receipts.recordNative(f.terminal(original.identity));
+    f.tick(); await workflow.poll(); assert.equal(unresolvedNativeReview(f.store().read(f.run.id)!), true, 'attention does not become periodic cache polling');
+    const observed = await f.boundary.observe!(f.context());
+    assert.equal(unresolvedNativeReview(observed.run), false); assert.equal(observed.run.nativeReview!.requests[0]!.observations, 3);
+    assert.equal(observed.run.nativeReview!.requests[0]!.status, 'replaced'); assert.equal(observed.run.nativeReview!.requests[0]!.failure, 'transport_failure');
+    assert.equal(observed.run.nativeReview!.wait!.kind, 'qualification'); assert.equal(f.reads().length, 3);
+    assert.equal(workflow.workers(), 0); assert.equal(f.submissions(), 2); assert.equal(observed.run.repairAdmissions?.length ?? 0, 0);
+  } finally { f.cleanup(); }
+});
+it('C2 settled inactive history never bypasses fresh current-role qualification in actual workflow', async () => {
+  const f = inactiveOracleFixture(); try {
+    const workflow = oracleWorkflow(f); await workflow.poll(); f.tick(); await workflow.poll();
+    const original = f.store().read(f.run.id)!.nativeReview!.requests[0]!;
+    f.receipts.recordNative(f.terminal(original.identity)); f.tick(); await workflow.poll(true);
+    assert.equal(unresolvedNativeReview(f.store().read(f.run.id)!), false);
+    f.host.binding.model = 'revoked-current-role'; f.tick(); await workflow.poll();
+    const r = f.store().read(f.run.id)!;
+    assert.equal(r.history.some(h => h.type === 'review_approved' || h.type === 'changes_requested'), false);
+    assert.equal(workflow.workers(), 0); assert.equal(f.submissions(), 2); assert.equal(r.repairAdmissions?.length ?? 0, 0);
+  } finally { f.cleanup(); }
+});
+for (const command of [['dispatch', 'once'], ['dispatch', 'serve', '--max-cycles', '1']]) {
+  for (const held of [true, false]) for (const cached of [true, false]) {
+    it(`C2 actual Oracle-only ${command.join(' ')} held=${held}/cached=${cached} retains A and reconciles inactive history`, async () => {
+      const f = inactiveOracleFixture(), originalUserInfo = os.userInfo, data = process.env.TACHIKO_DATA_DIR, log = console.log;
+      const list = GitHubDispatchRuntime.prototype.listRuntimeComments, update = GitHubDispatchRuntime.prototype.updateRuntimeComment, queue = GitHubDispatchRuntime.prototype.readQueueComment, create = GitHubDispatchRuntime.prototype.createRuntimeComment, snapshot = LiveGitHubAdapter.prototype.readLiveSnapshot, processRun = NodeProcessRunner.prototype.run;
+      let children = 0, submissions = 0;
+      try {
+        await f.issue(); const r = f.store().read(f.run.id)!, original = r.nativeReview!.requests[0]!, accepted = r.nativeReview!.accepted!;
+        assert.equal(r.nativeLead, undefined, 'recovery must not depend on a lead ledger');
+        os.userInfo = (() => ({ ...originalUserInfo(), homedir: f.root })) as typeof os.userInfo;
+        process.env.TACHIKO_DATA_DIR = path.join(f.root, f.directory); console.log = () => {};
+        const registry = createHostAdmissionRegistry(), evidence = { repository: 'acme/widgets', run: r.id, issue: 42, pullRequest: 7, claim: r.dispatchClaimId!, workspace: r.bootstrap!.workspacePath };
+        const owner = registry.admit({ laneId: `run:${r.id}`, role: 'production_captain', evidence, highAutonomy: true });
+        assert.equal(owner.outcome, 'admitted'); if (owner.outcome !== 'admitted') throw new Error('Controlled Oracle owner admission failed');
+        assert.equal(owner.missionId, original.identity.missionId);
+        const receipt = resolveRunOwnerReceiptPath('acme/widgets', r.id, evidence), base: any = { schemaVersion: 1, laneId: `run:${r.id}`, missionId: owner.missionId, repository: 'acme/widgets', runId: r.id, issue: 42, claimId: r.dispatchClaimId, workspace: r.bootstrap!.workspacePath };
+        registry.park(owner.token, 'workflow_wait', () => writeRunOwnerReceipt(receipt, { ...base, phase: 'park_transition', generation: 1, token: owner.token }), () => writeRunOwnerReceipt(receipt, { ...base, phase: 'parked', generation: 2 }));
+        publishAdmissionRuntimeProjection(path.join(f.root, f.directory), registry, f.store(), { stage: held ? 'maintenance_hold' : 'idle', supervisor: 'parked', maintenanceHold: { active: held } });
+        let comments = [{ id: 'oracle-retained', body: renderDispatchRuntime({ issue: 42, claimId: r.dispatchClaimId!, runId: r.id, profile: 'routine', repairTaskShapeAuthority: r.repairTaskShapeAuthority, state: 'running', claimedAt: T0, heartbeatAt: T0, leaseUntil: '2099-01-01T00:00:00.000Z' }) }];
+        GitHubDispatchRuntime.prototype.listRuntimeComments = async () => structuredClone(comments);
+        GitHubDispatchRuntime.prototype.updateRuntimeComment = async (_id, body) => { comments = [{ id: 'oracle-retained', body }]; return comments[0]!; };
+        GitHubDispatchRuntime.prototype.readQueueComment = async () => { throw new Error('Oracle-only issued recovery must use original control descriptor'); };
+        GitHubDispatchRuntime.prototype.createRuntimeComment = async () => { throw new Error('Oracle-only recovery cannot claim B'); };
+        LiveGitHubAdapter.prototype.readLiveSnapshot = async () => f.snapshot;
+        NodeProcessRunner.prototype.run = async () => { children++; throw new Error('Oracle-only recovery cannot create a process'); };
+        f.host.submit = async () => { submissions++; throw new Error('Oracle-only recovery cannot submit'); };
+        if (cached) f.receipts.recordNative(f.terminal(original.identity)); else f.setObserve(async identity => ({ outcome: 'complete', evidence: f.terminal(identity) }));
+        assert.equal(await main(command, { historicalCompletionHosts: f.hosts, nativeReviewerHost: f.host }), 0);
+        const current = f.store().read(r.id)!;
+        assert.equal(unresolvedNativeReview(current), false); assert.equal(current.nativeReview!.requests[0]!.status, 'replaced');
+        assert.equal(current.nativeReview!.requests[0]!.observations, cached ? 0 : 1); assert.equal(f.reads().length, cached ? 0 : 1);
+        assert.deepEqual(current.nativeReview!.accepted, accepted); assert.equal(current.nativeReview!.requests.length, 2);
+        assert.equal(current.history.some(h => h.type === 'review_approved' || h.type === 'changes_requested'), false);
+        assert.equal(current.repairAdmissions?.length ?? 0, 0); assert.equal(children, 0); assert.equal(submissions, 0);
+        assert.equal(selectDispatchRuntime(comments)!.claim.issue, 42); assert.equal(registry.readLane(`run:${r.id}`)!.status, 'parked');
+        assert.equal(readRunOwnerReceipt(receipt)!.workDisposition, undefined);
+      } finally {
+        GitHubDispatchRuntime.prototype.listRuntimeComments = list; GitHubDispatchRuntime.prototype.updateRuntimeComment = update; GitHubDispatchRuntime.prototype.readQueueComment = queue; GitHubDispatchRuntime.prototype.createRuntimeComment = create; LiveGitHubAdapter.prototype.readLiveSnapshot = snapshot; NodeProcessRunner.prototype.run = processRun;
+        os.userInfo = originalUserInfo; console.log = log; if (data === undefined) delete process.env.TACHIKO_DATA_DIR; else process.env.TACHIKO_DATA_DIR = data; f.cleanup();
+      }
+    });
+  }
+}
+it('C2 Oracle descriptor is captured before first issuance, immutable, strict and absent in readable legacy history', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.issue(); const r = f.store().read(f.run.id)!;
+    assert.deepEqual(r.nativeReview!.recoveryConfiguration, f.config);
+    const changed = { ...r, nativeReview: { ...r.nativeReview!, recoveryConfiguration: { ...f.config, revision: 'changed-control' } } };
+    assert.throws(() => f.store().updateIfUnchanged(r, changed), /monotonic/);
+    assert.throws(() => f.store().update({ ...r, nativeReview: { ...r.nativeReview!, recoveryConfiguration: { ...f.config, callerRoot: f.root } as any } }), /ledger/);
+    const historical = structuredClone(r); delete (historical.nativeReview as any).recoveryConfiguration;
+    const file = path.join(f.root, f.directory, `${r.id}.json`); writeFileSync(file, JSON.stringify(historical));
+    const loaded = f.store().read(r.id)!; assert.equal(unresolvedNativeReview(loaded), true);
+    assert.throws(() => issuedReviewRecoveryConfiguration(loaded), /immutable dispatch control location/);
+  } finally { f.cleanup(); }
+});
+it('C2 submitted legacy Oracle history cannot acquire a fabricated original descriptor from current context or raw CAS', async () => {
+  const f = inactiveOracleFixture(); try {
+    await f.boundary.advance(f.context({ recoveryConfiguration: undefined }));
+    const original = f.store().read(f.run.id)!;
+    assert.equal(original.nativeReview!.requests[0]!.submissionPossible, true); assert.equal(original.nativeReview!.recoveryConfiguration, undefined);
+    assert.throws(() => f.store().updateIfUnchanged(original, { ...original, nativeReview: { ...original.nativeReview!, recoveryConfiguration: f.config } }), /monotonic/);
+    f.tick(); await f.boundary.advance(f.context());
+    const replaced = f.store().read(f.run.id)!;
+    assert.equal(f.submissions(), 2); assert.equal(replaced.nativeReview!.requests.length, 2);
+    assert.equal(replaced.nativeReview!.recoveryConfiguration, undefined, 'a later replacement context is not original dispatch provenance');
+    assert.throws(() => issuedReviewRecoveryConfiguration(replaced), /immutable dispatch control location/);
+  } finally { f.cleanup(); }
+});
+for (const verdict of ['approve', 'request_changes'] as const) for (const cached of [true, false]) {
+  it(`C2 actual producer reconciles inactive ${verdict} via ${cached ? 'cache' : 'bounded observation'} without restoring eligibility`, async () => {
+    const f = inactiveOracleFixture(verdict); try {
+      await f.issue(); const before = f.store().read(f.run.id)!, original = before.nativeReview!.requests[0]!, active = before.nativeReview!.activeRequestId;
+      if (cached) f.receipts.recordNative(f.terminal(original.identity, verdict === 'approve' ? 'request_changes' : 'approve')); else f.setObserve(async identity => ({ outcome: 'complete', evidence: f.terminal(identity, verdict === 'approve' ? 'request_changes' : 'approve') }));
+      const reconciled = await f.boundary.advance(f.context());
+      assert.equal(reconciled.outcome, 'wait', 'historical completion is evidence-only on this poll');
+      assert.equal(unresolvedNativeReview(reconciled.run), false); assert.equal(reconciled.run.nativeReview!.requests[0]!.status, 'replaced');
+      assert.equal(reconciled.run.nativeReview!.activeRequestId, active); assert.deepEqual(reconciled.run.nativeReview!.accepted, before.nativeReview!.accepted);
+      assert.equal(f.reads().length, cached ? 0 : 1); assert.equal(f.submissions(), 2);
+      const clone = structuredClone(reconciled.run); assert.equal(f.store().updateIfUnchanged(f.store().read(f.run.id)!, clone), true);
+      const current = await f.boundary.advance(f.context()); assert.equal(current.outcome, 'complete'); if (current.outcome !== 'complete') throw new Error('Fresh current qualification missing');
+      assert.equal(f.boundary.validate({ ...f.context(), run: { ...current.run, reviewResult: current.result } }), true);
+      const adopted = applyTransition(current.run, { type: verdict === 'approve' ? 'review_approved' : 'changes_requested', reviewResult: current.result }, f.now(), TEST_VALIDATION_AUTHORITY);
+      assert.equal(adopted.state, verdict === 'approve' ? 'FINAL_GATE' : 'CHANGES_REQUESTED');
+      assert.equal(current.run.nativeReview!.requests.length, 2); assert.equal(current.run.repairAdmissions?.length ?? 0, 0);
+    } finally { f.cleanup(); }
+  });
+}
+for (const operation of ['update', 'CAS'] as const) {
+  it(`C2 ${operation} accepts exact authenticated inactive evidence and rejects raw/foreign/missing proof`, async () => {
+    const f = inactiveOracleFixture(); try {
+      await f.issue(); const before = f.store().read(f.run.id)!, original = before.nativeReview!.requests[0]!, e = f.terminal(original.identity);
+      f.receipts.recordNative(e); const proof = f.receipts.recordAuthenticatedCompletion('review', e, evidence => evidence.kind === 'terminal' && 'result' in evidence && f.hosts.review!.authenticate(evidence));
+      const valid: any = structuredClone(before); Object.assign(valid.nativeReview.requests[0], { terminalDigest: oracleDigest(e), completionProof: proof });
+      for (const invalid of ['missing', 'foreign'] as const) {
+        const next = structuredClone(valid); if (invalid === 'missing') delete next.nativeReview.requests[0].completionProof; else next.nativeReview.requests[0].completionProof.digest = 'f'.repeat(64);
+        assert.throws(() => operation === 'update' ? f.store().update(next) : f.store().updateIfUnchanged(before, next), /completion|monotonic/);
+        assert.equal(unresolvedNativeReview(f.store().read(f.run.id)!), true);
+      }
+      if (operation === 'update') f.store().update(valid); else assert.equal(f.store().updateIfUnchanged(before, valid), true);
+      const loaded = f.store().read(f.run.id)!; assert.equal(unresolvedNativeReview(loaded), false); assert.equal(loaded.nativeReview!.requests[0]!.status, 'replaced');
+      assert.equal(loaded.nativeReview!.activeRequestId, before.nativeReview!.activeRequestId); assert.deepEqual(loaded.nativeReview!.accepted, before.nativeReview!.accepted);
+      assert.equal(unresolvedNativeReview(new JsonFileStore({ dir: path.join(f.root, f.directory) }).read(f.run.id)!), true);
     } finally { f.cleanup(); }
   });
 }

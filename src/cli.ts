@@ -76,7 +76,7 @@ import {
 import { GitHubLiveStateError } from './github/errors.js';
 import { LiveGitHubAdapter } from './github/live-state.js';
 import { GhCliTransport, NodeProcessRunner } from './github/transport.js';
-import { resolveNativeReviewer, unresolvedNativeReview } from './oracle/native-reviewer.js';
+import { resolveNativeReviewer, unresolvedNativeReview, issuedReviewRecoveryConfiguration } from './oracle/native-reviewer.js';
 import type { NativeReviewerHost } from './oracle/types.js';
 import { JsonFileStore, type RunStore } from './store/json-file-store.js';
 import { GitWorktreeBootstrap } from './workspace/git-worktree-bootstrap.js';
@@ -2905,7 +2905,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
         // interval, so a transition cannot be overwritten mid-reconcile.
         const maintenanceHold = readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active === true;
         const issued = store.list().filter((run) => {
-          if (!run.mergeAttempt?.submissionPossible && !unresolvedNativeLead(run)) return false;
+          if (!run.mergeAttempt?.submissionPossible && !unresolvedNativeLead(run) && !(unresolvedNativeReview(run) && run.nativeReview?.wait?.kind !== 'qualification')) return false;
           if (run.state !== 'MERGED') return true;
           try { return !isDispatchRunOwnerRetiredCommand(store, run, admission); } catch { return true; }
         });
@@ -2916,10 +2916,10 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
           return { outcome: 'maintenance_hold' as const, reason: 'Typed restart hold prevents new dispatch admission.' };
         }
         publishRuntime('scanning', 'running', nextPollAt());
-        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : issuedLeadRecoveryConfiguration(recovering);
+        const config = recovering === undefined ? processConfig ??= resolveDispatchConfiguration() : recovering.mergeAttempt?.submissionPossible ? issuedMergeRecoveryConfiguration(recovering) : unresolvedNativeLead(recovering) ? issuedLeadRecoveryConfiguration(recovering) : issuedReviewRecoveryConfiguration(recovering);
         const transport = new GhCliTransport();
         const runtime = new GitHubDispatchRuntime(transport, config);
-        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost) : buildWorkflowDeps(store, undefined, {}, transport);
+        const workflow = recovering === undefined ? processWorkflow ??= buildWorkflowDeps(store, undefined, process.env, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost) : buildWorkflowDeps(store, undefined, {}, transport, native.nativeReviewerHost, native.nativeMergeHost, native.nativeLeadHost);
         return await dispatchOnceCommand(config, {
           workflow,
           runtime,
@@ -2939,7 +2939,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
               ...(execution === undefined ? {} : { execution }), dispatchClaimId, repairTaskShapeAuthority, admission: missionAdmission!,
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
-              assertReviewClaim, leadObservationOnly, leadRecoveryConfiguration,
+              assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible, leadRecoveryConfiguration,
               assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);},
               assertMergeInitiation: async (run) => {
                 if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');
@@ -2959,7 +2959,7 @@ export async function main(argv: string[], native: CliNativeDependencies = {}): 
               publishRuntimeProjection: (registry, runStore, update) => publishAdmissionRuntimeProjection(resolveRunsDir(), registry, runStore, update),
               ...(workspace === undefined ? {} : { admissionWorkspace: workspace }),
               releaseDispatchAdmissionLock: release, withDispatchAdmissionLock: withLock,
-              assertReviewClaim, leadObservationOnly, leadRecoveryConfiguration,
+              assertReviewClaim, leadObservationOnly: leadObservationOnly || recovering !== undefined && !recovering.mergeAttempt?.submissionPossible, leadRecoveryConfiguration,
               assertLeadInitiation:async(run)=>{if(readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active)throw new Error('Maintenance HOLD prevents lead/repair initiation.');if(!assertLeadInitiation)throw new Error('Lead dispatch authority unavailable.');await assertLeadInitiation(run);},
               assertMergeInitiation: async (run) => {
                 if (readOperationalRuntimeProjection(resolveRunsDir())?.maintenanceHold.active) throw new Error('Maintenance HOLD prevents merge initiation.');

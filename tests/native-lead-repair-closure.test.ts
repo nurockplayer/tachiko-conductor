@@ -338,7 +338,13 @@ it('a late inactive authenticated stop reconciles only its original uncertainty 
     assert.equal(f.run().state, 'WAITING_DEPENDENCY');
     assert.equal(f.run().repairAdmissions?.length ?? 0, 0, 'replacement cannot consume while the original is unknown');
     assert.equal(f.run().history.filter(h => h.type === 'start_fix').length, 0);
-    assert.equal(f.counts().boundaries, 1, 'only the initial worker boundary has run');
+    assert.equal(f.counts().boundaries, 0, 'no repair process or publication boundary may run while original work is unknown');
+    assert.equal(f.run().telemetry?.events.filter(e => e.kind === 'spawn' && e.role === 'worker').length, 1, 'actual initial implementation worker telemetry is separate from repair boundaries');
+    const initialPackets = readFileSync(f.prompts, 'utf8');
+    assert.equal(initialPackets.split('Packet: tachiko.implementation-packet.v1').length - 1, 1, 'one original packet actually reached the fixture worker');
+    assert.equal(f.run().implementationAuthority?.input.kind, 'initial');
+    assert.ok(initialPackets.includes(f.run().implementationAuthority!.input.identity.baseSha), 'actual initial worker received the original packet base');
+    assert.ok(initialPackets.includes(f.run().implementationAuthority!.input.authority.acceptedScope.text), 'actual initial worker received original accepted scope');
     f.setLeadObserve(async identity => { assert.equal(identity.requestId, original.identity.requestId); return { outcome: 'complete', evidence: f.terminal(original, 'stop') }; });
     for (let i = 0; i < 4 && (f.run().state !== 'MERGE_READY' || unresolvedNativeLead(f.run())); i++) { f.tick(); await f.poll(); }
     const r = f.run(); assert.equal(r.state, 'MERGE_READY'); assert.equal(unresolvedNativeLead(r), false);

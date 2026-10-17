@@ -287,6 +287,8 @@ export interface Run {
   readonly reviewResult?: ReviewResult;
   /** Native review lifecycle is owned exclusively by this Run's CAS. */
   readonly nativeReview?: {
+    /** Original dispatch location only; never completion or execution authority. */
+    readonly recoveryConfiguration?: import('../dispatch/config.js').DispatchConfiguration;
     readonly repairLimit?: number;
     readonly requests: readonly import('../oracle/types.js').NativeReviewRequestState[];
     readonly activeRequestId?: string;

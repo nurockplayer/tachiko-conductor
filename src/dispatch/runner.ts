@@ -478,8 +478,8 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     }
     if (run !== null) assertClaimAuthorityMatchesRun(existing.claim, run);
     if (options.issuedMergeRecoveryOnly && !run?.mergeAttempt?.submissionPossible) return { outcome: 'existing_claim', claim: existing.claim };
-    if (options.issuedLeadRecoveryOnly && (!run || !unresolvedNativeLead(run))) return {outcome:'existing_claim',claim:existing.claim};
-    if (options.maintenanceHold && !run?.mergeAttempt?.submissionPossible && (!run || !unresolvedNativeLead(run))) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD permits only observation/settlement of an already-issued merge.' };
+    if (options.issuedLeadRecoveryOnly && (!run || !unresolvedNativeLead(run) && !unresolvedNativeReview(run))) return {outcome:'existing_claim',claim:existing.claim};
+    if (options.maintenanceHold && !run?.mergeAttempt?.submissionPossible && (!run || !unresolvedNativeLead(run) && !unresolvedNativeReview(run))) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD permits only observation/settlement of an already-issued merge.' };
     const historicalHold = await historicalOwnerHold(options, run?.id);
     if (historicalHold !== null) return { outcome: 'owner_reconciliation_hold', entry, claim: existing.claim, reason: historicalHold };
     const ownerRetired = run !== null && run.state !== 'MERGED' && await retiredForProgression(run, options);

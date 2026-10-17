@@ -36,7 +36,7 @@ import { CANCEL_RUN_DECISION, LIVE_HEAD_SYNC_DECISION, RECOVER_LEGACY_PULL_REQUE
 import { createBootstrapFailureRun } from '../workflow/bootstrap-failure.js';
 import { pullRequestIdentityConflict } from '../workflow/pull-request-identity.js';
 import { acceptedScopeFromHandoff, buildImplementationPacket, preflightImplementationPacket, type ImplementationPacket, type ImplementationPacketInput } from '../agents/implementation-packet.js';
-import { parkNativeReview, unresolvedNativeReview } from '../oracle/native-reviewer.js';
+import { parkNativeReview, unresolvedNativeReview, nativeReviewWaitKind } from '../oracle/native-reviewer.js';
 
 export interface ReviewLoopDependencies {
   readonly store: RunStore;
@@ -1269,7 +1269,7 @@ export async function runReviewLoop(
     let reviewResult: ReviewResult;
     if (reviewer.native !== undefined) {
       const advanced = await reviewer.native.advance({
-        run, snapshot: liveSnapshot, store, now, owner: deps.reviewOwner,
+        run, snapshot: liveSnapshot, store, now, owner: deps.reviewOwner, recoveryConfiguration: deps.leadRecoveryConfiguration,
         ...(deps.assertReviewClaim === undefined ? {} : { assertLiveClaim: async () => await deps.assertReviewClaim!(store.read(run.id) ?? run) }),
         assertCurrent: () => deps.assertCurrentMutation?.(),
         onSubmission: (markedRun) => {
@@ -1281,9 +1281,15 @@ export async function runReviewLoop(
       run = advanced.run;
       if (advanced.outcome === 'superseded') return { outcome: 'superseded', run, reason: advanced.reason };
       if (advanced.outcome === 'wait') {
-        const parked = parkNativeReview(run, run.nativeReview?.activeRequestId === undefined ? 'binding' : 'request', advanced.reason, now());
+        const parked = parkNativeReview(run, run.nativeReview?.activeRequestId === undefined ? 'binding' : advanced.reason.includes('replacement allowance') ? 'qualification' : nativeReviewWaitKind(run), advanced.reason, now());
         if (!updateReviewRun(store, run, parked)) return staleReviewOutcome(run.id, run, store);
         return { outcome: 'waiting_dependency', run: parked, reason: advanced.reason };
+      }
+      if (unresolvedNativeReview(run)) {
+        const reason='Qualified active Oracle result retained; waiting for exact inactive remote completion before verdict adoption.';
+        const parked=parkNativeReview(run,nativeReviewWaitKind(run),reason,now());
+        if(!updateReviewRun(store,run,parked))return staleReviewOutcome(run.id,run,store);
+        return {outcome:'waiting_dependency',run:parked,reason};
       }
       reviewResult = advanced.result;
     } else {
