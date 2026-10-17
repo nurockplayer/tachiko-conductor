@@ -1,0 +1,75 @@
+name: Issue 104 toolchain preflight
+on:
+  push:
+    branches: [qualification/issue104-stage6-toolchain]
+permissions:
+  contents: read
+concurrency:
+  group: issue104-stage6-toolchain
+  cancel-in-progress: false
+jobs:
+  preflight:
+    runs-on: macos-26
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Record disposable runner and supported Git
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'owner=/root/v1_stage_six_lead cleanup=GitHub-hosted ephemeral runner\n'
+          printf 'checkout='; /usr/bin/git rev-parse HEAD
+          printf 'tree='; /usr/bin/git rev-parse 'HEAD^{tree}'
+          /usr/bin/sw_vers
+          /usr/bin/uname -m
+          /usr/sbin/sysctl -n hw.logicalcpu hw.memsize
+          /bin/df -k "$RUNNER_TEMP"
+          test -x /usr/bin/sandbox-exec
+          printf 'sandbox-exec=/usr/bin/sandbox-exec\n'
+          for tool in /usr/bin/git /Library/Developer/CommandLineTools/usr/bin/git; do
+            if test -x "$tool"; then
+              printf 'git-program=%s\n' "$tool"
+              "$tool" --version
+              "$tool" --exec-path
+            else
+              printf 'missing-git=%s\n' "$tool"
+            fi
+          done
+      - uses: actions/setup-node@v7
+        id: node
+        continue-on-error: true
+        with:
+          node-version: 24.21.0
+      - name: Qualify pinned Node and pnpm
+        if: steps.node.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          node -p 'JSON.stringify({node:process.version,program:require("fs").realpathSync(process.execPath),platform:process.platform,arch:process.arch})'
+          node -e 'const [a,b]=process.versions.node.split(".").map(Number);if(a!==24||b<21)process.exit(1)'
+          corepack enable
+          corepack prepare pnpm@10.34.5 --activate
+          test "$(pnpm --version)" = 10.34.5
+          node -e 'const f=require("fs");for(const p of process.env.PATH.split(":")){const q=p+"/pnpm";if(f.existsSync(q)){console.log("pnpm-program="+f.realpathSync(q));break}}'
+      - name: Enforce route prerequisites
+        if: always()
+        shell: bash
+        env:
+          NODE_SETUP_OUTCOME: ${{ steps.node.outcome }}
+        run: |
+          set -euo pipefail
+          test "$NODE_SETUP_OUTCOME" = success
+          test -x /usr/bin/sandbox-exec
+          git_program=/Library/Developer/CommandLineTools/usr/bin/git
+          test -x "$git_program"
+          exec_path=$(env -i PATH=/usr/bin:/bin GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 "$git_program" --exec-path)
+          canonical=$(node -e 'console.log(require("fs").realpathSync(process.argv[1]))' "$exec_path")
+          printf 'configured-git=%s canonical-exec-path=%s\n' "$git_program" "$canonical"
+          test "$canonical" = /Library/Developer/CommandLineTools/usr/libexec/git-core
+      - name: Terminal disposal receipt
+        if: always()
+        shell: bash
+        run: |
+          printf 'No candidate dependencies, artifacts, models or services were started. Job-owned checkout and tool cache are disposed with the ephemeral runner.\n'
