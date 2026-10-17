@@ -33,7 +33,7 @@ readmission and final checks. A possible submission is never resent. Open PR,
 timeout, lost acknowledgement, restart, lease expiry, or policy replacement do
 not prove non-submission. Three durable read-only observations with 30-second
 backoff are available; exhaustion retains ownership and requires attention.
-Waiting and observation create no model turns.
+The complete callable direct-PR/default-branch/commit/ancestry/squash capability set must exist before preparation, the possible-submission marker and the API boundary. Known missing capabilities wait before any effect. Waiting and observation create no model turns.
 
 Merged readback is retained separately from qualification. The actual squash
 commit must have exactly one parent equal to the recorded base, tree equal to
@@ -59,4 +59,15 @@ request or normalize an active/unknown local invocation. Stopped local-owner
 recovery still requires the existing explicit operator attestation; stopping a
 process cannot retire or cancel an issued external merge attempt. Only exact
 qualified settlement allows normal dispatch to advance to the next eligible
-issue while retaining the earlier queue row.
+issue while retaining the earlier queue row. Every historical or released-owner
+shortcut also requires a fresh model-free integration read before successor
+admission, even if the old runtime claim or queue row is absent or rerouted.
+A historical qualification remains immutable evidence, not a freshness lease.
+
+Exact-proof normalization validates the prior receipt phase, token and generation
+inside the admission transaction before replacing it. Stale or foreign receipts
+remain untouched. If a process dies after qualification CAS but before owner
+parking, the existing explicit operator-stopped recovery establishes real
+`workflow_settled` parking and uses the existing stopped release protocol. Fresh
+integration proof is still required for MERGED settlement. An arbitrary released
+receipt, timeout or active invocation cannot substitute for that stopped evidence.

@@ -79,6 +79,8 @@ export interface DispatchOnceOptions {
   readonly reconcileMergedRun?: (run: Run) => Promise<Run | null>;
   /** Trusted exact released owner proof; grants no delivery or repair authority. */
   readonly isRunOwnerRetired?: (run: Run) => boolean;
+  /** Fresh model-free integration proof is required in addition to released ownership for every native successor shortcut. */
+  readonly qualifyNativeProgression?: (run: Run) => Promise<boolean>;
   readonly createClaimId?: () => string;
   readonly withAdmissionLock?: <T>(operation: () => Promise<T> | T) => Promise<T>;
   readonly releaseAdmissionLock?: () => void;
@@ -103,8 +105,15 @@ function isTarget(run: Run, entry: DispatchQueueEntry, options: Pick<DispatchOnc
   return run.target.kind === 'issue' && run.target.owner.toLowerCase() === wanted.owner && run.target.repo.toLowerCase() === wanted.repo && run.target.issueNumber === wanted.issueNumber;
 }
 
-function activeRun(store: RunStore, entry: DispatchQueueEntry, options: DispatchOnceOptions): Run | null {
-  return store.list().find((run) => isTarget(run, entry, options) && isActiveRun(run) && options.isRunOwnerRetired?.(run) !== true) ?? null;
+async function retiredForProgression(run: Run, options: DispatchOnceOptions): Promise<boolean> {
+  if (options.isRunOwnerRetired?.(run) !== true) return false;
+  return run.nativeReview === undefined && run.mergeAttempt === undefined ||
+    options.qualifyNativeProgression !== undefined && await options.qualifyNativeProgression(run);
+}
+
+async function activeRun(store: RunStore, entry: DispatchQueueEntry, options: DispatchOnceOptions): Promise<Run | null> {
+  for (const run of store.list()) if (isTarget(run, entry, options) && isActiveRun(run) && !await retiredForProgression(run, options)) return run;
+  return null;
 }
 
 export function claimedRun(store: RunStore, claim: DispatchRuntimeClaim, entry: DispatchQueueEntry, options: Pick<DispatchOnceOptions, 'owner' | 'repo'>): Run | null {
@@ -156,8 +165,8 @@ async function delivered(run: Run, entry: DispatchQueueEntry, options: DispatchO
     run.repairTaskShapeAuthority === undefined || entry.repairTaskShapeAuthority === undefined ||
     !sameAuthorityRevision(run, entry) || run.repairTaskShapeAuthority.shape !== entry.repairTaskShapeAuthority.shape ||
     options.reconcileMergedRun === undefined) return false;
-  if (options.store.list().some((other) => other.id !== run.id && isTarget(other, entry, options) && isActiveRun(other) && options.isRunOwnerRetired?.(other) !== true)) {
-    throw new DispatchProtocolError(`Run ${run.id} has unrelated active work for #${entry.issue}; refusing delivery supersession.`);
+  for (const other of options.store.list()) {
+    if (other.id !== run.id && isTarget(other, entry, options) && isActiveRun(other) && !await retiredForProgression(other, options)) throw new DispatchProtocolError(`Run ${run.id} has unrelated active work for #${entry.issue}; refusing delivery supersession.`);
   }
   const settled = await options.reconcileMergedRun(run);
   if (settled === null) return false;
@@ -179,7 +188,7 @@ async function delivered(run: Run, entry: DispatchQueueEntry, options: DispatchO
 
 async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptions): Promise<{ readonly run: Run | null; readonly reason: string | null; readonly blocked?: boolean }> {
   const issueTarget = target(entry, options);
-  const run = activeRun(options.store, entry, options);
+  const run = await activeRun(options.store, entry, options);
   if (run !== null) return { run, reason: `#${entry.issue}: existing durable run ${run.id} is ${run.state}`, blocked: true };
   // Run/claim/profile/revision identity survives replacement of the one runtime
   // comment. A closed issue is required so a reopened incarnation cannot reuse
@@ -188,14 +197,14 @@ async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptio
   if (history.some((prior) => prior.state !== 'FAILED' && prior.state !== 'MERGED' && !sameAuthorityRevision(prior, entry))) {
     return { run: null, reason: `#${entry.issue}: revised reissue of released nonterminal work requires explicit terminal disposition before a replacement claim`, blocked: true };
   }
-  if (history.some((prior) => prior.state !== 'MERGED' && options.isRunOwnerRetired?.(prior) !== true)) {
+  for (const prior of history) if (prior.state !== 'MERGED' && !await retiredForProgression(prior, options)) {
     return { run: null, reason: `#${entry.issue}: prior dispatch work lacks proven delivery`, blocked: true };
   }
   // A new authority revision permits a new incarnation, but cannot hide an
   // interrupted release from an older one merely because its Run says MERGED.
   for (const prior of history.filter((candidate) => !sameAuthorityRevision(candidate, entry) && candidate.repairTaskShapeAuthority !== undefined)) {
     const priorEntry: DispatchQueueEntry = { issue: entry.issue, route: 'codex', profile: prior.execution?.profile ?? '', repairTaskShapeAuthority: prior.repairTaskShapeAuthority };
-    if (options.isRunOwnerRetired?.(prior) !== true && !await delivered(prior, priorEntry, options, true)) {
+    if (!await retiredForProgression(prior, options) && !await delivered(prior, priorEntry, options, true)) {
       return { run: null, reason: `#${entry.issue}: previous authority lacks exact delivery settlement`, blocked: true };
     }
   }
@@ -204,7 +213,7 @@ async function eligibility(entry: DispatchQueueEntry, options: DispatchOnceOptio
     if (matching.length === 1 && matching[0]!.state === 'MERGED' && await delivered(matching[0]!, entry, options)) {
       return { run: null, reason: `#${entry.issue}: exact dispatch delivery is complete` };
     }
-    if (matching.length === 1 && matching[0]!.state !== 'MERGED' && options.isRunOwnerRetired?.(matching[0]!) === true &&
+    if (matching.length === 1 && matching[0]!.state !== 'MERGED' && await retiredForProgression(matching[0]!, options) &&
       matching[0]!.execution?.profile === entry.profile && matching[0]!.repairTaskShapeAuthority?.shape === entry.repairTaskShapeAuthority?.shape) {
       return { run: null, reason: `#${entry.issue}: exact prior owner retirement prevents same-authority respawn` };
     }
@@ -427,11 +436,11 @@ async function retireTerminalClaim(
 }
 
 /** All same-repository prior dispatch owners count, even absent/rerouted rows. */
-function historicalOwnerHold(options: DispatchOnceOptions, currentRunId?: string): string | null {
+async function historicalOwnerHold(options: DispatchOnceOptions, currentRunId?: string): Promise<string | null> {
   for (const prior of options.store.list()) {
     if (prior.id === currentRunId || prior.dispatchClaimId === undefined ||
       prior.target.owner.toLowerCase() !== options.owner.toLowerCase() || prior.target.repo.toLowerCase() !== options.repo.toLowerCase()) continue;
-    if (options.isRunOwnerRetired?.(prior) !== true) return `Prior dispatch Run ${prior.id} retains unresolved dispatch work (${prior.state}); exact release and explicit work disposition are required.`;
+    if (!await retiredForProgression(prior, options)) return `Prior dispatch Run ${prior.id} retains unresolved dispatch work (${prior.state}); exact release, explicit work disposition and fresh native integration proof are required.`;
   }
   return null;
 }
@@ -461,9 +470,9 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     if (run !== null) assertClaimAuthorityMatchesRun(existing.claim, run);
     if (options.issuedMergeRecoveryOnly && !run?.mergeAttempt?.submissionPossible) return { outcome: 'existing_claim', claim: existing.claim };
     if (options.maintenanceHold && !run?.mergeAttempt?.submissionPossible) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD permits only observation/settlement of an already-issued merge.' };
-    const historicalHold = historicalOwnerHold(options, run?.id);
+    const historicalHold = await historicalOwnerHold(options, run?.id);
     if (historicalHold !== null) return { outcome: 'owner_reconciliation_hold', entry, claim: existing.claim, reason: historicalHold };
-    const ownerRetired = run !== null && run.state !== 'MERGED' && options.isRunOwnerRetired?.(run) === true;
+    const ownerRetired = run !== null && run.state !== 'MERGED' && await retiredForProgression(run, options);
     if (!ownerRetired && (run === null || !isSettledRun(run) || nativeReviewReentry(run, options.now()) || run.state === 'MERGE_READY' && run.nativeReview !== undefined && run.mergeAttempt?.submissionPossible !== true || nativeMergeReentry(run, options.now()))) {
       if (run !== null && options.admission?.readLane(`run:${run.id}`)?.status === 'active') {
         return {
@@ -519,7 +528,7 @@ export async function dispatchOnce(options: DispatchOnceOptions): Promise<Dispat
     return { outcome: 'no_eligible_work', reasons };
   }
   if (options.issuedMergeRecoveryOnly) return { outcome: 'no_eligible_work', reasons: ['Issued merge recovery has no exact retained runtime claim.'] };
-  const historicalHold = historicalOwnerHold(options);
+  const historicalHold = await historicalOwnerHold(options);
   if (historicalHold !== null) return { outcome: 'no_eligible_work', reasons: [historicalHold] };
   const queue = options.maintenanceHold || options.issuedMergeRecoveryOnly ? [] : parseDispatchQueue(options.queueBody);
   if (options.maintenanceHold) return { outcome: 'maintenance_hold', reason: 'Maintenance HOLD prevents new dispatch admission.' };

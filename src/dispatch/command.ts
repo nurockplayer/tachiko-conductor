@@ -1,3 +1,4 @@
+import { assertNativeMergeSettlement, qualifiedMergeIntegration } from '../workflow/merge.js';
 import { oracleDigest } from '../oracle/source-evidence.js';
 import type { ResolvedExecutionConfiguration } from '../execution-profiles.js';
 import type { Run } from '../domain/types.js';
@@ -60,6 +61,15 @@ export async function dispatchOnceCommand(
     admission: deps.admission,
     reconcileMergedRun: deps.reconcileMergedRun,
     isRunOwnerRetired: deps.isRunOwnerRetired,
+    qualifyNativeProgression: async (run) => {
+      try {
+        assertNativeMergeSettlement(run);
+        await qualifiedMergeIntegration(run, deps.workflow.github, now());
+        // Re-read exact Run and released receipt after asynchronous proof. A
+        // historical qualification is retained evidence, never a freshness lease.
+        return deps.isRunOwnerRetired?.(run) === true;
+      } catch { return false; }
+    },
     async execute(entry, existing, claim) {
       const assertReviewClaim = async (run: Run) => {
         const live = selectDispatchRuntime(await deps.runtime.listRuntimeComments());

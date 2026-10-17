@@ -130,19 +130,28 @@ export function nativeMergeReentry(run: Run, now: string): boolean {
   return a !== undefined && a.submissionPossible && !a.qualification && a.observations < MERGE_OBSERVATIONS && Date.parse(a.nextObservationAt) <= Date.parse(now);
 }
 
+/** Deterministic capability absence is known before an irreversible request.
+ * Transient failures after a fully equipped issuance remain uncertainty. */
+export function hasMergeIntegrationCapabilities(github: GitHubAdapter): boolean {
+  return [github.readPullRequest, github.readDefaultBranch, github.readCommit, github.isAncestor].every((method) => typeof method === 'function');
+}
+function hasMergeIssuanceCapabilities(github: GitHubAdapter): boolean {
+  return typeof github.squashPullRequest === 'function' && hasMergeIntegrationCapabilities(github);
+}
+
 /** Re-read actual immutable squash provenance and fresh default history. PR base is mutable after merge. */
 export async function qualifiedMergeIntegration(run: Run, github: GitHubAdapter, now: string): Promise<NativeMergeQualification> {
   const a = run.mergeAttempt; const i = a?.identity;
-  if (!a?.submissionPossible || !i || !nativeMergeCoherent(run) || !github.readPullRequest || !github.readCommit || !github.readDefaultBranch || !github.isAncestor) throw new Error('Native merge settlement lacks complete issued-attempt provenance capabilities.');
-  const p = await github.readPullRequest(run.target.owner, run.target.repo, i.pullRequestNumber);
+  if (!a?.submissionPossible || !i || !nativeMergeCoherent(run) || !hasMergeIntegrationCapabilities(github)) throw new Error('Native merge settlement lacks complete issued-attempt provenance capabilities.');
+  const p = await github.readPullRequest!(run.target.owner, run.target.repo, i.pullRequestNumber);
   if (p.state !== 'merged' || p.number !== i.pullRequestNumber || p.headSha !== i.headSha || p.headRef !== i.sourceBranch || p.baseRef !== i.policy.baseBranch ||
     p.headRepository?.owner.toLowerCase() !== i.policy.owner.toLowerCase() || p.headRepository.repo.toLowerCase() !== i.policy.repo.toLowerCase() ||
     p.baseRepository?.owner.toLowerCase() !== i.policy.owner.toLowerCase() || p.baseRepository.repo.toLowerCase() !== i.policy.repo.toLowerCase() || !SHA.test(p.mergeCommitSha ?? '') ||
     a.observedMerged !== undefined && p.mergeCommitSha !== a.observedMerged.mergeCommitSha) throw new Error('Direct merged source identity or actual merge commit is unqualified.');
-  const commit = await github.readCommit(i.policy.owner, i.policy.repo, p.mergeCommitSha!);
+  const commit = await github.readCommit!(i.policy.owner, i.policy.repo, p.mergeCommitSha!);
   if (commit.sha !== p.mergeCommitSha || commit.parents.length !== 1 || commit.parents[0] !== i.baseSha || commit.treeSha !== i.treeSha) throw new Error('Actual squash parent/tree differs from the recorded validated base/tree.');
-  const main = await github.readDefaultBranch(i.policy.owner, i.policy.repo);
-  if (main.branch !== i.policy.baseBranch || !SHA.test(main.headSha) || !await github.isAncestor(i.policy.owner, i.policy.repo, commit.sha, main.headSha)) throw new Error('Actual merge is not proven in fresh default-branch history.');
+  const main = await github.readDefaultBranch!(i.policy.owner, i.policy.repo);
+  if (main.branch !== i.policy.baseBranch || !SHA.test(main.headSha) || !await github.isAncestor!(i.policy.owner, i.policy.repo, commit.sha, main.headSha)) throw new Error('Actual merge is not proven in fresh default-branch history.');
   return { mergeCommitSha: commit.sha, parentSha: i.baseSha, treeSha: commit.treeSha, mainSha: main.headSha, observedAt: now };
 }
 /** All native- or attempt-bearing manual, automatic and retry settlement passes this guard. */
@@ -197,13 +206,14 @@ export async function observeNativeMerge(context: MergeContext): Promise<Run> {
 }
 /** One expected-HEAD squash. BASE uses explicitly accepted last-observed semantics, not atomic enforcement. */
 export async function initiateNativeMerge(context: MergeContext, host: NativeMergeHost, snapshot: GitHubLiveSnapshot): Promise<Run> {
-  if (!context.withBoundary || !context.assertInitiation || !context.owner || !context.assertClaim || !context.github.squashPullRequest || !context.github.readDefaultBranch) return context.run;
+  if (!context.withBoundary || !context.assertInitiation || !context.owner || !context.assertClaim || !hasMergeIssuanceCapabilities(context.github)) return context.run;
   return await context.withBoundary(async () => {
     let run = context.run;
     const p = host.policy;
     const snapshotPr = snapshot.pullRequest;
     const save = (next: Run) => { context.assertCurrent(); if (context.store.updateIfUnchanged?.(run, next) !== true) throw new Error('Run changed before native merge issuance.'); run = next; };
     await context.assertInitiation!(run); await context.assertClaim!(run); context.assertCurrent();
+    if (!hasMergeIssuanceCapabilities(context.github)) return run;
     const owner = context.owner!;
     if (run.state !== 'MERGE_READY' || !run.nativeReview?.accepted || !run.bootstrap || !run.headSha || snapshot.headSha !== run.headSha || snapshotPr?.state !== 'open' || snapshotPr.number !== run.pullRequest?.number ||
       snapshotPr.baseRef !== p.baseBranch || snapshotPr.baseRepository?.owner.toLowerCase() !== p.owner.toLowerCase() || snapshotPr.baseRepository.repo.toLowerCase() !== p.repo.toLowerCase() ||
@@ -214,6 +224,7 @@ export async function initiateNativeMerge(context: MergeContext, host: NativeMer
     if (main.branch !== p.baseBranch || main.headSha !== run.bootstrap.baseSha || snapshotPr.baseSha !== main.headSha) return park('Merge preparation observed default/PR/bootstrap base drift; explicit integration disposition and fresh validation/review are required.');
     const candidate = host.candidate(main.headSha, run.headSha);
     if (!candidate.baseIsAncestor || !SHA.test(candidate.treeSha)) return park('Merge preparation cannot prove the bootstrap base is an ancestor of the validated source tree.');
+    if (!hasMergeIssuanceCapabilities(context.github)) return run;
     if (!run.mergeAttempt) {
       const identity: NativeMergeIdentity = { attemptId: randomUUID(), runId: run.id, claimId: run.dispatchClaimId!, missionId: owner.missionId, laneId: owner.laneId, generation: owner.generation,
         pullRequestNumber: snapshotPr.number, sourceBranch: snapshotPr.headRef!, headSha: run.headSha, baseSha: main.headSha, treeSha: candidate.treeSha, reviewDigest: run.nativeReview.accepted.digest,
@@ -222,12 +233,15 @@ export async function initiateNativeMerge(context: MergeContext, host: NativeMer
     }
     const a = run.mergeAttempt!;
     if (a.submissionPossible || owner.generation < a.identity.generation || a.identity.missionId !== owner.missionId || !same(a.identity.policy, p) || a.identity.treeSha !== candidate.treeSha || a.identity.validationDigest !== oracleDigest(run.validationResult) || a.identity.reviewDigest !== run.nativeReview!.accepted!.digest) return run;
+    if (!hasMergeIssuanceCapabilities(context.github)) return run;
     // Mark local ownership before the durable uncertainty cut. Any exception
     // after this cut conservatively retains the same owner and never resends.
     context.onSubmission();
+    if (!hasMergeIssuanceCapabilities(context.github)) return run;
     save({ ...run, mergeAttempt: { ...a, submissionPossible: true, issuanceGeneration: owner.generation } });
     await context.assertInitiation!(run); await context.assertClaim!(run); context.assertCurrent();
     if (context.store.updateIfUnchanged?.(run, run) !== true) throw new Error('Run changed at merge publication fence.');
+    if (!hasMergeIssuanceCapabilities(context.github)) return run;
     try { await context.github.squashPullRequest!(p.owner, p.repo, a.identity.pullRequestNumber, a.identity.headSha); } catch { /* Lost acknowledgement is uncertainty, never retry authority. */ }
     return await observeNativeMerge({ ...context, run });
   });

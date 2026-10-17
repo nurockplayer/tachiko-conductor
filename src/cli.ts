@@ -1184,11 +1184,29 @@ function finalizeParkedRunOwnerReceipt(receiptPath: string, run: Run, missionId:
   writeRunOwnerReceipt(receiptPath, { ...current, phase: 'released', generation: releasedGeneration });
 }
 
+/** Validate the predecessor receipt before admission can overwrite it, under
+ * registry.admit's ownership transaction. Integration proof cannot repair a
+ * stale/foreign receipt or attest that an active invocation has stopped. */
+function assertIssuedMergeReadmissionReceipt(receiptPath: string, run: Run, lane: Readonly<AdmissionLaneView> | null, candidate: Extract<AdmissionResult, { outcome: 'admitted' }>): void {
+  if (!lane || !['parked', 'released'].includes(lane.status) || candidate.missionId !== lane.missionId || candidate.token.generation !== lane.generation + 1) throw new Error('Issued merge readmission lacks an exact quiescent predecessor lane.');
+  const workspace = assertMergeLaneIdentity(run, lane);
+  const receipt = readMergeReceipt(receiptPath, run, lane.missionId, workspace);
+  if (receipt.workDisposition !== undefined) throw new Error('Issued merge readmission cannot replace an explicit work disposition.');
+  const exactParked = lane.status === 'parked' && receipt.phase === 'parked' && receipt.generation === lane.generation && receipt.token === undefined;
+  const completedParkPublication = lane.status === 'parked' && receipt.phase === 'park_transition' && receipt.generation === lane.generation - 1 && receipt.token?.laneId === lane.laneId && receipt.token.generation === lane.generation - 1;
+  // A pre-execution receipt may have won publication before its readmission
+  // registry commit failed. The parked registry proves no active invocation.
+  const interruptedReadmission = lane.status === 'parked' && receipt.phase === 'pre_execution' && receipt.generation === lane.generation + 1 && receipt.token?.laneId === lane.laneId && receipt.token.generation === lane.generation + 1;
+  const exactStoppedRelease = lane.status === 'released' && receipt.phase === 'released' && receipt.generation === lane.generation && receipt.token === undefined;
+  if (receipt.settlementReason !== undefined || !(exactParked || completedParkPublication || interruptedReadmission || exactStoppedRelease)) throw new Error('Issued merge receipt phase/token/generation does not match its exact current predecessor lane.');
+}
+
 function acquireRunAdmission(registry: MissionAdmissionRegistry, run: Run, receiptPath?: string, workspace?: string): AdmissionToken {
   const laneId = `run:${run.id}`;
   const evidence = evidenceForRun(run, workspace === undefined ? {} : { workspace });
   const result = registry.admit({ laneId, role: 'production_captain', evidence, highAutonomy: true }, {
-    ...(receiptPath === undefined ? {} : { beforePublish: (candidate: Extract<AdmissionResult, { outcome: 'admitted' }>) => {
+    ...(receiptPath === undefined ? {} : { beforePublish: (candidate: Extract<AdmissionResult, { outcome: 'admitted' }>, previousLane?: Readonly<AdmissionLaneView> | null) => {
+      if (run.mergeAttempt?.submissionPossible) assertIssuedMergeReadmissionReceipt(receiptPath, run, previousLane ?? null, candidate);
       writeRunOwnerReceipt(receiptPath, runReceiptFor(run, candidate.missionId, candidate.token, 'pre_execution', evidence.workspace));
     } }),
   });
@@ -1377,6 +1395,26 @@ export function recoverRunAdmission(
   }
   if (!operatorStopped) throw new Error('External recovery requires explicit --stopped operator attestation that the provider and children have stopped; receipt phase alone cannot prove supervisor death.');
   registry.assertCurrentOwner(receipt.token);
+  if (run.state === 'MERGE_READY' && run.mergeAttempt?.qualification !== undefined) {
+    // This exact operator-stopped boundary is the evidence that the local
+    // invocation has quiesced after proof CAS but before normal parking.
+    // Establish real workflow_settled parking before the existing stopped
+    // release protocol records that provenance; never infer it from an
+    // arbitrary already-released receipt or a timeout.
+    assertNativeMergeSettlement(run);
+    registry.park(receipt.token, 'workflow_settled', () => {
+      // readLane is a read-only prepublication view while park's ownership
+      // transaction is held; it does not acquire another registry lock.
+      const lockedActive = registry.readLane(laneId);
+      if (!lockedActive) throw new Error('Stopped qualified owner disappeared before parking.');
+      assertLockedLaneUnchanged(lane, lockedActive, 'active');
+      const fresh = readRecoveryEvidence(store, canonicalReceiptPath, lockedActive, run.id, lane.missionId, expectedGeneration);
+      if (JSON.stringify(fresh.run) !== JSON.stringify(run)) throw new Error('Run changed before stopped qualified owner parking.');
+      assertActiveReceiptGeneration(fresh.receipt, laneId, expectedGeneration, operationTokenSecret!);
+      writeRunOwnerReceipt(canonicalReceiptPath, { ...fresh.receipt, phase: 'park_transition' });
+    }, () => finalizeRunOwnerReceipt(canonicalReceiptPath, receipt.token!, 'parked', expectedGeneration + 1));
+    return recoverRunAdmission(store, registry, runId, expectedGeneration + 1, true, canonicalReceiptPath, recoveryOptions);
+  }
   registry.release(receipt.token, true,
     (activeLane) => {
       assertLockedLaneUnchanged(lane, activeLane, 'active');
